@@ -1,5 +1,5 @@
 {
-    "name": "dependency-flow",
+    "name": "deploom",
     "private": true,
     "version": "0.2.1",
     "type": "module",
@@ -44,7 +44,11 @@
         "check:autopilot-scenarios": "node scripts/check-autopilot-scenarios.mjs",
         "check:notifications": "node scripts/check-notifications.mjs",
         "check:parallel-groups": "node scripts/check-parallel-groups.mjs",
-        "check:process-launcher": "node scripts/check-process-launcher.mjs"
+        "check:process-launcher": "node scripts/check-process-launcher.mjs",
+        "package:linux": "cross-env TOOL_VENDOR_PLATFORM=manylinux2014_x86_64 node scripts/prepare-tool.mjs && electron-builder --linux --x64 --publish never",
+        "package:mac:x64": "cross-env TOOL_VENDOR_PLATFORM=macosx_12_7_x86_64 node scripts/prepare-tool.mjs && electron-builder --mac --x64 --publish never",
+        "package:mac:arm64": "cross-env TOOL_VENDOR_PLATFORM=macosx_11_0_arm64 node scripts/prepare-tool.mjs && electron-builder --mac --arm64 --publish never",
+        "check:cross-platform": "node scripts/check-cross-platform.mjs"
     },
     "dependencies": {
         "electron-updater": "^6.8.9",
