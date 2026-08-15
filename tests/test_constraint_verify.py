@@ -56,6 +56,47 @@ class ConstraintVerifyTests(unittest.TestCase):
         self.assertIn("check-finish", events)
         self.assertIn("finish", events)
 
+    def test_parallel_screening_failure_cannot_shrink_without_serial_confirmation(self) -> None:
+        units = [
+            VerificationUnit("a", ("a",)),
+            VerificationUnit("b", ("b",)),
+        ]
+
+        def parallel_screen(candidate: tuple[VerificationUnit, ...]) -> bool:
+            # Model a false positive that exists only while the parallel wave is
+            # running (shared daemon/cache/port/resource interference).
+            return {item.id for item in candidate} == {"a"}
+
+        def isolated_confirmation(_candidate: tuple[VerificationUnit, ...]) -> bool:
+            return False
+
+        culprit = parallel_ddmin(
+            units,
+            parallel_screen,
+            parallelism=2,
+            max_checks=8,
+            confirm_failure=isolated_confirmation,
+        )
+        self.assertEqual({"a", "b"}, {item.id for item in culprit})
+
+    def test_parallel_screening_failure_shrinks_after_serial_confirmation(self) -> None:
+        units = [
+            VerificationUnit("a", ("a",)),
+            VerificationUnit("b", ("b",)),
+        ]
+
+        def fails(candidate: tuple[VerificationUnit, ...]) -> bool:
+            return "a" in {item.id for item in candidate}
+
+        culprit = parallel_ddmin(
+            units,
+            fails,
+            parallelism=2,
+            max_checks=8,
+            confirm_failure=fails,
+        )
+        self.assertEqual({"a"}, {item.id for item in culprit})
+
     def test_parallel_ddmin_has_total_watchdog(self) -> None:
         units = [VerificationUnit("a", ("a",)), VerificationUnit("b", ("b",))]
 

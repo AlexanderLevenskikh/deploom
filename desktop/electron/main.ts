@@ -4444,6 +4444,15 @@ function deterministicWatchdogFailure(result: { code: number; stderr: string; st
   return /BASELINE_LOCALIZATION_TIMEOUT|HARD_TIMEOUT|HARD_STALL|verification timed out|project check launch failed:.*timed out/i.test(text)
 }
 
+function nonRetryableDeterministicFailure(result: { code: number; stderr: string; stdout: string }): boolean {
+  if (deterministicWatchdogFailure(result)) return true
+  const text = `${result.stderr}\n${result.stdout}`
+  // These failures describe a completed deterministic proof attempt. Re-running
+  // registry discovery + solving + localization cannot make them transiently
+  // disappear; doing so only repeats hours of identical work.
+  return /BASELINE_VERIFY_INCONCLUSIVE_PROJECT_ERROR|BASELINE_PLAN_BROKEN|BASELINE_CONSTRAINT_LOOP_STUCK/i.test(text)
+}
+
 async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code: number; stderr: string; stdout: string }> {
   const rootJob = job.parallelParent ?? job
   if (job.cancelled || rootJob.cancelled) throw new Error('Выполнение отменено пользователем.')
@@ -4600,7 +4609,7 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
       const maxCommandAttempts = commandAttemptsForAction(job.action)
       let attemptsPerformed = 1
       let result = await executeCommand(job, spec)
-      for (let attempt = 2; result.code !== 0 && !deterministicWatchdogFailure(result) && attempt <= maxCommandAttempts; attempt += 1) {
+      for (let attempt = 2; result.code !== 0 && !nonRetryableDeterministicFailure(result) && attempt <= maxCommandAttempts; attempt += 1) {
         send('flow:job-output', { jobId: job.id, stream: 'system', line: `${spec.label}: transient retry ${attempt}/${maxCommandAttempts}; предыдущий exit=${result.code}.` })
         attemptsPerformed = attempt
         result = await executeCommand(job, spec)

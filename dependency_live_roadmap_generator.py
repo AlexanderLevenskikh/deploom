@@ -6630,6 +6630,32 @@ def _changed_assignment(
     }
 
 
+def _verification_inputs_for_units(
+    assignment: Dict[str, str],
+    rows_by_name: Dict[str, DependencyRow],
+    units: Iterable[VerificationUnit],
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Return (materialization_delta, solver_context_clause) for verification units.
+
+    VerificationUnit.packages deliberately includes unchanged peer/interaction
+    companions. They belong in a learned solver clause, but they must NOT be
+    materialized as exact package.json versions when reproducing a localization
+    probe. Reproduction must execute the same delta that ddmin observed.
+    """
+    package_names = {
+        name
+        for unit in units
+        for name in unit.packages
+    }
+    materialization = _changed_assignment(assignment, rows_by_name, package_names)
+    clause = {
+        name: assignment[name]
+        for name in sorted(package_names)
+        if name in assignment
+    }
+    return materialization, clause
+
+
 def _verification_units_for_assignment(
     rows_by_name: Dict[str, DependencyRow],
     assignment: Dict[str, str],
@@ -7110,16 +7136,15 @@ def resolve_peer_compatibility_with_verification(
 
                 def localization_progress(event: str, details: Dict[str, object]) -> None:
                     progress_reporter.emit(project, mode, f"localization-{event}", iteration=iteration, assignment=fingerprint, **details)
-                    if event in {"start", "wave-start", "heartbeat", "check-finish", "shrink", "timeout", "finish"}:
+                    if event in {"start", "wave-start", "heartbeat", "check-finish", "confirmation-start", "confirmation-finish", "shrink", "timeout", "finish"}:
                         detail_text = ", ".join(f"{key}={value}" for key, value in details.items())
                         level = "warn" if event == "timeout" else "info"
                         eprint(f"[{level}] {project}: Baseline localization {mode} {event}; {detail_text}")
 
                 def subset_fails(subset: Tuple[VerificationUnit, ...]) -> bool:
-                    package_names: Set[str] = set()
-                    for unit in subset:
-                        package_names.update(unit.packages)
-                    subset_changed = _changed_assignment(assignment, rows_by_name, package_names)
+                    subset_changed, _subset_clause = _verification_inputs_for_units(
+                        assignment, rows_by_name, subset
+                    )
                     if not subset_changed:
                         return False
                     subset_removals = _types_stub_removals_for_assignment(rows_by_name, subset_changed, mode, client)
@@ -7145,9 +7170,36 @@ def resolve_peer_compatibility_with_verification(
                         )
                     if learn_project_failure:
                         if config.project_checks == "adaptive":
-                            return adaptive_structural_regression(subset_result)
-                        return subset_result.kind == "project" and not subset_result.ok
-                    return subset_result.kind == "dependency" and not subset_result.ok
+                            structural = adaptive_structural_evidence(subset_result)
+                            progress_reporter.emit(
+                                project, mode, "localization-check-result",
+                                iteration=iteration, assignment=fingerprint,
+                                subset=subset_label, materialization=subset_label,
+                                changes=len(subset_changed), removals=sorted(subset_removals),
+                                kind=subset_result.kind, ok=subset_result.ok,
+                                structuralSignatures=list(structural),
+                            )
+                            return bool(structural)
+                        failed = subset_result.kind == "project" and not subset_result.ok
+                        progress_reporter.emit(
+                            project, mode, "localization-check-result",
+                            iteration=iteration, assignment=fingerprint,
+                            subset=subset_label, materialization=subset_label,
+                            changes=len(subset_changed), removals=sorted(subset_removals),
+                            kind=subset_result.kind, ok=subset_result.ok,
+                            failed=failed,
+                        )
+                        return failed
+                    failed = subset_result.kind == "dependency" and not subset_result.ok
+                    progress_reporter.emit(
+                        project, mode, "localization-check-result",
+                        iteration=iteration, assignment=fingerprint,
+                        subset=subset_label, materialization=subset_label,
+                        changes=len(subset_changed), removals=sorted(subset_removals),
+                        kind=subset_result.kind, ok=subset_result.ok,
+                        failed=failed,
+                    )
+                    return failed
 
                 try:
                     culprit_units = parallel_ddmin(
@@ -7158,6 +7210,13 @@ def resolve_peer_compatibility_with_verification(
                         progress=localization_progress,
                         progress_interval_seconds=config.progress_interval_seconds,
                         timeout_seconds=config.localization_timeout_seconds,
+                        # parallel_ddmin assumes a deterministic predicate. A
+                        # project verifier cannot prove that merely from separate
+                        # workspaces because concurrent probes still share host
+                        # resources. Screen in parallel, but only let a candidate
+                        # shrink the search after the same experiment fails again
+                        # with no sibling probe running.
+                        confirm_failure=subset_fails if learn_project_failure else None,
                     )
                 except LocalizationTimeoutError as exc:
                     progress_reporter.emit(project, mode, "localization-timeout", iteration=iteration, assignment=fingerprint, error=str(exc))
@@ -7173,16 +7232,31 @@ def resolve_peer_compatibility_with_verification(
                     project, mode, "localization-completed", iteration=iteration, assignment=fingerprint,
                     culpritUnits=len(culprit_units), elapsedSeconds=int(time.monotonic() - localization_started),
                 )
-                culprit_names: Set[str] = set()
-                for unit in culprit_units:
-                    culprit_names.update(unit.packages)
-                nogood = {
-                    name: assignment[name]
-                    for name in sorted(culprit_names)
-                    if name in assignment
-                }
+                culprit_changed, nogood = _verification_inputs_for_units(
+                    assignment, rows_by_name, culprit_units
+                )
+                if not culprit_changed:
+                    raise BaselineConstraintVerificationError(
+                        f"BASELINE_PLAN_BROKEN: {project}/{mode}: localized culprit has no materialized changes"
+                    )
                 if not nogood:
-                    nogood = dict(changed)
+                    nogood = dict(culprit_changed)
+
+                # This fingerprint is the identity of the *experiment*, not the
+                # richer learned solver clause. Every fresh reproduction below
+                # must materialize this exact delta (plus the exact same removals).
+                culprit_materialization = assignment_fingerprint(culprit_changed)
+                culprit_removals = _types_stub_removals_for_assignment(
+                    rows_by_name, culprit_changed, mode, client
+                )
+                progress_reporter.emit(
+                    project, mode, "localization-materialization-confirmed",
+                    iteration=iteration, assignment=fingerprint,
+                    materialization=culprit_materialization,
+                    changes=len(culprit_changed),
+                    contextLiterals=len(nogood),
+                    removals=sorted(culprit_removals),
+                )
 
                 # A project/build/typecheck observation becomes solver authority
                 # only after the localized literal set reproduces in fresh
@@ -7195,11 +7269,22 @@ def resolve_peer_compatibility_with_verification(
                     expected_structural = set(adaptive_structural_evidence(result)) if config.project_checks == "adaptive" else set()
                     for _proof_index in range(2):
                         proof_number = _proof_index + 1
-                        eprint(f"[info] {project}: Baseline reproduction {mode} {proof_number}/2 started; literals={len(nogood)}")
-                        progress_reporter.emit(project, mode, "reproduction-started", iteration=iteration, assignment=fingerprint, proof=proof_number, proofs=2, literals=len(nogood))
-                        proof_removals = _types_stub_removals_for_assignment(rows_by_name, nogood, mode, client)
+                        eprint(
+                            f"[info] {project}: Baseline reproduction {mode} {proof_number}/2 started; "
+                            f"literals={len(nogood)}, changes={len(culprit_changed)}, contextLiterals={len(nogood)}, "
+                            f"materialization={culprit_materialization}"
+                        )
+                        progress_reporter.emit(
+                            project, mode, "reproduction-started",
+                            iteration=iteration, assignment=fingerprint,
+                            proof=proof_number, proofs=2,
+                            changes=len(culprit_changed), contextLiterals=len(nogood),
+                            materialization=culprit_materialization,
+                            removals=sorted(culprit_removals),
+                        )
                         proof_result = verify_assignment(
-                            spec.path, nogood, config=config, run_project_checks=True, remove_packages=proof_removals,
+                            spec.path, culprit_changed, config=config, run_project_checks=True,
+                            remove_packages=culprit_removals,
                             progress=lambda message, proof_number=proof_number: (
                                 progress_reporter.emit(project, mode, "reproduction-running", iteration=iteration, assignment=fingerprint, proof=proof_number, proofs=2, message=message),
                                 eprint(f"[info] {project}: Baseline reproduction {mode} {proof_number}/2: {message}"),

@@ -82,6 +82,14 @@ if (parsedRecovery?.status !== "migration-repair-required") throw new Error("Rel
 if (!releasePrompt.includes("Human prose in chat is diagnostic only")) throw new Error("Release recovery must not use Markdown text as its primary control channel");
 
 const mainSource = readFileSync(new URL("../electron/main.ts", import.meta.url), "utf8");
+for (const retryContract of [
+  "function nonRetryableDeterministicFailure",
+  "BASELINE_VERIFY_INCONCLUSIVE_PROJECT_ERROR",
+  "!nonRetryableDeterministicFailure(result)",
+]) {
+  if (!mainSource.includes(retryContract)) throw new Error(`Deterministic Baseline retry contract missing: ${retryContract}`);
+}
+
 for (const required of [
   "handoffPreparedReleaseToMigrationRepair",
   "RELEASE_TO_MIGRATION_HANDOFF_UNSAFE",

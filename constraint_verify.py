@@ -75,12 +75,16 @@ def parallel_ddmin(
     progress: Optional[ProgressCallback] = None,
     progress_interval_seconds: float = 15.0,
     timeout_seconds: Optional[float] = None,
+    confirm_failure: Optional[Callable[[Tuple[VerificationUnit, ...]], bool]] = None,
 ) -> Tuple[VerificationUnit, ...]:
     """Return a small failure-inducing subset using parallel delta debugging.
 
-    `fails(subset)` must be deterministic. Candidates at the same ddmin level
+    `fails(subset)` should be deterministic. Candidates at the same ddmin level
     are evaluated concurrently. Results are consumed in deterministic input
     order so increasing parallelism cannot change the selected culprit set.
+    When the verifier cannot prove host-level isolation, pass `confirm_failure`:
+    a parallel positive result then becomes screening evidence only and must
+    reproduce after the wave has fully stopped before it can shrink the search.
 
     The watchdog is deliberately outside the worker callbacks: even if one
     verifier process stops producing output, the coordinator still emits
@@ -91,6 +95,12 @@ def parallel_ddmin(
         return current
 
     cache: Dict[Tuple[str, ...], bool] = {}
+    # A positive result produced while sibling candidates are running is only
+    # screening evidence. Project verifiers can share host-level resources
+    # (package-manager caches, daemons, ports, native tooling) even when their
+    # workspaces are isolated. Only a separately confirmed failure may shrink
+    # the search when confirm_failure is supplied.
+    confirmed_failure_keys: set[Tuple[str, ...]] = set()
     checks = 0
     started = time.monotonic()
     deadline = started + timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
@@ -211,12 +221,52 @@ def parallel_ddmin(
             emit("wave-finish", wave=wave, candidates=len(pending), active=0)
         return results
 
+    def first_confirmed_failure(
+        candidates: Sequence[Tuple[VerificationUnit, ...]],
+        results: Sequence[bool | None],
+        *,
+        wave: str,
+    ) -> Optional[Tuple[VerificationUnit, ...]]:
+        for index, value in enumerate(results):
+            if value is not True:
+                continue
+            candidate = candidates[index]
+            candidate_key = key(candidate)
+            if confirm_failure is None or candidate_key in confirmed_failure_keys:
+                return candidate
+
+            confirmation_started = time.monotonic()
+            emit(
+                "confirmation-start",
+                wave=wave,
+                candidateUnits=len(candidate),
+                candidatePackages=package_count(candidate),
+            )
+            confirmed = bool(confirm_failure(candidate))
+            emit(
+                "confirmation-finish",
+                wave=wave,
+                confirmed=confirmed,
+                confirmationElapsedSeconds=round(time.monotonic() - confirmation_started, 1),
+                candidateUnits=len(candidate),
+                candidatePackages=package_count(candidate),
+            )
+            # Never retain a parallel-only FAIL in the ddmin cache. If the
+            # isolated confirmation passes, future waves must see this candidate
+            # as non-failing instead of repeatedly following contaminated evidence.
+            cache[candidate_key] = confirmed
+            if confirmed:
+                confirmed_failure_keys.add(candidate_key)
+                return candidate
+        return None
+
     emit("start", units=len(current), packages=package_count(current), parallelism=parallelism)
     n = 2
     while len(current) >= 2 and checks < max_checks:
         parts = [tuple(part) for part in _partitions(current, n)]
-        subset_results = evaluate_many(parts, wave=f"subsets/{n}")
-        failing_subset = next((parts[i] for i, value in enumerate(subset_results) if value is True), None)
+        subset_wave = f"subsets/{n}"
+        subset_results = evaluate_many(parts, wave=subset_wave)
+        failing_subset = first_confirmed_failure(parts, subset_results, wave=subset_wave)
         if failing_subset is not None:
             current = failing_subset
             emit("shrink", reason="failing-subset", units=len(current), packages=package_count(current))
@@ -225,8 +275,9 @@ def parallel_ddmin(
 
         complements = [tuple(item for item in current if item not in part) for part in parts]
         complements = [candidate for candidate in complements if candidate]
-        complement_results = evaluate_many(complements, wave=f"complements/{n}")
-        failing_complement = next((complements[i] for i, value in enumerate(complement_results) if value is True), None)
+        complement_wave = f"complements/{n}"
+        complement_results = evaluate_many(complements, wave=complement_wave)
+        failing_complement = first_confirmed_failure(complements, complement_results, wave=complement_wave)
         if failing_complement is not None:
             current = failing_complement
             emit("shrink", reason="failing-complement", units=len(current), packages=package_count(current))
