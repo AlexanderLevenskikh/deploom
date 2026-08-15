@@ -8,11 +8,13 @@ import { LogPanel } from './components/LogPanel'
 import { ProjectRail } from './components/ProjectRail'
 import { SetupScreen } from './components/SetupScreen'
 import { useDependencyFlow } from './hooks/useDependencyFlow'
+import { useLanguage } from './i18n'
 
 type WorkspaceTab = 'flow' | 'dashboard'
 
 function App() {
   const flow = useDependencyFlow()
+  const { language, setLanguage, text } = useLanguage()
   const [tab, setTab] = useState<WorkspaceTab>('flow')
   const [setupBusy, setSetupBusy] = useState(false)
   const [showAddProject, setShowAddProject] = useState(false)
@@ -53,6 +55,10 @@ function App() {
         <div className="app-brand"><div className="brand-mark small"><GitFork size={18} /></div><strong>DepLoom</strong></div>
         <label className="workspace-select">Workspace<select value={details.workspace.id} onChange={(event) => void flow.selectWorkspace(event.target.value)}>{payload.state.workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}</select></label>
         <div className="header-actions">
+          <div className="language-switch" role="group" aria-label={text('Язык интерфейса', 'Interface language')}>
+            <button className={language === 'ru' ? 'active' : ''} aria-pressed={language === 'ru'} onClick={() => setLanguage('ru')}>RU</button>
+            <button className={language === 'en' ? 'active' : ''} aria-pressed={language === 'en'} onClick={() => setLanguage('en')}>EN</button>
+          </div>
           <label className="notification-toggle" title="Показывать системные Windows-уведомления после каждого завершённого этапа FLOW и каждой мигрированной группы."><input type="checkbox" checked={payload.notificationsEnabled} onChange={(event) => void flow.setNotificationsEnabled(event.target.checked)} /><Bell size={15} /><span>Уведомления</span></label>
           <button className={`button ${updateReady ? 'primary' : 'secondary'}`} disabled={!updateReady} title={updateTitle} onClick={() => void flow.installUpdate()}>{updateReady ? <RotateCcw size={16} /> : <RefreshCw className={flow.updateStatus.state === 'checking' || flow.updateStatus.state === 'downloading' ? 'spin' : ''} size={16} />}{updateLabel}</button>
           <button className="button secondary" disabled={!details.dashboardExists} onClick={openDashboard}><ExternalLink size={16} /> Dashboard</button>
@@ -75,7 +81,7 @@ function App() {
           {tab === 'dashboard' ? <DashboardWorkspace details={details} onRefresh={flow.refresh} onOpenExternal={() => flow.openPath(details.dashboardPath)} /> : null}
         </main>
 
-        <LogPanel logs={flow.logs} knownSources={knownLogSources} environment={payload.environment} active={Boolean(flow.activeJobId)} onSendAgentNote={flow.sendAgentNote} onCancel={() => void flow.cancelJob()} onClear={flow.clearLogs} />
+        <LogPanel logs={flow.logs} knownSources={knownLogSources} environment={payload.environment} active={Boolean(flow.activeJobId)} activeJobId={flow.activeJobId} onSendAgentNote={flow.sendAgentNote} onCancel={() => void flow.cancelJob()} onClear={flow.clearLogs} />
       </div>
 
       {showAddProject ? <AddProjectDialog workspaceId={details.workspace.id} onClose={() => setShowAddProject(false)} onPickDirectory={flow.pickDirectory} onSubmit={flow.addProject} /> : null}

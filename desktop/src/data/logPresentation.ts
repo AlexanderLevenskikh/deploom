@@ -148,6 +148,23 @@ function parseAgentLine(line: string): PresentedLog | undefined {
 const STDERR_ERROR_PATTERN = /\b(error|fatal|exception|traceback|denied)\b/i
 const STDERR_WARNING_PATTERN = /\bwarn(?:ing)?\b/i
 
+const TRANSIENT_SYSTEM_PROGRESS_PATTERNS = [
+  /Baseline localization \w+ (?:heartbeat|wave-start);/i,
+  /:\s*[^:]+:\s*running;\s*elapsed=\d+(?:\.\d+)?s;\s*hardTimeout=/i,
+  /\[dependency \d+\/\d+\].*(?:resolving declared and locked versions|loading registry metadata|registry metadata ready|OSV batch \d+\/\d+)/i,
+  /\[dependency \d+\/\d+\].*done in \d+(?:\.\d+)?s;.*vulnerabilities=0(?:;|$)/i,
+]
+
+export function isTransientSystemProgress(line: string): boolean {
+  const body = clean(line)
+  if (!body) return false
+  // Keep the aggregate solver result; the dozens of per-component timings are
+  // telemetry for Raw/RunMonitor, not useful activity-feed events.
+  if (/exact z3 \w+ SUMMARY;/i.test(body)) return false
+  if (/exact z3 \w+;\s+packages=\d+/i.test(body)) return true
+  return TRANSIENT_SYSTEM_PROGRESS_PATTERNS.some((pattern) => pattern.test(body))
+}
+
 export function presentLogs(logs: JobOutput[]): PresentedLog[] {
   const result: PresentedLog[] = []
   const buffers = new Map<string, string>()
@@ -173,7 +190,7 @@ export function presentLogs(logs: JobOutput[]): PresentedLog[] {
       const body = clean(entry.line)
       const userMessage = /^Вы → агент:\s*(.*)$/s.exec(body)
       if (userMessage) result.push({ kind: 'user', title: 'Вы', body: userMessage[1].trim(), ...(entry.source ? { source: entry.source } : {}) })
-      else result.push({ kind: 'system', body, ...(entry.source ? { source: entry.source } : {}) })
+      else if (!isTransientSystemProgress(body)) result.push({ kind: 'system', body, ...(entry.source ? { source: entry.source } : {}) })
       continue
     }
     const key = `${entry.jobId}:${entry.stream}`

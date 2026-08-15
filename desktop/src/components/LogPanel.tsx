@@ -1,13 +1,16 @@
 import { AlertCircle, AlertTriangle, Ban, Check, Copy, Download, MessageSquare, RotateCcw, Send, TerminalSquare, Wrench } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type UIEvent } from 'react'
 import { latestJobId, mergeLogSources, presentLogs, summarizeTokenUsage, type PresentedLog } from '../data/logPresentation'
+import { useLanguage } from '../i18n'
 import type { EnvironmentInfo, JobOutput, JobOutputSource } from '../types'
+import { RunMonitor } from './RunMonitor'
 
 type Props = {
   logs: JobOutput[]
   knownSources?: JobOutputSource[]
   environment: EnvironmentInfo
   active: boolean
+  activeJobId?: string
   onSendAgentNote: (note: string, branch?: string) => Promise<boolean>
   onCancel: () => void
   onClear: () => void
@@ -30,7 +33,8 @@ function ActivityIcon({ kind }: { kind: PresentedLog['kind'] }) {
   return <TerminalSquare size={15} />
 }
 
-export function LogPanel({ logs, knownSources = [], environment, active, onSendAgentNote, onCancel, onClear }: Props) {
+export function LogPanel({ logs, knownSources = [], environment, active, activeJobId, onSendAgentNote, onCancel, onClear }: Props) {
+  const { text } = useLanguage()
   const [view, setView] = useState<LogView>('activity')
   const [selectedSource, setSelectedSource] = useState('all')
   const [note, setNote] = useState('')
@@ -100,22 +104,23 @@ export function LogPanel({ logs, knownSources = [], environment, active, onSendA
   return (
     <aside className="log-panel">
       <div className="panel-heading">
-        <div><TerminalSquare size={17} /><strong>Лог выполнения</strong></div>
-        {tokens.total > 0 ? <span className="token-counter" title={tokenDetails}>{formatTokens(tokens.total)} токенов · последний запуск</span> : null}
+        <div><TerminalSquare size={17} /><strong>{text('Лог выполнения', 'Execution log')}</strong></div>
+        {tokens.total > 0 ? <span className="token-counter" title={tokenDetails}>{formatTokens(tokens.total)} {text('токенов · последний запуск', 'tokens · latest run')}</span> : null}
         <div className="heading-actions">
-          {active ? <button className="icon-button danger-text" title="Остановить" onClick={onCancel}><Ban size={16} /></button> : null}
-          <button className="icon-button" title={copied ? 'Скопировано' : 'Скопировать лог'} disabled={filteredLogs.length === 0} onClick={() => void copyLog()}>{copied ? <Check size={16} /> : <Copy size={16} />}</button>
-          <button className="icon-button" title="Очистить лог" onClick={onClear}><RotateCcw size={16} /></button>
+          {active ? <button className="icon-button danger-text" title={text('Остановить', 'Stop')} onClick={onCancel}><Ban size={16} /></button> : null}
+          <button className="icon-button" title={copied ? text('Скопировано', 'Copied') : text('Скопировать лог', 'Copy log')} disabled={filteredLogs.length === 0} onClick={() => void copyLog()}>{copied ? <Check size={16} /> : <Copy size={16} />}</button>
+          <button className="icon-button" title={text('Очистить лог', 'Clear log')} onClick={onClear}><RotateCcw size={16} /></button>
         </div>
       </div>
+      <RunMonitor logs={logs} active={active} jobId={activeJobId} />
       <div className="log-controls"><div className="log-tabs" role="tablist" aria-label="Представление лога">
-        <button role="tab" aria-selected={view === 'activity'} className={view === 'activity' ? 'active' : ''} onClick={() => setView('activity')}>Ход</button>
+        <button role="tab" aria-selected={view === 'activity'} className={view === 'activity' ? 'active' : ''} onClick={() => setView('activity')}>{text('Ход', 'Activity')}</button>
         <button role="tab" aria-selected={view === 'raw'} className={view === 'raw' ? 'active' : ''} onClick={() => setView('raw')}>Raw</button>
-      </div><label className="log-source-filter">Сессия<select value={selectedSource} onChange={(event) => { setSelectedSource(event.target.value); setNoteState('idle') }}><option value="all">Все сообщения</option><option value="system">Система / оркестратор</option>{sourceOptions.map(([key, source]) => <option key={key} value={key}>{sourceLabel(source)}</option>)}</select></label></div>
+      </div><label className="log-source-filter">{text('Сессия', 'Session')}<select value={selectedSource} onChange={(event) => { setSelectedSource(event.target.value); setNoteState('idle') }}><option value="all">{text('Все сообщения', 'All messages')}</option><option value="system">{text('Система / оркестратор', 'System / orchestrator')}</option>{sourceOptions.map(([key, source]) => <option key={key} value={key}>{sourceLabel(source)}</option>)}</select></label></div>
       <div className="agent-chat-composer"><div><strong>{addressedGroup ? `Сообщение · ${sourceLabel(addressedGroup)}` : 'Сообщение агенту'}</strong><span>{addressedGroup ? 'Будет отправлено только выбранной live-сессии.' : 'Выберите конкретную группу в списке сессий.'}</span></div><textarea rows={2} value={note} disabled={!active || !addressedGroup} onChange={(event) => { setNote(event.target.value); setNoteState('idle') }} placeholder={addressedGroup ? 'Дополнительный контекст для этой группы…' : 'Сначала выберите группу'} /><button className="button secondary" disabled={!active || !addressedGroup || !note.trim() || noteState === 'sending'} onClick={() => void sendNote()}><Send size={14} />{noteState === 'sending' ? 'Отправляю…' : noteState === 'sent' ? 'Отправлено' : 'Отправить'}</button>{noteState === 'unavailable' ? <small>Сессия уже завершилась или ещё не открылась.</small> : null}</div>
       {view === 'activity' ? (
         <div ref={activityRef} className="activity-log" aria-live="polite" onScroll={rememberLogPosition}>
-          {activity.length === 0 ? <span className="activity-empty">Здесь появится понятный ход работы агента.</span> : activity.map((entry, index) => (
+          {activity.length === 0 ? <span className="activity-empty">{text('Здесь появятся только этапы, результаты и изменения статусов.', 'Only stages, results, and status changes will appear here.')}</span> : activity.map((entry, index) => (
             <div className={`activity-entry ${entry.kind}`} key={`${entry.kind}-${index}`}>
               <span className="activity-icon"><ActivityIcon kind={entry.kind} /></span>
               <div><div className="activity-title"><strong>{entry.title ?? (entry.kind === 'system' ? 'Команда' : 'Вывод')}</strong><span className="log-source-badge">{sourceLabel(entry.source)}</span></div><p>{entry.body}</p>{entry.detail ? <small>{entry.detail}</small> : null}</div>
@@ -124,16 +129,16 @@ export function LogPanel({ logs, knownSources = [], environment, active, onSendA
         </div>
       ) : (
         <div ref={terminalRef} className="terminal" aria-live="polite" onScroll={rememberLogPosition}>
-          {filteredLogs.length === 0 ? <span className="terminal-muted">Для выбранной сессии сырого вывода пока нет.</span> : filteredLogs.map((entry, index) => <div className="raw-log-entry" key={`${entry.jobId}-${index}`}><span className="log-source-badge">{sourceLabel(entry.source)}</span><pre className={entry.stream}>{entry.line}</pre></div>)}
+          {filteredLogs.length === 0 ? <span className="terminal-muted">{text('Для выбранной сессии сырого вывода пока нет.', 'No raw output for the selected session yet.')}</span> : filteredLogs.map((entry, index) => <div className="raw-log-entry" key={`${entry.jobId}-${index}`}><span className="log-source-badge">{sourceLabel(entry.source)}</span><pre className={entry.stream}>{entry.line}</pre></div>)}
         </div>
       )}
-      <div className="context-heading"><strong>Окружение</strong></div>
+      <div className="context-heading"><strong>{text('Окружение', 'Environment')}</strong></div>
       <div className="environment-list">
         {Object.entries(environment).map(([name, info]) => (
           <div className="environment-row" key={name}><span className={`status-dot ${info.available ? 'success' : 'danger'}`} /><strong>{name}</strong><span>{info.available ? info.version : 'не найден'}</span></div>
         ))}
       </div>
-      <div className="download-hint"><Download size={16} /><span>Prompt и dashboard-state из встроенного отчёта сохраняются в workspace автоматически.</span></div>
+      <div className="download-hint"><Download size={16} /><span>{text('Prompt и dashboard-state из встроенного отчёта сохраняются в workspace автоматически.', 'Prompt and dashboard-state from the embedded report are saved to the workspace automatically.')}</span></div>
     </aside>
   )
 }

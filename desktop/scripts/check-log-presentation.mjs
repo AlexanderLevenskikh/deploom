@@ -3,6 +3,7 @@ import ts from "typescript";
 
 const source = await readFile(new URL("../src/data/logPresentation.ts", import.meta.url), "utf8");
 const panelSource = await readFile(new URL("../src/components/LogPanel.tsx", import.meta.url), "utf8");
+const monitorSource = await readFile(new URL("../src/data/processMonitor.ts", import.meta.url), "utf8");
 const appSource = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 const flowSource = await readFile(new URL("../src/components/FlowWorkspace.tsx", import.meta.url), "utf8");
 const failureModalSource = await readFile(new URL("../src/components/BranchFailureModal.tsx", import.meta.url), "utf8");
@@ -14,6 +15,7 @@ if (!appSource.includes("for (const branch of details.migrationProgress?.branche
 if (!flowSource.includes("migration-error-indicator") || !flowSource.includes("Ожидает Supervisor") || !failureModalSource.includes("Автопилот исправит") || !failureModalSource.includes("Требуется вмешательство")) throw new Error("Failed groups must expose warning/error reasons without implying user intervention");
 if (!panelSource.includes("followLogRef.current") || !panelSource.includes("scrollHeight - element.scrollTop - element.clientHeight <= 48")) throw new Error("Log panel must preserve manual scroll position while new entries arrive");
 if (panelSource.includes("scrollIntoView({ block: 'end' })")) throw new Error("Unconditional log autoscroll must not return");
+if (!panelSource.includes("<RunMonitor") || !appSource.includes("language-switch")) throw new Error("Run monitor / language switch is missing");
 const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
 const module = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
 const sources = module.mergeLogSources([], [{ kind: "group", id: "queued-1", label: "queued" }]);
@@ -36,6 +38,27 @@ const severity = module.presentLogs([
 ]);
 if (severity.map((entry) => entry.kind).join(",") !== "raw,warning,error") throw new Error(`Generator stderr severity is wrong: ${JSON.stringify(severity)}`);
 if (severity[0].title !== "Ход выполнения" || severity[1].title !== "Предупреждение") throw new Error("Generator severity titles are wrong");
+
+const compactActivity = module.presentLogs([
+  { jobId: "baseline", stream: "system", line: "partner-form: Baseline localization yellow heartbeat; elapsedSeconds=3667.6, checksStarted=10, maxChecks=24, currentUnits=2, wave=subsets/2, active=2, completed=0" },
+  { jobId: "baseline", stream: "system", line: "partner-form: Baseline yellow iteration 1 assignment abc: resolver-install: package-manager resolver install: running; elapsed=270s; hardTimeout=600s; pid=22120" },
+  { jobId: "baseline", stream: "system", line: "partner-form: Baseline localization yellow shrink; elapsedSeconds=3592.5, checksStarted=8, maxChecks=24, currentUnits=2, reason=failing-subset, units=2, packages=46" },
+  { jobId: "baseline", stream: "system", line: "partner-form: exact z3 yellow SUMMARY; components=26/26, changed=53, constraints=7190, refinements=0, elapsedMs=7488" },
+]);
+if (compactActivity.length !== 2) throw new Error(`Transient progress leaked into activity view: ${JSON.stringify(compactActivity)}`);
+if (!compactActivity.some((entry) => entry.body.includes("shrink")) || !compactActivity.some((entry) => entry.body.includes("SUMMARY"))) throw new Error("Valuable stage/status events were filtered out");
+
+const monitorCompiled = ts.transpileModule(monitorSource, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
+const monitorModule = await import(`data:text/javascript;base64,${Buffer.from(monitorCompiled).toString("base64")}`);
+const monitor = monitorModule.deriveRunMonitor([
+  { jobId: "baseline", stream: "system", line: "partner-form: Baseline localization yellow started; units=19, maxChecks=24, parallelism=4, attemptHardTimeout=3600s, localizationHardTimeout=7200s" },
+  { jobId: "baseline", stream: "system", line: "partner-form: Baseline localization yellow shrink; elapsedSeconds=1019.3, checksStarted=2, maxChecks=24, currentUnits=10, reason=failing-subset, units=10, packages=64" },
+  { jobId: "baseline", stream: "system", line: "partner-form: Baseline localization yellow shrink; elapsedSeconds=1820.0, checksStarted=4, maxChecks=24, currentUnits=5, reason=failing-subset, units=5, packages=58" },
+  { jobId: "baseline", stream: "system", line: "partner-form: Baseline localization yellow heartbeat; elapsedSeconds=2060.3, checksStarted=6, maxChecks=24, currentUnits=5, wave=subsets/2, active=2, completed=0" },
+], true, "baseline");
+if (monitor.phase !== "localizing" || monitor.localization?.currentUnits !== 5 || monitor.localization?.checksStarted !== 6) throw new Error(`Localization monitor is wrong: ${JSON.stringify(monitor)}`);
+if (monitor.localization?.activeChecks !== 2 || monitor.localization?.completedChecks !== 0) throw new Error(`Localization worker counters are wrong: ${JSON.stringify(monitor.localization)}`);
+if (monitor.localization?.shrinkHistory.join(",") !== "19,10,5") throw new Error(`Localization shrink history is wrong: ${JSON.stringify(monitor.localization)}`);
 
 const conversation = module.presentLogs([
   { jobId: "agent", stream: "system", line: "Вы → агент: Проверь ещё Storybook" },
