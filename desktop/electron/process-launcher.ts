@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import { delimiter, join } from 'node:path'
+import { posix, win32 } from 'node:path'
 
 export type ResolvedInvocation = { command: string; args: string[]; resolvedExecutable: string; windowsVerbatimArguments?: boolean }
 
@@ -11,6 +11,10 @@ type ResolveOptions = {
 }
 
 const WINDOWS_EXECUTABLE_EXTENSIONS = ['.exe', '.com', '.cmd', '.bat'] as const
+
+function pathApi(platform: NodeJS.Platform) {
+  return platform === 'win32' ? win32 : posix
+}
 
 /** Build the environment used by GUI-launched child processes.
  *
@@ -24,40 +28,42 @@ export function commandEnvironment(
   platform: NodeJS.Platform = process.platform,
 ): NodeJS.ProcessEnv {
   if (platform === 'win32') return { ...source }
+  const path = pathApi(platform)
   const home = source.HOME?.trim()
-  const bunBin = source.BUN_INSTALL?.trim() ? join(source.BUN_INSTALL, 'bin') : undefined
-  const inherited = (source.PATH ?? '').split(delimiter).map((item) => item.trim()).filter(Boolean)
+  const bunBin = source.BUN_INSTALL?.trim() ? path.join(source.BUN_INSTALL, 'bin') : undefined
+  const inherited = (source.PATH ?? '').split(path.delimiter).map((item) => item.trim()).filter(Boolean)
   const extras = [
     source.NVM_BIN,
     source.FNM_MULTISHELL_PATH,
     source.PNPM_HOME,
-    source.VOLTA_HOME ? join(source.VOLTA_HOME, 'bin') : undefined,
+    source.VOLTA_HOME ? path.join(source.VOLTA_HOME, 'bin') : undefined,
     bunBin,
-    home ? join(home, '.local', 'bin') : undefined,
-    home ? join(home, '.volta', 'bin') : undefined,
-    home ? join(home, '.asdf', 'shims') : undefined,
-    home ? join(home, '.local', 'share', 'pnpm') : undefined,
+    home ? path.join(home, '.local', 'bin') : undefined,
+    home ? path.join(home, '.volta', 'bin') : undefined,
+    home ? path.join(home, '.asdf', 'shims') : undefined,
+    home ? path.join(home, '.local', 'share', 'pnpm') : undefined,
     platform === 'darwin' ? '/opt/homebrew/bin' : undefined,
     platform === 'linux' ? '/home/linuxbrew/.linuxbrew/bin' : undefined,
     '/usr/local/bin',
     '/usr/bin',
     '/bin',
   ].filter((item): item is string => Boolean(item && item.trim()))
-  return { ...source, PATH: [...new Set([...inherited, ...extras])].join(delimiter) }
+  return { ...source, PATH: [...new Set([...inherited, ...extras])].join(path.delimiter) }
 }
 
 function windowsSearchDirectories(env: NodeJS.ProcessEnv, pathValue: string, platform: NodeJS.Platform): string[] {
-  const entries = pathValue.split(platform === 'win32' ? ';' : delimiter).map((item) => item.trim()).filter(Boolean)
+  const path = pathApi(platform)
+  const entries = pathValue.split(path.delimiter).map((item) => item.trim()).filter(Boolean)
   const extras = [
     env.NVM_SYMLINK,
     env.NVM_HOME,
-    env.VOLTA_HOME ? join(env.VOLTA_HOME, 'bin') : undefined,
+    env.VOLTA_HOME ? path.join(env.VOLTA_HOME, 'bin') : undefined,
     env.FNM_MULTISHELL_PATH,
-    env.APPDATA ? join(env.APPDATA, 'npm') : undefined,
-    env.ProgramFiles ? join(env.ProgramFiles, 'nodejs') : undefined,
-    env.LOCALAPPDATA ? join(env.LOCALAPPDATA, 'Programs', 'nodejs') : undefined,
-    env.USERPROFILE ? join(env.USERPROFILE, 'scoop', 'shims') : undefined,
-    env.USERPROFILE ? join(env.USERPROFILE, '.local', 'bin') : undefined,
+    env.APPDATA ? path.join(env.APPDATA, 'npm') : undefined,
+    env.ProgramFiles ? path.join(env.ProgramFiles, 'nodejs') : undefined,
+    env.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, 'Programs', 'nodejs') : undefined,
+    env.USERPROFILE ? path.join(env.USERPROFILE, 'scoop', 'shims') : undefined,
+    env.USERPROFILE ? path.join(env.USERPROFILE, '.local', 'bin') : undefined,
   ].filter((item): item is string => Boolean(item && item.trim()))
   return [...new Set([...entries, ...extras])]
 }
@@ -76,6 +82,7 @@ export function resolveExecutable(command: string, options: ResolveOptions = {})
   // reliably expose Python 3 as `python3` and often have no `python` alias.
   if (command === 'python' && platform !== 'win32') return 'python3'
   if (platform !== 'win32') return command
+  const path = pathApi(platform)
   const env = options.env ?? process.env
   const fileExists = options.fileExists ?? existsSync
   const pathValue = options.pathValue ?? env.PATH ?? ''
@@ -83,20 +90,20 @@ export function resolveExecutable(command: string, options: ResolveOptions = {})
 
   for (const entry of directories) {
     for (const extension of WINDOWS_EXECUTABLE_EXTENSIONS) {
-      const candidate = join(entry, `${command}${extension}`)
+      const candidate = path.join(entry, `${command}${extension}`)
       if (fileExists(candidate)) return candidate
     }
     if (command === 'opencode') {
-      const npmBinary = join(entry, 'node_modules', 'opencode-ai', 'bin', 'opencode.exe')
+      const npmBinary = path.join(entry, 'node_modules', 'opencode-ai', 'bin', 'opencode.exe')
       if (fileExists(npmBinary)) return npmBinary
     }
   }
   if (command === 'codex' && env.LOCALAPPDATA) {
-    const codexBinary = join(env.LOCALAPPDATA, 'Programs', 'OpenAI', 'Codex', 'bin', 'codex.exe')
+    const codexBinary = path.join(env.LOCALAPPDATA, 'Programs', 'OpenAI', 'Codex', 'bin', 'codex.exe')
     if (fileExists(codexBinary)) return codexBinary
   }
   if (command === 'claude' && env.USERPROFILE) {
-    const claudeBinary = join(env.USERPROFILE, '.local', 'bin', 'claude.exe')
+    const claudeBinary = path.join(env.USERPROFILE, '.local', 'bin', 'claude.exe')
     if (fileExists(claudeBinary)) return claudeBinary
   }
   return command
