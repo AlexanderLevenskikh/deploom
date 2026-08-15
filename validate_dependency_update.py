@@ -155,10 +155,25 @@ def parse_version(value: str) -> Optional[VersionInfo]:
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) or "")
 
 
-def version_key(version: VersionInfo) -> Tuple[int, int, int, int, str]:
+PrereleaseIdentifierKey = Tuple[int, int, str]
+PrereleaseKey = Tuple[PrereleaseIdentifierKey, ...]
+
+
+def prerelease_key(prerelease: str) -> PrereleaseKey:
+    """SemVer ?11 precedence: numeric identifiers compare numerically and below text."""
+    result: List[PrereleaseIdentifierKey] = []
+    for identifier in prerelease.split(".") if prerelease else ():
+        if identifier.isdigit():
+            result.append((0, int(identifier), ""))
+        else:
+            result.append((1, 0, identifier))
+    return tuple(result)
+
+
+def version_key(version: VersionInfo) -> Tuple[int, int, int, int, PrereleaseKey]:
     major, minor, patch, prerelease = version
     # Stable semver is greater than the same version with a prerelease suffix.
-    return (major, minor, patch, 0 if prerelease else 1, prerelease)
+    return (major, minor, patch, 0 if prerelease else 1, prerelease_key(prerelease))
 
 
 def version_lt(left: VersionInfo, right: VersionInfo) -> bool:

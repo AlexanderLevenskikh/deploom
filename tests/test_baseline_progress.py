@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dependency_live_roadmap_generator import BaselineProgressReporter
+from dependency_live_roadmap_generator import BaselineLocalizationCheckpointStore, BaselineProgressReporter
 
 
 class BaselineProgressReporterTests(unittest.TestCase):
@@ -45,6 +45,21 @@ class BaselineProgressReporterTests(unittest.TestCase):
             payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual("check", payload["phase"])
             self.assertIsInstance(payload["check"], int)
+
+    def test_corrupt_localization_checkpoint_is_preserved_for_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            progress = Path(tmp) / "state" / "baseline-verification-progress.json"
+            checkpoint = progress.with_name("baseline-localization-checkpoint.json")
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_text('{"schemaVersion": 1, "entries": ', encoding="utf-8")
+            store = BaselineLocalizationCheckpointStore(progress)
+
+            self.assertIsNone(store.load("Demo", "yellow", "identity"))
+            self.assertFalse(checkpoint.exists())
+            preserved = list(checkpoint.parent.glob("baseline-localization-checkpoint.json.corrupt-*"))
+            self.assertEqual(1, len(preserved))
+            self.assertIn('"entries"', preserved[0].read_text(encoding="utf-8"))
+
 
     def test_terminal_progress_is_not_overwritten_by_late_worker_heartbeat(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -23,6 +23,7 @@ from baseline_constraint_verifier import (
     detect_package_manager,
     discover_baseline_project_checks,
     is_structural_project_failure,
+    install_args,
     structural_project_failure_signatures,
     BaselineVerifyResult,
     verify_assignment,
@@ -115,6 +116,29 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 )
             self.assertFalse(result.ok)
             self.assertEqual("dependency", result.kind)
+
+
+    def test_yarn_resolver_only_install_explicitly_disables_scripts(self) -> None:
+        self.assertEqual(["install", "--ignore-scripts"], install_args("yarn", ignore_scripts=True))
+        self.assertEqual(["install"], install_args("yarn", ignore_scripts=False))
+
+    def test_assignment_missing_from_manifest_is_never_a_vacuous_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(
+                json.dumps({"dependencies": {"demo": "1.0.0"}}), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(Exception, "ASSIGNMENT_PACKAGE_NOT_DECLARED: added"):
+                _apply_assignment(root, {"added": "2.0.0"})
+
+            result = verify_assignment(
+                root,
+                {"added": "2.0.0"},
+                config=BaselineVerifyConfig(project_checks="off"),
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual("unknown", result.kind)
+            self.assertIn("ASSIGNMENT_PACKAGE_NOT_DECLARED: added", result.summary)
 
 
     def test_assignment_can_materialize_remove_action_before_executor(self) -> None:

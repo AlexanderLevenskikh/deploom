@@ -105,6 +105,10 @@ class BaselineVerifyResult:
         return self.kind == "dependency" or self.kind == "project"
 
 
+class AssignmentMaterializationError(RuntimeError):
+    """Raised when the solver assignment cannot be represented by package.json."""
+
+
 INFRA_PATTERNS = re.compile(
     r"(?:ENOENT|not recognized as an internal or external command|command not found|"
     r"ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|socket hang up|"
@@ -344,10 +348,13 @@ def detect_package_manager(project_dir: Path) -> str:
 
 def install_args(manager: str, *, ignore_scripts: bool) -> List[str]:
     if manager == "yarn":
-        # Works with Yarn classic; Berry accepts environment overrides below and
-        # ignores the classic flag only when unsupported, so keep the command
-        # minimal and disable scripts through environment instead.
-        return ["install"]
+        # Yarn Classic ignores YARN_ENABLE_SCRIPTS.  The explicit flag is the
+        # proof boundary for resolver-only verification; Berry is rejected by
+        # lockfile preflight before this verifier is reached.
+        args = ["install"]
+        if ignore_scripts:
+            args.append("--ignore-scripts")
+        return args
     if manager == "pnpm":
         args = ["install", "--no-frozen-lockfile"]
         if ignore_scripts:
@@ -507,10 +514,12 @@ def _apply_assignment(
     removals = {str(name) for name in remove_packages}
     for name in sorted(set(assignment) | removals):
         package_changed = False
+        package_seen = False
         for section in sections:
             deps = manifest.get(section)
             if not isinstance(deps, dict) or name not in deps:
                 continue
+            package_seen = True
             if name in removals:
                 del deps[name]
                 package_changed = True
@@ -519,6 +528,10 @@ def _apply_assignment(
             if deps[name] != version:
                 deps[name] = version
                 package_changed = True
+        if name in assignment and name not in removals and not package_seen:
+            raise AssignmentMaterializationError(
+                f"ASSIGNMENT_PACKAGE_NOT_DECLARED: {name} is absent from all direct dependency sections"
+            )
         if package_changed:
             changed.append(name)
     package_json.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -567,6 +580,11 @@ def verify_assignment(
         try:
             workspace_project = _materialize_workspace(project_dir, workspace_root)
             changed = _apply_assignment(workspace_project, assignment, remove_packages=remove_packages)
+        except AssignmentMaterializationError as exc:
+            # A solver/planner assignment that cannot be represented by the
+            # project manifest is not package-manager evidence and must never
+            # pass vacuously or become a learned dependency nogood.
+            return BaselineVerifyResult(False, "unknown", str(exc))
         except Exception as exc:  # filesystem/git setup is infrastructure, never a nogood
             return BaselineVerifyResult(False, "infrastructure", f"workspace preparation failed: {exc}")
 

@@ -18,6 +18,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
+import warnings
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional
 
@@ -149,6 +152,40 @@ class LearnedConstraintProof:
         }
 
 
+@contextmanager
+def _exclusive_cache_write_lock(path: Path):
+    """Cross-process lock for the tiny read-modify-replace cache transaction."""
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + 10.0
+    fd: Optional[int] = None
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"pid={os.getpid()} created={time.time()}\n".encode("utf-8"))
+            break
+        except FileExistsError:
+            try:
+                # A crashed writer must not deadlock future Baselines forever.
+                if time.time() - lock_path.stat().st_mtime > 120.0:
+                    lock_path.unlink()
+                    continue
+            except FileNotFoundError:
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"constraint cache lock timed out: {lock_path}")
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _read_cache(path: Optional[Path]) -> Dict[str, object]:
     if path is None or not path.is_file():
         return {"schemaVersion": CACHE_SCHEMA_VERSION, "entries": []}
@@ -200,55 +237,79 @@ def load_verified_nogoods(
 
 
 def persist_verified_nogood(path: Optional[Path], proof: LearnedConstraintProof, *, max_entries: int = 1000) -> bool:
-    """Atomically persist one proven clause. Returns True when cache changed."""
+    """Atomically persist one proven clause. Returns True when cache changed.
+
+    ``max_entries`` is intentionally a per-project retention bound. A busy
+    project must never evict verified clauses belonging to another project.
+    """
     if path is None or proof.verified_count < 2 or not proof.failure_signature or not proof.literals:
         return False
     path = path.resolve()
-    cache = _read_cache(path)
-    entries = [item for item in cache.get("entries", []) if isinstance(item, dict)]
-    normalized = proof.to_json()
-    identity = (
-        normalized["projectPath"],
-        normalized["environmentFingerprint"],
-        tuple(sorted(dict(normalized["literals"]).items())),
-    )
-    for existing in entries:
-        existing_literals = existing.get("literals") if isinstance(existing.get("literals"), dict) else {}
-        existing_identity = (
-            str(existing.get("projectPath") or ""),
-            str(existing.get("environmentFingerprint") or ""),
-            tuple(sorted((str(k), str(v)) for k, v in existing_literals.items())),
-        )
-        if existing_identity == identity:
-            # Preserve the original proof, but raise verification count if the
-            # same clause was independently reproduced again.
-            changed = False
-            if int(existing.get("verifiedCount") or 0) < int(normalized["verifiedCount"]):
-                existing["verifiedCount"] = normalized["verifiedCount"]
-                changed = True
-            if not existing.get("failureSignature"):
-                existing["failureSignature"] = normalized["failureSignature"]
-                changed = True
-            if not changed:
-                return False
-            break
-    else:
-        entries.append(normalized)
-
-    if len(entries) > max_entries:
-        entries = entries[-max_entries:]
-    payload = {"schemaVersion": CACHE_SCHEMA_VERSION, "entries": entries}
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.replace(temp_name, path)
-    finally:
-        try:
-            if os.path.exists(temp_name):
-                os.unlink(temp_name)
-        except OSError:
-            pass
-    return True
+        with _exclusive_cache_write_lock(path):
+            cache = _read_cache(path)
+            entries = [item for item in cache.get("entries", []) if isinstance(item, dict)]
+            normalized = proof.to_json()
+            identity = (
+                normalized["projectPath"],
+                normalized["environmentFingerprint"],
+                tuple(sorted(dict(normalized["literals"]).items())),
+            )
+            for existing in entries:
+                existing_literals = existing.get("literals") if isinstance(existing.get("literals"), dict) else {}
+                existing_identity = (
+                    str(existing.get("projectPath") or ""),
+                    str(existing.get("environmentFingerprint") or ""),
+                    tuple(sorted((str(k), str(v)) for k, v in existing_literals.items())),
+                )
+                if existing_identity == identity:
+                    changed = False
+                    if int(existing.get("verifiedCount") or 0) < int(normalized["verifiedCount"]):
+                        existing["verifiedCount"] = normalized["verifiedCount"]
+                        changed = True
+                    if not existing.get("failureSignature"):
+                        existing["failureSignature"] = normalized["failureSignature"]
+                        changed = True
+                    if not changed:
+                        return False
+                    break
+            else:
+                entries.append(normalized)
+
+            if max_entries > 0:
+                project_key = str(normalized["projectPath"])
+                project_count = sum(
+                    1 for item in entries
+                    if str(item.get("projectPath") or "") == project_key
+                )
+                drop = max(0, project_count - max_entries)
+                if drop:
+                    retained = []
+                    for item in entries:
+                        if drop and str(item.get("projectPath") or "") == project_key:
+                            drop -= 1
+                            continue
+                        retained.append(item)
+                    entries = retained
+
+            payload = {"schemaVersion": CACHE_SCHEMA_VERSION, "entries": entries}
+            fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                    json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                    handle.write("\n")
+                os.replace(temp_name, path)
+            finally:
+                try:
+                    if os.path.exists(temp_name):
+                        os.unlink(temp_name)
+                except OSError:
+                    pass
+            return True
+    except TimeoutError as exc:
+        # Durable cache is an optimization/evidence store, never solver
+        # authority for the current run. Losing the persistence opportunity must
+        # not invalidate an otherwise proven session-local result.
+        warnings.warn(str(exc), RuntimeWarning, stacklevel=2)
+        return False

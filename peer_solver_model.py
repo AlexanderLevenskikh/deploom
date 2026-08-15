@@ -80,6 +80,56 @@ class PeerOptimizationModel:
             total *= max(1, len(package.domain))
         return total
 
+    def validation_issue(self) -> str:
+        """Return a deterministic diagnostic for malformed finite-domain IR."""
+        if self.objective_width < 0:
+            return f"INVALID_OBJECTIVE_WIDTH: {self.objective_width}"
+        package_map: Dict[str, PackageVariable] = {}
+        for package in self.packages:
+            if not package.name:
+                return "EMPTY_PACKAGE_NAME"
+            if package.name in package_map:
+                return f"DUPLICATE_PACKAGE: {package.name}"
+            package_map[package.name] = package
+            if not package.domain:
+                return f"EMPTY_DOMAIN: {package.name}"
+            if len(set(package.domain)) != len(package.domain):
+                return f"DUPLICATE_DOMAIN_VERSION: {package.name}"
+            score_versions = [version for version, _score in package.scores]
+            if len(set(score_versions)) != len(score_versions):
+                return f"DUPLICATE_SCORE_VERSION: {package.name}"
+            if set(score_versions) != set(package.domain):
+                return f"SCORE_DOMAIN_MISMATCH: {package.name}"
+            for version, score in package.scores:
+                if len(score) != self.objective_width:
+                    return (
+                        f"OBJECTIVE_WIDTH_MISMATCH: {package.name}@{version}: "
+                        f"expected {self.objective_width}, got {len(score)}"
+                    )
+
+        for constraint in self.constraints:
+            for name, version in constraint.literals:
+                package = package_map.get(name)
+                if package is None:
+                    return f"UNKNOWN_CONSTRAINT_PACKAGE: {name}"
+                if version not in package.domain:
+                    return f"CONSTRAINT_LITERAL_OUTSIDE_DOMAIN: {name}@{version}"
+
+        for requirement in self.requirements:
+            trigger_name, trigger_version = requirement.trigger
+            trigger = package_map.get(trigger_name)
+            if trigger is None:
+                return f"UNKNOWN_REQUIREMENT_TRIGGER: {trigger_name}"
+            if trigger_version not in trigger.domain:
+                return f"REQUIREMENT_TRIGGER_OUTSIDE_DOMAIN: {trigger_name}@{trigger_version}"
+            provider = package_map.get(requirement.provider)
+            if provider is None:
+                return f"UNKNOWN_REQUIREMENT_PROVIDER: {requirement.provider}"
+            for version in requirement.allowed_versions:
+                if version not in provider.domain:
+                    return f"REQUIREMENT_VERSION_OUTSIDE_DOMAIN: {requirement.provider}@{version}"
+        return ""
+
     def assignment_issue(self, assignment: Mapping[str, str]) -> str:
         package_map = self.package_map()
         for name, package in package_map.items():
@@ -164,6 +214,14 @@ def solve_reference_exact(
     import time
 
     started = time.perf_counter()
+    model_issue = model.validation_issue()
+    if model_issue:
+        return ExactSolveResult(
+            backend="reference",
+            status="error",
+            detail=f"INVALID_MODEL: {model_issue}",
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+        )
     packages = tuple(sorted(model.packages, key=lambda package: package.name))
     domains: Sequence[Tuple[str, ...]] = [package.domain for package in packages]
     best_assignment: Optional[Dict[str, str]] = None

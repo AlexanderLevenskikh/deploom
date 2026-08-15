@@ -117,6 +117,22 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual("19.0.0", direct[("dependencies", "react")])
         self.assertEqual(">=18.0.0", direct[("peerDependencies", "react")])
 
+    def test_semver_prerelease_numeric_identifiers_compare_numerically(self) -> None:
+        nine = validator.parse_version("1.0.0-9")
+        ten = validator.parse_version("1.0.0-10")
+        numeric = validator.parse_version("1.0.0-1")
+        alpha = validator.parse_version("1.0.0-alpha")
+        stable = validator.parse_version("1.0.0")
+        self.assertIsNotNone(nine)
+        self.assertIsNotNone(ten)
+        self.assertIsNotNone(numeric)
+        self.assertIsNotNone(alpha)
+        self.assertIsNotNone(stable)
+        self.assertTrue(validator.version_lt(nine, ten))  # type: ignore[arg-type]
+        self.assertTrue(validator.version_lt(numeric, alpha))  # type: ignore[arg-type]
+        self.assertTrue(validator.version_gt(stable, alpha))  # type: ignore[arg-type]
+
+
     def test_scope_hash_and_manifest_validation(self) -> None:
         rows = [
             {"project":"Demo","group":2,"subgroup":"a","kind":"runtime","package":"foo","section":"dependencies","current":"1.0.0","target":"2.0.0","shouldUpdate":True,"requestedSpec":"^1.0.0"},

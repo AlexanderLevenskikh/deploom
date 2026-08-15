@@ -224,6 +224,29 @@ class PeerSolverModelTests(unittest.TestCase):
             self.assertEqual(reference.assignment, z3_result.assignment)
             self.assertEqual(reference.score, z3_result.score)
 
+    def test_invalid_empty_domain_is_reported_before_solver_backend(self):
+        model = PeerOptimizationModel(
+            packages=(PackageVariable("empty", "1", (), ()),),
+            objective_width=0,
+        )
+        reference = solve_reference_exact(model)
+        z3_result = solve_z3_exact(model)
+        self.assertEqual("error", reference.status)
+        self.assertIn("INVALID_MODEL: EMPTY_DOMAIN: empty", reference.detail)
+        self.assertEqual("error", z3_result.status)
+        self.assertIn("INVALID_MODEL: EMPTY_DOMAIN: empty", z3_result.detail)
+
+    def test_constraint_literal_outside_domain_is_diagnostic_not_keyerror(self):
+        model = PeerOptimizationModel(
+            packages=(PackageVariable("a", "1", ("1",), (("1", (0,)),)),),
+            constraints=(forbidden([("a", "2")], reason="invalid fixture"),),
+            objective_width=1,
+        )
+        result = solve_z3_exact(model)
+        self.assertEqual("error", result.status)
+        self.assertIn("CONSTRAINT_LITERAL_OUTSIDE_DOMAIN: a@2", result.detail)
+
+
     def test_shadow_result_is_non_authoritative_even_when_it_is_better(self):
         client = self.make_client()
         self.add_package(client, "a", {"1.0.0": {}, "2.0.0": {}})

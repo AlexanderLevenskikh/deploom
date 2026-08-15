@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -87,6 +88,59 @@ class ConstraintCacheTests(unittest.TestCase):
             output="ERR at dependency-flow-baseline-verify-xyz987/repo\npeer conflict",
         )
         self.assertEqual(a, b)
+
+    def test_retention_bound_is_per_project_not_global(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cache = root / "cache.json"
+            project_a = root / "a"
+            project_b = root / "b"
+            project_a.mkdir()
+            project_b.mkdir()
+
+            def proof(project: Path, literal: str) -> LearnedConstraintProof:
+                return LearnedConstraintProof(
+                    project_path=str(project.resolve()),
+                    environment_fingerprint="env",
+                    literals={literal: "2.0.0"},
+                    failure_signature=f"sig-{literal}",
+                    verified_count=2,
+                )
+
+            self.assertTrue(persist_verified_nogood(cache, proof(project_a, "a1"), max_entries=1))
+            self.assertTrue(persist_verified_nogood(cache, proof(project_b, "b1"), max_entries=1))
+            self.assertTrue(persist_verified_nogood(cache, proof(project_a, "a2"), max_entries=1))
+
+            self.assertEqual(
+                [{"a2": "2.0.0"}],
+                load_verified_nogoods(cache, project_path=project_a, environment_fingerprint="env"),
+            )
+            self.assertEqual(
+                [{"b1": "2.0.0"}],
+                load_verified_nogoods(cache, project_path=project_b, environment_fingerprint="env"),
+            )
+
+    def test_parallel_cache_writers_do_not_lose_proofs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cache = root / "cache.json"
+            project = root / "project"
+            project.mkdir()
+            proofs = [
+                LearnedConstraintProof(
+                    project_path=str(project.resolve()),
+                    environment_fingerprint="env",
+                    literals={f"p{index}": "2.0.0"},
+                    failure_signature=f"sig-{index}",
+                    verified_count=2,
+                )
+                for index in range(12)
+            ]
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                list(pool.map(lambda item: persist_verified_nogood(cache, item, max_entries=50), proofs))
+            payload = json.loads(cache.read_text(encoding="utf-8"))
+            self.assertEqual(12, len(payload["entries"]))
+
 
     def test_solve_and_verify_loads_matching_persistent_nogood_into_all_modes(self):
         with tempfile.TemporaryDirectory() as temp:

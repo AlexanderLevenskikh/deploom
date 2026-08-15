@@ -63,4 +63,23 @@ if ((main.match(/commandEnvironment\(/g) || []).length < 3) throw new Error('All
 for (const expected of ["'Проверка Node.js'", "`Проверка package manager (${manager})`", "'Проверка bundled Z3'"]) {
   if (!main.includes(expected)) throw new Error(`Cross-platform environment preflight missing: ${expected}`)
 }
+for (const expected of [
+  'function atomicWriteJsonSync(',
+  "mainWindow.webContents.on('will-navigate'",
+  'WORKSPACE_FOLDER_OUTSIDE_PARENT',
+  'refs/deploom/restart-backups/',
+  'RELEASE_CLEANUP_DIRTY_WORKTREE',
+  "child.stdin.on('error'",
+  "killer.on('error'",
+]) {
+  if (!main.includes(expected)) throw new Error(`Desktop durability/security hardening missing: ${expected}`)
+}
+for (const forbidden of [
+  'writeFileSync(statePath(), `${JSON.stringify(state, null, 2)}',
+  'writeFileSync(path, `${JSON.stringify(current, null, 2)}',
+  'writeFileSync(path, `${JSON.stringify(state, null, 2)}',
+]) {
+  if (main.includes(forbidden)) throw new Error(`Non-atomic desktop/team state write returned: ${forbidden}`)
+}
+
 console.log('Cross-platform desktop runtime/package contracts OK')

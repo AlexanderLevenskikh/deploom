@@ -43,7 +43,7 @@ import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } fro
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
 import { randomUUID } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { basename, delimiter, dirname, join, normalize, resolve } from 'node:path'
+import { basename, delimiter, dirname, join, normalize, resolve, isAbsolute, relative, sep } from 'node:path'
 import { createServer as createNetServer } from 'node:net'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -250,6 +250,24 @@ function statePath(): string {
   return join(app.getPath('userData'), 'dependency-flow-state.json')
 }
 
+type JsonReplacer = (this: unknown, key: string, value: unknown) => unknown
+
+function atomicWriteJsonSync(path: string, value: unknown, replacer?: JsonReplacer): void {
+  mkdirSync(dirname(path), { recursive: true })
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    const serialized = replacer
+      ? JSON.stringify(value, replacer, 2)
+      : JSON.stringify(value, null, 2)
+    writeFileSync(temporary, `${serialized}\n`, 'utf8')
+    renameSync(temporary, path)
+  } finally {
+    if (existsSync(temporary)) {
+      try { rmSync(temporary, { force: true }) } catch { /* old destination remains intact */ }
+    }
+  }
+}
+
 function updateErrorStatus(error: unknown): UpdateStatus {
   const raw = error instanceof Error ? error.message : String(error)
   console.error('[updater]', raw)
@@ -272,8 +290,7 @@ function loadState(): DesktopState {
 }
 
 function saveState(state: DesktopState): void {
-  mkdirSync(dirname(statePath()), { recursive: true })
-  writeFileSync(statePath(), `${JSON.stringify(state, null, 2)}\n`, 'utf8')
+  atomicWriteJsonSync(statePath(), state)
 }
 
 function notificationsEnabled(state = loadState()): boolean {
@@ -506,8 +523,7 @@ function updateTeamState(job: JobRecord, status: 'running' | 'passed' | 'failed'
       ? { bestEffortRelease: { target: job.target || 'yellow', current: job.bestEffortCurrentLevel || 'unknown', reason: job.bestEffortReason, updatedAt: current.updatedAt, ...(bestEffortHandoffPath ? { handoffPath: bestEffortHandoffPath } : {}) } }
       : job.action !== 'baseline' && previous?.bestEffortRelease ? { bestEffortRelease: previous.bestEffortRelease } : {}),
   }
-  mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, `${JSON.stringify(current, null, 2)}\n`, 'utf8')
+  atomicWriteJsonSync(path, current)
 }
 
 async function persistRecoveryIssue(job: JobRecord, message: string): Promise<FlowRecoveryIssue | undefined> {
@@ -528,8 +544,7 @@ async function persistRecoveryIssue(job: JobRecord, message: string): Promise<Fl
   state.updatedAt = issue.updatedAt
   state.projects[job.projectName] = { ...run, recovery: issue }
   const path = teamStatePath(job.workspace)
-  mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, 'utf8')
+  atomicWriteJsonSync(path, state)
   return issue
 }
 
@@ -581,7 +596,8 @@ function killProcessTree(child: ChildProcessWithoutNullStreams): void {
   const pid = child.pid
   if (!pid) return
   if (process.platform === 'win32') {
-    spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { windowsHide: true })
+    const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { windowsHide: true })
+    killer.on('error', () => {})
     return
   }
   try { process.kill(-pid, 'SIGTERM') } catch { try { child.kill('SIGTERM') } catch { /* already gone */ } }
@@ -816,8 +832,7 @@ function reconcileTeamState(workspace: WorkspaceRecord, project: ProjectSpec | u
       state.updatedAt = updatedAt
       state.projects[project.name] = run
       const path = teamStatePath(workspace)
-      mkdirSync(dirname(path), { recursive: true })
-      writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, 'utf8')
+      atomicWriteJsonSync(path, state)
     }
   }
 
@@ -837,8 +852,7 @@ function reconcileTeamState(workspace: WorkspaceRecord, project: ProjectSpec | u
       updatedAt,
     }
     const path = teamStatePath(workspace)
-    mkdirSync(dirname(path), { recursive: true })
-    writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, 'utf8')
+    atomicWriteJsonSync(path, state)
     return state
   }
 
@@ -857,8 +871,7 @@ function reconcileTeamState(workspace: WorkspaceRecord, project: ProjectSpec | u
     completedActions: reconciledActions,
   }
   const path = teamStatePath(workspace)
-  mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, 'utf8')
+  atomicWriteJsonSync(path, state)
   return state
 }
 
@@ -1657,6 +1670,13 @@ async function migrationBranchCleanupCommands(project: ProjectSpec, plan: Migrat
     args: ['-c', hooksArg, '-C', project.path, 'worktree', 'prune', '--expire', 'now'],
   })
   for (const branch of existing.filter((value): value is string => Boolean(value))) {
+    const backupRef = `refs/deploom/restart-backups/${Date.now()}/${branch}`
+    commands.push({
+      label: `Safety backup ????? ${branch} ????? restart`,
+      command: 'git',
+      cwd: project.path,
+      args: ['-c', hooksArg, '-C', project.path, 'update-ref', backupRef, `refs/heads/${branch}`],
+    })
     commands.push({
       label: `Удаление ветки ${branch} из предыдущей попытки`,
       command: 'git',
@@ -1686,6 +1706,24 @@ async function cleanupToolManagedProjectWorktreesAfterRelease(job: JobRecord, pr
 
   for (const path of paths) {
     if (existsSync(path)) {
+      const status = await spawnCapture('git', ['-C', path, 'status', '--porcelain=v1', '--untracked-files=all'], path, 30_000)
+      if (status.code !== 0) {
+        send('flow:job-output', {
+          jobId: job.id,
+          stream: 'system',
+          line: `RELEASE_CLEANUP_STATUS_UNKNOWN: ????????? worktree ${path} ????????, ?????? ??? ?? ??????? ???????? ??? ???????: ${status.stderr.trim() || `exit ${status.code}`}`,
+        })
+        continue
+      }
+      const dirty = relevantGitStatus(status.stdout)
+      if (dirty) {
+        send('flow:job-output', {
+          jobId: job.id,
+          stream: 'system',
+          line: `RELEASE_CLEANUP_DIRTY_WORKTREE: ${path} ???????? ??????????????? ????????? ? ?? ????? force-??????. ${dirty.slice(-1200)}`,
+        })
+        continue
+      }
       const removed = await spawnCapture('git', ['-c', `core.hooksPath=${emptyHooksPath()}`, '-C', project.path, 'worktree', 'remove', '--force', path], project.path, 60_000)
       if (removed.code !== 0 && existsSync(path)) {
         // This directory is inside DepLoom's own temp root, therefore
@@ -1718,8 +1756,7 @@ function clearAgentSessionState(workspace: WorkspaceRecord, projectName: string)
   state.projects[projectName] = rest
   state.updatedAt = new Date().toISOString()
   const path = teamStatePath(workspace)
-  mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, 'utf8')
+  atomicWriteJsonSync(path, state)
 }
 
 function forgetProjectPromptState(workspace: WorkspaceRecord, projectName: string, expectedPromptPath?: string): void {
@@ -1790,8 +1827,7 @@ function clearAgentBranchSessionState(workspace: WorkspaceRecord, projectName: s
   }
   state.updatedAt = new Date().toISOString()
   const path = teamStatePath(workspace)
-  mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, `${JSON.stringify(state, (_key, value) => value === undefined ? undefined : value, 2)}\n`, 'utf8')
+  atomicWriteJsonSync(path, state, (_key, value) => value === undefined ? undefined : value)
 }
 
 function completedAgentBatch(workspace: WorkspaceRecord, projectName: string, fingerprint: string): boolean {
@@ -1807,8 +1843,7 @@ function markAgentBatchCompleted(workspace: WorkspaceRecord, projectName: string
   state.projects[projectName] = { ...run, completedAgentBatchFingerprints: completed }
   state.updatedAt = new Date().toISOString()
   const path = teamStatePath(workspace)
-  mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, 'utf8')
+  atomicWriteJsonSync(path, state)
 }
 
 function markMigrationBranchCompleted(workspace: WorkspaceRecord, projectName: string, branchName: string): void {
@@ -1819,8 +1854,7 @@ function markMigrationBranchCompleted(workspace: WorkspaceRecord, projectName: s
   state.projects[projectName] = { ...run, completedMigrationBranches: completed }
   state.updatedAt = new Date().toISOString()
   const path = teamStatePath(workspace)
-  mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, 'utf8')
+  atomicWriteJsonSync(path, state)
 }
 
 function promptRoadmapFactsPath(prompt: string): string | undefined {
@@ -4156,8 +4190,7 @@ function markReleaseRecovered(workspace: WorkspaceRecord, projectName: string, t
     recovery: undefined,
   }
   const path = teamStatePath(workspace)
-  mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, `${JSON.stringify(state, (_key, value) => value === undefined ? undefined : value, 2)}\n`, 'utf8')
+  atomicWriteJsonSync(path, state, (_key, value) => value === undefined ? undefined : value)
 }
 
 async function handoffPreparedReleaseToMigrationRepair(
@@ -4574,6 +4607,15 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
       }
     })
     child.on('close', (result) => finish(timedOut ? 124 : (result ?? 1)))
+    child.stdin.on('error', (error) => {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'EPIPE' || code === 'ERR_STREAM_DESTROYED') return
+      send('flow:job-output', {
+        jobId: job.id,
+        stream: 'stderr',
+        line: `[warn] ${spec.label}: stdin stream error ignored after child launch: ${error.message}`,
+      })
+    })
     if (spec.stdin) child.stdin.end(spec.stdin)
     else child.stdin.end()
   })
@@ -4585,11 +4627,11 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
 }
 
 async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void> {
-  updateTeamState(job, 'running')
   let exitCode = 0
   let errorMessage = ''
   let teamStateFinalized = false
   try {
+    updateTeamState(job, 'running')
     if (job.bestEffortReason) {
       send('flow:job-output', { jobId: job.id, stream: 'system', line: `Best-effort release: целевой health-level пока не достигнут, но исполнимый migration plan исчерпан. ${job.bestEffortReason}. Финальные project gates и repository hooks НЕ ослабляются.` })
     }
@@ -4804,7 +4846,16 @@ function setupIpc(): void {
   // complete local workspace itself and no external template repository is
   // required.
   ipcMain.handle('flow:clone-workspace', async (_event, raw: { parentPath: string; folderName: string; teamRemote?: string; templateRemote?: string }) => {
-    const target = resolve(raw.parentPath, raw.folderName.trim())
+    const parent = resolve(raw.parentPath)
+    const folderName = raw.folderName.trim()
+    if (!folderName || isAbsolute(folderName)) {
+      throw new Error(`WORKSPACE_FOLDER_OUTSIDE_PARENT: invalid folder name ${JSON.stringify(folderName)}`)
+    }
+    const target = resolve(parent, folderName)
+    const relativeTarget = relative(parent, target)
+    if (!relativeTarget || relativeTarget === '..' || relativeTarget.startsWith(`..${sep}`) || isAbsolute(relativeTarget)) {
+      throw new Error(`WORKSPACE_FOLDER_OUTSIDE_PARENT: ${target} is outside ${parent}`)
+    }
     if (existsSync(target)) throw new Error(`Папка уже существует: ${target}`)
     const templateRemote = String(raw.templateRemote || '').trim()
     try {
@@ -5153,6 +5204,19 @@ async function createWindow(): Promise<void> {
       nodeIntegration: false,
       sandbox: true,
     },
+  })
+  const devServerOrigin = (() => {
+    if (!process.env.VITE_DEV_SERVER_URL) return ''
+    try { return new URL(process.env.VITE_DEV_SERVER_URL).origin } catch { return '' }
+  })()
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (devServerOrigin) {
+      try {
+        if (new URL(url).origin === devServerOrigin) return
+      } catch { /* malformed navigation is denied below */ }
+    }
+    event.preventDefault()
+    if (/^https?:/i.test(url)) void shell.openExternal(url)
   })
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/i.test(url)) void shell.openExternal(url)

@@ -20,6 +20,14 @@ def solve_z3_exact(
     silently fall back to the heuristic solver when Z3 is authoritative.
     """
     started = time.perf_counter()
+    model_issue = model.validation_issue()
+    if model_issue:
+        return ExactSolveResult(
+            backend="z3",
+            status="error",
+            detail=f"INVALID_MODEL: {model_issue}",
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+        )
     try:
         import z3  # type: ignore
     except Exception as exc:  # pragma: no cover - environment-dependent

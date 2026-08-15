@@ -6785,7 +6785,23 @@ class BaselineLocalizationCheckpointStore:
             return {"schemaVersion": 1, "entries": {}}
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except json.JSONDecodeError as exc:
+            # Atomic writes mean malformed JSON should be rare. Preserve the
+            # evidence instead of silently erasing a potentially multi-hour run.
+            stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            corrupt = self.path.with_name(f"{self.path.name}.corrupt-{stamp}-{os.getpid()}")
+            try:
+                os.replace(self.path, corrupt)
+                eprint(
+                    f"[warn] Baseline localization checkpoint is corrupt and was preserved as {corrupt}: {exc}"
+                )
+            except OSError as preserve_error:
+                eprint(
+                    f"[warn] Baseline localization checkpoint is corrupt and could not be preserved: "
+                    f"{self.path}: {exc}; preserveError={preserve_error}"
+                )
+            return {"schemaVersion": 1, "entries": {}}
+        except OSError:
             return {"schemaVersion": 1, "entries": {}}
         if not isinstance(payload, dict) or int(payload.get("schemaVersion") or 0) != 1:
             return {"schemaVersion": 1, "entries": {}}
@@ -8001,7 +8017,9 @@ def write_baseline_snapshot(baselines_dir: Path, snapshot: Dict[str, Any]) -> Pa
     captured_at = str(snapshot["capturedAt"])
     out = baseline_snapshot_path(baselines_dir, project, captured_at)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = out.with_suffix(out.suffix + ".tmp")
+    temporary.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, out)
     return out
 
 
@@ -8203,7 +8221,9 @@ def write_history_snapshot(history_dir: Path, snapshot: Dict[str, Any]) -> Path:
     snapshots_dir.mkdir(parents=True, exist_ok=True)
     safe_time = str(snapshot.get("capturedAt") or dt.datetime.now(dt.timezone.utc).isoformat()).replace(":", "-").replace(".", "-")
     path = snapshots_dir / f"{safe_time}.json"
-    path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
     return path
 
 
