@@ -163,7 +163,7 @@ export function useDependencyFlow() {
   useEffect(() => {
     if (!api) return
     const removeOutput = api.onJobOutput((event) => {
-      setLogs((current) => [...current.slice(-999), event])
+      setLogs((current) => [...current.slice(-999), { ...event, receivedAt: Date.now() }])
     })
     const removeMigrationProgress = api.onMigrationProgressChanged((event) => {
       if (event.workspaceId === selectedWorkspaceId && event.projectName === selectedProjectName) void refresh()

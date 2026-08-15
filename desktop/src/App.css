@@ -126,6 +126,17 @@
 .run-monitor-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
 .run-monitor-heading > div { display: flex; align-items: center; gap: 7px; min-width: 0; font-size: 11px; }
 .run-monitor-phase { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--blue); font-size: 10px; font-weight: 600; }
+.run-monitor-health { min-height: 28px; display: flex; align-items: center; gap: 7px; padding: 5px 8px; border-radius: 5px; background: var(--surface); color: var(--muted); font-size: 9px; }
+.run-monitor-health-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px var(--green-soft); }
+.run-monitor-health.healthy { color: #246c3a; background: var(--green-soft); }
+.run-monitor-health.quiet { color: var(--muted); }
+.run-monitor-health.warning { color: #78500a; background: var(--amber-soft); }
+.run-monitor-health.stale { color: #8f1f24; background: var(--red-soft); }
+.run-monitor-summary { padding: 7px 8px; border-left: 3px solid var(--blue); background: var(--blue-soft); color: #385a87; font-size: 9px; line-height: 1.45; }
+.run-monitor-localization { display: grid; gap: 5px; }
+.run-monitor-shrink { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; color: var(--blue); font-size: 11px; font-weight: 700; }
+.run-monitor-shrink span { padding: 2px 5px; border: 1px solid #b9d2f7; border-radius: 4px; background: #fff; }
+.run-monitor-localization small { color: var(--muted); font-size: 8px; line-height: 1.35; }
 .run-monitor-progress { display: grid; gap: 5px; }
 .run-monitor-progress-copy { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 9px; }
 .run-monitor-progress-copy b { color: var(--text); }

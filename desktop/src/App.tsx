@@ -81,7 +81,7 @@ function App() {
           {tab === 'dashboard' ? <DashboardWorkspace details={details} onRefresh={flow.refresh} onOpenExternal={() => flow.openPath(details.dashboardPath)} /> : null}
         </main>
 
-        <LogPanel logs={flow.logs} knownSources={knownLogSources} environment={payload.environment} active={Boolean(flow.activeJobId)} activeJobId={flow.activeJobId} onSendAgentNote={flow.sendAgentNote} onCancel={() => void flow.cancelJob()} onClear={flow.clearLogs} />
+        <LogPanel logs={flow.logs} knownSources={knownLogSources} environment={payload.environment} active={Boolean(flow.activeJobId)} activeJobId={flow.activeJobId} activeAction={flow.activeAction} migrationProgress={details.migrationProgress} onSendAgentNote={flow.sendAgentNote} onCancel={() => void flow.cancelJob()} onClear={flow.clearLogs} />
       </div>
 
       {showAddProject ? <AddProjectDialog workspaceId={details.workspace.id} onClose={() => setShowAddProject(false)} onPickDirectory={flow.pickDirectory} onSubmit={flow.addProject} /> : null}

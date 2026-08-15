@@ -2,7 +2,7 @@ import { AlertCircle, AlertTriangle, Ban, Check, Copy, Download, MessageSquare, 
 import { useEffect, useMemo, useRef, useState, type UIEvent } from 'react'
 import { latestJobId, mergeLogSources, presentLogs, summarizeTokenUsage, type PresentedLog } from '../data/logPresentation'
 import { useLanguage } from '../i18n'
-import type { EnvironmentInfo, JobOutput, JobOutputSource } from '../types'
+import type { EnvironmentInfo, FlowAction, JobOutput, JobOutputSource, MigrationProgress } from '../types'
 import { RunMonitor } from './RunMonitor'
 
 type Props = {
@@ -11,6 +11,8 @@ type Props = {
   environment: EnvironmentInfo
   active: boolean
   activeJobId?: string
+  activeAction?: FlowAction
+  migrationProgress?: MigrationProgress
   onSendAgentNote: (note: string, branch?: string) => Promise<boolean>
   onCancel: () => void
   onClear: () => void
@@ -33,7 +35,7 @@ function ActivityIcon({ kind }: { kind: PresentedLog['kind'] }) {
   return <TerminalSquare size={15} />
 }
 
-export function LogPanel({ logs, knownSources = [], environment, active, activeJobId, onSendAgentNote, onCancel, onClear }: Props) {
+export function LogPanel({ logs, knownSources = [], environment, active, activeJobId, activeAction, migrationProgress, onSendAgentNote, onCancel, onClear }: Props) {
   const { text } = useLanguage()
   const [view, setView] = useState<LogView>('activity')
   const [selectedSource, setSelectedSource] = useState('all')
@@ -112,7 +114,7 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
           <button className="icon-button" title={text('Очистить лог', 'Clear log')} onClick={onClear}><RotateCcw size={16} /></button>
         </div>
       </div>
-      <RunMonitor logs={logs} active={active} jobId={activeJobId} />
+      <RunMonitor logs={logs} active={active} jobId={activeJobId} action={activeAction} migrationProgress={migrationProgress} />
       <div className="log-controls"><div className="log-tabs" role="tablist" aria-label="Представление лога">
         <button role="tab" aria-selected={view === 'activity'} className={view === 'activity' ? 'active' : ''} onClick={() => setView('activity')}>{text('Ход', 'Activity')}</button>
         <button role="tab" aria-selected={view === 'raw'} className={view === 'raw' ? 'active' : ''} onClick={() => setView('raw')}>Raw</button>

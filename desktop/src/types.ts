@@ -187,7 +187,7 @@ export type ActionInput = {
 }
 
 export type JobOutputSource = { kind: 'group' | 'planner'; id: string; label: string }
-export type JobOutput = { jobId: string; stream: 'system' | 'stdout' | 'stderr'; line: string; workspaceId?: string; projectName?: string; source?: JobOutputSource }
+export type JobOutput = { jobId: string; stream: 'system' | 'stdout' | 'stderr'; line: string; workspaceId?: string; projectName?: string; source?: JobOutputSource; receivedAt?: number }
 export type JobFinished = { jobId: string; action: FlowAction; workspaceId?: string; projectName?: string; exitCode: number; error?: string }
 export type DownloadSaved = { path: string; filename: string; workspaceId?: string; projectName?: string; recalculate?: boolean; recalculateProjects?: string[] }
 export type UpdateStatus = { state: 'idle' | 'checking' | 'available' | 'downloading' | 'current' | 'ready' | 'error'; version?: string; percent?: number; message?: string; authRequired?: boolean }
