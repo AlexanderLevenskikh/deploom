@@ -1,4 +1,4 @@
-﻿import { readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import ts from "typescript";
 
 const source = await readFile(new URL("../src/data/logPresentation.ts", import.meta.url), "utf8");
@@ -9,10 +9,10 @@ const flowSource = await readFile(new URL("../src/components/FlowWorkspace.tsx",
 const failureModalSource = await readFile(new URL("../src/components/BranchFailureModal.tsx", import.meta.url), "utf8");
 const mainSource = await readFile(new URL("../electron/main.ts", import.meta.url), "utf8");
 if (!mainSource.includes("stallWarningMs: 2 * 60_000") || !mainSource.includes("stallAbortMs: 15 * 60_000")) throw new Error("Baseline/generate commands must expose silence watchdog thresholds");
-if (!mainSource.includes("HARD_STALL") || !mainSource.includes("РјРµС‚РєР° РІРѕР·РјРѕР¶РЅРѕРіРѕ Р·Р°РІРёСЃР°РЅРёСЏ")) throw new Error("Long deterministic jobs must surface visible stall markers");
-if (!mainSource.includes("deterministicWatchdogFailure") || !mainSource.includes("РїРѕР»РЅС‹Р№ Baseline Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё РїРѕРІС‚РѕСЂРЅРѕ РЅРµ Р·Р°РїСѓСЃРєР°СЋ")) throw new Error("A watchdog stop must not trigger three identical full Baseline retries");
+if (!mainSource.includes("HARD_STALL") || !mainSource.includes("метка возможного зависания")) throw new Error("Long deterministic jobs must surface visible stall markers");
+if (!mainSource.includes("deterministicWatchdogFailure") || !mainSource.includes("полный Baseline автоматически повторно не запускаю")) throw new Error("A watchdog stop must not trigger three identical full Baseline retries");
 if (!appSource.includes("for (const branch of details.migrationProgress?.branches ?? []) sessionBranches.add(branch.branch)")) throw new Error("Every planned migration group must appear before its first log/session");
-if (!flowSource.includes("migration-error-indicator") || !flowSource.includes("РћР¶РёРґР°РµС‚ Supervisor") || !failureModalSource.includes("РђРІС‚РѕРїРёР»РѕС‚ РёСЃРїСЂР°РІРёС‚") || !failureModalSource.includes("РўСЂРµР±СѓРµС‚СЃСЏ РІРјРµС€Р°С‚РµР»СЊСЃС‚РІРѕ")) throw new Error("Failed groups must expose warning/error reasons without implying user intervention");
+if (!flowSource.includes("migration-error-indicator") || !flowSource.includes("Ожидает Supervisor") || !failureModalSource.includes("Автопилот исправит") || !failureModalSource.includes("Требуется вмешательство")) throw new Error("Failed groups must expose warning/error reasons without implying user intervention");
 if (!panelSource.includes("followLogRef.current") || !panelSource.includes("scrollHeight - element.scrollTop - element.clientHeight <= 48")) throw new Error("Log panel must preserve manual scroll position while new entries arrive");
 if (panelSource.includes("scrollIntoView({ block: 'end' })")) throw new Error("Unconditional log autoscroll must not return");
 if (!panelSource.includes("<RunMonitor") || !appSource.includes("language-switch")) throw new Error("Run monitor / language switch is missing");
@@ -23,13 +23,13 @@ if (sources.length !== 1 || sources[0][0] !== "group:queued-1") throw new Error(
 const sample = [
   { jobId: "agent", stream: "stdout", line: '{"type":"step_start","sessionID":"secret"}\n' },
   { jobId: "agent", stream: "stdout", line: '{"type":"tool_use","part":{"type":"tool","tool":"glob","state":{"status":"completed","input":{"pattern":"docs/**"},"output":"No files found"}}}\n' },
-  { jobId: "agent", stream: "stdout", line: '{"type":"text","part":{"type":"text","text":"РџСЂРѕРІРµСЂСЏСЋ РґРѕРєСѓРјРµРЅС‚Р°С†РёСЋ."}}\n' },
+  { jobId: "agent", stream: "stdout", line: '{"type":"text","part":{"type":"text","text":"Проверяю документацию."}}\n' },
   { jobId: "agent", stream: "stdout", line: '{"type":"step_finish","part":{"type":"step-finish","tokens":{"total":19856,"input":19793,"output":63,"reasoning":0},"cost":0.12}}\n' },
 ];
 const presented = module.presentLogs(sample);
 if (presented.length !== 2) throw new Error(`Expected two human-friendly entries, got ${presented.length}`);
-if (presented[0].title !== "РС‰Сѓ С„Р°Р№Р»С‹" || presented[0].body !== "docs/**" || presented[0].detail !== "РќРёС‡РµРіРѕ РЅРµ РЅР°Р№РґРµРЅРѕ") throw new Error("Tool event was not summarized");
-if (presented[1].title !== "РђРіРµРЅС‚" || presented[1].body !== "РџСЂРѕРІРµСЂСЏСЋ РґРѕРєСѓРјРµРЅС‚Р°С†РёСЋ.") throw new Error("Agent text was not presented as a message");
+if (presented[0].title !== "Ищу файлы" || presented[0].body !== "docs/**" || presented[0].detail !== "Ничего не найдено") throw new Error("Tool event was not summarized");
+if (presented[1].title !== "Агент" || presented[1].body !== "Проверяю документацию.") throw new Error("Agent text was not presented as a message");
 if (JSON.stringify(presented).includes("sessionID") || JSON.stringify(presented).includes("19856")) throw new Error("Service telemetry leaked into activity view");
 const severity = module.presentLogs([
   { jobId: "generator", stream: "stderr", line: "[info] [1/1] checkout-form: loading registry metadata\n" },
@@ -37,7 +37,7 @@ const severity = module.presentLogs([
   { jobId: "generator", stream: "stderr", line: "[error] registry unavailable\n" },
 ]);
 if (severity.map((entry) => entry.kind).join(",") !== "raw,warning,error") throw new Error(`Generator stderr severity is wrong: ${JSON.stringify(severity)}`);
-if (severity[0].title !== "РҐРѕРґ РІС‹РїРѕР»РЅРµРЅРёСЏ" || severity[1].title !== "РџСЂРµРґСѓРїСЂРµР¶РґРµРЅРёРµ") throw new Error("Generator severity titles are wrong");
+if (severity[0].title !== "Ход выполнения" || severity[1].title !== "Предупреждение") throw new Error("Generator severity titles are wrong");
 
 const compactActivity = module.presentLogs([
   { jobId: "baseline", stream: "system", line: "demo-app: Baseline localization yellow heartbeat; elapsedSeconds=3667.6, checksStarted=10, maxChecks=24, currentUnits=2, wave=subsets/2, active=2, completed=0" },
@@ -61,15 +61,15 @@ if (monitor.localization?.activeChecks !== 2 || monitor.localization?.completedC
 if (monitor.localization?.shrinkHistory.join(",") !== "19,10,5") throw new Error(`Localization shrink history is wrong: ${JSON.stringify(monitor.localization)}`);
 
 const conversation = module.presentLogs([
-  { jobId: "agent", stream: "system", line: "Р’С‹ в†’ Р°РіРµРЅС‚: РџСЂРѕРІРµСЂСЊ РµС‰С‘ Storybook" },
-  { jobId: "agent", stream: "stdout", line: '{"type":"text","part":{"type":"text","text":"РџСЂРѕРІРµСЂСЏСЋ Storybook."}}\n' },
+  { jobId: "agent", stream: "system", line: "Вы → агент: Проверь ещё Storybook" },
+  { jobId: "agent", stream: "stdout", line: '{"type":"text","part":{"type":"text","text":"Проверяю Storybook."}}\n' },
 ]);
-if (conversation.length !== 2 || conversation[0].kind !== "user" || conversation[0].title !== "Р’С‹" || conversation[0].body !== "РџСЂРѕРІРµСЂСЊ РµС‰С‘ Storybook") throw new Error(`User chat message was not presented separately: ${JSON.stringify(conversation)}`);
-if (conversation[1].kind !== "message" || conversation[1].title !== "РђРіРµРЅС‚") throw new Error(`Agent reply did not remain a chat message: ${JSON.stringify(conversation)}`);
-const groupSource = { kind: 'group', id: 'libs-group-2', label: 'Р“СЂСѓРїРїР° 2' };
-const sourced = module.presentLogs([{ jobId: 'worker::group::libs-group-2', stream: 'stdout', source: groupSource, line: '{"type":"text","part":{"type":"text","text":"Р Р°Р±РѕС‚Р°СЋ."}}\n' }]);
+if (conversation.length !== 2 || conversation[0].kind !== "user" || conversation[0].title !== "Вы" || conversation[0].body !== "Проверь ещё Storybook") throw new Error(`User chat message was not presented separately: ${JSON.stringify(conversation)}`);
+if (conversation[1].kind !== "message" || conversation[1].title !== "Агент") throw new Error(`Agent reply did not remain a chat message: ${JSON.stringify(conversation)}`);
+const groupSource = { kind: 'group', id: 'libs-group-2', label: 'Группа 2' };
+const sourced = module.presentLogs([{ jobId: 'worker::group::libs-group-2', stream: 'stdout', source: groupSource, line: '{"type":"text","part":{"type":"text","text":"Работаю."}}\n' }]);
 if (sourced[0]?.source?.id !== groupSource.id) throw new Error(`Group source metadata was lost in presentation: ${JSON.stringify(sourced)}`);
-for (const required of ['Р’СЃРµ СЃРѕРѕР±С‰РµРЅРёСЏ', 'РЎРёСЃС‚РµРјР° / РѕСЂРєРµСЃС‚СЂР°С‚РѕСЂ', 'onSendAgentNote(message, addressedGroup.id)', 'sourceLabel(entry.source)']) if (!panelSource.includes(required)) throw new Error(`Session-filtered chat contract missing: ${required}`);
+for (const required of ['Все сообщения', 'Система / оркестратор', 'onSendAgentNote(message, addressedGroup.id)', 'sourceLabel(entry.source)']) if (!panelSource.includes(required)) throw new Error(`Session-filtered chat contract missing: ${required}`);
 
 const usage = module.summarizeTokenUsage(sample);
 if (usage.total !== 19856 || usage.input !== 19793 || usage.output !== 63 || usage.cost !== 0.12) throw new Error(`Token usage was not summarized: ${JSON.stringify(usage)}`);
@@ -91,24 +91,24 @@ if (cacheUsage.total !== cacheUsage.input + cacheUsage.output + cacheUsage.reaso
 if (cacheUsage.total !== 64450) throw new Error(`Total must match the provider's own per-step total when cache is included: ${JSON.stringify(cacheUsage)}`);
 
 const latest = module.latestJobId([
-  { jobId: "system", stream: "system", line: "Р—Р°РїСѓСЃРє: agent" },
+  { jobId: "system", stream: "system", line: "Запуск: agent" },
   { jobId: "job-1", stream: "stdout", line: "..." },
-  { jobId: "download", stream: "system", line: "РЎРѕС…СЂР°РЅРµРЅРѕ: ..." },
+  { jobId: "download", stream: "system", line: "Сохранено: ..." },
   { jobId: "job-2", stream: "stdout", line: "..." },
 ]);
 if (latest !== "job-2") throw new Error(`latestJobId must skip system/download markers and pick the real last job: ${latest}`);
 
 const claudeSample = [
   { jobId: "agent", stream: "stdout", line: '{"type":"system","subtype":"init","session_id":"sid"}\n' },
-  { jobId: "agent", stream: "stdout", line: '{"type":"assistant","message":{"content":[{"type":"text","text":"РџСЂРѕРІРµСЂСЏСЋ Р·Р°РІРёСЃРёРјРѕСЃС‚Рё."}]}}\n' },
+  { jobId: "agent", stream: "stdout", line: '{"type":"assistant","message":{"content":[{"type":"text","text":"Проверяю зависимости."}]}}\n' },
   { jobId: "agent", stream: "stdout", line: '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"npm test"}}]}}\n' },
-  { jobId: "agent", stream: "stdout", line: '{"type":"result","subtype":"success","is_error":false,"result":"Р“РѕС‚РѕРІРѕ.","usage":{"input_tokens":100,"output_tokens":40,"cache_read_input_tokens":500,"cache_creation_input_tokens":20},"total_cost_usd":0.05}\n' },
+  { jobId: "agent", stream: "stdout", line: '{"type":"result","subtype":"success","is_error":false,"result":"Готово.","usage":{"input_tokens":100,"output_tokens":40,"cache_read_input_tokens":500,"cache_creation_input_tokens":20},"total_cost_usd":0.05}\n' },
 ];
 const claudePresented = module.presentLogs(claudeSample);
 if (claudePresented.length !== 3) throw new Error(`Expected three human-friendly Claude entries, got ${claudePresented.length}`);
-if (claudePresented[0].title !== "РђРіРµРЅС‚" || claudePresented[0].body !== "РџСЂРѕРІРµСЂСЏСЋ Р·Р°РІРёСЃРёРјРѕСЃС‚Рё.") throw new Error("Claude assistant text was not presented as a message");
+if (claudePresented[0].title !== "Агент" || claudePresented[0].body !== "Проверяю зависимости.") throw new Error("Claude assistant text was not presented as a message");
 if (claudePresented[1].body !== "npm test") throw new Error("Claude tool_use was not summarized");
-if (claudePresented[2].kind !== "message" || claudePresented[2].body !== "Р“РѕС‚РѕРІРѕ.") throw new Error("Claude result event was not presented");
+if (claudePresented[2].kind !== "message" || claudePresented[2].body !== "Готово.") throw new Error("Claude result event was not presented");
 if (JSON.stringify(claudePresented).includes("sid")) throw new Error("Claude session id leaked into activity view");
 const claudeUsage = module.summarizeTokenUsage(claudeSample);
 if (claudeUsage.input !== 100 || claudeUsage.output !== 40 || claudeUsage.cost !== 0.05) throw new Error(`Claude token usage was not summarized: ${JSON.stringify(claudeUsage)}`);
@@ -121,7 +121,7 @@ if (claudeUsage.total !== 660) throw new Error(`Claude total must include cache,
 const failedReadActivity = module.presentLogs([
   { jobId: "planner", stream: "stdout", line: '{"type":"tool_use","part":{"type":"tool","tool":"read","state":{"status":"failed","input":{"path":"C:/Temp/.dependency-flow-planner-result.json"}}}}\n' },
 ]);
-if (failedReadActivity.length !== 1 || failedReadActivity[0].kind !== "tool" || failedReadActivity[0].title !== "Р§РёС‚Р°СЋ С„Р°Р№Р»") throw new Error(`Informational read activity turned red: ${JSON.stringify(failedReadActivity)}`);
+if (failedReadActivity.length !== 1 || failedReadActivity[0].kind !== "tool" || failedReadActivity[0].title !== "Читаю файл") throw new Error(`Informational read activity turned red: ${JSON.stringify(failedReadActivity)}`);
 
 // Real, routine stderr noise from tools the orchestrator shells out to
 // (git's own CRLF warning, a plain progress line) must not read as a failed

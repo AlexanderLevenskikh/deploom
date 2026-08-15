@@ -7,7 +7,7 @@ import json
 import re
 
 ROOT = Path(__file__).resolve().parents[1]
-SKIP_DIRS = {'.git', 'node_modules', 'dist', 'dist-electron', 'release', '__pycache__', '.cache', '.npm'}
+SKIP_DIRS = {'.git', '.idea', '.vs', 'node_modules', 'dist', 'dist-electron', 'release', '__pycache__', '.cache', '.npm'}
 TEXT_EXT = {'.py', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.json', '.jsonc', '.md', '.yml', '.yaml', '.ps1', '.sh', '.txt', '.toml', '.ini', '.cfg', '.html', '.css', '.xml', '.properties', ''}
 
 # Opaque hashes of organization/project identifiers removed during the private -> public
