@@ -2,7 +2,7 @@ appId: io.github.frontenddepsflow.app
 productName: Dependency Flow
 directories:
   output: release
-electronDist: node_modules/electron/dist
+
 files:
   - dist/**/*
   - dist-electron/**/*
