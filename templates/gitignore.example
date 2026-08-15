@@ -1,0 +1,18 @@
+# Python/cache/local environment
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Generated roadmap reports: rebuild anytime from settings.json
+artifacts/*
+!artifacts/.gitkeep
+
+# Keep the migration history: this is the process memory.
+# Do NOT ignore .dependency-update-history/ if you want to commit state after each migration.
+
+# Optional local scratch
+*.tmp
+*.bak
+.DS_Store

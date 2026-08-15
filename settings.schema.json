@@ -1,0 +1,1200 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Dependency Roadmap Settings",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "type": "integer"
+    },
+    "root": {
+      "type": "string"
+    },
+    "registry": {
+      "type": "string"
+    },
+    "useSystemProxy": {
+      "type": "boolean"
+    },
+    "knowledgeLog": {
+      "type": "string",
+      "description": "Tracked append-only package migration knowledge document. Active entries are embedded into HTML and selected into agent prompts by exact package name."
+    },
+    "internalScopes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "projects": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "path"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "sourceBranch": {
+                "type": "string"
+              },
+              "baseBranch": {
+                "type": "string"
+              },
+              "branchPrefix": {
+                "type": "string"
+              },
+              "mergedBranch": {
+                "type": "string"
+              },
+              "push": {
+                "type": "boolean"
+              },
+              "git": {
+                "type": "object",
+                "properties": {
+                  "sourceBranch": {
+                    "type": "string",
+                    "description": "Fetched source branch used as the immutable starting point for roadmap generation."
+                  },
+                  "baseBranch": {
+                    "type": "string",
+                    "description": "Dependency update base branch created from the pinned source commit.",
+                    "default": "libs"
+                  },
+                  "branchPrefix": {
+                    "type": "string",
+                    "description": "Prefix for package/group work branches generated in the agent branch plan."
+                  },
+                  "mergedBranch": {
+                    "type": "string",
+                    "description": "Branch into which work branches are merged before final validation."
+                  },
+                  "push": {
+                    "type": "boolean",
+                    "description": "Allow the tool/agent workflow to push project branches. Keep false for local review.",
+                    "default": false
+                  },
+                  "remote": {
+                    "type": "string",
+                    "description": "Git remote used for source fetch and optional internal/release pushes.",
+                    "default": "origin"
+                  },
+                  "sourceCheckoutGuard": {
+                    "type": "boolean",
+                    "description": "Legacy nested per-project override for the source checkout guard."
+                  },
+                  "auditBootstrap": {
+                    "type": "object",
+                    "properties": {
+                      "enabled": {
+                        "type": "boolean",
+                        "description": "Deprecated and ignored by generate.",
+                        "default": false
+                      },
+                      "workspace": {
+                        "type": "string",
+                        "description": "Deprecated and ignored by generate."
+                      },
+                      "push": {
+                        "type": "boolean",
+                        "description": "Deprecated and ignored by generate."
+                      },
+                      "commitMessage": {
+                        "type": "string",
+                        "description": "Deprecated and ignored by generate."
+                      },
+                      "branch": {
+                        "type": "string",
+                        "description": "Deprecated and ignored by generate."
+                      }
+                    },
+                    "additionalProperties": true,
+                    "description": "Deprecated compatibility setting. generate ignores it; run scripts/audit-project.ps1 or .sh explicitly for manual vulnerability reconciliation.",
+                    "deprecated": true
+                  },
+                  "releaseBranch": {
+                    "type": "string",
+                    "description": "Final clean squash branch. Defaults to <branchPrefix>-release."
+                  },
+                  "hooks": {
+                    "type": "object",
+                    "properties": {
+                      "intermediateCommits": {
+                        "type": "string",
+                        "enum": [
+                          "skip"
+                        ],
+                        "default": "skip",
+                        "description": "All source/audit/work/cleanup commits use a command-local empty hooksPath."
+                      },
+                      "intermediateMerges": {
+                        "type": "string",
+                        "enum": [
+                          "skip"
+                        ],
+                        "default": "skip",
+                        "description": "All source fast-forwards, internal merges and merge commits skip repository hooks."
+                      },
+                      "intermediatePushes": {
+                        "type": "string",
+                        "enum": [
+                          "skip"
+                        ],
+                        "default": "skip",
+                        "description": "Optional internal branch pushes skip pre-push hooks."
+                      },
+                      "releaseCommit": {
+                        "type": "string",
+                        "enum": [
+                          "run"
+                        ],
+                        "default": "run",
+                        "description": "The final squash commit on releaseBranch uses normal repository hooks."
+                      },
+                      "releasePush": {
+                        "type": "string",
+                        "enum": [
+                          "run"
+                        ],
+                        "default": "run",
+                        "description": "The release branch push keeps pre-push hooks enabled."
+                      }
+                    },
+                    "additionalProperties": false,
+                    "description": "Fixed hook policy: skip hooks on internal lifecycle operations and run them on the final release commit/push."
+                  },
+                  "release": {
+                    "type": "object",
+                    "properties": {
+                      "strategy": {
+                        "type": "string",
+                        "enum": [
+                          "squash"
+                        ],
+                        "default": "squash"
+                      },
+                      "cleanupAuditWorkspace": {
+                        "type": "boolean",
+                        "const": true,
+                        "default": true,
+                        "description": "Remove the tool-managed audit workspace from the squashed release tree before hooks and commit."
+                      },
+                      "commitMessage": {
+                        "type": "string",
+                        "default": "chore(deps): update dependencies"
+                      },
+                      "finalGateCommands": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "default": [],
+                        "description": "Commands executed on the staged release tree before the hook-enabled commit."
+                      }
+                    },
+                    "additionalProperties": true,
+                    "description": "Final release-branch policy. The supported strategy is a clean squash from mergedBranch."
+                  },
+                  "lockfileSync": {
+                    "type": "object",
+                    "properties": {
+                      "baselineMode": {
+                        "type": "string",
+                        "enum": [
+                          "validate",
+                          "update",
+                          "off"
+                        ],
+                        "default": "validate",
+                        "description": "Mode used only with --capture-baseline. Default validate keeps fetched source branch immutable."
+                      },
+                      "currentMode": {
+                        "type": "string",
+                        "enum": [
+                          "validate",
+                          "update",
+                          "off"
+                        ],
+                        "default": "update",
+                        "description": "Mode used by ordinary generation on the current checkout. Default update refreshes a stale project lockfile before analysis."
+                      },
+                      "allowExtraLockfiles": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Allow unrelated root lockfiles. Keep false so a Yarn project cannot silently use an incidental root package-lock.json."
+                      },
+                      "enforceRegistryArtifacts": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Reject package tarball/resolved URLs outside the configured registry. Metadata-only versions and foreign npm/yarn URLs are not valid targets."
+                      },
+                      "yarnDeduplicate": {
+                        "oneOf": [
+                          {
+                            "type": "string",
+                            "enum": [
+                              "auto",
+                              "required",
+                              "off"
+                            ]
+                          },
+                          {
+                            "type": "boolean"
+                          }
+                        ],
+                        "default": "auto",
+                        "description": "auto runs a discovered/configured deduplication command when available; required fails if none exists; off disables deduplication. Boolean true/false remain compatible aliases for auto/off."
+                      },
+                      "yarnDeduplicateCommand": {
+                        "oneOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          }
+                        ],
+                        "description": "Optional explicit command. Otherwise scripts deduplicate/dedupe:lockfile/lockfile:dedupe/deps:dedupe/dedupe or local yarn-deduplicate are discovered."
+                      },
+                      "yarnInstallArgs": {
+                        "oneOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          }
+                        ]
+                      },
+                      "npmInstallArgs": {
+                        "oneOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          }
+                        ]
+                      },
+                      "pnpmInstallArgs": {
+                        "oneOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "additionalProperties": true,
+                    "description": "Optional lockfile policy. Defaults already provide baseline validate, current-checkout update, no mixed root lockfiles, and best-effort Yarn deduplication."
+                  },
+                  "migration": {
+                    "type": "object",
+                    "properties": {
+                      "verificationCommands": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "default": [],
+                        "description": "Project checks run by Desktop before a work branch may merge. Failures are returned to the agent for in-scope repair. If omitted, release.finalGateCommands or existing package scripts are used."
+                      },
+                      "integrationVerificationCommands": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "default": [],
+                        "description": "Checks run on the cumulative merged branch after every group merge. Defaults to verificationCommands."
+                      }
+                    },
+                    "additionalProperties": true,
+                    "description": "Migration-time verification policy. These gates run before release so dependency regressions are repaired at the stage that introduced them."
+                  }
+                },
+                "additionalProperties": true
+              },
+              "gitRemote": {
+                "type": "string"
+              },
+              "sourceCheckoutGuard": {
+                "type": "boolean",
+                "description": "Per-project override for the global source checkout guard."
+              },
+              "auditBootstrap": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "type": "boolean",
+                    "description": "Deprecated and ignored by generate.",
+                    "default": false
+                  },
+                  "workspace": {
+                    "type": "string",
+                    "description": "Deprecated and ignored by generate."
+                  },
+                  "push": {
+                    "type": "boolean",
+                    "description": "Deprecated and ignored by generate."
+                  },
+                  "commitMessage": {
+                    "type": "string",
+                    "description": "Deprecated and ignored by generate."
+                  },
+                  "branch": {
+                    "type": "string",
+                    "description": "Deprecated and ignored by generate."
+                  }
+                },
+                "additionalProperties": true,
+                "description": "Deprecated compatibility setting. generate ignores it; run scripts/audit-project.ps1 or .sh explicitly for manual vulnerability reconciliation.",
+                "deprecated": true
+              },
+              "releaseBranch": {
+                "type": "string"
+              },
+              "gitHooks": {
+                "type": "object",
+                "properties": {
+                  "intermediateCommits": {
+                    "type": "string",
+                    "enum": [
+                      "skip"
+                    ],
+                    "default": "skip",
+                    "description": "All source/audit/work/cleanup commits use a command-local empty hooksPath."
+                  },
+                  "intermediateMerges": {
+                    "type": "string",
+                    "enum": [
+                      "skip"
+                    ],
+                    "default": "skip",
+                    "description": "All source fast-forwards, internal merges and merge commits skip repository hooks."
+                  },
+                  "intermediatePushes": {
+                    "type": "string",
+                    "enum": [
+                      "skip"
+                    ],
+                    "default": "skip",
+                    "description": "Optional internal branch pushes skip pre-push hooks."
+                  },
+                  "releaseCommit": {
+                    "type": "string",
+                    "enum": [
+                      "run"
+                    ],
+                    "default": "run",
+                    "description": "The final squash commit on releaseBranch uses normal repository hooks."
+                  },
+                  "releasePush": {
+                    "type": "string",
+                    "enum": [
+                      "run"
+                    ],
+                    "default": "run",
+                    "description": "The release branch push keeps pre-push hooks enabled."
+                  }
+                },
+                "additionalProperties": false,
+                "description": "Fixed hook policy: skip hooks on internal lifecycle operations and run them on the final release commit/push."
+              },
+              "release": {
+                "type": "object",
+                "properties": {
+                  "strategy": {
+                    "type": "string",
+                    "enum": [
+                      "squash"
+                    ],
+                    "default": "squash"
+                  },
+                  "cleanupAuditWorkspace": {
+                    "type": "boolean",
+                    "const": true,
+                    "default": true,
+                    "description": "Remove the tool-managed audit workspace from the squashed release tree before hooks and commit."
+                  },
+                  "commitMessage": {
+                    "type": "string",
+                    "default": "chore(deps): update dependencies"
+                  },
+                  "finalGateCommands": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": [],
+                    "description": "Commands executed on the staged release tree before the hook-enabled commit."
+                  }
+                },
+                "additionalProperties": true,
+                "description": "Final release-branch policy. The supported strategy is a clean squash from mergedBranch."
+              },
+              "lockfileSync": {
+                "type": "object",
+                "properties": {
+                  "baselineMode": {
+                    "type": "string",
+                    "enum": [
+                      "validate",
+                      "update",
+                      "off"
+                    ],
+                    "default": "validate",
+                    "description": "Mode used only with --capture-baseline. Default validate keeps fetched source branch immutable."
+                  },
+                  "currentMode": {
+                    "type": "string",
+                    "enum": [
+                      "validate",
+                      "update",
+                      "off"
+                    ],
+                    "default": "update",
+                    "description": "Mode used by ordinary generation on the current checkout. Default update refreshes a stale project lockfile before analysis."
+                  },
+                  "allowExtraLockfiles": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Allow unrelated root lockfiles. Keep false so a Yarn project cannot silently use an incidental root package-lock.json."
+                  },
+                  "enforceRegistryArtifacts": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Reject package tarball/resolved URLs outside the configured registry. Metadata-only versions and foreign npm/yarn URLs are not valid targets."
+                  },
+                  "yarnDeduplicate": {
+                    "oneOf": [
+                      {
+                        "type": "string",
+                        "enum": [
+                          "auto",
+                          "required",
+                          "off"
+                        ]
+                      },
+                      {
+                        "type": "boolean"
+                      }
+                    ],
+                    "default": "auto",
+                    "description": "auto runs a discovered/configured deduplication command when available; required fails if none exists; off disables deduplication. Boolean true/false remain compatible aliases for auto/off."
+                  },
+                  "yarnDeduplicateCommand": {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    ],
+                    "description": "Optional explicit command. Otherwise scripts deduplicate/dedupe:lockfile/lockfile:dedupe/deps:dedupe/dedupe or local yarn-deduplicate are discovered."
+                  },
+                  "yarnInstallArgs": {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    ]
+                  },
+                  "npmInstallArgs": {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    ]
+                  },
+                  "pnpmInstallArgs": {
+                    "oneOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    ]
+                  }
+                },
+                "additionalProperties": true,
+                "description": "Optional lockfile policy. Defaults already provide baseline validate, current-checkout update, no mixed root lockfiles, and best-effort Yarn deduplication."
+              },
+              "migration": {
+                "type": "object",
+                "properties": {
+                  "verificationCommands": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": [],
+                    "description": "Project checks run by Desktop before a work branch may merge. Failures are returned to the agent for in-scope repair. If omitted, release.finalGateCommands or existing package scripts are used."
+                  },
+                  "integrationVerificationCommands": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "default": [],
+                    "description": "Checks run on the cumulative merged branch after every group merge. Defaults to verificationCommands."
+                  }
+                },
+                "additionalProperties": true,
+                "description": "Migration-time verification policy. These gates run before release so dependency regressions are repaired at the stage that introduced them."
+              },
+              "autonomy": {
+                "type": "object",
+                "properties": {
+                  "maxAgentAttemptsPerBatch": {
+                    "type": "integer",
+                    "minimum": 2,
+                    "maximum": 10,
+                    "default": 6,
+                    "description": "Fresh Executor attempts per batch before Supervisor replans. Identical conversations are not resumed automatically."
+                  },
+                  "maxGroupRepairAttempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8,
+                    "default": 4,
+                    "description": "Verification-repair attempts for one work branch."
+                  },
+                  "maxMergeRecoveryAttempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8,
+                    "default": 4,
+                    "description": "Bounded agent attempts for a preserved unresolved merge."
+                  },
+                  "maxIntegrationRepairAttempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8,
+                    "default": 4,
+                    "description": "Repair attempts for cumulative merged integration verification."
+                  },
+                  "maxReleaseRecoveryAttempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8,
+                    "default": 4,
+                    "description": "Fresh release recovery attempts before preserving the state for handoff."
+                  },
+                  "maxPlannerRevisions": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 12,
+                    "default": 6,
+                    "description": "Maximum number of materially different Supervisor replans in one migration job."
+                  },
+                  "maxSamePlanRepeats": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3,
+                    "default": 1,
+                    "description": "How many times the same scope+normalized blocker may recur before loop protection stops that path."
+                  },
+                  "allowBestEffortRelease": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Allow release when the automatic executable plan is exhausted, no Critical vulnerabilities remain, and all normal build/lint/final gates/hooks still pass. The unmet health target remains visible in the final report."
+                  },
+                  "allowResidualPlanDeferral": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "When a safe planner revision would otherwise require human approval for new architectural scope, temporarily defer the current bounded work branch and continue the residual plan. Infrastructure and safety blockers are never deferred."
+                  },
+                  "maxParallelGroups": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 6,
+                    "default": 2,
+                    "description": "Independent untouched Branch-plan groups executed concurrently in separate Git worktrees. Merge and cumulative verification always remain sequential."
+                  },
+                  "autoDeferApprovalBlockers": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Convert planner approval for forbidden/new scope into bounded blocker deferral and continue the safe residual plan instead of stopping FLOW."
+                  },
+                  "softStopOnAutonomyPlateau": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "When autonomous repair/replan is exhausted without a safety violation, preserve the best green state and finish as best-effort/handoff instead of surfacing a terminal error."
+                  }
+                },
+                "additionalProperties": false,
+                "description": "Autonomy budget and loop protection. Higher limits allow more self-repair while repeated identical failures still stop early."
+              }
+            }
+          }
+        ]
+      }
+    },
+    "groupsConfig": {
+      "type": "string"
+    },
+    "onlyProject": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "artifactsDir": {
+      "type": "string"
+    },
+    "out": {
+      "type": "string"
+    },
+    "jsonOut": {
+      "type": "string"
+    },
+    "htmlOut": {
+      "type": "string"
+    },
+    "historyDir": {
+      "type": "string"
+    },
+    "eventsLog": {
+      "type": "string"
+    },
+    "runsDir": {
+      "type": "string"
+    },
+    "indexFile": {
+      "type": "string"
+    },
+    "includePrerelease": {
+      "type": "boolean"
+    },
+    "maxCandidates": {
+      "type": "integer"
+    },
+    "timeout": {
+      "type": "integer"
+    },
+    "dashboardState": {
+      "type": "string"
+    },
+    "releaseIntelEnabled": {
+      "type": "boolean"
+    },
+    "releaseIntelMaxPackages": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "historySnapshotsEnabled": {
+      "type": "boolean"
+    },
+    "sourceCheckoutGuard": {
+      "type": "boolean",
+      "description": "Before analysis, require a clean Git checkout and fast-forward it to the exact fetched remote/sourceBranch commit. The tool default is false; the workspace template enables it explicitly.",
+      "default": false
+    },
+    "auditBootstrap": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Deprecated and ignored by generate.",
+          "default": false
+        },
+        "workspace": {
+          "type": "string",
+          "description": "Deprecated and ignored by generate.",
+          "default": ".dependency-roadmap-audit"
+        },
+        "push": {
+          "type": "boolean",
+          "description": "Deprecated and ignored by generate.",
+          "default": false
+        },
+        "commitMessage": {
+          "type": "string",
+          "description": "Deprecated and ignored by generate.",
+          "default": "chore(deps): capture dependency audit baseline"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Deprecated and ignored by generate."
+        }
+      },
+      "additionalProperties": true,
+      "description": "Deprecated compatibility setting. generate ignores it; run scripts/audit-project.ps1 or .sh explicitly for manual vulnerability reconciliation.",
+      "deprecated": true
+    },
+    "gitHooks": {
+      "type": "object",
+      "properties": {
+        "intermediateCommits": {
+          "type": "string",
+          "enum": [
+            "skip"
+          ],
+          "default": "skip",
+          "description": "All source/audit/work/cleanup commits use a command-local empty hooksPath."
+        },
+        "intermediateMerges": {
+          "type": "string",
+          "enum": [
+            "skip"
+          ],
+          "default": "skip",
+          "description": "All source fast-forwards, internal merges and merge commits skip repository hooks."
+        },
+        "intermediatePushes": {
+          "type": "string",
+          "enum": [
+            "skip"
+          ],
+          "default": "skip",
+          "description": "Optional internal branch pushes skip pre-push hooks."
+        },
+        "releaseCommit": {
+          "type": "string",
+          "enum": [
+            "run"
+          ],
+          "default": "run",
+          "description": "The final squash commit on releaseBranch uses normal repository hooks."
+        },
+        "releasePush": {
+          "type": "string",
+          "enum": [
+            "run"
+          ],
+          "default": "run",
+          "description": "The release branch push keeps pre-push hooks enabled."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Fixed hook policy: skip hooks on internal lifecycle operations and run them on the final release commit/push."
+    },
+    "release": {
+      "type": "object",
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": [
+            "squash"
+          ],
+          "default": "squash"
+        },
+        "cleanupAuditWorkspace": {
+          "type": "boolean",
+          "const": true,
+          "default": true,
+          "description": "Remove the tool-managed audit workspace from the squashed release tree before hooks and commit."
+        },
+        "commitMessage": {
+          "type": "string",
+          "default": "chore(deps): update dependencies"
+        },
+        "finalGateCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Commands executed on the staged release tree before the hook-enabled commit."
+        }
+      },
+      "additionalProperties": true,
+      "description": "Final release-branch policy. The supported strategy is a clean squash from mergedBranch."
+    },
+    "lockfileSync": {
+      "type": "object",
+      "properties": {
+        "baselineMode": {
+          "type": "string",
+          "enum": [
+            "validate",
+            "update",
+            "off"
+          ],
+          "default": "validate",
+          "description": "Mode used only with --capture-baseline. Default validate keeps fetched source branch immutable."
+        },
+        "currentMode": {
+          "type": "string",
+          "enum": [
+            "validate",
+            "update",
+            "off"
+          ],
+          "default": "update",
+          "description": "Mode used by ordinary generation on the current checkout. Default update refreshes a stale project lockfile before analysis."
+        },
+        "allowExtraLockfiles": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow unrelated root lockfiles. Keep false so a Yarn project cannot silently use an incidental root package-lock.json."
+        },
+        "enforceRegistryArtifacts": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reject package tarball/resolved URLs outside the configured registry. Metadata-only versions and foreign npm/yarn URLs are not valid targets."
+        },
+        "yarnDeduplicate": {
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "auto",
+                "required",
+                "off"
+              ]
+            },
+            {
+              "type": "boolean"
+            }
+          ],
+          "default": "auto",
+          "description": "auto runs a discovered/configured deduplication command when available; required fails if none exists; off disables deduplication. Boolean true/false remain compatible aliases for auto/off."
+        },
+        "yarnDeduplicateCommand": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ],
+          "description": "Optional explicit command. Otherwise scripts deduplicate/dedupe:lockfile/lockfile:dedupe/deps:dedupe/dedupe or local yarn-deduplicate are discovered."
+        },
+        "yarnInstallArgs": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "npmInstallArgs": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "pnpmInstallArgs": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        }
+      },
+      "additionalProperties": true,
+      "description": "Optional lockfile policy. Defaults already provide baseline validate, current-checkout update, no mixed root lockfiles, and best-effort Yarn deduplication."
+    },
+    "constraintVerification": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "solverBackend": {
+          "type": "string",
+          "enum": [
+            "custom",
+            "z3"
+          ],
+          "default": "z3",
+          "description": "Authoritative constraint optimizer. z3 is bundled with the tool and never falls back to heuristic search. Exact unknown/timeout/unsat locally defers only the affected component to its current assignment; a missing/broken Z3 runtime remains an explicit environment error. Set custom only for diagnostic/backwards-compatibility experiments."
+        },
+        "compareLegacySolver": {
+          "type": "boolean",
+          "default": false,
+          "description": "When solverBackend=z3, optionally run the legacy custom solver only as a diagnostic comparator on small components."
+        },
+        "legacyComparatorMaxComponentSize": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 8
+        },
+        "persistentLearning": {
+          "type": "boolean",
+          "default": true,
+          "description": "Persist only reproducible package-manager dependency-resolution nogoods under a resolver-environment fingerprint."
+        },
+        "learningReproductions": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 5,
+          "default": 2
+        },
+        "constraintCachePath": {
+          "type": "string",
+          "description": "Optional persistent proof-cache path. Defaults to .dependency-roadmap/state/constraint-cache.json relative to the settings workspace."
+        },
+        "parallelism": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16,
+          "default": 4
+        },
+        "maxIterations": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32,
+          "default": 8
+        },
+        "maxDeltaChecks": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 128,
+          "default": 24
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 3600,
+          "default": 600
+        },
+        "attemptTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 14400,
+          "default": 3600,
+          "description": "Hard wall-clock limit in seconds for one complete isolated assignment verification attempt (resolver/lifecycle/project checks combined)."
+        },
+        "progressIntervalSeconds": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 60,
+          "default": 15,
+          "description": "Heartbeat interval in seconds while verifier/localization subprocesses are still running."
+        },
+        "projectChecks": {
+          "type": "string",
+          "enum": [
+            "off",
+            "diagnostic",
+            "adaptive",
+            "strict"
+          ],
+          "default": "adaptive",
+          "description": "Resolver/install failures teach the solver hard nogoods. adaptive (default) also rejects reproducible structural package/loadability failures while leaving ordinary source-migration failures to Executor; diagnostic never learns project-check failures; strict promotes every project-check failure to a hard constraint."
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional Baseline project checks. Defaults to migration.verificationCommands/integrationVerificationCommands, then release.finalGateCommands."
+        },
+        "shadowSolver": {
+          "type": "string",
+          "enum": [
+            "off",
+            "z3"
+          ],
+          "default": "off",
+          "description": "Non-authoritative exact shadow backend. z3 compares the finite-domain IR with the production solver but never changes target_* or the branch plan."
+        },
+        "shadowSolverTimeoutMs": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 600000,
+          "default": 30000
+        },
+        "shadowSolverMaxRefinements": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 512,
+          "default": 32
+        },
+        "shadowSolverMinComponentSize": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 1
+        },
+        "localizationTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 300,
+          "maximum": 21600,
+          "default": 7200,
+          "description": "Hard wall-clock limit in seconds for one complete deterministic conflict-localization cycle. Timeout preserves the plan and learns no constraint."
+        }
+      },
+      "additionalProperties": true,
+      "description": "Pre-agent solve-and-verify loop. Candidate assignments are materialized in isolated local clones, failing combinations are delta-debugged in parallel and learned as solver nogoods."
+    },
+    "migration": {
+      "type": "object",
+      "properties": {
+        "verificationCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Project checks run by Desktop before a work branch may merge. Failures are returned to the agent for in-scope repair. If omitted, release.finalGateCommands or existing package scripts are used."
+        },
+        "integrationVerificationCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Checks run on the cumulative merged branch after every group merge. Defaults to verificationCommands."
+        }
+      },
+      "additionalProperties": true,
+      "description": "Migration-time verification policy. These gates run before release so dependency regressions are repaired at the stage that introduced them."
+    },
+    "autonomy": {
+      "type": "object",
+      "properties": {
+        "maxAgentAttemptsPerBatch": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 10,
+          "default": 6,
+          "description": "Fresh Executor attempts per batch before Supervisor replans. Identical conversations are not resumed automatically."
+        },
+        "maxGroupRepairAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "default": 4,
+          "description": "Verification-repair attempts for one work branch."
+        },
+        "maxMergeRecoveryAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "default": 4,
+          "description": "Bounded agent attempts for a preserved unresolved merge."
+        },
+        "maxIntegrationRepairAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "default": 4,
+          "description": "Repair attempts for cumulative merged integration verification."
+        },
+        "maxReleaseRecoveryAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8,
+          "default": 4,
+          "description": "Fresh release recovery attempts before preserving the state for handoff."
+        },
+        "maxPlannerRevisions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 12,
+          "default": 6,
+          "description": "Maximum number of materially different Supervisor replans in one migration job."
+        },
+        "maxSamePlanRepeats": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3,
+          "default": 1,
+          "description": "How many times the same scope+normalized blocker may recur before loop protection stops that path."
+        },
+        "allowBestEffortRelease": {
+          "type": "boolean",
+          "default": true,
+          "description": "Allow release when the automatic executable plan is exhausted, no Critical vulnerabilities remain, and all normal build/lint/final gates/hooks still pass. The unmet health target remains visible in the final report."
+        },
+        "allowResidualPlanDeferral": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a safe planner revision would otherwise require human approval for new architectural scope, temporarily defer the current bounded work branch and continue the residual plan. Infrastructure and safety blockers are never deferred."
+        },
+        "maxParallelGroups": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 6,
+          "default": 2,
+          "description": "Independent untouched Branch-plan groups executed concurrently in separate Git worktrees. Merge and cumulative verification always remain sequential."
+        },
+        "autoDeferApprovalBlockers": {
+          "type": "boolean",
+          "default": true,
+          "description": "Convert planner approval for forbidden/new scope into bounded blocker deferral and continue the safe residual plan instead of stopping FLOW."
+        },
+        "softStopOnAutonomyPlateau": {
+          "type": "boolean",
+          "default": true,
+          "description": "When autonomous repair/replan is exhausted without a safety violation, preserve the best green state and finish as best-effort/handoff instead of surfacing a terminal error."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Autonomy budget and loop protection. Higher limits allow more self-repair while repeated identical failures still stop early."
+    }
+  },
+  "additionalProperties": true
+}

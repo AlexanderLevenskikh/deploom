@@ -1,0 +1,46 @@
+appId: io.github.frontenddepsflow.app
+productName: Dependency Flow
+directories:
+  output: release
+electronDist: node_modules/electron/dist
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - package.json
+  - build/icon.ico
+  - build/icon.png
+asar: true
+extraResources:
+  - from: ..
+    to: tool
+    filter:
+      - "*.py"
+      - "*.json"
+      - "requirements.txt"
+      - "requirements-solver.txt"
+      - "scripts/**/*"
+      - "templates/**/*"
+  - from: vendor
+    to: tool/vendor
+win:
+  icon: build/icon.ico
+  target: nsis
+nsis:
+  artifactName: Dependency-Flow-Setup-${version}.${ext}
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Dependency Flow
+mac:
+  icon: build/icon.png
+  target: dmg
+linux:
+  icon: build/icon.png
+  target: AppImage
+publish:
+  provider: github
+  owner: AlexanderLevenskikh
+  repo: deploom
+  releaseType: release

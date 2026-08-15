@@ -1,0 +1,4 @@
+extends: ./electron-builder.yml
+# The local config reuses installed Electron on Windows. CI runs on Linux and
+# must download the Windows Electron distribution instead.
+electronDist: null

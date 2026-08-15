@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 3,
+  "changePolicy": "minimal-compatibility-only",
+  "refactoringPerformed": false,
+  "regressionDirectory": "regressionTests/dependencyRegression",
+  "defaultTestCommand": "yarn test",
+  "regressionTestCommand": "yarn test:dependency-regression",
+  "includedInDefaultTest": false,
+  "defaultCollectedRegressionFiles": [],
+  "regressionCollectedFiles": [
+    "regressionTests/dependencyRegression/react-router-dom.test.tsx"
+  ],
+  "packages": [
+    {
+      "package": "react-router-dom",
+      "section": "dependencies",
+      "testRequired": true,
+      "testOrigin": "generated",
+      "gateType": "test",
+      "reason": "runtime router migration",
+      "invariant": "route generation and navigation preserve the existing application behavior",
+      "relevanceProof": "The regression test imports the same router API used by src/router.ts and checks the route shape consumed by the application.",
+      "usageFiles": [
+        "src/router.ts"
+      ],
+      "testFiles": [
+        "regressionTests/dependencyRegression/react-router-dom.test.tsx"
+      ],
+      "testCases": [
+        "navigates to an existing route and preserves query parameters"
+      ],
+      "failureProbe": {
+        "status": "passed",
+        "restored": true,
+        "description": "Temporarily changed the expected route and observed this dedicated test fail, then restored the source and test files."
+      },
+      "baseline": {
+        "status": "passed",
+        "command": "yarn test:dependency-regression"
+      },
+      "postUpdate": {
+        "status": "passed",
+        "command": "yarn test:dependency-regression"
+      }
+    }
+  ]
+}

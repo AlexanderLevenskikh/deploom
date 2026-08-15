@@ -1,0 +1,46 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.npmrc
+.yarnrc
+.netrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+
+# IDE / editor
+.idea/
+.vs/
+.vscode/
+.fleet/
+.history/
+*.swp
+*.swo
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Generated / caches
+__pycache__/
+*.pyc
+node_modules/
+desktop/node_modules/
+desktop/dist/
+desktop/dist-electron/
+desktop/release/
+desktop/.npm/
+desktop/.cache/
+.dependency-roadmap/

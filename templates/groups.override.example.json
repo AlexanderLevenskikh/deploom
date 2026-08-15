@@ -1,0 +1,18 @@
+{
+  "packages": {
+    "react-router-dom": {
+      "group": 4,
+      "reason": "example: route migration is handled separately"
+    }
+  },
+  "projects": {
+    "web-app": {
+      "packages": {
+        "vite": {
+          "group": 4,
+          "reason": "example project-specific override"
+        }
+      }
+    }
+  }
+}

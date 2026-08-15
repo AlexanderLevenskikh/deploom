@@ -1,0 +1,3 @@
+# Z3 is platform-specific (the wheel bundles a native libz3 binary), so it must
+# not be installed through the universal --platform any vendor pass.
+z3-solver==4.13.1.0

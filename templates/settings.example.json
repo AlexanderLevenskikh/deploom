@@ -1,0 +1,99 @@
+{
+  "root": "C:/Users/developer/work",
+  "registry": "https://registry.npmjs.org",
+  "useSystemProxy": false,
+  "internalScopes": [],
+  "projects": [
+    {
+      "name": "web-app",
+      "path": "web-app",
+      "git": {
+        "sourceBranch": "main",
+        "baseBranch": "deps",
+        "branchPrefix": "deps",
+        "mergedBranch": "deps-merged",
+        "push": false,
+        "remote": "origin",
+        "releaseBranch": "deps-release"
+      }
+    },
+    {
+      "name": "shared-ui",
+      "path": "shared-ui",
+      "git": {
+        "sourceBranch": "main",
+        "baseBranch": "deps",
+        "branchPrefix": "deps",
+        "mergedBranch": "deps-merged",
+        "push": false,
+        "remote": "origin",
+        "releaseBranch": "deps-release"
+      }
+    },
+    {
+      "name": "embedded-widget",
+      "path": "embedded-widget",
+      "git": {
+        "sourceBranch": "main",
+        "baseBranch": "deps",
+        "branchPrefix": "deps",
+        "mergedBranch": "deps-merged",
+        "push": false,
+        "remote": "origin",
+        "releaseBranch": "deps-release"
+      }
+    }
+  ],
+  "groupsConfig": "groups.override.json",
+  "artifactsDir": "artifacts",
+  "out": "artifacts/dependency-roadmap.md",
+  "jsonOut": "artifacts/dependency-roadmap.json",
+  "htmlOut": "artifacts/dependency-roadmap.html",
+  "historyDir": ".dependency-update-history",
+  "eventsLog": ".dependency-update-history/events.jsonl",
+  "runsDir": ".dependency-update-history/runs",
+  "indexFile": ".dependency-update-history/index.md",
+  "includePrerelease": false,
+  "maxCandidates": 0,
+  "timeout": 30,
+  "dashboardState": ".dependency-roadmap/state/dashboard-state.json",
+  "releaseIntelEnabled": true,
+  "releaseIntelMaxPackages": 0,
+  "historySnapshotsEnabled": true,
+  "sourceCheckoutGuard": true,
+  "gitHooks": {
+    "intermediateCommits": "skip",
+    "intermediateMerges": "skip",
+    "intermediatePushes": "skip",
+    "releaseCommit": "run",
+    "releasePush": "run"
+  },
+  "constraintVerification": {
+    "enabled": true,
+    "parallelism": 4,
+    "maxIterations": 8,
+    "maxDeltaChecks": 24,
+    "timeoutSeconds": 600,
+    "projectChecks": "adaptive",
+    "attemptTimeoutSeconds": 3600,
+    "progressIntervalSeconds": 15,
+    "localizationTimeoutSeconds": 7200
+  },
+  "migration": {
+    "verificationCommands": [],
+    "integrationVerificationCommands": []
+  },
+  "release": {
+    "strategy": "squash",
+    "cleanupAuditWorkspace": true,
+    "commitMessage": "chore(deps): update dependencies",
+    "finalGateCommands": []
+  },
+  "lockfileSync": {
+    "baselineMode": "validate",
+    "currentMode": "update",
+    "allowExtraLockfiles": false,
+    "enforceRegistryArtifacts": true,
+    "yarnDeduplicate": "auto"
+  }
+}
