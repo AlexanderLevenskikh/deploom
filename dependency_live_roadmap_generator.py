@@ -6765,6 +6765,78 @@ class BaselineProgressReporter:
                     pass
 
 
+class BaselineLocalizationCheckpointStore:
+    """Durable ddmin recovery state guarded by an exact proof identity."""
+
+    def __init__(self, progress_path: Optional[Path]) -> None:
+        self.path = (
+            progress_path.with_name("baseline-localization-checkpoint.json")
+            if progress_path is not None
+            else None
+        )
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _slot(project: str, mode: str) -> str:
+        return hashlib.sha256(f"{project}\0{mode}".encode("utf-8")).hexdigest()[:24]
+
+    def _read_locked(self) -> Dict[str, Any]:
+        if self.path is None or not self.path.exists():
+            return {"schemaVersion": 1, "entries": {}}
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"schemaVersion": 1, "entries": {}}
+        if not isinstance(payload, dict) or int(payload.get("schemaVersion") or 0) != 1:
+            return {"schemaVersion": 1, "entries": {}}
+        if not isinstance(payload.get("entries"), dict):
+            payload["entries"] = {}
+        return payload
+
+    def _write_locked(self, payload: Dict[str, Any]) -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.path.with_suffix(self.path.suffix + ".tmp")
+        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(temp, self.path)
+
+    def load(self, project: str, mode: str, identity: str) -> Optional[Dict[str, object]]:
+        if self.path is None:
+            return None
+        with self._lock:
+            payload = self._read_locked()
+            entry = payload.get("entries", {}).get(self._slot(project, mode))
+            if not isinstance(entry, dict) or entry.get("identity") != identity:
+                return None
+            state = entry.get("state")
+            return dict(state) if isinstance(state, dict) else None
+
+    def save(self, project: str, mode: str, identity: str, state: Mapping[str, object]) -> None:
+        if self.path is None:
+            return
+        with self._lock:
+            payload = self._read_locked()
+            entries = payload.setdefault("entries", {})
+            entries[self._slot(project, mode)] = {
+                "identity": identity,
+                "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "state": dict(state),
+            }
+            self._write_locked(payload)
+
+    def clear(self, project: str, mode: str) -> None:
+        if self.path is None:
+            return
+        with self._lock:
+            payload = self._read_locked()
+            entries = payload.get("entries")
+            if not isinstance(entries, dict):
+                return
+            if entries.pop(self._slot(project, mode), None) is not None:
+                self._write_locked(payload)
+
+
 def resolve_peer_compatibility_with_verification(
     rows_by_project: Dict[str, List[DependencyRow]],
     projects_by_name: Dict[str, ProjectSpec],
@@ -6784,6 +6856,7 @@ def resolve_peer_compatibility_with_verification(
     can explicitly promote them to learned constraints.
     """
     progress_reporter = BaselineProgressReporter(progress_path)
+    localization_checkpoint_store = BaselineLocalizationCheckpointStore(progress_path)
     learned: Dict[str, Dict[str, List[Dict[str, str]]]] = {
         project: {mode: [] for mode in modes} for project in rows_by_project
     }
@@ -7136,7 +7209,7 @@ def resolve_peer_compatibility_with_verification(
 
                 def localization_progress(event: str, details: Dict[str, object]) -> None:
                     progress_reporter.emit(project, mode, f"localization-{event}", iteration=iteration, assignment=fingerprint, **details)
-                    if event in {"start", "wave-start", "heartbeat", "check-finish", "confirmation-start", "confirmation-finish", "shrink", "timeout", "finish"}:
+                    if event in {"start", "resume", "wave-start", "heartbeat", "check-finish", "confirmation-start", "confirmation-heartbeat", "confirmation-finish", "shrink", "timeout", "checkpoint-error", "finish"}:
                         detail_text = ", ".join(f"{key}={value}" for key, value in details.items())
                         level = "warn" if event == "timeout" else "info"
                         eprint(f"[{level}] {project}: Baseline localization {mode} {event}; {detail_text}")
@@ -7202,6 +7275,47 @@ def resolve_peer_compatibility_with_verification(
                     return failed
 
                 try:
+                    source_head_result = subprocess.run(
+                        ["git", "-C", str(spec.path), "rev-parse", "HEAD"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    source_head = source_head_result.stdout.strip() if source_head_result.returncode == 0 else ""
+                except (OSError, subprocess.SubprocessError):
+                    source_head = ""
+
+                localization_identity_payload = {
+                    "algorithm": "baseline-ddmin-resume-v1",
+                    "sourceHead": source_head,
+                    "environment": project_environment_fingerprint,
+                    "mode": mode,
+                    "assignment": sorted(assignment.items()),
+                    "commands": list(config.commands),
+                    "projectChecks": config.project_checks,
+                    "units": [{"id": unit.id, "packages": list(unit.packages)} for unit in units],
+                }
+                localization_identity = hashlib.sha256(
+                    json.dumps(
+                        localization_identity_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                localization_resume_state = localization_checkpoint_store.load(
+                    project, mode, localization_identity
+                )
+                if localization_resume_state is not None:
+                    eprint(
+                        f"[info] {project}: Baseline localization {mode} resume checkpoint found; "
+                        f"currentUnits={len(localization_resume_state.get('currentUnitIds') or [])}, "
+                        f"checksStarted={localization_resume_state.get('checksStarted', 0)}, "
+                        f"reason={localization_resume_state.get('reason', 'unknown')}"
+                    )
+
+                try:
                     culprit_units = parallel_ddmin(
                         units,
                         subset_fails,
@@ -7217,6 +7331,10 @@ def resolve_peer_compatibility_with_verification(
                         # shrink the search after the same experiment fails again
                         # with no sibling probe running.
                         confirm_failure=subset_fails if learn_project_failure else None,
+                        resume_state=localization_resume_state,
+                        checkpoint=lambda state: localization_checkpoint_store.save(
+                            project, mode, localization_identity, state
+                        ),
                     )
                 except LocalizationTimeoutError as exc:
                     progress_reporter.emit(project, mode, "localization-timeout", iteration=iteration, assignment=fingerprint, error=str(exc))
@@ -7334,6 +7452,9 @@ def resolve_peer_compatibility_with_verification(
                         f"{assignment_fingerprint(nogood)}; {result.summary}"
                     )
                 learned[project][mode].append(nogood)
+                # Keep the finished localization checkpoint through project
+                # reproductions; clear only after the clause becomes solver authority.
+                localization_checkpoint_store.clear(project, mode)
                 detail = ", ".join(f"{name}@{version}" for name, version in sorted(nogood.items()))
 
                 # Persist only package-manager dependency failures that reproduce

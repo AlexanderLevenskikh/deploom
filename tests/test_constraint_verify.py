@@ -97,6 +97,132 @@ class ConstraintVerifyTests(unittest.TestCase):
         )
         self.assertEqual({"a"}, {item.id for item in culprit})
 
+    def test_serial_confirmation_emits_heartbeat(self) -> None:
+        units = [VerificationUnit("a", ("a",)), VerificationUnit("b", ("b",))]
+        events: list[str] = []
+
+        def parallel_screen(candidate: tuple[VerificationUnit, ...]) -> bool:
+            return {item.id for item in candidate} == {"a"}
+
+        def slow_confirmation(_candidate: tuple[VerificationUnit, ...]) -> bool:
+            time.sleep(1.15)
+            return True
+
+        culprit = parallel_ddmin(
+            units,
+            parallel_screen,
+            parallelism=2,
+            max_checks=8,
+            confirm_failure=slow_confirmation,
+            progress=lambda event, _details: events.append(event),
+            progress_interval_seconds=1,
+            timeout_seconds=5,
+        )
+        self.assertEqual({"a"}, {item.id for item in culprit})
+        self.assertIn("confirmation-heartbeat", events)
+
+    def test_resume_reuses_screening_but_still_confirms_fail(self) -> None:
+        units = [VerificationUnit("a", ("a",)), VerificationUnit("b", ("b",))]
+        parallel_calls = 0
+        confirmation_calls = 0
+
+        def parallel_screen(_candidate: tuple[VerificationUnit, ...]) -> bool:
+            nonlocal parallel_calls
+            parallel_calls += 1
+            raise AssertionError("cached screening result should be reused")
+
+        def confirm(candidate: tuple[VerificationUnit, ...]) -> bool:
+            nonlocal confirmation_calls
+            confirmation_calls += 1
+            return {item.id for item in candidate} == {"a"}
+
+        state = {
+            "schemaVersion": 1,
+            "initialUnitIds": ["a", "b"],
+            "currentUnitIds": ["a", "b"],
+            "granularity": 2,
+            "checksStarted": 2,
+            "cache": [
+                {"unitIds": ["a"], "failed": True, "confirmedFailure": False},
+                {"unitIds": ["b"], "failed": False, "confirmedFailure": False},
+            ],
+            "finished": False,
+        }
+
+        culprit = parallel_ddmin(
+            units,
+            parallel_screen,
+            parallelism=2,
+            max_checks=8,
+            confirm_failure=confirm,
+            resume_state=state,
+        )
+        self.assertEqual(0, parallel_calls)
+        self.assertEqual(1, confirmation_calls)
+        self.assertEqual({"a"}, {item.id for item in culprit})
+
+    def test_checkpoint_can_resume_finished_localization_without_rechecks(self) -> None:
+        units = [VerificationUnit("a", ("a",)), VerificationUnit("b", ("b",))]
+        states: list[dict[str, object]] = []
+
+        def fails(candidate: tuple[VerificationUnit, ...]) -> bool:
+            return {item.id for item in candidate} == {"a"}
+
+        culprit = parallel_ddmin(
+            units,
+            fails,
+            parallelism=2,
+            max_checks=8,
+            confirm_failure=fails,
+            checkpoint=lambda state: states.append(dict(state)),
+        )
+        self.assertEqual({"a"}, {item.id for item in culprit})
+        final_state = states[-1]
+        self.assertEqual(["a"], final_state["currentUnitIds"])
+        self.assertTrue(final_state["finished"])
+
+        calls = 0
+        def should_not_run(_candidate: tuple[VerificationUnit, ...]) -> bool:
+            nonlocal calls
+            calls += 1
+            return True
+
+        resumed = parallel_ddmin(
+            units,
+            should_not_run,
+            parallelism=2,
+            max_checks=8,
+            confirm_failure=should_not_run,
+            resume_state=final_state,
+        )
+        self.assertEqual(0, calls)
+        self.assertEqual({"a"}, {item.id for item in resumed})
+
+    def test_serial_confirmation_obeys_total_watchdog(self) -> None:
+        units = [VerificationUnit("a", ("a",)), VerificationUnit("b", ("b",))]
+        events: list[str] = []
+
+        def parallel_screen(candidate: tuple[VerificationUnit, ...]) -> bool:
+            return {item.id for item in candidate} == {"a"}
+
+        def hangs(_candidate: tuple[VerificationUnit, ...]) -> bool:
+            time.sleep(0.5)
+            return True
+
+        with self.assertRaises(LocalizationTimeoutError):
+            parallel_ddmin(
+                units,
+                parallel_screen,
+                parallelism=2,
+                max_checks=8,
+                confirm_failure=hangs,
+                progress=lambda event, _details: events.append(event),
+                progress_interval_seconds=1,
+                timeout_seconds=0.1,
+            )
+        self.assertIn("confirmation-heartbeat", events)
+        self.assertIn("timeout", events)
+
     def test_parallel_ddmin_has_total_watchdog(self) -> None:
         units = [VerificationUnit("a", ("a",)), VerificationUnit("b", ("b",))]
 

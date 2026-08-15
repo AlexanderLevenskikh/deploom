@@ -21,6 +21,7 @@ class LocalizationTimeoutError(RuntimeError):
 
 
 ProgressCallback = Callable[[str, Mapping[str, object]], None]
+CheckpointCallback = Callable[[Mapping[str, object]], None]
 
 
 @dataclass(frozen=True)
@@ -76,53 +77,131 @@ def parallel_ddmin(
     progress_interval_seconds: float = 15.0,
     timeout_seconds: Optional[float] = None,
     confirm_failure: Optional[Callable[[Tuple[VerificationUnit, ...]], bool]] = None,
+    resume_state: Optional[Mapping[str, object]] = None,
+    checkpoint: Optional[CheckpointCallback] = None,
 ) -> Tuple[VerificationUnit, ...]:
-    """Return a small failure-inducing subset using parallel delta debugging.
+    """Return a small failure-inducing subset using resumable parallel ddmin.
 
-    `fails(subset)` should be deterministic. Candidates at the same ddmin level
-    are evaluated concurrently. Results are consumed in deterministic input
-    order so increasing parallelism cannot change the selected culprit set.
-    When the verifier cannot prove host-level isolation, pass `confirm_failure`:
-    a parallel positive result then becomes screening evidence only and must
-    reproduce after the wave has fully stopped before it can shrink the search.
+    Parallel FAIL is screening evidence only when ``confirm_failure`` is set.
+    It may be cached across restarts, but it still cannot shrink the search
+    until the same candidate fails again in an isolated serial confirmation.
 
-    The watchdog is deliberately outside the worker callbacks: even if one
-    verifier process stops producing output, the coordinator still emits
-    heartbeats and eventually raises instead of waiting forever.
+    The checkpoint stores execution evidence, not solver authority.  A resumed
+    invocation keeps current subset/cache/check budget, while wall-clock timeout
+    starts fresh for the new process.
     """
-    current = tuple(units)
-    if len(current) <= 1 or max_checks <= 0:
-        return current
+    initial = tuple(units)
+    if len(initial) <= 1 or max_checks <= 0:
+        return initial
 
+    unit_by_id = {item.id: item for item in initial}
+    initial_ids = tuple(item.id for item in initial)
+    if len(unit_by_id) != len(initial_ids):
+        raise ValueError("VerificationUnit ids must be unique")
+
+    current = initial
     cache: Dict[Tuple[str, ...], bool] = {}
-    # A positive result produced while sibling candidates are running is only
-    # screening evidence. Project verifiers can share host-level resources
-    # (package-manager caches, daemons, ports, native tooling) even when their
-    # workspaces are isolated. Only a separately confirmed failure may shrink
-    # the search when confirm_failure is supplied.
     confirmed_failure_keys: set[Tuple[str, ...]] = set()
     checks = 0
+    n = 2
+    resumed_finished = False
+
     started = time.monotonic()
     deadline = started + timeout_seconds if timeout_seconds and timeout_seconds > 0 else None
     progress_interval_seconds = max(1.0, float(progress_interval_seconds or 15.0))
-
-    def emit(event: str, **details: object) -> None:
-        if progress is None:
-            return
-        payload = {
-            "elapsedSeconds": round(time.monotonic() - started, 1),
-            "checksStarted": checks,
-            "maxChecks": max_checks,
-            "currentUnits": len(current),
-            **details,
-        }
-        progress(event, payload)
 
     def key(candidate: Sequence[VerificationUnit]) -> Tuple[str, ...]:
         return tuple(sorted(item.id for item in candidate))
 
     def package_count(candidate: Sequence[VerificationUnit]) -> int:
         return len({name for item in candidate for name in item.packages})
+
+    def emit(event: str, **details: object) -> None:
+        if progress is None:
+            return
+        progress(event, {
+            "elapsedSeconds": round(time.monotonic() - started, 1),
+            "checksStarted": checks,
+            "maxChecks": max_checks,
+            "currentUnits": len(current),
+            **details,
+        })
+
+    def state_payload(reason: str, *, finished: bool = False) -> Dict[str, object]:
+        entries = []
+        for candidate_key in sorted(cache):
+            entries.append({
+                "unitIds": list(candidate_key),
+                "failed": bool(cache[candidate_key]),
+                "confirmedFailure": candidate_key in confirmed_failure_keys,
+            })
+        return {
+            "schemaVersion": 1,
+            "reason": reason,
+            "initialUnitIds": list(initial_ids),
+            "currentUnitIds": [item.id for item in current],
+            "granularity": n,
+            "checksStarted": checks,
+            "cache": entries,
+            "finished": finished,
+        }
+
+    def persist(reason: str, *, finished: bool = False) -> None:
+        if checkpoint is None:
+            return
+        try:
+            checkpoint(state_payload(reason, finished=finished))
+        except Exception as exc:
+            # Recovery cache failure must never change the solver result.
+            emit("checkpoint-error", reason=reason, error=f"{type(exc).__name__}: {exc}")
+
+    if resume_state is not None and int(resume_state.get("schemaVersion") or 0) == 1:
+        raw_initial = resume_state.get("initialUnitIds")
+        state_initial = tuple(str(item) for item in raw_initial) if isinstance(raw_initial, list) else ()
+        if state_initial == initial_ids:
+            raw_current = resume_state.get("currentUnitIds")
+            current_ids = tuple(str(item) for item in raw_current) if isinstance(raw_current, list) else ()
+            if (
+                current_ids
+                and len(set(current_ids)) == len(current_ids)
+                and all(item_id in unit_by_id for item_id in current_ids)
+            ):
+                current = tuple(unit_by_id[item_id] for item_id in current_ids)
+                try:
+                    n = max(2, min(len(current), int(resume_state.get("granularity") or 2)))
+                except (TypeError, ValueError):
+                    n = 2
+                try:
+                    checks = max(0, min(max_checks, int(resume_state.get("checksStarted") or 0)))
+                except (TypeError, ValueError):
+                    checks = 0
+
+                raw_cache = resume_state.get("cache")
+                if isinstance(raw_cache, list):
+                    for entry in raw_cache:
+                        if not isinstance(entry, dict):
+                            continue
+                        raw_ids = entry.get("unitIds")
+                        if not isinstance(raw_ids, list):
+                            continue
+                        ids = tuple(sorted(str(item) for item in raw_ids))
+                        if not ids or any(item_id not in unit_by_id for item_id in ids):
+                            continue
+                        failed = bool(entry.get("failed"))
+                        cache[ids] = failed
+                        if failed and bool(entry.get("confirmedFailure")):
+                            confirmed_failure_keys.add(ids)
+
+                resumed_finished = bool(resume_state.get("finished"))
+                emit(
+                    "resume",
+                    resumedUnits=len(current),
+                    resumedPackages=package_count(current),
+                    resumedChecks=checks,
+                    cachedResults=len(cache),
+                    confirmedFailures=len(confirmed_failure_keys),
+                    finished=resumed_finished,
+                )
 
     def evaluate_many(candidates: Sequence[Tuple[VerificationUnit, ...]], *, wave: str) -> List[bool | None]:
         nonlocal checks
@@ -138,6 +217,7 @@ def parallel_ddmin(
         if not pending:
             return results
 
+        persist("wave-start")
         workers = max(1, min(parallelism, len(pending)))
         emit("wave-start", wave=wave, candidates=len(pending), active=workers)
         pool = ThreadPoolExecutor(max_workers=workers)
@@ -187,6 +267,7 @@ def parallel_ddmin(
                     for future in unfinished:
                         future.cancel()
                     emit("timeout", wave=wave, active=len(unfinished), timeoutSeconds=timeout_seconds)
+                    persist("timeout")
                     raise LocalizationTimeoutError(
                         f"localization exceeded {int(timeout_seconds or 0)}s with {len(unfinished)} check(s) still active"
                     )
@@ -198,22 +279,20 @@ def parallel_ddmin(
                     emit("heartbeat", wave=wave, active=len(unfinished), completed=len(future_map) - len(unfinished))
                     last_heartbeat = time.monotonic()
                     continue
-                # Consume completed futures in deterministic candidate order.
-                ordered_done = sorted(done, key=lambda future: future_map[future][0])
-                for future in ordered_done:
+
+                for future in sorted(done, key=lambda item: future_map[item][0]):
                     index, candidate, _check_number = future_map[future]
                     value = bool(future.result())
                     cache[key(candidate)] = value
                     results[index] = value
+                    persist("check-finish")
+
                 if time.monotonic() - last_heartbeat >= progress_interval_seconds:
                     emit("heartbeat", wave=wave, active=len(unfinished), completed=len(future_map) - len(unfinished))
                     last_heartbeat = time.monotonic()
         except Exception:
             for future in future_map:
                 future.cancel()
-            # Do not let ThreadPoolExecutor.__exit__ turn one failed/hung check
-            # into an unbounded wait. Running verifier callbacks have their own
-            # hard process/attempt watchdog and will terminate independently.
             pool.shutdown(wait=False, cancel_futures=True)
             raise
         else:
@@ -242,7 +321,49 @@ def parallel_ddmin(
                 candidateUnits=len(candidate),
                 candidatePackages=package_count(candidate),
             )
-            confirmed = bool(confirm_failure(candidate))
+
+            # Strictly one proof worker. Coordinator remains free to emit output.
+            pool = ThreadPoolExecutor(max_workers=1)
+            future = pool.submit(confirm_failure, candidate)
+            try:
+                while not future.done():
+                    now = time.monotonic()
+                    if deadline is not None and now >= deadline:
+                        future.cancel()
+                        emit(
+                            "timeout",
+                            wave=wave,
+                            phase="confirmation",
+                            candidateUnits=len(candidate),
+                            candidatePackages=package_count(candidate),
+                            timeoutSeconds=timeout_seconds,
+                        )
+                        persist("confirmation-timeout")
+                        raise LocalizationTimeoutError(
+                            f"localization exceeded {int(timeout_seconds or 0)}s during serial confirmation"
+                        )
+
+                    wait_for = progress_interval_seconds
+                    if deadline is not None:
+                        wait_for = max(0.1, min(wait_for, deadline - now))
+                    done, _ = wait({future}, timeout=wait_for, return_when=FIRST_COMPLETED)
+                    if not done:
+                        emit(
+                            "confirmation-heartbeat",
+                            wave=wave,
+                            confirmationElapsedSeconds=round(time.monotonic() - confirmation_started, 1),
+                            candidateUnits=len(candidate),
+                            candidatePackages=package_count(candidate),
+                        )
+
+                confirmed = bool(future.result())
+            except Exception:
+                future.cancel()
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                pool.shutdown(wait=True)
+
             emit(
                 "confirmation-finish",
                 wave=wave,
@@ -251,17 +372,23 @@ def parallel_ddmin(
                 candidateUnits=len(candidate),
                 candidatePackages=package_count(candidate),
             )
-            # Never retain a parallel-only FAIL in the ddmin cache. If the
-            # isolated confirmation passes, future waves must see this candidate
-            # as non-failing instead of repeatedly following contaminated evidence.
+
             cache[candidate_key] = confirmed
             if confirmed:
                 confirmed_failure_keys.add(candidate_key)
+            else:
+                confirmed_failure_keys.discard(candidate_key)
+            persist("confirmation-finish")
+
+            if confirmed:
                 return candidate
         return None
 
     emit("start", units=len(current), packages=package_count(current), parallelism=parallelism)
-    n = 2
+    if resumed_finished:
+        emit("finish", units=len(current), packages=package_count(current), resumed=True)
+        return current
+
     while len(current) >= 2 and checks < max_checks:
         parts = [tuple(part) for part in _partitions(current, n)]
         subset_wave = f"subsets/{n}"
@@ -269,8 +396,9 @@ def parallel_ddmin(
         failing_subset = first_confirmed_failure(parts, subset_results, wave=subset_wave)
         if failing_subset is not None:
             current = failing_subset
-            emit("shrink", reason="failing-subset", units=len(current), packages=package_count(current))
             n = max(2, n - 1)
+            emit("shrink", reason="failing-subset", units=len(current), packages=package_count(current))
+            persist("shrink")
             continue
 
         complements = [tuple(item for item in current if item not in part) for part in parts]
@@ -280,13 +408,17 @@ def parallel_ddmin(
         failing_complement = first_confirmed_failure(complements, complement_results, wave=complement_wave)
         if failing_complement is not None:
             current = failing_complement
-            emit("shrink", reason="failing-complement", units=len(current), packages=package_count(current))
             n = max(2, n - 1)
+            emit("shrink", reason="failing-complement", units=len(current), packages=package_count(current))
+            persist("shrink")
             continue
 
         if n >= len(current):
             break
         n = min(len(current), n * 2)
+        persist("granularity")
 
     emit("finish", units=len(current), packages=package_count(current))
+    persist("finish", finished=True)
     return current
+
