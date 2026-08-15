@@ -36,7 +36,7 @@ runPip([
 // TOOL_VENDOR_PLATFORM lets Linux CI prepare a Windows bundle.
 const targetPlatform = process.env.TOOL_VENDOR_PLATFORM || (
   process.platform === "win32" ? "win_amd64" :
-  process.platform === "darwin" ? (process.arch === "arm64" ? "macosx_11_0_arm64" : "macosx_12_7_x86_64") :
+  process.platform === "darwin" ? (process.arch === "arm64" ? "macosx_11_0_arm64" : "macosx_11_0_x86_64") :
   (process.arch === "arm64" ? "manylinux_2_34_aarch64" : "manylinux2014_x86_64")
 );
 

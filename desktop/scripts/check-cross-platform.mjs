@@ -19,6 +19,8 @@ if (isToolManagedWorktreePath('/tmp/CaseTemp/dependency-flow-planner-1', '/tmp/c
 const builder = readFileSync(new URL('../electron-builder.yml', import.meta.url), 'utf8')
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 const main = readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8')
+const prepareTool = readFileSync(new URL('./prepare-tool.mjs', import.meta.url), 'utf8')
+const solverRequirements = readFileSync(new URL('../../requirements-solver.txt', import.meta.url), 'utf8')
 for (const expected of [
   'appId: io.github.alexanderlevenskikh.deploom',
   'productName: DepLoom',
@@ -31,7 +33,23 @@ for (const expected of [
   if (!builder.includes(expected)) throw new Error(`Cross-platform packager contract missing: ${expected}`)
 }
 for (const script of ['package:win', 'package:linux', 'package:mac:x64', 'package:mac:arm64']) {
-  if (!pkg.scripts?.[script]) throw new Error(`Missing packaging script: ${script}`)
+  const command = pkg.scripts?.[script]
+  if (!command) throw new Error(`Missing packaging script: ${script}`)
+  if (!command.startsWith('npm run build && ')) {
+    throw new Error(`Packaging script must build dist + dist-electron in its own fresh CI job: ${script}`)
+  }
+}
+if (!pkg.scripts?.['package:win:ci']?.startsWith('npm run build && ')) {
+  throw new Error('Cross-compiled Windows packaging must also build dist + dist-electron first')
+}
+if (!pkg.scripts?.['package:win:ci']?.includes('TOOL_VENDOR_PLATFORM=win_amd64')) {
+  throw new Error('Cross-compiled Windows packaging must vendor the Windows Z3 wheel')
+}
+if (!solverRequirements.includes('z3-solver==4.13.0.0')) {
+  throw new Error('Packaged Solver must use the cross-platform Z3 pin verified by all release targets')
+}
+if (!prepareTool.includes('macosx_11_0_x86_64') || !prepareTool.includes('macosx_11_0_arm64')) {
+  throw new Error('macOS tool vendoring must target the wheel tags supported by the shared Z3 pin')
 }
 if (!main.includes("process.kill(-pid, 'SIGTERM')") || !main.includes("process.kill(-pid, 'SIGKILL')")) throw new Error('POSIX process-tree termination is not wired')
 if ((main.match(/detached: processTreeDetached\(\)/g) || []).length < 3) throw new Error('All command/server spawn paths must create a POSIX process group')
