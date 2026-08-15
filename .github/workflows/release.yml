@@ -140,9 +140,15 @@ jobs:
             desktop/release/DepLoom-Setup-*.exe
             desktop/release/DepLoom-Setup-*.exe.blockmap
             desktop/release/latest.yml
-            desktop/package-win-attempt-*.log
           if-no-files-found: error
           retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: deploom-windows-package-logs
+          path: desktop/package-win-attempt-*.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   package-linux:
     needs: validate
@@ -272,11 +278,21 @@ jobs:
         run: |
           set -euo pipefail
           version="$(tr -d '\r\n' < VERSION)"
-          test -f "release-assets/DepLoom-Setup-$version-x64.exe"
-          test -f "release-assets/DepLoom-Setup-$version-x64.exe.blockmap"
-          test -f release-assets/latest.yml
-          test -f "release-assets/DepLoom-$version-x64.AppImage"
-          test -f release-assets/latest-linux.yml
+          echo "Downloaded release assets:"
+          find release-assets -maxdepth 3 -type f -printf '%P\n' | sort
+
+          require_asset() {
+            if [[ ! -f "$1" ]]; then
+              echo "::error::Missing release asset: $1"
+              exit 1
+            fi
+          }
+
+          require_asset "release-assets/DepLoom-Setup-$version-x64.exe"
+          require_asset "release-assets/DepLoom-Setup-$version-x64.exe.blockmap"
+          require_asset "release-assets/latest.yml"
+          require_asset "release-assets/DepLoom-$version-x64.AppImage"
+          require_asset "release-assets/latest-linux.yml"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" release-assets/DepLoom-* release-assets/latest.yml release-assets/latest-linux.yml --clobber
             gh release edit "$GITHUB_REF_NAME" --title "DepLoom $version" --notes "DepLoom $version. Supported public desktop builds: Windows x64 and Linux x64. macOS x64/arm64 packages are CI-validated but intentionally not published until Developer ID signing and notarization are configured."
