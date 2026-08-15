@@ -1,10 +1,11 @@
-import { join } from 'node:path'
+import { win32 } from 'node:path'
 import { decodeProcessOutputChunk, packageManagerResolutionHint, resolveExecutable, resolveSpawnInvocation } from '../dist-electron/process-launcher.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from '../dist-electron/opencode-runtime.js'
 
-const appData = join('/virtual', 'AppData', 'Roaming')
-const yarnShim = join(appData, 'npm', 'yarn.cmd')
-const fakeExists = (path) => path === yarnShim
+const appData = win32.join(String.raw`C:\virtual`, 'AppData', 'Roaming')
+const yarnShim = win32.join(appData, 'npm', 'yarn.cmd')
+const fakeExists = (path) =>
+  win32.normalize(path).toLowerCase() === win32.normalize(yarnShim).toLowerCase()
 const options = {
   platform: 'win32',
   env: { APPDATA: appData, COMSPEC: 'C:\\Windows\\System32\\cmd.exe', PATH: '' },
