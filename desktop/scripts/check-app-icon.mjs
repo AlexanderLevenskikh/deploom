@@ -9,5 +9,7 @@ const png = readFileSync(iconPng)
 if (ico[0] !== 0 || ico[1] !== 0 || ico[2] !== 1 || ico[3] !== 0) throw new Error('build/icon.ico is not a Windows icon')
 if (png.subarray(1, 4).toString('ascii') !== 'PNG') throw new Error('build/icon.png is not a PNG')
 const builder = readFileSync(new URL('../electron-builder.yml', import.meta.url), 'utf8')
-if (!builder.includes('icon: build/icon.ico') || !builder.includes('- build/icon.ico')) throw new Error('Packager is not configured to use/include the application icon')
-console.log('Application icon assets OK')
+for (const required of ['productName: DepLoom', 'icon: build/icon.ico', 'icon: build/icon.png', '- build/icon.ico', '- build/icon.png']) {
+  if (!builder.includes(required)) throw new Error(`Packager icon/identity contract missing: ${required}`)
+}
+console.log('DepLoom Windows/macOS/Linux icon assets OK')

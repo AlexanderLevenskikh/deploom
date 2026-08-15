@@ -1,5 +1,5 @@
-appId: io.github.frontenddepsflow.app
-productName: Dependency Flow
+appId: io.github.alexanderlevenskikh.deploom
+productName: DepLoom
 directories:
   output: release
 
@@ -26,19 +26,25 @@ win:
   icon: build/icon.ico
   target: nsis
 nsis:
-  artifactName: Dependency-Flow-Setup-${version}.${ext}
+  artifactName: DepLoom-Setup-${version}-${arch}.${ext}
   oneClick: false
   perMachine: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
-  shortcutName: Dependency Flow
+  shortcutName: DepLoom
 mac:
   icon: build/icon.png
-  target: dmg
+  category: public.app-category.developer-tools
+  target:
+    - dmg
+    - zip
+  artifactName: DepLoom-${version}-${arch}.${ext}
 linux:
   icon: build/icon.png
+  category: Development
   target: AppImage
+  artifactName: DepLoom-${version}-${arch}.${ext}
 publish:
   provider: github
   owner: AlexanderLevenskikh

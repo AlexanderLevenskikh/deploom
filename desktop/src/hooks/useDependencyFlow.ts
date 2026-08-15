@@ -74,7 +74,7 @@ function autopilotActionInput(details: WorkspaceDetails, state: AutopilotState, 
     workspaceId: state.workspaceId,
     projectName: state.projectName,
     target: state.target,
-    label: action === 'baseline' ? `Dependency Flow: autopilot ${new Date().toISOString().slice(0, 10)}` : 'Dependency Flow: autopilot',
+    label: action === 'baseline' ? `DepLoom: autopilot ${new Date().toISOString().slice(0, 10)}` : 'DepLoom: autopilot',
     releaseBranch: state.releaseBranch || project?.git?.releaseBranch || `${project?.git?.baseBranch || project?.git?.branchPrefix || 'libs'}-release`,
     commitMessage: `chore(deps): save ${state.projectName} roadmap state`,
     autopilot: true,
@@ -329,7 +329,7 @@ export function useDependencyFlow() {
       action: 'generate',
       workspaceId: next.workspaceId,
       projectName: next.projectName,
-      label: 'Dependency Flow: автоматический пересчёт после изменения scope',
+      label: 'DepLoom: автоматический пересчёт после изменения scope',
     }
     setPendingRoadmapRecalc((current) => {
       const rest = (current ?? []).slice(1)

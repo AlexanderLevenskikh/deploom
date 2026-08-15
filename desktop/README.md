@@ -1,6 +1,6 @@
-# Dependency Flow Desktop
+# DepLoom Desktop
 
-Electron frontend DepLoom; установленное приложение пока сохраняет совместимое имя Dependency Flow. Приложение запускает Python tool из того же release и работает с отдельным team-state repository, где лежат только конфиги, knowledge, history и artifacts.
+Основной пользовательский продукт DepLoom. Electron Control Plane запускает bundled Python core из того же release, управляет Git/worktree, agent sessions, recovery/merge/release state и показывает прогресс. На машине пользователя нужен Python 3: `python` на Windows или `python3` на Linux/macOS.
 
 ## Development
 
@@ -10,19 +10,42 @@ npm run build
 npm run dev
 ```
 
-## Windows installer
+## Packaging
 
 ```bash
 npm run package:win
+npm run package:linux
+npm run package:mac:x64
+npm run package:mac:arm64
 ```
 
-Команда устанавливает Python-зависимости в ignored `vendor/`, собирает desktop и включает корневой Python tool в `resources/tool`. Результат: `release/Dependency-Flow-Setup-<version>.exe`.
+Артефакты имеют единое публичное имя DepLoom:
 
-Основной release pipeline — `.github/workflows/release.yml`. Тег `vX.Y.Z` должен совпадать с `../VERSION` и `package.json`; GitHub Release получает installer, blockmap и `latest.yml`. Публичный release source — `AlexanderLevenskikh/deploom`; desktop-updater не зависит от какого-либо внутреннего Git hosting.
+- Windows x64: `release/DepLoom-Setup-<version>-x64.exe` + blockmap + `latest.yml`;
+- Linux x64: `release/DepLoom-<version>-x64.AppImage` + `latest-linux.yml`;
+- macOS x64/arm64: `release/DepLoom-<version>-<arch>.dmg/.zip` + `latest-mac.yml`.
+
+`prepare-tool.mjs` кладёт portable Python dependencies и Z3 wheel **для конкретной target OS/arch** в `vendor/`, после чего packager включает их в `resources/tool`. Runtime выбирает `python`/`python3` по ОС и завершает timeout/cancel целым process tree, а не только непосредственным child.
+
+### Статус платформ
+
+Windows x64 и Linux x64 публикуются в GitHub Releases и считаются supported. macOS x64/arm64 уже собирается и smoke-проверяется в GitHub Actions, но **не прикладывается к публичному Release**, пока не настроены Apple Developer ID signing и notarization. Это намеренная release gate: `electron-updater` на macOS требует подписанное приложение.
 
 ## Обновления
 
-Приложение проверяет **публичный GitHub Release `AlexanderLevenskikh/deploom`** через `electron-updater` через 10 секунд после запуска и затем каждые 30 минут. `electron-builder` вшивает GitHub feed в `app-update.yml`, поэтому клиенту не нужен API-ключ, token или отдельная настройка доступа. Новый installer скачивается в фоне; кнопка обновления становится активной, когда новая версия уже готова к установке.
+Приложение проверяет **публичный GitHub Release `AlexanderLevenskikh/deploom`** через 10 секунд после запуска и затем каждые 30 минут. `electron-builder` вшивает GitHub feed в `app-update.yml`; runtime не использует `setFeedURL`, API-ключ или приватный registry. Windows публикует `latest.yml`, Linux — `latest-linux.yml`; macOS CI проверяет `latest-mac.yml`, но публичное macOS-обновление включится только вместе с подписанным/notarized release.
+
+## State repository
+
+Командный workspace остаётся **team-state repository**: Desktop хранит там настройки команды, knowledge/history, flow state и воспроизводимые артефакты, а локальные runtime caches и скачанные обновления в Git не форсируются. Это состояние общее для поддерживаемых Desktop-платформ и не является вторым orchestration backend.
+
+## GUI PATH
+
+На Linux/macOS DepLoom не запускает пользовательские shell startup scripts, но расширяет унаследованный **GUI PATH** стандартными `/usr/local/bin`, Homebrew и пользовательскими Volta/asdf/pnpm/local bin-каталогами. Это позволяет находить `python3`, Node/package managers и agent CLI при запуске из Dock/desktop без небезопасного выполнения `.zshrc`/`.bashrc`.
+
+## CLI boundary
+
+Python entry points в корне репозитория остаются low-level headless tooling (baseline/roadmap/audit/validation/branch helpers). Они **не являются полным CLI-аналогом Autopilot**. Мы намеренно не дублируем Electron state machine: orchestration, agent sessions, recovery, merge/release и persistent UI state имеют одного владельца — Desktop Control Plane.
 
 ## Работа с этапами FLOW
 

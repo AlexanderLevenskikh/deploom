@@ -43,7 +43,7 @@ export function SetupScreen({ busy, onSelectExisting, onPickParent, onCreate }: 
           <label>Родительская папка<div className="input-action"><input value={parentPath} onChange={(event) => setParentPath(event.target.value)} placeholder="Выберите папку" /><button type="button" className="icon-button" title="Выбрать папку" onClick={() => void chooseParent()}><FolderGit2 size={17} /></button></div></label>
           <label>Имя папки<input value={folderName} onChange={(event) => setFolderName(event.target.value)} /></label>
           <label>Командный remote <span className="optional">необязательно</span><input value={teamRemote} onChange={(event) => setTeamRemote(event.target.value)} placeholder="git@git.example/team/dependency-roadmap.git" /></label>
-          <div className="setup-note">Dependency Flow сам создаст Git-репозиторий, <code>.dependency-roadmap</code>, начальный конфиг и commit. Если указан командный remote, он будет добавлен как <code>origin</code>.</div>
+          <div className="setup-note">DepLoom сам создаст Git-репозиторий, <code>.dependency-roadmap</code>, начальный конфиг и commit. Если указан командный remote, он будет добавлен как <code>origin</code>.</div>
           <button className="button primary wide" disabled={busy || !parentPath.trim() || !folderName.trim()}>{busy ? <LoaderCircle className="spin" size={17} /> : <GitFork size={17} />} Создать и подключить</button>
         </form>
       </section>

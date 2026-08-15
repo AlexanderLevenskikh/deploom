@@ -66,6 +66,7 @@ jobs:
       - name: Desktop contract checks
         working-directory: desktop
         run: |
+          npm run check:cross-platform
           npm run check:updater-runtime
           npm run check:updater-schedule
           npm run check:updater-error

@@ -1,34 +1,42 @@
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const workflow = readFileSync(join(root, ".github", "workflows", "release.yml"), "utf8");
-const builder = readFileSync(join(root, "desktop", "electron-builder.yml"), "utf8");
-
-const requiredWorkflow = [
-  "gh release create $env:GITHUB_REF_NAME",
-  "$installer",
-  '"$installer.blockmap"',
-  "'release/latest.yml'",
-  "GH_TOKEN: ${{ github.token }}",
-  "contents: write",
-];
-for (const needle of requiredWorkflow) {
-  if (!workflow.includes(needle)) throw new Error(`Missing public GitHub release asset contract: ${needle}`);
-}
+const root = join(dirname(fileURLToPath(import.meta.url)), '..')
+const workflow = readFileSync(join(root, '.github', 'workflows', 'release.yml'), 'utf8')
+const builder = readFileSync(join(root, 'desktop', 'electron-builder.yml'), 'utf8')
+const main = readFileSync(join(root, 'desktop', 'electron', 'main.ts'), 'utf8')
 
 for (const needle of [
-  "provider: github",
-  "owner: AlexanderLevenskikh",
-  "repo: deploom",
-  "releaseType: release",
+  'package-windows:',
+  'package-linux:',
+  'package-macos:',
+  'publish-release:',
+  'DepLoom-Setup-$version-x64.exe',
+  'DepLoom-$version-x64.AppImage',
+  'latest.yml',
+  'latest-linux.yml',
+  'latest-mac.yml',
+  'deploom-macos-${{ matrix.arch }}-unsigned-smoke',
+  'gh release create "$GITHUB_REF_NAME"',
+  'GH_TOKEN: ${{ github.token }}',
+  'contents: write',
 ]) {
-  if (!builder.includes(needle)) throw new Error(`Missing electron-builder GitHub provider contract: ${needle}`);
+  if (!workflow.includes(needle)) throw new Error(`Missing public GitHub release/platform asset contract: ${needle}`)
 }
-
-if (/setFeedURL\s*\(/.test(readFileSync(join(root, "desktop", "electron", "main.ts"), "utf8"))) {
-  throw new Error("Desktop updater must use packaged app-update.yml instead of a runtime token/feed override");
+for (const needle of [
+  'appId: io.github.alexanderlevenskikh.deploom',
+  'productName: DepLoom',
+  'provider: github',
+  'owner: AlexanderLevenskikh',
+  'repo: deploom',
+  'releaseType: release',
+  'target: AppImage',
+  '- dmg',
+  '- zip',
+]) {
+  if (!builder.includes(needle)) throw new Error(`Missing electron-builder public/cross-platform contract: ${needle}`)
 }
-
-console.log("Public GitHub release assets/update provider contract OK");
+if (/setFeedURL\s*\(/.test(main)) throw new Error('Desktop updater must use packaged app-update.yml instead of a runtime token/feed override')
+if (workflow.includes('release-assets/DepLoom-') && !workflow.includes('latest-linux.yml')) throw new Error('Linux release payload must include latest-linux.yml')
+console.log('Public GitHub Windows/Linux release + macOS smoke/update provider contract OK')

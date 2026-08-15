@@ -26,7 +26,7 @@ try {
   assert.match(gitignore, /artifacts\/\*/, 'generated roadmap artifacts must stay untracked')
   assert.ok(calls.some((call) => call.command === 'git' && call.args[0] === 'init'), 'new workspace must initialize Git locally')
   assert.ok(calls.some((call) => call.args.includes('refs/heads/main')), 'bootstrap must use a deterministic initial branch')
-  assert.ok(calls.some((call) => call.args.includes('commit') && call.args.includes('chore: initialize Dependency Flow workspace')), 'new workspace must get a root commit')
+  assert.ok(calls.some((call) => call.args.includes('commit') && call.args.includes('chore: initialize DepLoom workspace')), 'new workspace must get a root commit')
   assert.ok(calls.some((call) => call.args.join(' ') === 'remote add origin git@example.test:team/deps-workspace.git'), 'optional team remote must be origin')
 
   const setup = readFileSync(join(root, 'src', 'components', 'SetupScreen.tsx'), 'utf8')

@@ -199,6 +199,9 @@ class YarnNpmAuditBridgeRegressionTests(unittest.TestCase):
             reproduce = (workspace / "reproduce-npm-audit.cmd").read_text(encoding="utf-8")
             self.assertIn("npm audit --json --package-lock-only --legacy-peer-deps %*", reproduce)
             self.assertNotIn("nexus.example", reproduce)
+            reproduce_sh = (workspace / "reproduce-npm-audit.sh").read_text(encoding="utf-8")
+            self.assertIn('exec npm audit --json --package-lock-only --legacy-peer-deps "$@"', reproduce_sh)
+            self.assertNotIn("nexus.example", reproduce_sh)
             self.assertFalse((project / "package-lock.json").exists())
 
     def test_persistent_workspace_reuses_existing_package_lock(self) -> None:

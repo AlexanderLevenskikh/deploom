@@ -141,7 +141,7 @@ export function countTrackedDirtyChanges(porcelainOutput: string): number {
 }
 
 // Identifies only known IDE/OS paths for diagnostics and tests. Runtime gates
-// filter these entries in memory: Dependency Flow must not stash, delete or
+// filter these entries in memory: DepLoom must not stash, delete or
 // commit a user's IDE state merely because the project is open in an editor.
 export function strayUntrackedPaths(porcelainOutput: string): string[] {
   return porcelainOutput

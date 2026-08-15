@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 — First public DepLoom release
+## 0.2.1 — First public DepLoom release
 
 - First public release from a sanitized, fresh-history source snapshot; private/internal Git history is intentionally not part of the public repository.
 - Baseline structural verification now compares normalized diagnostics, confirms project-derived dependency evidence before learning constraints, and covers known ESM/CJS, TypeScript module-resolution and toolchain-runtime incompatibility classes before Executor.
@@ -8,6 +8,11 @@
 - Added immutable materialization proofs and watchdog/heartbeat progress for long Baseline localization/reproduction work, including process-tree termination on hard stalls.
 - Public auto-update feed is pinned to GitHub Releases in `AlexanderLevenskikh/deploom`; packaged clients check shortly after startup and every 30 minutes, auto-download valid updates, and install on quit or explicit user action.
 - Removed private GitLab CI configuration and temporary development patch artifacts from the public source snapshot.
+- Rebranded the installed application identity to `DepLoom` (`io.github.alexanderlevenskikh.deploom`) before the first public installer, including installer/artifact names and Windows AppUserModelId.
+- Added supported Linux x64 AppImage packaging with `latest-linux.yml`, platform-correct bundled Z3 verification and public GitHub Release upload.
+- Added macOS x64/arm64 DMG+ZIP CI packaging/smoke verification; macOS artifacts remain intentionally unpublished until Developer ID signing and notarization are configured.
+- Desktop command execution is now platform-neutral: `python3` on POSIX, dedicated POSIX process groups for complete child-tree termination, platform-aware icons, and case-correct path containment.
+- Clarified that the Python entry points are advanced/headless core tooling, not a second full Autopilot orchestration implementation.
 
 ## 0.1.132 — Baseline watchdog, progress and structural runtime hardening
 

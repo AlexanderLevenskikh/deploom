@@ -45,7 +45,7 @@ for (const needle of required) {
 if (prompt.includes('Save the compact manifest below **unchanged**')) throw new Error('Desktop executor must replace the legacy scope-save instruction')
 const desktopAwarePrompt = legacyPrompt.replace(
   '1. Save the compact manifest below **unchanged** to `C:\\history\\runs\\<timestamp>_Demo_scope.json`; validator supports `compact-v1`.',
-  '1. When run through Dependency Flow Desktop, the executor contract at the top of the materialized batch prompt provides the authoritative pre-written scope-manifest path; use that file and **do not create a duplicate**. Outside Desktop, save the compact manifest below unchanged to `C:\\history\\runs\\<timestamp>_Demo_scope.json`; validator supports `compact-v1`.',
+  '1. When run through DepLoom Desktop, the executor contract at the top of the materialized batch prompt provides the authoritative pre-written scope-manifest path; use that file and **do not create a duplicate**. Outside Desktop, save the compact manifest below unchanged to `C:\\history\\runs\\<timestamp>_Demo_scope.json`; validator supports `compact-v1`.',
 )
 const desktopAware = injectExecutorBatchContext(desktopAwarePrompt, { batchIndex: 0, batchCount: 1, packages: ['jsdom', 'vitest'], scopeHash: 'f4981ff8', scopeManifestPath: scopePath, shell: 'windows-powershell' })
 if (desktopAware.includes('Outside Desktop, save the compact manifest')) throw new Error('Materialized Desktop prompt must replace the generic scope-save fallback with the exact pre-written scope path')

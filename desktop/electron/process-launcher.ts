@@ -12,6 +12,40 @@ type ResolveOptions = {
 
 const WINDOWS_EXECUTABLE_EXTENSIONS = ['.exe', '.com', '.cmd', '.bat'] as const
 
+/** Build the environment used by GUI-launched child processes.
+ *
+ * Finder/desktop launchers often provide a much smaller PATH than an
+ * interactive shell. Keep the inherited PATH authoritative, but append common
+ * POSIX tool locations and package-manager homes so git/python3/node/yarn and
+ * agent CLIs remain discoverable without running user shell startup scripts.
+ */
+export function commandEnvironment(
+  source: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  if (platform === 'win32') return { ...source }
+  const home = source.HOME?.trim()
+  const bunBin = source.BUN_INSTALL?.trim() ? join(source.BUN_INSTALL, 'bin') : undefined
+  const inherited = (source.PATH ?? '').split(delimiter).map((item) => item.trim()).filter(Boolean)
+  const extras = [
+    source.NVM_BIN,
+    source.FNM_MULTISHELL_PATH,
+    source.PNPM_HOME,
+    source.VOLTA_HOME ? join(source.VOLTA_HOME, 'bin') : undefined,
+    bunBin,
+    home ? join(home, '.local', 'bin') : undefined,
+    home ? join(home, '.volta', 'bin') : undefined,
+    home ? join(home, '.asdf', 'shims') : undefined,
+    home ? join(home, '.local', 'share', 'pnpm') : undefined,
+    platform === 'darwin' ? '/opt/homebrew/bin' : undefined,
+    platform === 'linux' ? '/home/linuxbrew/.linuxbrew/bin' : undefined,
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+  ].filter((item): item is string => Boolean(item && item.trim()))
+  return { ...source, PATH: [...new Set([...inherited, ...extras])].join(delimiter) }
+}
+
 function windowsSearchDirectories(env: NodeJS.ProcessEnv, pathValue: string, platform: NodeJS.Platform): string[] {
   const entries = pathValue.split(platform === 'win32' ? ';' : delimiter).map((item) => item.trim()).filter(Boolean)
   const extras = [
@@ -37,6 +71,10 @@ function windowsSearchDirectories(env: NodeJS.ProcessEnv, pathValue: string, pla
 export function resolveExecutable(command: string, options: ResolveOptions = {}): string {
   if (command.includes('/') || command.includes('\\')) return command
   const platform = options.platform ?? process.platform
+  // The desktop command model intentionally uses the logical name `python`.
+  // Windows installations commonly expose `python.exe`, while Linux/macOS
+  // reliably expose Python 3 as `python3` and often have no `python` alias.
+  if (command === 'python' && platform !== 'win32') return 'python3'
   if (platform !== 'win32') return command
   const env = options.env ?? process.env
   const fileExists = options.fileExists ?? existsSync
@@ -96,6 +134,26 @@ export function resolveSpawnInvocation(command: string, args: string[], options:
   return { command: resolvedExecutable, args, resolvedExecutable }
 }
 
+
+/** Spawn long-lived/killable children as their own POSIX process group.
+ *
+ * Windows uses taskkill /T, so detached process groups are unnecessary there.
+ * On Linux/macOS a negative PID signal can only terminate the whole descendant
+ * tree when the child is the leader of its own process group.
+ */
+export function processTreeDetached(platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== 'win32'
+}
+
+/** Normalize filesystem paths for containment checks without breaking POSIX
+ * case sensitivity. Windows paths are case-insensitive; Linux/macOS paths must
+ * preserve case (macOS may use a case-sensitive volume).
+ */
+export function normalizePathForComparison(value: string, platform: NodeJS.Platform = process.platform): string {
+  const normalized = value.replace(/[\\/]+$/g, '')
+  return platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
 export function decodeProcessOutputChunk(chunk: Buffer, platform: NodeJS.Platform = process.platform): string {
   const utf8 = chunk.toString('utf8')
   if (platform !== 'win32' || !utf8.includes('\uFFFD')) return utf8
@@ -112,5 +170,5 @@ export function decodeProcessOutputChunk(chunk: Buffer, platform: NodeJS.Platfor
 export function packageManagerResolutionHint(command: string, resolvedExecutable: string): string | undefined {
   if (!['yarn', 'npm', 'pnpm', 'corepack'].includes(command)) return undefined
   if (resolvedExecutable !== command) return undefined
-  return `${command} не найден в PATH/Node manager paths. Запустите Dependency Flow из окружения, где доступен ${command}, либо добавьте Node/npm/Corepack в PATH.`
+  return `${command} не найден в PATH/Node manager paths. Запустите DepLoom из окружения, где доступен ${command}, либо добавьте Node/npm/Corepack в PATH.`
 }

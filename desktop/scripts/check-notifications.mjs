@@ -10,7 +10,7 @@ if (!autopilot.body.includes("опубликованы")) throw new Error("Autop
 const main = readFileSync(new URL("../electron/main.ts", import.meta.url), "utf8");
 const preload = readFileSync(new URL("../electron/preload.cts", import.meta.url), "utf8");
 const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-for (const required of ["Notification.isSupported()", "flow:set-notifications-enabled", "group-complete", "stage-complete", "app.setAppUserModelId('io.github.frontenddepsflow.app')"]) {
+for (const required of ["Notification.isSupported()", "flow:set-notifications-enabled", "group-complete", "stage-complete", "app.setAppUserModelId('io.github.alexanderlevenskikh.deploom')"]) {
   if (!main.includes(required)) throw new Error("Main notification wiring missing: " + required);
 }
 if (!preload.includes("setNotificationsEnabled") || !preload.includes("notifyAutopilotComplete")) throw new Error("Preload notification API is incomplete");

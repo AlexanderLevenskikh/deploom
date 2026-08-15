@@ -14,7 +14,7 @@ export function selectParallelGroupQueue(branches: readonly MigrationBranchProgr
   const skipped: string[] = []
   for (const branch of branches) {
     // Every incomplete branch may occupy a parallel slot. Existing checkouts
-    // are filtered by the executor's ownership check: Dependency Flow can adopt
+    // are filtered by the executor's ownership check: DepLoom can adopt
     // its own saved worktree (including partial dirty progress), but never the
     // canonical checkout or an arbitrary user worktree.
     if (!['waiting', 'created', 'partial', 'changes'].includes(branch.status)) continue

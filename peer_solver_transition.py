@@ -7,7 +7,7 @@ invalid.  This module treats each tentative cohort as one Boolean toggle:
 member's target version.  It then proves that every hard IR constraint is safe
 for arbitrary combinations of those toggles.
 
-For the IR used by Dependency Flow, a violation is a conjunction of exact toggle
+For the IR used by DepLoom, a violation is a conjunction of exact toggle
 requirements.  If a violation requires one tentative cohort to be applied and
 another to remain current, those cohorts cannot be independent; merging one
 opposite-valued pair makes that violation unreachable.  Repeating to a fixed

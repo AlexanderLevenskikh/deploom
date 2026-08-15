@@ -20,7 +20,7 @@ function App() {
   const details = payload?.details
 
   if (flow.loading || !payload) {
-    return <div className="splash"><Workflow size={28} /><strong>Dependency Flow</strong><span>Загрузка рабочего состояния…</span></div>
+    return <div className="splash"><Workflow size={28} /><strong>DepLoom</strong><span>Загрузка рабочего состояния…</span></div>
   }
 
   if (!details) {
@@ -44,13 +44,13 @@ function App() {
         ? 'Проверка обновлений…'
         : flow.updateStatus.state === 'error' ? 'Обновление недоступно' : 'Обновлений нет'
   const updateTitle = updateReady
-    ? `Установить Dependency Flow ${flow.updateStatus.version ?? ''}`.trim()
+    ? `Установить DepLoom ${flow.updateStatus.version ?? ''}`.trim()
     : flow.updateStatus.message || 'Кнопка станет доступна после автоматического скачивания новой версии.'
 
   return (
     <div className="app-shell">
       <header className="app-header">
-        <div className="app-brand"><div className="brand-mark small"><GitFork size={18} /></div><strong>Dependency Flow</strong></div>
+        <div className="app-brand"><div className="brand-mark small"><GitFork size={18} /></div><strong>DepLoom</strong></div>
         <label className="workspace-select">Workspace<select value={details.workspace.id} onChange={(event) => void flow.selectWorkspace(event.target.value)}>{payload.state.workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}</select></label>
         <div className="header-actions">
           <label className="notification-toggle" title="Показывать системные Windows-уведомления после каждого завершённого этапа FLOW и каждой мигрированной группы."><input type="checkbox" checked={payload.notificationsEnabled} onChange={(event) => void flow.setNotificationsEnabled(event.target.checked)} /><Bell size={15} /><span>Уведомления</span></label>
@@ -64,7 +64,7 @@ function App() {
       {flow.error ? <div className="error-banner" role="alert"><span>{flow.error}</span><button onClick={() => flow.setError(undefined)}>Закрыть</button></div> : null}
 
       <div className="app-grid">
-        <ProjectRail details={details} selected={project} active={flow.workspaceBusy} onRefreshAll={() => void flow.runAction({ action: 'generate-all', workspaceId: details.workspace.id, label: 'Dependency Flow: все проекты' })} onSelectProject={(name) => void flow.selectProject(name)} onAddProject={() => setShowAddProject(true)} onAddWorkspace={() => void flow.registerExisting()} />
+        <ProjectRail details={details} selected={project} active={flow.workspaceBusy} onRefreshAll={() => void flow.runAction({ action: 'generate-all', workspaceId: details.workspace.id, label: 'DepLoom: все проекты' })} onSelectProject={(name) => void flow.selectProject(name)} onAddProject={() => setShowAddProject(true)} onAddWorkspace={() => void flow.registerExisting()} />
 
         <main className="main-workspace">
           <div className="workspace-titlebar">
@@ -82,7 +82,7 @@ function App() {
 
 
       <footer className="status-bar">
-        <span>Dependency Flow {payload.appVersion}</span><span>Template: {details.git.branch}</span><span>Tool: {payload.environment.python.available ? 'готов' : 'нет Python'}</span><span className="status-spacer" /><span><i className={`status-dot ${payload.environment[details.workspace.agent]?.available ? 'success' : 'danger'}`} />{details.workspace.agent}: {payload.environment[details.workspace.agent]?.available ? 'доступен' : 'не найден'}</span><span>{details.git.dirty ? 'Workspace изменён' : 'Workspace чистый'}</span>
+        <span>DepLoom {payload.appVersion}</span><span>Template: {details.git.branch}</span><span>Tool: {payload.environment.python.available ? 'готов' : 'нет Python'}</span><span className="status-spacer" /><span><i className={`status-dot ${payload.environment[details.workspace.agent]?.available ? 'success' : 'danger'}`} />{details.workspace.agent}: {payload.environment[details.workspace.agent]?.available ? 'доступен' : 'не найден'}</span><span>{details.git.dirty ? 'Workspace изменён' : 'Workspace чистый'}</span>
       </footer>
     </div>
   )

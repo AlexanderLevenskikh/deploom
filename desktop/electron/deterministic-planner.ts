@@ -30,7 +30,7 @@ export function deterministicPlannerDecision(
       result: {
         status: 'refresh-plan',
         reason: options.ownedWorktree
-          ? 'Dependency Flow owns the referenced temp worktree; regenerate residual state without model arbitration.'
+          ? 'DepLoom owns the referenced temp worktree; regenerate residual state without model arbitration.'
           : /DEPENDENCY_COMPATIBILITY_EVIDENCE/.test(failure)
             ? 'Post-Executor dependency evidence must be reproduced/localized by deterministic Verifier and fed back to exact Z3; model arbitration is not version authority.'
             : 'Saved executor scope is mechanically stale; deterministic regeneration is sufficient.',

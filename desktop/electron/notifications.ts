@@ -21,19 +21,19 @@ const ACTION_LABELS: Record<FlowAction, string> = {
 
 export function flowNotificationContent(event: FlowNotificationEvent): { title: string; body: string } {
   if (event.kind === 'stage-complete') {
-    return { title: 'Dependency Flow · Этап завершён', body: event.projectName + ': ' + ACTION_LABELS[event.action] }
+    return { title: 'DepLoom · Этап завершён', body: event.projectName + ': ' + ACTION_LABELS[event.action] }
   }
   if (event.kind === 'group-complete') {
     const packageText = event.packages.length
       ? ' · ' + event.packages.slice(0, 3).join(', ') + (event.packages.length > 3 ? ' +' + (event.packages.length - 3) : '')
       : ''
     return {
-      title: 'Dependency Flow · Группа мигрирована',
+      title: 'DepLoom · Группа мигрирована',
       body: event.projectName + ': группа ' + event.index + ' из ' + event.total + ' (' + event.branch + ')' + packageText,
     }
   }
   return {
-    title: 'Dependency Flow · Автопилот завершён',
+    title: 'DepLoom · Автопилот завершён',
     body: event.projectName + (event.published ? ': FLOW завершён, изменения опубликованы' : ': доступный FLOW завершён'),
   }
 }

@@ -38,7 +38,7 @@ import { scopeExpansionCoverage, shouldUseSupervisorSeed, targetClosureFromRoadm
 import { summarizeUpdaterError } from './updater-error.js'
 import { flowNotificationContent, type FlowNotificationEvent } from './notifications.js'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { decodeProcessOutputChunk, packageManagerResolutionHint, resolveSpawnInvocation } from './process-launcher.js'
+import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveSpawnInvocation } from './process-launcher.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
 import { randomUUID } from 'node:crypto'
@@ -431,7 +431,7 @@ function writeBestEffortHandoff(job: JobRecord): string | undefined {
     const blockerLines = closure.lagBlockers.length
       ? closure.lagBlockers.map((blocker) => `- \`${blocker.package}\`${blocker.current ? ` ${blocker.current}` : ''}${blocker.required ? ` → требуется ${blocker.required}` : ''}${blocker.note ? ` — ${blocker.note}` : ''}`).join('\n')
       : '- Roadmap не содержит детализированных lag blockers; пересоберите verification перед следующей итерацией.'
-    const markdown = `# Dependency Flow — best-effort handoff\n\n` +
+    const markdown = `# DepLoom — best-effort handoff\n\n` +
       `Проект: **${job.projectName}**\n\n` +
       `Цель: **${job.target === 'green' ? 'Green' : 'Yellow'}**, достигнутый уровень: **${closure.current}**${typeof closure.lagOkPct === 'number' ? ` (${closure.lagOkPct.toFixed(1)}%)` : ''}.\n\n` +
       `Release-ветка: \`${job.releaseBranch || 'не зафиксирована'}\`.\n\n` +
@@ -574,14 +574,21 @@ function captureAgentSession(job: JobRecord, chunk: string): void {
   }
 }
 
-// `child.kill()` only signals the immediate process. On Windows that leaves any descendants
-// (npm/node/test runners spawned by agents or gate commands) running after cancel/timeout.
+// Every command is spawned as its own POSIX process group (or as a normal
+// Windows process tree). A timeout/cancel must terminate npm/node/test descendants
+// too; otherwise a hidden child can hold pipes, worktrees or package-manager locks.
 function killProcessTree(child: ChildProcessWithoutNullStreams): void {
-  if (process.platform === 'win32' && child.pid) {
-    spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true })
-  } else {
-    child.kill()
+  const pid = child.pid
+  if (!pid) return
+  if (process.platform === 'win32') {
+    spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { windowsHide: true })
+    return
   }
+  try { process.kill(-pid, 'SIGTERM') } catch { try { child.kill('SIGTERM') } catch { /* already gone */ } }
+  const hardKill = setTimeout(() => {
+    try { process.kill(-pid, 'SIGKILL') } catch { try { child.kill('SIGKILL') } catch { /* already gone */ } }
+  }, 3_000)
+  hardKill.unref()
 }
 
 // A killed process just looks like a non-zero exit to the caller, which for a
@@ -597,9 +604,9 @@ function spawnCapture(command: string, args: string[], cwd: string, timeoutMs = 
     let stderr = ''
     let settled = false
     let timedOut = false
-    const commandEnv = envOverrides ? { ...process.env, ...envOverrides } : process.env
+    const commandEnv = commandEnvironment(envOverrides ? { ...process.env, ...envOverrides } : process.env)
     const invocation = resolveSpawnInvocation(command, args, { env: commandEnv })
-    const child = spawn(invocation.command, invocation.args, { cwd, shell: false, windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments, env: commandEnv })
+    const child = spawn(invocation.command, invocation.args, { cwd, shell: false, detached: processTreeDetached(), windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments, env: commandEnv })
     const timer = setTimeout(() => { timedOut = true; killProcessTree(child) }, timeoutMs)
     child.stdout.on('data', (chunk: Buffer) => { stdout += decodeProcessOutputChunk(chunk) })
     child.stderr.on('data', (chunk: Buffer) => { stderr += decodeProcessOutputChunk(chunk) })
@@ -1015,11 +1022,12 @@ async function ensureOpenCodeServer(job: JobRecord, cwd: string): Promise<string
       const databasePath = startupAttempt === 1 ? ensureOpenCodeRuntime(owner) : rotateOpenCodeRuntime(owner)
       const port = await reserveLocalPort()
       const url = `http://127.0.0.1:${port}`
-      const opencodeInvocation = resolveSpawnInvocation('opencode', ['serve', '--hostname', '127.0.0.1', '--port', String(port)])
-      const commandEnv = openCodeDatabaseEnv(process.env, databasePath)
+      const commandEnv = commandEnvironment(openCodeDatabaseEnv(process.env, databasePath))
+      const opencodeInvocation = resolveSpawnInvocation('opencode', ['serve', '--hostname', '127.0.0.1', '--port', String(port)], { env: commandEnv })
       const server = spawn(opencodeInvocation.command, opencodeInvocation.args, {
         cwd,
         shell: false,
+        detached: processTreeDetached(),
         windowsHide: true,
         windowsVerbatimArguments: opencodeInvocation.windowsVerbatimArguments,
         env: commandEnv,
@@ -1385,6 +1393,8 @@ async function environmentInfo(): Promise<Record<string, { available: boolean; v
   const checks = await Promise.all([
     ['git', ['--version']],
     ['python', ['--version']],
+    ['node', ['--version']],
+    ['npm', ['--version']],
     ['codex', ['--version']],
     ['opencode', ['--version']],
     ['claude', ['--version']],
@@ -1478,13 +1488,18 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
   const settingsPath = resolveSettingsPath(workspace)
   const commonGeneratorArgs = [generatorPath(), '--project-settings', settingsPath, '--only-project', project.name]
   switch (input.action) {
-    case 'preflight':
+    case 'preflight': {
+      const manager = projectPackageManager(project)
       return [
         { label: 'Проверка Git рабочего набора', command: 'git', args: ['-C', workspace.path, 'status', '--short', '--branch'], cwd: workspace.path },
         { label: 'Проверка Git проекта', command: 'git', args: ['-C', project.path, 'status', '--short', '--branch'], cwd: project.path },
         { label: 'Проверка Python', command: 'python', args: ['--version'], cwd: workspace.path },
+        { label: 'Проверка Node.js', command: 'node', args: ['--version'], cwd: project.path },
+        { label: `Проверка package manager (${manager})`, command: manager, args: ['--version'], cwd: project.path },
+        ...(app.isPackaged ? [{ label: 'Проверка bundled Z3', command: 'python', args: ['-c', 'import z3; print(z3.get_version_string())'], cwd: workspace.path }] : []),
         { label: 'Проверка генератора', command: 'python', args: [generatorPath(), '--help'], cwd: workspace.path },
       ]
+    }
     case 'sync-tool':
       return [{ label: 'Проверка встроенного tool', command: 'python', args: [generatorPath(), '--help'], cwd: workspace.path }]
     case 'baseline':
@@ -1497,14 +1512,14 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
     case 'generate':
       return [{
         label: 'Построение свежего roadmap', command: 'python', cwd: workspace.path,
-        args: [...commonGeneratorArgs, '--history-snapshot-label', input.label?.trim() || 'Dependency Flow: после итерации'],
+        args: [...commonGeneratorArgs, '--history-snapshot-label', input.label?.trim() || 'DepLoom: после итерации'],
         stallWarningMs: 2 * 60_000,
         stallAbortMs: 15 * 60_000,
       }]
     case 'generate-all':
       return [{
         label: 'Актуализация roadmap всех проектов', command: 'python', cwd: workspace.path,
-        args: [generatorPath(), '--project-settings', settingsPath, '--history-snapshot-label', input.label?.trim() || 'Dependency Flow: все проекты'],
+        args: [generatorPath(), '--project-settings', settingsPath, '--history-snapshot-label', input.label?.trim() || 'DepLoom: все проекты'],
         stallWarningMs: 2 * 60_000,
         stallAbortMs: 15 * 60_000,
       }]
@@ -1593,13 +1608,13 @@ function emptyHooksPath(): string {
 // issued for branches confirmed to exist locally, so a missing branch never
 // turns into a failed `git branch -D`.
 async function migrationBranchCleanupCommands(project: ProjectSpec, plan: MigrationPlan | undefined): Promise<CommandSpec[]> {
-  // Even without a readable old prompt, stale Dependency Flow worktrees are
+  // Even without a readable old prompt, stale DepLoom worktrees are
   // still ours and can safely be removed. Branch deletion remains scoped to
   // the exact saved plan when one exists.
   const candidates = plan ? [...new Set([...plan.branches.map((branch) => branch.branch), plan.mergedBranch].filter(Boolean))] : []
 
   // `git branch -D` refuses to delete a branch that is still registered in a
-  // linked worktree. Fresh restart owns Dependency Flow's temp worktrees, so
+  // linked worktree. Fresh restart owns DepLoom's temp worktrees, so
   // remove those first. Stale/prunable registrations are handled by prune.
   // User-owned worktrees are never deleted automatically.
   const worktreeList = await spawnCapture('git', ['-C', project.path, 'worktree', 'list', '--porcelain'], project.path, 30_000)
@@ -1612,7 +1627,7 @@ async function migrationBranchCleanupCommands(project: ProjectSpec, plan: Migrat
   )
   if (cleanup.blockedUserWorktrees.length) {
     const details = cleanup.blockedUserWorktrees.map((item) => `${item.branch}: ${item.path}`).join('; ')
-    throw new Error(`MIGRATION_RESTART_USER_WORKTREE_BLOCKED: ветка предыдущей попытки используется внешним worktree. Dependency Flow не удаляет пользовательские worktree автоматически: ${details}`)
+    throw new Error(`MIGRATION_RESTART_USER_WORKTREE_BLOCKED: ветка предыдущей попытки используется внешним worktree. DepLoom не удаляет пользовательские worktree автоматически: ${details}`)
   }
 
   const existing = await Promise.all(candidates.map(async (branch) => {
@@ -1622,14 +1637,14 @@ async function migrationBranchCleanupCommands(project: ProjectSpec, plan: Migrat
   const hooksArg = `core.hooksPath=${emptyHooksPath()}`
   const commands: CommandSpec[] = []
 
-  // Remove every still-present Dependency Flow worktree registered for this
+  // Remove every still-present DepLoom worktree registered for this
   // repository, not only worktrees whose branch happens to remain in the saved
   // plan. Missing directories are intentionally left to `worktree prune`, which
   // makes restart idempotent after manual/partial cleanup. Repeating --force is
   // safe for our disposable temp worktrees and also removes a stale locked one.
   for (const path of cleanup.toolManagedPaths.filter((candidate) => existsSync(candidate))) {
     commands.push({
-      label: `Удаление временного Dependency Flow worktree: ${path}`,
+      label: `Удаление временного DepLoom worktree: ${path}`,
       command: 'git',
       cwd: project.path,
       args: ['-c', hooksArg, '-C', project.path, 'worktree', 'remove', '--force', path],
@@ -1673,7 +1688,7 @@ async function cleanupToolManagedProjectWorktreesAfterRelease(job: JobRecord, pr
     if (existsSync(path)) {
       const removed = await spawnCapture('git', ['-c', `core.hooksPath=${emptyHooksPath()}`, '-C', project.path, 'worktree', 'remove', '--force', path], project.path, 60_000)
       if (removed.code !== 0 && existsSync(path)) {
-        // This directory is inside Dependency Flow's own temp root, therefore
+        // This directory is inside DepLoom's own temp root, therefore
         // it is safe to remove physically. `worktree prune` below reconciles
         // any stale Git administrative record left by an interrupted process.
         try { rmSync(path, { recursive: true, force: true }) } catch { /* re-check below */ }
@@ -1685,10 +1700,10 @@ async function cleanupToolManagedProjectWorktreesAfterRelease(job: JobRecord, pr
   const after = await spawnCapture('git', ['-C', project.path, 'worktree', 'list', '--porcelain'], project.path, 30_000)
   const remaining = after.code === 0 ? toolManagedWorktreePaths(liveGitWorktreeRecords(after.stdout), project.path, tempPath) : paths.filter(existsSync)
   if (remaining.length) {
-    send('flow:job-output', { jobId: job.id, stream: 'system', line: `Предупреждение: release-ветка создана, но Windows удерживает ${remaining.length} временных Dependency Flow worktree; следующий restart повторит уборку: ${remaining.join('; ')}` })
+    send('flow:job-output', { jobId: job.id, stream: 'system', line: `Предупреждение: release-ветка создана, но Windows удерживает ${remaining.length} временных DepLoom worktree; следующий restart повторит уборку: ${remaining.join('; ')}` })
     return
   }
-  send('flow:job-output', { jobId: job.id, stream: 'system', line: `Release cleanup: удалены временные Dependency Flow worktree (${paths.length}); git worktree prune выполнен.` })
+  send('flow:job-output', { jobId: job.id, stream: 'system', line: `Release cleanup: удалены временные DepLoom worktree (${paths.length}); git worktree prune выполнен.` })
 }
 
 // Drops any recorded agent session (legacy whole-migration shape from a
@@ -3390,7 +3405,7 @@ async function runMigrationAgentIteration(job: JobRecord): Promise<void> {
       const existingWorktree = await worktreePathForBranch(project.path, next.branch)
       if (existingWorktree && portablePathKey(existingWorktree) !== portablePathKey(project.path)) {
         if (!isToolManagedWorktreePath(existingWorktree, app.getPath('temp'))) {
-          throw new Error(`MIGRATION_REPLAN_REQUIRED: PARALLEL_USER_WORKTREE_BLOCKED: ${next.branch} уже checkout в пользовательском worktree ${existingWorktree}. Dependency Flow не будет менять чужой checkout; Supervisor должен временно отложить эту branch/cohort и продолжить зелёных siblings, не показывая пользователю красный stop.`)
+          throw new Error(`MIGRATION_REPLAN_REQUIRED: PARALLEL_USER_WORKTREE_BLOCKED: ${next.branch} уже checkout в пользовательском worktree ${existingWorktree}. DepLoom не будет менять чужой checkout; Supervisor должен временно отложить эту branch/cohort и продолжить зелёных siblings, не показывая пользователю красный stop.`)
         }
         const worker: ParallelGroupWorker = { branch: next, worktreePath: existingWorktree, project: { ...project, path: existingWorktree }, job: parallelWorkerJob(job, next) }
         send('flow:job-output', { jobId: job.id, stream: 'system', line: `Продолжаю ${next.branch} в сохранённом tool-managed worktree ${existingWorktree}; ручное переключение ветки не требуется.` })
@@ -3686,7 +3701,7 @@ function clearEphemeralToolWorktreeDeferrals(workspace: WorkspaceRecord, project
       // Worktree occupancy is ephemeral orchestration state and must never be
       // persisted as a package-level compatibility decision. Old versions did
       // persist it, so a planner kept reading "user-owned worktree" long after
-      // the current runtime could reclaim that exact Dependency Flow temp path.
+      // the current runtime could reclaim that exact DepLoom temp path.
       // Only auto-clear legacy reasons that visibly point into our own temp
       // namespace; a genuinely external/user worktree remains protected.
       const candidatePath = toolManagedWorktreeFromLegacyDeferral(reason, app.getPath('temp'))
@@ -4437,7 +4452,7 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
   let stdout = ''
   const code = await new Promise<number>((resolvePromise, reject) => {
     const pythonPath = join(bundledToolDir(), 'vendor')
-    const baseEnv: NodeJS.ProcessEnv = { ...process.env, ...spec.env, FORCE_COLOR: '0' }
+    const baseEnv: NodeJS.ProcessEnv = commandEnvironment({ ...process.env, ...spec.env, FORCE_COLOR: '0' })
     let ephemeralOpenCodeDirectory: string | undefined
     let commandEnv: NodeJS.ProcessEnv
     if (spec.command === 'python') {
@@ -4459,7 +4474,7 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
       commandEnv = baseEnv
     }
     const invocation = resolveSpawnInvocation(spec.command, spec.args, { env: commandEnv })
-    const child = spawn(invocation.command, invocation.args, { cwd: spec.cwd, shell: false, windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments, env: commandEnv })
+    const child = spawn(invocation.command, invocation.args, { cwd: spec.cwd, shell: false, detached: processTreeDetached(), windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments, env: commandEnv })
     job.child = child
     rootJob.parallelChildren ??= new Set<ChildProcessWithoutNullStreams>()
     rootJob.parallelChildren.add(child)
@@ -4666,9 +4681,10 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
 }
 
 function isInside(candidate: string, root: string): boolean {
-  const normalizedCandidate = normalize(resolve(candidate)).toLowerCase()
-  const normalizedRoot = normalize(resolve(root)).toLowerCase()
-  return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(`${normalizedRoot}${process.platform === 'win32' ? '\\' : '/'}`)
+  const normalizedCandidate = normalizePathForComparison(normalize(resolve(candidate)))
+  const normalizedRoot = normalizePathForComparison(normalize(resolve(root)))
+  const boundary = process.platform === 'win32' ? '\\' : '/'
+  return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(`${normalizedRoot}${boundary}`)
 }
 
 function allowedPath(targetPath: string): boolean {
@@ -4732,7 +4748,7 @@ function setupIpc(): void {
     const workspacePath = resolve(raw.path)
     if (!existsSync(join(workspacePath, '.git'))) throw new Error('Выбранная папка не является Git-репозиторием workspace.')
     const state = loadState()
-    const existing = state.workspaces.find((item) => normalize(item.path).toLowerCase() === normalize(workspacePath).toLowerCase())
+    const existing = state.workspaces.find((item) => normalizePathForComparison(normalize(item.path)) === normalizePathForComparison(normalize(workspacePath)))
     const workspace = existing ?? {
       id: randomUUID(), name: raw.name?.trim() || basename(workspacePath), path: workspacePath,
       templateRemote: DEFAULT_TEMPLATE_REMOTE, toolRemote: DEFAULT_TOOL_REMOTE,
@@ -4775,7 +4791,7 @@ function setupIpc(): void {
 
   // Keep the historical IPC name and optional templateRemote input so an old
   // renderer / an already configured installation remains compatible. The new
-  // UI does not send templateRemote: in that mode Dependency Flow bootstraps a
+  // UI does not send templateRemote: in that mode DepLoom bootstraps a
   // complete local workspace itself and no external template repository is
   // required.
   ipcMain.handle('flow:clone-workspace', async (_event, raw: { parentPath: string; folderName: string; teamRemote?: string; templateRemote?: string }) => {
@@ -5119,8 +5135,8 @@ async function createWindow(): Promise<void> {
     minWidth: 1080,
     minHeight: 700,
     backgroundColor: '#ffffff',
-    title: 'Dependency Flow',
-    icon: join(__dirname, '..', 'build', 'icon.ico'),
+    title: 'DepLoom',
+    icon: join(__dirname, '..', 'build', process.platform === 'win32' ? 'icon.ico' : 'icon.png'),
     autoHideMenuBar: true,
     webPreferences: {
       preload: join(__dirname, 'preload.cjs'),
@@ -5138,7 +5154,7 @@ async function createWindow(): Promise<void> {
 }
 
 app.whenReady().then(async () => {
-  app.setAppUserModelId('io.github.frontenddepsflow.app')
+  app.setAppUserModelId('io.github.alexanderlevenskikh.deploom')
   setupIpc()
   await setupDashboardProtocol()
   setupDownloads()

@@ -64,7 +64,7 @@ export function assertAgentContextBudget(parts: readonly (string | undefined)[],
       `AGENT_CONTEXT_BUDGET_EXCEEDED: ${label}: estimated application input ${assessment.estimatedInputTokens} > `
       + `${assessment.effectiveInputCeilingTokens} effective input ceiling. Provider context=${assessment.providerContextLimitTokens}, `
       + `output reserve=${assessment.outputReserveTokens}, provider/system/tool-history reserve=${assessment.providerHistoryReserveTokens}, `
-      + `safety=${assessment.safetyMarginTokens}. Dependency Flow must split/compact/start fresh before launching the model.`,
+      + `safety=${assessment.safetyMarginTokens}. DepLoom must split/compact/start fresh before launching the model.`,
     )
   }
   return assessment

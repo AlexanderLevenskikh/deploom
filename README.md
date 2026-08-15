@@ -1,25 +1,37 @@
 # DepLoom
 
-Публичный monorepo DepLoom (desktop-приложение пока сохраняет совместимое имя Dependency Flow): Python CLI находится в корне, Electron-приложение — в `desktop/`. Installer включает tool и его Python-зависимости, поэтому версии desktop и tool всегда совпадают.
+Публичный monorepo DepLoom: deterministic Python core находится в корне, основной продукт — Electron Desktop в `desktop/`. Desktop включает Python tool и его platform-specific Python-зависимости в `resources/tool`, поэтому версии UI и core всегда совпадают. Для выполнения core на машине пользователя требуется установленный Python 3 (`python` на Windows, `python3` на Linux/macOS).
 
 Новый командный workspace Desktop создаёт самостоятельно: локально инициализирует Git-репозиторий, `.dependency-roadmap/settings.project.json`, рабочие каталоги и начальный commit. Внешний `dependency-roadmap-template` для новых workspace больше не требуется. Уже созданные template-based workspace продолжают подключаться как обычные существующие Git-репозитории без миграции; legacy IPC с явно переданным `templateRemote` также сохраняет прежний clone/upstream/origin сценарий.
 
-Версия продукта хранится в `VERSION` и обязана совпадать с `desktop/package.json`. Тег `vX.Y.Z` запускает GitHub Actions release pipeline в `AlexanderLevenskikh/deploom` и публикует публичный GitHub Release с installer, blockmap и `latest.yml`; desktop обновляется только из этого GitHub repository без клиентского API-ключа.
+Версия продукта хранится в `VERSION` и обязана совпадать с `desktop/package.json`. Тег `vX.Y.Z` запускает GitHub Actions release pipeline в `AlexanderLevenskikh/deploom`. Публично публикуются Windows x64 (`.exe`, blockmap, `latest.yml`) и Linux x64 (`.AppImage`, `latest-linux.yml`); macOS x64/arm64 собирается и проверяется в CI, но не публикуется до настройки Developer ID signing + notarization. Desktop обновляется только из этого GitHub repository без клиентского API-ключа.
+
+## Поддерживаемые платформы
+
+| Платформа | Статус | Пакет | Автообновление |
+|---|---|---|---|
+| Windows x64 | Supported | NSIS `.exe` | Да, GitHub Releases |
+| Linux x64 | Supported | AppImage | Да, GitHub Releases |
+| macOS arm64/x64 | CI-validated preview | `.dmg` + `.zip` | Будет включено вместе с подписанным/notarized release |
+
+Runtime команд запускается platform-neutral: логическое `python` разрешается в `python.exe` на Windows и `python3` на Linux/macOS; timeout/cancel завершает всё дерево дочерних процессов через `taskkill /T /F` на Windows и отдельную POSIX process group на Linux/macOS. Linux/macOS path-containment сохраняет case sensitivity.
+
+На Linux/macOS Desktop дополнительно нормализует GUI PATH для типичных Homebrew/Volta/asdf/pnpm/user-bin установок, не выполняя пользовательские shell startup scripts.
 
 ### Публикация самого DepLoom
 
 Для публичного репозитория используется только SSH remote `git@github.com:AlexanderLevenskikh/deploom.git` и ветка `master`. Скрипт `push-github-branch-and-tag.ps1` умеет начать прямо из распакованного sanitized archive без `.git`: он создаёт свежую историю на `master`, настраивает/проверяет `origin` через SSH, запускает release validation, push ветки и тега.
 
-Первая публичная публикация текущей версии `0.2.0`:
+Первая публичная публикация текущей версии `0.2.1`:
 
 ```powershell
 .\push-github-branch-and-tag.ps1 `
-  -Commit "Initial public release: DepLoom 0.2.0" `
-  -Tag v0.2.0
+  -Commit "Initial public release: DepLoom 0.2.1" `
+  -Tag v0.2.1
 ```
 
 Для следующего обычного patch-release `-Tag` можно не указывать: общий release helper автоматически увеличит patch version, проверит чистый release commit и только после validation отправит `master` и новый tag. Если `origin` уже указывает на тот же GitHub repository через HTTPS, GitHub-скрипт безопасно переключит его на SSH; любой другой remote считается ошибкой.
-CLI-инструмент для квартального аудита npm/yarn-зависимостей: строит MD/JSON/HTML отчёт, считает статус проекта, подбирает целевые версии, группирует зависимости по стратегии работ и генерирует промпт для агента из HTML.
+Низкоуровневый Python tooling умеет строить MD/JSON/HTML roadmap, выполнять baseline/audit/validation и генерировать agent artifacts; полный FLOW/Autopilot остаётся только в Desktop Control Plane.
 
 ## Полный FLOW в Desktop
 
@@ -37,7 +49,7 @@ Baseline теперь является владельцем version planning: co
 
 Начиная с `v0.1.84` ephemeral worktree occupancy вообще не сохраняется как долговременный package deferral: старые `PARALLEL_USER_WORKTREE_BLOCKED`, указывающие в собственный `%TEMP%/dependency-flow-worktrees`, автоматически очищаются перед residual replan. Windows-пути нормализуются по slash/case, поэтому собственный worker не должен становиться «user-owned».
 
-Начиная с `v0.1.83` **дополнительная Git-ветка тоже не является ошибкой пользователя**. Исторические continuation refs, созданные Dependency Flow, автоматически восстанавливаются из сохранённых планов при совпадении package scope; остальные refs остаются в quarantine и не попадают в `merged` без детерминированного adoption. Сам факт существования лишнего ref не блокирует completion. Даже transient infrastructure failure сначала получает до трёх автоматических retry. Красный stop оставлен для состояний, где продолжение способно потерять/подменить код: неизвестный активный `MERGE_HEAD`, недоверенное Git-состояние, pinned source/release mismatch, пользовательские изменения перед destructive handoff или устойчиво сломанная инфраструктура/сама тулза.
+Начиная с `v0.1.83` **дополнительная Git-ветка тоже не является ошибкой пользователя**. Исторические continuation refs, созданные DepLoom, автоматически восстанавливаются из сохранённых планов при совпадении package scope; остальные refs остаются в quarantine и не попадают в `merged` без детерминированного adoption. Сам факт существования лишнего ref не блокирует completion. Даже transient infrastructure failure сначала получает до трёх автоматических retry. Красный stop оставлен для состояний, где продолжение способно потерять/подменить код: неизвестный активный `MERGE_HEAD`, недоверенное Git-состояние, pinned source/release mismatch, пользовательские изменения перед destructive handoff или устойчиво сломанная инфраструктура/сама тулза.
 
 Независимые группы могут исполняться параллельно через отдельные tool-managed Git worktree (`autonomy.maxParallelGroups`, по умолчанию `2`, поддерживается до `12`). Каждая группа получает отдельную agent-session и свой checkout; совместимые/пересекающиеся scope не запускаются одновременно. Готовые ветки затем merge-ятся **строго последовательно**, и после каждого merge выполняется cumulative verification. Ошибка одного worker не отменяет зелёный результат остальных.
 
@@ -100,7 +112,7 @@ python -m pip install -r requirements-solver.txt
 
 ## Запуск
 
-Основной FLOW запускается из установленного Dependency Flow. Standalone CLI для automation и диагностики:
+Основной FLOW/Autopilot запускается из установленного DepLoom Desktop. Корневые Python-команды — **advanced/headless tooling для baseline, roadmap, audit и validation**, а не второй полноценный оркестратор Desktop: Git/worktree orchestration, agent sessions, recovery, merge/release state machine и UI progress остаются у единственного Electron Control Plane. Пример низкоуровневого CLI:
 
 ```bash
 python dependency_live_roadmap_generator.py --project-settings "<team-workspace>/.dependency-roadmap/settings.project.json"

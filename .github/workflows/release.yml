@@ -9,13 +9,12 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
-  validate-and-package-windows:
-    runs-on: windows-latest
-    env:
-      npm_config_cache: ${{ github.workspace }}\desktop\.npm
-      ELECTRON_CACHE: ${{ github.workspace }}\desktop\.cache\electron
-      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}\desktop\.cache\electron-builder
+  validate:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -33,40 +32,36 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
+      - name: Validate public repository, version and tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = 'AlexanderLevenskikh/deploom'
+          version="$(tr -d '\r\n' < VERSION)"
+          package_version="$(node -p "require('./desktop/package.json').version")"
+          test "$package_version" = "$version"
+          if [[ "$GITHUB_REF_TYPE" == 'tag' ]]; then test "$GITHUB_REF_NAME" = "v$version"; fi
+
       - name: Check public source sanitization
-        shell: pwsh
         run: python scripts/check-public-sanitization.py
 
-      - name: Validate version, repository and tag
-        shell: pwsh
-        run: |
-          if ($env:GITHUB_REPOSITORY -ne 'AlexanderLevenskikh/deploom') {
-            throw "Release workflow must run from AlexanderLevenskikh/deploom, got $env:GITHUB_REPOSITORY"
-          }
-          $version = (Get-Content VERSION -Raw).Trim()
-          $packageVersion = node -p "require('./desktop/package.json').version"
-          if ($packageVersion.Trim() -ne $version) { throw "desktop/package.json=$packageVersion but VERSION=$version" }
-          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
-            throw "Tag $env:GITHUB_REF_NAME must match v$version"
-          }
-
       - name: Install and test Python tool
-        shell: pwsh
         run: |
           python -m pip install -r requirements.txt
           python -m pip install -r requirements-solver.txt
+          python dependency_live_roadmap_generator.py --help >/dev/null
           python run_tool_tests.py --suite all
 
       - name: Install desktop dependencies
         working-directory: desktop
         run: npm ci
 
-      - name: Build desktop and run critical checks
+      - name: Build and run desktop contracts
         working-directory: desktop
-        shell: pwsh
         run: |
           npm run lint
           npm run build
+          npm run check:cross-platform
           npm run check:updater-runtime
           npm run check:updater-schedule
           npm run check:updater-error
@@ -81,7 +76,34 @@ jobs:
           npm run check:materialization-proof
           npm run check:workspace-bootstrap
 
-      - name: Package Windows installer with transient retries
+      - name: Validate release workflow/assets contract
+        run: |
+          node scripts/check-release-assets.mjs
+          node scripts/check-package-windows-resilience.mjs
+
+  package-windows:
+    needs: validate
+    runs-on: windows-latest
+    env:
+      npm_config_cache: ${{ github.workspace }}\desktop\.npm
+      ELECTRON_CACHE: ${{ github.workspace }}\desktop\.cache\electron
+      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}\desktop\.cache\electron-builder
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+      - name: Package Windows x64 with transient retries
         working-directory: desktop
         shell: pwsh
         run: |
@@ -99,7 +121,7 @@ jobs:
             Start-Sleep -Seconds (15 * $attempt)
           }
           $version = (Get-Content ../VERSION -Raw).Trim()
-          $installer = "release/Dependency-Flow-Setup-$version.exe"
+          $installer = "release/DepLoom-Setup-$version-x64.exe"
           if (-not (Test-Path $installer)) { throw "Missing installer: $installer" }
           if (-not (Test-Path "$installer.blockmap")) { throw "Missing blockmap: $installer.blockmap" }
           if (-not (Test-Path 'release/latest.yml')) { throw 'Missing electron-updater latest.yml' }
@@ -109,31 +131,158 @@ jobs:
           foreach ($expected in @('provider: github', 'owner: AlexanderLevenskikh', 'repo: deploom')) {
             if ($feed -notmatch [regex]::Escape($expected)) { throw "Packaged updater feed does not target deploom: missing '$expected'" }
           }
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+          $env:PYTHONPATH = (Resolve-Path 'release/win-unpacked/resources/tool/vendor').Path
+          python -c "import z3; print('packaged z3', z3.get_version_string())"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: dependency-flow-windows
+          name: deploom-windows-x64
           path: |
-            desktop/release/Dependency-Flow-Setup-*.exe
-            desktop/release/Dependency-Flow-Setup-*.exe.blockmap
+            desktop/release/DepLoom-Setup-*.exe
+            desktop/release/DepLoom-Setup-*.exe.blockmap
             desktop/release/latest.yml
             desktop/package-win-attempt-*.log
+          if-no-files-found: error
           retention-days: 14
 
-      - name: Publish GitHub Release
-        if: github.ref_type == 'tag'
-        shell: pwsh
+  package-linux:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install desktop dependencies
         working-directory: desktop
+        run: npm ci
+      - name: Package and smoke-check Linux x64 AppImage
+        working-directory: desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run package:linux
+          version="$(tr -d '\r\n' < ../VERSION)"
+          appimage="release/DepLoom-$version-x64.AppImage"
+          test -f "$appimage"
+          test -f release/latest-linux.yml
+          test -f release/linux-unpacked/resources/app-update.yml
+          grep -F 'provider: github' release/linux-unpacked/resources/app-update.yml
+          grep -F 'owner: AlexanderLevenskikh' release/linux-unpacked/resources/app-update.yml
+          grep -F 'repo: deploom' release/linux-unpacked/resources/app-update.yml
+          PYTHONPATH="$PWD/release/linux-unpacked/resources/tool/vendor" python3 -c "import z3; print('packaged z3', z3.get_version_string())"
+          chmod +x "$appimage"
+          rm -rf squashfs-root
+          "$appimage" --appimage-extract >/dev/null
+          test -f squashfs-root/resources/app-update.yml
+          rm -rf squashfs-root
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: deploom-linux-x64
+          path: |
+            desktop/release/DepLoom-*.AppImage
+            desktop/release/latest-linux.yml
+          if-no-files-found: error
+          retention-days: 14
+
+  package-macos:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x64
+          - runner: macos-latest
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      # Public macOS distribution stays disabled until Developer ID signing and
+      # notarization credentials are configured. CI still proves both packages.
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+      - name: Package unsigned macOS smoke build
+        working-directory: desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run "package:mac:${{ matrix.arch }}"
+          version="$(tr -d '\r\n' < ../VERSION)"
+          test -f "release/DepLoom-$version-${{ matrix.arch }}.dmg"
+          test -f "release/DepLoom-$version-${{ matrix.arch }}.zip"
+          test -f release/latest-mac.yml
+          app_update="$(find release -path '*/DepLoom.app/Contents/Resources/app-update.yml' -print -quit)"
+          test -n "$app_update"
+          grep -F 'provider: github' "$app_update"
+          grep -F 'owner: AlexanderLevenskikh' "$app_update"
+          grep -F 'repo: deploom' "$app_update"
+          vendor="$(find release -path '*/DepLoom.app/Contents/Resources/tool/vendor' -type d -print -quit)"
+          test -n "$vendor"
+          PYTHONPATH="$vendor" python3 -c "import z3; print('packaged z3', z3.get_version_string())"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: deploom-macos-${{ matrix.arch }}-unsigned-smoke
+          path: |
+            desktop/release/DepLoom-*.dmg
+            desktop/release/DepLoom-*.zip
+            desktop/release/latest-mac.yml
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    if: github.ref_type == 'tag'
+    needs: [validate, package-windows, package-linux, package-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: deploom-windows-x64
+          path: release-assets
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: deploom-linux-x64
+          path: release-assets
+      - name: Publish Windows + Linux GitHub Release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $version = (Get-Content ../VERSION -Raw).Trim()
-          $installer = "release/Dependency-Flow-Setup-$version.exe"
-          gh release create $env:GITHUB_REF_NAME `
-            $installer `
-            "$installer.blockmap" `
-            'release/latest.yml' `
-            --verify-tag `
-            --title "Dependency Flow $version" `
-            --notes "Dependency Flow $version. Windows installer and electron-updater metadata built by GitHub Actions."
+          set -euo pipefail
+          version="$(tr -d '\r\n' < VERSION)"
+          test -f "release-assets/DepLoom-Setup-$version-x64.exe"
+          test -f "release-assets/DepLoom-Setup-$version-x64.exe.blockmap"
+          test -f release-assets/latest.yml
+          test -f "release-assets/DepLoom-$version-x64.AppImage"
+          test -f release-assets/latest-linux.yml
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/DepLoom-* release-assets/latest.yml release-assets/latest-linux.yml --clobber
+            gh release edit "$GITHUB_REF_NAME" --title "DepLoom $version" --notes "DepLoom $version. Supported public desktop builds: Windows x64 and Linux x64. macOS x64/arm64 packages are CI-validated but intentionally not published until Developer ID signing and notarization are configured."
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/DepLoom-* release-assets/latest.yml release-assets/latest-linux.yml \
+              --verify-tag \
+              --title "DepLoom $version" \
+              --notes "DepLoom $version. Supported public desktop builds: Windows x64 and Linux x64. macOS x64/arm64 packages are CI-validated but intentionally not published until Developer ID signing and notarization are configured."
+          fi

@@ -56,21 +56,23 @@ if (!ownershipSource.includes('realpathSync.native')) throw new Error('Windows s
 for (const required of ['liveMaxParallelGroups', 'configured slots=${maxParallelGroups}', 'parallelWorkerJob(parent, branch)', "'worktree', 'prune', '--expire', 'now'", 'jobId: worker.job.id', 'Причина: ${message.slice(0, 3000)}', 'openCodeTransportOwner(job)', 'if (owner !== job) return', 'client-${randomUUID()}', 'OPENCODE_SERVER_START_ATTEMPTS = 3', 'if (owner.openCodeServerStarting) return owner.openCodeServerStarting']) if (!mainSource.includes(required)) throw new Error(`parallel runtime contract missing: ${required}`)
 console.log('Parallel group scheduler contract OK')
 
+if (isToolManagedWorktreePath('/tmp/CaseTemp/dependency-flow-planner-123', '/tmp/casetemp', 'linux')) throw new Error('POSIX ownership must not collapse case-distinct TEMP roots')
+
 const temp = 'C:\\Users\\developer\\AppData\\Local\\Temp'
 const toolWorktree = 'C:/Users/developer/AppData/Local/Temp/dependency-flow-worktrees/593c34bb-555d-4024-bb01-ba5da6024042/deps-demo-continuation-2'
 const plannerWorktree = 'C:/Users/developer/AppData/Local/Temp/dependency-flow-planner-job-123-1786699527349'
 const baselineWorktree = 'C:/Users/developer/AppData/Local/Temp/dependency-flow-job-123-baseline'
-if (!isToolManagedWorktreePath(toolWorktree, temp)) throw new Error('Dependency Flow temp worktree must survive Windows slash/case normalization')
-if (!isToolManagedWorktreePath(plannerWorktree, temp) || !isToolManagedWorktreePath(baselineWorktree, temp)) throw new Error('detached planner/baseline worktrees must be owned by Dependency Flow cleanup')
-if (isToolManagedWorktreePath('C:/Users/developer/Desktop/manual-worktree/deps-demo-continuation-2', temp)) throw new Error('arbitrary user worktree must not be claimed')
+if (!isToolManagedWorktreePath(toolWorktree, temp, 'win32')) throw new Error('DepLoom temp worktree must survive Windows slash/case normalization')
+if (!isToolManagedWorktreePath(plannerWorktree, temp, 'win32') || !isToolManagedWorktreePath(baselineWorktree, temp, 'win32')) throw new Error('detached planner/baseline worktrees must be owned by DepLoom cleanup')
+if (isToolManagedWorktreePath('C:/Users/developer/Desktop/manual-worktree/deps-demo-continuation-2', temp, 'win32')) throw new Error('arbitrary user worktree must not be claimed')
 const legacyReason = `PARALLEL_USER_WORKTREE_BLOCKED: branch is checked out in a user-owned worktree ${toolWorktree} at commit 9409794`
-if (toolManagedWorktreeFromLegacyDeferral(legacyReason, temp) !== toolWorktree) throw new Error('legacy self-worktree deferral must be recognized and clearable')
+if (toolManagedWorktreeFromLegacyDeferral(legacyReason, temp, 'win32') !== toolWorktree) throw new Error('legacy self-worktree deferral must be recognized and clearable')
 
 const restartCleanup = restartWorktreeCleanupTargets([
   { path: 'C:/Users/developer/project', branch: 'deps-old' },
   { path: toolWorktree, branch: 'deps-old' },
   { path: 'C:/Users/developer/Desktop/manual-worktree/deps-other', branch: 'deps-other' },
-], ['deps-old', 'deps-other'], 'C:/Users/developer/project', temp)
+], ['deps-old', 'deps-other'], 'C:/Users/developer/project', temp, 'win32')
 if (restartCleanup.toolManagedPaths.join(',') !== toolWorktree) throw new Error('fresh restart must remove its own temp worktree before deleting the old branch')
 if (restartCleanup.blockedUserWorktrees.length !== 1 || restartCleanup.blockedUserWorktrees[0].branch !== 'deps-other') throw new Error('fresh restart must never delete an arbitrary user worktree')
 for (const required of [
@@ -89,11 +91,11 @@ const releaseCleanupPaths = toolManagedWorktreePaths([
   { path: 'C:/Users/developer/project', branch: 'CD-42-release' },
   { path: toolWorktree, branch: 'deps-old' },
   { path: 'C:/Users/developer/Desktop/manual-worktree/deps-other', branch: 'deps-other' },
-], 'C:/Users/developer/project', temp)
-if (releaseCleanupPaths.join(',') !== toolWorktree) throw new Error('release cleanup must select every Dependency Flow temp worktree and leave user worktrees untouched')
+], 'C:/Users/developer/project', temp, 'win32')
+if (releaseCleanupPaths.join(',') !== toolWorktree) throw new Error('release cleanup must select every DepLoom temp worktree and leave user worktrees untouched')
 for (const required of [
   'cleanupToolManagedProjectWorktreesAfterRelease(',
   "job.action === 'release' && job.projectName",
   "'worktree', 'prune', '--expire', 'now'",
-  'Release cleanup: удалены временные Dependency Flow worktree',
+  'Release cleanup: удалены временные DepLoom worktree',
 ]) if (!mainSource.includes(required)) throw new Error(`release worktree cleanup contract missing: ${required}`)

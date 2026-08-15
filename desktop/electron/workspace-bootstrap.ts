@@ -6,7 +6,7 @@ export type WorkspaceCommandRunner = (command: string, args: string[], cwd: stri
 
 export const WORKSPACE_SETTINGS_PATH = '.dependency-roadmap/settings.project.json'
 
-const WORKSPACE_GITIGNORE = `# Dependency Flow local/generated files
+const WORKSPACE_GITIGNORE = `# DepLoom local/generated files
 .dependency-roadmap/settings.local.json
 .dependency-roadmap/artifacts/*
 !.dependency-roadmap/artifacts/.gitkeep
@@ -62,9 +62,9 @@ export async function initializeWorkspaceRepository(
   // logic can operate. Use command-local identity so workspace creation never
   // mutates or depends on the user's global Git configuration.
   const commit = await run('git', [
-    '-c', 'user.name=Dependency Flow',
+    '-c', 'user.name=DepLoom',
     '-c', 'user.email=dependency-flow@localhost',
-    'commit', '-m', 'chore: initialize Dependency Flow workspace',
+    'commit', '-m', 'chore: initialize DepLoom workspace',
   ], target, 30_000)
   if (commit.code !== 0) throw commandError(commit, 'Не удалось создать начальный commit workspace.')
 

@@ -1246,6 +1246,15 @@ def _yarn_npm_lock_audit(project: Path, registry: str, audit_workspace: Optional
             "rem Uses the current npm registry. To override it safely, append --registry <url>.\n"
             "npm audit --json --package-lock-only --legacy-peer-deps %*\n",
         )
+        reproduce_sh = workspace / "reproduce-npm-audit.sh"
+        _write_text(
+            reproduce_sh,
+            "#!/usr/bin/env sh\n"
+            "# Uses the current npm registry. To override it safely, append --registry <url>.\n"
+            "exec npm audit --json --package-lock-only --legacy-peer-deps \"$@\"\n",
+        )
+        if os.name != "nt":
+            reproduce_sh.chmod(0o755)
         _progress("querying vulnerability audit endpoint through the effective npm registry")
         audit_started = time.monotonic()
         code, stdout, stderr = run(command, workspace, env, timeout=300)
