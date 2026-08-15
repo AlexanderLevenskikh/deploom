@@ -78,5 +78,6 @@
     "author": "DepLoom contributors",
     "engines": {
         "node": ">=22.12.0"
-    }
+    },
+    "desktopName": "io.github.alexanderlevenskikh.deploom.desktop"
 }

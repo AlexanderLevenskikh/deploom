@@ -32,6 +32,8 @@ for (const needle of [
   'repo: deploom',
   'releaseType: release',
   'target: AppImage',
+  'artifactName: DepLoom-${version}-x64.${ext}',
+  'syncDesktopName: true',
   '- dmg',
   '- zip',
 ]) {

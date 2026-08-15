@@ -29,6 +29,8 @@ for (const expected of [
   '- zip',
   'DepLoom-Setup-${version}-${arch}.${ext}',
   'DepLoom-${version}-${arch}.${ext}',
+  'artifactName: DepLoom-${version}-x64.${ext}',
+  'syncDesktopName: true',
 ]) {
   if (!builder.includes(expected)) throw new Error(`Cross-platform packager contract missing: ${expected}`)
 }
@@ -51,6 +53,7 @@ if (!solverRequirements.includes('z3-solver==4.13.0.0')) {
 if (!prepareTool.includes('macosx_11_0_x86_64') || !prepareTool.includes('macosx_11_0_arm64')) {
   throw new Error('macOS tool vendoring must target the wheel tags supported by the shared Z3 pin')
 }
+if (pkg.desktopName !== 'io.github.alexanderlevenskikh.deploom.desktop') throw new Error('Linux desktopName must match the public app id for WM_CLASS/launcher association')
 if (!main.includes("process.kill(-pid, 'SIGTERM')") || !main.includes("process.kill(-pid, 'SIGKILL')")) throw new Error('POSIX process-tree termination is not wired')
 if ((main.match(/detached: processTreeDetached\(\)/g) || []).length < 3) throw new Error('All command/server spawn paths must create a POSIX process group')
 if (!main.includes("app.setAppUserModelId('io.github.alexanderlevenskikh.deploom')")) throw new Error('Desktop runtime app id is stale')
