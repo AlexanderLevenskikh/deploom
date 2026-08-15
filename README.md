@@ -5,6 +5,20 @@
 Новый командный workspace Desktop создаёт самостоятельно: локально инициализирует Git-репозиторий, `.dependency-roadmap/settings.project.json`, рабочие каталоги и начальный commit. Внешний `dependency-roadmap-template` для новых workspace больше не требуется. Уже созданные template-based workspace продолжают подключаться как обычные существующие Git-репозитории без миграции; legacy IPC с явно переданным `templateRemote` также сохраняет прежний clone/upstream/origin сценарий.
 
 Версия продукта хранится в `VERSION` и обязана совпадать с `desktop/package.json`. Тег `vX.Y.Z` запускает GitHub Actions release pipeline в `AlexanderLevenskikh/deploom` и публикует публичный GitHub Release с installer, blockmap и `latest.yml`; desktop обновляется только из этого GitHub repository без клиентского API-ключа.
+
+### Публикация самого DepLoom
+
+Для публичного репозитория используется только SSH remote `git@github.com:AlexanderLevenskikh/deploom.git` и ветка `master`. Скрипт `push-github-branch-and-tag.ps1` умеет начать прямо из распакованного sanitized archive без `.git`: он создаёт свежую историю на `master`, настраивает/проверяет `origin` через SSH, запускает release validation, push ветки и тега.
+
+Первая публичная публикация текущей версии `0.2.0`:
+
+```powershell
+.\push-github-branch-and-tag.ps1 `
+  -Commit "Initial public release: DepLoom 0.2.0" `
+  -Tag v0.2.0
+```
+
+Для следующего обычного patch-release `-Tag` можно не указывать: общий release helper автоматически увеличит patch version, проверит чистый release commit и только после validation отправит `master` и новый tag. Если `origin` уже указывает на тот же GitHub repository через HTTPS, GitHub-скрипт безопасно переключит его на SSH; любой другой remote считается ошибкой.
 CLI-инструмент для квартального аудита npm/yarn-зависимостей: строит MD/JSON/HTML отчёт, считает статус проекта, подбирает целевые версии, группирует зависимости по стратегии работ и генерирует промпт для агента из HTML.
 
 ## Полный FLOW в Desktop

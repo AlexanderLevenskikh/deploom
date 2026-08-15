@@ -96,6 +96,13 @@ try {
     }
 
     # --------------------------------------------------------
+    # Repository state
+    # --------------------------------------------------------
+
+    & git rev-parse --verify HEAD *> $null
+    $HasHead = ($LASTEXITCODE -eq 0)
+
+    # --------------------------------------------------------
     # Remote
     # --------------------------------------------------------
 
@@ -237,14 +244,18 @@ try {
         throw "Failed to stage current changes."
     }
 
-    # VERSION files always belong to the second commit.
-    & git reset -- `
-        VERSION `
-        desktop/package.json `
-        desktop/package-lock.json
+    # VERSION files normally belong to the second commit.  An unborn
+    # repository has no HEAD to reset against, so the first public source
+    # commit intentionally contains the already-selected version files.
+    if ($HasHead) {
+        & git reset -- `
+            VERSION `
+            desktop/package.json `
+            desktop/package-lock.json
 
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to exclude version files from source commit."
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to exclude version files from source commit."
+        }
     }
 
     & git diff --cached --quiet
@@ -304,35 +315,58 @@ try {
     Write-Host ""
     Write-Host "== Update version =="
 
-    Push-Location $DesktopPath
-
-    try {
-        & npm version $Version `
-            --no-git-tag-version `
-            --allow-same-version `
-            --ignore-scripts
-
-        if ($LASTEXITCODE -ne 0) {
-            throw (
-                "Failed to update desktop/package.json " +
-                "and desktop/package-lock.json."
-            )
-        }
-    }
-    finally {
-        Pop-Location
+    $CurrentPackageVersion = (
+        & node -p "require('./desktop/package.json').version"
+    ).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to read desktop/package.json version."
     }
 
-    # Root VERSION without BOM.
+    $CurrentPackageLockVersion = (
+        & node -p "require('./desktop/package-lock.json').version"
+    ).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to read desktop/package-lock.json version."
+    }
 
-    $Utf8NoBom = New-Object `
-        System.Text.UTF8Encoding($false)
-
-    [System.IO.File]::WriteAllText(
-        $VersionPath,
-        "$Version`n",
-        $Utf8NoBom
+    $CurrentVersionFileValue = (Get-Content $VersionPath -Raw).Trim()
+    $VersionAlreadyCurrent = (
+        $CurrentPackageVersion -eq $Version -and
+        $CurrentPackageLockVersion -eq $Version -and
+        $CurrentVersionFileValue -eq $Version
     )
+
+    if ($VersionAlreadyCurrent) {
+        Write-Host "Version files already match $Version; no version commit is required."
+    }
+    else {
+        Push-Location $DesktopPath
+
+        try {
+            & npm version $Version `
+                --no-git-tag-version `
+                --allow-same-version `
+                --ignore-scripts
+
+            if ($LASTEXITCODE -ne 0) {
+                throw (
+                    "Failed to update desktop/package.json " +
+                    "and desktop/package-lock.json."
+                )
+            }
+        }
+        finally {
+            Pop-Location
+        }
+
+        # Root VERSION without BOM.
+        $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText(
+            $VersionPath,
+            "$Version`n",
+            $Utf8NoBom
+        )
+    }
 
     # --------------------------------------------------------
     # Verify versions before commit
@@ -403,64 +437,66 @@ try {
     Write-Host ""
     Write-Host "== Commit version =="
 
-    & git add -- `
-        VERSION `
-        desktop/package.json `
-        desktop/package-lock.json
+    if (-not $VersionAlreadyCurrent) {
+        & git add -- `
+            VERSION `
+            desktop/package.json `
+            desktop/package-lock.json
 
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to stage version files."
-    }
-
-    # Guarantee that ONLY version files are staged.
-    $StagedFiles = @(
-        & git diff --cached --name-only
-    )
-
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to inspect staged version changes."
-    }
-
-    $AllowedVersionFiles = @(
-        "VERSION",
-        "desktop/package.json",
-        "desktop/package-lock.json"
-    )
-
-    $UnexpectedStagedFiles = @(
-        $StagedFiles | Where-Object {
-            $_ -notin $AllowedVersionFiles
-        }
-    )
-
-    if ($UnexpectedStagedFiles.Count -gt 0) {
-        Write-Host ""
-        Write-Host "Unexpected files staged for release commit:"
-
-        $UnexpectedStagedFiles | ForEach-Object {
-            Write-Host "  $_"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to stage version files."
         }
 
-        throw "Release commit contains non-version files."
-    }
-
-    & git diff --cached --quiet
-    $HasVersionChanges = ($LASTEXITCODE -ne 0)
-
-    if (-not $HasVersionChanges) {
-        throw (
-            "Version bump produced no changes. " +
-            "Refusing to create release without version commit."
+        # Guarantee that ONLY version files are staged.
+        $StagedFiles = @(
+            & git diff --cached --name-only
         )
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to inspect staged version changes."
+        }
+
+        $AllowedVersionFiles = @(
+            "VERSION",
+            "desktop/package.json",
+            "desktop/package-lock.json"
+        )
+
+        $UnexpectedStagedFiles = @(
+            $StagedFiles | Where-Object {
+                $_ -notin $AllowedVersionFiles
+            }
+        )
+
+        if ($UnexpectedStagedFiles.Count -gt 0) {
+            Write-Host ""
+            Write-Host "Unexpected files staged for release commit:"
+
+            $UnexpectedStagedFiles | ForEach-Object {
+                Write-Host "  $_"
+            }
+
+            throw "Release commit contains non-version files."
+        }
+
+        & git diff --cached --quiet
+        $HasVersionChanges = ($LASTEXITCODE -ne 0)
+
+        if (-not $HasVersionChanges) {
+            throw "Version update unexpectedly produced no changes."
+        }
+
+        & git commit -m "chore: release $Tag"
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create version commit."
+        }
+
+        $VersionCommitCreated = $true
     }
-
-    & git commit -m "chore: release $Tag"
-
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to create version commit."
+    else {
+        Write-Host "No version commit needed for $Tag."
     }
-
-    $VersionCommitCreated = $true
 
     $ReleaseCommit = (& git rev-parse HEAD).Trim()
 

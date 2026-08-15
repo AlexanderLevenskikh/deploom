@@ -592,6 +592,24 @@ class PeerCompatibilitySolverTests(unittest.TestCase):
         self.assertLess(release.index("git push -u $Remote $Branch"), release.index("$BranchPublished = $true"))
         self.assertLess(release.index("$BranchPublished = $true"), release.index("git push $Remote \"refs/tags/$Tag\""))
 
+    def test_github_release_script_enforces_public_ssh_remote_and_master(self):
+        root = Path(roadmap.__file__).parent
+        github_release = (root / "push-github-branch-and-tag.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn('git@github.com:AlexanderLevenskikh/deploom.git', github_release)
+        self.assertIn('$RequiredBranch = "master"', github_release)
+        self.assertIn("git init -b $RequiredBranch", github_release)
+        self.assertIn("remote', 'set-url', $RemoteName, $ExpectedRemote", github_release)
+        self.assertIn("gh repo edit $GitHubRepository --default-branch $RequiredBranch", github_release)
+        self.assertIn("push-branch-and-tag.ps1", github_release)
+
+    def test_release_helper_supports_fresh_same_version_public_tag(self):
+        root = Path(roadmap.__file__).parent
+        release = (root / "push-branch-and-tag.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("$HasHead = ($LASTEXITCODE -eq 0)", release)
+        self.assertIn("if ($HasHead)", release)
+        self.assertIn("$VersionAlreadyCurrent", release)
+        self.assertIn("No version commit needed for $Tag", release)
+
     def test_baseline_confirmation_describes_a_new_cycle(self):
         flow = (Path(roadmap.__file__).parent / "desktop/src/data/flow.ts").read_text(encoding="utf-8")
         self.assertNotIn("После начала обновления переснимать его нельзя", flow)
