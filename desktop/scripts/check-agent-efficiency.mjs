@@ -51,8 +51,20 @@ const materializedJson = JSON.parse(materialized.text);
 if (materializedJson.dependencies.a !== "1.5.0" || "b" in materializedJson.devDependencies) throw new Error(`Control-plane dependency materialization is wrong: ${materialized.text}`);
 if (classifyDependencyMaterializationFailure("HTTP 502 Bad Gateway") !== "infrastructure") throw new Error("Materialization must never learn network failures as dependency constraints");
 if (classifyDependencyMaterializationFailure("ERESOLVE conflicting peer dependency") !== "dependency") throw new Error("Materialization must classify deterministic resolver conflicts");
-if (dependencyMaterializationInstallSpec("yarn").args.includes("--frozen-lockfile")) throw new Error("Control-plane materialization must be allowed to regenerate the approved lockfile");
+const yarnInstall = dependencyMaterializationInstallSpec("yarn");
+if (!yarnInstall.args.includes("--frozen-lockfile")) {
+  throw new Error("Yarn materialization must preserve the exact proven lockfile");
+}
 
+const pnpmInstall = dependencyMaterializationInstallSpec("pnpm");
+if (!pnpmInstall.args.includes("--frozen-lockfile")) {
+  throw new Error("pnpm materialization must preserve the exact proven lockfile");
+}
+
+const npmInstall = dependencyMaterializationInstallSpec("npm");
+if (npmInstall.args[0] !== "ci") {
+  throw new Error("npm materialization must use immutable npm ci semantics");
+}
 const fingerprint = agentScopeFingerprint({ provider: "opencode", project: "Demo", branch: "libs-group-5", scopeHash: "scope-a", model: "corp/code", promptVersion: "2026-08-09T05:26:00Z" });
 const saved = { provider: "opencode", id: "ses-safe", interrupted: true, updatedAt: "now", scopeFingerprint: fingerprint };
 if (resumableAgentSessionId(saved, "opencode", fingerprint) !== "ses-safe") throw new Error("Exact interrupted session must be resumable");
