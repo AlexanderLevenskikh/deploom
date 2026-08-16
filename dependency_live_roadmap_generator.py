@@ -6922,26 +6922,64 @@ def _verification_inputs_for_units(
     return materialization, clause
 
 
+def _expand_verification_component_context(
+    component: Sequence[str],
+    component_for: Mapping[str, Sequence[str]],
+    interactions_by_name: Mapping[str, Sequence[InteractionEdge]],
+    *,
+    context_radius: int,
+) -> Tuple[str, ...]:
+    """Expand a hard component through bounded verification-only interactions.
+
+    Radius 1 is exactly the historical behavior: the hard peer/learned-nogood
+    component plus its directly interacting neighbor components. Higher radii
+    are used only after repeated diagnostic failures and remain non-authoritative
+    until the resulting exact candidate is freshly certified.
+    """
+    packages: Set[str] = {str(name) for name in component}
+    frontier: Set[str] = set(packages)
+    radius = max(0, int(context_radius))
+    for _hop in range(radius):
+        next_frontier: Set[str] = set()
+        for name in sorted(frontier):
+            for edge in interactions_by_name.get(name, ()):
+                other = edge.right if edge.left == name else edge.left
+                for member in component_for.get(other, (other,)):
+                    member = str(member)
+                    if member not in packages:
+                        next_frontier.add(member)
+        if not next_frontier:
+            break
+        packages.update(next_frontier)
+        frontier = next_frontier
+    return tuple(sorted(packages))
+
+
 def _verification_units_for_assignment(
     rows_by_name: Dict[str, DependencyRow],
     assignment: Dict[str, str],
     mode: str,
     client: LiveDataClient,
     learned_nogoods: List[Dict[str, str]],
+    *,
+    context_radius: int = 1,
 ) -> List[VerificationUnit]:
-    """Build diagnostic units from hard cohorts plus one-hop interaction context.
+    """Build bounded conflict-localization units for an exact assignment.
 
     Peer/learned-nogood components remain atomic. Ordinary direct-dependency
-    interactions do *not* become solver constraints up front; instead an active
-    changed component carries its directly interacting current neighbors into
-    conflict localization. This lets a project-level failure teach an exact
-    nogood such as NOT(vitest@3.2.6 AND vite@4.3.9) without globally coupling
-    every ordinary dependency before there is evidence of incompatibility.
+    interactions do *not* become solver constraints up front. Radius 1 preserves
+    the original behavior. A larger radius is diagnostic navigation only and is
+    requested by repeated-conflict escalation; fresh package-manager/project
+    certification is still required before any clause becomes authoritative.
     """
-    domains = {name: _candidate_domain(row, mode, client) for name, row in rows_by_name.items()}
+    domains = {
+        name: _candidate_domain(row, mode, client)
+        for name, row in rows_by_name.items()
+    }
     hard_graph = _potential_peer_graph(rows_by_name, domains, client)
     merge_nogood_edges(hard_graph, learned_nogoods)
     hard_components = _graph_components(hard_graph)
+
     component_for: Dict[str, Tuple[str, ...]] = {}
     for component in hard_components:
         frozen = tuple(component)
@@ -6956,20 +6994,26 @@ def _verification_units_for_assignment(
     units: List[VerificationUnit] = []
     for component in hard_components:
         changed_here = any(
-            assignment.get(name, rows_by_name[name].current_version) != rows_by_name[name].current_version
+            assignment.get(name, rows_by_name[name].current_version)
+            != rows_by_name[name].current_version
             for name in component
         )
         if not changed_here:
             continue
-        packages: Set[str] = set(component)
-        for name in component:
-            for edge in interactions_by_name.get(name, ()):  # one-hop only; avoid giant transitive units
-                other = edge.right if edge.left == name else edge.left
-                packages.update(component_for.get(other, (other,)))
-        ordered = tuple(sorted(packages))
-        digest = hashlib.sha256("\0".join(ordered).encode("utf-8")).hexdigest()[:10]
-        units.append(VerificationUnit(id=f"constraint-{digest}", packages=ordered))
+        ordered = _expand_verification_component_context(
+            component,
+            component_for,
+            interactions_by_name,
+            context_radius=context_radius,
+        )
+        digest = hashlib.sha256(
+            "\0".join(ordered).encode("utf-8")
+        ).hexdigest()[:10]
+        units.append(
+            VerificationUnit(id=f"constraint-{digest}", packages=ordered)
+        )
     return units
+
 
 
 
@@ -6980,6 +7024,20 @@ EVIDENCE_NAVIGATION_ONLY = "NAVIGATION_ONLY"
 
 GRAPH_GENERALIZATION_MAX_LITERALS = 12
 GRAPH_GENERALIZATION_PROJECT_PROOFS = 2
+# Repetition is navigation evidence only. It may widen what we freshly verify,
+# but it never becomes solver authority by itself.
+GRAPH_GENERALIZATION_MAX_CONTEXT_RADIUS = 4
+GRAPH_GENERALIZATION_ESCALATED_MAX_LITERALS = 32
+
+
+@dataclasses.dataclass(frozen=True)
+class GraphGeneralizationProposal:
+    candidate: Dict[str, str]
+    seed_candidate_fingerprint: str
+    navigation_key: str
+    context_radius: int
+    repeat_count: int
+    predicate_key: str
 
 
 def _failure_package_hints(
@@ -7065,13 +7123,18 @@ def _graph_guided_generalization_candidate(
     client: LiveDataClient,
     learned_nogoods: List[Dict[str, str]],
     result: BaselineVerifyResult,
+    *,
+    context_radius: int = 1,
+    max_literals: int = GRAPH_GENERALIZATION_MAX_LITERALS,
 ) -> Optional[Dict[str, str]]:
+    """Return one bounded diagnostic clause; authority still requires certification."""
     units = _verification_units_for_assignment(
         rows_by_name,
         assignment,
         mode,
         client,
         learned_nogoods,
+        context_radius=context_radius,
     )
     hints = _failure_package_hints(result, rows_by_name)
     return _select_graph_guided_candidate_clause(
@@ -7079,7 +7142,114 @@ def _graph_guided_generalization_candidate(
         rows_by_name,
         units,
         hints,
+        max_literals=max_literals,
     )
+
+
+def _graph_generalization_repeat_predicate(
+    result: BaselineVerifyResult,
+) -> str:
+    """Stable navigation identity only; never solver authority."""
+    structural = structural_project_failure_signatures(result)
+    if structural:
+        return "structural:" + "|".join(sorted(structural))
+    signature = dependency_failure_signature(
+        summary=result.summary,
+        output=result.output,
+    )
+    return f"{result.kind}:{signature}"
+
+
+def _adaptive_graph_guided_generalization_proposal(
+    rows_by_name: Dict[str, DependencyRow],
+    assignment: Dict[str, str],
+    mode: str,
+    client: LiveDataClient,
+    learned_nogoods: List[Dict[str, str]],
+    result: BaselineVerifyResult,
+    *,
+    project_key: str,
+    repeat_tracker: Dict[str, int],
+    failed_candidates: Set[Tuple[str, str]],
+) -> Optional[GraphGeneralizationProposal]:
+    """Escalate diagnostic context only when the same failure family repeats.
+
+    The repeat counter chooses what to verify next. It is intentionally not
+    evidence that a clause is true. Every returned candidate must still pass the
+    existing fresh certification loop before it can enter ``learned``.
+    """
+    seed = _graph_guided_generalization_candidate(
+        rows_by_name,
+        assignment,
+        mode,
+        client,
+        learned_nogoods,
+        result,
+        context_radius=1,
+        max_literals=GRAPH_GENERALIZATION_MAX_LITERALS,
+    )
+    if seed is None:
+        return None
+
+    seed_fingerprint = assignment_fingerprint(seed)
+    predicate_key = _graph_generalization_repeat_predicate(result)
+    seed_shape = tuple(sorted(seed))
+    navigation_payload = {
+        "project": str(project_key),
+        "mode": str(mode),
+        "kind": str(result.kind),
+        "predicate": predicate_key,
+        "seedPackages": list(seed_shape),
+    }
+    navigation_key = hashlib.sha256(
+        json.dumps(
+            navigation_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+
+    repeat_count = repeat_tracker.get(navigation_key, 0) + 1
+    repeat_tracker[navigation_key] = repeat_count
+
+    max_radius = max(1, int(GRAPH_GENERALIZATION_MAX_CONTEXT_RADIUS))
+    start_radius = 1 if repeat_count <= 1 else min(repeat_count, max_radius)
+
+    for radius in range(start_radius, max_radius + 1):
+        if radius == 1:
+            candidate = dict(seed)
+        else:
+            candidate = _graph_guided_generalization_candidate(
+                rows_by_name,
+                assignment,
+                mode,
+                client,
+                learned_nogoods,
+                result,
+                context_radius=radius,
+                max_literals=GRAPH_GENERALIZATION_ESCALATED_MAX_LITERALS,
+            )
+            if candidate is None:
+                continue
+
+        candidate_fingerprint = assignment_fingerprint(candidate)
+        if (navigation_key, candidate_fingerprint) in failed_candidates:
+            # Navigation-only negative memoization. This does not exclude any
+            # solver assignment and is not persisted as proof.
+            continue
+
+        return GraphGeneralizationProposal(
+            candidate=dict(candidate),
+            seed_candidate_fingerprint=seed_fingerprint,
+            navigation_key=navigation_key,
+            context_radius=radius,
+            repeat_count=repeat_count,
+            predicate_key=predicate_key,
+        )
+
+    return None
+
 
 
 def _annotate_constraint_preflight(
@@ -7481,6 +7651,8 @@ def resolve_peer_compatibility_with_verification(
     global_exact_exclusions: Dict[str, Dict[str, List[Dict[str, str]]]] = {
         project: {mode: [] for mode in modes} for project in rows_by_project
     }
+    graph_generalization_repeats: Dict[str, int] = {}
+    graph_generalization_failed_candidates: Set[Tuple[str, str]] = set()
     final_assignments: Dict[str, Dict[str, Dict[str, str]]] = {}
     resolver_cache: Dict[Tuple[str, Tuple[Tuple[str, str], ...], Tuple[str, ...]], BaselineVerifyResult] = {}
     project_preflight_cache: Dict[
@@ -7957,14 +8129,39 @@ def resolve_peer_compatibility_with_verification(
                             "no solver constraint was learned"
                         )
                     generalized_nogood: Optional[Dict[str, str]] = None
-                    candidate = _graph_guided_generalization_candidate(
+                    proposal = _adaptive_graph_guided_generalization_proposal(
                         rows_by_name,
                         assignment,
                         mode,
                         client,
                         learned[project][mode],
                         result,
+                        project_key=project,
+                        repeat_tracker=graph_generalization_repeats,
+                        failed_candidates=graph_generalization_failed_candidates,
                     )
+                    candidate = proposal.candidate if proposal is not None else None
+                    if proposal is not None and proposal.repeat_count > 1:
+                        eprint(
+                            f"[info] {project}: repeated graph-guided conflict {mode}; "
+                            f"seed={proposal.seed_candidate_fingerprint}, repeat={proposal.repeat_count}, "
+                            f"expanding verification context radius={proposal.context_radius}, "
+                            f"candidate={assignment_fingerprint(proposal.candidate)}, "
+                            f"literals={len(proposal.candidate)}, authority={EVIDENCE_DIAGNOSTIC_HINT}"
+                        )
+                        progress_reporter.emit(
+                            project,
+                            mode,
+                            "generalization-context-expanded",
+                            iteration=iteration,
+                            assignment=fingerprint,
+                            seedCandidate=proposal.seed_candidate_fingerprint,
+                            candidate=assignment_fingerprint(proposal.candidate),
+                            repeatCount=proposal.repeat_count,
+                            contextRadius=proposal.context_radius,
+                            literals=len(proposal.candidate),
+                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                        )
                     if candidate is not None:
                         candidate_fingerprint = assignment_fingerprint(candidate)
                         progress_reporter.emit(
@@ -7972,11 +8169,15 @@ def resolve_peer_compatibility_with_verification(
                             iteration=iteration, assignment=fingerprint,
                             candidate=candidate_fingerprint,
                             literals=len(candidate),
+                            contextRadius=(proposal.context_radius if proposal is not None else 1),
+                            repeatCount=(proposal.repeat_count if proposal is not None else 1),
                             authority=EVIDENCE_DIAGNOSTIC_HINT,
                         )
                         eprint(
                             f"[info] {project}: graph-guided generalization proposal {mode}; "
                             f"candidate={candidate_fingerprint}, literals={len(candidate)}, "
+                            f"contextRadius={(proposal.context_radius if proposal is not None else 1)}, "
+                            f"repeat={(proposal.repeat_count if proposal is not None else 1)}, "
                             f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
                         )
                         candidate_removals = _types_stub_removals_for_assignment(
@@ -8086,6 +8287,8 @@ def resolve_peer_compatibility_with_verification(
                                 iteration=iteration, assignment=fingerprint,
                                 candidate=candidate_fingerprint,
                                 literals=len(generalized_nogood),
+                                contextRadius=(proposal.context_radius if proposal is not None else 1),
+                                repeatCount=(proposal.repeat_count if proposal is not None else 1),
                                 authority=EVIDENCE_CONFIRMED_CONSTRAINT,
                                 predicate=stable_predicate,
                             )
@@ -8096,6 +8299,32 @@ def resolve_peer_compatibility_with_verification(
                             iteration=iteration, assignment=fingerprint,
                             candidate=candidate_fingerprint,
                             authority=EVIDENCE_DIAGNOSTIC_HINT,
+                        )
+
+                    if candidate is not None and proposal is not None:
+                        graph_generalization_failed_candidates.add(
+                            (proposal.navigation_key, candidate_fingerprint)
+                        )
+                        eprint(
+                            f"[info] {project}: graph-guided candidate remains diagnostic {mode}; "
+                            f"candidate={candidate_fingerprint}, repeat={proposal.repeat_count}, "
+                            f"contextRadius={proposal.context_radius}, "
+                            f"authority={EVIDENCE_DIAGNOSTIC_HINT}; "
+                            "fresh certification did not reproduce a stable authoritative predicate"
+                        )
+                        progress_reporter.emit(
+                            project,
+                            mode,
+                            "generalization-diagnostic",
+                            iteration=iteration,
+                            assignment=fingerprint,
+                            seedCandidate=proposal.seed_candidate_fingerprint,
+                            candidate=candidate_fingerprint,
+                            repeatCount=proposal.repeat_count,
+                            contextRadius=proposal.context_radius,
+                            literals=len(candidate),
+                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                            reason="authoritative-predicate-not-certified",
                         )
 
                     if exact_nogood in global_exact_exclusions[project][mode]:
