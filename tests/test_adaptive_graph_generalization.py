@@ -271,5 +271,248 @@ class AdaptiveGraphGeneralizationTests(unittest.TestCase):
         )
 
 
+    def test_literal_budget_grows_finer_than_graph_radius(self) -> None:
+        self.assertEqual(2, roadmap._graph_generalization_literal_budget(1, 2))
+        self.assertEqual(4, roadmap._graph_generalization_literal_budget(2, 2))
+        self.assertEqual(6, roadmap._graph_generalization_literal_budget(3, 2))
+        self.assertEqual(8, roadmap._graph_generalization_literal_budget(4, 2))
+        self.assertEqual(12, roadmap._graph_generalization_literal_budget(5, 2))
+        self.assertEqual(16, roadmap._graph_generalization_literal_budget(6, 2))
+        self.assertEqual(24, roadmap._graph_generalization_literal_budget(7, 2))
+        self.assertEqual(32, roadmap._graph_generalization_literal_budget(8, 2))
+        self.assertEqual(32, roadmap._graph_generalization_literal_budget(99, 2))
+
+    def test_oversized_radius_is_sliced_instead_of_disappearing(self) -> None:
+        names = [chr(ord("a") + index) for index in range(12)]
+        rows = {
+            name: SimpleNamespace(current_version="1.0.0")
+            for name in names
+        }
+        assignment = {
+            name: ("2.0.0" if name in {"a", "c", "d", "e"} else "1.0.0")
+            for name in names
+        }
+        unit = roadmap.VerificationUnit(
+            id="oversized",
+            packages=tuple(names[:10]),
+        )
+
+        with mock.patch.object(
+            roadmap,
+            "_verification_units_for_assignment",
+            return_value=[unit],
+        ), mock.patch.object(
+            roadmap,
+            "_failure_package_hints",
+            return_value={"a"},
+        ):
+            candidate = roadmap._bounded_graph_guided_generalization_candidate(
+                rows,
+                assignment,
+                "yellow",
+                mock.Mock(),
+                [],
+                BaselineVerifyResult(
+                    False,
+                    "dependency",
+                    "ERESOLVE",
+                    output="peer conflict",
+                ),
+                context_radius=3,
+                literal_budget=6,
+                required_packages=("a", "b"),
+            )
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(6, len(candidate))
+        self.assertIn("a", candidate)
+        self.assertIn("b", candidate)
+        self.assertLess(len(candidate), len(assignment))
+        self.assertTrue({"a", "c", "d", "e"} & set(candidate))
+
+    def test_repeat_three_uses_bounded_slice_instead_of_returning_none(self) -> None:
+        names = [chr(ord("a") + index) for index in range(12)]
+        rows = {
+            name: SimpleNamespace(current_version="1.0.0")
+            for name in names
+        }
+        assignment = {
+            name: ("2.0.0" if name in {"a", "c", "d", "e"} else "1.0.0")
+            for name in names
+        }
+        result = BaselineVerifyResult(
+            False,
+            "dependency",
+            "unable to resolve dependency tree",
+            output="ERESOLVE peer conflict",
+        )
+        repeat_tracker: dict[str, int] = {}
+        failed: set[tuple[str, str]] = set()
+        seeds: dict[str, tuple[str, ...]] = {}
+
+        def units(_rows, _assignment, _mode, _client, _learned, *, context_radius=1):
+            if context_radius <= 1:
+                packages = ("a", "b")
+            elif context_radius == 2:
+                packages = ("a", "b", "c")
+            else:
+                packages = tuple(names[:10])
+            return [
+                roadmap.VerificationUnit(
+                    id=f"radius-{context_radius}",
+                    packages=packages,
+                )
+            ]
+
+        with mock.patch.object(
+            roadmap,
+            "_verification_units_for_assignment",
+            side_effect=units,
+        ), mock.patch.object(
+            roadmap,
+            "_failure_package_hints",
+            return_value={"a"},
+        ):
+            proposals = []
+            for expected_repeat in (1, 2, 3):
+                proposal = roadmap._adaptive_graph_guided_generalization_proposal(
+                    rows,
+                    assignment,
+                    "yellow",
+                    mock.Mock(),
+                    [],
+                    result,
+                    project_key="Demo",
+                    repeat_tracker=repeat_tracker,
+                    failed_candidates=failed,
+                    seed_packages_by_family=seeds,
+                )
+                self.assertIsNotNone(proposal)
+                assert proposal is not None
+                proposals.append(proposal)
+                self.assertEqual(expected_repeat, proposal.repeat_count)
+                if expected_repeat < 3:
+                    failed.add(
+                        (
+                            proposal.navigation_key,
+                            roadmap.assignment_fingerprint(proposal.candidate),
+                        )
+                    )
+
+        first, second, third = proposals
+        self.assertEqual(2, len(first.candidate))
+        self.assertEqual(3, len(second.candidate))
+        self.assertEqual(3, third.context_radius)
+        self.assertEqual(6, third.literal_budget)
+        self.assertEqual(6, len(third.candidate))
+        self.assertTrue(third.bounded_slice)
+        self.assertLess(len(third.candidate), len(assignment))
+
+    def test_seed_can_carry_forward_within_same_stable_failure_family(self) -> None:
+        names = ("a", "b", "c", "d", "e", "f")
+        rows = {
+            name: SimpleNamespace(current_version="1.0.0")
+            for name in names
+        }
+        assignment = {
+            name: ("2.0.0" if name in {"a", "c"} else "1.0.0")
+            for name in names
+        }
+        result = BaselineVerifyResult(
+            False,
+            "dependency",
+            "npm resolver failed",
+            output=(
+                "npm ERR! code ERESOLVE\n"
+                "npm ERR! Found: a@2.0.0\n"
+                "npm ERR! Could not resolve dependency:\n"
+                'npm ERR! peer a@"^1.0.0" from b@1.0.0'
+            ),
+        )
+        repeat_tracker: dict[str, int] = {}
+        failed: set[tuple[str, str]] = set()
+        seeds: dict[str, tuple[str, ...]] = {}
+        hints = {"value": {"a"}}
+
+        def units(_rows, _assignment, _mode, _client, _learned, *, context_radius=1):
+            packages = ("a", "b") if context_radius <= 1 else ("a", "b", "c", "d")
+            return [
+                roadmap.VerificationUnit(
+                    id=f"radius-{context_radius}",
+                    packages=packages,
+                )
+            ]
+
+        with mock.patch.object(
+            roadmap,
+            "_verification_units_for_assignment",
+            side_effect=units,
+        ), mock.patch.object(
+            roadmap,
+            "_failure_package_hints",
+            side_effect=lambda *_args, **_kwargs: set(hints["value"]),
+        ):
+            first = roadmap._adaptive_graph_guided_generalization_proposal(
+                rows,
+                assignment,
+                "yellow",
+                mock.Mock(),
+                [],
+                result,
+                project_key="Demo",
+                repeat_tracker=repeat_tracker,
+                failed_candidates=failed,
+                seed_packages_by_family=seeds,
+            )
+            assert first is not None
+            self.assertEqual("fresh", first.seed_source)
+            failed.add(
+                (
+                    first.navigation_key,
+                    roadmap.assignment_fingerprint(first.candidate),
+                )
+            )
+
+            hints["value"] = set()
+            second = roadmap._adaptive_graph_guided_generalization_proposal(
+                rows,
+                assignment,
+                "yellow",
+                mock.Mock(),
+                [],
+                result,
+                project_key="Demo",
+                repeat_tracker=repeat_tracker,
+                failed_candidates=failed,
+                seed_packages_by_family=seeds,
+            )
+
+        self.assertIsNotNone(second)
+        assert second is not None
+        self.assertEqual("carry-forward", second.seed_source)
+        self.assertEqual(2, second.repeat_count)
+        self.assertIn("a", second.candidate)
+        self.assertIn("b", second.candidate)
+
+    def test_block_d_navigation_state_is_not_solver_authority(self) -> None:
+        source = inspect.getsource(
+            roadmap.resolve_peer_compatibility_with_verification
+        )
+        self.assertIn(
+            "seed_packages_by_family=graph_generalization_seed_packages",
+            source,
+        )
+        self.assertNotIn(
+            "learned[project][mode].append(graph_generalization_seed_packages",
+            source,
+        )
+        self.assertNotIn(
+            "global_exact_exclusions[project][mode].append(graph_generalization_seed_packages",
+            source,
+        )
+        self.assertIn("if certified and stable_predicate:", source)
+
+
 if __name__ == "__main__":
     unittest.main()

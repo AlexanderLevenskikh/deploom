@@ -7030,6 +7030,10 @@ GRAPH_GENERALIZATION_PROJECT_PROOFS = 2
 # but it never becomes solver authority by itself.
 GRAPH_GENERALIZATION_MAX_CONTEXT_RADIUS = 4
 GRAPH_GENERALIZATION_ESCALATED_MAX_LITERALS = 32
+# Literal growth is deliberately finer-grained than graph-radius growth.
+# Repetition chooses the next diagnostic experiment only; fresh certification
+# remains the sole route to solver authority.
+GRAPH_GENERALIZATION_LITERAL_BUDGET_STEPS = (4, 6, 8, 12, 16, 24, 32)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7040,6 +7044,10 @@ class GraphGeneralizationProposal:
     context_radius: int
     repeat_count: int
     predicate_key: str
+    family_key: str
+    literal_budget: int
+    bounded_slice: bool
+    seed_source: str
 
 
 def _failure_package_hints(
@@ -7129,7 +7137,7 @@ def _graph_guided_generalization_candidate(
     context_radius: int = 1,
     max_literals: int = GRAPH_GENERALIZATION_MAX_LITERALS,
 ) -> Optional[Dict[str, str]]:
-    """Return one bounded diagnostic clause; authority still requires certification."""
+    """Return one whole bounded diagnostic clause; authority still requires certification."""
     units = _verification_units_for_assignment(
         rows_by_name,
         assignment,
@@ -7146,6 +7154,135 @@ def _graph_guided_generalization_candidate(
         hints,
         max_literals=max_literals,
     )
+
+
+def _graph_generalization_literal_budget(
+    repeat_count: int,
+    seed_size: int,
+) -> int:
+    """Return the deterministic candidate-size budget for one failure family."""
+    if repeat_count <= 1:
+        return max(1, int(seed_size))
+    index = min(
+        max(0, int(repeat_count) - 2),
+        len(GRAPH_GENERALIZATION_LITERAL_BUDGET_STEPS) - 1,
+    )
+    return min(
+        GRAPH_GENERALIZATION_ESCALATED_MAX_LITERALS,
+        max(int(seed_size), GRAPH_GENERALIZATION_LITERAL_BUDGET_STEPS[index]),
+    )
+
+
+def _bounded_graph_guided_generalization_candidate(
+    rows_by_name: Dict[str, DependencyRow],
+    assignment: Dict[str, str],
+    mode: str,
+    client: LiveDataClient,
+    learned_nogoods: List[Dict[str, str]],
+    result: BaselineVerifyResult,
+    *,
+    context_radius: int,
+    literal_budget: int,
+    required_packages: Sequence[str],
+) -> Optional[Dict[str, str]]:
+    """Slice an oversized graph-local unit into a deterministic diagnostic subset.
+
+    The subset is navigation-only. The existing fresh graph-certification path
+    must reproduce the authoritative failure predicate before it enters learned.
+    """
+    units = _verification_units_for_assignment(
+        rows_by_name,
+        assignment,
+        mode,
+        client,
+        learned_nogoods,
+        context_radius=context_radius,
+    )
+    required = {str(name) for name in required_packages if str(name)}
+    hints = _failure_package_hints(result, rows_by_name)
+    effective_hints = set(hints) | required
+    if not effective_hints or not units:
+        return None
+
+    changed_names = {
+        name
+        for name, version in assignment.items()
+        if name in rows_by_name
+        and version != rows_by_name[name].current_version
+    }
+    if not changed_names:
+        return None
+
+    ranked: List[Tuple[int, int, str, VerificationUnit]] = []
+    for unit in units:
+        package_set = set(unit.packages) & set(assignment)
+        overlap = len(package_set & effective_hints)
+        if overlap <= 0 or not (package_set & changed_names):
+            continue
+        ranked.append((-overlap, len(package_set), unit.id, unit))
+    if not ranked:
+        return None
+
+    _overlap, _size, _id, selected = min(ranked)
+    available = {
+        str(name)
+        for name in selected.packages
+        if name in assignment
+    }
+    if not available:
+        return None
+
+    max_allowed = min(
+        max(1, int(literal_budget)),
+        max(0, len(assignment) - 1),
+    )
+    if max_allowed <= 0:
+        return None
+
+    ordered: List[str] = []
+    seen: Set[str] = set()
+
+    def add_names(names: Iterable[str]) -> None:
+        for name in sorted({str(item) for item in names}):
+            if name in available and name not in seen:
+                seen.add(name)
+                ordered.append(name)
+
+    add_names(required)
+    add_names(hints)
+    add_names(available & changed_names)
+    add_names(available)
+
+    chosen = ordered[:max_allowed]
+    if not chosen:
+        return None
+
+    if not (set(chosen) & changed_names):
+        changed_available = sorted(available & changed_names)
+        if not changed_available:
+            return None
+        replacement = changed_available[0]
+        replace_index = None
+        for index in range(len(chosen) - 1, -1, -1):
+            if chosen[index] not in required:
+                replace_index = index
+                break
+        if replace_index is None:
+            return None
+        chosen[replace_index] = replacement
+        chosen = list(dict.fromkeys(chosen))
+
+    clause = {
+        name: str(assignment[name])
+        for name in chosen
+        if name in assignment
+    }
+    if not clause or len(clause) >= len(assignment):
+        return None
+    if not any(name in changed_names for name in clause):
+        return None
+    return clause
+
 
 
 def _graph_generalization_repeat_predicate(
@@ -7174,14 +7311,33 @@ def _adaptive_graph_guided_generalization_proposal(
     project_key: str,
     repeat_tracker: Dict[str, int],
     failed_candidates: Set[Tuple[str, str]],
+    seed_packages_by_family: Optional[Dict[str, Tuple[str, ...]]] = None,
 ) -> Optional[GraphGeneralizationProposal]:
-    """Escalate diagnostic context only when the same failure family repeats.
+    """Keep localization alive across exact assignments without creating authority.
 
-    The repeat counter chooses what to verify next. It is intentionally not
-    evidence that a clause is true. Every returned candidate must still pass the
-    existing fresh certification loop before it can enter ``learned``.
+    Oversized radii are sliced into gradually larger deterministic candidates.
+    A seed package shape may be carried across the same stable failure family
+    when a later resolver rendering omits package hints. Both mechanisms are
+    navigation-only; every candidate still requires fresh certification.
     """
-    seed = _graph_guided_generalization_candidate(
+    predicate_key = _graph_generalization_repeat_predicate(result)
+    family_payload = {
+        "project": str(project_key),
+        "mode": str(mode),
+        "kind": str(result.kind),
+        "predicate": predicate_key,
+    }
+    family_key = hashlib.sha256(
+        json.dumps(
+            family_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+
+    seed_store = seed_packages_by_family
+    fresh_seed = _graph_guided_generalization_candidate(
         rows_by_name,
         assignment,
         mode,
@@ -7191,17 +7347,34 @@ def _adaptive_graph_guided_generalization_proposal(
         context_radius=1,
         max_literals=GRAPH_GENERALIZATION_MAX_LITERALS,
     )
-    if seed is None:
-        return None
+
+    seed_source = "fresh"
+    if fresh_seed is not None:
+        seed = dict(fresh_seed)
+        seed_shape = tuple(sorted(seed))
+        if seed_store is not None:
+            seed_store[family_key] = seed_shape
+    else:
+        stored_shape = (
+            tuple(seed_store.get(family_key, ()))
+            if seed_store is not None
+            else ()
+        )
+        seed_shape = tuple(
+            name for name in stored_shape
+            if name in assignment
+        )
+        if not seed_shape or len(seed_shape) >= len(assignment):
+            return None
+        seed = {
+            name: str(assignment[name])
+            for name in seed_shape
+        }
+        seed_source = "carry-forward"
 
     seed_fingerprint = assignment_fingerprint(seed)
-    predicate_key = _graph_generalization_repeat_predicate(result)
-    seed_shape = tuple(sorted(seed))
     navigation_payload = {
-        "project": str(project_key),
-        "mode": str(mode),
-        "kind": str(result.kind),
-        "predicate": predicate_key,
+        "family": family_key,
         "seedPackages": list(seed_shape),
     }
     navigation_key = hashlib.sha256(
@@ -7215,15 +7388,45 @@ def _adaptive_graph_guided_generalization_proposal(
 
     repeat_count = repeat_tracker.get(navigation_key, 0) + 1
     repeat_tracker[navigation_key] = repeat_count
+    literal_budget = _graph_generalization_literal_budget(
+        repeat_count,
+        len(seed),
+    )
+
+    if repeat_count <= 1 and seed_source == "fresh":
+        candidate_fingerprint = assignment_fingerprint(seed)
+        if (navigation_key, candidate_fingerprint) not in failed_candidates:
+            return GraphGeneralizationProposal(
+                candidate=dict(seed),
+                seed_candidate_fingerprint=seed_fingerprint,
+                navigation_key=navigation_key,
+                context_radius=1,
+                repeat_count=repeat_count,
+                predicate_key=predicate_key,
+                family_key=family_key,
+                literal_budget=literal_budget,
+                bounded_slice=False,
+                seed_source=seed_source,
+            )
 
     max_radius = max(1, int(GRAPH_GENERALIZATION_MAX_CONTEXT_RADIUS))
-    start_radius = 1 if repeat_count <= 1 else min(repeat_count, max_radius)
+    start_radius = min(max(2, repeat_count), max_radius)
 
     for radius in range(start_radius, max_radius + 1):
-        if radius == 1:
-            candidate = dict(seed)
-        else:
-            candidate = _graph_guided_generalization_candidate(
+        candidate = _graph_guided_generalization_candidate(
+            rows_by_name,
+            assignment,
+            mode,
+            client,
+            learned_nogoods,
+            result,
+            context_radius=radius,
+            max_literals=literal_budget,
+        )
+        bounded_slice = False
+
+        if candidate is None:
+            candidate = _bounded_graph_guided_generalization_candidate(
                 rows_by_name,
                 assignment,
                 mode,
@@ -7231,15 +7434,16 @@ def _adaptive_graph_guided_generalization_proposal(
                 learned_nogoods,
                 result,
                 context_radius=radius,
-                max_literals=GRAPH_GENERALIZATION_ESCALATED_MAX_LITERALS,
+                literal_budget=literal_budget,
+                required_packages=seed_shape,
             )
-            if candidate is None:
-                continue
+            bounded_slice = candidate is not None
+
+        if candidate is None:
+            continue
 
         candidate_fingerprint = assignment_fingerprint(candidate)
         if (navigation_key, candidate_fingerprint) in failed_candidates:
-            # Navigation-only negative memoization. This does not exclude any
-            # solver assignment and is not persisted as proof.
             continue
 
         return GraphGeneralizationProposal(
@@ -7249,9 +7453,14 @@ def _adaptive_graph_guided_generalization_proposal(
             context_radius=radius,
             repeat_count=repeat_count,
             predicate_key=predicate_key,
+            family_key=family_key,
+            literal_budget=literal_budget,
+            bounded_slice=bounded_slice,
+            seed_source=seed_source,
         )
 
     return None
+
 
 
 
@@ -7656,6 +7865,7 @@ def resolve_peer_compatibility_with_verification(
     }
     graph_generalization_repeats: Dict[str, int] = {}
     graph_generalization_failed_candidates: Set[Tuple[str, str]] = set()
+    graph_generalization_seed_packages: Dict[str, Tuple[str, ...]] = {}
     final_assignments: Dict[str, Dict[str, Dict[str, str]]] = {}
     resolver_cache: Dict[Tuple[str, Tuple[Tuple[str, str], ...], Tuple[str, ...]], BaselineVerifyResult] = {}
     project_preflight_cache: Dict[
@@ -8147,6 +8357,7 @@ def resolve_peer_compatibility_with_verification(
                         project_key=project,
                         repeat_tracker=graph_generalization_repeats,
                         failed_candidates=graph_generalization_failed_candidates,
+                        seed_packages_by_family=graph_generalization_seed_packages,
                     )
                     candidate = proposal.candidate if proposal is not None else None
                     if proposal is not None and proposal.repeat_count > 1:
@@ -8155,7 +8366,9 @@ def resolve_peer_compatibility_with_verification(
                             f"seed={proposal.seed_candidate_fingerprint}, repeat={proposal.repeat_count}, "
                             f"expanding verification context radius={proposal.context_radius}, "
                             f"candidate={assignment_fingerprint(proposal.candidate)}, "
-                            f"literals={len(proposal.candidate)}, authority={EVIDENCE_DIAGNOSTIC_HINT}"
+                            f"literals={len(proposal.candidate)}, literalBudget={proposal.literal_budget}, "
+                            f"boundedSlice={str(proposal.bounded_slice).lower()}, seedSource={proposal.seed_source}, "
+                            f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
                         )
                         progress_reporter.emit(
                             project,
@@ -8167,6 +8380,9 @@ def resolve_peer_compatibility_with_verification(
                             candidate=assignment_fingerprint(proposal.candidate),
                             repeatCount=proposal.repeat_count,
                             contextRadius=proposal.context_radius,
+                            literalBudget=proposal.literal_budget,
+                            boundedSlice=proposal.bounded_slice,
+                            seedSource=proposal.seed_source,
                             literals=len(proposal.candidate),
                             authority=EVIDENCE_DIAGNOSTIC_HINT,
                         )
@@ -8179,6 +8395,9 @@ def resolve_peer_compatibility_with_verification(
                             literals=len(candidate),
                             contextRadius=(proposal.context_radius if proposal is not None else 1),
                             repeatCount=(proposal.repeat_count if proposal is not None else 1),
+                            literalBudget=(proposal.literal_budget if proposal is not None else len(candidate)),
+                            boundedSlice=(proposal.bounded_slice if proposal is not None else False),
+                            seedSource=(proposal.seed_source if proposal is not None else "legacy"),
                             authority=EVIDENCE_DIAGNOSTIC_HINT,
                         )
                         eprint(
@@ -8186,6 +8405,9 @@ def resolve_peer_compatibility_with_verification(
                             f"candidate={candidate_fingerprint}, literals={len(candidate)}, "
                             f"contextRadius={(proposal.context_radius if proposal is not None else 1)}, "
                             f"repeat={(proposal.repeat_count if proposal is not None else 1)}, "
+                            f"literalBudget={(proposal.literal_budget if proposal is not None else len(candidate))}, "
+                            f"boundedSlice={str(proposal.bounded_slice if proposal is not None else False).lower()}, "
+                            f"seedSource={(proposal.seed_source if proposal is not None else 'legacy')}, "
                             f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
                         )
                         candidate_removals = _types_stub_removals_for_assignment(
