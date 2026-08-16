@@ -10,6 +10,7 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+import heapq
 import time
 
 
@@ -59,6 +60,200 @@ def merge_nogood_edges(graph: Dict[str, set[str]], nogoods: Iterable[Mapping[str
             graph[name].add(anchor)
 
 
+
+
+class GlobalExactExclusionError(RuntimeError):
+    """Global exact-assignment exclusions could not be satisfied exactly."""
+
+
+@dataclass(frozen=True)
+class RankedComponentAlternative:
+    assignment: Mapping[str, str]
+    score: Tuple[int, ...]
+
+
+def coordinate_global_exact_exclusions(
+    initial: Sequence[RankedComponentAlternative],
+    exclusions: Sequence[Mapping[str, str]],
+    next_alternative: Callable[
+        [int, Tuple[Mapping[str, str], ...]],
+        Optional[RankedComponentAlternative],
+    ],
+    *,
+    max_states: int = 4096,
+    progress: Optional[ProgressCallback] = None,
+) -> Tuple[Dict[str, str], int]:
+    """Solve global exact tuple exclusions without merging solver components.
+
+    Each component owns a ranked stream of exact local assignments. The
+    coordinator enumerates the Cartesian product best-first and rejects only
+    complete assignments matching a confirmed global exclusion. A local
+    component assignment is never forbidden merely because it participated in
+    one rejected global tuple.
+    """
+    if not initial:
+        return {}, 0
+
+    component_names: list[Tuple[str, ...]] = []
+    score_width: Optional[int] = None
+    alternatives: list[list[RankedComponentAlternative]] = []
+
+    seen_names: set[str] = set()
+    for index, alternative in enumerate(initial):
+        names = tuple(sorted(str(name) for name in alternative.assignment))
+        if not names:
+            raise ValueError(f"component {index} has no package names")
+        overlap = seen_names.intersection(names)
+        if overlap:
+            raise ValueError(
+                "component assignments must be disjoint; overlap="
+                + ",".join(sorted(overlap))
+            )
+        seen_names.update(names)
+        if score_width is None:
+            score_width = len(alternative.score)
+        elif len(alternative.score) != score_width:
+            raise ValueError("component score tuples must have the same width")
+        component_names.append(names)
+        alternatives.append([alternative])
+
+    exact_exclusions = [
+        dict(exclusion)
+        for exclusion in exclusions
+        if exclusion
+    ]
+    if not exact_exclusions:
+        merged: Dict[str, str] = {}
+        for alternative in initial:
+            merged.update(alternative.assignment)
+        return merged, 1
+
+    exhausted: set[int] = set()
+
+    def emit(event: str, **details: object) -> None:
+        if progress is not None:
+            progress(event, details)
+
+    def ensure(component_index: int, alternative_index: int) -> bool:
+        while len(alternatives[component_index]) <= alternative_index:
+            if component_index in exhausted:
+                return False
+            existing = tuple(
+                dict(item.assignment)
+                for item in alternatives[component_index]
+            )
+            candidate = next_alternative(component_index, existing)
+            if candidate is None:
+                exhausted.add(component_index)
+                return False
+
+            expected_names = component_names[component_index]
+            actual_names = tuple(sorted(str(name) for name in candidate.assignment))
+            if actual_names != expected_names:
+                raise ValueError(
+                    f"component {component_index} alternative changed package identity"
+                )
+            if score_width is not None and len(candidate.score) != score_width:
+                raise ValueError(
+                    f"component {component_index} alternative score width changed"
+                )
+            frozen = tuple(
+                (name, str(candidate.assignment[name]))
+                for name in expected_names
+            )
+            if any(
+                tuple((name, str(item.assignment[name])) for name in expected_names) == frozen
+                for item in alternatives[component_index]
+            ):
+                raise GlobalExactExclusionError(
+                    f"component {component_index} repeated an already ranked assignment"
+                )
+            alternatives[component_index].append(candidate)
+            emit(
+                "component-alternative",
+                component=component_index,
+                rank=len(alternatives[component_index]) - 1,
+            )
+        return True
+
+    def compose(state: Tuple[int, ...]) -> Dict[str, str]:
+        merged: Dict[str, str] = {}
+        for component_index, alternative_index in enumerate(state):
+            merged.update(
+                alternatives[component_index][alternative_index].assignment
+            )
+        return merged
+
+    def total_score(state: Tuple[int, ...]) -> Tuple[int, ...]:
+        width = int(score_width or 0)
+        values = [0] * width
+        for component_index, alternative_index in enumerate(state):
+            score = alternatives[component_index][alternative_index].score
+            for score_index, value in enumerate(score):
+                values[score_index] += int(value)
+        return tuple(values)
+
+    initial_state = tuple(0 for _ in alternatives)
+    heap: list[Tuple[Tuple[int, ...], Tuple[int, ...]]] = [
+        (tuple(-value for value in total_score(initial_state)), initial_state)
+    ]
+    queued = {initial_state}
+    visited: set[Tuple[int, ...]] = set()
+    explored = 0
+
+    while heap:
+        _priority, state = heapq.heappop(heap)
+        queued.discard(state)
+        if state in visited:
+            continue
+        visited.add(state)
+        explored += 1
+        if explored > max(1, int(max_states)):
+            raise GlobalExactExclusionError(
+                f"global exact exclusion coordinator exceeded {max_states} states"
+            )
+
+        assignment = compose(state)
+        matched = [
+            exclusion
+            for exclusion in exact_exclusions
+            if assignment_matches_nogood(assignment, exclusion)
+        ]
+        if not matched:
+            emit(
+                "accepted",
+                exploredStates=explored,
+                rankedComponents=len(alternatives),
+            )
+            return assignment, explored
+
+        emit(
+            "rejected-global-exact",
+            exploredStates=explored,
+            matchedExclusions=len(matched),
+        )
+
+        for component_index in range(len(alternatives)):
+            next_index = state[component_index] + 1
+            if not ensure(component_index, next_index):
+                continue
+            next_state = list(state)
+            next_state[component_index] = next_index
+            frozen_state = tuple(next_state)
+            if frozen_state in visited or frozen_state in queued:
+                continue
+            heapq.heappush(
+                heap,
+                (
+                    tuple(-value for value in total_score(frozen_state)),
+                    frozen_state,
+                ),
+            )
+            queued.add(frozen_state)
+
+    raise GlobalExactExclusionError(
+        "all ranked component combinations were exhausted by global exact exclusions"
+    )
 def _partitions(items: Sequence[VerificationUnit], count: int) -> List[List[VerificationUnit]]:
     count = max(1, min(count, len(items)))
     result: List[List[VerificationUnit]] = [[] for _ in range(count)]

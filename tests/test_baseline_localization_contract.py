@@ -124,6 +124,43 @@ class BaselineLocalizationContractTests(unittest.TestCase):
         )
 
 
+    def test_graph_guided_candidate_exactifies_interaction_context(self) -> None:
+        rows = {
+            "plugin": SimpleNamespace(current_version="1.0.0"),
+            "vite": SimpleNamespace(current_version="4.3.9"),
+            "eslint": SimpleNamespace(current_version="8.0.0"),
+        }
+        assignment = {
+            "plugin": "2.0.0",
+            "vite": "4.3.9",
+            "eslint": "9.0.0",
+        }
+        units = (
+            VerificationUnit("plugin-vite", ("plugin", "vite")),
+            VerificationUnit("eslint", ("eslint",)),
+        )
+        candidate = roadmap._select_graph_guided_candidate_clause(
+            assignment,
+            rows,
+            units,
+            {"plugin"},
+        )
+        self.assertEqual(
+            {"plugin": "2.0.0", "vite": "4.3.9"},
+            candidate,
+        )
+
+    def test_graph_guided_candidate_is_diagnostic_until_certified(self) -> None:
+        source = (ROOT / "dependency_live_roadmap_generator.py").read_text(encoding="utf-8")
+        self.assertIn('EVIDENCE_DIAGNOSTIC_HINT = "DIAGNOSTIC_HINT"', source)
+        self.assertIn('EVIDENCE_CONFIRMED_CONSTRAINT = "CONFIRMED_CONSTRAINT"', source)
+        self.assertIn("global_exact_exclusions[project][mode].append(exact_nogood)", source)
+        self.assertNotIn(
+            "merge_nogood_edges(graph, global_exact_exclusions",
+            source,
+        )
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -62,7 +62,7 @@ import threading
 from collections import defaultdict
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import requests
 from dateutil.relativedelta import relativedelta
@@ -71,7 +71,16 @@ from cli_io import configure_utf8_stdio
 from dependency_audit_branch import AuditBranchError, recover_orphaned_managed_workspace
 from git_hook_policy import GitHookPolicyError, run_git
 from workspace_noise import relevant_porcelain_entries
-from constraint_verify import LocalizationTimeoutError, VerificationUnit, assignment_matches_nogood, merge_nogood_edges, parallel_ddmin
+from constraint_verify import (
+    GlobalExactExclusionError,
+    LocalizationTimeoutError,
+    RankedComponentAlternative,
+    VerificationUnit,
+    assignment_matches_nogood,
+    coordinate_global_exact_exclusions,
+    merge_nogood_edges,
+    parallel_ddmin,
+)
 from baseline_constraint_verifier import (
     BaselineVerifyConfig, BaselineVerifyResult, assignment_fingerprint,
     discover_baseline_project_checks, structural_project_failure_signatures, verify_assignment,
@@ -6234,12 +6243,121 @@ def _resolution_change_reason(
     return ""
 
 
+
+
+def _coordinate_solver_global_exclusions(
+    components: List[List[str]],
+    initial_assignment: Dict[str, str],
+    exact_exclusions: List[Dict[str, str]],
+    rows_by_name: Dict[str, DependencyRow],
+    domains: Dict[str, List[str]],
+    client: LiveDataClient,
+    mode: str,
+    learned_nogoods: List[Dict[str, str]],
+    solver_config: Optional[Dict[str, Any]],
+    stability_targets: Optional[Dict[str, str]],
+) -> Dict[str, str]:
+    """Apply full-assignment exclusions without changing component topology."""
+    if not exact_exclusions:
+        return initial_assignment
+    if not any(
+        assignment_matches_nogood(initial_assignment, exclusion)
+        for exclusion in exact_exclusions
+    ):
+        return initial_assignment
+
+    ranked_initial: List[RankedComponentAlternative] = []
+    models = []
+    for component in components:
+        model = _build_peer_optimization_model(
+            component,
+            rows_by_name,
+            domains,
+            client,
+            mode,
+            learned_nogoods,
+            stability_targets,
+        )
+        models.append(model)
+        local_assignment = {
+            name: initial_assignment[name]
+            for name in component
+        }
+        ranked_initial.append(
+            RankedComponentAlternative(
+                assignment=local_assignment,
+                score=tuple(model.assignment_score(local_assignment)),
+            )
+        )
+
+    def next_alternative(
+        component_index: int,
+        existing: Tuple[Mapping[str, str], ...],
+    ) -> Optional[RankedComponentAlternative]:
+        component = components[component_index]
+        # These exact local exclusions exist only inside the ranked alternative
+        # generator. They are navigation state, never learned solver authority.
+        temporary_nogoods = list(learned_nogoods)
+        temporary_nogoods.extend(dict(item) for item in existing)
+        report = _run_z3_peer_component(
+            component,
+            rows_by_name,
+            domains,
+            client,
+            mode,
+            temporary_nogoods,
+            solver_config,
+            stability_targets,
+        )
+        status = str(report.get("status") or "")
+        candidate = report.get("assignment")
+        if status == "optimal" and isinstance(candidate, dict):
+            candidate_assignment = {
+                name: str(candidate[name])
+                for name in component
+            }
+            return RankedComponentAlternative(
+                assignment=candidate_assignment,
+                score=tuple(models[component_index].assignment_score(candidate_assignment)),
+            )
+        if status == "unsat":
+            return None
+        raise GlobalExactExclusionError(
+            f"component {component_index} alternative solve returned {status or 'error'}: "
+            f"{str(report.get('detail') or '')[:240]}"
+        )
+
+    def coordinator_progress(event: str, details: Mapping[str, object]) -> None:
+        if event in {"rejected-global-exact", "component-alternative", "accepted"}:
+            detail = ", ".join(
+                f"{key}={value}" for key, value in sorted(details.items())
+            )
+            eprint(
+                f"[info] global exact coordinator {mode} {event}; {detail}"
+            )
+
+    assignment, explored = coordinate_global_exact_exclusions(
+        ranked_initial,
+        exact_exclusions,
+        next_alternative,
+        max_states=4096,
+        progress=coordinator_progress,
+    )
+    eprint(
+        f"[info] global exact coordinator {mode} resolved "
+        f"{len(exact_exclusions)} exclusion(s) across {len(components)} "
+        f"independent component(s); exploredStates={explored}"
+    )
+    return assignment
+
+
 def resolve_peer_compatibility(
     rows_by_project: Dict[str, List[DependencyRow]],
     client: LiveDataClient,
     *,
     modes: Tuple[str, ...] = ("yellow", "green", "default"),
     learned_nogoods_by_project_mode: Optional[Dict[str, Dict[str, List[Dict[str, str]]]]] = None,
+    global_exact_exclusions_by_project_mode: Optional[Dict[str, Dict[str, List[Dict[str, str]]]]] = None,
     apply_results: bool = True,
     solver_statuses_out: Optional[Dict[str, Dict[str, Dict[str, str]]]] = None,
     shadow_solver_config_by_project: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -6270,6 +6388,11 @@ def resolve_peer_compatibility(
         residual_targets = dict((residual_targets_by_project or {}).get(project, {}))
         for mode in modes:
             learned_nogoods = ((learned_nogoods_by_project_mode or {}).get(project, {}).get(mode, []))
+            global_exact_exclusions = (
+                (global_exact_exclusions_by_project_mode or {})
+                .get(project, {})
+                .get(mode, [])
+            )
             domains: Dict[str, List[str]] = {}
             for name, row in rows_by_name.items():
                 previous_target = residual_targets.get(name, "")
@@ -6481,6 +6604,31 @@ def resolve_peer_compatibility(
                     mode_shadow_reports.append(dict(report))
                     if shadow_reports_out is not None:
                         shadow_reports_out.setdefault(project, {}).setdefault(mode, []).append(dict(report))
+
+
+            if global_exact_exclusions:
+                if authoritative_backend != "z3":
+                    raise BaselineConstraintVerificationError(
+                        f"GLOBAL_EXACT_EXCLUSION_REQUIRES_Z3: {project}/{mode}"
+                    )
+                try:
+                    assignment = _coordinate_solver_global_exclusions(
+                        components,
+                        assignment,
+                        global_exact_exclusions,
+                        rows_by_name,
+                        domains,
+                        client,
+                        mode,
+                        learned_nogoods,
+                        solver_config,
+                        residual_targets,
+                    )
+                except GlobalExactExclusionError as exc:
+                    raise BaselineConstraintVerificationError(
+                        f"GLOBAL_EXACT_EXCLUSION_COORDINATOR_FAILED: "
+                        f"{project}/{mode}: {exc}"
+                    ) from None
 
             if mode_exact_reports:
                 exact_changed = sum(int(report.get("changed") or 0) for report in mode_exact_reports)
@@ -6777,6 +6925,116 @@ def _verification_units_for_assignment(
     return units
 
 
+
+EVIDENCE_HARD_MODEL = "HARD_MODEL"
+EVIDENCE_CONFIRMED_CONSTRAINT = "CONFIRMED_CONSTRAINT"
+EVIDENCE_DIAGNOSTIC_HINT = "DIAGNOSTIC_HINT"
+EVIDENCE_NAVIGATION_ONLY = "NAVIGATION_ONLY"
+
+GRAPH_GENERALIZATION_MAX_LITERALS = 12
+GRAPH_GENERALIZATION_PROJECT_PROOFS = 2
+
+
+def _failure_package_hints(
+    result: BaselineVerifyResult,
+    rows_by_name: Mapping[str, DependencyRow],
+) -> Set[str]:
+    hints: Set[str] = set()
+    signatures = structural_project_failure_signatures(result)
+    for signature in signatures:
+        if ":" not in signature:
+            continue
+        prefix, value = signature.split(":", 1)
+        candidate = value.strip().lower()
+        if prefix in {
+            "ts-module-resolution",
+            "esm-cjs",
+            "duplicate-type-universe",
+        }:
+            for name in rows_by_name:
+                if name.lower() == candidate:
+                    hints.add(name)
+        elif prefix == "toolchain-runtime-api" and candidate.startswith("sass."):
+            if "sass" in rows_by_name:
+                hints.add("sass")
+
+    text = f"{result.summary}\n{result.output}".lower()
+    for name in rows_by_name:
+        lowered = name.lower()
+        if lowered and lowered in text:
+            hints.add(name)
+    return hints
+
+
+def _select_graph_guided_candidate_clause(
+    assignment: Mapping[str, str],
+    rows_by_name: Mapping[str, DependencyRow],
+    units: Sequence[VerificationUnit],
+    hints: Set[str],
+    *,
+    max_literals: int = GRAPH_GENERALIZATION_MAX_LITERALS,
+) -> Optional[Dict[str, str]]:
+    """Pick one bounded diagnostic candidate; certification decides authority."""
+    if not hints or not units:
+        return None
+
+    changed_names = {
+        name
+        for name, version in assignment.items()
+        if name in rows_by_name
+        and version != rows_by_name[name].current_version
+    }
+    ranked: List[Tuple[int, int, str, VerificationUnit]] = []
+    for unit in units:
+        package_set = set(unit.packages)
+        overlap = len(package_set & hints)
+        if overlap <= 0 or not (package_set & changed_names):
+            continue
+        ranked.append((-overlap, len(package_set), unit.id, unit))
+    if not ranked:
+        return None
+
+    _overlap, _size, _id, selected = min(ranked)
+    clause = {
+        name: str(assignment[name])
+        for name in sorted(selected.packages)
+        if name in assignment
+    }
+    if not clause:
+        return None
+    if len(clause) > max(1, int(max_literals)):
+        return None
+    if len(clause) >= len(assignment):
+        return None
+    if not any(name in changed_names for name in clause):
+        return None
+    return clause
+
+
+def _graph_guided_generalization_candidate(
+    rows_by_name: Dict[str, DependencyRow],
+    assignment: Dict[str, str],
+    mode: str,
+    client: LiveDataClient,
+    learned_nogoods: List[Dict[str, str]],
+    result: BaselineVerifyResult,
+) -> Optional[Dict[str, str]]:
+    units = _verification_units_for_assignment(
+        rows_by_name,
+        assignment,
+        mode,
+        client,
+        learned_nogoods,
+    )
+    hints = _failure_package_hints(result, rows_by_name)
+    return _select_graph_guided_candidate_clause(
+        assignment,
+        rows_by_name,
+        units,
+        hints,
+    )
+
+
 def _annotate_constraint_preflight(
     rows: List[DependencyRow],
     mode: str,
@@ -6974,6 +7232,9 @@ def resolve_peer_compatibility_with_verification(
     learned: Dict[str, Dict[str, List[Dict[str, str]]]] = {
         project: {mode: [] for mode in modes} for project in rows_by_project
     }
+    global_exact_exclusions: Dict[str, Dict[str, List[Dict[str, str]]]] = {
+        project: {mode: [] for mode in modes} for project in rows_by_project
+    }
     final_assignments: Dict[str, Dict[str, Dict[str, str]]] = {}
     resolver_cache: Dict[Tuple[str, Tuple[Tuple[str, str], ...], Tuple[str, ...]], BaselineVerifyResult] = {}
     project_preflight_cache: Dict[
@@ -7165,6 +7426,7 @@ def resolve_peer_compatibility_with_verification(
                     {project: rows}, client,
                     modes=(mode,),
                     learned_nogoods_by_project_mode=learned,
+                    global_exact_exclusions_by_project_mode=global_exact_exclusions,
                     apply_results=False,
                     solver_statuses_out=solver_statuses,
                     shadow_solver_config_by_project={project: spec.constraint_verify_config},
@@ -7413,22 +7675,168 @@ def resolve_peer_compatibility_with_verification(
                             "the exact assignment did not reproduce the same authoritative failure; "
                             "no solver constraint was learned"
                         )
-                    if exact_nogood in learned[project][mode]:
-                        raise BaselineConstraintVerificationError(
-                            f"BASELINE_CONSTRAINT_LOOP_STUCK: {project}/{mode}: "
-                            f"exact failing assignment {fingerprint} was already blocked"
+                    generalized_nogood: Optional[Dict[str, str]] = None
+                    candidate = _graph_guided_generalization_candidate(
+                        rows_by_name,
+                        assignment,
+                        mode,
+                        client,
+                        learned[project][mode],
+                        result,
+                    )
+                    if candidate is not None:
+                        candidate_fingerprint = assignment_fingerprint(candidate)
+                        progress_reporter.emit(
+                            project, mode, "generalization-proposed",
+                            iteration=iteration, assignment=fingerprint,
+                            candidate=candidate_fingerprint,
+                            literals=len(candidate),
+                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                        )
+                        eprint(
+                            f"[info] {project}: graph-guided generalization proposal {mode}; "
+                            f"candidate={candidate_fingerprint}, literals={len(candidate)}, "
+                            f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
+                        )
+                        candidate_removals = _types_stub_removals_for_assignment(
+                            rows_by_name, candidate, mode, client
+                        )
+                        proof_count = (
+                            1 if result.kind == "dependency"
+                            else GRAPH_GENERALIZATION_PROJECT_PROOFS
+                        )
+                        stable_predicate = ""
+                        certified = True
+                        for proof_index in range(proof_count):
+                            proof_number = proof_index + 1
+                            candidate_result = verify_assignment(
+                                spec.path,
+                                candidate,
+                                config=confirmation_config if result.kind == "project" else config,
+                                run_project_checks=confirmation_project_checks,
+                                remove_packages=candidate_removals,
+                                progress=lambda message, proof_number=proof_number: (
+                                    progress_reporter.emit(
+                                        project, mode, "generalization-certification-running",
+                                        iteration=iteration, assignment=fingerprint,
+                                        candidate=candidate_fingerprint,
+                                        proof=proof_number, proofs=proof_count,
+                                        message=message,
+                                    ),
+                                    eprint(
+                                        f"[info] {project}: graph certification {mode} "
+                                        f"{proof_number}/{proof_count}: {message}"
+                                    ),
+                                ),
+                                progress_label=(
+                                    f"Baseline graph certification {mode} "
+                                    f"{proof_number}/{proof_count} {candidate_fingerprint}"
+                                ),
+                            )
+                            if candidate_result.kind in {"infrastructure", "unknown"}:
+                                certified = False
+                                eprint(
+                                    f"[warn] {project}: graph-guided candidate remained diagnostic; "
+                                    f"certification={candidate_result.kind}: {candidate_result.summary}"
+                                )
+                                break
+
+                            predicate = ""
+                            if result.kind == "dependency":
+                                if candidate_result.kind == "dependency" and not candidate_result.ok:
+                                    observed = dependency_failure_signature(
+                                        summary=candidate_result.summary,
+                                        output=candidate_result.output,
+                                    )
+                                    if observed == expected_signature:
+                                        predicate = observed
+                            elif result.kind == "preparation":
+                                if candidate_result.kind == "preparation" and not candidate_result.ok:
+                                    observed = dependency_failure_signature(
+                                        summary=candidate_result.summary,
+                                        output=candidate_result.output,
+                                    )
+                                    if observed == expected_signature:
+                                        predicate = observed
+                            elif config.project_checks == "adaptive":
+                                if candidate_result.kind == "project" and not candidate_result.ok:
+                                    observed_structural = set(
+                                        adaptive_structural_evidence(candidate_result)
+                                    )
+                                    stable = sorted(
+                                        observed_structural & expected_structural
+                                    )
+                                    if stable:
+                                        predicate = "|".join(stable)
+                            else:
+                                if candidate_result.kind == "project" and not candidate_result.ok:
+                                    observed = dependency_failure_signature(
+                                        summary=candidate_result.summary,
+                                        output=candidate_result.output,
+                                    )
+                                    if observed == expected_signature:
+                                        predicate = observed
+
+                            if not predicate:
+                                certified = False
+                                break
+                            if stable_predicate and predicate != stable_predicate:
+                                certified = False
+                                break
+                            stable_predicate = predicate
+
+                        if certified and stable_predicate:
+                            generalized_nogood = dict(candidate)
+                            if generalized_nogood in learned[project][mode]:
+                                raise BaselineConstraintVerificationError(
+                                    f"BASELINE_CONSTRAINT_LOOP_STUCK: {project}/{mode}: "
+                                    f"certified generalized constraint {candidate_fingerprint} "
+                                    "was already learned"
+                                )
+                            learned[project][mode].append(generalized_nogood)
+                            localization_checkpoint_store.clear(project, mode)
+                            eprint(
+                                f"[warn] {project}: graph-guided constraint certified; "
+                                f"NOT({candidate_fingerprint}), literals={len(generalized_nogood)}, "
+                                f"authority={EVIDENCE_CONFIRMED_CONSTRAINT}; re-solving"
+                            )
+                            progress_reporter.emit(
+                                project, mode, "generalization-certified",
+                                iteration=iteration, assignment=fingerprint,
+                                candidate=candidate_fingerprint,
+                                literals=len(generalized_nogood),
+                                authority=EVIDENCE_CONFIRMED_CONSTRAINT,
+                                predicate=stable_predicate,
+                            )
+                            continue
+
+                        progress_reporter.emit(
+                            project, mode, "generalization-not-certified",
+                            iteration=iteration, assignment=fingerprint,
+                            candidate=candidate_fingerprint,
+                            authority=EVIDENCE_DIAGNOSTIC_HINT,
                         )
 
-                    learned[project][mode].append(exact_nogood)
+                    if exact_nogood in global_exact_exclusions[project][mode]:
+                        raise BaselineConstraintVerificationError(
+                            f"BASELINE_CONSTRAINT_LOOP_STUCK: {project}/{mode}: "
+                            f"global exact assignment {fingerprint} was already excluded"
+                        )
+
+                    global_exact_exclusions[project][mode].append(exact_nogood)
                     localization_checkpoint_store.clear(project, mode)
                     eprint(
-                        f"[warn] {project}: blocked exact failing assignment {fingerprint} after fresh confirmation; "
-                        "re-solving immediately without mandatory ddmin generalization"
+                        f"[warn] {project}: blocked exact failing assignment {fingerprint} "
+                        f"as global exact exclusion; literals={len(exact_nogood)}, "
+                        f"authority={EVIDENCE_CONFIRMED_CONSTRAINT}; "
+                        "solver components remain independent"
                     )
                     progress_reporter.emit(
                         project, mode, "exact-assignment-blocked",
                         iteration=iteration, assignment=fingerprint,
                         literals=len(exact_nogood), origin=result.kind,
+                        authority=EVIDENCE_CONFIRMED_CONSTRAINT,
+                        topologyMerged=False,
                     )
                     continue
 

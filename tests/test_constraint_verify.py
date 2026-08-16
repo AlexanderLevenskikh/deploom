@@ -9,7 +9,16 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from constraint_verify import LocalizationTimeoutError, VerificationUnit, assignment_matches_nogood, merge_nogood_edges, parallel_ddmin
+from constraint_verify import (
+    GlobalExactExclusionError,
+    LocalizationTimeoutError,
+    RankedComponentAlternative,
+    VerificationUnit,
+    assignment_matches_nogood,
+    coordinate_global_exact_exclusions,
+    merge_nogood_edges,
+    parallel_ddmin,
+)
 
 
 class ConstraintVerifyTests(unittest.TestCase):
@@ -235,6 +244,85 @@ class ConstraintVerifyTests(unittest.TestCase):
                 units, hangs, parallelism=2, max_checks=4,
                 timeout_seconds=0.05, progress_interval_seconds=1,
             )
+
+    def test_global_exact_exclusion_keeps_components_independent(self) -> None:
+        initial = (
+            RankedComponentAlternative({"a": "2"}, (10,)),
+            RankedComponentAlternative({"b": "2"}, (10,)),
+        )
+        alternatives = {
+            0: [RankedComponentAlternative({"a": "1"}, (7,))],
+            1: [RankedComponentAlternative({"b": "1"}, (9,))],
+        }
+
+        def next_alt(index, existing):
+            rank = len(existing) - 1
+            values = alternatives[index]
+            return values[rank] if rank < len(values) else None
+
+        assignment, explored = coordinate_global_exact_exclusions(
+            initial,
+            [{"a": "2", "b": "2"}],
+            next_alt,
+        )
+        self.assertEqual({"a": "2", "b": "1"}, assignment)
+        self.assertGreaterEqual(explored, 2)
+
+    def test_global_exact_exclusion_handles_multiple_blocked_tuples(self) -> None:
+        initial = (
+            RankedComponentAlternative({"a": "2"}, (10,)),
+            RankedComponentAlternative({"b": "2"}, (10,)),
+        )
+        alternatives = {
+            0: [RankedComponentAlternative({"a": "1"}, (8,))],
+            1: [RankedComponentAlternative({"b": "1"}, (9,))],
+        }
+
+        def next_alt(index, existing):
+            rank = len(existing) - 1
+            values = alternatives[index]
+            return values[rank] if rank < len(values) else None
+
+        assignment, _explored = coordinate_global_exact_exclusions(
+            initial,
+            [
+                {"a": "2", "b": "2"},
+                {"a": "2", "b": "1"},
+            ],
+            next_alt,
+        )
+        self.assertEqual({"a": "1", "b": "2"}, assignment)
+
+    def test_global_exact_exclusion_never_strengthens_to_local_block(self) -> None:
+        initial = (
+            RankedComponentAlternative({"a": "2"}, (10,)),
+            RankedComponentAlternative({"b": "2"}, (10,)),
+        )
+        calls: list[tuple[int, tuple[tuple[tuple[str, str], ...], ...]]] = []
+
+        def next_alt(index, existing):
+            frozen = tuple(
+                tuple(sorted(item.items()))
+                for item in existing
+            )
+            calls.append((index, frozen))
+            if index == 0 and len(existing) == 1:
+                return RankedComponentAlternative({"a": "1"}, (1,))
+            if index == 1 and len(existing) == 1:
+                return RankedComponentAlternative({"b": "1"}, (9,))
+            return None
+
+        assignment, _ = coordinate_global_exact_exclusions(
+            initial,
+            [{"a": "2", "b": "2"}],
+            next_alt,
+        )
+        self.assertEqual({"a": "2", "b": "1"}, assignment)
+        # The callback receives only the local component history. The global
+        # a@2+b@2 exclusion is never projected into an authoritative local a@2
+        # or b@2 constraint.
+        self.assertIn((1, ((("b", "2"),),)), calls)
+
 
 
 if __name__ == "__main__":
