@@ -60,6 +60,7 @@ import time
 import tarfile
 import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -3123,6 +3124,72 @@ def normalized_lag_months(value: Any, default: int = 12) -> int:
     return parsed if parsed in (3, 6, 9, 12) else default
 
 
+REGISTRY_PREFETCH_PARALLELISM = 8
+
+
+def _prefetch_registry_metadata(
+    client: LiveDataClient,
+    dependencies: Sequence[Tuple[str, str, str]],
+    *,
+    progress_label: str = "",
+    max_workers: int = REGISTRY_PREFETCH_PARALLELISM,
+) -> None:
+    """Fetch independent packuments concurrently, then reduce deterministically."""
+    names = sorted({
+        str(name)
+        for name, _kind, spec in dependencies
+        if not is_non_registry_spec(spec) and str(name) not in client.npm_cache
+    })
+    if not names:
+        return
+    workers = max(1, min(int(max_workers), 16, len(names)))
+    if workers <= 1:
+        for name in names:
+            client.npm_cache[name] = client.fetch_npm_metadata(name)
+        return
+
+    started = time.perf_counter()
+    local = threading.local()
+
+    def fetch_one(name: str) -> Any:
+        worker = getattr(local, "client", None)
+        if worker is None:
+            worker = LiveDataClient(
+                client.registry, timeout=client.timeout,
+                batch_size=client.batch_size, sleep_sec=client.sleep_sec,
+                use_system_proxy=client.use_system_proxy,
+            )
+            local.client = worker
+        return worker.fetch_npm_metadata(name)
+
+    results: Dict[str, Any] = {}
+    errors: Dict[str, BaseException] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch_one, name): name for name in names}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except BaseException as exc:
+                errors[name] = exc
+
+    if errors:
+        first_name = sorted(errors)[0]
+        first_error = errors[first_name]
+        raise RegistryInfrastructureError(
+            f"REGISTRY_METADATA_PREFETCH_FAILED: {first_name}: {first_error}"
+        ) from first_error
+
+    for name in names:
+        client.npm_cache[name] = results[name]
+
+    eprint(
+        f"[info] {progress_label}: registry metadata prefetch completed; "
+        f"packages={len(names)}; parallelism={workers}; "
+        f"elapsed={time.perf_counter() - started:.1f}s"
+    )
+
+
 def analyze_project(
     project: ProjectSpec,
     client: LiveDataClient,
@@ -3148,6 +3215,11 @@ def analyze_project(
     eprint(
         f"[info] {label}: dependency analysis started; direct={len(dependencies)}; "
         f"manager={manager}; lockfile={lock_name}"
+    )
+    _prefetch_registry_metadata(
+        client,
+        dependencies,
+        progress_label=label,
     )
 
     for dependency_index, (name, kind, spec) in enumerate(dependencies, start=1):

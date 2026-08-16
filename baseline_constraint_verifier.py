@@ -14,6 +14,7 @@ are fed back into planning before any Executor branch is created.
 """
 from __future__ import annotations
 
+import atexit
 import dataclasses
 import hashlib
 import json
@@ -23,6 +24,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -481,6 +483,192 @@ def clean_ephemeral_verification_caches(project_dir: Path) -> Tuple[str, ...]:
     return tuple(removed)
 
 
+@dataclasses.dataclass(frozen=True)
+class PreparedWorkspaceSnapshot:
+    key: str
+    workspace_root: Path
+    project_relative: Path
+    observed_resolved_versions: Mapping[str, str]
+    observed_resolved_hash: str
+
+
+_PREPARED_SNAPSHOT_LOCK = threading.Lock()
+_PREPARED_SNAPSHOT_ROOT: Optional[Path] = None
+_PREPARED_SNAPSHOTS: Dict[Tuple[str, str], PreparedWorkspaceSnapshot] = {}
+
+
+def _cleanup_prepared_snapshot_root() -> None:
+    global _PREPARED_SNAPSHOT_ROOT
+    root = _PREPARED_SNAPSHOT_ROOT
+    if root is None:
+        return
+    shutil.rmtree(root, ignore_errors=True)
+    _PREPARED_SNAPSHOT_ROOT = None
+    _PREPARED_SNAPSHOTS.clear()
+
+
+atexit.register(_cleanup_prepared_snapshot_root)
+
+
+def _prepared_snapshot_root() -> Path:
+    global _PREPARED_SNAPSHOT_ROOT
+    with _PREPARED_SNAPSHOT_LOCK:
+        if _PREPARED_SNAPSHOT_ROOT is None:
+            _PREPARED_SNAPSHOT_ROOT = Path(
+                tempfile.mkdtemp(prefix="dependency-flow-prepared-snapshots-")
+            )
+        return _PREPARED_SNAPSHOT_ROOT
+
+
+def _copy_tree_snapshot(source: Path, target: Path) -> None:
+    """Copy one sealed prepared tree without writable hard-link sharing."""
+    source = source.resolve()
+    target = target.resolve()
+    if target.exists():
+        raise RuntimeError(f"PREPARED_SNAPSHOT_TARGET_EXISTS: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if os.name == "nt":
+        robocopy = shutil.which("robocopy")
+        if robocopy:
+            result = subprocess.run(
+                [
+                    robocopy, str(source), str(target), "/E", "/COPY:DAT",
+                    "/DCOPY:DAT", "/R:1", "/W:1", "/NFL", "/NDL",
+                    "/NJH", "/NJS", "/NP", "/SL",
+                ],
+                text=True, encoding="utf-8", errors="replace",
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=900, check=False,
+            )
+            if result.returncode < 8:
+                return
+            shutil.rmtree(target, ignore_errors=True)
+            raise RuntimeError(
+                "PREPARED_SNAPSHOT_ROBOCOPY_FAILED: "
+                f"exit={result.returncode}: {(result.stdout or '')[-1200:]}"
+            )
+
+    if os.name != "nt":
+        cp = shutil.which("cp")
+        if cp:
+            target.mkdir(parents=True, exist_ok=False)
+            result = subprocess.run(
+                [cp, "-a", "--reflink=auto", f"{source}/.", str(target)],
+                text=True, encoding="utf-8", errors="replace",
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=900, check=False,
+            )
+            if result.returncode == 0:
+                return
+            shutil.rmtree(target, ignore_errors=True)
+
+    shutil.copytree(source, target, symlinks=True)
+
+
+def _prepared_snapshot_slot(key: str, source_project: Path) -> Tuple[str, str]:
+    return str(key), str(source_project.resolve())
+
+
+def _lookup_prepared_workspace_snapshot(
+    key: str, source_project: Path
+) -> Optional[PreparedWorkspaceSnapshot]:
+    slot = _prepared_snapshot_slot(key, source_project)
+    with _PREPARED_SNAPSHOT_LOCK:
+        snapshot = _PREPARED_SNAPSHOTS.get(slot)
+        if snapshot is None:
+            return None
+        if not snapshot.workspace_root.is_dir():
+            _PREPARED_SNAPSHOTS.pop(slot, None)
+            return None
+        return snapshot
+
+
+def _evict_prepared_workspace_snapshot(key: str, source_project: Path) -> None:
+    slot = _prepared_snapshot_slot(key, source_project)
+    with _PREPARED_SNAPSHOT_LOCK:
+        snapshot = _PREPARED_SNAPSHOTS.pop(slot, None)
+    if snapshot is not None:
+        shutil.rmtree(snapshot.workspace_root.parent, ignore_errors=True)
+
+
+def _publish_prepared_workspace_snapshot(
+    workspace_root: Path,
+    workspace_project: Path,
+    *,
+    key: str,
+    observed_versions: Mapping[str, str],
+    observed_hash: str,
+    source_project: Path,
+) -> PreparedWorkspaceSnapshot:
+    slot = _prepared_snapshot_slot(key, source_project)
+    existing = _lookup_prepared_workspace_snapshot(key, source_project)
+    if existing is not None:
+        return existing
+
+    root = _prepared_snapshot_root()
+    stage = Path(tempfile.mkdtemp(prefix=f"{key[:12]}-", dir=root))
+    stage_workspace = stage / "workspace"
+    try:
+        _copy_tree_snapshot(workspace_root, stage_workspace)
+        relative = workspace_project.resolve().relative_to(workspace_root.resolve())
+        snapshot = PreparedWorkspaceSnapshot(
+            key=str(key),
+            workspace_root=stage_workspace,
+            project_relative=relative,
+            observed_resolved_versions=dict(sorted(
+                (str(name), str(version)) for name, version in observed_versions.items()
+            )),
+            observed_resolved_hash=str(observed_hash),
+        )
+        with _PREPARED_SNAPSHOT_LOCK:
+            raced = _PREPARED_SNAPSHOTS.get(slot)
+            if raced is None:
+                _PREPARED_SNAPSHOTS[slot] = snapshot
+                return snapshot
+        shutil.rmtree(stage, ignore_errors=True)
+        assert raced is not None
+        return raced
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def _materialize_prepared_workspace_snapshot(
+    snapshot: PreparedWorkspaceSnapshot,
+    target: Path,
+) -> Path:
+    _copy_tree_snapshot(snapshot.workspace_root, target)
+    project = target / snapshot.project_relative
+    if not project.is_dir():
+        raise RuntimeError(
+            f"PREPARED_SNAPSHOT_PROJECT_MISSING: {snapshot.project_relative}"
+        )
+    return project
+
+
+def _package_manager_cache_environment(
+    config: BaselineVerifyConfig,
+    manager: str,
+) -> Dict[str, str]:
+    """Use a DepLoom-owned artifact cache without changing resolver authority."""
+    if not config.proof_cache_dir:
+        return {}
+    root = (
+        Path(config.proof_cache_dir).resolve().parent
+        / "package-manager-artifacts"
+        / str(manager).lower()
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    if manager == "yarn":
+        return {"YARN_CACHE_FOLDER": str(root)}
+    if manager == "npm":
+        return {"npm_config_cache": str(root)}
+    if manager == "pnpm":
+        return {"npm_config_store_dir": str(root)}
+    return {}
+
+
 def _git_root_and_relative(project_dir: Path) -> Tuple[Optional[Path], Path]:
     try:
         result = subprocess.run(
@@ -827,6 +1015,7 @@ def verify_assignment(
             "YARN_ENABLE_SCRIPTS": "false",
             "npm_config_ignore_scripts": "true",
         }
+        install_env.update(_package_manager_cache_environment(config, manager))
         resolver_record = (
             proof_store.lookup_pass("resolver", config.reuse_resolver_proof_key)
             if config.reuse_resolver_proof_key
@@ -955,175 +1144,197 @@ def verify_assignment(
             )
 
         if run_project_checks and config.project_checks != "off" and config.commands:
-            # Re-enable lifecycle scripts before project verification. This is
-            # still an external package-manager invocation, so classify its
-            # failure exactly like the resolver-only install *before* deciding
-            # it is project/migration evidence. Otherwise a transient registry
-            # 502, native postinstall/toolchain failure, auth issue, etc. could
-            # be mislabeled as a deterministic project incompatibility and be
-            # learned as a false solver nogood in strict/adaptive refinement.
-            full_install = install_args(manager, ignore_scripts=False)
-            full_argv, _ = _command_prefix(executable, full_install)
-            preparation_started = time.monotonic()
-            event("verify.preparation.start", command=" ".join(full_argv))
-            try:
-                full_result = _run(
-                    full_argv,
-                    workspace_project,
-                    timeout_seconds=phase_timeout(),
-                    env={"CI": "1", "YARN_ENABLE_IMMUTABLE_INSTALLS": "false", "YARN_ENABLE_SCRIPTS": "true", "npm_config_ignore_scripts": "false"},
-                    base_env=base_env,
-                    progress=phase_progress("lifecycle-install"), progress_label="package-manager lifecycle install",
-                    progress_interval_seconds=config.progress_interval_seconds,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                return BaselineVerifyResult(False, "infrastructure", f"project-preflight install failed: {exc}", command=" ".join(full_argv))
-            preparation_classified = "passed" if full_result.returncode == 0 else _classify_install_failure(full_result.stdout or "")
-            event(
-                "verify.preparation.finish",
-                durationMs=int((time.monotonic() - preparation_started) * 1000),
-                exitCode=full_result.returncode,
-                outcome=preparation_classified,
+            snapshot = _lookup_prepared_workspace_snapshot(
+                proof_identity.preparation_proof_key, project_dir
             )
-            if full_result.returncode != 0:
-                tail = "\n".join((full_result.stdout or "").splitlines()[-80:])
-                classified = preparation_classified
-                if classified in {"infrastructure", "dependency"}:
-                    return BaselineVerifyResult(
-                        False,
-                        classified,
-                        "assignment resolves without lifecycle scripts, but lifecycle install failed",
-                        command=" ".join(full_argv), output=tail, workspace=str(workspace_project),
-                    )
-                return BaselineVerifyResult(
-                    False,
-                    "preparation",
-                    "assignment resolves, but lifecycle/preparation failed deterministically",
-                    command=" ".join(full_argv), output=tail, workspace=str(workspace_project),
-                )
-
-            try:
-                lifecycle_observed = observed_resolved_assignment(
-                    workspace_project,
-                    assignment,
-                    remove_packages=remove_packages,
-                )
-                lifecycle_observed_hash = observed_resolved_hash(lifecycle_observed)
-            except ObservedResolutionError as exc:
-                event("verify.preparation.observed-drift", outcome="unknown", detail=str(exc))
-                return BaselineVerifyResult(
-                    False, "unknown", str(exc), workspace=str(workspace_project)
-                )
-            if lifecycle_observed_hash != observed_hash:
-                return BaselineVerifyResult(
-                    False,
-                    "unknown",
-                    "OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: lifecycle install changed "
-                    f"the proven direct tree resolver={observed_hash} "
-                    f"lifecycle={lifecycle_observed_hash}",
-                    workspace=str(workspace_project),
-                )
-            observed_versions = lifecycle_observed
-            observed_hash = lifecycle_observed_hash
-            publish_pass(
-                "preparation",
-                proof_identity.preparation_proof_key,
-                observed_versions,
-                observed_hash,
-            )
-
-            project_failures: List[BaselineProjectFailure] = []
-            for command_index, command in enumerate(config.commands, start=1):
-                removed_caches = clean_ephemeral_verification_caches(workspace_project)
-                if removed_caches:
-                    _emit_progress(progress, f"{progress_label}: normalized transient caches before {command}: {', '.join(removed_caches)}")
-                _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} started: {command}")
-                check_started = time.monotonic()
+            if snapshot is not None and snapshot.observed_resolved_hash != observed_hash:
                 event(
-                    "verify.project-check.start",
-                    command=command,
-                    check=command_index,
-                    checks=len(config.commands),
+                    "verify.preparation.snapshot-rejected",
+                    reason="observed-resolved-hash-mismatch",
+                    snapshotObservedHash=snapshot.observed_resolved_hash,
+                    resolverObservedHash=observed_hash,
                 )
-                shell_argv: Sequence[str]
-                if os.name == "nt":
-                    shell_argv = [os.environ.get("COMSPEC") or "cmd.exe", "/d", "/s", "/c", command]
-                else:
-                    shell_argv = ["/bin/sh", "-lc", command]
+                _evict_prepared_workspace_snapshot(
+                    proof_identity.preparation_proof_key, project_dir
+                )
+                snapshot = None
+
+            if snapshot is not None:
+                event(
+                    "verify.preparation.snapshot-hit",
+                    preparationProofKey=proof_identity.preparation_proof_key,
+                    observedResolvedHash=observed_hash,
+                )
+                _emit_progress(
+                    progress,
+                    f"{progress_label}: lifecycle preparation snapshot HIT; fresh project-check clones will be materialized from the sealed tree",
+                )
+                observed_versions = dict(snapshot.observed_resolved_versions)
+            else:
+                full_install = install_args(manager, ignore_scripts=False)
+                full_argv, _ = _command_prefix(executable, full_install)
+                lifecycle_env = {
+                    "CI": "1",
+                    "YARN_ENABLE_IMMUTABLE_INSTALLS": "false",
+                    "YARN_ENABLE_SCRIPTS": "true",
+                    "npm_config_ignore_scripts": "false",
+                }
+                lifecycle_env.update(_package_manager_cache_environment(config, manager))
+                preparation_started = time.monotonic()
+                event("verify.preparation.start", command=" ".join(full_argv))
                 try:
-                    check_result = _run(
-                        shell_argv,
-                        workspace_project,
-                        timeout_seconds=phase_timeout(),
-                        base_env=base_env,
-                        progress=phase_progress(f"project-check:{command}"),
-                        progress_label=command,
+                    full_result = _run(
+                        full_argv, workspace_project,
+                        timeout_seconds=phase_timeout(), env=lifecycle_env,
+                        base_env=base_env, progress=phase_progress("lifecycle-install"),
+                        progress_label="package-manager lifecycle install",
                         progress_interval_seconds=config.progress_interval_seconds,
                     )
                 except (OSError, subprocess.TimeoutExpired) as exc:
-                    return BaselineVerifyResult(False, "infrastructure", f"project check launch failed: {exc}", command=command)
+                    return BaselineVerifyResult(False, "infrastructure", f"project-preflight install failed: {exc}", command=" ".join(full_argv))
+                preparation_classified = "passed" if full_result.returncode == 0 else _classify_install_failure(full_result.stdout or "")
                 event(
-                    "verify.project-check.finish",
-                    command=command,
-                    check=command_index,
-                    checks=len(config.commands),
-                    durationMs=int((time.monotonic() - check_started) * 1000),
-                    exitCode=check_result.returncode,
-                    outcome="passed" if check_result.returncode == 0 else "failed",
+                    "verify.preparation.finish",
+                    durationMs=int((time.monotonic() - preparation_started) * 1000),
+                    exitCode=full_result.returncode,
+                    outcome=preparation_classified,
                 )
-                if check_result.returncode == 0:
-                    _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} PASS: {command}")
-                    continue
-                tail = "\n".join((check_result.stdout or "").splitlines()[-80:])
-                # Project commands are external processes too.  Never let a
-                # network/disk/tooling failure masquerade as structural evidence.
-                if INFRA_PATTERNS.search(tail):
-                    return BaselineVerifyResult(
-                        False, "infrastructure", f"project preflight infrastructure failure: {command}",
-                        command=command, output=tail, workspace=str(workspace_project),
+                if full_result.returncode != 0:
+                    tail = "\n".join((full_result.stdout or "").splitlines()[-80:])
+                    if preparation_classified in {"infrastructure", "dependency"}:
+                        return BaselineVerifyResult(False, preparation_classified, "assignment resolves without lifecycle scripts, but lifecycle install failed", command=" ".join(full_argv), output=tail, workspace=str(workspace_project))
+                    return BaselineVerifyResult(False, "preparation", "assignment resolves, but lifecycle/preparation failed deterministically", command=" ".join(full_argv), output=tail, workspace=str(workspace_project))
+
+                try:
+                    lifecycle_observed = observed_resolved_assignment(
+                        workspace_project, assignment, remove_packages=remove_packages,
                     )
-                project_failures.append(BaselineProjectFailure(command, check_result.returncode, tail))
-                _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} RED exit={check_result.returncode}: {command}")
+                    lifecycle_observed_hash = observed_resolved_hash(lifecycle_observed)
+                except ObservedResolutionError as exc:
+                    event("verify.preparation.observed-drift", outcome="unknown", detail=str(exc))
+                    return BaselineVerifyResult(False, "unknown", str(exc), workspace=str(workspace_project))
+                if lifecycle_observed_hash != observed_hash:
+                    return BaselineVerifyResult(
+                        False, "unknown",
+                        "OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: lifecycle install changed "
+                        f"the proven direct tree resolver={observed_hash} lifecycle={lifecycle_observed_hash}",
+                        workspace=str(workspace_project),
+                    )
+                observed_versions = lifecycle_observed
+                observed_hash = lifecycle_observed_hash
+                publish_pass("preparation", proof_identity.preparation_proof_key, observed_versions, observed_hash)
+
+                normalized = clean_ephemeral_verification_caches(workspace_project)
+                if normalized:
+                    event("verify.preparation.snapshot-normalized", removedCaches=list(normalized))
+                snapshot_started = time.monotonic()
+                try:
+                    snapshot = _publish_prepared_workspace_snapshot(
+                        workspace_root, workspace_project,
+                        key=proof_identity.preparation_proof_key,
+                        observed_versions=observed_versions,
+                        observed_hash=observed_hash,
+                        source_project=project_dir,
+                    )
+                except Exception as exc:
+                    return BaselineVerifyResult(False, "infrastructure", f"PREPARED_SNAPSHOT_PUBLISH_FAILED: {exc}", workspace=str(workspace_project))
+                event(
+                    "verify.preparation.snapshot-publish",
+                    durationMs=int((time.monotonic() - snapshot_started) * 1000),
+                    preparationProofKey=proof_identity.preparation_proof_key,
+                )
+
+            if snapshot is None:
+                return BaselineVerifyResult(False, "infrastructure", "PREPARED_SNAPSHOT_UNAVAILABLE: project checks require a sealed preparation tree")
+
+            project_failures: List[BaselineProjectFailure] = []
+            for command_index, command in enumerate(config.commands, start=1):
+                command_root = temp_root / f"project-check-{command_index:02d}"
+                clone_started = time.monotonic()
+                try:
+                    command_project = _materialize_prepared_workspace_snapshot(snapshot, command_root)
+                except Exception as exc:
+                    return BaselineVerifyResult(False, "infrastructure", f"PREPARED_SNAPSHOT_CLONE_FAILED: {command}: {exc}", command=command)
+                event(
+                    "verify.project-check.clone.finish",
+                    command=command, check=command_index, checks=len(config.commands),
+                    durationMs=int((time.monotonic() - clone_started) * 1000),
+                    preparationProofKey=proof_identity.preparation_proof_key,
+                )
+                try:
+                    removed_caches = clean_ephemeral_verification_caches(command_project)
+                    if removed_caches:
+                        _emit_progress(progress, f"{progress_label}: normalized transient caches before {command}: {', '.join(removed_caches)}")
+                    _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} started: {command}")
+                    check_started = time.monotonic()
+                    event(
+                        "verify.project-check.start", command=command,
+                        check=command_index, checks=len(config.commands),
+                        isolation="fresh-prepared-snapshot-clone",
+                    )
+                    if os.name == "nt":
+                        shell_argv: Sequence[str] = [os.environ.get("COMSPEC") or "cmd.exe", "/d", "/s", "/c", command]
+                    else:
+                        shell_argv = ["/bin/sh", "-lc", command]
+                    try:
+                        check_result = _run(
+                            shell_argv, command_project,
+                            timeout_seconds=phase_timeout(), base_env=base_env,
+                            progress=phase_progress(f"project-check:{command}"),
+                            progress_label=command,
+                            progress_interval_seconds=config.progress_interval_seconds,
+                        )
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        return BaselineVerifyResult(False, "infrastructure", f"project check launch failed: {exc}", command=command)
+
+                    try:
+                        check_observed = observed_resolved_assignment(
+                            command_project, assignment, remove_packages=remove_packages,
+                        )
+                        check_observed_hash = observed_resolved_hash(check_observed)
+                    except ObservedResolutionError as exc:
+                        return BaselineVerifyResult(False, "unknown", str(exc), command=command, workspace=str(command_project))
+                    if check_observed_hash != observed_hash:
+                        return BaselineVerifyResult(
+                            False, "unknown",
+                            "OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: project check "
+                            f"{command} mutated the proven direct dependency tree",
+                            command=command, workspace=str(command_project),
+                        )
+
+                    event(
+                        "verify.project-check.finish", command=command,
+                        check=command_index, checks=len(config.commands),
+                        durationMs=int((time.monotonic() - check_started) * 1000),
+                        exitCode=check_result.returncode,
+                        outcome="passed" if check_result.returncode == 0 else "failed",
+                        isolation="fresh-prepared-snapshot-clone",
+                    )
+                    if check_result.returncode == 0:
+                        _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} PASS: {command}")
+                        continue
+                    tail = "\n".join((check_result.stdout or "").splitlines()[-80:])
+                    if INFRA_PATTERNS.search(tail):
+                        return BaselineVerifyResult(False, "infrastructure", f"project preflight infrastructure failure: {command}", command=command, output=tail, workspace=str(command_project))
+                    project_failures.append(BaselineProjectFailure(command, check_result.returncode, tail))
+                    _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} RED exit={check_result.returncode}: {command}")
+                finally:
+                    shutil.rmtree(command_root, ignore_errors=True)
 
             if project_failures:
                 summary_commands = ", ".join(item.command for item in project_failures)
                 output = "\n\n".join(
-                    f"=== {item.command} (exit {item.exit_code}) ===\n{item.output}" for item in project_failures
+                    f"=== {item.command} (exit {item.exit_code}) ===\n{item.output}"
+                    for item in project_failures
                 )
                 first = project_failures[0]
                 return BaselineVerifyResult(
-                    False, "project", f"project preflight failed: {summary_commands}", command=first.command,
-                    output=output[-16000:], workspace=str(workspace_project), project_failures=tuple(project_failures),
+                    False, "project", f"project preflight failed: {summary_commands}",
+                    command=first.command, output=output[-16000:], workspace=str(workspace_project),
+                    project_failures=tuple(project_failures),
                 )
 
-        if run_project_checks and config.project_checks != "off" and config.commands:
-            try:
-                final_observed = observed_resolved_assignment(
-                    workspace_project,
-                    assignment,
-                    remove_packages=remove_packages,
-                )
-                final_observed_hash = observed_resolved_hash(final_observed)
-            except ObservedResolutionError as exc:
-                return BaselineVerifyResult(
-                    False, "unknown", str(exc), workspace=str(workspace_project)
-                )
-            if final_observed_hash != observed_hash:
-                return BaselineVerifyResult(
-                    False,
-                    "unknown",
-                    "OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: project checks mutated "
-                    "the proven direct dependency tree",
-                    workspace=str(workspace_project),
-                )
-            observed_versions = final_observed
-            observed_hash = final_observed_hash
-            publish_pass(
-                "project",
-                proof_identity.project_proof_key,
-                observed_versions,
-                observed_hash,
-            )
+            publish_pass("project", proof_identity.project_proof_key, observed_versions, observed_hash)
 
         _emit_progress(progress, f"{progress_label}: completed; elapsed={int(time.monotonic() - attempt_started)}s")
         event("verify.attempt.finish", outcome="passed")
