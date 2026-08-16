@@ -7465,6 +7465,61 @@ def _adaptive_graph_guided_generalization_proposal(
 
 
 
+
+GRAPH_GENERALIZATION_HISTORY_LIMIT = 6
+
+
+def _cross_iteration_consensus_proposal(
+    proposal: GraphGeneralizationProposal,
+    assignment: Mapping[str, str],
+    history_by_family: Dict[str, List[Tuple[str, ...]]],
+    failed_candidates: Set[Tuple[str, str]],
+) -> GraphGeneralizationProposal:
+    # Navigation-only recurrent package core across one stable failure family.
+    # The candidate gets no authority here: existing fresh certification must
+    # reproduce the authoritative predicate, then Block F minimizes it again.
+    history = history_by_family.setdefault(proposal.navigation_key, [])
+    observation = tuple(sorted(proposal.candidate))
+    if observation and observation not in history:
+        history.append(observation)
+        if len(history) > GRAPH_GENERALIZATION_HISTORY_LIMIT:
+            del history[:-GRAPH_GENERALIZATION_HISTORY_LIMIT]
+
+    if len(history) < 2:
+        return proposal
+
+    support: Dict[str, int] = {}
+    for package_shape in history:
+        for name in set(package_shape):
+            support[name] = support.get(name, 0) + 1
+
+    required_support = max(2, (2 * len(history) + 2) // 3)
+    recurrent = tuple(
+        sorted(
+            name
+            for name, count in support.items()
+            if count >= required_support and name in assignment
+        )
+    )
+    if not recurrent:
+        return proposal
+
+    candidate = {name: str(assignment[name]) for name in recurrent}
+    if not candidate or len(candidate) >= len(proposal.candidate):
+        return proposal
+
+    candidate_fingerprint = assignment_fingerprint(candidate)
+    if (proposal.navigation_key, candidate_fingerprint) in failed_candidates:
+        return proposal
+
+    return dataclasses.replace(
+        proposal,
+        candidate=candidate,
+        bounded_slice=True,
+        seed_source="cross-iteration-consensus",
+    )
+
+
 NOGOOD_MINIMIZATION_MAX_CHECKS = 12
 
 
@@ -8119,6 +8174,7 @@ def resolve_peer_compatibility_with_verification(
     graph_generalization_repeats: Dict[str, int] = {}
     graph_generalization_failed_candidates: Set[Tuple[str, str]] = set()
     graph_generalization_seed_packages: Dict[str, Tuple[str, ...]] = {}
+    graph_generalization_history_by_family: Dict[str, List[Tuple[str, ...]]] = {}
     final_assignments: Dict[str, Dict[str, Dict[str, str]]] = {}
     resolver_cache: Dict[Tuple[str, Tuple[Tuple[str, str], ...], Tuple[str, ...]], BaselineVerifyResult] = {}
     project_preflight_cache: Dict[
@@ -8656,6 +8712,36 @@ def resolve_peer_compatibility_with_verification(
                         failed_candidates=graph_generalization_failed_candidates,
                         seed_packages_by_family=graph_generalization_seed_packages,
                     )
+                    if proposal is not None:
+                        proposal = _cross_iteration_consensus_proposal(
+                            proposal,
+                            assignment,
+                            graph_generalization_history_by_family,
+                            graph_generalization_failed_candidates,
+                        )
+                        if proposal.seed_source == "cross-iteration-consensus":
+                            consensus_fingerprint = assignment_fingerprint(
+                                proposal.candidate
+                            )
+                            eprint(
+                                f"[info] {project}: cross-iteration conflict consensus {mode}; "
+                                f"candidate={consensus_fingerprint}, "
+                                f"literals={len(proposal.candidate)}, "
+                                f"family={proposal.navigation_key[:12]}, "
+                                f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
+                            )
+                            progress_reporter.emit(
+                                project,
+                                mode,
+                                "cross-iteration-consensus-proposed",
+                                iteration=iteration,
+                                assignment=fingerprint,
+                                candidate=consensus_fingerprint,
+                                literals=len(proposal.candidate),
+                                repeatCount=proposal.repeat_count,
+                                seedSource=proposal.seed_source,
+                                authority=EVIDENCE_DIAGNOSTIC_HINT,
+                            )
                     candidate = proposal.candidate if proposal is not None else None
                     if proposal is not None and proposal.repeat_count > 1:
                         eprint(

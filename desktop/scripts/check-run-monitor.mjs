@@ -27,10 +27,21 @@ requireText(main, /BASELINE_VERIFICATION_PLATEAU/, 'semantic Baseline plateau mu
 requireText(main, /BASELINE_VERIFICATION_HARD_BUDGET_EXHAUSTED/, 'hard Baseline safety exhaustion must be non-retryable')
 requireText(main, /BASELINE_SOLVER_REPEATED_FAILED_ASSIGNMENT/, 'repeated confirmed failing assignment must be non-retryable')
 requireText(monitor, /DEPLOOM_PROGRESS_V2 /, 'monitor must consume structured Baseline progress')
+requireText(monitor, /prefixIndex = trimmed\.indexOf\(STRUCTURED_BASELINE_PREFIX\)/, 'structured telemetry must tolerate transport prefixes')
+requireText(monitor, /minimizing-conflict/, 'monitor must expose Block F conflict minimization')
+requireText(view, /monitor\.minimization/, 'RunMonitor must render conflict minimization')
 requireText(monitor, /allowedIterations/, 'monitor must expose the live adaptive iteration budget')
 requireText(monitor, /learnedConstraints/, 'monitor must expose learned-constraint progress')
 requireText(view, /state\.conflict\.boundedSlice \? 'true' : 'false'/, 'boundedSlice must render without untyped common.yes/common.no keys')
 requireText(logPanel, /DEPLOOM_PROGRESS_V2 /, 'machine Baseline telemetry must be filtered from user-facing logs')
 if (/common\.yes|common\.no/.test(view)) throw new Error('RunMonitor must not use nonexistent common.yes/common.no translation keys')
+const structuredIndex = monitor.indexOf('const structured = structuredBaselineProgress(line)')
+const systemGateIndex = monitor.indexOf("if (entry.stream !== 'system') continue")
+if (structuredIndex < 0 || systemGateIndex < 0 || structuredIndex > systemGateIndex) {
+  throw new Error('structured Baseline telemetry must be parsed before the system-stream prose gate')
+}
+if (!/entry\.line\.includes\('DEPLOOM_PROGRESS_V2 '\)/.test(logPanel)) {
+  throw new Error('machine telemetry filter must tolerate transport prefixes')
+}
 
 console.log('Run monitor logical-run / retry / elapsed-time contracts OK')

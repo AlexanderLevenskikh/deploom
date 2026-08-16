@@ -655,3 +655,133 @@ class ProofPreservingNogoodMinimizationTests(unittest.TestCase):
         self.assertIn("BASELINE_VERIFICATION_PLATEAU", source)
         self.assertIn("BASELINE_VERIFICATION_HARD_BUDGET_EXHAUSTED", source)
         self.assertIn("BASELINE_SOLVER_REPEATED_FAILED_ASSIGNMENT", source)
+class CrossIterationConflictHistoryTests(unittest.TestCase):
+    def _proposal(
+        self,
+        candidate: dict[str, str],
+        *,
+        navigation_key: str = "family",
+        seed_source: str = "fresh",
+    ) -> roadmap.GraphGeneralizationProposal:
+        return roadmap.GraphGeneralizationProposal(
+            candidate=candidate,
+            seed_candidate_fingerprint=roadmap.assignment_fingerprint(candidate),
+            navigation_key=navigation_key,
+            context_radius=2,
+            repeat_count=2,
+            predicate_key=navigation_key,
+            family_key=navigation_key,
+            literal_budget=max(4, len(candidate)),
+            bounded_slice=False,
+            seed_source=seed_source,
+        )
+
+    def test_consensus_uses_recurrent_core_but_remains_only_a_proposal(self) -> None:
+        history: dict[str, list[tuple[str, ...]]] = {}
+        assignment = {
+            "a": "2.0.0",
+            "b": "3.0.0",
+            "c": "4.0.0",
+            "d": "5.0.0",
+        }
+
+        first = roadmap._cross_iteration_consensus_proposal(
+            self._proposal(
+                {"a": "2.0.0", "b": "3.0.0", "c": "4.0.0"}
+            ),
+            assignment,
+            history,
+            set(),
+        )
+        self.assertEqual("fresh", first.seed_source)
+
+        second = roadmap._cross_iteration_consensus_proposal(
+            self._proposal(
+                {"a": "2.0.0", "b": "3.0.0", "d": "5.0.0"}
+            ),
+            assignment,
+            history,
+            set(),
+        )
+        self.assertEqual("cross-iteration-consensus", second.seed_source)
+        self.assertEqual(
+            {"a": "2.0.0", "b": "3.0.0"},
+            second.candidate,
+        )
+        self.assertTrue(second.bounded_slice)
+
+    def test_failed_consensus_candidate_is_not_retried(self) -> None:
+        assignment = {
+            "a": "2.0.0",
+            "b": "3.0.0",
+            "c": "4.0.0",
+            "d": "5.0.0",
+        }
+        history = {
+            "family": [
+                ("a", "b", "c"),
+                ("a", "b", "d"),
+            ]
+        }
+        consensus = {"a": "2.0.0", "b": "3.0.0"}
+        failed = {
+            ("family", roadmap.assignment_fingerprint(consensus))
+        }
+        original = self._proposal(
+            {"a": "2.0.0", "b": "3.0.0", "c": "4.0.0"}
+        )
+
+        result = roadmap._cross_iteration_consensus_proposal(
+            original,
+            assignment,
+            history,
+            failed,
+        )
+        self.assertEqual(original.candidate, result.candidate)
+        self.assertNotEqual("cross-iteration-consensus", result.seed_source)
+
+    def test_history_is_bounded(self) -> None:
+        history: dict[str, list[tuple[str, ...]]] = {}
+        assignment = {
+            chr(ord("a") + index): "2.0.0"
+            for index in range(12)
+        }
+        for index in range(12):
+            names = {
+                "a": "2.0.0",
+                chr(ord("b") + (index % 10)): "2.0.0",
+                chr(ord("b") + ((index + 1) % 10)): "2.0.0",
+            }
+            roadmap._cross_iteration_consensus_proposal(
+                self._proposal(names),
+                assignment,
+                history,
+                set(),
+            )
+        self.assertLessEqual(
+            len(history["family"]),
+            roadmap.GRAPH_GENERALIZATION_HISTORY_LIMIT,
+        )
+
+    def test_production_consensus_still_flows_through_fresh_certification(self) -> None:
+        source = inspect.getsource(
+            roadmap.resolve_peer_compatibility_with_verification
+        )
+        consensus_index = source.index(
+            "_cross_iteration_consensus_proposal("
+        )
+        certification_index = source.index(
+            "for proof_index in range(proof_count):",
+            consensus_index,
+        )
+        authority_index = source.index(
+            "learned[project][mode].append(generalized_nogood)",
+            certification_index,
+        )
+        self.assertLess(consensus_index, certification_index)
+        self.assertLess(certification_index, authority_index)
+        helper = inspect.getsource(
+            roadmap._cross_iteration_consensus_proposal
+        )
+        self.assertNotIn("learned[", helper)
+        self.assertIn('seed_source="cross-iteration-consensus"', helper)

@@ -23,7 +23,7 @@ type LogView = 'activity' | 'raw'
 
 function sourceKey(source?: JobOutputSource): string { return source ? `${source.kind}:${source.id}` : 'system' }
 function isMachineTelemetry(entry: JobOutput): boolean {
-  return entry.line.trimStart().startsWith('DEPLOOM_PROGRESS_V2 ')
+  return entry.line.includes('DEPLOOM_PROGRESS_V2 ')
 }
 
 function formatTokens(value: number, language: Language): string {

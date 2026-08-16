@@ -70,6 +70,12 @@ export function RunMonitor({ logs, active, jobId, action, runStartedAt, migratio
     if (state.activity === 'verifying-assignment') return t('monitor.activity.verifying')
     if (state.activity === 'confirming-exact') return t('monitor.activity.confirmingExact')
     if (state.activity === 'certifying-conflict') return t('monitor.activity.certifying')
+    if (state.activity === 'minimizing-conflict') {
+      const history = state.minimization?.shrinkHistory
+      return history?.length
+        ? t('monitor.activity.minimizingWithHistory', { history: history.join(' → ') })
+        : t('monitor.activity.minimizing')
+    }
     if (state.activity === 'project-check') return t('monitor.activity.projectCheck')
     if (state.activity === 'localizing' && state.localization) {
       return t('monitor.localizationSummary', { history: state.localization.shrinkHistory.join(' → ') })
@@ -158,6 +164,7 @@ export function RunMonitor({ logs, active, jobId, action, runStartedAt, migratio
       <div className="run-monitor-facts">
         {state.retry ? <div><span>{t('monitor.attemptTime')}</span><strong>{state.retry.current}/{state.retry.total}{attemptDuration ? ` · ${attemptDuration}` : ''}</strong></div> : null}
         {state.baseline?.iteration ? <div><span>{t('monitor.iteration')}</span><strong>{state.baseline.iteration}{(state.baseline.allowedIterations ?? state.baseline.maxIterations) ? `/${state.baseline.allowedIterations ?? state.baseline.maxIterations}` : ''}</strong></div> : null}
+        {state.baseline?.mode ? <div><span>{t('monitor.mode')}</span><strong>{state.baseline.mode}</strong></div> : null}
         {state.baseline?.hardIterations !== undefined ? <div><span>{t('monitor.hardBudget')}</span><strong>{state.baseline.hardIterations}</strong></div> : null}
         {state.baseline?.learnedConstraints !== undefined ? <div><span>{t('monitor.learnedConstraints')}</span><strong>{state.baseline.learnedConstraints}</strong></div> : null}
         {state.baseline?.certifiedExtensions !== undefined ? <div><span>{t('monitor.certifiedExtensions')}</span><strong>{state.baseline.certifiedExtensions}</strong></div> : null}
@@ -167,6 +174,9 @@ export function RunMonitor({ logs, active, jobId, action, runStartedAt, migratio
         {state.conflict?.literalBudget !== undefined ? <div><span>{t('monitor.literalBudget')}</span><strong>{state.conflict.literalBudget}</strong></div> : null}
         {state.conflict?.boundedSlice !== undefined ? <div><span>{t('monitor.boundedSlice')}</span><strong>{state.conflict.boundedSlice ? 'true' : 'false'}</strong></div> : null}
         {state.conflict?.seedSource ? <div><span>{t('monitor.seedSource')}</span><strong>{state.conflict.seedSource}</strong></div> : null}
+        {state.minimization?.originalLiterals !== undefined ? <div><span>{t('monitor.minimization')}</span><strong>{state.minimization.originalLiterals}{state.minimization.minimizedLiterals !== undefined ? `→${state.minimization.minimizedLiterals}` : ''}</strong></div> : null}
+        {state.minimization?.checks !== undefined ? <div><span>{t('monitor.minimizationChecks')}</span><strong>{state.minimization.checks}</strong></div> : null}
+        {state.minimization?.acceptedShrinks !== undefined ? <div><span>{t('monitor.acceptedShrinks')}</span><strong>{state.minimization.acceptedShrinks}</strong></div> : null}
         {state.dependency ? <div><span>{t('common.current')}</span><strong title={state.dependency.name}>{state.dependency.name}</strong></div> : null}
         {state.solver?.componentsTotal ? <div><span>{t('monitor.components')}</span><strong>{state.solver.componentsDone ?? 0}/{state.solver.componentsTotal}</strong></div> : null}
         {state.solver?.changed !== undefined ? <div><span>{t('monitor.changes')}</span><strong>{state.solver.changed}</strong></div> : null}

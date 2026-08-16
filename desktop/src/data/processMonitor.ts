@@ -24,6 +24,7 @@ export type RunMonitorActivity =
   | 'verifying-assignment'
   | 'confirming-exact'
   | 'certifying-conflict'
+  | 'minimizing-conflict'
   | 'searching-next'
   | 'project-check'
   | 'localizing'
@@ -77,6 +78,15 @@ export type RunMonitorState = {
     boundedSlice?: boolean
     seedSource?: string
     authority?: string
+  }
+  minimization?: {
+    source?: string
+    originalLiterals?: number
+    minimizedLiterals?: number
+    checks?: number
+    acceptedShrinks?: number
+    shrinkHistory?: number[]
+    exhausted?: boolean
   }
   localization?: {
     initialUnits: number
@@ -220,9 +230,10 @@ const STRUCTURED_BASELINE_PREFIX = 'DEPLOOM_PROGRESS_V2 '
 
 function structuredBaselineProgress(line: string): StructuredBaselineProgress | undefined {
   const trimmed = line.trim()
-  if (!trimmed.startsWith(STRUCTURED_BASELINE_PREFIX)) return undefined
+  const prefixIndex = trimmed.indexOf(STRUCTURED_BASELINE_PREFIX)
+  if (prefixIndex < 0) return undefined
   try {
-    const parsed = JSON.parse(trimmed.slice(STRUCTURED_BASELINE_PREFIX.length)) as Partial<StructuredBaselineProgress>
+    const parsed = JSON.parse(trimmed.slice(prefixIndex + STRUCTURED_BASELINE_PREFIX.length)) as Partial<StructuredBaselineProgress>
     if (
       parsed.schemaVersion !== 2
       || parsed.type !== 'deploom-baseline-progress'
@@ -251,11 +262,19 @@ function structuredBoolean(event: StructuredBaselineProgress, key: string): bool
   return typeof value === 'boolean' ? value : undefined
 }
 
+function structuredNumberArray(event: StructuredBaselineProgress, key: string): number[] | undefined {
+  const value = event[key]
+  if (!Array.isArray(value)) return undefined
+  const numbers = value.filter((item): item is number => typeof item === 'number' && Number.isFinite(item))
+  return numbers.length === value.length ? numbers : undefined
+}
+
 function structuredTransition(phase: string): { phase: RunMonitorPhase; activity: RunMonitorActivity } | undefined {
   if (phase === 'solve-and-verify-started' || phase === 'iteration-started') return { phase: 'solving', activity: 'solving' }
   if (phase === 'exact-assignment-blocked' || phase === 'constraint-learned' || phase === 'generalization-certified') return { phase: 'solving', activity: 'searching-next' }
   if (phase.startsWith('exact-assignment-confirmation')) return { phase: 'confirming', activity: 'confirming-exact' }
-  if (phase.startsWith('generalization-')) return { phase: 'confirming', activity: 'certifying-conflict' }
+  if (phase.startsWith('constraint-minimization-')) return { phase: 'confirming', activity: 'minimizing-conflict' }
+  if (phase === 'cross-iteration-consensus-proposed' || phase.startsWith('generalization-')) return { phase: 'confirming', activity: 'certifying-conflict' }
   if (phase.startsWith('localization-confirmation')) return { phase: 'confirming', activity: 'confirming-localized' }
   if (phase.startsWith('localization-')) return { phase: 'localizing', activity: 'localizing' }
   if (phase.startsWith('reproduction-')) return { phase: 'reproducing', activity: 'reproducing' }
@@ -297,7 +316,6 @@ export function deriveRunMonitor(
   }
 
   for (const entry of scoped) {
-    if (entry.stream !== 'system') continue
     const line = entry.line.trim()
     const receivedAt = entry.receivedAt
     let match: RegExpExecArray | null
@@ -335,7 +353,7 @@ export function deriveRunMonitor(
         assignment: assignment ?? state.assignment,
       }
 
-      if (structured.phase.startsWith('generalization-')) {
+      if (structured.phase === 'cross-iteration-consensus-proposed' || structured.phase.startsWith('generalization-')) {
         state = {
           ...state,
           conflict: {
@@ -352,9 +370,27 @@ export function deriveRunMonitor(
         }
       }
 
+      if (structured.phase.startsWith('constraint-minimization-')) {
+        state = {
+          ...state,
+          minimization: {
+            ...state.minimization,
+            source: structuredText(structured, 'source') ?? state.minimization?.source,
+            originalLiterals: structuredNumber(structured, 'originalLiterals') ?? state.minimization?.originalLiterals,
+            minimizedLiterals: structuredNumber(structured, 'minimizedLiterals') ?? state.minimization?.minimizedLiterals,
+            checks: structuredNumber(structured, 'checks') ?? structuredNumber(structured, 'check') ?? state.minimization?.checks,
+            acceptedShrinks: structuredNumber(structured, 'acceptedShrinks') ?? state.minimization?.acceptedShrinks,
+            shrinkHistory: structuredNumberArray(structured, 'shrinkHistory') ?? state.minimization?.shrinkHistory,
+            exhausted: structuredBoolean(structured, 'exhausted') ?? state.minimization?.exhausted,
+          },
+        }
+      }
+
       if (eventAt !== undefined) lastSignalAt = Math.max(lastSignalAt ?? 0, eventAt)
       continue
     }
+
+    if (entry.stream !== 'system') continue
 
     match = /transient retry (\d+)\/(\d+)/i.exec(line)
     if (match) {
