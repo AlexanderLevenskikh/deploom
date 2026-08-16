@@ -32,6 +32,14 @@ from baseline_constraint_verifier import (
 
 
 class BaselineConstraintVerifierTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._observed_patch = patch(
+            "baseline_constraint_verifier.observed_resolved_assignment",
+            return_value={"demo": "2.0.0"},
+        )
+        self._observed_patch.start()
+        self.addCleanup(self._observed_patch.stop)
+
     def test_config_bounds_parallelism_and_defaults_to_adaptive_project_checks(self) -> None:
         config = BaselineVerifyConfig.from_mapping({"parallelism": 999, "maxIterations": 0})
         self.assertEqual(16, config.parallelism)
@@ -428,7 +436,13 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 commands=(),
                 environment=dict(os.environ),
             )
-            VerificationProofStore(cache).publish_pass("resolver", identity.resolver_input_key, identity)
+            VerificationProofStore(cache).publish_pass(
+                "resolver", identity.resolver_input_key, identity,
+                metadata={
+                    "observedResolvedVersions": {},
+                    "observedResolvedHash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                },
+            )
 
             with patch("baseline_constraint_verifier.resolve_executable", return_value=sys.executable), \
                     patch("baseline_constraint_verifier._verify_assignment_uncached") as uncached:
@@ -473,7 +487,13 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 commands=("npm run typecheck",),
                 environment=dict(os.environ),
             )
-            VerificationProofStore(cache).publish_pass("resolver", identity.resolver_input_key, identity)
+            VerificationProofStore(cache).publish_pass(
+                "resolver", identity.resolver_input_key, identity,
+                metadata={
+                    "observedResolvedVersions": {},
+                    "observedResolvedHash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                },
+            )
 
             captured = {}
             def fake_uncached(project_dir, assignment, *, config, **kwargs):
@@ -516,6 +536,51 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
             self.assertTrue(result.ok, result.summary)
             self.assertEqual("passed", result.kind)
 
+
+
+
+class ObservedResolutionProofTests(unittest.TestCase):
+    def test_full_direct_observation_detects_resolutions_drift(self) -> None:
+        import baseline_constraint_verifier as verifier
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(json.dumps({
+                "dependencies": {"demo": "2.0.0"},
+                "resolutions": {"demo": "1.5.0"},
+            }), encoding="utf-8")
+            installed = root / "node_modules" / "demo"
+            installed.mkdir(parents=True)
+            (installed / "package.json").write_text(
+                json.dumps({"name": "demo", "version": "1.5.0"}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                verifier.ObservedResolutionError,
+                "OBSERVED_RESOLVED_ASSIGNMENT_DRIFT",
+            ):
+                verifier.observed_resolved_assignment(root, {"demo": "2.0.0"})
+
+    def test_full_direct_observation_has_stable_peer_optional_and_remove_sentinels(self) -> None:
+        import baseline_constraint_verifier as verifier
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(json.dumps({
+                "optionalDependencies": {"optional-demo": "2.0.0"},
+                "peerDependencies": {"peer-demo": "3.0.0"},
+            }), encoding="utf-8")
+            observed = verifier.observed_resolved_assignment(
+                root,
+                {
+                    "optional-demo": "2.0.0",
+                    "peer-demo": "3.0.0",
+                    "removed-demo": "1.0.0",
+                },
+                remove_packages=("removed-demo",),
+            )
+            self.assertEqual("<optional-not-installed>", observed["optional-demo"])
+            self.assertEqual("<peer-only>", observed["peer-demo"])
+            self.assertEqual("<removed>", observed["removed-demo"])
+            self.assertEqual(64, len(verifier.observed_resolved_hash(observed)))
 
 
 if __name__ == "__main__":

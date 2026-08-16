@@ -89,6 +89,7 @@ from baseline_constraint_verifier import (
 from verification_proof import (
     VerificationProofStore,
     build_verification_proof_identity,
+    source_snapshot_fingerprint,
 )
 from proven_dependency_state import (
     build_proven_dependency_envelope,
@@ -7256,63 +7257,66 @@ class BaselineLocalizationCheckpointStore:
 
 
 def _proof_source_head_and_clean(
-    project_dir: Path,
+    project_path: Path,
     *,
-    require_git: bool,
-) -> Tuple[str, bool]:
-    try:
-        head = subprocess.run(
-            ["git", "-C", str(project_dir), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
+    require_git: bool = True,
+) -> tuple[str, bool]:
+    project_path = project_path.resolve()
+    root_result = subprocess.run(
+        ["git", "-C", str(project_path), "rev-parse", "--show-toplevel"],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    if root_result.returncode != 0 or not root_result.stdout.strip():
         if require_git:
             raise BaselineConstraintVerificationError(
-                f"PROVEN_DEPENDENCY_SOURCE_UNREADABLE: {project_dir}: {exc}"
-            ) from exc
-        return "non-git", True
-
-    if head.returncode != 0 or not head.stdout.strip():
-        if require_git:
-            raise BaselineConstraintVerificationError(
-                f"PROVEN_DEPENDENCY_SOURCE_UNREADABLE: {project_dir}: "
-                "actionable dependency proof requires a git HEAD"
+                "PROVEN_DEPENDENCY_SOURCE_SNAPSHOT_INVALID: actionable dependency proof "
+                "requires a git HEAD; non-git content snapshots are diagnostic/no-op only"
             )
-        # verification_proof.source_snapshot_fingerprint() already provides a
-        # content-tree identity outside Git. No-op state therefore needs no
-        # invented commit hash.
-        return "non-git", True
+        source_key = source_snapshot_fingerprint(project_path)
+        return "non-git", bool(source_key)
 
-    try:
-        status = subprocess.run(
-            [
-                "git", "-C", str(project_dir), "status", "--porcelain=v1",
-                "--untracked-files=all", "--", ".",
-                ":(exclude).dependency-roadmap/**",
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
+    git_root = Path(root_result.stdout.strip()).resolve()
+    head_result = subprocess.run(
+        ["git", "-C", str(git_root), "rev-parse", "HEAD"],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    if head_result.returncode != 0 or not head_result.stdout.strip():
         raise BaselineConstraintVerificationError(
-            f"PROVEN_DEPENDENCY_SOURCE_UNREADABLE: {project_dir}: {exc}"
-        ) from exc
-
-    if status.returncode != 0:
-        raise BaselineConstraintVerificationError(
-            f"PROVEN_DEPENDENCY_SOURCE_UNREADABLE: {project_dir}: git status failed"
+            "PROVEN_DEPENDENCY_SOURCE_SNAPSHOT_INVALID: cannot read git HEAD"
         )
-
-    return head.stdout.strip(), not bool(status.stdout)
+    status_result = subprocess.run(
+        [
+            "git", "-C", str(git_root),
+            "status", "--porcelain=v1", "--untracked-files=all", "--",
+            ".",
+            ":(exclude).dependency-roadmap/**",
+            ":(glob,exclude)**/.dependency-roadmap/**",
+        ],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+    if status_result.returncode != 0:
+        raise BaselineConstraintVerificationError(
+            "PROVEN_DEPENDENCY_SOURCE_SNAPSHOT_INVALID: git status failed while sealing proof source"
+        )
+    return head_result.stdout.strip(), not bool(status_result.stdout.strip())
 
 
 def _build_proven_envelope_for_mode(
@@ -7366,9 +7370,23 @@ def _build_proven_envelope_for_mode(
     proof_store = VerificationProofStore(
         Path(config.proof_cache_dir) if config.proof_cache_dir else None
     )
-    resolver_pass = (
-        proof_store.lookup_pass("resolver", identity.resolver_input_key) is not None
+    resolver_record = proof_store.lookup_pass(
+        "resolver", identity.resolver_input_key
     )
+    resolver_pass = resolver_record is not None
+    observed_resolved_hash = (
+        str(resolver_record.metadata.get("observedResolvedHash") or "")
+        if resolver_record is not None
+        else ""
+    )
+    if requires_execution and (
+        len(observed_resolved_hash) != 64
+        or any(ch not in "0123456789abcdef" for ch in observed_resolved_hash.lower())
+    ):
+        raise BaselineConstraintVerificationError(
+            f"PROVEN_DEPENDENCY_OBSERVED_PROOF_MISSING: {spec.name}/{mode}: "
+            "ResolverProof does not carry the full installed direct-tree hash"
+        )
     preparation_pass = (
         proof_store.lookup_pass("preparation", identity.preparation_proof_key) is not None
     )
@@ -7411,6 +7429,7 @@ def _build_proven_envelope_for_mode(
         resolver_input_key=identity.resolver_input_key,
         preparation_proof_key=identity.preparation_proof_key,
         project_proof_key=identity.project_proof_key,
+        observed_resolved_hash=observed_resolved_hash,
         assignment=assignment,
         removals=tuple(sorted(removals)),
         verification_commands=config.commands,

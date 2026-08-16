@@ -18,13 +18,14 @@ class ProvenDependencyStateTests(unittest.TestCase):
         return build_proven_dependency_envelope(
             project="Demo",
             mode="yellow",
-            proof_schema="baseline-proof-v2",
+            proof_schema="baseline-proof-v3",
             source_head="abc123",
             source_snapshot_key="source-key",
             assignment_key="assignment-key",
             resolver_input_key="resolver-key",
             preparation_proof_key="preparation-key",
             project_proof_key="project-key",
+            observed_resolved_hash="a" * 64,
             assignment={"a": "2.0.0", "@types/a": "1.0.0"},
             removals=("@types/a",),
             verification_commands=("yarn lint:types",),
@@ -53,6 +54,22 @@ class ProvenDependencyStateTests(unittest.TestCase):
         valid, reason = validate_proven_dependency_envelope(envelope)
         self.assertFalse(valid)
         self.assertIn("key mismatch", reason)
+
+    def test_resolver_pass_requires_observed_tree_hash(self):
+        envelope = self.envelope()
+        broken = dict(envelope)
+        broken["observedResolvedHash"] = ""
+        broken["envelopeKey"] = proof_envelope_key(broken)
+        valid, reason = validate_proven_dependency_envelope(broken)
+        self.assertFalse(valid)
+        self.assertIn("observedResolvedHash", reason)
+
+        failed = dict(envelope)
+        failed["resolverProofStatus"] = "failed"
+        failed["envelopeKey"] = proof_envelope_key(failed)
+        valid, reason = validate_proven_dependency_envelope(failed)
+        self.assertFalse(valid)
+        self.assertIn("resolver proof status", reason)
 
     def test_atomic_state_write_preserves_envelope(self):
         with tempfile.TemporaryDirectory() as tmp:

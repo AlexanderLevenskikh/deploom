@@ -178,6 +178,8 @@ class ProofHandoffFirewallTests(unittest.TestCase):
         materialization = (ROOT / "desktop" / "electron" / "materialization-proof.ts").read_text(encoding="utf-8")
         self.assertIn("schemaVersion: 2", materialization)
         self.assertIn("observedResolvedVersions", materialization)
+        self.assertIn("observedResolvedDirectAssignmentHash", materialization)
+        self.assertIn("provenObservedResolvedHash", materialization)
         self.assertIn("provenEnvelopeKey", materialization)
 
         desktop = (ROOT / "desktop" / "electron" / "main.ts").read_text(encoding="utf-8")

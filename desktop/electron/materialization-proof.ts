@@ -27,6 +27,9 @@ export type DependencyMaterializationProof = {
   lockfiles: Record<string, string>
   observedResolvedVersions: Record<string, string>
   observedResolvedHash: string
+  provenExactDirectAssignment?: Record<string, string>
+  provenRemovals?: string[]
+  provenObservedResolvedHash?: string
   packageManager: string
   packageManagerVersion: string
   nodeVersion: string
@@ -159,6 +162,66 @@ export function observedResolvedVersions(
   return Object.fromEntries(Object.entries(observed).sort(([a], [b]) => a.localeCompare(b)))
 }
 
+
+export function observedResolvedDirectAssignment(
+  projectPath: string,
+  exactAssignment: Readonly<Record<string, string>>,
+  removals: readonly string[],
+): Record<string, string> {
+  const packageJson = JSON.parse(readFileSync(join(projectPath, 'package.json'), 'utf8')) as unknown
+  const sections = dependencySectionsFromPackageJson(packageJson)
+  const removalSet = new Set(removals.map(String))
+  const observed: Record<string, string> = {}
+
+  for (const [packageName, target] of Object.entries(exactAssignment).sort(([a], [b]) => a.localeCompare(b))) {
+    if (removalSet.has(packageName)) {
+      observed[packageName] = '<removed>'
+      continue
+    }
+
+    const declaredSections = DEPENDENCY_SECTIONS.filter((section) => sections[section]?.[packageName] !== undefined)
+    if (!declaredSections.length) {
+      throw new Error(`OBSERVED_RESOLVED_ASSIGNMENT_UNDECLARED: ${packageName}@${target}`)
+    }
+    if (declaredSections.length === 1 && declaredSections[0] === 'peerDependencies') {
+      observed[packageName] = '<peer-only>'
+      continue
+    }
+
+    const optionalOnly = declaredSections.includes('optionalDependencies')
+      && declaredSections.every((section) => section === 'optionalDependencies' || section === 'peerDependencies')
+    const packagePath = installedPackageJsonPath(projectPath, packageName)
+    if (!packagePath) {
+      if (optionalOnly) {
+        observed[packageName] = '<optional-not-installed>'
+        continue
+      }
+      throw new Error(`OBSERVED_RESOLVED_ASSIGNMENT_MISSING: ${packageName}@${target}`)
+    }
+
+    let version = ''
+    try {
+      const raw = JSON.parse(readFileSync(packagePath, 'utf8')) as { version?: unknown }
+      version = typeof raw.version === 'string' ? raw.version.trim() : ''
+    } catch (error) {
+      throw new Error(`OBSERVED_RESOLVED_ASSIGNMENT_INVALID: ${packageName}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    if (version !== target) {
+      throw new Error(`OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: ${packageName} expected=${target} observed=${version || '<missing-version>'}`)
+    }
+    observed[packageName] = version
+  }
+  return Object.fromEntries(Object.entries(observed).sort(([a], [b]) => a.localeCompare(b)))
+}
+
+export function observedResolvedDirectAssignmentHash(
+  projectPath: string,
+  exactAssignment: Readonly<Record<string, string>>,
+  removals: readonly string[],
+): string {
+  return sha256(canonicalJson(observedResolvedDirectAssignment(projectPath, exactAssignment, removals)))
+}
+
 export function materializationProofPath(workspacePath: string, project: string, branch: string): string {
   const safe = (value: string) => value.replace(/[^a-zA-Z0-9._-]+/g, '-')
   return join(workspacePath, '.dependency-roadmap', 'state', 'materialization-proofs', safe(project), `${safe(branch)}.json`)
@@ -174,6 +237,9 @@ export function createMaterializationProof(input: {
   resolverInputKey: string
   sourceSnapshotKey: string
   projectProofKey: string
+  provenExactDirectAssignment?: Readonly<Record<string, string>>
+  provenRemovals?: readonly string[]
+  provenObservedResolvedHash?: string
   packageManager: string
   packageManagerVersion: string
   nodeVersion: string
@@ -185,6 +251,43 @@ export function createMaterializationProof(input: {
   const dependencySections = dependencySectionsFromPackageJson(packageJson)
   const dependencyControlFields = dependencyControlFieldsFromPackageJson(packageJson)
   const observed = observedResolvedVersions(input.projectPath, actions)
+  const hasProvenObservedContract = Boolean(
+    input.provenExactDirectAssignment
+    || input.provenRemovals
+    || input.provenObservedResolvedHash,
+  )
+  let provenExactDirectAssignment: Record<string, string> | undefined
+  let provenRemovals: string[] | undefined
+  let provenObservedResolvedHash: string | undefined
+  if (hasProvenObservedContract) {
+    const exactAssignment = input.provenExactDirectAssignment
+    const removals = input.provenRemovals
+    const baselineObservedHash = input.provenObservedResolvedHash
+    if (!exactAssignment || !removals || !baselineObservedHash) {
+      throw new Error('PROVEN_OBSERVED_RESOLVED_CONTRACT_INCOMPLETE')
+    }
+
+    const normalizedAssignment = Object.fromEntries(
+      Object.entries(exactAssignment)
+        .map(([name, version]) => [String(name), String(version)])
+        .sort(([a], [b]) => a.localeCompare(b)),
+    )
+    const normalizedRemovals = [...new Set(removals.map(String))].sort()
+    const currentHash = observedResolvedDirectAssignmentHash(
+      input.projectPath,
+      normalizedAssignment,
+      normalizedRemovals,
+    )
+    if (currentHash !== baselineObservedHash) {
+      throw new Error(
+        `OBSERVED_PROVEN_ASSIGNMENT_DRIFT: baseline=${baselineObservedHash} current=${currentHash}`,
+      )
+    }
+
+    provenExactDirectAssignment = normalizedAssignment
+    provenRemovals = normalizedRemovals
+    provenObservedResolvedHash = currentHash
+  }
 
   return {
     schemaVersion: 2,
@@ -204,6 +307,9 @@ export function createMaterializationProof(input: {
     lockfiles: lockfileHashes(input.projectPath),
     observedResolvedVersions: observed,
     observedResolvedHash: sha256(canonicalJson(observed)),
+    ...(provenExactDirectAssignment ? { provenExactDirectAssignment } : {}),
+    ...(provenRemovals ? { provenRemovals } : {}),
+    ...(provenObservedResolvedHash ? { provenObservedResolvedHash } : {}),
     packageManager: input.packageManager,
     packageManagerVersion: input.packageManagerVersion,
     nodeVersion: input.nodeVersion,
@@ -243,6 +349,9 @@ export function validateMaterializationProof(input: {
   resolverInputKey?: string
   sourceSnapshotKey?: string
   projectProofKey?: string
+  provenExactDirectAssignment?: Readonly<Record<string, string>>
+  provenRemovals?: readonly string[]
+  provenObservedResolvedHash?: string
 }): { ok: boolean; reason: string } {
   const proof = input.proof
   if (!proof) return { ok: false, reason: 'proof missing' }
@@ -253,6 +362,9 @@ export function validateMaterializationProof(input: {
   if (input.resolverInputKey && proof.resolverInputKey !== input.resolverInputKey) return { ok: false, reason: 'resolver proof identity mismatch' }
   if (input.sourceSnapshotKey && proof.sourceSnapshotKey !== input.sourceSnapshotKey) return { ok: false, reason: 'source snapshot identity mismatch' }
   if (input.projectProofKey && proof.projectProofKey !== input.projectProofKey) return { ok: false, reason: 'project proof identity mismatch' }
+  if (input.provenObservedResolvedHash && proof.provenObservedResolvedHash !== input.provenObservedResolvedHash) return { ok: false, reason: 'proven observed resolved hash mismatch' }
+  if (input.provenExactDirectAssignment && canonicalJson(proof.provenExactDirectAssignment ?? {}) !== canonicalJson(input.provenExactDirectAssignment)) return { ok: false, reason: 'proven exact direct assignment mismatch' }
+  if (input.provenRemovals && canonicalJson(proof.provenRemovals ?? []) !== canonicalJson([...input.provenRemovals].map(String).sort())) return { ok: false, reason: 'proven removals mismatch' }
   if (proof.packageManager !== input.packageManager) return { ok: false, reason: 'package-manager mismatch' }
   if (input.packageManagerVersion && proof.packageManagerVersion !== input.packageManagerVersion) return { ok: false, reason: 'package-manager version mismatch' }
   if (input.nodeVersion && proof.nodeVersion !== input.nodeVersion) return { ok: false, reason: 'Node version mismatch' }
@@ -277,6 +389,32 @@ export function validateMaterializationProof(input: {
   }
   if (sha256(canonicalJson(observed)) !== proof.observedResolvedHash) {
     return { ok: false, reason: 'observed resolved tuple changed' }
+  }
+
+  const provenAssignment = input.provenExactDirectAssignment ?? proof.provenExactDirectAssignment
+  const provenRemovals = input.provenRemovals ?? proof.provenRemovals
+  const provenHash = input.provenObservedResolvedHash ?? proof.provenObservedResolvedHash
+  const hasProvenObservedContract = Boolean(provenAssignment || provenRemovals || provenHash)
+  if (hasProvenObservedContract) {
+    if (!provenAssignment || !provenRemovals || !provenHash) {
+      return { ok: false, reason: 'proven observed resolved contract incomplete' }
+    }
+    let currentProvenHash = ''
+    try {
+      currentProvenHash = observedResolvedDirectAssignmentHash(
+        input.projectPath,
+        provenAssignment,
+        provenRemovals,
+      )
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+    }
+    if (currentProvenHash !== provenHash) {
+      return {
+        ok: false,
+        reason: `OBSERVED_PROVEN_ASSIGNMENT_DRIFT: baseline=${provenHash} current=${currentProvenHash}`,
+      }
+    }
   }
   return { ok: true, reason: 'materialization proof matches ProofEnvelope and current dependency state' }
 }

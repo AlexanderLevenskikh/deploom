@@ -2109,6 +2109,9 @@ async function materializeApprovedDependencyAssignment(
       resolverInputKey: proofEnvelope.resolverInputKey,
       sourceSnapshotKey: proofEnvelope.sourceSnapshotKey,
       projectProofKey: proofEnvelope.projectProofKey,
+    provenExactDirectAssignment: proofEnvelope.exactDirectAssignment,
+    provenRemovals: proofEnvelope.removals,
+    provenObservedResolvedHash: proofEnvelope.observedResolvedHash,
     })
     if (existingValidation.ok) {
       send('flow:job-output', {
@@ -2217,6 +2220,9 @@ async function materializeApprovedDependencyAssignment(
     resolverInputKey: proofEnvelope.resolverInputKey,
     sourceSnapshotKey: proofEnvelope.sourceSnapshotKey,
     projectProofKey: proofEnvelope.projectProofKey,
+    provenExactDirectAssignment: proofEnvelope.exactDirectAssignment,
+    provenRemovals: proofEnvelope.removals,
+    provenObservedResolvedHash: proofEnvelope.observedResolvedHash,
     packageManager: manager,
     packageManagerVersion: runtime.packageManagerVersion,
     nodeVersion: runtime.nodeVersion,
@@ -2237,6 +2243,9 @@ async function materializeApprovedDependencyAssignment(
     resolverInputKey: proofEnvelope.resolverInputKey,
     sourceSnapshotKey: proofEnvelope.sourceSnapshotKey,
     projectProofKey: proofEnvelope.projectProofKey,
+    provenExactDirectAssignment: proofEnvelope.exactDirectAssignment,
+    provenRemovals: proofEnvelope.removals,
+    provenObservedResolvedHash: proofEnvelope.observedResolvedHash,
   })
   if (!proofValidation.ok) throw new Error(`DEPENDENCY_MATERIALIZATION_PROOF_INVALID: ${branchName}: ${proofValidation.reason}`)
   send('flow:job-output', {

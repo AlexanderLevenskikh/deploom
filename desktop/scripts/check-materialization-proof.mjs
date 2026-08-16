@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import {
   createMaterializationProof,
   materializationAssignmentHash,
+  observedResolvedDirectAssignmentHash,
   readMaterializationProof,
   validateMaterializationProof,
   writeMaterializationProof,
@@ -14,8 +15,11 @@ try {
   const packagePath = join(dir, 'package.json')
   const lockPath = join(dir, 'yarn.lock')
   const installedPath = join(dir, 'node_modules', 'a')
+  const installedBPath = join(dir, 'node_modules', 'b')
   mkdirSync(installedPath, { recursive: true })
+  mkdirSync(installedBPath, { recursive: true })
   writeFileSync(join(installedPath, 'package.json'), JSON.stringify({ name: 'a', version: '2.0.0' }))
+  writeFileSync(join(installedBPath, 'package.json'), JSON.stringify({ name: 'b', version: '3.0.0' }))
   writeFileSync(packagePath, JSON.stringify({
     scripts: { build: 'vite build' },
     dependencies: { a: '2.0.0' },
@@ -25,12 +29,21 @@ try {
   writeFileSync(lockPath, 'a@2.0.0:\n  version "2.0.0"\n')
 
   const actions = [{ package: 'a', target: '2.0.0', action: 'update', section: 'dependencies' }]
+  const provenExactDirectAssignment = { a: '2.0.0', b: '3.0.0' }
+  const provenRemovals = []
   const identity = {
     provenEnvelopeKey: 'envelope-key',
     provenAssignmentKey: 'assignment-key',
     resolverInputKey: 'resolver-key',
     sourceSnapshotKey: 'source-key',
     projectProofKey: 'project-key',
+    provenExactDirectAssignment,
+    provenRemovals,
+    provenObservedResolvedHash: observedResolvedDirectAssignmentHash(
+      dir,
+      provenExactDirectAssignment,
+      provenRemovals,
+    ),
   }
   const proof = createMaterializationProof({
     projectPath: dir,

@@ -11,7 +11,7 @@ import threading
 from pathlib import Path
 from typing import Mapping, Sequence
 
-PROOF_SCHEMA_VERSION = "baseline-proof-v2"
+PROOF_SCHEMA_VERSION = "baseline-proof-v3"
 
 _RESOLVER_FILES = (
     "package.json",
@@ -36,6 +36,21 @@ _TELEMETRY_LOCKS: dict[str, threading.Lock] = {}
 _TELEMETRY_LOCKS_GUARD = threading.Lock()
 
 
+class SourceIdentityUnavailable(RuntimeError):
+    """Raised when a proof identity cannot be computed without guessing."""
+
+
+
+def _git_marker_exists(project_dir: Path) -> bool:
+    current = project_dir.resolve()
+    while True:
+        if (current / ".git").exists():
+            return True
+        if current.parent == current:
+            return False
+        current = current.parent
+
+
 def _canonical_hash(value: object, *, length: int = 32) -> str:
     encoded = json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -49,8 +64,10 @@ def _hash_file(path: Path) -> str:
         with path.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
-    except OSError:
-        return "unreadable"
+    except OSError as exc:
+        raise SourceIdentityUnavailable(
+            f"SOURCE_IDENTITY_FILE_UNREADABLE: {path}: {exc}"
+        ) from exc
     return digest.hexdigest()
 
 
@@ -79,6 +96,27 @@ def _run_git(project_dir: Path, args: Sequence[str]) -> subprocess.CompletedProc
         return subprocess.CompletedProcess(["git", *args], 127, stdout="", stderr=str(exc))
 
 
+def _git_root_or_none(project_dir: Path) -> Path | None:
+    result = _run_git(project_dir, ["rev-parse", "--show-toplevel"])
+    if result.returncode == 0 and result.stdout.strip():
+        return Path(result.stdout.strip()).resolve()
+    if result.returncode == 127 or _git_marker_exists(project_dir):
+        detail = (result.stderr or result.stdout or "git rev-parse failed").strip()
+        raise SourceIdentityUnavailable(
+            f"SOURCE_IDENTITY_GIT_UNAVAILABLE: rev-parse --show-toplevel: {detail}"
+        )
+    return None
+
+
+def _git_success(result: subprocess.CompletedProcess[str], operation: str) -> str:
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
+        raise SourceIdentityUnavailable(
+            f"SOURCE_IDENTITY_GIT_UNAVAILABLE: {operation}: {detail}"
+        )
+    return result.stdout or ""
+
+
 def _fallback_source_fingerprint(project_dir: Path) -> str:
     files: list[tuple[str, str]] = []
     for path in sorted(project_dir.rglob("*")):
@@ -95,64 +133,79 @@ def _fallback_source_fingerprint(project_dir: Path) -> str:
 
 
 def source_snapshot_fingerprint(project_dir: Path) -> str:
-    """Hash the exact source snapshot relevant to preparation/project proofs."""
+    """Hash the repository-wide source snapshot relevant to proof reuse."""
     project_dir = project_dir.resolve()
-    root = _run_git(project_dir, ["rev-parse", "--show-toplevel"])
-    head = _run_git(project_dir, ["rev-parse", "HEAD"])
-    if root.returncode != 0 or head.returncode != 0:
+    git_root = _git_root_or_none(project_dir)
+    if git_root is None:
         return _fallback_source_fingerprint(project_dir)
 
-    git_root = Path(root.stdout.strip()).resolve()
+    head = _git_success(
+        _run_git(git_root, ["rev-parse", "HEAD"]),
+        "rev-parse HEAD",
+    ).strip()
+    if not head:
+        raise SourceIdentityUnavailable("SOURCE_IDENTITY_GIT_UNAVAILABLE: empty HEAD")
+
     try:
         relative = project_dir.relative_to(git_root).as_posix() or "."
-    except ValueError:
-        return _fallback_source_fingerprint(project_dir)
+    except ValueError as exc:
+        raise SourceIdentityUnavailable(
+            f"SOURCE_IDENTITY_PROJECT_OUTSIDE_GIT_ROOT: {project_dir} vs {git_root}"
+        ) from exc
 
-    status = _run_git(
-        project_dir,
-        [
-            "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".",
-            ":(exclude).dependency-roadmap/**",
-        ],
+    pathspec = [
+        ".",
+        ":(exclude).dependency-roadmap/**",
+        ":(glob,exclude)**/.dependency-roadmap/**",
+    ]
+    status = _git_success(
+        _run_git(
+            git_root,
+            ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", *pathspec],
+        ),
+        "git status",
     )
-    if status.returncode == 0 and not status.stdout:
+    if not status:
         return _canonical_hash({
             "kind": "git-clean",
-            "head": head.stdout.strip(),
+            "head": head,
             "relative": relative,
         })
 
-    diff = _run_git(project_dir, ["diff", "--binary", "HEAD", "--", ".", ":(exclude).dependency-roadmap/**"])
-    untracked = _run_git(
-        project_dir,
-        [
-            "ls-files", "--others", "--exclude-standard", "-z", "--", ".",
-            ":(exclude).dependency-roadmap/**",
-        ],
+    diff = _git_success(
+        _run_git(git_root, ["diff", "--binary", "HEAD", "--", *pathspec]),
+        "git diff",
+    )
+    untracked = _git_success(
+        _run_git(
+            git_root,
+            ["ls-files", "--others", "--exclude-standard", "-z", "--", *pathspec],
+        ),
+        "git ls-files --others",
     )
     untracked_hashes: list[tuple[str, str]] = []
-    if untracked.returncode == 0:
-        for raw in untracked.stdout.split("\0"):
-            raw = raw.strip()
-            if not raw:
-                continue
-            path = git_root / raw
-            if path.is_file():
-                untracked_hashes.append((raw.replace("\\", "/"), _hash_file(path)))
+    for raw in untracked.split("\0"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        path = git_root / raw
+        if path.is_file():
+            untracked_hashes.append(
+                (raw.replace("\\", "/"), _hash_file(path))
+            )
 
     return _canonical_hash({
         "kind": "git-dirty",
-        "head": head.stdout.strip(),
+        "head": head,
         "relative": relative,
-        "diff": hashlib.sha256((diff.stdout or "").encode("utf-8")).hexdigest(),
+        "diff": hashlib.sha256(diff.encode("utf-8")).hexdigest(),
         "untracked": sorted(untracked_hashes),
     })
 
 
 def _resolver_ancestor_files(project_dir: Path) -> list[tuple[str, str]]:
     project_dir = project_dir.resolve()
-    root_probe = _run_git(project_dir, ["rev-parse", "--show-toplevel"])
-    stop = Path(root_probe.stdout.strip()).resolve() if root_probe.returncode == 0 and root_probe.stdout.strip() else project_dir
+    stop = _git_root_or_none(project_dir) or project_dir
 
     chain: list[Path] = []
     current = project_dir
@@ -334,6 +387,7 @@ class CachedProofRecord:
     key: str
     created_at: str
     identity: Mapping[str, str]
+    metadata: Mapping[str, object]
 
 
 class VerificationProofStore:
@@ -373,11 +427,33 @@ class VerificationProofStore:
             isinstance(k, str) and isinstance(v, str) for k, v in identity.items()
         ):
             return None
+        metadata = payload.get("metadata")
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            return None
+        if proof_type == "resolver":
+            observed = metadata.get("observedResolvedVersions")
+            observed_hash = metadata.get("observedResolvedHash")
+            if (
+                not isinstance(observed, dict)
+                or not all(
+                    isinstance(name, str) and isinstance(version, str)
+                    for name, version in observed.items()
+                )
+                or not isinstance(observed_hash, str)
+                or len(observed_hash) != 64
+                or _canonical_hash(
+                    dict(sorted(observed.items())), length=64
+                ) != observed_hash
+            ):
+                return None
         return CachedProofRecord(
             proof_type=proof_type,
             key=key,
             created_at=str(payload.get("createdAt") or ""),
             identity=dict(identity),
+            metadata=dict(metadata),
         )
 
     def publish_pass(
@@ -385,6 +461,8 @@ class VerificationProofStore:
         proof_type: str,
         key: str,
         identity: VerificationProofIdentity,
+        *,
+        metadata: Mapping[str, object] | None = None,
     ) -> bool:
         path = self._path(proof_type, key)
         if path is None:
@@ -397,6 +475,7 @@ class VerificationProofStore:
             "outcome": "passed",
             "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
             "identity": identity.event_fields(),
+            "metadata": dict(metadata or {}),
         }
         temp: Path | None = None
         try:

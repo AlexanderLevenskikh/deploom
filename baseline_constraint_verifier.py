@@ -110,6 +110,8 @@ class BaselineVerifyResult:
     output: str = ""
     workspace: str = ""
     project_failures: Tuple[BaselineProjectFailure, ...] = ()
+    observed_resolved_versions: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    observed_resolved_hash: str = ""
 
     @property
     def hard_failure(self) -> bool:
@@ -118,6 +120,10 @@ class BaselineVerifyResult:
 
 class AssignmentMaterializationError(RuntimeError):
     """Raised when the solver assignment cannot be represented by package.json."""
+
+
+class ObservedResolutionError(RuntimeError):
+    """Raised when the installed direct tree differs from the exact assignment."""
 
 
 INFRA_PATTERNS = re.compile(
@@ -550,6 +556,107 @@ def _apply_assignment(
     return changed
 
 
+
+OBSERVED_REMOVED = "<removed>"
+OBSERVED_PEER_ONLY = "<peer-only>"
+OBSERVED_OPTIONAL_NOT_INSTALLED = "<optional-not-installed>"
+DIRECT_DEPENDENCY_SECTIONS = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)
+
+
+def _installed_package_json_path(project_dir: Path, package_name: str) -> Optional[Path]:
+    parts = package_name.split("/") if package_name.startswith("@") else [package_name]
+    cursor = project_dir.resolve()
+    while True:
+        candidate = cursor.joinpath("node_modules", *parts, "package.json")
+        if candidate.is_file():
+            return candidate
+        if cursor.parent == cursor:
+            return None
+        cursor = cursor.parent
+
+
+def observed_resolved_assignment(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    *,
+    remove_packages: Iterable[str] = (),
+) -> Dict[str, str]:
+    """Observe the full direct assignment actually installed by the package manager."""
+    try:
+        manifest = json.loads((project_dir / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise ObservedResolutionError(
+            f"OBSERVED_RESOLVED_ASSIGNMENT_MANIFEST_INVALID: {exc}"
+        ) from exc
+
+    removals = {str(name) for name in remove_packages}
+    observed: Dict[str, str] = {}
+    for name, target in sorted((str(k), str(v)) for k, v in assignment.items()):
+        if name in removals:
+            observed[name] = OBSERVED_REMOVED
+            continue
+
+        declared_sections = [
+            section
+            for section in DIRECT_DEPENDENCY_SECTIONS
+            if isinstance(manifest.get(section), dict)
+            and name in manifest[section]
+        ]
+        if not declared_sections:
+            raise ObservedResolutionError(
+                f"OBSERVED_RESOLVED_ASSIGNMENT_UNDECLARED: {name}@{target}"
+            )
+
+        if set(declared_sections) == {"peerDependencies"}:
+            observed[name] = OBSERVED_PEER_ONLY
+            continue
+
+        package_json = _installed_package_json_path(project_dir, name)
+        optional_only = (
+            "optionalDependencies" in declared_sections
+            and set(declared_sections).issubset(
+                {"optionalDependencies", "peerDependencies"}
+            )
+        )
+        if package_json is None:
+            if optional_only:
+                observed[name] = OBSERVED_OPTIONAL_NOT_INSTALLED
+                continue
+            raise ObservedResolutionError(
+                f"OBSERVED_RESOLVED_ASSIGNMENT_MISSING: {name}@{target}"
+            )
+
+        try:
+            package = json.loads(package_json.read_text(encoding="utf-8"))
+            version = str(package.get("version") or "").strip()
+        except (OSError, ValueError, TypeError) as exc:
+            raise ObservedResolutionError(
+                f"OBSERVED_RESOLVED_ASSIGNMENT_INVALID: {name}: {exc}"
+            ) from exc
+        if version != target:
+            raise ObservedResolutionError(
+                f"OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: "
+                f"{name} expected={target} observed={version or '<missing-version>'}"
+            )
+        observed[name] = version
+    return dict(sorted(observed.items()))
+
+
+def observed_resolved_hash(observed: Mapping[str, str]) -> str:
+    payload = json.dumps(
+        dict(sorted((str(k), str(v)) for k, v in observed.items())),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _classify_install_failure(output: str) -> str:
     if INFRA_PATTERNS.search(output):
         return "infrastructure"
@@ -570,6 +677,7 @@ def verify_assignment(
     remove_packages: Iterable[str] = (),
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "assignment verification",
+    proof_identity: Optional[VerificationProofIdentity] = None,
 ) -> BaselineVerifyResult:
     """Materialize one exact direct-dependency assignment in an isolated clone."""
     project_dir = project_dir.resolve()
@@ -579,7 +687,6 @@ def verify_assignment(
     remove_packages = tuple(sorted({str(item) for item in remove_packages}))
     telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
     assignment_hash = assignment_fingerprint(assignment)
-    proof_identity: Optional[VerificationProofIdentity] = None
 
     def event(name: str, **fields: object) -> None:
         payload = {
@@ -642,26 +749,43 @@ def verify_assignment(
                 workspace=str(workspace_project),
             )
 
-        proof_identity = build_verification_proof_identity(
-            project_dir,
-            assignment=assignment,
-            remove_packages=tuple(sorted(str(item) for item in remove_packages)),
-            manager=manager,
-            manager_executable=executable,
-            registry=config.registry,
-            project_checks=config.project_checks if run_project_checks else "off",
-            commands=config.commands if run_project_checks else (),
-            environment=base_env,
-        )
+        if proof_identity is None:
+            proof_identity = build_verification_proof_identity(
+                project_dir,
+                assignment=assignment,
+                remove_packages=tuple(sorted(str(item) for item in remove_packages)),
+                manager=manager,
+                manager_executable=executable,
+                registry=config.registry,
+                project_checks=config.project_checks if run_project_checks else "off",
+                commands=config.commands if run_project_checks else (),
+                environment=base_env,
+            )
         event("proof.identity", manager=manager)
 
         proof_store = VerificationProofStore(
             Path(config.proof_cache_dir) if config.proof_cache_dir else None
         )
 
-        def publish_pass(proof_type: str, key: str) -> None:
-            if proof_store.publish_pass(proof_type, key, proof_identity):
-                event("proof.cache.publish", proofType=proof_type, cacheKey=key)
+        def publish_pass(
+            proof_type: str,
+            key: str,
+            observed_versions: Mapping[str, str],
+            observed_hash: str,
+        ) -> None:
+            metadata = {
+                "observedResolvedVersions": dict(sorted(observed_versions.items())),
+                "observedResolvedHash": observed_hash,
+            }
+            if proof_store.publish_pass(
+                proof_type, key, proof_identity, metadata=metadata
+            ):
+                event(
+                    "proof.cache.publish",
+                    proofType=proof_type,
+                    cacheKey=key,
+                    observedResolvedHash=observed_hash,
+                )
 
         install = install_args(manager, ignore_scripts=True)
         argv, _ = _command_prefix(executable, install)
@@ -671,10 +795,27 @@ def verify_assignment(
             "YARN_ENABLE_SCRIPTS": "false",
             "npm_config_ignore_scripts": "true",
         }
+        resolver_record = (
+            proof_store.lookup_pass("resolver", config.reuse_resolver_proof_key)
+            if config.reuse_resolver_proof_key
+            else None
+        )
         resolver_reused = bool(
-            config.reuse_resolver_proof_key
+            resolver_record is not None
             and config.reuse_resolver_proof_key == proof_identity.resolver_input_key
         )
+        observed_versions: Dict[str, str] = {}
+        observed_hash = ""
+        if resolver_reused and resolver_record is not None:
+            observed_versions = {
+                str(name): str(version)
+                for name, version in dict(
+                    resolver_record.metadata.get("observedResolvedVersions") or {}
+                ).items()
+            }
+            observed_hash = str(
+                resolver_record.metadata.get("observedResolvedHash") or ""
+            )
         if resolver_reused:
             event(
                 "proof.cache.hit",
@@ -754,7 +895,32 @@ def verify_assignment(
                     workspace=str(workspace_project),
                 )
 
-        publish_pass("resolver", proof_identity.resolver_input_key)
+        if not resolver_reused:
+            try:
+                observed_versions = observed_resolved_assignment(
+                    workspace_project,
+                    assignment,
+                    remove_packages=remove_packages,
+                )
+                observed_hash = observed_resolved_hash(observed_versions)
+            except ObservedResolutionError as exc:
+                event("verify.resolver.observed-drift", outcome="unknown", detail=str(exc))
+                return BaselineVerifyResult(
+                    False, "unknown", str(exc), workspace=str(workspace_project)
+                )
+            publish_pass(
+                "resolver",
+                proof_identity.resolver_input_key,
+                observed_versions,
+                observed_hash,
+            )
+        elif not observed_hash:
+            return BaselineVerifyResult(
+                False,
+                "unknown",
+                "OBSERVED_RESOLVED_PROOF_MISSING: reused ResolverProof has no observed tree hash",
+                workspace=str(workspace_project),
+            )
 
         if run_project_checks and config.project_checks != "off" and config.commands:
             # Re-enable lifecycle scripts before project verification. This is
@@ -804,7 +970,35 @@ def verify_assignment(
                     command=" ".join(full_argv), output=tail, workspace=str(workspace_project),
                 )
 
-            publish_pass("preparation", proof_identity.preparation_proof_key)
+            try:
+                lifecycle_observed = observed_resolved_assignment(
+                    workspace_project,
+                    assignment,
+                    remove_packages=remove_packages,
+                )
+                lifecycle_observed_hash = observed_resolved_hash(lifecycle_observed)
+            except ObservedResolutionError as exc:
+                event("verify.preparation.observed-drift", outcome="unknown", detail=str(exc))
+                return BaselineVerifyResult(
+                    False, "unknown", str(exc), workspace=str(workspace_project)
+                )
+            if lifecycle_observed_hash != observed_hash:
+                return BaselineVerifyResult(
+                    False,
+                    "unknown",
+                    "OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: lifecycle install changed "
+                    f"the proven direct tree resolver={observed_hash} "
+                    f"lifecycle={lifecycle_observed_hash}",
+                    workspace=str(workspace_project),
+                )
+            observed_versions = lifecycle_observed
+            observed_hash = lifecycle_observed_hash
+            publish_pass(
+                "preparation",
+                proof_identity.preparation_proof_key,
+                observed_versions,
+                observed_hash,
+            )
 
             project_failures: List[BaselineProjectFailure] = []
             for command_index, command in enumerate(config.commands, start=1):
@@ -871,13 +1065,41 @@ def verify_assignment(
                 )
 
         if run_project_checks and config.project_checks != "off" and config.commands:
-            publish_pass("project", proof_identity.project_proof_key)
+            try:
+                final_observed = observed_resolved_assignment(
+                    workspace_project,
+                    assignment,
+                    remove_packages=remove_packages,
+                )
+                final_observed_hash = observed_resolved_hash(final_observed)
+            except ObservedResolutionError as exc:
+                return BaselineVerifyResult(
+                    False, "unknown", str(exc), workspace=str(workspace_project)
+                )
+            if final_observed_hash != observed_hash:
+                return BaselineVerifyResult(
+                    False,
+                    "unknown",
+                    "OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: project checks mutated "
+                    "the proven direct dependency tree",
+                    workspace=str(workspace_project),
+                )
+            observed_versions = final_observed
+            observed_hash = final_observed_hash
+            publish_pass(
+                "project",
+                proof_identity.project_proof_key,
+                observed_versions,
+                observed_hash,
+            )
 
         _emit_progress(progress, f"{progress_label}: completed; elapsed={int(time.monotonic() - attempt_started)}s")
         event("verify.attempt.finish", outcome="passed")
         return BaselineVerifyResult(
             True, "passed", f"resolver preflight passed for {len(changed)} changed direct package(s)",
             command=" ".join(argv), workspace=str(workspace_project),
+            observed_resolved_versions=observed_versions,
+            observed_resolved_hash=observed_hash,
         )
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
@@ -961,7 +1183,8 @@ def verify_assignment(
     )
     if wants_project_proof:
         cache_event("proof.cache.lookup", "project", identity.project_proof_key)
-        if proof_store.lookup_pass("project", identity.project_proof_key) is not None:
+        project_record = proof_store.lookup_pass("project", identity.project_proof_key)
+        if project_record is not None:
             cache_event("proof.cache.hit", "project", identity.project_proof_key)
             _emit_progress(
                 progress,
@@ -973,11 +1196,21 @@ def verify_assignment(
                 "passed",
                 "exact ProjectProof cache hit",
                 command=f"proof-cache:{identity.project_proof_key[:12]}",
+                observed_resolved_versions={
+                    str(name): str(version)
+                    for name, version in dict(
+                        project_record.metadata.get("observedResolvedVersions") or {}
+                    ).items()
+                },
+                observed_resolved_hash=str(
+                    project_record.metadata.get("observedResolvedHash") or ""
+                ),
             )
         cache_event("proof.cache.miss", "project", identity.project_proof_key)
 
     cache_event("proof.cache.lookup", "resolver", identity.resolver_input_key)
-    resolver_hit = proof_store.lookup_pass("resolver", identity.resolver_input_key) is not None
+    resolver_record = proof_store.lookup_pass("resolver", identity.resolver_input_key)
+    resolver_hit = resolver_record is not None
     if resolver_hit:
         cache_event("proof.cache.hit", "resolver", identity.resolver_input_key)
         if not wants_project_proof:
@@ -985,11 +1218,21 @@ def verify_assignment(
                 progress,
                 f"{progress_label}: exact ResolverProof cache HIT; resolver verification skipped",
             )
+            assert resolver_record is not None
             return BaselineVerifyResult(
                 True,
                 "passed",
                 "exact ResolverProof cache hit",
                 command=f"proof-cache:{identity.resolver_input_key[:12]}",
+                observed_resolved_versions={
+                    str(name): str(version)
+                    for name, version in dict(
+                        resolver_record.metadata.get("observedResolvedVersions") or {}
+                    ).items()
+                },
+                observed_resolved_hash=str(
+                    resolver_record.metadata.get("observedResolvedHash") or ""
+                ),
             )
     else:
         cache_event("proof.cache.miss", "resolver", identity.resolver_input_key)
@@ -1010,4 +1253,5 @@ def verify_assignment(
         remove_packages=remove_packages,
         progress=progress,
         progress_label=progress_label,
+        proof_identity=identity,
     )
