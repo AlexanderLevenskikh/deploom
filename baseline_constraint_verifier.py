@@ -48,6 +48,7 @@ class BaselineVerifyConfig:
     attempt_timeout_seconds: int = 3600
     localization_timeout_seconds: int = 7200
     progress_interval_seconds: int = 15
+    snapshot_copy_timeout_seconds: int = 1800
     project_checks: str = "adaptive"  # off | diagnostic | adaptive | strict
     commands: Tuple[str, ...] = ()
     registry: str = ""
@@ -77,6 +78,19 @@ class BaselineVerifyConfig:
             attempt_timeout_seconds=max(60, min(_as_int(raw.get("attemptTimeoutSeconds", raw.get("attempt_timeout_seconds")), 3600), 14400)),
             localization_timeout_seconds=max(300, min(_as_int(raw.get("localizationTimeoutSeconds", raw.get("localization_timeout_seconds")), 7200), 21600)),
             progress_interval_seconds=max(5, min(_as_int(raw.get("progressIntervalSeconds", raw.get("progress_interval_seconds")), 15), 60)),
+            snapshot_copy_timeout_seconds=max(
+                60,
+                min(
+                    _as_int(
+                        raw.get(
+                            "snapshotCopyTimeoutSeconds",
+                            raw.get("snapshot_copy_timeout_seconds"),
+                        ),
+                        1800,
+                    ),
+                    7200,
+                ),
+            ),
             project_checks=mode,
             commands=commands,
         )
@@ -524,7 +538,67 @@ def _prepared_snapshot_root() -> Path:
         return _PREPARED_SNAPSHOT_ROOT
 
 
-def _copy_tree_snapshot(source: Path, target: Path) -> None:
+def _run_snapshot_copy(
+    argv: Sequence[str],
+    cwd: Path,
+    *,
+    timeout_seconds: int,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "snapshot copy",
+    progress_interval_seconds: int = 15,
+) -> subprocess.CompletedProcess[str]:
+    started = time.monotonic()
+    popen_kwargs = dict(
+        cwd=str(cwd),
+        env=os.environ.copy(),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        shell=False,
+    )
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    process = subprocess.Popen(list(argv), **popen_kwargs)
+    interval = max(1, min(int(progress_interval_seconds or 15), int(timeout_seconds)))
+    while True:
+        elapsed = time.monotonic() - started
+        remaining = timeout_seconds - elapsed
+        if remaining <= 0:
+            _emit_progress(
+                progress,
+                f"{progress_label}: HARD_TIMEOUT after {int(elapsed)}s; "
+                f"terminating process tree pid={process.pid}",
+            )
+            _terminate_process_tree(process)
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                _terminate_process_tree(process)
+            raise subprocess.TimeoutExpired(list(argv), timeout_seconds)
+        try:
+            stdout, _stderr = process.communicate(timeout=min(interval, remaining))
+            return subprocess.CompletedProcess(
+                list(argv), process.returncode or 0, stdout=stdout or "", stderr=None
+            )
+        except subprocess.TimeoutExpired:
+            _emit_progress(
+                progress,
+                f"{progress_label}: running; elapsed={int(time.monotonic() - started)}s; "
+                f"hardTimeout={timeout_seconds}s; pid={process.pid}",
+            )
+
+
+def _copy_tree_snapshot(
+    source: Path,
+    target: Path,
+    *,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "prepared snapshot copy",
+    timeout_seconds: int = 1800,
+    progress_interval_seconds: int = 15,
+) -> None:
     """Copy one sealed prepared tree without writable hard-link sharing."""
     source = source.resolve()
     target = target.resolve()
@@ -535,15 +609,17 @@ def _copy_tree_snapshot(source: Path, target: Path) -> None:
     if os.name == "nt":
         robocopy = shutil.which("robocopy")
         if robocopy:
-            result = subprocess.run(
+            result = _run_snapshot_copy(
                 [
                     robocopy, str(source), str(target), "/E", "/COPY:DAT",
                     "/DCOPY:DAT", "/R:1", "/W:1", "/NFL", "/NDL",
                     "/NJH", "/NJS", "/NP", "/SL",
                 ],
-                text=True, encoding="utf-8", errors="replace",
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                timeout=900, check=False,
+                source,
+                timeout_seconds=max(1, int(timeout_seconds)),
+                progress=progress,
+                progress_label=progress_label,
+                progress_interval_seconds=progress_interval_seconds,
             )
             if result.returncode < 8:
                 return
@@ -557,11 +633,13 @@ def _copy_tree_snapshot(source: Path, target: Path) -> None:
         cp = shutil.which("cp")
         if cp:
             target.mkdir(parents=True, exist_ok=False)
-            result = subprocess.run(
+            result = _run_snapshot_copy(
                 [cp, "-a", "--reflink=auto", f"{source}/.", str(target)],
-                text=True, encoding="utf-8", errors="replace",
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                timeout=900, check=False,
+                source,
+                timeout_seconds=max(1, int(timeout_seconds)),
+                progress=progress,
+                progress_label=progress_label,
+                progress_interval_seconds=progress_interval_seconds,
             )
             if result.returncode == 0:
                 return
@@ -604,6 +682,10 @@ def _publish_prepared_workspace_snapshot(
     observed_versions: Mapping[str, str],
     observed_hash: str,
     source_project: Path,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "prepared snapshot publish copy",
+    timeout_seconds: int = 1800,
+    progress_interval_seconds: int = 15,
 ) -> PreparedWorkspaceSnapshot:
     slot = _prepared_snapshot_slot(key, source_project)
     existing = _lookup_prepared_workspace_snapshot(key, source_project)
@@ -614,7 +696,14 @@ def _publish_prepared_workspace_snapshot(
     stage = Path(tempfile.mkdtemp(prefix=f"{key[:12]}-", dir=root))
     stage_workspace = stage / "workspace"
     try:
-        _copy_tree_snapshot(workspace_root, stage_workspace)
+        _copy_tree_snapshot(
+            workspace_root,
+            stage_workspace,
+            progress=progress,
+            progress_label=progress_label,
+            timeout_seconds=timeout_seconds,
+            progress_interval_seconds=progress_interval_seconds,
+        )
         relative = workspace_project.resolve().relative_to(workspace_root.resolve())
         snapshot = PreparedWorkspaceSnapshot(
             key=str(key),
@@ -641,8 +730,20 @@ def _publish_prepared_workspace_snapshot(
 def _materialize_prepared_workspace_snapshot(
     snapshot: PreparedWorkspaceSnapshot,
     target: Path,
+    *,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "prepared snapshot clone copy",
+    timeout_seconds: int = 1800,
+    progress_interval_seconds: int = 15,
 ) -> Path:
-    _copy_tree_snapshot(snapshot.workspace_root, target)
+    _copy_tree_snapshot(
+        snapshot.workspace_root,
+        target,
+        progress=progress,
+        progress_label=progress_label,
+        timeout_seconds=timeout_seconds,
+        progress_interval_seconds=progress_interval_seconds,
+    )
     project = target / snapshot.project_relative
     if not project.is_dir():
         raise RuntimeError(
@@ -943,6 +1044,12 @@ def verify_assignment(
             raise subprocess.TimeoutExpired(progress_label, config.attempt_timeout_seconds)
         return max(1, min(config.timeout_seconds, remaining))
 
+    def snapshot_copy_timeout() -> int:
+        remaining = int(attempt_deadline - time.monotonic())
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(progress_label, config.attempt_timeout_seconds)
+        return max(1, min(config.snapshot_copy_timeout_seconds, remaining))
+
     def phase_progress(phase: str) -> ProgressCallback:
         return lambda message: _emit_progress(progress, f"{progress_label}: {phase}: {message}")
 
@@ -1238,6 +1345,16 @@ def verify_assignment(
                 if normalized:
                     event("verify.preparation.snapshot-normalized", removedCaches=list(normalized))
                 snapshot_started = time.monotonic()
+                snapshot_timeout = snapshot_copy_timeout()
+                event(
+                    "verify.preparation.snapshot-publish.start",
+                    preparationProofKey=proof_identity.preparation_proof_key,
+                    hardTimeoutSeconds=snapshot_timeout,
+                )
+                _emit_progress(
+                    progress,
+                    f"{progress_label}: snapshot publish started; hardTimeout={snapshot_timeout}s",
+                )
                 try:
                     snapshot = _publish_prepared_workspace_snapshot(
                         workspace_root, workspace_project,
@@ -1245,13 +1362,22 @@ def verify_assignment(
                         observed_versions=observed_versions,
                         observed_hash=observed_hash,
                         source_project=project_dir,
+                        progress=progress,
+                        progress_label=f"{progress_label}: snapshot-publish",
+                        timeout_seconds=snapshot_timeout,
+                        progress_interval_seconds=config.progress_interval_seconds,
                     )
                 except Exception as exc:
                     return BaselineVerifyResult(False, "infrastructure", f"PREPARED_SNAPSHOT_PUBLISH_FAILED: {exc}", workspace=str(workspace_project))
+                snapshot_duration_ms = int((time.monotonic() - snapshot_started) * 1000)
                 event(
                     "verify.preparation.snapshot-publish",
-                    durationMs=int((time.monotonic() - snapshot_started) * 1000),
+                    durationMs=snapshot_duration_ms,
                     preparationProofKey=proof_identity.preparation_proof_key,
+                )
+                _emit_progress(
+                    progress,
+                    f"{progress_label}: snapshot publish PASS; elapsed={snapshot_duration_ms // 1000}s",
                 )
 
             if snapshot is None:
@@ -1261,15 +1387,42 @@ def verify_assignment(
             for command_index, command in enumerate(config.commands, start=1):
                 command_root = temp_root / f"project-check-{command_index:02d}"
                 clone_started = time.monotonic()
+                clone_timeout = snapshot_copy_timeout()
+                event(
+                    "verify.project-check.clone.start",
+                    command=command,
+                    check=command_index,
+                    checks=len(config.commands),
+                    preparationProofKey=proof_identity.preparation_proof_key,
+                    hardTimeoutSeconds=clone_timeout,
+                )
+                _emit_progress(
+                    progress,
+                    f"{progress_label}: project clone {command_index}/{len(config.commands)} started; "
+                    f"hardTimeout={clone_timeout}s",
+                )
                 try:
-                    command_project = _materialize_prepared_workspace_snapshot(snapshot, command_root)
+                    command_project = _materialize_prepared_workspace_snapshot(
+                        snapshot,
+                        command_root,
+                        progress=progress,
+                        progress_label=f"{progress_label}: project-clone:{command_index}/{len(config.commands)}",
+                        timeout_seconds=clone_timeout,
+                        progress_interval_seconds=config.progress_interval_seconds,
+                    )
                 except Exception as exc:
                     return BaselineVerifyResult(False, "infrastructure", f"PREPARED_SNAPSHOT_CLONE_FAILED: {command}: {exc}", command=command)
+                clone_duration_ms = int((time.monotonic() - clone_started) * 1000)
                 event(
                     "verify.project-check.clone.finish",
                     command=command, check=command_index, checks=len(config.commands),
-                    durationMs=int((time.monotonic() - clone_started) * 1000),
+                    durationMs=clone_duration_ms,
                     preparationProofKey=proof_identity.preparation_proof_key,
+                )
+                _emit_progress(
+                    progress,
+                    f"{progress_label}: project clone {command_index}/{len(config.commands)} PASS; "
+                    f"elapsed={clone_duration_ms // 1000}s",
                 )
                 try:
                     removed_caches = clean_ephemeral_verification_caches(command_project)
