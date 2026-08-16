@@ -552,3 +552,106 @@ class BaselineLivenessBudgetTests(unittest.TestCase):
         self.assertEqual(24, snapshot["learnedConstraints"])
         self.assertEqual(1, snapshot["generalizationAttempts"])
         self.assertEqual(1, snapshot["diagnostics"])
+class ProofPreservingNogoodMinimizationTests(unittest.TestCase):
+    def test_minimizer_finds_two_literal_conflict_with_fresh_certification(self) -> None:
+        clause = {
+            "a": "2.0.0",
+            "b": "3.0.0",
+            "c": "4.0.0",
+            "d": "5.0.0",
+            "e": "6.0.0",
+            "f": "7.0.0",
+            "g": "8.0.0",
+            "h": "9.0.0",
+        }
+        calls: list[tuple[str, ...]] = []
+
+        def certify(candidate: dict[str, str], _check: int) -> str:
+            shape = tuple(sorted(candidate))
+            calls.append(shape)
+            return "peer:a+b" if {"a", "b"} <= set(candidate) else ""
+
+        result = roadmap._proof_preserving_minimize_nogood(
+            clause,
+            certify,
+            initial_predicate="peer:a+b",
+            max_checks=12,
+        )
+
+        self.assertEqual({"a": "2.0.0", "b": "3.0.0"}, result.minimized)
+        self.assertEqual("peer:a+b", result.predicate)
+        self.assertGreaterEqual(result.accepted_shrinks, 1)
+        self.assertEqual(8, result.shrink_history[0])
+        self.assertEqual(2, result.shrink_history[-1])
+        self.assertLessEqual(result.checks, 12)
+        self.assertTrue(calls)
+
+    def test_minimizer_never_accepts_shrink_without_certifier(self) -> None:
+        clause = {
+            "a": "2.0.0",
+            "b": "3.0.0",
+            "c": "4.0.0",
+            "d": "5.0.0",
+        }
+        result = roadmap._proof_preserving_minimize_nogood(
+            clause,
+            lambda _candidate, _check: "",
+            initial_predicate="stable-proof",
+            max_checks=8,
+        )
+        self.assertEqual(clause, result.minimized)
+        self.assertEqual(0, result.accepted_shrinks)
+        self.assertEqual((4,), result.shrink_history)
+
+    def test_localized_clause_requires_literal_level_initial_certification(self) -> None:
+        clause = {"a": "2.0.0", "b": "3.0.0"}
+        calls = 0
+
+        def certify(candidate: dict[str, str], _check: int) -> str:
+            nonlocal calls
+            calls += 1
+            return "stable" if set(candidate) == {"a", "b"} else ""
+
+        result = roadmap._proof_preserving_minimize_nogood(
+            clause,
+            certify,
+            initial_predicate="",
+            max_checks=4,
+        )
+        self.assertGreaterEqual(calls, 1)
+        self.assertEqual("stable", result.predicate)
+        self.assertEqual(clause, result.minimized)
+
+    def test_minimization_budget_scales_but_is_hard_bounded(self) -> None:
+        self.assertEqual(0, roadmap._nogood_minimization_check_budget(1))
+        self.assertGreaterEqual(roadmap._nogood_minimization_check_budget(8), 4)
+        self.assertLessEqual(
+            roadmap._nogood_minimization_check_budget(128),
+            roadmap.NOGOOD_MINIMIZATION_MAX_CHECKS,
+        )
+
+    def test_production_wires_minimization_before_solver_authority(self) -> None:
+        source = inspect.getsource(
+            roadmap.resolve_peer_compatibility_with_verification
+        )
+        self.assertGreaterEqual(
+            source.count("_proof_preserving_minimize_nogood("),
+            2,
+            source,
+        )
+        self.assertLess(
+            source.index("minimization = _proof_preserving_minimize_nogood("),
+            source.index("learned[project][mode].append(generalized_nogood)"),
+        )
+        self.assertLess(
+            source.index("localized_minimization = _proof_preserving_minimize_nogood("),
+            source.index("learned[project][mode].append(nogood)"),
+        )
+
+    def test_convergence_has_semantic_plateau_and_hard_stop_codes(self) -> None:
+        source = inspect.getsource(
+            roadmap.resolve_peer_compatibility_with_verification
+        )
+        self.assertIn("BASELINE_VERIFICATION_PLATEAU", source)
+        self.assertIn("BASELINE_VERIFICATION_HARD_BUDGET_EXHAUSTED", source)
+        self.assertIn("BASELINE_SOLVER_REPEATED_FAILED_ASSIGNMENT", source)
