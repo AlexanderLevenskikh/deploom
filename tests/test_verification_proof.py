@@ -16,10 +16,15 @@ if str(ROOT) not in sys.path:
 from verification_proof import (
     SourceIdentityUnavailable,
     VerificationProofStore,
+    bind_resolved_state_identity,
     build_verification_proof_identity,
     emit_verification_event,
     environment_snapshot_fingerprint,
     source_snapshot_fingerprint,
+)
+from resolved_dependency_state import (
+    capture_resolved_dependency_state,
+    resolved_state_metadata,
 )
 
 
@@ -185,6 +190,13 @@ class VerificationProofIdentityTests(unittest.TestCase):
             observed_hash = __import__("hashlib").sha256(
                 json.dumps(observed, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).hexdigest()
+            state = capture_resolved_dependency_state(
+                project,
+                manager="npm",
+                resolver_input_key=identity.resolver_input_key,
+                observed_resolved_hash=observed_hash,
+                proof_cache_dir=store.root,
+            )
             self.assertTrue(store.publish_pass(
                 "resolver",
                 identity.resolver_input_key,
@@ -192,6 +204,7 @@ class VerificationProofIdentityTests(unittest.TestCase):
                 metadata={
                     "observedResolvedVersions": observed,
                     "observedResolvedHash": observed_hash,
+                    **resolved_state_metadata(state),
                 },
             ))
             self.assertIsNotNone(store.lookup_pass("resolver", identity.resolver_input_key))
@@ -220,6 +233,68 @@ class VerificationProofIdentityTests(unittest.TestCase):
             self.assertEqual(first.source_snapshot_key, second.source_snapshot_key)
             self.assertEqual(first.project_proof_key, second.project_proof_key)
 
+
+    def test_resolved_state_binding_invalidates_preparation_and_project_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._project(Path(tmp))
+            base = self._identity(project)
+            first = bind_resolved_state_identity(
+                base,
+                "a" * 64,
+                project_checks="adaptive",
+                commands=("npm run typecheck",),
+            )
+            second = bind_resolved_state_identity(
+                base,
+                "b" * 64,
+                project_checks="adaptive",
+                commands=("npm run typecheck",),
+            )
+            self.assertEqual(base.resolver_input_key, first.resolver_input_key)
+            self.assertEqual(base.resolver_input_key, second.resolver_input_key)
+            self.assertEqual("a" * 64, first.resolved_state_key)
+            self.assertNotEqual(first.preparation_proof_key, second.preparation_proof_key)
+            self.assertNotEqual(first.project_proof_key, second.project_proof_key)
+
+    def test_parent_yarnrc_outside_project_invalidates_resolver_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            parent = root / "parent"
+            project = parent / "repo"
+            project.mkdir(parents=True)
+            (project / "package.json").write_text(
+                json.dumps({"packageManager": "yarn@1.22.22", "dependencies": {"demo": "^1.0.0"}}),
+                encoding="utf-8",
+            )
+            (project / "yarn.lock").write_text("", encoding="utf-8")
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": str(root / "home")}
+            first = build_verification_proof_identity(
+                project,
+                assignment={"demo": "2.0.0"},
+                remove_packages=(),
+                manager="yarn",
+                manager_executable=sys.executable,
+                registry="https://registry.example.test/npm",
+                project_checks="adaptive",
+                commands=("yarn test",),
+                environment=env,
+            )
+            (parent / ".yarnrc").write_text(
+                'registry "https://registry.example.test/other"\\n',
+                encoding="utf-8",
+            )
+            second = build_verification_proof_identity(
+                project,
+                assignment={"demo": "2.0.0"},
+                remove_packages=(),
+                manager="yarn",
+                manager_executable=sys.executable,
+                registry="https://registry.example.test/npm",
+                project_checks="adaptive",
+                commands=("yarn test",),
+                environment=env,
+            )
+            self.assertNotEqual(first.resolver_input_key, second.resolver_input_key)
 
 
 if __name__ == "__main__":

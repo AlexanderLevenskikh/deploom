@@ -93,13 +93,37 @@ class BlockLPerformanceTests(unittest.TestCase):
 
     def test_production_path_has_snapshot_reuse_and_per_command_isolation(self) -> None:
         source = Path(verifier.__file__).read_text(encoding="utf-8")
+
+        # Snapshot reuse remains mandatory.
+        self.assertIn("_lookup_prepared_workspace_snapshot(", source)
+        self.assertIn("_publish_prepared_workspace_snapshot(", source)
         self.assertIn("verify.preparation.snapshot-hit", source)
-        self.assertIn("verify.preparation.snapshot-publish", source)
-        self.assertIn('isolation="fresh-prepared-snapshot-clone"', source)
-        self.assertIn("_materialize_prepared_workspace_snapshot", source)
-        self.assertIn("OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: project check ", source)
-        self.assertIn("mutated the proven direct dependency tree", source)
-        self.assertIn("_package_manager_cache_environment(config, manager)", source)
+
+        # Every project command still gets its own command root and cleanup.
+        self.assertIn(
+            'command_root = temp_root / f"project-check-{command_index:02d}"',
+            source,
+        )
+        self.assertIn("for command_index, command in enumerate(config.commands, start=1):", source)
+        self.assertIn("shutil.rmtree(command_root, ignore_errors=True)", source)
+
+        # The production path now has two proof-preserving isolation backends:
+        # guarded NTFS zero-copy fast path plus safe full-copy fallback.
+        self.assertIn('"ntfs-junction-guarded"', source)
+        self.assertIn('"fresh-prepared-snapshot-clone"', source)
+        self.assertIn("guarded_clone_is_active(command_root)", source)
+        self.assertIn("try_materialize_guarded_clone(", source)
+        self.assertIn("_copy_tree_snapshot(", source)
+
+        # Fast path is not an unguarded shared writable tree.
+        self.assertIn("stop_guarded_clone(command_root)", source)
+        self.assertIn("PREPARED_DEPENDENCY_TREE_MUTATION", source)
+        self.assertIn("_evict_prepared_workspace_snapshot(", source)
+
+        # The check always runs against the materialized command workspace,
+        # never directly against the sealed prepared snapshot.
+        self.assertIn("command_project = _materialize_prepared_workspace_snapshot(", source)
+        self.assertIn("command_project,", source)
 
     def test_discovery_prefetch_precedes_sequential_reduction(self) -> None:
         source = Path(roadmap.__file__).read_text(encoding="utf-8")

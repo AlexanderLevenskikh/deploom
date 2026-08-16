@@ -26,6 +26,9 @@ class ProvenDependencyStateTests(unittest.TestCase):
             preparation_proof_key="preparation-key",
             project_proof_key="project-key",
             observed_resolved_hash="a" * 64,
+            resolved_state_key="b" * 64,
+            resolved_lockfile_path="yarn.lock",
+            resolved_lockfile_hash="c" * 64,
             assignment={"a": "2.0.0", "@types/a": "1.0.0"},
             removals=("@types/a",),
             verification_commands=("yarn lint:types",),
@@ -70,6 +73,16 @@ class ProvenDependencyStateTests(unittest.TestCase):
         valid, reason = validate_proven_dependency_envelope(failed)
         self.assertFalse(valid)
         self.assertIn("resolver proof status", reason)
+
+
+    def test_resolver_pass_requires_explicit_resolved_state(self):
+        envelope = self.envelope()
+        broken = dict(envelope)
+        broken["resolvedStateKey"] = ""
+        broken["envelopeKey"] = proof_envelope_key(broken)
+        valid, reason = validate_proven_dependency_envelope(broken)
+        self.assertFalse(valid)
+        self.assertIn("resolvedStateKey", reason)
 
     def test_atomic_state_write_preserves_envelope(self):
         with tempfile.TemporaryDirectory() as tmp:

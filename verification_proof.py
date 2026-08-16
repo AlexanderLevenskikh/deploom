@@ -15,7 +15,7 @@ from urllib.parse import unquote, urlparse
 
 from semantic_version import NpmSpec
 
-PROOF_SCHEMA_VERSION = "baseline-proof-v4-fixed-source-identity"
+PROOF_SCHEMA_VERSION = "baseline-proof-v5-resolved-state"
 
 _RESOLVER_FILES = (
     "package.json",
@@ -389,6 +389,75 @@ def _user_config_files(environment: Mapping[str, str]) -> list[tuple[str, str]]:
     return result
 
 
+
+def _yarn_config_chain(project_dir: Path, environment: Mapping[str, str]) -> list[Path]:
+    project_dir = project_dir.resolve()
+    chain: list[Path] = []
+    current = project_dir
+    while True:
+        candidate = current / ".yarnrc"
+        if candidate.is_file():
+            chain.append(candidate.resolve())
+        if current.parent == current:
+            break
+        current = current.parent
+    for key in ("HOME", "USERPROFILE"):
+        raw = environment.get(key)
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser() / ".yarnrc"
+        if candidate.is_file():
+            resolved = candidate.resolve()
+            if resolved not in chain:
+                chain.append(resolved)
+    return chain
+
+
+def _effective_yarn_config_identity(
+    project_dir: Path,
+    environment: Mapping[str, str],
+    manager: str,
+) -> Mapping[str, object]:
+    if str(manager).lower() != "yarn":
+        return {}
+    chain = _yarn_config_chain(project_dir, environment)
+    files = [
+        (str(path).replace("\\", "/"), _hash_file(path))
+        for path in chain
+    ]
+    yarn_path: Path | None = None
+    yarn_path_source = ""
+    pattern = re.compile(r"^\s*yarn-path\s+(?:[\"']([^\"']+)[\"']|(\S+))\s*$", re.IGNORECASE)
+    # Yarn rc resolution is nearest-config-wins. Scan from filesystem root
+    # toward the project so the closest declaration replaces the parent one.
+    for path in reversed(chain):
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            match = pattern.match(line)
+            if not match:
+                continue
+            raw = (match.group(1) or match.group(2) or "").strip()
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                candidate = path.parent / candidate
+            yarn_path = candidate.resolve()
+            yarn_path_source = str(path).replace("\\", "/")
+    delegated: Mapping[str, object] = {}
+    if yarn_path is not None:
+        delegated = {
+            "source": yarn_path_source,
+            "path": str(yarn_path).replace("\\", "/"),
+            "identity": _version_identity(str(yarn_path), environment),
+        }
+    return {
+        "files": files,
+        "delegatedYarnPath": delegated,
+    }
+
+
 def _version_identity(executable: str, environment: Mapping[str, str]) -> str:
     path = Path(executable)
     argv: list[str]
@@ -439,6 +508,7 @@ class VerificationProofIdentity:
     environment_key: str
     source_snapshot_key: str
     resolver_input_key: str
+    resolved_state_key: str
     preparation_proof_key: str
     project_proof_key: str
     localization_experiment_key: str
@@ -450,6 +520,7 @@ class VerificationProofIdentity:
             "environmentKey": self.environment_key,
             "sourceSnapshotKey": self.source_snapshot_key,
             "resolverInputKey": self.resolver_input_key,
+            "resolvedStateKey": self.resolved_state_key,
             "preparationProofKey": self.preparation_proof_key,
             "projectProofKey": self.project_proof_key,
             "localizationExperimentKey": self.localization_experiment_key,
@@ -481,6 +552,7 @@ def build_verification_proof_identity(
         "schema": PROOF_SCHEMA_VERSION,
         "projectResolverFiles": _resolver_ancestor_files(project_dir),
         "userConfigFiles": _user_config_files(environment),
+        "effectiveYarnConfig": _effective_yarn_config_identity(project_dir, environment, manager),
         "fixedResolverInputsKey": fixed_resolver_inputs_key,
         "assignmentKey": assignment_key,
         "environmentKey": environment_key,
@@ -497,8 +569,9 @@ def build_verification_proof_identity(
     preparation_key = _canonical_hash({
         "schema": PROOF_SCHEMA_VERSION,
         "resolverInputKey": resolver_key,
+        "resolvedStateKey": "",
         "sourceSnapshotKey": source_key,
-        "preparationPolicy": "same-assignment:lifecycle-scripts-on",
+        "preparationPolicy": "same-resolved-state:lifecycle-scripts-on:frozen-lockfile",
     })
     project_key = _canonical_hash({
         "schema": PROOF_SCHEMA_VERSION,
@@ -518,11 +591,53 @@ def build_verification_proof_identity(
         environment_key=environment_key,
         source_snapshot_key=source_key,
         resolver_input_key=resolver_key,
+        resolved_state_key="",
         preparation_proof_key=preparation_key,
         project_proof_key=project_key,
         localization_experiment_key=localization_key,
     )
 
+
+
+
+def bind_resolved_state_identity(
+    identity: VerificationProofIdentity,
+    resolved_state_key: str,
+    *,
+    project_checks: str,
+    commands: Sequence[str],
+) -> VerificationProofIdentity:
+    resolved_state_key = str(resolved_state_key)
+    if len(resolved_state_key) != 64 or any(
+        ch not in "0123456789abcdef" for ch in resolved_state_key.lower()
+    ):
+        raise ValueError("RESOLVED_STATE_KEY_INVALID")
+    preparation_key = _canonical_hash({
+        "schema": PROOF_SCHEMA_VERSION,
+        "resolverInputKey": identity.resolver_input_key,
+        "resolvedStateKey": resolved_state_key,
+        "sourceSnapshotKey": identity.source_snapshot_key,
+        "preparationPolicy": "same-resolved-state:lifecycle-scripts-on:frozen-lockfile",
+    })
+    project_key = _canonical_hash({
+        "schema": PROOF_SCHEMA_VERSION,
+        "preparationProofKey": preparation_key,
+        "sourceSnapshotKey": identity.source_snapshot_key,
+        "projectChecks": project_checks,
+        "commands": list(commands),
+    })
+    localization_key = _canonical_hash({
+        "schema": PROOF_SCHEMA_VERSION,
+        "projectProofKey": project_key,
+        "algorithm": "same-origin-localization-v1",
+    })
+    return dataclasses.replace(
+        identity,
+        resolved_state_key=resolved_state_key,
+        preparation_proof_key=preparation_key,
+        project_proof_key=project_key,
+        localization_experiment_key=localization_key,
+    )
 
 
 _ALLOWED_PROOF_TYPES = frozenset({"resolver", "preparation", "project"})
@@ -582,6 +697,13 @@ class VerificationProofStore:
         if proof_type == "resolver":
             observed = metadata.get("observedResolvedVersions")
             observed_hash = metadata.get("observedResolvedHash")
+            resolved_state_key = metadata.get("resolvedStateKey")
+            resolved_resolver_key = metadata.get("resolvedStateResolverInputKey")
+            resolved_manager = metadata.get("resolvedPackageManager")
+            resolved_lock_path = metadata.get("resolvedLockfilePath")
+            resolved_lock_hash = metadata.get("resolvedLockfileHash")
+            resolved_artifact = metadata.get("resolvedStateArtifact")
+            resolved_observed_hash = metadata.get("resolvedStateObservedHash")
             if (
                 not isinstance(observed, dict)
                 or not all(
@@ -593,6 +715,20 @@ class VerificationProofStore:
                 or _canonical_hash(
                     dict(sorted(observed.items())), length=64
                 ) != observed_hash
+                or not isinstance(resolved_state_key, str)
+                or len(resolved_state_key) != 64
+                or not isinstance(resolved_resolver_key, str)
+                or resolved_resolver_key != key
+                or not isinstance(resolved_manager, str)
+                or not resolved_manager
+                or not isinstance(resolved_lock_path, str)
+                or not resolved_lock_path
+                or not isinstance(resolved_lock_hash, str)
+                or len(resolved_lock_hash) != 64
+                or not isinstance(resolved_artifact, str)
+                or not resolved_artifact
+                or not isinstance(resolved_observed_hash, str)
+                or resolved_observed_hash != observed_hash
             ):
                 return None
         return CachedProofRecord(

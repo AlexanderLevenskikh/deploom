@@ -89,10 +89,12 @@ from baseline_constraint_verifier import (
 )
 from verification_proof import (
     VerificationProofStore,
+    bind_resolved_state_identity,
     build_verification_proof_identity,
     is_fixed_manifest_spec,
     source_snapshot_fingerprint,
 )
+from resolved_dependency_state import load_resolved_dependency_state
 from proven_dependency_state import (
     build_proven_dependency_envelope,
     write_proven_dependency_state,
@@ -8429,7 +8431,28 @@ def _build_proven_envelope_for_mode(
     resolver_record = proof_store.lookup_pass(
         "resolver", identity.resolver_input_key
     )
-    resolver_pass = resolver_record is not None
+    resolved_state = (
+        load_resolved_dependency_state(
+            resolver_record.metadata,
+            proof_cache_dir=proof_store.root,
+        )
+        if resolver_record is not None
+        else None
+    )
+    if resolver_record is not None and resolved_state is None:
+        raise BaselineConstraintVerificationError(
+            f"PROVEN_DEPENDENCY_RESOLVED_STATE_MISSING: {project}/{mode}: "
+            f"ResolverProofKey={identity.resolver_input_key} does not carry a valid "
+            "content-addressed post-resolve lockfile artifact"
+        )
+    resolver_pass = resolver_record is not None and resolved_state is not None
+    if resolved_state is not None:
+        identity = bind_resolved_state_identity(
+            identity,
+            resolved_state.key,
+            project_checks=config.project_checks,
+            commands=config.commands,
+        )
     observed_resolved_hash = (
         str(resolver_record.metadata.get("observedResolvedHash") or "")
         if resolver_record is not None
@@ -8486,6 +8509,9 @@ def _build_proven_envelope_for_mode(
         preparation_proof_key=identity.preparation_proof_key,
         project_proof_key=identity.project_proof_key,
         observed_resolved_hash=observed_resolved_hash,
+        resolved_state_key=(resolved_state.key if resolved_state is not None else ""),
+        resolved_lockfile_path=(resolved_state.lockfile_path if resolved_state is not None else ""),
+        resolved_lockfile_hash=(resolved_state.lockfile_hash if resolved_state is not None else ""),
         assignment=assignment,
         removals=tuple(sorted(removals)),
         verification_commands=config.commands,

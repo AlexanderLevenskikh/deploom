@@ -11,6 +11,7 @@ import { buildAgentExecutionBatches } from './agent-batching.js'
 import { assessAgentContextBudget, assertAgentContextBudget } from './agent-context-budget.js'
 import { applyDependencyActionsToPackageJson, classifyDependencyMaterializationFailure, dependencyMaterializationInstallSpec } from './dependency-materialization.js'
 import { createMaterializationProof, DEPENDENCY_CONTROL_KEYS, materializationProofPath, readMaterializationProof, validateMaterializationProof, writeMaterializationProof, type DependencyMaterializationProof } from './materialization-proof.js'
+import { loadProvenResolvedState, resolvedStateTargetPath, restoreProvenResolvedStateLockfile, verifyProvenResolvedStateLockfile } from './resolved-state-proof.js'
 import { buildGroupVerificationRepairPrompt } from './group-repair.js'
 import { batchRoadmapDocument, replaceRoadmapPath } from './roadmap-dossier.js'
 import { latestAgentCheckpoint } from './agent-checkpoint.js'
@@ -1984,13 +1985,20 @@ async function restoreImmutableDependencyState(
     }
   }
   writeFileSync(packagePath, `${JSON.stringify(raw, null, 2)}\n`, 'utf8')
-  for (const lockfile of Object.keys(proof.lockfiles)) {
+  const lockfilesToRestore = new Set([
+    ...Object.keys(proof.lockfiles),
+    proof.provenResolvedLockfilePath,
+  ].filter(Boolean))
+  for (const lockfile of lockfilesToRestore) {
     const restored = await spawnCapture('git', ['-C', project.path, 'checkout', proof.gitHead, '--', lockfile], project.path, 30_000)
     if (restored.code !== 0) {
       throw new Error(`AGENT_DEPENDENCY_STATE_MUTATION: ${branchName}: immutable ${lockfile} changed and Control Plane could not restore it from materialization commit ${proof.gitHead}.`)
     }
   }
-  const dependencyFiles = dependencyFilesForProject(project)
+  const dependencyFiles = [...new Set([
+    ...dependencyFilesForProject(project),
+    proof.provenResolvedLockfilePath,
+  ].filter(Boolean))]
   const add = await spawnCapture('git', ['-c', `core.hooksPath=${emptyHooksPath()}`, '-C', project.path, 'add', '--', ...dependencyFiles], project.path, 30_000)
   if (add.code !== 0) throw new Error(`AGENT_DEPENDENCY_STATE_MUTATION: ${branchName}: failed to stage deterministic dependency-state restoration.`)
   const staged = await spawnCapture('git', ['-C', project.path, 'diff', '--cached', '--quiet', '--', ...dependencyFiles], project.path, 20_000)
@@ -2064,6 +2072,15 @@ async function materializeApprovedDependencyAssignment(
     )
   }
   const proofEnvelope = proofEnvelopeValidation.envelope
+  let provenResolvedState: ReturnType<typeof loadProvenResolvedState>
+  try {
+    provenResolvedState = loadProvenResolvedState(job.workspace.path, proofEnvelope)
+  } catch (error) {
+    throw new Error(
+      `MIGRATION_REPLAN_REQUIRED: PROVEN_RESOLVED_STATE_INVALID: ${branchName}: ${error instanceof Error ? error.message : String(error)}. `
+      + 'Baseline resolver proof no longer carries the exact package-manager state that ProjectProof verified.',
+    )
+  }
 
   let packageText: string
   let packageJson: unknown
@@ -2076,6 +2093,16 @@ async function materializeApprovedDependencyAssignment(
 
   const manager = projectPackageManager(project)
   const runtime = await dependencyRuntimeIdentity(project, manager)
+  if (provenResolvedState.manager !== manager) {
+    throw new Error(`MIGRATION_REPLAN_REQUIRED: PROVEN_RESOLVED_STATE_MANAGER_DRIFT: ${branchName}: baseline=${provenResolvedState.manager}, current=${manager}.`)
+  }
+  const gitRootResult = await spawnCapture('git', ['-C', project.path, 'rev-parse', '--show-toplevel'], project.path, 20_000)
+  if (gitRootResult.code !== 0 || !gitRootResult.stdout.trim()) {
+    throw new Error(`PROVEN_RESOLVED_STATE_GIT_ROOT_UNREADABLE: ${branchName}`)
+  }
+  const gitRoot = gitRootResult.stdout.trim()
+  const resolvedLockfileAbsolute = resolvedStateTargetPath(gitRoot, provenResolvedState)
+  const resolvedLockfileProjectRelative = relative(project.path, resolvedLockfileAbsolute).replace(/\\/g, '/')
   const proofPath = materializationProofPath(job.workspace.path, project.name, branchName)
   const satisfiedBefore = satisfiedScopePackagesFromPrompt(fullGroupPrompt, project.name, packageJson) ?? new Set<string>()
   const allTargetsPresent = actions.every((action) => satisfiedBefore.has(action.package))
@@ -2112,6 +2139,9 @@ async function materializeApprovedDependencyAssignment(
     provenExactDirectAssignment: proofEnvelope.exactDirectAssignment,
     provenRemovals: proofEnvelope.removals,
     provenObservedResolvedHash: proofEnvelope.observedResolvedHash,
+    provenResolvedStateKey: provenResolvedState.key,
+    provenResolvedLockfilePath: resolvedLockfileProjectRelative,
+    provenResolvedLockfileHash: provenResolvedState.lockfileHash,
     })
     if (existingValidation.ok) {
       send('flow:job-output', {
@@ -2148,6 +2178,14 @@ async function materializeApprovedDependencyAssignment(
     )
   }
 
+  try {
+    restoreProvenResolvedStateLockfile(gitRoot, provenResolvedState)
+  } catch (error) {
+    throw new Error(
+      `MIGRATION_REPLAN_REQUIRED: PROVEN_RESOLVED_STATE_RESTORE_FAILED: ${branchName}: ${error instanceof Error ? error.message : String(error)}.`,
+    )
+  }
+
   const applied = applyDependencyActionsToPackageJson(packageText, actions)
   if (applied.changedPackages.length) writeFileSync(join(project.path, 'package.json'), applied.text, 'utf8')
 
@@ -2177,6 +2215,15 @@ async function materializeApprovedDependencyAssignment(
     throw new Error(`DEPENDENCY_MATERIALIZATION_FAILED: ${branchName}: ${manager} install завершился неизвестной ошибкой; hard solver constraint не обучается без классификации. ${output.trim().slice(-2400)}`)
   }
 
+  try {
+    verifyProvenResolvedStateLockfile(gitRoot, provenResolvedState)
+  } catch (error) {
+    throw new Error(
+      `MIGRATION_REPLAN_REQUIRED: PROVEN_RESOLVED_STATE_MATERIALIZATION_DRIFT: ${branchName}: ${error instanceof Error ? error.message : String(error)}. `
+      + 'Frozen materialization did not preserve the exact lockfile verified by Baseline.',
+    )
+  }
+
   let materializedJson: unknown
   try { materializedJson = JSON.parse(readFileSync(join(project.path, 'package.json'), 'utf8')) as unknown } catch { materializedJson = undefined }
   const satisfiedAfter = satisfiedScopePackagesFromPrompt(fullGroupPrompt, project.name, materializedJson) ?? new Set<string>()
@@ -2185,7 +2232,10 @@ async function materializeApprovedDependencyAssignment(
     throw new Error(`MIGRATION_REPLAN_REQUIRED: DEPENDENCY_MATERIALIZATION_POSTCONDITION: ${branchName}: control-plane install завершился, но package.json не содержит immutable target(s): ${missing.join(', ')}.`)
   }
 
-  const dependencyFiles = dependencyFilesForProject(project)
+  const dependencyFiles = [...new Set([
+    ...dependencyFilesForProject(project),
+    resolvedLockfileProjectRelative,
+  ])]
   const add = await executeCommand(job, {
     label: `Stage immutable dependency assignment ${branchName}`,
     command: 'git',
@@ -2223,6 +2273,9 @@ async function materializeApprovedDependencyAssignment(
     provenExactDirectAssignment: proofEnvelope.exactDirectAssignment,
     provenRemovals: proofEnvelope.removals,
     provenObservedResolvedHash: proofEnvelope.observedResolvedHash,
+    provenResolvedStateKey: provenResolvedState.key,
+    provenResolvedLockfilePath: resolvedLockfileProjectRelative,
+    provenResolvedLockfileHash: provenResolvedState.lockfileHash,
     packageManager: manager,
     packageManagerVersion: runtime.packageManagerVersion,
     nodeVersion: runtime.nodeVersion,
@@ -2246,12 +2299,15 @@ async function materializeApprovedDependencyAssignment(
     provenExactDirectAssignment: proofEnvelope.exactDirectAssignment,
     provenRemovals: proofEnvelope.removals,
     provenObservedResolvedHash: proofEnvelope.observedResolvedHash,
+    provenResolvedStateKey: provenResolvedState.key,
+    provenResolvedLockfilePath: resolvedLockfileProjectRelative,
+    provenResolvedLockfileHash: provenResolvedState.lockfileHash,
   })
   if (!proofValidation.ok) throw new Error(`DEPENDENCY_MATERIALIZATION_PROOF_INVALID: ${branchName}: ${proofValidation.reason}`)
   send('flow:job-output', {
     jobId: job.id,
     stream: 'system',
-    line: `${branchName}: materialization proof записан (${proof.assignmentHash}); manifest/lockfile + Node ${proof.nodeVersion} + ${manager} ${proof.packageManagerVersion}.`,
+    line: `${branchName}: materialization proof записан (${proof.assignmentHash}); ResolvedState=${provenResolvedState.key.slice(0, 12)}, exact frozen lockfile + Node ${proof.nodeVersion} + ${manager} ${proof.packageManagerVersion}.`,
   })
   return { safeToSplitSemanticBatches: true, changedPackages: applied.changedPackages, proofPath }
 }

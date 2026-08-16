@@ -55,9 +55,9 @@ export function applyDependencyActionsToPackageJson(text: string, actions: reado
 }
 
 export function dependencyMaterializationInstallSpec(manager: PackageManager): { command: string; args: string[] } {
-  if (manager === 'yarn') return { command: 'yarn', args: ['install'] }
-  if (manager === 'pnpm') return { command: 'pnpm', args: ['install', '--no-frozen-lockfile'] }
-  return { command: 'npm', args: ['install', '--no-audit', '--no-fund'] }
+  if (manager === 'yarn') return { command: 'yarn', args: ['install', '--frozen-lockfile'] }
+  if (manager === 'pnpm') return { command: 'pnpm', args: ['install', '--frozen-lockfile'] }
+  return { command: 'npm', args: ['ci', '--no-audit', '--no-fund'] }
 }
 
 const INFRA_PATTERN = /(?:ENOENT|not recognized as an internal or external command|command not found|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|socket hang up|SELF_SIGNED_CERT|unable to get local issuer|certificate has expired|ENOSPC|EPERM|EACCES|HTTP\s+(?:429|500|502|503|504)\b)/i

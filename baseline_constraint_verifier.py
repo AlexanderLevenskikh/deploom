@@ -33,9 +33,25 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, 
 from verification_proof import (
     VerificationProofIdentity,
     VerificationProofStore,
+    bind_resolved_state_identity,
     build_verification_proof_identity,
     emit_verification_event,
     is_fixed_manifest_spec,
+)
+from resolved_dependency_state import (
+    ResolvedDependencyState,
+    ResolvedDependencyStateError,
+    assert_resolved_dependency_state,
+    capture_resolved_dependency_state,
+    load_resolved_dependency_state,
+    resolved_state_metadata,
+    restore_resolved_dependency_state,
+)
+from prepared_workspace_fastpath import (
+    cleanup_guarded_clone,
+    guarded_clone_is_active,
+    stop_guarded_clone,
+    try_materialize_guarded_clone,
 )
 
 @dataclasses.dataclass(frozen=True)
@@ -129,6 +145,8 @@ class BaselineVerifyResult:
     project_failures: Tuple[BaselineProjectFailure, ...] = ()
     observed_resolved_versions: Mapping[str, str] = dataclasses.field(default_factory=dict)
     observed_resolved_hash: str = ""
+    resolved_state_key: str = ""
+    resolved_lockfile_hash: str = ""
 
     @property
     def hard_failure(self) -> bool:
@@ -384,21 +402,27 @@ def detect_package_manager(project_dir: Path) -> str:
     return "npm"
 
 
-def install_args(manager: str, *, ignore_scripts: bool) -> List[str]:
+def install_args(
+    manager: str, *, ignore_scripts: bool, frozen: bool = False
+) -> List[str]:
     if manager == "yarn":
-        # Yarn Classic ignores YARN_ENABLE_SCRIPTS.  The explicit flag is the
-        # proof boundary for resolver-only verification; Berry is rejected by
-        # lockfile preflight before this verifier is reached.
+        # Resolver discovery may create/extend the lockfile. Every phase after
+        # ResolvedState capture is frozen to those exact bytes.
         args = ["install"]
+        if frozen:
+            args.append("--frozen-lockfile")
         if ignore_scripts:
             args.append("--ignore-scripts")
         return args
     if manager == "pnpm":
-        args = ["install", "--no-frozen-lockfile"]
+        args = ["install", "--frozen-lockfile" if frozen else "--no-frozen-lockfile"]
         if ignore_scripts:
             args.append("--ignore-scripts")
         return args
-    args = ["install", "--no-audit", "--no-fund"]
+    if frozen:
+        args = ["ci", "--no-audit", "--no-fund"]
+    else:
+        args = ["install", "--no-audit", "--no-fund"]
     if ignore_scripts:
         args.append("--ignore-scripts")
     return args
@@ -506,6 +530,8 @@ class PreparedWorkspaceSnapshot:
     key: str
     workspace_root: Path
     project_relative: Path
+    source_project: Path
+    storage_mode: str
     observed_resolved_versions: Mapping[str, str]
     observed_resolved_hash: str
 
@@ -513,6 +539,7 @@ class PreparedWorkspaceSnapshot:
 _PREPARED_SNAPSHOT_LOCK = threading.Lock()
 _PREPARED_SNAPSHOT_ROOT: Optional[Path] = None
 _PREPARED_SNAPSHOTS: Dict[Tuple[str, str], PreparedWorkspaceSnapshot] = {}
+_PREPARED_SNAPSHOT_MAX_COUNT = 2
 
 
 def _cleanup_prepared_snapshot_root() -> None:
@@ -599,7 +626,7 @@ def _copy_tree_snapshot(
     timeout_seconds: int = 1800,
     progress_interval_seconds: int = 15,
 ) -> None:
-    """Copy one sealed prepared tree without writable hard-link sharing."""
+    """Safe full-copy fallback when the zero-copy Windows backend is unavailable."""
     source = source.resolve()
     target = target.resolve()
     if target.exists():
@@ -613,7 +640,7 @@ def _copy_tree_snapshot(
                 [
                     robocopy, str(source), str(target), "/E", "/COPY:DAT",
                     "/DCOPY:DAT", "/R:1", "/W:1", "/NFL", "/NDL",
-                    "/NJH", "/NJS", "/NP", "/SL",
+                    "/NJH", "/NJS", "/NP", "/SL", "/MT:32",
                 ],
                 source,
                 timeout_seconds=max(1, int(timeout_seconds)),
@@ -657,12 +684,14 @@ def _lookup_prepared_workspace_snapshot(
 ) -> Optional[PreparedWorkspaceSnapshot]:
     slot = _prepared_snapshot_slot(key, source_project)
     with _PREPARED_SNAPSHOT_LOCK:
-        snapshot = _PREPARED_SNAPSHOTS.get(slot)
+        snapshot = _PREPARED_SNAPSHOTS.pop(slot, None)
         if snapshot is None:
             return None
         if not snapshot.workspace_root.is_dir():
-            _PREPARED_SNAPSHOTS.pop(slot, None)
             return None
+        # Dict insertion order becomes a tiny LRU. Snapshot eviction never
+        # weakens proof; it only forces rematerialization on a future miss.
+        _PREPARED_SNAPSHOTS[slot] = snapshot
         return snapshot
 
 
@@ -672,6 +701,22 @@ def _evict_prepared_workspace_snapshot(key: str, source_project: Path) -> None:
         snapshot = _PREPARED_SNAPSHOTS.pop(slot, None)
     if snapshot is not None:
         shutil.rmtree(snapshot.workspace_root.parent, ignore_errors=True)
+
+
+def _enforce_prepared_snapshot_budget(protected_slot: Tuple[str, str]) -> None:
+    victims: List[PreparedWorkspaceSnapshot] = []
+    with _PREPARED_SNAPSHOT_LOCK:
+        while len(_PREPARED_SNAPSHOTS) > _PREPARED_SNAPSHOT_MAX_COUNT:
+            slot = next(iter(_PREPARED_SNAPSHOTS))
+            if slot == protected_slot and len(_PREPARED_SNAPSHOTS) > 1:
+                snapshot = _PREPARED_SNAPSHOTS.pop(slot)
+                _PREPARED_SNAPSHOTS[slot] = snapshot
+                slot = next(iter(_PREPARED_SNAPSHOTS))
+            victim = _PREPARED_SNAPSHOTS.pop(slot, None)
+            if victim is not None:
+                victims.append(victim)
+    for victim in victims:
+        shutil.rmtree(victim.workspace_root.parent, ignore_errors=True)
 
 
 def _publish_prepared_workspace_snapshot(
@@ -695,20 +740,40 @@ def _publish_prepared_workspace_snapshot(
     root = _prepared_snapshot_root()
     stage = Path(tempfile.mkdtemp(prefix=f"{key[:12]}-", dir=root))
     stage_workspace = stage / "workspace"
+    relative = workspace_project.resolve().relative_to(workspace_root.resolve())
+    storage_mode = "copied-sealed-workspace"
     try:
-        _copy_tree_snapshot(
-            workspace_root,
-            stage_workspace,
-            progress=progress,
-            progress_label=progress_label,
-            timeout_seconds=timeout_seconds,
-            progress_interval_seconds=progress_interval_seconds,
-        )
-        relative = workspace_project.resolve().relative_to(workspace_root.resolve())
+        # On the normal Windows path both directories live under the same temp
+        # volume. Renaming the already-prepared tree publishes the immutable
+        # snapshot in O(metadata), instead of physically copying node_modules.
+        moved = False
+        if os.name == "nt":
+            try:
+                os.replace(workspace_root, stage_workspace)
+                moved = True
+                storage_mode = "moved-sealed-workspace"
+                _emit_progress(
+                    progress,
+                    f"{progress_label}: zero-copy snapshot promotion complete",
+                )
+            except OSError:
+                moved = False
+        if not moved:
+            _copy_tree_snapshot(
+                workspace_root,
+                stage_workspace,
+                progress=progress,
+                progress_label=progress_label,
+                timeout_seconds=timeout_seconds,
+                progress_interval_seconds=progress_interval_seconds,
+            )
+
         snapshot = PreparedWorkspaceSnapshot(
             key=str(key),
             workspace_root=stage_workspace,
             project_relative=relative,
+            source_project=source_project.resolve(),
+            storage_mode=storage_mode,
             observed_resolved_versions=dict(sorted(
                 (str(name), str(version)) for name, version in observed_versions.items()
             )),
@@ -718,10 +783,13 @@ def _publish_prepared_workspace_snapshot(
             raced = _PREPARED_SNAPSHOTS.get(slot)
             if raced is None:
                 _PREPARED_SNAPSHOTS[slot] = snapshot
-                return snapshot
-        shutil.rmtree(stage, ignore_errors=True)
-        assert raced is not None
-        return raced
+                published = snapshot
+            else:
+                published = raced
+        if raced is not None:
+            shutil.rmtree(stage, ignore_errors=True)
+        _enforce_prepared_snapshot_budget(slot)
+        return published
     except Exception:
         shutil.rmtree(stage, ignore_errors=True)
         raise
@@ -736,6 +804,19 @@ def _materialize_prepared_workspace_snapshot(
     timeout_seconds: int = 1800,
     progress_interval_seconds: int = 15,
 ) -> Path:
+    # Zero-config Windows/NTFS fast path: clone only source/config, then expose
+    # the immutable prepared dependency bytes through junctions guarded by
+    # ReadDirectoryChangesW. Any package-tree mutation fails closed.
+    fast = try_materialize_guarded_clone(
+        source_project=snapshot.source_project,
+        prepared_workspace_root=snapshot.workspace_root,
+        project_relative=snapshot.project_relative,
+        target=target,
+        progress=progress,
+    )
+    if fast is not None:
+        return fast
+
     _copy_tree_snapshot(
         snapshot.workspace_root,
         target,
@@ -1104,16 +1185,22 @@ def verify_assignment(
             Path(config.proof_cache_dir) if config.proof_cache_dir else None
         )
 
+        resolved_state: Optional[ResolvedDependencyState] = None
+
         def publish_pass(
             proof_type: str,
             key: str,
             observed_versions: Mapping[str, str],
             observed_hash: str,
+            *,
+            extra_metadata: Optional[Mapping[str, object]] = None,
         ) -> None:
-            metadata = {
+            metadata: Dict[str, object] = {
                 "observedResolvedVersions": dict(sorted(observed_versions.items())),
                 "observedResolvedHash": observed_hash,
             }
+            if extra_metadata:
+                metadata.update(dict(extra_metadata))
             if proof_store.publish_pass(
                 proof_type, key, proof_identity, metadata=metadata
             ):
@@ -1122,9 +1209,10 @@ def verify_assignment(
                     proofType=proof_type,
                     cacheKey=key,
                     observedResolvedHash=observed_hash,
+                    resolvedStateKey=proof_identity.resolved_state_key,
                 )
 
-        install = install_args(manager, ignore_scripts=True)
+        install = install_args(manager, ignore_scripts=True, frozen=False)
         argv, _ = _command_prefix(executable, install)
         install_env = {
             "CI": "1",
@@ -1144,27 +1232,55 @@ def verify_assignment(
         )
         observed_versions: Dict[str, str] = {}
         observed_hash = ""
+
         if resolver_reused and resolver_record is not None:
-            observed_versions = {
-                str(name): str(version)
-                for name, version in dict(
-                    resolver_record.metadata.get("observedResolvedVersions") or {}
-                ).items()
-            }
-            observed_hash = str(
-                resolver_record.metadata.get("observedResolvedHash") or ""
+            resolved_state = load_resolved_dependency_state(
+                resolver_record.metadata,
+                proof_cache_dir=proof_store.root,
             )
+            if resolved_state is None:
+                resolver_reused = False
+                resolver_record = None
+                event(
+                    "proof.cache.rejected",
+                    proofType="resolver",
+                    cacheKey=proof_identity.resolver_input_key,
+                    reason="resolved-state-artifact-invalid-or-missing",
+                )
+            else:
+                observed_versions = {
+                    str(name): str(version)
+                    for name, version in dict(
+                        resolver_record.metadata.get("observedResolvedVersions") or {}
+                    ).items()
+                }
+                observed_hash = str(
+                    resolver_record.metadata.get("observedResolvedHash") or ""
+                )
+                proof_identity = bind_resolved_state_identity(
+                    proof_identity,
+                    resolved_state.key,
+                    project_checks=config.project_checks if run_project_checks else "off",
+                    commands=config.commands if run_project_checks else (),
+                )
+                try:
+                    restore_resolved_dependency_state(workspace_project, resolved_state)
+                except ResolvedDependencyStateError as exc:
+                    return BaselineVerifyResult(
+                        False, "unknown", str(exc), workspace=str(workspace_project)
+                    )
+
         if resolver_reused:
             event(
                 "proof.cache.hit",
                 proofType="resolver",
                 cacheKey=proof_identity.resolver_input_key,
-                reuseMode="skip-scripts-off-install",
+                reuseMode="restore-exact-resolved-state-then-frozen-lifecycle",
             )
             _emit_progress(
                 progress,
-                f"{progress_label}: resolver PASS reused from exact ResolverInputKey; "
-                "lifecycle materialization remains fresh",
+                f"{progress_label}: ResolverProof HIT; exact proven lockfile restored. "
+                "Fresh lifecycle remains frozen and authoritative.",
             )
         else:
             resolver_started = time.monotonic()
@@ -1210,26 +1326,26 @@ def verify_assignment(
             return BaselineVerifyResult(False, "unknown", f"ASSIGNMENT_MANIFEST_UNREADABLE: {exc}")
         removal_names = set(remove_packages)
         for expected_name, expected_version in sorted(assignment.items()):
-            observed_versions = []
+            declared_versions = []
             for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
                 values = materialized_manifest.get(section)
                 if isinstance(values, dict) and expected_name in values:
-                    observed_versions.append(str(values[expected_name]))
+                    declared_versions.append(str(values[expected_name]))
             if expected_name in removal_names:
-                if observed_versions:
+                if declared_versions:
                     return BaselineVerifyResult(
                         False,
                         "unknown",
-                        f"ASSIGNMENT_MANIFEST_DRIFT: {expected_name} was proven for removal but remains declared as {observed_versions!r}",
+                        f"ASSIGNMENT_MANIFEST_DRIFT: {expected_name} was proven for removal but remains declared as {declared_versions!r}",
                         workspace=str(workspace_project),
                     )
                 continue
-            if not observed_versions or any(value != expected_version for value in observed_versions):
+            if not declared_versions or any(value != expected_version for value in declared_versions):
                 return BaselineVerifyResult(
                     False,
                     "unknown",
                     f"ASSIGNMENT_MANIFEST_DRIFT: {expected_name} expected {expected_version!r}, "
-                    f"observed {observed_versions!r}",
+                    f"observed {declared_versions!r}",
                     workspace=str(workspace_project),
                 )
 
@@ -1246,17 +1362,45 @@ def verify_assignment(
                 return BaselineVerifyResult(
                     False, "unknown", str(exc), workspace=str(workspace_project)
                 )
+            try:
+                resolved_state = capture_resolved_dependency_state(
+                    workspace_project,
+                    manager=manager,
+                    resolver_input_key=proof_identity.resolver_input_key,
+                    observed_resolved_hash=observed_hash,
+                    proof_cache_dir=proof_store.root,
+                )
+            except ResolvedDependencyStateError as exc:
+                return BaselineVerifyResult(
+                    False,
+                    "unknown",
+                    str(exc),
+                    workspace=str(workspace_project),
+                )
+            proof_identity = bind_resolved_state_identity(
+                proof_identity,
+                resolved_state.key,
+                project_checks=config.project_checks if run_project_checks else "off",
+                commands=config.commands if run_project_checks else (),
+            )
             publish_pass(
                 "resolver",
                 proof_identity.resolver_input_key,
                 observed_versions,
                 observed_hash,
+                extra_metadata=resolved_state_metadata(resolved_state),
             )
-        elif not observed_hash:
+            event(
+                "verify.resolved-state.captured",
+                resolvedStateKey=resolved_state.key,
+                lockfilePath=resolved_state.lockfile_path,
+                lockfileHash=resolved_state.lockfile_hash,
+            )
+        elif not observed_hash or resolved_state is None:
             return BaselineVerifyResult(
                 False,
                 "unknown",
-                "OBSERVED_RESOLVED_PROOF_MISSING: reused ResolverProof has no observed tree hash",
+                "RESOLVED_STATE_PROOF_MISSING: reused ResolverProof has no exact resolved state",
                 workspace=str(workspace_project),
             )
 
@@ -1288,11 +1432,11 @@ def verify_assignment(
                 )
                 observed_versions = dict(snapshot.observed_resolved_versions)
             else:
-                full_install = install_args(manager, ignore_scripts=False)
+                full_install = install_args(manager, ignore_scripts=False, frozen=True)
                 full_argv, _ = _command_prefix(executable, full_install)
                 lifecycle_env = {
                     "CI": "1",
-                    "YARN_ENABLE_IMMUTABLE_INSTALLS": "false",
+                    "YARN_ENABLE_IMMUTABLE_INSTALLS": "true",
                     "YARN_ENABLE_SCRIPTS": "true",
                     "npm_config_ignore_scripts": "false",
                 }
@@ -1339,7 +1483,22 @@ def verify_assignment(
                     )
                 observed_versions = lifecycle_observed
                 observed_hash = lifecycle_observed_hash
-                publish_pass("preparation", proof_identity.preparation_proof_key, observed_versions, observed_hash)
+                try:
+                    assert resolved_state is not None
+                    assert_resolved_dependency_state(workspace_project, resolved_state)
+                except (AssertionError, ResolvedDependencyStateError) as exc:
+                    return BaselineVerifyResult(
+                        False, "unknown",
+                        f"RESOLVED_STATE_PREPARATION_DRIFT: {exc}",
+                        workspace=str(workspace_project),
+                    )
+                publish_pass(
+                    "preparation",
+                    proof_identity.preparation_proof_key,
+                    observed_versions,
+                    observed_hash,
+                    extra_metadata=resolved_state_metadata(resolved_state),
+                )
 
                 normalized = clean_ephemeral_verification_caches(workspace_project)
                 if normalized:
@@ -1377,8 +1536,9 @@ def verify_assignment(
                 )
                 _emit_progress(
                     progress,
-                    f"{progress_label}: snapshot publish PASS; elapsed={snapshot_duration_ms // 1000}s",
+                    f"{progress_label}: snapshot publish PASS; elapsed={snapshot_duration_ms // 1000}s; mode={snapshot.storage_mode}",
                 )
+                workspace_project = snapshot.workspace_root / snapshot.project_relative
 
             if snapshot is None:
                 return BaselineVerifyResult(False, "infrastructure", "PREPARED_SNAPSHOT_UNAVAILABLE: project checks require a sealed preparation tree")
@@ -1412,17 +1572,25 @@ def verify_assignment(
                     )
                 except Exception as exc:
                     return BaselineVerifyResult(False, "infrastructure", f"PREPARED_SNAPSHOT_CLONE_FAILED: {command}: {exc}", command=command)
+                clone_isolation = (
+                    "ntfs-junction-guarded"
+                    if guarded_clone_is_active(command_root)
+                    else "fresh-prepared-snapshot-clone"
+                )
                 clone_duration_ms = int((time.monotonic() - clone_started) * 1000)
                 event(
                     "verify.project-check.clone.finish",
-                    command=command, check=command_index, checks=len(config.commands),
+                    command=command,
+                    check=command_index,
+                    checks=len(config.commands),
                     durationMs=clone_duration_ms,
                     preparationProofKey=proof_identity.preparation_proof_key,
+                    isolation=clone_isolation,
                 )
                 _emit_progress(
                     progress,
                     f"{progress_label}: project clone {command_index}/{len(config.commands)} PASS; "
-                    f"elapsed={clone_duration_ms // 1000}s",
+                    f"elapsed={clone_duration_ms // 1000}s; isolation={clone_isolation}",
                 )
                 try:
                     removed_caches = clean_ephemeral_verification_caches(command_project)
@@ -1431,9 +1599,11 @@ def verify_assignment(
                     _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} started: {command}")
                     check_started = time.monotonic()
                     event(
-                        "verify.project-check.start", command=command,
-                        check=command_index, checks=len(config.commands),
-                        isolation="fresh-prepared-snapshot-clone",
+                        "verify.project-check.start",
+                        command=command,
+                        check=command_index,
+                        checks=len(config.commands),
+                        isolation=clone_isolation,
                     )
                     if os.name == "nt":
                         shell_argv: Sequence[str] = [os.environ.get("COMSPEC") or "cmd.exe", "/d", "/s", "/c", command]
@@ -1441,14 +1611,67 @@ def verify_assignment(
                         shell_argv = ["/bin/sh", "-lc", command]
                     try:
                         check_result = _run(
-                            shell_argv, command_project,
-                            timeout_seconds=phase_timeout(), base_env=base_env,
+                            shell_argv,
+                            command_project,
+                            timeout_seconds=phase_timeout(),
+                            base_env=base_env,
                             progress=phase_progress(f"project-check:{command}"),
                             progress_label=command,
                             progress_interval_seconds=config.progress_interval_seconds,
                         )
                     except (OSError, subprocess.TimeoutExpired) as exc:
+                        if clone_isolation == "ntfs-junction-guarded":
+                            cleanup_guarded_clone(command_root)
+                            _evict_prepared_workspace_snapshot(
+                                proof_identity.preparation_proof_key, project_dir
+                            )
                         return BaselineVerifyResult(False, "infrastructure", f"project check launch failed: {exc}", command=command)
+
+                    guard_result = stop_guarded_clone(command_root)
+                    if guard_result.errors or guard_result.mutations:
+                        # Detach junctions before evicting the shared prepared
+                        # tree; otherwise Windows may keep target handles alive.
+                        cleanup_guarded_clone(command_root)
+                        _evict_prepared_workspace_snapshot(
+                            proof_identity.preparation_proof_key, project_dir
+                        )
+                        detail = "; ".join([
+                            *(f"watcher-error={item}" for item in guard_result.errors),
+                            *(f"dependency-mutation={item}" for item in guard_result.mutations[:12]),
+                        ])
+                        return BaselineVerifyResult(
+                            False,
+                            "unknown",
+                            f"PREPARED_DEPENDENCY_TREE_MUTATION: project check {command} attempted to mutate the shared proven dependency tree; {detail}",
+                            command=command,
+                            workspace=str(command_project),
+                        )
+
+                    # Allowed .vite/.vitest writes are cache-only. Remove them
+                    # from the sealed dependency base before any later check.
+                    prepared_project = snapshot.workspace_root / snapshot.project_relative
+                    normalized_shared = clean_ephemeral_verification_caches(prepared_project)
+                    if normalized_shared:
+                        event(
+                            "verify.project-check.shared-cache-normalized",
+                            command=command,
+                            removedCaches=list(normalized_shared),
+                        )
+
+                    try:
+                        assert resolved_state is not None
+                        assert_resolved_dependency_state(command_project, resolved_state)
+                    except (AssertionError, ResolvedDependencyStateError) as exc:
+                        _evict_prepared_workspace_snapshot(
+                            proof_identity.preparation_proof_key, project_dir
+                        )
+                        return BaselineVerifyResult(
+                            False,
+                            "unknown",
+                            f"RESOLVED_STATE_PROJECT_DRIFT: {command}: {exc}",
+                            command=command,
+                            workspace=str(command_project),
+                        )
 
                     try:
                         check_observed = observed_resolved_assignment(
@@ -1466,12 +1689,14 @@ def verify_assignment(
                         )
 
                     event(
-                        "verify.project-check.finish", command=command,
-                        check=command_index, checks=len(config.commands),
+                        "verify.project-check.finish",
+                        command=command,
+                        check=command_index,
+                        checks=len(config.commands),
                         durationMs=int((time.monotonic() - check_started) * 1000),
                         exitCode=check_result.returncode,
                         outcome="passed" if check_result.returncode == 0 else "failed",
-                        isolation="fresh-prepared-snapshot-clone",
+                        isolation=clone_isolation,
                     )
                     if check_result.returncode == 0:
                         _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} PASS: {command}")
@@ -1482,6 +1707,7 @@ def verify_assignment(
                     project_failures.append(BaselineProjectFailure(command, check_result.returncode, tail))
                     _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} RED exit={check_result.returncode}: {command}")
                 finally:
+                    cleanup_guarded_clone(command_root)
                     shutil.rmtree(command_root, ignore_errors=True)
 
             if project_failures:
@@ -1497,7 +1723,11 @@ def verify_assignment(
                     project_failures=tuple(project_failures),
                 )
 
-            publish_pass("project", proof_identity.project_proof_key, observed_versions, observed_hash)
+            assert resolved_state is not None
+            publish_pass(
+                "project", proof_identity.project_proof_key, observed_versions, observed_hash,
+                extra_metadata=resolved_state_metadata(resolved_state),
+            )
 
         _emit_progress(progress, f"{progress_label}: completed; elapsed={int(time.monotonic() - attempt_started)}s")
         event("verify.attempt.finish", outcome="passed")
@@ -1506,6 +1736,8 @@ def verify_assignment(
             command=" ".join(argv), workspace=str(workspace_project),
             observed_resolved_versions=observed_versions,
             observed_resolved_hash=observed_hash,
+            resolved_state_key=resolved_state.key if resolved_state is not None else "",
+            resolved_lockfile_hash=resolved_state.lockfile_hash if resolved_state is not None else "",
         )
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
@@ -1529,7 +1761,7 @@ def verify_assignment(
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "assignment verification",
 ) -> BaselineVerifyResult:
-    """Cache-aware proof entry point."""
+    """Cache-aware proof entry point with ResolvedState-bound project proofs."""
     project_dir = project_dir.resolve()
     proof_store = VerificationProofStore(
         Path(config.proof_cache_dir) if config.proof_cache_dir else None
@@ -1587,16 +1819,51 @@ def verify_assignment(
     wants_project_proof = bool(
         run_project_checks and config.project_checks != "off" and config.commands
     )
-    if wants_project_proof:
+
+    cache_event("proof.cache.lookup", "resolver", identity.resolver_input_key)
+    resolver_record = proof_store.lookup_pass("resolver", identity.resolver_input_key)
+    resolved_state = (
+        load_resolved_dependency_state(
+            resolver_record.metadata,
+            proof_cache_dir=proof_store.root,
+        )
+        if resolver_record is not None
+        else None
+    )
+    resolver_hit = resolver_record is not None and resolved_state is not None
+    if resolver_record is not None and resolved_state is None:
+        cache_event(
+            "proof.cache.rejected",
+            "resolver",
+            identity.resolver_input_key,
+            reason="resolved-state-artifact-invalid-or-missing",
+        )
+    elif resolver_hit and resolved_state is not None:
+        identity = bind_resolved_state_identity(
+            identity,
+            resolved_state.key,
+            project_checks=config.project_checks if run_project_checks else "off",
+            commands=config.commands if run_project_checks else (),
+        )
+        cache_event(
+            "proof.cache.hit",
+            "resolver",
+            identity.resolver_input_key,
+        )
+    else:
+        cache_event("proof.cache.miss", "resolver", identity.resolver_input_key)
+
+    if wants_project_proof and resolver_hit:
         cache_event("proof.cache.lookup", "project", identity.project_proof_key)
         project_record = proof_store.lookup_pass("project", identity.project_proof_key)
         if project_record is not None:
             cache_event("proof.cache.hit", "project", identity.project_proof_key)
             _emit_progress(
                 progress,
-                f"{progress_label}: exact ProjectProof cache HIT; "
-                "clone/install/lifecycle/project checks skipped",
+                f"{progress_label}: exact ProjectProof cache HIT for ResolvedState "
+                f"{identity.resolved_state_key[:12]}; install/lifecycle/checks skipped",
             )
+            assert resolved_state is not None
             return BaselineVerifyResult(
                 True,
                 "passed",
@@ -1611,37 +1878,34 @@ def verify_assignment(
                 observed_resolved_hash=str(
                     project_record.metadata.get("observedResolvedHash") or ""
                 ),
+                resolved_state_key=resolved_state.key,
+                resolved_lockfile_hash=resolved_state.lockfile_hash,
             )
         cache_event("proof.cache.miss", "project", identity.project_proof_key)
 
-    cache_event("proof.cache.lookup", "resolver", identity.resolver_input_key)
-    resolver_record = proof_store.lookup_pass("resolver", identity.resolver_input_key)
-    resolver_hit = resolver_record is not None
-    if resolver_hit:
-        cache_event("proof.cache.hit", "resolver", identity.resolver_input_key)
-        if not wants_project_proof:
-            _emit_progress(
-                progress,
-                f"{progress_label}: exact ResolverProof cache HIT; resolver verification skipped",
-            )
-            assert resolver_record is not None
-            return BaselineVerifyResult(
-                True,
-                "passed",
-                "exact ResolverProof cache hit",
-                command=f"proof-cache:{identity.resolver_input_key[:12]}",
-                observed_resolved_versions={
-                    str(name): str(version)
-                    for name, version in dict(
-                        resolver_record.metadata.get("observedResolvedVersions") or {}
-                    ).items()
-                },
-                observed_resolved_hash=str(
-                    resolver_record.metadata.get("observedResolvedHash") or ""
-                ),
-            )
-    else:
-        cache_event("proof.cache.miss", "resolver", identity.resolver_input_key)
+    if resolver_hit and not wants_project_proof:
+        _emit_progress(
+            progress,
+            f"{progress_label}: exact ResolverProof + ResolvedState cache HIT; resolver verification skipped",
+        )
+        assert resolver_record is not None and resolved_state is not None
+        return BaselineVerifyResult(
+            True,
+            "passed",
+            "exact ResolverProof cache hit",
+            command=f"proof-cache:{identity.resolver_input_key[:12]}",
+            observed_resolved_versions={
+                str(name): str(version)
+                for name, version in dict(
+                    resolver_record.metadata.get("observedResolvedVersions") or {}
+                ).items()
+            },
+            observed_resolved_hash=str(
+                resolver_record.metadata.get("observedResolvedHash") or ""
+            ),
+            resolved_state_key=resolved_state.key,
+            resolved_lockfile_hash=resolved_state.lockfile_hash,
+        )
 
     effective_config = (
         dataclasses.replace(

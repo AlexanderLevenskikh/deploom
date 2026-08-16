@@ -88,6 +88,7 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 json.dumps({"packageManager": "npm@11.0.0", "dependencies": {"demo": "1.0.0"}}),
                 encoding="utf-8",
             )
+            (root / "package-lock.json").write_text(json.dumps({"lockfileVersion": 3, "packages": {}}), encoding="utf-8")
             runs = [
                 CompletedProcess(["npm", "install"], 0, stdout="resolver ok"),
                 CompletedProcess(["npm", "install"], 1, stdout="npm error HTTP 502 Bad Gateway"),
@@ -111,6 +112,7 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 json.dumps({"packageManager": "npm@11.0.0", "dependencies": {"demo": "1.0.0"}}),
                 encoding="utf-8",
             )
+            (root / "package-lock.json").write_text(json.dumps({"lockfileVersion": 3, "packages": {}}), encoding="utf-8")
             runs = [
                 CompletedProcess(["npm", "install"], 0, stdout="resolver ok"),
                 CompletedProcess(["npm", "install"], 1, stdout="ERESOLVE conflicting peer dependency"),
@@ -133,13 +135,13 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 json.dumps({"packageManager": "npm@11.0.0", "dependencies": {"demo": "1.0.0"}}),
                 encoding="utf-8",
             )
+            (root / "package-lock.json").write_text(json.dumps({"lockfileVersion": 3, "packages": {}}), encoding="utf-8")
             runs = [
                 CompletedProcess(["npm", "install"], 0, stdout="resolver ok"),
                 CompletedProcess(["npm", "install"], 7, stdout="postinstall deterministic toolchain failure"),
             ]
             with patch("baseline_constraint_verifier.resolve_executable", return_value="npm"), \
-                    patch("baseline_constraint_verifier._run", side_effect=runs), \
-                    patch("baseline_constraint_verifier.build_verification_proof_identity"):
+                    patch("baseline_constraint_verifier._run", side_effect=runs):
                 result = verify_assignment(
                     root,
                     {"demo": "2.0.0"},
@@ -155,6 +157,8 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
     def test_yarn_resolver_only_install_explicitly_disables_scripts(self) -> None:
         self.assertEqual(["install", "--ignore-scripts"], install_args("yarn", ignore_scripts=True))
         self.assertEqual(["install"], install_args("yarn", ignore_scripts=False))
+        self.assertEqual(["install", "--frozen-lockfile"], install_args("yarn", ignore_scripts=False, frozen=True))
+        self.assertEqual(["ci", "--no-audit", "--no-fund"], install_args("npm", ignore_scripts=False, frozen=True))
 
     def test_assignment_missing_from_manifest_is_never_a_vacuous_pass(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -266,6 +270,7 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 json.dumps({"packageManager": "npm@11.0.0", "dependencies": {"demo": "1.0.0"}}),
                 encoding="utf-8",
             )
+            (root / "package-lock.json").write_text(json.dumps({"lockfileVersion": 3, "packages": {}}), encoding="utf-8")
             runs = [
                 CompletedProcess(["npm", "install"], 0, stdout="resolver ok"),
                 CompletedProcess(["npm", "install"], 0, stdout="lifecycle ok"),
@@ -415,12 +420,17 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
 
     def test_exact_resolver_proof_cache_hit_skips_uncached_verifier(self) -> None:
         from verification_proof import VerificationProofStore, build_verification_proof_identity
+        from resolved_dependency_state import capture_resolved_dependency_state, resolved_state_metadata
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
             root.mkdir()
             (root / "package.json").write_text(
                 json.dumps({"packageManager": "npm@11.0.0", "dependencies": {"demo": "1.0.0"}}),
+                encoding="utf-8",
+            )
+            (root / "package-lock.json").write_text(
+                json.dumps({"lockfileVersion": 3, "packages": {}}),
                 encoding="utf-8",
             )
             cache = Path(tmp) / "cas"
@@ -436,11 +446,20 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 commands=(),
                 environment=dict(os.environ),
             )
+            observed_hash = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+            state = capture_resolved_dependency_state(
+                root,
+                manager="npm",
+                resolver_input_key=identity.resolver_input_key,
+                observed_resolved_hash=observed_hash,
+                proof_cache_dir=cache,
+            )
             VerificationProofStore(cache).publish_pass(
                 "resolver", identity.resolver_input_key, identity,
                 metadata={
                     "observedResolvedVersions": {},
-                    "observedResolvedHash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                    "observedResolvedHash": observed_hash,
+                    **resolved_state_metadata(state),
                 },
             )
 
@@ -454,10 +473,12 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 )
             self.assertTrue(result.ok)
             self.assertIn("ResolverProof cache hit", result.summary)
+            self.assertEqual(state.key, result.resolved_state_key)
             uncached.assert_not_called()
 
     def test_resolver_cache_hit_marks_combined_verification_for_resolver_skip(self) -> None:
         from verification_proof import VerificationProofStore, build_verification_proof_identity
+        from resolved_dependency_state import capture_resolved_dependency_state, resolved_state_metadata
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
@@ -468,6 +489,10 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                     "dependencies": {"demo": "1.0.0"},
                     "scripts": {"typecheck": "tsc"},
                 }),
+                encoding="utf-8",
+            )
+            (root / "package-lock.json").write_text(
+                json.dumps({"lockfileVersion": 3, "packages": {}}),
                 encoding="utf-8",
             )
             cache = Path(tmp) / "cas"
@@ -487,11 +512,20 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 commands=("npm run typecheck",),
                 environment=dict(os.environ),
             )
+            observed_hash = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+            state = capture_resolved_dependency_state(
+                root,
+                manager="npm",
+                resolver_input_key=identity.resolver_input_key,
+                observed_resolved_hash=observed_hash,
+                proof_cache_dir=cache,
+            )
             VerificationProofStore(cache).publish_pass(
                 "resolver", identity.resolver_input_key, identity,
                 metadata={
                     "observedResolvedVersions": {},
-                    "observedResolvedHash": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                    "observedResolvedHash": observed_hash,
+                    **resolved_state_metadata(state),
                 },
             )
 
@@ -511,6 +545,75 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertEqual(identity.resolver_input_key, captured["reuse"])
 
+    def test_resolver_cache_hit_emits_bound_resolved_state_once(self) -> None:
+        from verification_proof import VerificationProofStore, build_verification_proof_identity
+        from resolved_dependency_state import capture_resolved_dependency_state, resolved_state_metadata
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            (root / "package.json").write_text(
+                json.dumps({"packageManager": "npm@11.0.0", "dependencies": {"demo": "1.0.0"}}),
+                encoding="utf-8",
+            )
+            (root / "package-lock.json").write_text(
+                json.dumps({"lockfileVersion": 3, "packages": {}}),
+                encoding="utf-8",
+            )
+            cache = Path(tmp) / "cas"
+            telemetry = Path(tmp) / "telemetry.jsonl"
+            config = BaselineVerifyConfig(
+                project_checks="off",
+                proof_cache_dir=str(cache),
+                telemetry_path=str(telemetry),
+            )
+            identity = build_verification_proof_identity(
+                root,
+                assignment={"demo": "2.0.0"},
+                remove_packages=(),
+                manager="npm",
+                manager_executable=sys.executable,
+                registry="",
+                project_checks="off",
+                commands=(),
+                environment=dict(os.environ),
+            )
+            observed_hash = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+            state = capture_resolved_dependency_state(
+                root,
+                manager="npm",
+                resolver_input_key=identity.resolver_input_key,
+                observed_resolved_hash=observed_hash,
+                proof_cache_dir=cache,
+            )
+            VerificationProofStore(cache).publish_pass(
+                "resolver", identity.resolver_input_key, identity,
+                metadata={
+                    "observedResolvedVersions": {},
+                    "observedResolvedHash": observed_hash,
+                    **resolved_state_metadata(state),
+                },
+            )
+
+            with patch("baseline_constraint_verifier.resolve_executable", return_value=sys.executable), \
+                    patch("baseline_constraint_verifier._verify_assignment_uncached") as uncached:
+                result = verify_assignment(
+                    root,
+                    {"demo": "2.0.0"},
+                    config=config,
+                    run_project_checks=False,
+                )
+
+            self.assertTrue(result.ok)
+            uncached.assert_not_called()
+            events = [
+                json.loads(line)
+                for line in telemetry.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            hits = [item for item in events if item.get("event") == "proof.cache.hit"]
+            self.assertTrue(hits)
+            self.assertEqual(state.key, hits[-1].get("resolvedStateKey"))
 
     def test_remove_only_assignment_is_verified_as_removed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -520,6 +623,14 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                     "packageManager": "npm@11.0.0",
                     "devDependencies": {"@types/demo": "1.0.0"},
                 }),
+                encoding="utf-8",
+            )
+            # _run is mocked in this fixture, so it cannot create npm's real
+            # lockfile for ResolvedState capture. Seed the deterministic fixture
+            # lock explicitly; production still requires the package manager's
+            # post-resolve bytes.
+            (root / "package-lock.json").write_text(
+                json.dumps({"lockfileVersion": 3, "packages": {}}),
                 encoding="utf-8",
             )
             with patch("baseline_constraint_verifier.resolve_executable", return_value="npm"), \
@@ -535,7 +646,6 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 )
             self.assertTrue(result.ok, result.summary)
             self.assertEqual("passed", result.kind)
-
 
     def test_yarn_resolution_warning_is_not_authoritative_dependency_failure(self) -> None:
         output = (

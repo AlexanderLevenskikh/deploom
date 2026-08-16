@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -44,6 +45,11 @@ try {
       provenExactDirectAssignment,
       provenRemovals,
     ),
+    provenResolvedStateKey: 'a'.repeat(64),
+    provenResolvedLockfilePath: 'yarn.lock',
+    provenResolvedLockfileHash: createHash('sha256').update(
+      'a@2.0.0:\n  version "2.0.0"\n',
+    ).digest('hex'),
   }
   const proof = createMaterializationProof({
     projectPath: dir,
@@ -57,7 +63,7 @@ try {
     gitHead: 'deadbeef',
     createdAt: '2026-08-14T00:00:00.000Z',
   })
-  if (proof.schemaVersion !== 2) throw new Error('proof schema was not upgraded')
+  if (proof.schemaVersion !== 3) throw new Error('proof schema was not upgraded')
   if (proof.assignmentHash !== materializationAssignmentHash(actions)) throw new Error('assignment hash is not deterministic')
   if (proof.observedResolvedVersions.a !== '2.0.0') throw new Error(`resolved tuple was not observed: ${JSON.stringify(proof.observedResolvedVersions)}`)
 

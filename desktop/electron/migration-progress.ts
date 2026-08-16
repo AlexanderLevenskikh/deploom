@@ -209,7 +209,7 @@ export function scopeTargetsFromPrompt(markdown: string, projectName: string): R
 }
 
 export type ProvenDependencyEnvelope = {
-  schemaVersion: 2
+  schemaVersion: 3
   proofSchema: string
   envelopeKey: string
   project: string
@@ -221,6 +221,9 @@ export type ProvenDependencyEnvelope = {
   preparationProofKey: string
   projectProofKey: string
   observedResolvedHash: string
+  resolvedStateKey: string
+  resolvedLockfilePath: string
+  resolvedLockfileHash: string
   exactDirectAssignment: Record<string, string>
   removals: string[]
   verificationCommands: string[]
@@ -263,7 +266,7 @@ export function validateScopeProofEnvelope(
   const manifest = migrationScopeManifestFromPrompt(markdown)
   const envelope = proofEnvelopeFromPrompt(markdown, projectName)
   if (!manifest || !envelope) return { ok: false, reason: 'proof envelope missing' }
-  if (envelope.schemaVersion !== 2 || envelope.project !== projectName) return { ok: false, reason: 'proof envelope project/schema mismatch' }
+  if (envelope.schemaVersion !== 3 || envelope.project !== projectName) return { ok: false, reason: 'proof envelope project/schema mismatch' }
   if (typeof manifest.targetMode !== 'string' || envelope.mode !== manifest.targetMode) return { ok: false, reason: 'proof envelope target mode mismatch' }
   if (!envelope.envelopeKey || proofEnvelopeContentKey(envelope) !== envelope.envelopeKey) return { ok: false, reason: 'proof envelope content hash mismatch' }
   if (!envelope.sourceHead || !envelope.sourceSnapshotKey || !envelope.assignmentKey || !envelope.resolverInputKey) return { ok: false, reason: 'proof envelope identity incomplete' }
@@ -275,6 +278,15 @@ export function validateScopeProofEnvelope(
   if (actions.length && envelope.resolverProofStatus !== 'passed') return { ok: false, reason: `resolver proof status is ${envelope.resolverProofStatus || 'missing'}` }
   if (actions.length && !/^[0-9a-f]{64}$/i.test(envelope.observedResolvedHash || '')) {
     return { ok: false, reason: 'proof envelope observed resolved hash missing' }
+  }
+  if (actions.length && !/^[0-9a-f]{64}$/i.test(envelope.resolvedStateKey || '')) {
+    return { ok: false, reason: 'proof envelope resolved state key missing' }
+  }
+  if (actions.length && !envelope.resolvedLockfilePath) {
+    return { ok: false, reason: 'proof envelope resolved lockfile path missing' }
+  }
+  if (actions.length && !/^[0-9a-f]{64}$/i.test(envelope.resolvedLockfileHash || '')) {
+    return { ok: false, reason: 'proof envelope resolved lockfile hash missing' }
   }
 
   for (const action of actions) {

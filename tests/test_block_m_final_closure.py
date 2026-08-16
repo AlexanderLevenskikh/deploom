@@ -129,7 +129,11 @@ class BlockMFinalClosureTests(unittest.TestCase):
     def test_architecture_tripwires_remain_present(self) -> None:
         verifier_source = Path(verifier.__file__).read_text(encoding="utf-8")
         roadmap_source = Path(roadmap.__file__).read_text(encoding="utf-8")
-        self.assertIn('isolation="fresh-prepared-snapshot-clone"', verifier_source)
+        self.assertIn('"ntfs-junction-guarded"', verifier_source)
+        self.assertIn('"fresh-prepared-snapshot-clone"', verifier_source)
+        self.assertIn("guarded_clone_is_active(command_root)", verifier_source)
+        self.assertIn("stop_guarded_clone(command_root)", verifier_source)
+        self.assertIn("PREPARED_DEPENDENCY_TREE_MUTATION", verifier_source)
         self.assertIn("OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: project check ", verifier_source)
         self.assertIn("_apply_fixed_peer_constant_constraints", roadmap_source)
         self.assertIn('seed_source = "bounded-fresh"', roadmap_source)

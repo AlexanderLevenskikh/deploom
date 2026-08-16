@@ -10,7 +10,7 @@ export type MaterializationAction = {
 }
 
 export type DependencyMaterializationProof = {
-  schemaVersion: 2
+  schemaVersion: 3
   project: string
   branch: string
   assignmentHash: string
@@ -30,6 +30,9 @@ export type DependencyMaterializationProof = {
   provenExactDirectAssignment?: Record<string, string>
   provenRemovals?: string[]
   provenObservedResolvedHash?: string
+  provenResolvedStateKey: string
+  provenResolvedLockfilePath: string
+  provenResolvedLockfileHash: string
   packageManager: string
   packageManagerVersion: string
   nodeVersion: string
@@ -240,6 +243,9 @@ export function createMaterializationProof(input: {
   provenExactDirectAssignment?: Readonly<Record<string, string>>
   provenRemovals?: readonly string[]
   provenObservedResolvedHash?: string
+  provenResolvedStateKey: string
+  provenResolvedLockfilePath: string
+  provenResolvedLockfileHash: string
   packageManager: string
   packageManagerVersion: string
   nodeVersion: string
@@ -289,8 +295,21 @@ export function createMaterializationProof(input: {
     provenObservedResolvedHash = currentHash
   }
 
+  if (!/^[0-9a-f]{64}$/i.test(input.provenResolvedStateKey)) {
+    throw new Error('PROVEN_RESOLVED_STATE_KEY_INVALID')
+  }
+  if (!input.provenResolvedLockfilePath || !/^[0-9a-f]{64}$/i.test(input.provenResolvedLockfileHash)) {
+    throw new Error('PROVEN_RESOLVED_LOCKFILE_CONTRACT_INVALID')
+  }
+  const provenLockfile = resolve(input.projectPath, input.provenResolvedLockfilePath)
+  if (!existsSync(provenLockfile)) throw new Error(`PROVEN_RESOLVED_LOCKFILE_MISSING: ${input.provenResolvedLockfilePath}`)
+  const currentResolvedLockHash = sha256(readFileSync(provenLockfile))
+  if (currentResolvedLockHash !== input.provenResolvedLockfileHash) {
+    throw new Error(`PROVEN_RESOLVED_LOCKFILE_DRIFT: expected=${input.provenResolvedLockfileHash} current=${currentResolvedLockHash}`)
+  }
+
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     project: input.project,
     branch: input.branch,
     assignmentHash: materializationAssignmentHash(actions),
@@ -310,6 +329,9 @@ export function createMaterializationProof(input: {
     ...(provenExactDirectAssignment ? { provenExactDirectAssignment } : {}),
     ...(provenRemovals ? { provenRemovals } : {}),
     ...(provenObservedResolvedHash ? { provenObservedResolvedHash } : {}),
+    provenResolvedStateKey: input.provenResolvedStateKey,
+    provenResolvedLockfilePath: input.provenResolvedLockfilePath,
+    provenResolvedLockfileHash: input.provenResolvedLockfileHash,
     packageManager: input.packageManager,
     packageManagerVersion: input.packageManagerVersion,
     nodeVersion: input.nodeVersion,
@@ -329,7 +351,7 @@ export function readMaterializationProof(path: string): DependencyMaterializatio
   if (!existsSync(path)) return undefined
   try {
     const value = JSON.parse(readFileSync(path, 'utf8')) as DependencyMaterializationProof
-    return value?.schemaVersion === 2 ? value : undefined
+    return value?.schemaVersion === 3 ? value : undefined
   } catch {
     return undefined
   }
@@ -352,6 +374,9 @@ export function validateMaterializationProof(input: {
   provenExactDirectAssignment?: Readonly<Record<string, string>>
   provenRemovals?: readonly string[]
   provenObservedResolvedHash?: string
+  provenResolvedStateKey?: string
+  provenResolvedLockfilePath?: string
+  provenResolvedLockfileHash?: string
 }): { ok: boolean; reason: string } {
   const proof = input.proof
   if (!proof) return { ok: false, reason: 'proof missing' }
@@ -363,6 +388,9 @@ export function validateMaterializationProof(input: {
   if (input.sourceSnapshotKey && proof.sourceSnapshotKey !== input.sourceSnapshotKey) return { ok: false, reason: 'source snapshot identity mismatch' }
   if (input.projectProofKey && proof.projectProofKey !== input.projectProofKey) return { ok: false, reason: 'project proof identity mismatch' }
   if (input.provenObservedResolvedHash && proof.provenObservedResolvedHash !== input.provenObservedResolvedHash) return { ok: false, reason: 'proven observed resolved hash mismatch' }
+  if (input.provenResolvedStateKey && proof.provenResolvedStateKey !== input.provenResolvedStateKey) return { ok: false, reason: 'proven resolved state mismatch' }
+  if (input.provenResolvedLockfilePath && proof.provenResolvedLockfilePath !== input.provenResolvedLockfilePath) return { ok: false, reason: 'proven resolved lockfile path mismatch' }
+  if (input.provenResolvedLockfileHash && proof.provenResolvedLockfileHash !== input.provenResolvedLockfileHash) return { ok: false, reason: 'proven resolved lockfile hash mismatch' }
   if (input.provenExactDirectAssignment && canonicalJson(proof.provenExactDirectAssignment ?? {}) !== canonicalJson(input.provenExactDirectAssignment)) return { ok: false, reason: 'proven exact direct assignment mismatch' }
   if (input.provenRemovals && canonicalJson(proof.provenRemovals ?? []) !== canonicalJson([...input.provenRemovals].map(String).sort())) return { ok: false, reason: 'proven removals mismatch' }
   if (proof.packageManager !== input.packageManager) return { ok: false, reason: 'package-manager mismatch' }
@@ -380,6 +408,14 @@ export function validateMaterializationProof(input: {
 
   const currentLockfiles = lockfileHashes(input.projectPath)
   if (canonicalJson(currentLockfiles) !== canonicalJson(proof.lockfiles)) return { ok: false, reason: 'lockfile digest changed' }
+  if (!proof.provenResolvedStateKey || !proof.provenResolvedLockfilePath || !proof.provenResolvedLockfileHash) {
+    return { ok: false, reason: 'proven resolved-state contract missing' }
+  }
+  const provenLockfile = resolve(input.projectPath, proof.provenResolvedLockfilePath)
+  if (!existsSync(provenLockfile)) return { ok: false, reason: 'proven resolved lockfile missing' }
+  if (sha256(readFileSync(provenLockfile)) !== proof.provenResolvedLockfileHash) {
+    return { ok: false, reason: 'proven resolved lockfile digest changed' }
+  }
 
   let observed: Record<string, string>
   try {

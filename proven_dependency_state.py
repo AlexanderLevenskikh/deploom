@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 PROVEN_DEPENDENCY_STATE_SCHEMA_VERSION = 1
-PROVEN_DEPENDENCY_ENVELOPE_SCHEMA_VERSION = 2
+PROVEN_DEPENDENCY_ENVELOPE_SCHEMA_VERSION = 3
 
 
 def _canonical_json(value: Any) -> str:
@@ -43,6 +43,9 @@ def build_proven_dependency_envelope(
     preparation_proof_key: str,
     project_proof_key: str,
     observed_resolved_hash: str,
+    resolved_state_key: str,
+    resolved_lockfile_path: str,
+    resolved_lockfile_hash: str,
     assignment: Mapping[str, str],
     removals: Sequence[str],
     verification_commands: Sequence[str],
@@ -63,6 +66,9 @@ def build_proven_dependency_envelope(
         "preparationProofKey": str(preparation_proof_key),
         "projectProofKey": str(project_proof_key),
         "observedResolvedHash": str(observed_resolved_hash),
+        "resolvedStateKey": str(resolved_state_key),
+        "resolvedLockfilePath": str(resolved_lockfile_path),
+        "resolvedLockfileHash": str(resolved_lockfile_hash),
         "exactDirectAssignment": {
             str(name): str(version)
             for name, version in sorted(assignment.items())
@@ -108,13 +114,26 @@ def validate_proven_dependency_envelope(
     if resolver_status not in {"passed", "not-required-no-op"}:
         return False, f"resolver proof status invalid: {resolver_status or 'missing'}"
     observed_hash = str(envelope.get("observedResolvedHash") or "")
+    resolved_state_key = str(envelope.get("resolvedStateKey") or "")
+    resolved_lockfile_path = str(envelope.get("resolvedLockfilePath") or "")
+    resolved_lockfile_hash = str(envelope.get("resolvedLockfileHash") or "")
     if resolver_status == "passed":
         if len(observed_hash) != 64 or any(
             ch not in "0123456789abcdef" for ch in observed_hash.lower()
         ):
             return False, "observedResolvedHash missing or invalid for resolver PASS"
-    elif observed_hash:
-        return False, "no-op envelope must not claim an observed resolver tree"
+        if len(resolved_state_key) != 64 or any(
+            ch not in "0123456789abcdef" for ch in resolved_state_key.lower()
+        ):
+            return False, "resolvedStateKey missing or invalid for resolver PASS"
+        if not resolved_lockfile_path:
+            return False, "resolvedLockfilePath missing for resolver PASS"
+        if len(resolved_lockfile_hash) != 64 or any(
+            ch not in "0123456789abcdef" for ch in resolved_lockfile_hash.lower()
+        ):
+            return False, "resolvedLockfileHash missing or invalid for resolver PASS"
+    elif observed_hash or resolved_state_key or resolved_lockfile_path or resolved_lockfile_hash:
+        return False, "no-op envelope must not claim a resolved package-manager state"
     return True, "proof envelope valid"
 
 
