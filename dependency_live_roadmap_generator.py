@@ -138,6 +138,47 @@ class RegistryInfrastructureError(RuntimeError):
     """Registry/network uncertainty must never become dependency policy."""
 
 
+def _sanitized_baseline_failure_tail(
+    output: str,
+    *,
+    max_lines: int = 60,
+    max_chars: int = 6000,
+) -> str:
+    """Expose package-manager diagnostics without echoing common credential forms."""
+    text = str(output or "")
+    substitutions = (
+        (
+            re.compile(
+                r"(?i)(authorization\s*:\s*(?:bearer|basic)\s+)\S+"
+            ),
+            r"\1<redacted>",
+        ),
+        (
+            re.compile(
+                r"(?i)((?:_authToken|authToken|password|passwd|api[-_]?key)"
+                r"\s*[=:]\s*)[^\s&]+"
+            ),
+            r"\1<redacted>",
+        ),
+        (
+            re.compile(
+                r"(?i)(https?://)[^/\s:@]+:[^@\s/]+@"
+            ),
+            r"\1<redacted>@",
+        ),
+        (
+            re.compile(
+                r"(?i)([?&](?:token|auth|key|password)=)[^&\s]+"
+            ),
+            r"\1<redacted>",
+        ),
+    )
+    for pattern, replacement in substitutions:
+        text = pattern.sub(replacement, text)
+    lines = text.splitlines()[-max(1, int(max_lines)):]
+    return "\n".join(lines)[-max(256, int(max_chars)):].strip()
+
+
 class VulnerabilityEvidenceUnavailable(RuntimeError):
     """OSV uncertainty must never become an authoritative zero-vulnerability fact."""
 
@@ -8894,9 +8935,16 @@ def resolve_peer_compatibility_with_verification(
                         "Dependency plan was preserved; fix infrastructure and rerun generation."
                     )
                 if result.kind == "unknown":
+                    diagnostic_tail = _sanitized_baseline_failure_tail(result.output)
+                    diagnostic = (
+                        f"\nResolver diagnostic tail (sanitized):\n{diagnostic_tail}"
+                        if diagnostic_tail
+                        else ""
+                    )
                     raise BaselineConstraintVerificationError(
                         f"BASELINE_VERIFY_UNKNOWN_ERROR: {project}/{mode}: {result.summary}. "
                         "Resolver failure was not classified as dependency evidence, so no compatibility constraint was learned."
+                        f"{diagnostic}"
                     )
 
                 if result.ok:

@@ -61,9 +61,11 @@ class BlockLPerformanceTests(unittest.TestCase):
             config = verifier.BaselineVerifyConfig(proof_cache_dir=str(Path(tmp) / "baseline-proofs"))
             yarn = verifier._package_manager_cache_environment(config, "yarn")
             npm = verifier._package_manager_cache_environment(config, "npm")
-            self.assertIn("YARN_CACHE_FOLDER", yarn)
+            # Yarn Classic intentionally keeps its native warm user cache.
+            # Cache location is not proof authority; the fresh isolated install is.
+            self.assertEqual({}, yarn)
             self.assertIn("npm_config_cache", npm)
-            rendered = " ".join([*yarn.keys(), *yarn.values(), *npm.keys(), *npm.values()]).lower()
+            rendered = " ".join([*npm.keys(), *npm.values()]).lower()
             self.assertNotIn("offline", rendered)
             self.assertNotIn("prefer-offline", rendered)
 

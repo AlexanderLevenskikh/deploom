@@ -131,9 +131,13 @@ class ObservedResolutionError(RuntimeError):
 
 INFRA_PATTERNS = re.compile(
     r"(?:ENOENT|not recognized as an internal or external command|command not found|"
-    r"ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|socket hang up|"
+    r"ECONNRESET|ECONNREFUSED|ETIMEDOUT|ESOCKETTIMEDOUT|EAI_AGAIN|ENETUNREACH|"
+    r"getaddrinfo\s+ENOTFOUND|socket hang up|"
+    r"There appears to be trouble with (?:your network connection|the npm registry)|"
+    r"(?:ResponseError:\s*)?Request failed [\"'](?:401 Unauthorized|403 Forbidden|"
+    r"408 Request Timeout|429 Too Many Requests|5\d\d [^\"']+)[\"']|"
     r"SELF_SIGNED_CERT|unable to get local issuer|certificate has expired|"
-    r"ENOSPC|EPERM|EACCES|HTTP\s+(?:429|500|502|503|504)\b)",
+    r"ENOSPC|EPERM|EACCES|HTTP\s+(?:401|403|408|429|500|502|503|504)\b)",
     re.IGNORECASE,
 )
 
@@ -651,7 +655,15 @@ def _package_manager_cache_environment(
     config: BaselineVerifyConfig,
     manager: str,
 ) -> Dict[str, str]:
-    """Use a DepLoom-owned artifact cache without changing resolver authority."""
+    """Configure artifact caches without changing resolver authority.
+
+    Yarn Classic keeps its native user cache. Pointing YARN_CACHE_FOLDER at a
+    fresh DepLoom-private directory turns every first Baseline into a cold
+    transitive refetch and does not strengthen the proof: the authoritative
+    boundary is still the fresh isolated install plus observed direct tree.
+    """
+    if manager == "yarn":
+        return {}
     if not config.proof_cache_dir:
         return {}
     root = (
@@ -660,8 +672,6 @@ def _package_manager_cache_environment(
         / str(manager).lower()
     )
     root.mkdir(parents=True, exist_ok=True)
-    if manager == "yarn":
-        return {"YARN_CACHE_FOLDER": str(root)}
     if manager == "npm":
         return {"npm_config_cache": str(root)}
     if manager == "pnpm":
