@@ -32,7 +32,7 @@ from typing import (
 )
 
 CACHE_SCHEMA_VERSION = 1
-SOLVER_SCHEMA_VERSION = "peer-ir-v1"
+SOLVER_SCHEMA_VERSION = "peer-ir-v2-fixed-inputs"
 _ENV_FILES = (
     "package.json",
     "package-lock.json",

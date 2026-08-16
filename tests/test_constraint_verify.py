@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -19,6 +22,9 @@ from constraint_verify import (
     merge_nogood_edges,
     parallel_ddmin,
 )
+import constraint_cache
+import dependency_live_roadmap_generator as roadmap
+from baseline_constraint_verifier import _apply_assignment
 
 
 class ConstraintVerifyTests(unittest.TestCase):
@@ -323,6 +329,262 @@ class ConstraintVerifyTests(unittest.TestCase):
         # or b@2 constraint.
         self.assertIn((1, ((("b", "2"),),)), calls)
 
+
+
+class FixedNonRegistryInputTests(unittest.TestCase):
+    class _Client:
+        registry = "https://registry.example"
+        npm_cache: dict[str, object] = {}
+        registry_artifact_cache: dict[tuple[str, str], object] = {}
+
+    def _row(
+        self,
+        name: str,
+        spec: str,
+        *,
+        current: str = "1.0.0",
+    ) -> roadmap.DependencyRow:
+        return roadmap.DependencyRow(
+            project="p",
+            package_dir=".",
+            name=name,
+            kind="runtime",
+            requested_spec=spec,
+            current_version=current,
+            current_source="fixture",
+            latest_version=current,
+            current_vulns="0",
+            min_no_critical="—",
+            min_no_high="—",
+            min_no_vuln="—",
+            min_lag_12m="—",
+            min_lag_9m="—",
+            min_lag_6m="—",
+            min_lag_3m="—",
+            group=5,
+            reason="fixture",
+            notes="fixture",
+        )
+
+    def test_non_registry_specs_are_fixed_inputs(self) -> None:
+        for spec in (
+            "git+https://example.invalid/lib.git#deadbeef",
+            "github:owner/repo#deadbeef",
+            "workspace:*",
+            "file:../lib",
+            "link:../lib",
+            "portal:../lib",
+            "https://example.invalid/lib.tgz",
+        ):
+            with self.subTest(spec=spec):
+                self.assertTrue(
+                    roadmap._is_fixed_dependency_input(
+                        self._row("external", spec)
+                    )
+                )
+        self.assertFalse(
+            roadmap._is_fixed_dependency_input(
+                self._row("registry", "^1.2.3")
+            )
+        )
+
+    def test_fixed_inputs_are_not_exact_solver_components(self) -> None:
+        libjs = self._row(
+            "libjs",
+            "git+https://example.invalid/libjs.git#deadbeef",
+            current="3.0.0",
+        )
+        react = self._row("react", "^18.2.0", current="18.2.0")
+        components: list[tuple[str, ...]] = []
+
+        def exact(
+            component,
+            _rows_by_name,
+            domains,
+            _client,
+            _mode,
+            _learned,
+            _config,
+            _stability=None,
+        ):
+            components.append(tuple(component))
+            assignment = {
+                name: domains[name][0]
+                for name in component
+            }
+            return {
+                "status": "optimal",
+                "assignment": assignment,
+                "changed": 0,
+                "hardConstraints": 0,
+                "refinements": 0,
+                "elapsedMs": 0,
+            }
+
+        with patch.object(roadmap, "_run_z3_peer_component", side_effect=exact):
+            result = roadmap.resolve_peer_compatibility(
+                {"p": [libjs, react]},
+                self._Client(),
+                modes=("yellow",),
+                apply_results=False,
+            )
+
+        assignment = result["p"]["yellow"]
+        self.assertNotIn("libjs", assignment)
+        self.assertEqual("18.2.0", assignment["react"])
+        self.assertTrue(components)
+        self.assertTrue(
+            all("libjs" not in component for component in components),
+            components,
+        )
+
+    def test_matching_fixed_literal_projects_out_of_solver_clause(self) -> None:
+        fixed = {
+            "libjs": self._row(
+                "libjs",
+                "git+https://example.invalid/libjs.git#deadbeef",
+                current="3.0.0",
+            )
+        }
+        projected = roadmap._project_constraints_over_fixed_inputs(
+            [{"libjs": "3.0.0", "react": "19.0.0"}],
+            fixed,
+            project="p",
+            mode="yellow",
+            source="fixture",
+        )
+        self.assertEqual([{"react": "19.0.0"}], projected)
+
+    def test_mismatching_fixed_literal_makes_clause_unreachable(self) -> None:
+        fixed = {
+            "libjs": self._row(
+                "libjs",
+                "git+https://example.invalid/libjs.git#deadbeef",
+                current="3.0.0",
+            )
+        }
+        projected = roadmap._project_constraints_over_fixed_inputs(
+            [{"libjs": "2.0.0", "react": "19.0.0"}],
+            fixed,
+            project="p",
+            mode="yellow",
+            source="fixture",
+        )
+        self.assertEqual([], projected)
+
+    def test_fixed_only_matching_constraint_fails_closed(self) -> None:
+        fixed = {
+            "libjs": self._row(
+                "libjs",
+                "git+https://example.invalid/libjs.git#deadbeef",
+                current="3.0.0",
+            )
+        }
+        with self.assertRaises(roadmap.BaselineConstraintVerificationError) as error:
+            roadmap._project_constraints_over_fixed_inputs(
+                [{"libjs": "3.0.0"}],
+                fixed,
+                project="p",
+                mode="yellow",
+                source="fixture",
+            )
+        self.assertIn("FIXED_INPUT_CONSTRAINT_CONFLICT", str(error.exception))
+
+    def test_verifier_does_not_rewrite_fixed_git_manifest_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            manifest = {
+                "dependencies": {
+                    "libjs": "git+https://example.invalid/libjs.git#deadbeef",
+                    "react": "^18.2.0",
+                }
+            }
+            (project / "package.json").write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
+
+            changed = _apply_assignment(
+                project,
+                {"react": "18.3.1"},
+            )
+            after = json.loads(
+                (project / "package.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(["react"], changed)
+        self.assertEqual(
+            "git+https://example.invalid/libjs.git#deadbeef",
+            after["dependencies"]["libjs"],
+        )
+        self.assertEqual("18.3.1", after["dependencies"]["react"])
+
+    def test_constraint_cache_schema_invalidates_pre_h_solver_learning(self) -> None:
+        self.assertEqual(
+            "peer-ir-v2-fixed-inputs",
+            constraint_cache.SOLVER_SCHEMA_VERSION,
+        )
+
+    def test_fixed_source_lock_change_changes_resolver_environment_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / "package.json").write_text(
+                json.dumps(
+                    {
+                        "packageManager": "yarn@1.22.22",
+                        "dependencies": {
+                            "libjs": "git+https://example.invalid/libjs.git#main"
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            lock = project / "yarn.lock"
+            lock.write_text(
+                'libjs@git+https://example.invalid/libjs.git#main:\\n'
+                '  resolved "https://example.invalid/libjs.git#aaaaaaaa"\\n',
+                encoding="utf-8",
+            )
+            stable_command = {
+                "command": "fixture",
+                "executable": "fixture",
+                "version": "1",
+            }
+            with patch.object(
+                constraint_cache,
+                "_command_identity",
+                return_value=stable_command,
+            ):
+                before = constraint_cache.resolver_environment_fingerprint(
+                    project,
+                    registry="https://registry.example",
+                )
+                lock.write_text(
+                    'libjs@git+https://example.invalid/libjs.git#main:\\n'
+                    '  resolved "https://example.invalid/libjs.git#bbbbbbbb"\\n',
+                    encoding="utf-8",
+                )
+                after = constraint_cache.resolver_environment_fingerprint(
+                    project,
+                    registry="https://registry.example",
+                )
+        self.assertNotEqual(before, after)
+
+    def test_h_production_source_has_managed_solver_boundary(self) -> None:
+        source = Path(roadmap.__file__).read_text(encoding="utf-8")
+        self.assertIn(
+            "solver_rows_by_name, fixed_rows_by_name = _partition_solver_inputs(rows_by_name)",
+            source,
+        )
+        self.assertIn(
+            "for name, row in solver_rows_by_name.items():",
+            source,
+        )
+        self.assertIn(
+            "graph = _potential_peer_graph(solver_rows_by_name, domains, client)",
+            source,
+        )
+        self.assertIn("FIXED_INPUT_CONSTRAINT_CONFLICT", source)
 
 
 if __name__ == "__main__":

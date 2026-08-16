@@ -3032,6 +3032,75 @@ def is_non_registry_spec(spec: str) -> bool:
     return s.startswith(("workspace:", "file:", "link:", "portal:", "git+", "github:", "http://", "https://"))
 
 
+def _is_fixed_dependency_input(row: DependencyRow) -> bool:
+    # External/fixed source, not a registry version decision.
+    return is_non_registry_spec(row.requested_spec)
+
+
+def _partition_solver_inputs(
+    rows_by_name: Mapping[str, DependencyRow],
+) -> Tuple[Dict[str, DependencyRow], Dict[str, DependencyRow]]:
+    # Fixed inputs stay in package.json/lockfile and therefore in real
+    # package-manager verification/proof identity. They are deliberately absent
+    # from the exact finite-domain model.
+    solver_rows: Dict[str, DependencyRow] = {}
+    fixed_rows: Dict[str, DependencyRow] = {}
+    for name, row in rows_by_name.items():
+        if _is_fixed_dependency_input(row):
+            fixed_rows[str(name)] = row
+        else:
+            solver_rows[str(name)] = row
+    return solver_rows, fixed_rows
+
+
+def _project_constraints_over_fixed_inputs(
+    constraints: Sequence[Mapping[str, str]],
+    fixed_rows_by_name: Mapping[str, DependencyRow],
+    *,
+    project: str,
+    mode: str,
+    source: str,
+) -> List[Dict[str, str]]:
+    # Partially evaluate authoritative clauses against immutable fixed inputs.
+    # A matching fixed literal is a constant True and is removed. A mismatching
+    # literal makes the clause unreachable. An all-fixed matching clause means
+    # the fixed environment itself is incompatible and must fail closed.
+    projected_constraints: List[Dict[str, str]] = []
+    for raw in constraints:
+        if not raw:
+            continue
+        projected: Dict[str, str] = {}
+        reachable = True
+        matched_fixed: List[str] = []
+        for raw_name, raw_version in sorted(raw.items()):
+            name = str(raw_name)
+            version = str(raw_version)
+            fixed = fixed_rows_by_name.get(name)
+            if fixed is None:
+                projected[name] = version
+                continue
+            if version != str(fixed.current_version):
+                reachable = False
+                break
+            matched_fixed.append(name)
+
+        if not reachable:
+            continue
+        if not projected:
+            fixed_detail = ", ".join(
+                f"{name}@{fixed_rows_by_name[name].current_version}"
+                for name in matched_fixed
+            )
+            raise BaselineConstraintVerificationError(
+                f"FIXED_INPUT_CONSTRAINT_CONFLICT: {project}/{mode}: {source} constraint "
+                f"matches only immutable non-registry resolver input(s): {fixed_detail}. "
+                "Fixed-source incompatibility cannot be turned into an empty Solver clause."
+            )
+        if projected not in projected_constraints:
+            projected_constraints.append(projected)
+    return projected_constraints
+
+
 def normalized_lag_months(value: Any, default: int = 12) -> int:
     try:
         parsed = int(value)
@@ -6443,17 +6512,32 @@ def resolve_peer_compatibility(
             name: _aggregate_duplicate_package_row(items)
             for name, items in rows_for_name.items()
         }
+        solver_rows_by_name, fixed_rows_by_name = _partition_solver_inputs(rows_by_name)
 
         residual_targets = dict((residual_targets_by_project or {}).get(project, {}))
         for mode in modes:
-            learned_nogoods = ((learned_nogoods_by_project_mode or {}).get(project, {}).get(mode, []))
-            global_exact_exclusions = (
+            raw_learned_nogoods = ((learned_nogoods_by_project_mode or {}).get(project, {}).get(mode, []))
+            raw_global_exact_exclusions = (
                 (global_exact_exclusions_by_project_mode or {})
                 .get(project, {})
                 .get(mode, [])
             )
+            learned_nogoods = _project_constraints_over_fixed_inputs(
+                raw_learned_nogoods,
+                fixed_rows_by_name,
+                project=project,
+                mode=mode,
+                source="learned-nogood",
+            )
+            global_exact_exclusions = _project_constraints_over_fixed_inputs(
+                raw_global_exact_exclusions,
+                fixed_rows_by_name,
+                project=project,
+                mode=mode,
+                source="global-exact-exclusion",
+            )
             domains: Dict[str, List[str]] = {}
-            for name, row in rows_by_name.items():
+            for name, row in solver_rows_by_name.items():
                 previous_target = residual_targets.get(name, "")
                 # If a previously approved target is already the version in the
                 # cumulative merged checkout, that package is completed work.
@@ -6462,11 +6546,12 @@ def resolve_peer_compatibility(
                     domains[name] = [row.current_version]
                 else:
                     domains[name] = _candidate_domain(row, mode, client)
-            graph = _potential_peer_graph(rows_by_name, domains, client)
+            graph = _potential_peer_graph(solver_rows_by_name, domains, client)
             merge_nogood_edges(graph, learned_nogoods)
             components = _graph_components(graph)
             eprint(
-                f"[info] {project}: peer solver {mode}; packages={len(rows_by_name)}, "
+                f"[info] {project}: peer solver {mode}; packages={len(solver_rows_by_name)}, "
+                f"fixedInputs={len(fixed_rows_by_name)}, direct={len(rows_by_name)}, "
                 f"components={len(components)}, candidates={sum(len(domain) for domain in domains.values())}"
             )
             assignment: Dict[str, str] = {}
@@ -6861,7 +6946,9 @@ def _verification_assignment(
     assignment: Dict[str, str],
     rows_by_name: Dict[str, DependencyRow],
 ) -> Dict[str, str]:
-    # Complete direct assignment that the verifier must prove.
+    # Complete solver-managed direct assignment. Fixed git/file/workspace/http
+    # declarations remain untouched in package.json and are still proven as
+    # resolver inputs through manifest/lock/source/environment identity.
     return {
         name: assignment[name]
         for name in sorted(assignment)
@@ -6975,7 +7062,11 @@ def _verification_units_for_assignment(
     certification is still required before any clause becomes authoritative.
     """
     domains = {
-        name: _candidate_domain(row, mode, client)
+        name: (
+            [row.current_version]
+            if _is_fixed_dependency_input(row)
+            else _candidate_domain(row, mode, client)
+        )
         for name, row in rows_by_name.items()
     }
     hard_graph = _potential_peer_graph(rows_by_name, domains, client)
@@ -8383,6 +8474,14 @@ def resolve_peer_compatibility_with_verification(
             name: _aggregate_duplicate_package_row(items)
             for name, items in rows_for_name.items()
         }
+        fixed_input_names = tuple(
+            sorted(
+                name
+                for name, row in rows_by_name.items()
+                if _is_fixed_dependency_input(row)
+            )
+        )
+        solver_managed_inputs = len(rows_by_name) - len(fixed_input_names)
 
         for mode in modes:
             liveness = BaselineLivenessBudget(
@@ -8393,7 +8492,8 @@ def resolve_peer_compatibility_with_verification(
             eprint(
                 f"[info] {project}: Baseline solve-and-verify {mode} started; "
                 f"maxIterations={config.max_iterations}, hardIterations={liveness.hard_iterations}, "
-                f"learningExtensionLimit={liveness.max_learning_extensions}, parallelism={config.parallelism}"
+                f"learningExtensionLimit={liveness.max_learning_extensions}, parallelism={config.parallelism}, "
+                f"solverManagedInputs={solver_managed_inputs}, fixedInputs={len(fixed_input_names)}"
             )
             progress_reporter.emit(
                 project,
@@ -8405,6 +8505,8 @@ def resolve_peer_compatibility_with_verification(
                 subprocessTimeoutSeconds=config.timeout_seconds,
                 attemptHardTimeoutSeconds=config.attempt_timeout_seconds,
                 localizationHardTimeoutSeconds=config.localization_timeout_seconds,
+                solverManagedInputs=solver_managed_inputs,
+                fixedInputs=len(fixed_input_names),
                 **liveness.snapshot(learned_constraints=len(learned[project][mode])),
             )
             last_fingerprint = ""
@@ -8476,7 +8578,8 @@ def resolve_peer_compatibility_with_verification(
                 if result is None:
                     eprint(
                         f"[info] {project}: Baseline verify {mode} iteration {iteration}: "
-                        f"proving full exact assignment ({len(verification_assignment)} direct; {len(changed)} changed), assignment={fingerprint}"
+                        f"proving exact solver-managed assignment ({len(verification_assignment)} managed direct; "
+                        f"fixedInputs={len(fixed_input_names)}; {len(changed)} changed), assignment={fingerprint}"
                     )
                     if config.project_checks != "off" and config.commands:
                         # One isolated workspace proves resolver state first and then

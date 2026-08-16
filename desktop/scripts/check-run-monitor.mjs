@@ -26,6 +26,8 @@ requireText(main, /BASELINE_CONSTRAINT_BUDGET_EXHAUSTED/, 'legacy deterministic 
 requireText(main, /BASELINE_VERIFICATION_PLATEAU/, 'semantic Baseline plateau must be non-retryable')
 requireText(main, /BASELINE_VERIFICATION_HARD_BUDGET_EXHAUSTED/, 'hard Baseline safety exhaustion must be non-retryable')
 requireText(main, /BASELINE_SOLVER_REPEATED_FAILED_ASSIGNMENT/, 'repeated confirmed failing assignment must be non-retryable')
+requireText(main, /EXACT_SOLVER_PROOF_REQUIRED/, 'unfinished exact solver proof must be non-retryable')
+requireText(main, /FIXED_INPUT_CONSTRAINT_CONFLICT/, 'fixed-input proof conflict must be non-retryable')
 requireText(monitor, /DEPLOOM_PROGRESS_V2 /, 'monitor must consume structured Baseline progress')
 requireText(monitor, /prefixIndex = trimmed\.indexOf\(STRUCTURED_BASELINE_PREFIX\)/, 'structured telemetry must tolerate transport prefixes')
 requireText(monitor, /minimizing-conflict/, 'monitor must expose Block F conflict minimization')
