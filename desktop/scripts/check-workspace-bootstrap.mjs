@@ -31,7 +31,11 @@ try {
 
   const setup = readFileSync(join(root, 'src', 'components', 'SetupScreen.tsx'), 'utf8')
   assert.doesNotMatch(setup, /Базовый template|templateRemote|remote\.trim\(\)/, 'new-workspace UI must not require a template setting')
-  assert.match(setup, /Создать и подключить/, 'new-workspace UI must expose local bootstrap')
+  assert.match(setup, /t\('setup\.create'\)/, 'new-workspace UI must expose the localized bootstrap action')
+  const enLocale = readFileSync(join(root, 'src', 'i18n', 'locales', 'en.ts'), 'utf8')
+  const ruLocale = readFileSync(join(root, 'src', 'i18n', 'locales', 'ru.ts'), 'utf8')
+  assert.match(enLocale, /"setup\.create":\s*"Create and connect"/, 'English locale must expose the local bootstrap action')
+  assert.match(ruLocale, /"setup\.create":\s*"Создать и подключить"/, 'Russian locale must expose the local bootstrap action')
 
   const main = readFileSync(join(root, 'electron', 'main.ts'), 'utf8')
   assert.match(main, /if \(templateRemote\)/, 'legacy explicit template path must remain supported')
