@@ -117,6 +117,13 @@ OSV_VULN = "https://api.osv.dev/v1/vulns/{id}"
 REQUEST_TIMEOUT = 30
 OSV_BATCH_SIZE = 100
 RATE_SLEEP_SEC = 0.05
+REGISTRY_METADATA_MAX_ATTEMPTS = 3
+
+
+class RegistryInfrastructureError(RuntimeError):
+    """Registry/network uncertainty must never become dependency policy."""
+
+
 
 # Package metadata may be served by the configured Nexus while individual
 # version records still point at public npm/yarn tarballs, or at a tarball that
@@ -1565,9 +1572,24 @@ class LiveDataClient:
                 else:
                     evidence["status"] = "empty-artifact"
                     evidence["error"] = "registry returned an empty artifact response"
+        except requests.HTTPError as exc:
+            status = int(getattr(exc.response, "status_code", 0) or 0)
+            if status in {404, 410}:
+                evidence["status"] = "missing-artifact"
+                evidence["error"] = f"registry returned HTTP {status} for exact tarball"
+            else:
+                raise RegistryInfrastructureError(
+                    f"REGISTRY_ARTIFACT_UNAVAILABLE: {pkg}@{version}: "
+                    f"HTTP {status or 'unknown'}: {str(exc)[-500:]}"
+                ) from exc
+        except requests.RequestException as exc:
+            raise RegistryInfrastructureError(
+                f"REGISTRY_ARTIFACT_UNAVAILABLE: {pkg}@{version}: {str(exc)[-500:]}"
+            ) from exc
         except Exception as exc:
-            evidence["status"] = "unavailable"
-            evidence["error"] = str(exc)[-500:]
+            raise RegistryInfrastructureError(
+                f"REGISTRY_ARTIFACT_INVALID_RESPONSE: {pkg}@{version}: {str(exc)[-500:]}"
+            ) from exc
         finally:
             if response is not None:
                 response.close()
@@ -1670,17 +1692,52 @@ class LiveDataClient:
             return self.npm_cache[pkg]
         encoded = pkg.replace("/", "%2F")
         url = f"{self.registry}/{encoded}"
-        try:
-            r = self.session.get(url, timeout=self.timeout)
-            r.raise_for_status()
-            data = r.json()
-            self.npm_cache[pkg] = data
-            time.sleep(self.sleep_sec)
-            return data
-        except Exception as e:
-            eprint(f"[warn] npm metadata unavailable for {pkg}: {e}")
-            self.npm_cache[pkg] = None
-            return None
+        last_error = ""
+        for attempt in range(1, REGISTRY_METADATA_MAX_ATTEMPTS + 1):
+            try:
+                response = self.session.get(url, timeout=self.timeout)
+                status = int(getattr(response, "status_code", 0) or 0)
+                if status == 404:
+                    # A real 404 is a deterministic registry fact. Unlike a
+                    # timeout/5xx it is safe to memoize as package absence.
+                    self.npm_cache[pkg] = None
+                    return None
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise ValueError("registry metadata response is not a JSON object")
+                self.npm_cache[pkg] = data
+                time.sleep(self.sleep_sec)
+                return data
+            except requests.HTTPError as exc:
+                status = int(getattr(exc.response, "status_code", 0) or 0)
+                if status == 404:
+                    self.npm_cache[pkg] = None
+                    return None
+                last_error = f"HTTP {status or 'unknown'}: {exc}"
+                if 400 <= status < 500 and status != 429:
+                    break
+            except requests.RequestException as exc:
+                last_error = str(exc)
+            except (ValueError, TypeError) as exc:
+                last_error = f"invalid registry response: {exc}"
+                break
+            except Exception as exc:
+                last_error = str(exc)
+                break
+
+            if attempt < REGISTRY_METADATA_MAX_ATTEMPTS:
+                delay = min(0.25 * (2 ** (attempt - 1)), 2.0)
+                eprint(
+                    f"[warn] npm metadata transient failure for {pkg}; "
+                    f"retry {attempt}/{REGISTRY_METADATA_MAX_ATTEMPTS}: {last_error}"
+                )
+                time.sleep(delay)
+
+        raise RegistryInfrastructureError(
+            f"REGISTRY_METADATA_UNAVAILABLE: {pkg}: "
+            f"{last_error or 'registry request failed without a stable response'}"
+        )
 
     def query_osv_versions(
         self,
@@ -4688,6 +4745,7 @@ def plan_executable_actions(
     client: LiveDataClient,
     *,
     modes: Tuple[str, ...] = ("yellow", "green", "default"),
+    immutable_targets: bool = False,
 ) -> None:
     """Freeze update/remove semantics before Branch-plan generation.
 
@@ -4741,6 +4799,11 @@ def plan_executable_actions(
                             f"but resolved runtime {runtime_name or 'package'}@{runtime_version or 'unknown'} "
                             "was not proven to ship its own declarations"
                         )
+                        if immutable_targets:
+                            raise BaselineConstraintVerificationError(
+                                f"FINAL_PROVEN_ASSIGNMENT_ACTION_INVALID: {project}/{mode}: {reason}. "
+                                "A post-proof action planner may not change dependency versions."
+                            )
                         _set_mode_target(row, mode, NO_ACTION, reason)
                         row.compatibility_note = target_reason_join([row.compatibility_note, reason])
                         action = "deferred"
@@ -4916,12 +4979,12 @@ def _normalized_node_version(value: Any) -> str:
 
 
 def _project_node_versions(project_dir: str) -> List[Tuple[str, str]]:
-    """Return exact Node versions the project explicitly pins plus the active runtime.
+    """Return only exact Node versions explicitly pinned by the project.
 
-    Package ``engines.node`` is often a support *range*, not an exact runtime,
-    so it is intentionally not converted into a guessed version.  Exact pins
-    from Volta/.nvmrc/.node-version and the Node executable used by this run are
-    safe constraints for target metadata checks.
+    The runtime executing DepLoom is tool infrastructure, not project intent.
+    Feeding the planner host runtime into Z3 makes one source commit produce
+    different assignments on different machines. Only repository pins are
+    authoritative here; an unpinned project must not inherit the host.
     """
     key = str(Path(project_dir).resolve())
     cached = _PROJECT_NODE_VERSION_CACHE.get(key)
@@ -4945,22 +5008,6 @@ def _project_node_versions(project_dir: str) -> List[Tuple[str, str]]:
             version = ""
         if version:
             found.append((version, filename))
-    try:
-        runtime = subprocess.run(
-            ["node", "--version"],
-            cwd=str(root),
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        if runtime.returncode == 0:
-            version = _normalized_node_version(runtime.stdout or runtime.stderr)
-            if version:
-                found.append((version, "active node runtime"))
-    except (FileNotFoundError, OSError, subprocess.SubprocessError):
-        pass
-    # Preserve source evidence while deduplicating identical exact versions.
     dedup: Dict[str, str] = {}
     for version, source in found:
         dedup.setdefault(version, source)
@@ -6489,23 +6536,13 @@ def resolve_peer_compatibility(
                             f"refinements={exact_report.get('refinements', 0)}, "
                             f"elapsedMs={exact_report.get('elapsedMs', 0)}"
                         )
-                    elif exact_status in {"unknown", "unknown_refinement_budget", "unsat"}:
-                        # Exact UNKNOWN/UNSAT for one independent component must
-                        # not turn the whole Autopilot run red. Keep that
-                        # component on the already-installed current tuple and
-                        # continue solving/verifying every other component. This
-                        # is an explicit local defer, never a heuristic claim
-                        # that the desired target is incompatible.
-                        component_assignment = {
-                            name: rows_by_name[name].current_version
-                            for name in component
-                        }
-                        deferred_status = f"exact_{exact_status}_deferred"
-                        diagnostics.update(status=deferred_status, backend="z3")
-                        eprint(
-                            f"[warn] {project}: exact z3 {mode} {exact_status.upper()} for "
-                            f"{len(component)} package(s); deferring only this component to current "
-                            f"without heuristic fallback; detail={str(exact_report.get('detail') or '')[:240]}"
+                    elif exact_status in {"unknown", "unknown_refinement_budget", "sat_unproven", "unsat"}:
+                        raise BaselineConstraintVerificationError(
+                            f"EXACT_SOLVER_PROOF_REQUIRED: {project}/{mode}: "
+                            f"component={','.join(component)} status={exact_status}; "
+                            f"detail={str(exact_report.get('detail') or '')[:500]}. "
+                            "Missing/unfinished exact proof is not a dependency decision and cannot be "
+                            "silently converted to the current tuple."
                         )
                     else:
                         raise BaselineConstraintVerificationError(
@@ -8192,13 +8229,16 @@ def resolve_peer_compatibility_with_verification(
                     f"{config.max_iterations} solve-and-verify iterations"
                 )
 
-    # Apply each mode exactly once. No intermediate failed candidate ever mutates
-    # target_* fields, so Dashboard cannot observe or resurrect a rejected state.
+    # Re-run only as a fail-closed consistency assertion while legacy target/cohort
+    # materialization still lives inside resolve_peer_compatibility(). This second
+    # solve has NO authority to choose a different assignment: the package-manager
+    # verified final_assignments object is the handoff contract.
     applied = resolve_peer_compatibility(
         rows_by_project,
         client,
         modes=modes,
         learned_nogoods_by_project_mode=learned,
+        global_exact_exclusions_by_project_mode=global_exact_exclusions,
         apply_results=True,
         shadow_solver_config_by_project={
             name: spec.constraint_verify_config
@@ -8207,7 +8247,57 @@ def resolve_peer_compatibility_with_verification(
         },
         residual_targets_by_project=residual_targets_by_project,
     )
-    return applied
+    for project, mode_assignments in final_assignments.items():
+        for mode, proven in mode_assignments.items():
+            replayed = (applied.get(project) or {}).get(mode)
+            if replayed != proven:
+                raise BaselineConstraintVerificationError(
+                    f"PROVEN_ASSIGNMENT_REOPENED: {project}/{mode}: "
+                    f"verified={assignment_fingerprint(proven)}, "
+                    f"replayed={assignment_fingerprint(replayed or {})}. "
+                    "A post-verification solve produced a different assignment; no artifact was emitted."
+                )
+            for row in rows_by_project.get(project, []):
+                setattr(row, f"target_{mode}_dynamic_locked", True)
+
+    assert_proven_assignment_conformance(
+        rows_by_project,
+        final_assignments,
+        modes=modes,
+    )
+    return final_assignments
+
+def assert_proven_assignment_conformance(
+    rows_by_project: Dict[str, List[DependencyRow]],
+    proven_assignments: Mapping[str, Mapping[str, Mapping[str, str]]],
+    *,
+    modes: Tuple[str, ...] = ("yellow", "green", "default"),
+) -> None:
+    """Fail if any post-proof code changed one literal of a proven assignment."""
+    mismatches: List[str] = []
+    for project, mode_assignments in proven_assignments.items():
+        rows = rows_by_project.get(project, [])
+        for mode in modes:
+            proven = mode_assignments.get(mode)
+            if proven is None:
+                continue
+            for row in rows:
+                if row.name not in proven:
+                    continue
+                target = str(getattr(row, _target_attr(mode), "") or "")
+                actual = target if target_is_action(target) else row.current_version
+                expected = str(proven[row.name])
+                if actual != expected:
+                    mismatches.append(
+                        f"{project}/{mode}:{row.name} expected={expected} actual={actual}"
+                    )
+    if mismatches:
+        raise BaselineConstraintVerificationError(
+            "PROVEN_ASSIGNMENT_MUTATED: "
+            + " | ".join(mismatches[:20])
+            + (" | ..." if len(mismatches) > 20 else "")
+        )
+
 
 def _peer_scope_blocker(
     row: DependencyRow,
@@ -8283,6 +8373,8 @@ def validate_final_peer_assignment(
 def enrich_registry_target_evidence(
     rows_by_project: Dict[str, List[DependencyRow]],
     client: LiveDataClient,
+    *,
+    allow_target_mutation: bool = True,
 ) -> None:
     """Attach target tarball proof and remove any action without Nexus evidence."""
     for project, rows in rows_by_project.items():
@@ -8318,6 +8410,11 @@ def enrich_registry_target_evidence(
                         f"REGISTRY_TARGET_UNAVAILABLE: {row.name}@{target}; status={evidence.get('status')}; "
                         f"configured registry={client.registry}; {evidence.get('error') or 'tarball probe failed'}"
                     )
+                    if not allow_target_mutation:
+                        raise BaselineConstraintVerificationError(
+                            f"FINAL_PROVEN_ASSIGNMENT_REGISTRY_DRIFT: {project}/{mode}: {blocker}. "
+                            "Registry evidence changed after proof; no target was rewritten."
+                        )
                     _set_mode_target(row, mode, NO_ACTION, blocker)
                     row.notes = target_reason_join([row.notes, blocker])
                     eprint(f"[warn] {project}: {blocker}")
@@ -9688,7 +9785,7 @@ function targetForRow(row, mode){
       dynamicLocked: row.dataset.targetDefaultDynamicLocked === '1'
     };
   }
-  if (result.dynamicLocked) {
+  if (result.dynamicLocked || (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('desktop-export'))) {
     result.has = !!semverParts(result.value);
     return result;
   }
@@ -12721,18 +12818,26 @@ def main() -> None:
     if residual_targets_by_project:
         count = sum(len(targets) for targets in residual_targets_by_project.values())
         eprint(f"[info] residual stability: loaded {count} previously approved target(s); merged matches are hard-fixed, pending matches are preferred")
-    resolve_peer_compatibility_with_verification(
+    proven_assignments = resolve_peer_compatibility_with_verification(
         rows_by_project, projects_by_name, client,
         residual_targets_by_project=residual_targets_by_project,
         external_evidence_by_project=external_evidence_by_project,
         progress_path=baseline_progress_path,
     )
-    enrich_registry_target_evidence(rows_by_project, client)
-    minimize_yellow_plan_after_compatibility(rows_by_project, client, health_by_project)
-    # Freeze executable update/remove semantics before any HTML/desktop Branch
-    # plan exists. This prevents late browser-only @types stub removals from
-    # bypassing solver and transition-safety proofs.
-    plan_executable_actions(rows_by_project, client)
+    # Everything below this line is a consumer of the proven assignment.
+    enrich_registry_target_evidence(
+        rows_by_project,
+        client,
+        allow_target_mutation=False,
+    )
+    # A late @types action decision may fail the handoff, but may not mutate a
+    # package-manager-proven dependency target.
+    plan_executable_actions(
+        rows_by_project,
+        client,
+        immutable_targets=True,
+    )
+    assert_proven_assignment_conformance(rows_by_project, proven_assignments)
     final_peer_issues = validate_final_peer_assignment(rows_by_project, client)
     if final_peer_issues:
         raise RuntimeError(

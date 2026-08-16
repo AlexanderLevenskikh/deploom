@@ -8,6 +8,19 @@ from typing import Dict, Tuple
 from peer_solver_model import ExactSolveResult, PeerOptimizationModel
 
 
+def _objective_bounds_proven(optimize: object, handles: list[object]) -> tuple[bool, str]:
+    """Return true only when every Optimize objective has a closed exact bound."""
+    for index, handle in enumerate(handles):
+        try:
+            lower = str(optimize.lower(handle))  # type: ignore[attr-defined]
+            upper = str(optimize.upper(handle))  # type: ignore[attr-defined]
+        except Exception as exc:
+            return False, f"objective[{index}] bounds unavailable: {exc}"
+        if lower != upper:
+            return False, f"objective[{index}] lower={lower} upper={upper}"
+    return True, f"objectives={len(handles)} bounds closed"
+
+
 def solve_z3_exact(
     model: PeerOptimizationModel,
     *,
@@ -41,6 +54,7 @@ def solve_z3_exact(
     try:
         optimize = z3.Optimize()
         optimize.set(priority="lex")
+        objective_handles: list[object] = []
         if timeout_ms > 0:
             optimize.set(timeout=int(timeout_ms))
 
@@ -78,7 +92,7 @@ def solve_z3_exact(
                     score = package.score_for(version)[objective_index]
                     if score:
                         terms.append(z3.If(variables[(package.name, version)], int(score), 0))
-            optimize.maximize(z3.Sum(terms) if terms else z3.IntVal(0))
+            objective_handles.append(optimize.maximize(z3.Sum(terms) if terms else z3.IntVal(0)))
 
         # Match the production/reference deterministic tie-break: among equal
         # objective vectors, choose the lexicographically smallest assignment by
@@ -86,12 +100,12 @@ def solve_z3_exact(
         for package in sorted(model.packages, key=lambda item: item.name):
             lexical_versions = sorted(package.domain)
             lexical_rank = {version: index for index, version in enumerate(lexical_versions)}
-            optimize.minimize(
+            objective_handles.append(optimize.minimize(
                 z3.Sum([
                     z3.If(variables[(package.name, version)], lexical_rank[version], 0)
                     for version in package.domain
                 ])
-            )
+            ))
 
         check = optimize.check()
         elapsed = int((time.perf_counter() - started) * 1000)
@@ -107,6 +121,15 @@ def solve_z3_exact(
                 backend="z3",
                 status="unknown",
                 detail=reason or "Z3 returned unknown",
+                elapsed_ms=elapsed,
+            )
+
+        bounds_proven, bounds_detail = _objective_bounds_proven(optimize, objective_handles)
+        if not bounds_proven:
+            return ExactSolveResult(
+                backend="z3",
+                status="sat_unproven",
+                detail=f"Z3 returned a satisfiable model without closed optimization bounds: {bounds_detail}",
                 elapsed_ms=elapsed,
             )
 

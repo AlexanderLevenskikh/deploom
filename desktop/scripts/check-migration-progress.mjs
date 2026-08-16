@@ -190,7 +190,7 @@ if (historicalAdopted.branches[0].branch !== "libs-continuation-1" || historical
 }
 
 const scopePrompt = `${prompt}\n\n## Exact compact scope manifest\n\n\`\`\`json\n{"columns":["project","package","section","target","shouldUpdate","action"],"rows":[["Demo","a","dependencies","2.0.0",true,"update"],["Demo","b","dependencies","—",true,"remove"],["Demo","c","devDependencies","3.0.0",true,"update"]]}\n\`\`\``;
-const satisfied = satisfiedScopePackagesFromPrompt(scopePrompt, "Demo", { dependencies: { a: "^2.0.0" }, devDependencies: { c: "2.5.0" } });
+const satisfied = satisfiedScopePackagesFromPrompt(scopePrompt, "Demo", { dependencies: { a: "2.0.0" }, devDependencies: { c: "2.5.0" } });
 const factChecked = buildMigrationProgress({ plan, refs: ["libs-group-1", "libs-group-2", "libs-merged"], currentBranch: "libs-merged", mergedBranches: ["libs-group-1", "libs-group-2"], satisfiedPackages: satisfied, factsRef: "libs-merged" });
 if (factChecked.completedDependencies !== 2 || factChecked.unmetPackages.join(",") !== "c") throw new Error(`Merged branches hid unmet package targets: ${JSON.stringify(factChecked)}`);
 if (!migrationCompletionIssues(factChecked).some((issue) => issue.includes("c"))) throw new Error(`Unmet scope package did not block completion: ${JSON.stringify(factChecked)}`);
@@ -199,11 +199,18 @@ if (!migrationCompletionIssues(factChecked).some((issue) => issue.includes("c"))
 // branch happens to be checked out reported already-merged packages as unmet,
 // which is exactly the false AGENT_GIT_PLAN_INCOMPLETE that stopped a run with
 // three of five groups genuinely finished.
-const mergedFacts = satisfiedScopePackagesFromPrompt(scopePrompt, "Demo", { dependencies: { a: "^2.0.0" }, devDependencies: { c: "3.1.0" } });
-const workBranchFacts = satisfiedScopePackagesFromPrompt(scopePrompt, "Demo", { dependencies: { a: "^1.0.0" }, devDependencies: { c: "3.1.0" } });
+const mergedFacts = satisfiedScopePackagesFromPrompt(scopePrompt, "Demo", { dependencies: { a: "2.0.0" }, devDependencies: { c: "3.0.0" } });
+const workBranchFacts = satisfiedScopePackagesFromPrompt(scopePrompt, "Demo", { dependencies: { a: "1.0.0" }, devDependencies: { c: "3.0.0" } });
 const fromMerged = buildMigrationProgress({ plan, refs: ["libs-group-1", "libs-group-2", "libs-merged"], currentBranch: "libs-group-2", mergedBranches: ["libs-group-1", "libs-group-2"], satisfiedPackages: mergedFacts, factsRef: "libs-merged" });
 if (fromMerged.unmetPackages.length !== 0) throw new Error(`Merged-branch facts must clear the gate: ${JSON.stringify(fromMerged.unmetPackages)}`);
 if (migrationCompletionIssues(fromMerged).length !== 0) throw new Error(`A genuinely complete migration was rejected: ${JSON.stringify(migrationCompletionIssues(fromMerged))}`);
+
+// Proof conformance is exact. A semver range or a higher version is not the
+// assignment the package-manager verifier proved.
+const rangedDrift = satisfiedScopePackagesFromPrompt(scopePrompt, "Demo", { dependencies: { a: "^2.0.0" }, devDependencies: { c: "3.0.0" } });
+if (rangedDrift?.has("a")) throw new Error("A semver range must not satisfy an exact proven target");
+const higherDrift = satisfiedScopePackagesFromPrompt(scopePrompt, "Demo", { dependencies: { a: "2.0.0" }, devDependencies: { c: "3.1.0" } });
+if (higherDrift?.has("c")) throw new Error("A higher dependency version must not satisfy an exact proven target");
 const fromWorkBranch = buildMigrationProgress({ plan, refs: ["libs-group-1", "libs-group-2", "libs-merged"], currentBranch: "libs-group-2", mergedBranches: ["libs-group-1", "libs-group-2"], satisfiedPackages: workBranchFacts, factsRef: "libs-merged" });
 if (!fromWorkBranch.unmetPackages.includes("a")) throw new Error(`Fixture is wrong: the work branch must lack a merged target`);
 

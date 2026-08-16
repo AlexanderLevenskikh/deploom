@@ -206,20 +206,11 @@ export function scopeTargetsFromPrompt(markdown: string, projectName: string): R
   return Object.fromEntries(scopeActionsFromPrompt(markdown, projectName).map((row) => [row.package, row.target]))
 }
 
-function comparableVersion(value: string): number[] | undefined {
-  const match = /(?:^|[^0-9])(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/.exec(value)
-  if (!match) return undefined
-  return [Number(match[1]), Number(match[2]), Number(match[3]), match[4] ? -1 : 0]
-}
-
-function versionAtLeast(actual: string, target: string): boolean {
-  const left = comparableVersion(actual)
-  const right = comparableVersion(target)
-  if (!left || !right) return actual === target
-  for (let index = 0; index < left.length; index += 1) {
-    if (left[index] !== right[index]) return left[index] > right[index]
-  }
-  return true
+function versionExactlyMatches(actual: string, target: string): boolean {
+  // This predicate protects proof conformance, not UI progress. The Control
+  // Plane materializes exact pins; ranges or higher versions are a different
+  // dependency state and therefore require a new proof.
+  return actual.trim() === target.trim()
 }
 
 export function satisfiedScopePackagesFromPrompt(markdown: string, projectName: string, packageJson: unknown): Set<string> | undefined {
@@ -230,7 +221,7 @@ export function satisfiedScopePackagesFromPrompt(markdown: string, projectName: 
   for (const action of scopeActions(manifest, projectName)) {
     const section = root[action.section]
     const spec = section && typeof section === 'object' ? (section as Record<string, unknown>)[action.package] : undefined
-    if (action.action === 'remove' ? spec === undefined : typeof spec === 'string' && versionAtLeast(spec, action.target)) satisfied.add(action.package)
+    if (action.action === 'remove' ? spec === undefined : typeof spec === 'string' && versionExactlyMatches(spec, action.target)) satisfied.add(action.package)
   }
   return satisfied
 }

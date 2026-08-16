@@ -323,14 +323,13 @@ class PeerSolverModelTests(unittest.TestCase):
 
         self.assertEqual("2.0.0", assignments["Demo"]["default"]["a"])
 
-    def test_authoritative_z3_unknown_locally_defers_without_legacy_fallback(self):
+    def test_authoritative_z3_unknown_fails_closed_without_legacy_fallback(self):
         client = self.make_client()
         self.add_package(client, "a", {"1.0.0": {}, "2.0.0": {}})
         row = self.row("a")
         by_project = {"Demo": [row]}
         roadmap.capture_desired_targets(by_project)
         roadmap.enrich_registry_target_evidence(by_project, client)
-        statuses = {}
 
         with mock.patch.object(
             roadmap, "solve_z3_exact",
@@ -338,17 +337,17 @@ class PeerSolverModelTests(unittest.TestCase):
         ), mock.patch.object(
             roadmap, "_solve_peer_component", side_effect=AssertionError("legacy fallback is forbidden")
         ):
-            assignments = roadmap.resolve_peer_compatibility(
-                by_project,
-                client,
-                modes=("default",),
-                apply_results=False,
-                solver_statuses_out=statuses,
-                shadow_solver_config_by_project={"Demo": {"solverBackend": "z3"}},
-            )
-
-        self.assertEqual("1.0.0", assignments["Demo"]["default"]["a"])
-        self.assertEqual("exact_unknown_deferred", statuses["Demo"]["default"]["a"])
+            with self.assertRaisesRegex(
+                roadmap.BaselineConstraintVerificationError,
+                "EXACT_SOLVER_PROOF_REQUIRED",
+            ):
+                roadmap.resolve_peer_compatibility(
+                    by_project,
+                    client,
+                    modes=("default",),
+                    apply_results=False,
+                    shadow_solver_config_by_project={"Demo": {"solverBackend": "z3"}},
+                )
 
     def test_shadow_z3_runs_before_legacy_search(self):
         client = self.make_client()
