@@ -627,6 +627,25 @@ def verify_assignment(
                 workspace=str(workspace_project),
             )
 
+        try:
+            materialized_manifest = json.loads((workspace_project / "package.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            return BaselineVerifyResult(False, "unknown", f"ASSIGNMENT_MANIFEST_UNREADABLE: {exc}")
+        for expected_name, expected_version in sorted(assignment.items()):
+            observed_versions = []
+            for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+                values = materialized_manifest.get(section)
+                if isinstance(values, dict) and expected_name in values:
+                    observed_versions.append(str(values[expected_name]))
+            if not observed_versions or any(value != expected_version for value in observed_versions):
+                return BaselineVerifyResult(
+                    False,
+                    "unknown",
+                    f"ASSIGNMENT_MANIFEST_DRIFT: {expected_name} expected {expected_version!r}, "
+                    f"observed {observed_versions!r}",
+                    workspace=str(workspace_project),
+                )
+
         if run_project_checks and config.project_checks != "off" and config.commands:
             # Re-enable lifecycle scripts before project verification. This is
             # still an external package-manager invocation, so classify its

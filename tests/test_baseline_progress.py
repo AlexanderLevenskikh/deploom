@@ -11,7 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from dependency_live_roadmap_generator import BaselineLocalizationCheckpointStore, BaselineProgressReporter
+from dependency_live_roadmap_generator import (
+    BaselineLocalizationCheckpointStore,
+    BaselineProgressReporter,
+    _normalize_baseline_progress_details,
+)
 
 
 class BaselineProgressReporterTests(unittest.TestCase):
@@ -29,6 +33,18 @@ class BaselineProgressReporterTests(unittest.TestCase):
             self.assertEqual(4, payload["active"])
             self.assertIn("updatedAt", payload)
             self.assertFalse(path.with_suffix(path.suffix + ".tmp").exists())
+    def test_nested_timeout_phase_cannot_collide_with_progress_phase(self) -> None:
+        details = _normalize_baseline_progress_details({
+            "phase": "confirmation",
+            "checksStarted": 8,
+            "currentUnits": 3,
+        })
+        self.assertNotIn("phase", details)
+        self.assertEqual("confirmation", details["localizationPhase"])
+        reporter = BaselineProgressReporter(None)
+        reporter.emit("Demo", "yellow", "localization-timeout", **details)
+
+
 
     def test_parallel_progress_writes_do_not_corrupt_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -45,6 +61,22 @@ class BaselineProgressReporterTests(unittest.TestCase):
             payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual("check", payload["phase"])
             self.assertIsInstance(payload["check"], int)
+    def test_checkpoint_can_be_detected_before_source_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            progress = Path(tmp) / "state" / "baseline-verification-progress.json"
+            store = BaselineLocalizationCheckpointStore(progress)
+            self.assertFalse(store.has_project_checkpoint("Demo"))
+            store.save(
+                "Demo",
+                "yellow",
+                "identity",
+                {"schemaVersion": 1, "currentUnitIds": ["a"], "finished": False},
+                source_head="abc123",
+            )
+            self.assertTrue(store.has_project_checkpoint("Demo"))
+            self.assertFalse(store.has_project_checkpoint("Other"))
+
+
 
     def test_corrupt_localization_checkpoint_is_preserved_for_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

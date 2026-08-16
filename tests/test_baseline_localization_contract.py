@@ -31,6 +31,18 @@ class BaselineLocalizationContractTests(unittest.TestCase):
 
         self.assertEqual({"plugin": "2.0.0"}, materialization)
         self.assertEqual({"plugin": "2.0.0", "vite": "4.3.9"}, clause)
+    def test_full_verification_assignment_keeps_unchanged_direct_versions_exact(self) -> None:
+        rows = {
+            "plugin": SimpleNamespace(current_version="1.0.0"),
+            "vite": SimpleNamespace(current_version="4.3.9"),
+        }
+        assignment = {"plugin": "2.0.0", "vite": "4.3.9"}
+        full = roadmap._verification_assignment(assignment, rows)
+        delta = roadmap._changed_assignment(assignment, rows)
+        self.assertEqual({"plugin": "2.0.0", "vite": "4.3.9"}, full)
+        self.assertEqual({"plugin": "2.0.0"}, delta)
+
+
 
     def test_solver_context_clause_would_change_a_ranged_manifest_but_materialization_does_not(self) -> None:
         rows = {

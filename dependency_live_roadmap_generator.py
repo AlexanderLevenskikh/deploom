@@ -1071,7 +1071,7 @@ def _dirty_checkout_details(project: ProjectSpec) -> str:
     return preview
 
 
-def ensure_source_checkout(project: ProjectSpec) -> Dict[str, Any]:
+def ensure_source_checkout(project: ProjectSpec, *, allow_checkpoint_resume: bool = False) -> Dict[str, Any]:
     """Move a clean checkout to the exact fetched source branch commit.
 
     The guard never resets, stashes, rebases or discards local work.  A dirty
@@ -1126,6 +1126,36 @@ def ensure_source_checkout(project: ProjectSpec) -> Dict[str, Any]:
     fetch = _git_command(project, ["fetch", "--prune", remote, fetch_refspec], check=False)
     if fetch.returncode != 0:
         message = (fetch.stderr or fetch.stdout or "git fetch failed").strip()
+        if allow_checkpoint_resume:
+            # A resumable Baseline is already pinned to the source snapshot that
+            # created its checkpoint. A temporary remote outage must not discard
+            # that work. We lease only the locally cached remote snapshot; the
+            # exact localization identity is still checked later.
+            cached_remote_probe = _git_command(project, ["rev-parse", remote_ref], check=False)
+            local_head_probe = _git_command(project, ["rev-parse", "HEAD"], check=False)
+            branch_probe = _git_command(project, ["branch", "--show-current"], check=False)
+            cached_remote = (cached_remote_probe.stdout or "").strip() if cached_remote_probe.returncode == 0 else ""
+            local_head = (local_head_probe.stdout or "").strip() if local_head_probe.returncode == 0 else ""
+            local_branch = (branch_probe.stdout or "").strip() if branch_probe.returncode == 0 else ""
+            dirty_resume = _dirty_checkout_details(project)
+            if cached_remote and local_head and cached_remote == local_head and local_branch == branch and not dirty_resume:
+                metadata = {
+                    "verified": True,
+                    "remote": remote,
+                    "sourceBranch": branch,
+                    "sourceCommit": local_head,
+                    "remoteCommit": cached_remote,
+                    "verifiedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "remoteFresh": False,
+                    "resumedFromCheckpoint": True,
+                }
+                project.source_checkout = metadata
+                eprint(
+                    f"[warn] {project.name}: source fetch failed, but a Baseline checkpoint exists; "
+                    f"resuming cached source snapshot {local_head[:12]} because HEAD == {remote_ref}. "
+                    "Checkpoint identity will still be validated before evidence reuse."
+                )
+                return metadata
         raise SourceCheckoutGuardError(
             "SOURCE_FETCH_FAILED",
             project,
@@ -6630,6 +6660,19 @@ def _changed_assignment(
     }
 
 
+def _verification_assignment(
+    assignment: Dict[str, str],
+    rows_by_name: Dict[str, DependencyRow],
+) -> Dict[str, str]:
+    # Complete direct assignment that the verifier must prove.
+    return {
+        name: assignment[name]
+        for name in sorted(assignment)
+        if name in rows_by_name
+    }
+
+
+
 def _verification_inputs_for_units(
     assignment: Dict[str, str],
     rows_by_name: Dict[str, DependencyRow],
@@ -6731,6 +6774,18 @@ def _annotate_constraint_preflight(
             row.constraint_preflight[mode] = dict(payload)
 
 
+def _normalize_baseline_progress_details(details: Mapping[str, object]) -> Dict[str, object]:
+    # Verifier telemetry may have its own nested phase (e.g. confirmation).
+    # Rename it so BaselineProgressReporter.emit(..., phase, **details) cannot
+    # receive two values for its positional phase argument.
+    normalized = dict(details)
+    nested_phase = normalized.pop("phase", None)
+    if nested_phase is not None:
+        normalized["localizationPhase"] = nested_phase
+    return normalized
+
+
+
 class BaselineProgressReporter:
     """Live + persisted progress for long deterministic verification phases."""
 
@@ -6828,7 +6883,21 @@ class BaselineLocalizationCheckpointStore:
             state = entry.get("state")
             return dict(state) if isinstance(state, dict) else None
 
-    def save(self, project: str, mode: str, identity: str, state: Mapping[str, object]) -> None:
+    def has_project_checkpoint(self, project: str) -> bool:
+        if self.path is None:
+            return False
+        with self._lock:
+            payload = self._read_locked()
+            entries = payload.get("entries")
+            if not isinstance(entries, dict):
+                return False
+            for mode in ("yellow", "green", "default"):
+                entry = entries.get(self._slot(project, mode))
+                if isinstance(entry, dict) and isinstance(entry.get("state"), dict):
+                    return True
+            return False
+
+    def save(self, project: str, mode: str, identity: str, state: Mapping[str, object], *, source_head: str = "") -> None:
         if self.path is None:
             return
         with self._lock:
@@ -6836,6 +6905,7 @@ class BaselineLocalizationCheckpointStore:
             entries = payload.setdefault("entries", {})
             entries[self._slot(project, mode)] = {
                 "identity": identity,
+                "sourceHead": source_head,
                 "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "state": dict(state),
             }
@@ -6985,11 +7055,11 @@ def resolve_peer_compatibility_with_verification(
                     if control.kind not in {"infrastructure", "unknown"}:
                         adaptive_control_cache[key] = control
                 if control.kind in {"infrastructure", "unknown"}:
-                    eprint(
-                        f"[warn] {project}: adaptive structural comparison inconclusive for {command!r}; "
-                        f"current control is {control.kind} ({control.summary})"
+                    raise BaselineConstraintVerificationError(
+                        f"BASELINE_VERIFY_INCONCLUSIVE_CONTROL: {project}: adaptive structural comparison "
+                        f"for {command!r} is {control.kind} ({control.summary}); "
+                        "UNKNOWN is not equivalent to NOT_INTRODUCED"
                     )
-                    return ()
                 baseline_signatures = set(structural_project_failure_signatures(control))
                 introduced.update(candidate_signatures - baseline_signatures)
 
@@ -7065,8 +7135,9 @@ def resolve_peer_compatibility_with_verification(
                     name for name, status in component_statuses.items() if status == "sat_unproven"
                 )
                 changed = _changed_assignment(assignment, rows_by_name)
+                verification_assignment = _verification_assignment(assignment, rows_by_name)
                 removals = _types_stub_removals_for_assignment(rows_by_name, assignment, mode, client)
-                fingerprint = assignment_fingerprint(changed)
+                fingerprint = assignment_fingerprint(verification_assignment)
                 if not changed:
                     if unknown_budget_names:
                         eprint(
@@ -7079,16 +7150,16 @@ def resolve_peer_compatibility_with_verification(
                     progress_reporter.emit(project, mode, "mode-passed-no-changes", iteration=iteration, assignment=fingerprint)
                     break
 
-                cache_key = (str(spec.path.resolve()), tuple(sorted(changed.items())), tuple(sorted(removals)))
+                cache_key = (str(spec.path.resolve()), tuple(sorted(verification_assignment.items())), tuple(sorted(removals)))
                 project_cache_key = (
-                    str(spec.path.resolve()), tuple(sorted(changed.items())),
+                    str(spec.path.resolve()), tuple(sorted(verification_assignment.items())),
                     tuple(sorted(removals)), tuple(config.commands),
                 )
                 result = resolver_cache.get(cache_key)
                 if result is None:
                     eprint(
                         f"[info] {project}: Baseline verify {mode} iteration {iteration}: "
-                        f"materializing {len(changed)} changed direct package(s), assignment={fingerprint}"
+                        f"proving full exact assignment ({len(verification_assignment)} direct; {len(changed)} changed), assignment={fingerprint}"
                     )
                     if config.project_checks != "off" and config.commands:
                         # One isolated workspace proves resolver state first and then
@@ -7112,7 +7183,7 @@ def resolve_peer_compatibility_with_verification(
                             result = combined
                     else:
                         result = verify_assignment(
-                            spec.path, changed, config=config, run_project_checks=False, remove_packages=removals,
+                            spec.path, verification_assignment, config=config, run_project_checks=False, remove_packages=removals,
                             progress=lambda message: (progress_reporter.emit(project, mode, "resolver-verification", iteration=iteration, assignment=fingerprint, message=message), eprint(f"[info] {project}: {message}")),
                             progress_label=f"Baseline {mode} iteration {iteration} resolver {fingerprint}",
                         )
@@ -7139,7 +7210,7 @@ def resolve_peer_compatibility_with_verification(
                         project_result = project_preflight_cache.get(project_cache_key)
                         if project_result is None:
                             project_result = verify_assignment(
-                                spec.path, changed, config=config, run_project_checks=True, remove_packages=removals,
+                                spec.path, verification_assignment, config=config, run_project_checks=True, remove_packages=removals,
                                 progress=lambda message: (progress_reporter.emit(project, mode, "project-preflight", iteration=iteration, assignment=fingerprint, message=message), eprint(f"[info] {project}: {message}")),
                                 progress_label=f"Baseline {mode} iteration {iteration} project preflight {fingerprint}",
                             )
@@ -7197,6 +7268,102 @@ def resolve_peer_compatibility_with_verification(
                         progress_reporter.emit(project, mode, "mode-passed", iteration=iteration, assignment=fingerprint)
                         break
 
+                # Proof-preserving fast path: forbid exactly the full assignment
+                # that failed, then re-solve immediately. A localized witness is
+                # not automatically a context-independent Solver nogood.
+                if result.kind in {"dependency", "project"}:
+                    exact_nogood = dict(verification_assignment)
+                    if not exact_nogood:
+                        raise BaselineConstraintVerificationError(
+                            f"BASELINE_PLAN_BROKEN: {project}/{mode}: failing assignment has no solver-owned literals"
+                        )
+
+                    confirmation_project_checks = result.kind == "project"
+                    expected_signature = dependency_failure_signature(
+                        summary=result.summary, output=result.output
+                    )
+                    expected_structural = (
+                        set(adaptive_structural_evidence(result))
+                        if result.kind == "project" and config.project_checks == "adaptive"
+                        else set()
+                    )
+                    eprint(
+                        f"[info] {project}: Baseline exact-assignment confirmation {mode} started; "
+                        f"assignment={fingerprint}; literals={len(exact_nogood)}; origin={result.kind}"
+                    )
+                    progress_reporter.emit(
+                        project, mode, "exact-assignment-confirmation-started",
+                        iteration=iteration, assignment=fingerprint,
+                        literals=len(exact_nogood), origin=result.kind,
+                    )
+                    confirmation = verify_assignment(
+                        spec.path, verification_assignment, config=config,
+                        run_project_checks=confirmation_project_checks, remove_packages=removals,
+                        progress=lambda message: (
+                            progress_reporter.emit(
+                                project, mode, "exact-assignment-confirmation-running",
+                                iteration=iteration, assignment=fingerprint, message=message,
+                            ),
+                            eprint(f"[info] {project}: Baseline exact confirmation {mode}: {message}"),
+                        ),
+                        progress_label=f"Baseline exact confirmation {mode} {fingerprint}",
+                    )
+                    if confirmation.kind in {"infrastructure", "unknown"}:
+                        raise BaselineConstraintVerificationError(
+                            f"BASELINE_VERIFY_INCONCLUSIVE_CONFIRMATION: {project}/{mode}: "
+                            f"{confirmation.kind}: {confirmation.summary}; no solver constraint was learned"
+                        )
+
+                    if result.kind == "dependency":
+                        observed_signature = dependency_failure_signature(
+                            summary=confirmation.summary, output=confirmation.output
+                        )
+                        confirmed_exact_failure = (
+                            confirmation.kind == "dependency" and observed_signature == expected_signature
+                        )
+                    elif config.project_checks == "adaptive":
+                        observed_structural = (
+                            set(adaptive_structural_evidence(confirmation))
+                            if confirmation.kind == "project" else set()
+                        )
+                        confirmed_exact_failure = (
+                            bool(expected_structural)
+                            and confirmation.kind == "project"
+                            and observed_structural == expected_structural
+                        )
+                    else:
+                        observed_signature = dependency_failure_signature(
+                            summary=confirmation.summary, output=confirmation.output
+                        )
+                        confirmed_exact_failure = (
+                            confirmation.kind == "project" and observed_signature == expected_signature
+                        )
+
+                    if not confirmed_exact_failure:
+                        raise BaselineConstraintVerificationError(
+                            f"BASELINE_VERIFY_INCONCLUSIVE_CONFIRMATION: {project}/{mode}: "
+                            "the exact assignment did not reproduce the same authoritative failure; "
+                            "no solver constraint was learned"
+                        )
+                    if exact_nogood in learned[project][mode]:
+                        raise BaselineConstraintVerificationError(
+                            f"BASELINE_CONSTRAINT_LOOP_STUCK: {project}/{mode}: "
+                            f"exact failing assignment {fingerprint} was already blocked"
+                        )
+
+                    learned[project][mode].append(exact_nogood)
+                    localization_checkpoint_store.clear(project, mode)
+                    eprint(
+                        f"[warn] {project}: blocked exact failing assignment {fingerprint} after fresh confirmation; "
+                        "re-solving immediately without mandatory ddmin generalization"
+                    )
+                    progress_reporter.emit(
+                        project, mode, "exact-assignment-blocked",
+                        iteration=iteration, assignment=fingerprint,
+                        literals=len(exact_nogood), origin=result.kind,
+                    )
+                    continue
+
                 # Hard dependency (or explicitly strict project) failure. Localize
                 # the failing set concurrently and teach the solver one nogood.
                 units = _verification_units_for_assignment(
@@ -7224,9 +7391,10 @@ def resolve_peer_compatibility_with_verification(
                 )
 
                 def localization_progress(event: str, details: Dict[str, object]) -> None:
-                    progress_reporter.emit(project, mode, f"localization-{event}", iteration=iteration, assignment=fingerprint, **details)
+                    safe_details = _normalize_baseline_progress_details(details)
+                    progress_reporter.emit(project, mode, f"localization-{event}", iteration=iteration, assignment=fingerprint, **safe_details)
                     if event in {"start", "resume", "wave-start", "heartbeat", "check-finish", "confirmation-start", "confirmation-heartbeat", "confirmation-finish", "shrink", "timeout", "checkpoint-error", "finish"}:
-                        detail_text = ", ".join(f"{key}={value}" for key, value in details.items())
+                        detail_text = ", ".join(f"{key}={value}" for key, value in safe_details.items())
                         level = "warn" if event == "timeout" else "info"
                         eprint(f"[{level}] {project}: Baseline localization {mode} {event}; {detail_text}")
 
@@ -7346,10 +7514,10 @@ def resolve_peer_compatibility_with_verification(
                         # resources. Screen in parallel, but only let a candidate
                         # shrink the search after the same experiment fails again
                         # with no sibling probe running.
-                        confirm_failure=subset_fails if learn_project_failure else None,
+                        confirm_failure=subset_fails,
                         resume_state=localization_resume_state,
                         checkpoint=lambda state: localization_checkpoint_store.save(
-                            project, mode, localization_identity, state
+                            project, mode, localization_identity, state, source_head=source_head
                         ),
                     )
                 except LocalizationTimeoutError as exc:
@@ -11886,6 +12054,9 @@ def main() -> None:
         if not projects:
             ap.error(f"--only-project did not match any configured project: {', '.join(wanted_values)}")
 
+    baseline_progress_path = settings_base / ".dependency-roadmap" / "state" / "baseline-verification-progress.json"
+    baseline_resume_store = BaselineLocalizationCheckpointStore(baseline_progress_path)
+
     for project in projects:
         cache_value = project.constraint_verify_config.get("constraintCachePath")
         if cache_value:
@@ -11935,7 +12106,10 @@ def main() -> None:
                     f"baseline capture will switch to fetched {project.git_remote or 'origin'}/{project.source_branch}."
                 )
             try:
-                metadata = ensure_source_checkout(project)
+                metadata = ensure_source_checkout(
+                    project,
+                    allow_checkpoint_resume=baseline_resume_store.has_project_checkpoint(project.name),
+                )
             except SourceCheckoutGuardError as exc:
                 eprint(f"[error] {exc}")
                 raise SystemExit(2) from None
@@ -12075,7 +12249,7 @@ def main() -> None:
         rows_by_project, projects_by_name, client,
         residual_targets_by_project=residual_targets_by_project,
         external_evidence_by_project=external_evidence_by_project,
-        progress_path=settings_base / ".dependency-roadmap" / "state" / "baseline-verification-progress.json",
+        progress_path=baseline_progress_path,
     )
     enrich_registry_target_evidence(rows_by_project, client)
     minimize_yellow_plan_after_compatibility(rows_by_project, client, health_by_project)
