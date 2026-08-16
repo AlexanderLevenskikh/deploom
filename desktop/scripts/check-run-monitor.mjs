@@ -2,6 +2,7 @@ import fs from 'node:fs'
 
 const monitor = fs.readFileSync('src/data/processMonitor.ts', 'utf8')
 const view = fs.readFileSync('src/components/RunMonitor.tsx', 'utf8')
+const logPanel = fs.readFileSync('src/components/LogPanel.tsx', 'utf8')
 const hook = fs.readFileSync('src/hooks/useDependencyFlow.ts', 'utf8')
 const main = fs.readFileSync('electron/main.ts', 'utf8')
 
@@ -22,5 +23,11 @@ requireText(view, /if \(state\.dependency\)[\s\S]*else if \(state\.retry\)/, 'li
 requireText(view, /monitor\.totalTime/, 'monitor must render total time')
 requireText(view, /monitor\.attemptTime/, 'monitor must render current attempt time')
 requireText(main, /BASELINE_CONSTRAINT_BUDGET_EXHAUSTED/, 'deterministic Baseline budget exhaustion must be non-retryable')
+requireText(monitor, /DEPLOOM_PROGRESS_V2 /, 'monitor must consume structured Baseline progress')
+requireText(monitor, /allowedIterations/, 'monitor must expose the live adaptive iteration budget')
+requireText(monitor, /learnedConstraints/, 'monitor must expose learned-constraint progress')
+requireText(view, /state\.conflict\.boundedSlice \? 'true' : 'false'/, 'boundedSlice must render without untyped common.yes/common.no keys')
+requireText(logPanel, /DEPLOOM_PROGRESS_V2 /, 'machine Baseline telemetry must be filtered from user-facing logs')
+if (/common\.yes|common\.no/.test(view)) throw new Error('RunMonitor must not use nonexistent common.yes/common.no translation keys')
 
 console.log('Run monitor logical-run / retry / elapsed-time contracts OK')

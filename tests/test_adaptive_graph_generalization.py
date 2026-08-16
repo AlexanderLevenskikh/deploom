@@ -516,3 +516,39 @@ class AdaptiveGraphGeneralizationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+class BaselineLivenessBudgetTests(unittest.TestCase):
+    def test_exact_exclusions_do_not_extend_but_fresh_learning_does(self) -> None:
+        budget = roadmap.BaselineLivenessBudget(
+            base_iterations=8,
+            max_learning_extensions=8,
+            starting_learned_constraints=3,
+        )
+        self.assertEqual(8, budget.allowed_iterations)
+        self.assertEqual(16, budget.hard_iterations)
+
+        budget.record_exact_exclusion()
+        self.assertEqual(8, budget.allowed_iterations)
+        self.assertEqual(1, budget.exact_since_learning)
+
+        budget.observe_learned_constraints(4)
+        self.assertEqual(9, budget.allowed_iterations)
+        self.assertEqual(1, budget.certified_extensions)
+        self.assertEqual(0, budget.exact_since_learning)
+
+    def test_learning_extensions_are_hard_capped_and_snapshot_is_complete(self) -> None:
+        budget = roadmap.BaselineLivenessBudget(
+            base_iterations=8,
+            max_learning_extensions=8,
+        )
+        budget.record_generalization_attempt()
+        budget.record_diagnostic()
+        for learned in range(1, 25):
+            budget.observe_learned_constraints(learned)
+
+        snapshot = budget.snapshot(learned_constraints=24)
+        self.assertEqual(16, budget.allowed_iterations)
+        self.assertEqual(16, snapshot["hardIterations"])
+        self.assertEqual(8, snapshot["certifiedExtensions"])
+        self.assertEqual(24, snapshot["learnedConstraints"])
+        self.assertEqual(1, snapshot["generalizationAttempts"])
+        self.assertEqual(1, snapshot["diagnostics"])

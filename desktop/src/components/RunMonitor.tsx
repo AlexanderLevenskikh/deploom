@@ -62,8 +62,9 @@ export function RunMonitor({ logs, active, jobId, action, runStartedAt, migratio
     if (state.activity === 'planning') return t('monitor.activity.planning')
     if (state.activity === 'solving' || state.activity === 'searching-next') {
       const base = t(state.activity === 'searching-next' ? 'monitor.activity.searchingNext' : 'monitor.activity.solving')
-      return state.baseline?.iteration && state.baseline.maxIterations
-        ? `${base} · ${t('monitor.iteration')} ${state.baseline.iteration}/${state.baseline.maxIterations}`
+      const limit = state.baseline?.allowedIterations ?? state.baseline?.maxIterations
+      return state.baseline?.iteration && limit
+        ? `${base} · ${t('monitor.iteration')} ${state.baseline.iteration}/${limit}`
         : base
     }
     if (state.activity === 'verifying-assignment') return t('monitor.activity.verifying')
@@ -156,7 +157,16 @@ export function RunMonitor({ logs, active, jobId, action, runStartedAt, migratio
 
       <div className="run-monitor-facts">
         {state.retry ? <div><span>{t('monitor.attemptTime')}</span><strong>{state.retry.current}/{state.retry.total}{attemptDuration ? ` · ${attemptDuration}` : ''}</strong></div> : null}
-        {state.baseline?.iteration ? <div><span>{t('monitor.iteration')}</span><strong>{state.baseline.iteration}{state.baseline.maxIterations ? `/${state.baseline.maxIterations}` : ''}</strong></div> : null}
+        {state.baseline?.iteration ? <div><span>{t('monitor.iteration')}</span><strong>{state.baseline.iteration}{(state.baseline.allowedIterations ?? state.baseline.maxIterations) ? `/${state.baseline.allowedIterations ?? state.baseline.maxIterations}` : ''}</strong></div> : null}
+        {state.baseline?.hardIterations !== undefined ? <div><span>{t('monitor.hardBudget')}</span><strong>{state.baseline.hardIterations}</strong></div> : null}
+        {state.baseline?.learnedConstraints !== undefined ? <div><span>{t('monitor.learnedConstraints')}</span><strong>{state.baseline.learnedConstraints}</strong></div> : null}
+        {state.baseline?.certifiedExtensions !== undefined ? <div><span>{t('monitor.certifiedExtensions')}</span><strong>{state.baseline.certifiedExtensions}</strong></div> : null}
+        {state.baseline?.exactExclusions !== undefined ? <div><span>{t('monitor.exactExclusions')}</span><strong>{state.baseline.exactExclusions}</strong></div> : null}
+        {state.conflict?.candidate ? <div><span>{t('monitor.conflictCandidate')}</span><strong title={state.conflict.candidate}>{state.conflict.candidate}</strong></div> : null}
+        {state.conflict?.literals !== undefined ? <div><span>{t('monitor.literals')}</span><strong>{state.conflict.literals}</strong></div> : null}
+        {state.conflict?.literalBudget !== undefined ? <div><span>{t('monitor.literalBudget')}</span><strong>{state.conflict.literalBudget}</strong></div> : null}
+        {state.conflict?.boundedSlice !== undefined ? <div><span>{t('monitor.boundedSlice')}</span><strong>{state.conflict.boundedSlice ? 'true' : 'false'}</strong></div> : null}
+        {state.conflict?.seedSource ? <div><span>{t('monitor.seedSource')}</span><strong>{state.conflict.seedSource}</strong></div> : null}
         {state.dependency ? <div><span>{t('common.current')}</span><strong title={state.dependency.name}>{state.dependency.name}</strong></div> : null}
         {state.solver?.componentsTotal ? <div><span>{t('monitor.components')}</span><strong>{state.solver.componentsDone ?? 0}/{state.solver.componentsTotal}</strong></div> : null}
         {state.solver?.changed !== undefined ? <div><span>{t('monitor.changes')}</span><strong>{state.solver.changed}</strong></div> : null}

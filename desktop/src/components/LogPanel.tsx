@@ -22,6 +22,9 @@ type Props = {
 type LogView = 'activity' | 'raw'
 
 function sourceKey(source?: JobOutputSource): string { return source ? `${source.kind}:${source.id}` : 'system' }
+function isMachineTelemetry(entry: JobOutput): boolean {
+  return entry.line.trimStart().startsWith('DEPLOOM_PROGRESS_V2 ')
+}
 
 function formatTokens(value: number, language: Language): string {
   return new Intl.NumberFormat(language === 'ru' ? 'ru-RU' : 'en-US', {
@@ -82,8 +85,9 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
     return tool ? t('log.tool.generic', { name: tool[1] }) : title
   }
 
-  const sourceOptions = useMemo(() => mergeLogSources(logs, knownSources), [logs, knownSources])
-  const filteredLogs = useMemo(() => selectedSource === 'all' ? logs : selectedSource === 'system' ? logs.filter((entry) => !entry.source) : logs.filter((entry) => sourceKey(entry.source) === selectedSource), [logs, selectedSource])
+  const visibleLogs = useMemo(() => logs.filter((entry) => !isMachineTelemetry(entry)), [logs])
+  const sourceOptions = useMemo(() => mergeLogSources(visibleLogs, knownSources), [visibleLogs, knownSources])
+  const filteredLogs = useMemo(() => selectedSource === 'all' ? visibleLogs : selectedSource === 'system' ? visibleLogs.filter((entry) => !entry.source) : visibleLogs.filter((entry) => sourceKey(entry.source) === selectedSource), [selectedSource, visibleLogs])
   const selectedSourceInfo = sourceOptions.find(([key]) => key === selectedSource)?.[1]
   const addressedGroup = selectedSourceInfo?.kind === 'group' ? selectedSourceInfo : undefined
   const activity = useMemo(() => presentLogs(filteredLogs), [filteredLogs])

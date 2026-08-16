@@ -52,8 +52,32 @@ export type RunMonitorState = {
   dependency?: { current: number; total: number; name: string }
   projectCheck?: { current: number; total: number; name: string; status?: 'pass' | 'red' }
   solver?: { componentsDone?: number; componentsTotal?: number; changed?: number; constraints?: number }
-  baseline?: { iteration?: number; maxIterations?: number }
+  baseline?: {
+    mode?: string
+    iteration?: number
+    maxIterations?: number
+    baseIterations?: number
+    allowedIterations?: number
+    hardIterations?: number
+    learningExtensionLimit?: number
+    certifiedExtensions?: number
+    learnedConstraints?: number
+    exactExclusions?: number
+    exactSinceLearning?: number
+    generalizationAttempts?: number
+    diagnostics?: number
+  }
   assignment?: string
+  conflict?: {
+    candidate?: string
+    literals?: number
+    contextRadius?: number
+    repeatCount?: number
+    literalBudget?: number
+    boundedSlice?: boolean
+    seedSource?: string
+    authority?: string
+  }
   localization?: {
     initialUnits: number
     currentUnits: number
@@ -181,6 +205,65 @@ function earliestReceivedAt(logs: readonly JobOutput[]): number | undefined {
   return undefined
 }
 
+
+type StructuredBaselineProgress = {
+  schemaVersion: 2
+  type: 'deploom-baseline-progress'
+  project: string
+  mode: string
+  phase: string
+  updatedAt: string
+  [key: string]: unknown
+}
+
+const STRUCTURED_BASELINE_PREFIX = 'DEPLOOM_PROGRESS_V2 '
+
+function structuredBaselineProgress(line: string): StructuredBaselineProgress | undefined {
+  const trimmed = line.trim()
+  if (!trimmed.startsWith(STRUCTURED_BASELINE_PREFIX)) return undefined
+  try {
+    const parsed = JSON.parse(trimmed.slice(STRUCTURED_BASELINE_PREFIX.length)) as Partial<StructuredBaselineProgress>
+    if (
+      parsed.schemaVersion !== 2
+      || parsed.type !== 'deploom-baseline-progress'
+      || typeof parsed.phase !== 'string'
+      || typeof parsed.mode !== 'string'
+      || typeof parsed.updatedAt !== 'string'
+    ) return undefined
+    return parsed as StructuredBaselineProgress
+  } catch {
+    return undefined
+  }
+}
+
+function structuredNumber(event: StructuredBaselineProgress, key: string): number | undefined {
+  const value = event[key]
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function structuredText(event: StructuredBaselineProgress, key: string): string | undefined {
+  const value = event[key]
+  return typeof value === 'string' && value ? value : undefined
+}
+
+function structuredBoolean(event: StructuredBaselineProgress, key: string): boolean | undefined {
+  const value = event[key]
+  return typeof value === 'boolean' ? value : undefined
+}
+
+function structuredTransition(phase: string): { phase: RunMonitorPhase; activity: RunMonitorActivity } | undefined {
+  if (phase === 'solve-and-verify-started' || phase === 'iteration-started') return { phase: 'solving', activity: 'solving' }
+  if (phase === 'exact-assignment-blocked' || phase === 'constraint-learned' || phase === 'generalization-certified') return { phase: 'solving', activity: 'searching-next' }
+  if (phase.startsWith('exact-assignment-confirmation')) return { phase: 'confirming', activity: 'confirming-exact' }
+  if (phase.startsWith('generalization-')) return { phase: 'confirming', activity: 'certifying-conflict' }
+  if (phase.startsWith('localization-confirmation')) return { phase: 'confirming', activity: 'confirming-localized' }
+  if (phase.startsWith('localization-')) return { phase: 'localizing', activity: 'localizing' }
+  if (phase.startsWith('reproduction-')) return { phase: 'reproducing', activity: 'reproducing' }
+  if (phase.includes('verification') || phase === 'project-preflight') return { phase: 'verifying', activity: 'verifying-assignment' }
+  if (phase === 'budget-exhausted') return { phase: 'solving', activity: 'searching-next' }
+  return undefined
+}
+
 export function deriveRunMonitor(
   logs: readonly JobOutput[],
   active: boolean,
@@ -218,6 +301,60 @@ export function deriveRunMonitor(
     const line = entry.line.trim()
     const receivedAt = entry.receivedAt
     let match: RegExpExecArray | null
+
+
+    const structured = structuredBaselineProgress(line)
+    if (structured) {
+      const parsedUpdatedAt = Date.parse(structured.updatedAt)
+      const eventAt = receivedAt ?? (Number.isFinite(parsedUpdatedAt) ? parsedUpdatedAt : undefined)
+      const transition = structuredTransition(structured.phase)
+      if (transition) move(transition.phase, transition.activity, eventAt)
+
+      const iteration = structuredNumber(structured, 'iteration')
+      const assignment = structuredText(structured, 'assignment')
+      const nextBaseline = {
+        ...state.baseline,
+        mode: structured.mode,
+        iteration: iteration ?? state.baseline?.iteration,
+        maxIterations: structuredNumber(structured, 'maxIterations') ?? state.baseline?.maxIterations,
+        baseIterations: structuredNumber(structured, 'baseIterations') ?? state.baseline?.baseIterations,
+        allowedIterations: structuredNumber(structured, 'allowedIterations') ?? state.baseline?.allowedIterations,
+        hardIterations: structuredNumber(structured, 'hardIterations') ?? state.baseline?.hardIterations,
+        learningExtensionLimit: structuredNumber(structured, 'learningExtensionLimit') ?? state.baseline?.learningExtensionLimit,
+        certifiedExtensions: structuredNumber(structured, 'certifiedExtensions') ?? state.baseline?.certifiedExtensions,
+        learnedConstraints: structuredNumber(structured, 'learnedConstraints') ?? state.baseline?.learnedConstraints,
+        exactExclusions: structuredNumber(structured, 'exactExclusions') ?? state.baseline?.exactExclusions,
+        exactSinceLearning: structuredNumber(structured, 'exactSinceLearning') ?? state.baseline?.exactSinceLearning,
+        generalizationAttempts: structuredNumber(structured, 'generalizationAttempts') ?? state.baseline?.generalizationAttempts,
+        diagnostics: structuredNumber(structured, 'diagnostics') ?? state.baseline?.diagnostics,
+      }
+
+      state = {
+        ...state,
+        baseline: nextBaseline,
+        assignment: assignment ?? state.assignment,
+      }
+
+      if (structured.phase.startsWith('generalization-')) {
+        state = {
+          ...state,
+          conflict: {
+            ...state.conflict,
+            candidate: structuredText(structured, 'candidate') ?? state.conflict?.candidate,
+            literals: structuredNumber(structured, 'literals') ?? state.conflict?.literals,
+            contextRadius: structuredNumber(structured, 'contextRadius') ?? state.conflict?.contextRadius,
+            repeatCount: structuredNumber(structured, 'repeatCount') ?? state.conflict?.repeatCount,
+            literalBudget: structuredNumber(structured, 'literalBudget') ?? state.conflict?.literalBudget,
+            boundedSlice: structuredBoolean(structured, 'boundedSlice') ?? state.conflict?.boundedSlice,
+            seedSource: structuredText(structured, 'seedSource') ?? state.conflict?.seedSource,
+            authority: structuredText(structured, 'authority') ?? state.conflict?.authority,
+          },
+        }
+      }
+
+      if (eventAt !== undefined) lastSignalAt = Math.max(lastSignalAt ?? 0, eventAt)
+      continue
+    }
 
     match = /transient retry (\d+)\/(\d+)/i.exec(line)
     if (match) {

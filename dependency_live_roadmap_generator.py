@@ -7501,6 +7501,79 @@ def _normalize_baseline_progress_details(details: Mapping[str, object]) -> Dict[
 
 
 
+
+class BaselineLivenessBudget:
+    # Progress-aware soft budget with a bounded hard safety ceiling.
+    # Only newly learned authoritative solver constraints extend the budget.
+
+    def __init__(
+        self,
+        *,
+        base_iterations: int,
+        max_learning_extensions: int,
+        starting_learned_constraints: int = 0,
+    ) -> None:
+        self.base_iterations = max(1, int(base_iterations))
+        self.max_learning_extensions = max(0, int(max_learning_extensions))
+        self.starting_learned_constraints = max(0, int(starting_learned_constraints))
+        self.learned_constraints = self.starting_learned_constraints
+        self.certified_extensions = 0
+        self.exact_exclusions = 0
+        self.exact_since_learning = 0
+        self.generalization_attempts = 0
+        self.diagnostics = 0
+
+    @property
+    def hard_iterations(self) -> int:
+        return self.base_iterations + self.max_learning_extensions
+
+    @property
+    def allowed_iterations(self) -> int:
+        return min(
+            self.hard_iterations,
+            self.base_iterations + self.certified_extensions,
+        )
+
+    def observe_learned_constraints(self, learned_constraints: int) -> None:
+        current = max(self.starting_learned_constraints, int(learned_constraints))
+        if current <= self.learned_constraints:
+            return
+        self.learned_constraints = current
+        self.certified_extensions = min(
+            self.max_learning_extensions,
+            max(0, current - self.starting_learned_constraints),
+        )
+        self.exact_since_learning = 0
+
+    def record_certified_constraint(self) -> None:
+        self.observe_learned_constraints(self.learned_constraints + 1)
+
+    def record_exact_exclusion(self) -> None:
+        self.exact_exclusions += 1
+        self.exact_since_learning += 1
+
+    def record_generalization_attempt(self) -> None:
+        self.generalization_attempts += 1
+
+    def record_diagnostic(self) -> None:
+        self.diagnostics += 1
+
+    def snapshot(self, *, learned_constraints: int) -> Dict[str, int]:
+        self.observe_learned_constraints(learned_constraints)
+        return {
+            "baseIterations": self.base_iterations,
+            "allowedIterations": self.allowed_iterations,
+            "hardIterations": self.hard_iterations,
+            "learningExtensionLimit": self.max_learning_extensions,
+            "certifiedExtensions": self.certified_extensions,
+            "learnedConstraints": self.learned_constraints,
+            "exactExclusions": self.exact_exclusions,
+            "exactSinceLearning": self.exact_since_learning,
+            "generalizationAttempts": self.generalization_attempts,
+            "diagnostics": self.diagnostics,
+        }
+
+
 class BaselineProgressReporter:
     """Live + persisted progress for long deterministic verification phases."""
 
@@ -7515,7 +7588,7 @@ class BaselineProgressReporter:
                 self._terminal = False
             if self._terminal and ("check" in phase or "heartbeat" in phase or "running" in phase):
                 return
-            if phase in {"localization-timeout", "mode-passed", "mode-passed-no-changes"}:
+            if phase in {"localization-timeout", "mode-passed", "mode-passed-no-changes", "budget-exhausted"}:
                 self._terminal = True
             payload = {
                 "schemaVersion": 1,
@@ -7525,6 +7598,24 @@ class BaselineProgressReporter:
                 "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
                 **details,
             }
+
+            # Versioned machine channel for Desktop. The persisted latest-state
+            # file deliberately stays schemaVersion=1 for backwards compatibility.
+            stream_payload = {
+                **payload,
+                "schemaVersion": 2,
+                "type": "deploom-baseline-progress",
+            }
+            eprint(
+                "DEPLOOM_PROGRESS_V2 "
+                + json.dumps(
+                    stream_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+
             if self.path is not None:
                 try:
                     self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -8076,17 +8167,39 @@ def resolve_peer_compatibility_with_verification(
         }
 
         for mode in modes:
+            liveness = BaselineLivenessBudget(
+                base_iterations=config.max_iterations,
+                max_learning_extensions=config.max_iterations,
+                starting_learned_constraints=len(learned[project][mode]),
+            )
             eprint(
                 f"[info] {project}: Baseline solve-and-verify {mode} started; "
-                f"maxIterations={config.max_iterations}, parallelism={config.parallelism}"
+                f"maxIterations={config.max_iterations}, hardIterations={liveness.hard_iterations}, "
+                f"learningExtensionLimit={liveness.max_learning_extensions}, parallelism={config.parallelism}"
             )
             progress_reporter.emit(
-                project, mode, "solve-and-verify-started", maxIterations=config.max_iterations,
-                parallelism=config.parallelism, maxDeltaChecks=config.max_delta_checks,
-                subprocessTimeoutSeconds=config.timeout_seconds, attemptHardTimeoutSeconds=config.attempt_timeout_seconds, localizationHardTimeoutSeconds=config.localization_timeout_seconds,
+                project,
+                mode,
+                "solve-and-verify-started",
+                maxIterations=config.max_iterations,
+                parallelism=config.parallelism,
+                maxDeltaChecks=config.max_delta_checks,
+                subprocessTimeoutSeconds=config.timeout_seconds,
+                attemptHardTimeoutSeconds=config.attempt_timeout_seconds,
+                localizationHardTimeoutSeconds=config.localization_timeout_seconds,
+                **liveness.snapshot(learned_constraints=len(learned[project][mode])),
             )
             last_fingerprint = ""
-            for iteration in range(1, config.max_iterations + 1):
+            iteration = 0
+            while iteration < liveness.allowed_iterations:
+                iteration += 1
+                progress_reporter.emit(
+                    project,
+                    mode,
+                    "iteration-started",
+                    iteration=iteration,
+                    **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                )
                 solver_statuses: Dict[str, Dict[str, Dict[str, str]]] = {}
                 candidate_map = resolve_peer_compatibility(
                     {project: rows}, client,
@@ -8119,7 +8232,14 @@ def resolve_peer_compatibility_with_verification(
                     else:
                         eprint(f"[info] {project}: Baseline verify {mode}: no target changes to materialize")
                     final_assignments.setdefault(project, {})[mode] = assignment
-                    progress_reporter.emit(project, mode, "mode-passed-no-changes", iteration=iteration, assignment=fingerprint)
+                    progress_reporter.emit(
+                        project,
+                        mode,
+                        "mode-passed-no-changes",
+                        iteration=iteration,
+                        assignment=fingerprint,
+                        **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                    )
                     break
 
                 cache_key = (str(spec.path.resolve()), tuple(sorted(verification_assignment.items())), tuple(sorted(removals)))
@@ -8237,7 +8357,14 @@ def resolve_peer_compatibility_with_verification(
                                 f"[info] {project}: Baseline solve-and-verify {mode} PASSED "
                                 f"after {iteration} iteration(s); assignment={fingerprint}"
                             )
-                        progress_reporter.emit(project, mode, "mode-passed", iteration=iteration, assignment=fingerprint)
+                        progress_reporter.emit(
+                            project,
+                            mode,
+                            "mode-passed",
+                            iteration=iteration,
+                            assignment=fingerprint,
+                            **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                        )
                         break
 
                 # Proof-preserving fast path: forbid exactly the full assignment
@@ -8387,6 +8514,7 @@ def resolve_peer_compatibility_with_verification(
                             authority=EVIDENCE_DIAGNOSTIC_HINT,
                         )
                     if candidate is not None:
+                        liveness.record_generalization_attempt()
                         candidate_fingerprint = assignment_fingerprint(candidate)
                         progress_reporter.emit(
                             project, mode, "generalization-proposed",
@@ -8508,6 +8636,7 @@ def resolve_peer_compatibility_with_verification(
                                     "was already learned"
                                 )
                             learned[project][mode].append(generalized_nogood)
+                            liveness.observe_learned_constraints(len(learned[project][mode]))
                             localization_checkpoint_store.clear(project, mode)
                             eprint(
                                 f"[warn] {project}: graph-guided constraint certified; "
@@ -8521,11 +8650,16 @@ def resolve_peer_compatibility_with_verification(
                                 literals=len(generalized_nogood),
                                 contextRadius=(proposal.context_radius if proposal is not None else 1),
                                 repeatCount=(proposal.repeat_count if proposal is not None else 1),
+                                literalBudget=(proposal.literal_budget if proposal is not None else len(generalized_nogood)),
+                                boundedSlice=(proposal.bounded_slice if proposal is not None else False),
+                                seedSource=(proposal.seed_source if proposal is not None else "legacy"),
                                 authority=EVIDENCE_CONFIRMED_CONSTRAINT,
                                 predicate=stable_predicate,
+                                **liveness.snapshot(learned_constraints=len(learned[project][mode])),
                             )
                             continue
 
+                        liveness.record_diagnostic()
                         progress_reporter.emit(
                             project, mode, "generalization-not-certified",
                             iteration=iteration, assignment=fingerprint,
@@ -8566,6 +8700,7 @@ def resolve_peer_compatibility_with_verification(
                         )
 
                     global_exact_exclusions[project][mode].append(exact_nogood)
+                    liveness.record_exact_exclusion()
                     localization_checkpoint_store.clear(project, mode)
                     eprint(
                         f"[warn] {project}: blocked exact failing assignment {fingerprint} "
@@ -8579,6 +8714,7 @@ def resolve_peer_compatibility_with_verification(
                         literals=len(exact_nogood), origin=result.kind,
                         authority=EVIDENCE_CONFIRMED_CONSTRAINT,
                         topologyMerged=False,
+                        **liveness.snapshot(learned_constraints=len(learned[project][mode])),
                     )
                     continue
 
@@ -8854,6 +8990,7 @@ def resolve_peer_compatibility_with_verification(
                         f"{assignment_fingerprint(nogood)}; {result.summary}"
                     )
                 learned[project][mode].append(nogood)
+                liveness.observe_learned_constraints(len(learned[project][mode]))
                 # Keep the finished localization checkpoint through project
                 # reproductions; clear only after the clause becomes solver authority.
                 localization_checkpoint_store.clear(project, mode)
@@ -8922,16 +9059,41 @@ def resolve_peer_compatibility_with_verification(
                     f"NOT({detail}); verification checks localized in parallel"
                 )
                 progress_reporter.emit(
-                    project, mode, "constraint-learned", iteration=iteration, assignment=fingerprint,
-                    constraintNumber=len(learned[project][mode]), literals=dict(nogood),
+                    project,
+                    mode,
+                    "constraint-learned",
+                    iteration=iteration,
+                    assignment=fingerprint,
+                    constraintNumber=len(learned[project][mode]),
+                    literals=dict(nogood),
+                    **liveness.snapshot(learned_constraints=len(learned[project][mode])),
                 )
                 if fingerprint == last_fingerprint and len(learned[project][mode]) > 1:
                     eprint(f"[warn] {project}: solver repeated assignment {fingerprint}; learned constraint should force next repair")
                 last_fingerprint = fingerprint
             else:
+                summary = liveness.snapshot(
+                    learned_constraints=len(learned[project][mode])
+                )
+                progress_reporter.emit(
+                    project,
+                    mode,
+                    "budget-exhausted",
+                    iteration=iteration,
+                    assignment=last_fingerprint,
+                    reason="no-resolver-green-assignment",
+                    **summary,
+                )
                 raise BaselineConstraintVerificationError(
-                    f"BASELINE_CONSTRAINT_BUDGET_EXHAUSTED: {project}/{mode}: no resolver-green assignment after "
-                    f"{config.max_iterations} solve-and-verify iterations"
+                    f"BASELINE_CONSTRAINT_BUDGET_EXHAUSTED: {project}/{mode}: "
+                    f"no resolver-green assignment after {iteration} solve-and-verify iteration(s); "
+                    f"baseIterations={summary['baseIterations']}, "
+                    f"allowedIterations={summary['allowedIterations']}, "
+                    f"hardIterations={summary['hardIterations']}, "
+                    f"certifiedExtensions={summary['certifiedExtensions']}, "
+                    f"learnedConstraints={summary['learnedConstraints']}, "
+                    f"exactExclusions={summary['exactExclusions']}, "
+                    f"exactSinceLearning={summary['exactSinceLearning']}"
                 )
 
     # Re-run only as a fail-closed consistency assertion while legacy target/cohort
