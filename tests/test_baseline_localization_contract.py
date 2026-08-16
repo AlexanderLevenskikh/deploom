@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 from types import SimpleNamespace
 
 import dependency_live_roadmap_generator as roadmap
-from baseline_constraint_verifier import _apply_assignment
+from baseline_constraint_verifier import BaselineProjectFailure, BaselineVerifyConfig, BaselineVerifyResult, _apply_assignment
 from constraint_verify import VerificationUnit
 
 
@@ -93,6 +93,34 @@ class BaselineLocalizationContractTests(unittest.TestCase):
             "combined = verify_assignment(\n"
             "                            spec.path, changed, config=config, run_project_checks=True",
             source,
+        )
+
+
+    def test_adaptive_confirmation_runs_only_structurally_responsible_commands(self) -> None:
+        result = BaselineVerifyResult(
+            False,
+            "project",
+            "project preflight failed",
+            project_failures=(
+                BaselineProjectFailure(
+                    "yarn lint:types",
+                    2,
+                    "TS2307 Cannot find module '@vitejs/plugin-react' and could not be resolved under your current moduleResolution setting",
+                ),
+                BaselineProjectFailure(
+                    "yarn lint:scripts",
+                    1,
+                    "src/App.tsx: ordinary eslint migration debt",
+                ),
+            ),
+        )
+        config = BaselineVerifyConfig(
+            project_checks="adaptive",
+            commands=("yarn lint:types", "yarn lint:scripts", "yarn build"),
+        )
+        self.assertEqual(
+            ("yarn lint:types",),
+            roadmap._targeted_adaptive_confirmation_commands(result, config),
         )
 
 

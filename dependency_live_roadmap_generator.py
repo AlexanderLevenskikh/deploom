@@ -6673,6 +6673,34 @@ def _verification_assignment(
 
 
 
+
+def _targeted_adaptive_confirmation_commands(
+    result: BaselineVerifyResult,
+    config: BaselineVerifyConfig,
+) -> Tuple[str, ...]:
+    """Commands that actually produced adaptive structural evidence."""
+    if (
+        result.kind != "project"
+        or config.project_checks != "adaptive"
+        or not result.project_failures
+    ):
+        return config.commands
+
+    responsible: List[str] = []
+    for failure in result.project_failures:
+        single = BaselineVerifyResult(
+            False,
+            "project",
+            f"project preflight failed: {failure.command}",
+            command=failure.command,
+            output=failure.output,
+            project_failures=(failure,),
+        )
+        if structural_project_failure_signatures(single) and failure.command not in responsible:
+            responsible.append(failure.command)
+    return tuple(responsible) or config.commands
+
+
 def _verification_inputs_for_units(
     assignment: Dict[str, str],
     rows_by_name: Dict[str, DependencyRow],
@@ -6977,10 +7005,16 @@ def resolve_peer_compatibility_with_verification(
             if progress_path is not None
             else None
         )
+        verification_proof_cache_dir = (
+            progress_path.parent.parent / "cache" / "baseline-proofs"
+            if progress_path is not None
+            else None
+        )
         config = dataclasses.replace(
             config,
             registry=client.registry,
             telemetry_path=str(verification_telemetry_path) if verification_telemetry_path is not None else "",
+            proof_cache_dir=str(verification_proof_cache_dir) if verification_proof_cache_dir is not None else "",
         )
         if not config.enabled:
             eprint(f"[info] {project}: Baseline constraint verification disabled by configuration")
@@ -7289,6 +7323,21 @@ def resolve_peer_compatibility_with_verification(
                         )
 
                     confirmation_project_checks = result.kind in {"preparation", "project"}
+                    confirmation_config = config
+                    if result.kind == "project" and config.project_checks == "adaptive":
+                        targeted_commands = _targeted_adaptive_confirmation_commands(result, config)
+                        if targeted_commands != config.commands:
+                            confirmation_config = dataclasses.replace(config, commands=targeted_commands)
+                            eprint(
+                                f"[info] {project}: exact confirmation narrowed project checks "
+                                f"from {len(config.commands)} to {len(targeted_commands)} responsible command(s): "
+                                f"{', '.join(targeted_commands)}"
+                            )
+                            progress_reporter.emit(
+                                project, mode, "exact-assignment-confirmation-targeted",
+                                iteration=iteration, assignment=fingerprint,
+                                commands=list(targeted_commands),
+                            )
                     expected_signature = dependency_failure_signature(
                         summary=result.summary, output=result.output
                     )
@@ -7307,7 +7356,7 @@ def resolve_peer_compatibility_with_verification(
                         literals=len(exact_nogood), origin=result.kind,
                     )
                     confirmation = verify_assignment(
-                        spec.path, verification_assignment, config=config,
+                        spec.path, verification_assignment, config=confirmation_config,
                         run_project_checks=confirmation_project_checks, remove_packages=removals,
                         progress=lambda message: (
                             progress_reporter.emit(

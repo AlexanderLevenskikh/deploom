@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import subprocess
 import tempfile
@@ -403,6 +404,93 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                     progress_interval_seconds=1,
                 )
         self.assertTrue(any("HARD_TIMEOUT" in message for message in messages))
+
+    def test_exact_resolver_proof_cache_hit_skips_uncached_verifier(self) -> None:
+        from verification_proof import VerificationProofStore, build_verification_proof_identity
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            (root / "package.json").write_text(
+                json.dumps({"packageManager": "npm@11.0.0", "dependencies": {"demo": "1.0.0"}}),
+                encoding="utf-8",
+            )
+            cache = Path(tmp) / "cas"
+            config = BaselineVerifyConfig(project_checks="off", proof_cache_dir=str(cache))
+            identity = build_verification_proof_identity(
+                root,
+                assignment={"demo": "2.0.0"},
+                remove_packages=(),
+                manager="npm",
+                manager_executable=sys.executable,
+                registry="",
+                project_checks="off",
+                commands=(),
+                environment=dict(os.environ),
+            )
+            VerificationProofStore(cache).publish_pass("resolver", identity.resolver_input_key, identity)
+
+            with patch("baseline_constraint_verifier.resolve_executable", return_value=sys.executable), \
+                    patch("baseline_constraint_verifier._verify_assignment_uncached") as uncached:
+                result = verify_assignment(
+                    root,
+                    {"demo": "2.0.0"},
+                    config=config,
+                    run_project_checks=False,
+                )
+            self.assertTrue(result.ok)
+            self.assertIn("ResolverProof cache hit", result.summary)
+            uncached.assert_not_called()
+
+    def test_resolver_cache_hit_marks_combined_verification_for_resolver_skip(self) -> None:
+        from verification_proof import VerificationProofStore, build_verification_proof_identity
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            root.mkdir()
+            (root / "package.json").write_text(
+                json.dumps({
+                    "packageManager": "npm@11.0.0",
+                    "dependencies": {"demo": "1.0.0"},
+                    "scripts": {"typecheck": "tsc"},
+                }),
+                encoding="utf-8",
+            )
+            cache = Path(tmp) / "cas"
+            config = BaselineVerifyConfig(
+                project_checks="adaptive",
+                commands=("npm run typecheck",),
+                proof_cache_dir=str(cache),
+            )
+            identity = build_verification_proof_identity(
+                root,
+                assignment={"demo": "2.0.0"},
+                remove_packages=(),
+                manager="npm",
+                manager_executable=sys.executable,
+                registry="",
+                project_checks="adaptive",
+                commands=("npm run typecheck",),
+                environment=dict(os.environ),
+            )
+            VerificationProofStore(cache).publish_pass("resolver", identity.resolver_input_key, identity)
+
+            captured = {}
+            def fake_uncached(project_dir, assignment, *, config, **kwargs):
+                captured["reuse"] = config.reuse_resolver_proof_key
+                return BaselineVerifyResult(True, "passed", "fresh lifecycle/project verification")
+
+            with patch("baseline_constraint_verifier.resolve_executable", return_value=sys.executable), \
+                    patch("baseline_constraint_verifier._verify_assignment_uncached", side_effect=fake_uncached):
+                result = verify_assignment(
+                    root,
+                    {"demo": "2.0.0"},
+                    config=config,
+                    run_project_checks=True,
+                )
+            self.assertTrue(result.ok)
+            self.assertEqual(identity.resolver_input_key, captured["reuse"])
+
 
 
 if __name__ == "__main__":

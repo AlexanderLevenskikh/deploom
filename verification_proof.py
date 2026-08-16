@@ -11,7 +11,7 @@ import threading
 from pathlib import Path
 from typing import Mapping, Sequence
 
-PROOF_SCHEMA_VERSION = "baseline-proof-v1"
+PROOF_SCHEMA_VERSION = "baseline-proof-v2"
 
 _RESOLVER_FILES = (
     "package.json",
@@ -28,7 +28,8 @@ _RESOLVER_FILES = (
 )
 
 _EXCLUDED_FALLBACK_DIRS = {
-    ".git", "node_modules", "dist", "build", ".cache", ".idea", ".vs", ".vscode", ".fleet",
+    ".git", "node_modules", "dist", "build", ".cache", ".dependency-roadmap",
+    ".idea", ".vs", ".vscode", ".fleet",
 }
 
 _TELEMETRY_LOCKS: dict[str, threading.Lock] = {}
@@ -109,7 +110,10 @@ def source_snapshot_fingerprint(project_dir: Path) -> str:
 
     status = _run_git(
         project_dir,
-        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."],
+        [
+            "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".",
+            ":(exclude).dependency-roadmap/**",
+        ],
     )
     if status.returncode == 0 and not status.stdout:
         return _canonical_hash({
@@ -118,9 +122,13 @@ def source_snapshot_fingerprint(project_dir: Path) -> str:
             "relative": relative,
         })
 
-    diff = _run_git(project_dir, ["diff", "--binary", "HEAD", "--", "."])
+    diff = _run_git(project_dir, ["diff", "--binary", "HEAD", "--", ".", ":(exclude).dependency-roadmap/**"])
     untracked = _run_git(
-        project_dir, ["ls-files", "--others", "--exclude-standard", "-z", "--", "."]
+        project_dir,
+        [
+            "ls-files", "--others", "--exclude-standard", "-z", "--", ".",
+            ":(exclude).dependency-roadmap/**",
+        ],
     )
     untracked_hashes: list[tuple[str, str]] = []
     if untracked.returncode == 0:
@@ -314,6 +322,101 @@ def build_verification_proof_identity(
         project_proof_key=project_key,
         localization_experiment_key=localization_key,
     )
+
+
+
+_ALLOWED_PROOF_TYPES = frozenset({"resolver", "preparation", "project"})
+
+
+@dataclasses.dataclass(frozen=True)
+class CachedProofRecord:
+    proof_type: str
+    key: str
+    created_at: str
+    identity: Mapping[str, str]
+
+
+class VerificationProofStore:
+    """PASS-only CAS for exact proof identities."""
+
+    def __init__(self, root: Path | None):
+        self.root = root.resolve() if root is not None else None
+
+    def _path(self, proof_type: str, key: str) -> Path | None:
+        if self.root is None or proof_type not in _ALLOWED_PROOF_TYPES:
+            return None
+        normalized = key.lower()
+        if not normalized or any(ch not in "0123456789abcdef" for ch in normalized):
+            return None
+        return self.root / proof_type / f"{normalized}.json"
+
+    def lookup_pass(self, proof_type: str, key: str) -> CachedProofRecord | None:
+        path = self._path(proof_type, key)
+        if path is None or not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("schemaVersion") != 1:
+            return None
+        if payload.get("proofSchema") != PROOF_SCHEMA_VERSION:
+            return None
+        if payload.get("proofType") != proof_type or payload.get("key") != key:
+            return None
+        if payload.get("outcome") != "passed":
+            return None
+        identity = payload.get("identity")
+        if not isinstance(identity, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in identity.items()
+        ):
+            return None
+        return CachedProofRecord(
+            proof_type=proof_type,
+            key=key,
+            created_at=str(payload.get("createdAt") or ""),
+            identity=dict(identity),
+        )
+
+    def publish_pass(
+        self,
+        proof_type: str,
+        key: str,
+        identity: VerificationProofIdentity,
+    ) -> bool:
+        path = self._path(proof_type, key)
+        if path is None:
+            return False
+        payload = {
+            "schemaVersion": 1,
+            "proofSchema": PROOF_SCHEMA_VERSION,
+            "proofType": proof_type,
+            "key": key,
+            "outcome": "passed",
+            "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "identity": identity.event_fields(),
+        }
+        temp: Path | None = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_name(
+                path.name + f".tmp-{os.getpid()}-{threading.get_ident()}"
+            )
+            temp.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temp, path)
+            return True
+        except OSError:
+            if temp is not None:
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
+            return False
 
 
 def _telemetry_lock(path: Path) -> threading.Lock:

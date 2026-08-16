@@ -30,6 +30,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, 
 
 from verification_proof import (
     VerificationProofIdentity,
+    VerificationProofStore,
     build_verification_proof_identity,
     emit_verification_event,
 )
@@ -48,6 +49,8 @@ class BaselineVerifyConfig:
     commands: Tuple[str, ...] = ()
     registry: str = ""
     telemetry_path: str = ""
+    proof_cache_dir: str = ""
+    reuse_resolver_proof_key: str = ""
 
     @staticmethod
     def from_mapping(value: Optional[Mapping[str, object]], *, fallback_commands: Sequence[str] = ()) -> "BaselineVerifyConfig":
@@ -651,6 +654,14 @@ def verify_assignment(
         )
         event("proof.identity", manager=manager)
 
+        proof_store = VerificationProofStore(
+            Path(config.proof_cache_dir) if config.proof_cache_dir else None
+        )
+
+        def publish_pass(proof_type: str, key: str) -> None:
+            if proof_store.publish_pass(proof_type, key, proof_identity):
+                event("proof.cache.publish", proofType=proof_type, cacheKey=key)
+
         install = install_args(manager, ignore_scripts=True)
         argv, _ = _command_prefix(executable, install)
         install_env = {
@@ -659,42 +670,59 @@ def verify_assignment(
             "YARN_ENABLE_SCRIPTS": "false",
             "npm_config_ignore_scripts": "true",
         }
-        resolver_started = time.monotonic()
-        event("verify.resolver.start", command=" ".join(argv))
-        try:
-            result = _run(
-                argv,
-                workspace_project,
-                timeout_seconds=phase_timeout(),
-                env=install_env,
-                base_env=base_env,
-                progress=phase_progress("resolver-install"),
-                progress_label="package-manager resolver install",
-                progress_interval_seconds=config.progress_interval_seconds,
-            )
-        except subprocess.TimeoutExpired as exc:
-            return BaselineVerifyResult(False, "infrastructure", f"package-manager verification timed out: {exc}", command=" ".join(argv))
-        except OSError as exc:
-            return BaselineVerifyResult(False, "infrastructure", f"package-manager launch failed: {exc}", command=" ".join(argv))
-
-        output = result.stdout or ""
-        kind = "passed" if result.returncode == 0 else _classify_install_failure(output)
-        event(
-            "verify.resolver.finish",
-            durationMs=int((time.monotonic() - resolver_started) * 1000),
-            exitCode=result.returncode,
-            outcome=kind,
+        resolver_reused = bool(
+            config.reuse_resolver_proof_key
+            and config.reuse_resolver_proof_key == proof_identity.resolver_input_key
         )
-        if result.returncode != 0:
-            tail = "\n".join(output.splitlines()[-80:])
-            return BaselineVerifyResult(
-                False,
-                kind,
-                f"{manager} resolver preflight failed for {len(changed)} changed direct package(s)",
-                command=" ".join(argv),
-                output=tail,
-                workspace=str(workspace_project),
+        if resolver_reused:
+            event(
+                "proof.cache.hit",
+                proofType="resolver",
+                cacheKey=proof_identity.resolver_input_key,
+                reuseMode="skip-scripts-off-install",
             )
+            _emit_progress(
+                progress,
+                f"{progress_label}: resolver PASS reused from exact ResolverInputKey; "
+                "lifecycle materialization remains fresh",
+            )
+        else:
+            resolver_started = time.monotonic()
+            event("verify.resolver.start", command=" ".join(argv))
+            try:
+                result = _run(
+                    argv,
+                    workspace_project,
+                    timeout_seconds=phase_timeout(),
+                    env=install_env,
+                    base_env=base_env,
+                    progress=phase_progress("resolver-install"),
+                    progress_label="package-manager resolver install",
+                    progress_interval_seconds=config.progress_interval_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                return BaselineVerifyResult(False, "infrastructure", f"package-manager verification timed out: {exc}", command=" ".join(argv))
+            except OSError as exc:
+                return BaselineVerifyResult(False, "infrastructure", f"package-manager launch failed: {exc}", command=" ".join(argv))
+
+            output = result.stdout or ""
+            kind = "passed" if result.returncode == 0 else _classify_install_failure(output)
+            event(
+                "verify.resolver.finish",
+                durationMs=int((time.monotonic() - resolver_started) * 1000),
+                exitCode=result.returncode,
+                outcome=kind,
+            )
+            if result.returncode != 0:
+                tail = "\n".join(output.splitlines()[-80:])
+                return BaselineVerifyResult(
+                    False,
+                    kind,
+                    f"{manager} resolver preflight failed for {len(changed)} changed direct package(s)",
+                    command=" ".join(argv),
+                    output=tail,
+                    workspace=str(workspace_project),
+                )
 
         try:
             materialized_manifest = json.loads((workspace_project / "package.json").read_text(encoding="utf-8"))
@@ -714,6 +742,8 @@ def verify_assignment(
                     f"observed {observed_versions!r}",
                     workspace=str(workspace_project),
                 )
+
+        publish_pass("resolver", proof_identity.resolver_input_key)
 
         if run_project_checks and config.project_checks != "off" and config.commands:
             # Re-enable lifecycle scripts before project verification. This is
@@ -762,6 +792,8 @@ def verify_assignment(
                     "assignment resolves, but lifecycle/preparation failed deterministically",
                     command=" ".join(full_argv), output=tail, workspace=str(workspace_project),
                 )
+
+            publish_pass("preparation", proof_identity.preparation_proof_key)
 
             project_failures: List[BaselineProjectFailure] = []
             for command_index, command in enumerate(config.commands, start=1):
@@ -827,6 +859,9 @@ def verify_assignment(
                     output=output[-16000:], workspace=str(workspace_project), project_failures=tuple(project_failures),
                 )
 
+        if run_project_checks and config.project_checks != "off" and config.commands:
+            publish_pass("project", proof_identity.project_proof_key)
+
         _emit_progress(progress, f"{progress_label}: completed; elapsed={int(time.monotonic() - attempt_started)}s")
         event("verify.attempt.finish", outcome="passed")
         return BaselineVerifyResult(
@@ -840,3 +875,128 @@ def verify_assignment(
 def assignment_fingerprint(assignment: Mapping[str, str]) -> str:
     payload = json.dumps(dict(sorted(assignment.items())), separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+_verify_assignment_uncached = verify_assignment
+
+
+def verify_assignment(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    *,
+    config: BaselineVerifyConfig,
+    run_project_checks: bool = False,
+    remove_packages: Iterable[str] = (),
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "assignment verification",
+) -> BaselineVerifyResult:
+    """Cache-aware proof entry point."""
+    project_dir = project_dir.resolve()
+    proof_store = VerificationProofStore(
+        Path(config.proof_cache_dir) if config.proof_cache_dir else None
+    )
+    if proof_store.root is None:
+        return _verify_assignment_uncached(
+            project_dir,
+            assignment,
+            config=config,
+            run_project_checks=run_project_checks,
+            remove_packages=remove_packages,
+            progress=progress,
+            progress_label=progress_label,
+        )
+
+    manager = detect_package_manager(project_dir)
+    executable = resolve_executable(manager)
+    if not executable:
+        return _verify_assignment_uncached(
+            project_dir,
+            assignment,
+            config=config,
+            run_project_checks=run_project_checks,
+            remove_packages=remove_packages,
+            progress=progress,
+            progress_label=progress_label,
+        )
+
+    environment = dict(os.environ)
+    identity = build_verification_proof_identity(
+        project_dir,
+        assignment=assignment,
+        remove_packages=tuple(sorted(str(item) for item in remove_packages)),
+        manager=manager,
+        manager_executable=executable,
+        registry=config.registry,
+        project_checks=config.project_checks if run_project_checks else "off",
+        commands=config.commands if run_project_checks else (),
+        environment=environment,
+    )
+    telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
+
+    def cache_event(name: str, proof_type: str, key: str, **extra: object) -> None:
+        emit_verification_event(
+            telemetry_path,
+            name,
+            projectPath=str(project_dir),
+            label=progress_label,
+            proofType=proof_type,
+            cacheKey=key,
+            **identity.event_fields(),
+            **extra,
+        )
+
+    wants_project_proof = bool(
+        run_project_checks and config.project_checks != "off" and config.commands
+    )
+    if wants_project_proof:
+        cache_event("proof.cache.lookup", "project", identity.project_proof_key)
+        if proof_store.lookup_pass("project", identity.project_proof_key) is not None:
+            cache_event("proof.cache.hit", "project", identity.project_proof_key)
+            _emit_progress(
+                progress,
+                f"{progress_label}: exact ProjectProof cache HIT; "
+                "clone/install/lifecycle/project checks skipped",
+            )
+            return BaselineVerifyResult(
+                True,
+                "passed",
+                "exact ProjectProof cache hit",
+                command=f"proof-cache:{identity.project_proof_key[:12]}",
+            )
+        cache_event("proof.cache.miss", "project", identity.project_proof_key)
+
+    cache_event("proof.cache.lookup", "resolver", identity.resolver_input_key)
+    resolver_hit = proof_store.lookup_pass("resolver", identity.resolver_input_key) is not None
+    if resolver_hit:
+        cache_event("proof.cache.hit", "resolver", identity.resolver_input_key)
+        if not wants_project_proof:
+            _emit_progress(
+                progress,
+                f"{progress_label}: exact ResolverProof cache HIT; resolver verification skipped",
+            )
+            return BaselineVerifyResult(
+                True,
+                "passed",
+                "exact ResolverProof cache hit",
+                command=f"proof-cache:{identity.resolver_input_key[:12]}",
+            )
+    else:
+        cache_event("proof.cache.miss", "resolver", identity.resolver_input_key)
+
+    effective_config = (
+        dataclasses.replace(
+            config,
+            reuse_resolver_proof_key=identity.resolver_input_key,
+        )
+        if resolver_hit and wants_project_proof
+        else config
+    )
+    return _verify_assignment_uncached(
+        project_dir,
+        assignment,
+        config=effective_config,
+        run_project_checks=run_project_checks,
+        remove_packages=remove_packages,
+        progress=progress,
+        progress_label=progress_label,
+    )
