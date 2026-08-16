@@ -613,7 +613,12 @@ class PeerCompatibilitySolverTests(unittest.TestCase):
     def test_baseline_confirmation_describes_a_new_cycle(self):
         flow = (Path(roadmap.__file__).parent / "desktop/src/data/flow.ts").read_text(encoding="utf-8")
         self.assertNotIn("После начала обновления переснимать его нельзя", flow)
-        self.assertIn("Baseline начнёт новый цикл планирования", flow)
+        root = Path(__file__).resolve().parents[1]
+        ru = (root / "desktop" / "src" / "i18n" / "locales" / "ru.ts").read_text(encoding="utf-8")
+        en = (root / "desktop" / "src" / "i18n" / "locales" / "en.ts").read_text(encoding="utf-8")
+        self.assertIn("confirmationKey: 'flow.stage.baseline.confirmation'", flow)
+        self.assertIn('"flow.stage.baseline.confirmation": "Baseline начнёт новый цикл планирования', ru)
+        self.assertIn('"flow.stage.baseline.confirmation": "Baseline starts a new planning cycle', en)
 
     def test_dashboard_and_branch_plan_do_not_assume_five_groups(self):
         source = Path(roadmap.__file__).read_text(encoding="utf-8")

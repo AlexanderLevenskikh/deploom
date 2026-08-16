@@ -89,6 +89,8 @@ jobs:
           npm run check:target-closure
           npm run check:project-settings
           npm run check:log-presentation
+          npm run check:i18n
+          npm run check:run-monitor
           npm run check:app-icon
           npm run check:release-policy
           npm run check:merge-recovery
