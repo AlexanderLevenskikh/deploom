@@ -22,7 +22,14 @@ import time
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional
+from typing import (
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+)
 
 CACHE_SCHEMA_VERSION = 1
 SOLVER_SCHEMA_VERSION = "peer-ir-v1"
@@ -120,11 +127,162 @@ _WHITESPACE = re.compile(r"\s+")
 
 
 def dependency_failure_signature(*, summary: str, output: str) -> str:
-    """Normalize a resolver failure enough to compare fresh-workspace reruns."""
+    """Legacy strict failure identity.
+
+    This intentionally continues to hash the normalized complete output. It is
+    the fallback whenever no narrow structured resolver predicate is available.
+    """
     text = f"{summary}\n{output}".strip().lower()
     text = _FAILURE_PATH.sub("<workspace>", text)
     text = _WHITESPACE.sub(" ", text)
     return _sha256_bytes(text.encode("utf-8"))[:24]
+
+
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_NPM_ERESOLVE_PEER_BLOCK = re.compile(
+    r"found:\s*(?P<found>@?[a-z0-9_.-]+(?:/[a-z0-9_.-]+)?@[^\s]+)"
+    r".{0,5000}?"
+    r"could not resolve dependency:\s*"
+    r"(?:npm\s+(?:err!|error)\s*)?"
+    r"peer(?:optional)?\s+(?P<peer>.+?)\s+from\s+"
+    r"(?P<consumer>@?[a-z0-9_.-]+(?:/[a-z0-9_.-]+)?@[^\s,]+)",
+    re.IGNORECASE | re.DOTALL,
+)
+_NPM_MISSING_VERSION = re.compile(
+    r"no matching version found for\s+"
+    r"(?P<spec>@?[a-z0-9_.-]+(?:/[a-z0-9_.-]+)?@[^\s]+)",
+    re.IGNORECASE,
+)
+_YARN1_MISSING_VERSION = re.compile(
+    r"""couldn't find any versions for\s+["'](?P<package>[^"']+)["']\s+"""
+    r"""that matches\s+["'](?P<range>[^"']+)["']""",
+    re.IGNORECASE,
+)
+_YARN_BERRY_NO_CANDIDATES = re.compile(
+    r"\bYN0082\b(?P<body>[^\r\n]*)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_resolver_predicate_atom(value: str) -> str:
+    text = _ANSI_ESCAPE.sub("", str(value))
+    text = _FAILURE_PATH.sub("<workspace>", text)
+    text = text.replace('"', "").replace("'", "").replace("`", "")
+    text = _WHITESPACE.sub(" ", text.strip().lower())
+    return text.rstrip(".,;:")
+
+
+def _package_name_from_spec(value: str) -> str:
+    normalized = _normalize_resolver_predicate_atom(value)
+    head, separator, _version = normalized.rpartition("@")
+    if separator and head:
+        return head
+    return ""
+
+
+def dependency_failure_predicates(*, summary: str, output: str) -> Tuple[str, ...]:
+    """Extract only narrow fatal resolver facts suitable for proof comparison.
+
+    These facts are not authority on their own. They only compare two already
+    failed fresh verifier runs. Unknown output yields no structured predicate
+    and therefore falls back to the legacy strict whole-output identity.
+    """
+    text = _ANSI_ESCAPE.sub("", f"{summary}\n{output}")
+    facts: List[str] = []
+
+    # npm ERESOLVE: require both the concrete version actually found and the
+    # exact peer requirement/consumer. Requirement alone would be too broad.
+    if re.search(r"\bERESOLVE\b", text, re.IGNORECASE):
+        for match in _NPM_ERESOLVE_PEER_BLOCK.finditer(text):
+            found = _normalize_resolver_predicate_atom(match.group("found"))
+            peer = _normalize_resolver_predicate_atom(match.group("peer"))
+            consumer = _normalize_resolver_predicate_atom(match.group("consumer"))
+            found_name = _package_name_from_spec(found)
+            peer_name = _package_name_from_spec(peer)
+            if (
+                found
+                and peer
+                and consumer
+                and found_name
+                and peer_name
+                and found_name == peer_name
+            ):
+                facts.append(
+                    f"npm-eresolve-peer:found={found};required={peer};consumer={consumer}"
+                )
+
+    for match in _NPM_MISSING_VERSION.finditer(text):
+        spec = _normalize_resolver_predicate_atom(match.group("spec"))
+        if spec:
+            facts.append(f"missing-version:{spec}")
+
+    for match in _YARN1_MISSING_VERSION.finditer(text):
+        package = _normalize_resolver_predicate_atom(match.group("package"))
+        requested = _normalize_resolver_predicate_atom(match.group("range"))
+        if package and requested:
+            facts.append(f"missing-version:{package}@{requested}")
+
+    # YN0082 is a fatal Yarn Berry no-candidates resolver code. Preserve the
+    # normalized exact body rather than reducing it to a generic code.
+    for match in _YARN_BERRY_NO_CANDIDATES.finditer(text):
+        body = _normalize_resolver_predicate_atom(match.group("body"))
+        if body:
+            facts.append(f"yarn-yn0082:{body}")
+
+    return tuple(dict.fromkeys(facts))
+
+
+def _structured_dependency_predicate_signature(predicate: str) -> str:
+    digest = _sha256_bytes(
+        f"resolver-predicate-v2\0{predicate}".encode("utf-8")
+    )[:24]
+    return f"resolver-predicate-v2:{digest}"
+
+
+def matching_dependency_failure_signature(
+    *,
+    expected_summary: str,
+    expected_output: str,
+    observed_summary: str,
+    observed_output: str,
+) -> str:
+    """Match two failed resolver runs without trusting unrelated output noise.
+
+    Preferred path is an exact shared structured fatal fact. Opaque failures
+    retain the pre-existing strict normalized-whole-output equality.
+    """
+    expected_predicates = dependency_failure_predicates(
+        summary=expected_summary,
+        output=expected_output,
+    )
+    observed_predicates = set(
+        dependency_failure_predicates(
+            summary=observed_summary,
+            output=observed_output,
+        )
+    )
+    for predicate in expected_predicates:
+        if predicate in observed_predicates:
+            return _structured_dependency_predicate_signature(predicate)
+
+    expected_legacy = dependency_failure_signature(
+        summary=expected_summary,
+        output=expected_output,
+    )
+    observed_legacy = dependency_failure_signature(
+        summary=observed_summary,
+        output=observed_output,
+    )
+    return expected_legacy if expected_legacy == observed_legacy else ""
+
+
+def dependency_failure_navigation_signature(*, summary: str, output: str) -> str:
+    """Stable navigation key only; never solver authority."""
+    predicates = dependency_failure_predicates(summary=summary, output=output)
+    if predicates:
+        return _structured_dependency_predicate_signature(predicates[0])
+    return dependency_failure_signature(summary=summary, output=output)
+
 
 
 @dataclasses.dataclass(frozen=True)

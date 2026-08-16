@@ -230,5 +230,46 @@ class AdaptiveGraphGeneralizationTests(unittest.TestCase):
         )
 
 
+    def test_repeat_navigation_uses_structured_resolver_predicate(self) -> None:
+        first = BaselineVerifyResult(
+            False,
+            "dependency",
+            "npm resolver failed",
+            output=(
+                "npm ERR! code ERESOLVE\n"
+                "npm ERR! Found: vite@4.3.9\n"
+                "npm ERR! Could not resolve dependency:\n"
+                'npm ERR! peer vite@"^5.0.0" from vitest@3.2.6\n'
+                "full-assignment-only noise"
+            ),
+        )
+        second = BaselineVerifyResult(
+            False,
+            "dependency",
+            "npm resolver failed",
+            output=(
+                "candidate-only warning\n"
+                "npm ERR! code ERESOLVE\n"
+                "npm ERR! Found: vite@4.3.9\n"
+                "npm ERR! Could not resolve dependency:\n"
+                'npm ERR! peer vite@"^5.0.0" from vitest@3.2.6'
+            ),
+        )
+        self.assertEqual(
+            roadmap._graph_generalization_repeat_predicate(first),
+            roadmap._graph_generalization_repeat_predicate(second),
+        )
+
+    def test_production_dependency_certification_uses_structured_matcher(self) -> None:
+        source = inspect.getsource(
+            roadmap.resolve_peer_compatibility_with_verification
+        )
+        self.assertGreaterEqual(
+            source.count("matching_dependency_failure_signature("),
+            2,
+            source,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -136,8 +136,8 @@ INFRA_PATTERNS = re.compile(
 
 DEPENDENCY_PATTERNS = re.compile(
     r"(?:ERESOLVE|unable to resolve dependency tree|could not resolve dependency|"
-    r"No matching version found|Couldn't find any versions|YN0060|YN0082|"
-    r"peer dependency|conflicting peer dependency|resolution field .* incompatible)",
+    r"No matching version found|Couldn't find any versions|YN0082|"
+    r"conflicting peer dependency)",
     re.IGNORECASE,
 )
 

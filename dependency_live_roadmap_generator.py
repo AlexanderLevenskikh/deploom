@@ -101,6 +101,8 @@ from constraint_cache import (
     load_verified_nogoods,
     persist_verified_nogood,
     resolver_environment_fingerprint,
+    dependency_failure_navigation_signature,
+    matching_dependency_failure_signature,
 )
 from peer_solver_model import ForbiddenCombination, PackageVariable, PeerOptimizationModel, RequiresAny, forbidden
 from peer_solver_z3 import solve_z3_exact
@@ -7153,11 +7155,12 @@ def _graph_generalization_repeat_predicate(
     structural = structural_project_failure_signatures(result)
     if structural:
         return "structural:" + "|".join(sorted(structural))
-    signature = dependency_failure_signature(
+    signature = dependency_failure_navigation_signature(
         summary=result.summary,
         output=result.output,
     )
     return f"{result.kind}:{signature}"
+
 
 
 def _adaptive_graph_guided_generalization_proposal(
@@ -8089,12 +8092,17 @@ def resolve_peer_compatibility_with_verification(
                         )
 
                     if result.kind == "dependency":
-                        observed_signature = dependency_failure_signature(
-                            summary=confirmation.summary, output=confirmation.output
+                        observed_signature = (
+                            matching_dependency_failure_signature(
+                                expected_summary=result.summary,
+                                expected_output=result.output,
+                                observed_summary=confirmation.summary,
+                                observed_output=confirmation.output,
+                            )
+                            if confirmation.kind == "dependency"
+                            else ""
                         )
-                        confirmed_exact_failure = (
-                            confirmation.kind == "dependency" and observed_signature == expected_signature
-                        )
+                        confirmed_exact_failure = bool(observed_signature)
                     elif result.kind == "preparation":
                         observed_signature = dependency_failure_signature(
                             summary=confirmation.summary,
@@ -8226,11 +8234,13 @@ def resolve_peer_compatibility_with_verification(
                             predicate = ""
                             if result.kind == "dependency":
                                 if candidate_result.kind == "dependency" and not candidate_result.ok:
-                                    observed = dependency_failure_signature(
-                                        summary=candidate_result.summary,
-                                        output=candidate_result.output,
+                                    observed = matching_dependency_failure_signature(
+                                        expected_summary=result.summary,
+                                        expected_output=result.output,
+                                        observed_summary=candidate_result.summary,
+                                        observed_output=candidate_result.output,
                                     )
-                                    if observed == expected_signature:
+                                    if observed:
                                         predicate = observed
                             elif result.kind == "preparation":
                                 if candidate_result.kind == "preparation" and not candidate_result.ok:

@@ -15,6 +15,9 @@ from constraint_cache import (
     load_verified_nogoods,
     persist_verified_nogood,
     resolver_environment_fingerprint,
+    dependency_failure_navigation_signature,
+    dependency_failure_predicates,
+    matching_dependency_failure_signature,
 )
 
 
@@ -200,6 +203,147 @@ class ConstraintCacheTests(unittest.TestCase):
 
             self.assertGreaterEqual(len(captured), 1)
             self.assertIn({"a": "2.0.0", "b": "2.0.0"}, captured[0]["Demo"]["default"])
+
+
+    def test_structured_npm_peer_predicate_matches_despite_unrelated_tree_noise(self) -> None:
+        full = """
+npm ERR! code ERESOLVE
+npm ERR! Found: vite@4.3.9
+npm ERR! node_modules/vite
+npm ERR! vite@"4.3.9" from the root project
+npm ERR! Could not resolve dependency:
+npm ERR! peer vite@"^5.0.0" from vitest@3.2.6
+npm ERR! unrelated full-assignment tree line
+"""
+        candidate = """
+npm ERR! code ERESOLVE
+npm ERR! candidate-only warning
+npm ERR! Found: vite@4.3.9
+npm ERR! Could not resolve dependency:
+npm ERR! peer vite@"^5.0.0" from vitest@3.2.6
+"""
+        match = matching_dependency_failure_signature(
+            expected_summary="npm resolver failed",
+            expected_output=full,
+            observed_summary="npm resolver failed in another workspace",
+            observed_output=candidate,
+        )
+        self.assertTrue(match.startswith("resolver-predicate-v2:"), match)
+        self.assertEqual(
+            dependency_failure_navigation_signature(
+                summary="resolver failed", output=full
+            ),
+            dependency_failure_navigation_signature(
+                summary="resolver failed", output=candidate
+            ),
+        )
+
+    def test_structured_peer_predicate_requires_same_found_version_and_range(self) -> None:
+        base = """
+npm ERR! code ERESOLVE
+npm ERR! Found: vite@4.3.9
+npm ERR! Could not resolve dependency:
+npm ERR! peer vite@"^5.0.0" from vitest@3.2.6
+"""
+        different_found = """
+npm ERR! code ERESOLVE
+npm ERR! Found: vite@3.2.0
+npm ERR! Could not resolve dependency:
+npm ERR! peer vite@"^5.0.0" from vitest@3.2.6
+"""
+        different_range = """
+npm ERR! code ERESOLVE
+npm ERR! Found: vite@4.3.9
+npm ERR! Could not resolve dependency:
+npm ERR! peer vite@"^6.0.0" from vitest@3.2.6
+"""
+        for observed in (different_found, different_range):
+            self.assertEqual(
+                "",
+                matching_dependency_failure_signature(
+                    expected_summary="resolver failed",
+                    expected_output=base,
+                    observed_summary="resolver failed",
+                    observed_output=observed,
+                ),
+            )
+
+    def test_missing_version_predicate_matches_yarn_noise_but_not_other_range(self) -> None:
+        full = (
+            'yarn install v1.22.22\n'
+            'warning Resolution field "x@1" is incompatible with requested version "x@2"\n'
+            "error Couldn't find any versions for \"demo-pkg\" that matches \"^3.0.0\"\\n"
+        )
+        candidate = (
+            'yarn install v1.22.22\n'
+            'different progress line\n'
+            "error Couldn't find any versions for \"demo-pkg\" that matches \"^3.0.0\"\\n"
+        )
+        other = (
+            "error Couldn't find any versions for \"demo-pkg\" that matches \"^4.0.0\"\\n"
+        )
+        self.assertTrue(
+            matching_dependency_failure_signature(
+                expected_summary="yarn resolver failed",
+                expected_output=full,
+                observed_summary="yarn resolver failed",
+                observed_output=candidate,
+            ).startswith("resolver-predicate-v2:")
+        )
+        self.assertEqual(
+            "",
+            matching_dependency_failure_signature(
+                expected_summary="yarn resolver failed",
+                expected_output=full,
+                observed_summary="yarn resolver failed",
+                observed_output=other,
+            ),
+        )
+
+    def test_resolution_field_warning_is_never_a_structured_fatal_predicate(self) -> None:
+        self.assertEqual(
+            (),
+            dependency_failure_predicates(
+                summary="yarn install failed with opaque exit",
+                output=(
+                    'warning Resolution field "es5-ext@0.10.50" is incompatible '
+                    'with requested version "es5-ext@^0.10.62"'
+                ),
+            ),
+        )
+
+    def test_opaque_failures_keep_strict_legacy_equality(self) -> None:
+        same = matching_dependency_failure_signature(
+            expected_summary="opaque resolver crash",
+            expected_output="dependency-flow-baseline-verify-abc/repo   XYZ-42",
+            observed_summary="opaque resolver crash",
+            observed_output="dependency-flow-baseline-verify-def/repo\nXYZ-42",
+        )
+        self.assertTrue(same)
+        self.assertFalse(same.startswith("resolver-predicate-v2:"))
+        self.assertEqual(
+            "",
+            matching_dependency_failure_signature(
+                expected_summary="opaque resolver crash",
+                expected_output="XYZ-42 alpha",
+                observed_summary="opaque resolver crash",
+                observed_output="XYZ-42 beta",
+            ),
+        )
+
+    def test_shared_fatal_fact_can_match_when_full_output_contains_extra_fact(self) -> None:
+        full = (
+            "npm ERR! No matching version found for alpha@9.9.9.\n"
+            "npm ERR! No matching version found for beta@8.8.8.\n"
+        )
+        candidate = "npm ERR! No matching version found for beta@8.8.8."
+        match = matching_dependency_failure_signature(
+            expected_summary="resolver failed",
+            expected_output=full,
+            observed_summary="resolver failed",
+            observed_output=candidate,
+        )
+        self.assertTrue(match.startswith("resolver-predicate-v2:"), match)
 
 
 if __name__ == "__main__":

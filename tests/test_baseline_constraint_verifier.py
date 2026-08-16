@@ -537,6 +537,31 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
             self.assertEqual("passed", result.kind)
 
 
+    def test_yarn_resolution_warning_is_not_authoritative_dependency_failure(self) -> None:
+        output = (
+            'warning Resolution field "es5-ext@0.10.50" is incompatible '
+            'with requested version "es5-ext@^0.10.62"\n'
+            'error command failed with opaque exit 1'
+        )
+        self.assertEqual("unknown", _classify_install_failure(output))
+
+    def test_yarn_peer_warning_code_is_not_authoritative_dependency_failure(self) -> None:
+        self.assertEqual(
+            "unknown",
+            _classify_install_failure(
+                "YN0060: react is listed with version 18 which does not satisfy a peer request"
+            ),
+        )
+
+    def test_fatal_yarn_no_candidates_remains_dependency_failure(self) -> None:
+        self.assertEqual(
+            "dependency",
+            _classify_install_failure(
+                "YN0082: │ demo@npm:^9.0.0: No candidates found"
+            ),
+        )
+
+
 
 
 class ObservedResolutionProofTests(unittest.TestCase):
