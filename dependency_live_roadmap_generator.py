@@ -89,6 +89,7 @@ from baseline_constraint_verifier import (
 from verification_proof import (
     VerificationProofStore,
     build_verification_proof_identity,
+    is_fixed_manifest_spec,
     source_snapshot_fingerprint,
 )
 from proven_dependency_state import (
@@ -134,6 +135,10 @@ REGISTRY_METADATA_MAX_ATTEMPTS = 3
 
 class RegistryInfrastructureError(RuntimeError):
     """Registry/network uncertainty must never become dependency policy."""
+
+
+class VulnerabilityEvidenceUnavailable(RuntimeError):
+    """OSV uncertainty must never become an authoritative zero-vulnerability fact."""
 
 
 
@@ -1784,12 +1789,21 @@ class LiveDataClient:
                             details.append(self.fetch_osv_vuln(vuln_id))
                     self.osv_cache[(pkg, v)] = details
                 time.sleep(self.sleep_sec)
+            except VulnerabilityEvidenceUnavailable:
+                raise
             except Exception as e:
-                eprint(f"[warn] OSV query failed for {pkg} batch {i}: {e}")
-                for v in batch:
-                    self.osv_cache[(pkg, v)] = []
+                # UNKNOWN must not be cached as []: [] means a successful query
+                # with zero known vulnerabilities.
+                raise VulnerabilityEvidenceUnavailable(
+                    f"OSV_QUERY_UNAVAILABLE: {pkg}: batch={i // self.batch_size + 1}/{max(1, batch_total)}: {str(e)[-500:]}"
+                ) from e
         for v in versions:
-            result[v] = self.osv_cache.get((pkg, v), [])
+            key = (pkg, v)
+            if key not in self.osv_cache:
+                raise VulnerabilityEvidenceUnavailable(
+                    f"OSV_QUERY_INCOMPLETE: {pkg}@{v}: query returned no authoritative result"
+                )
+            result[v] = self.osv_cache[key]
         return result
 
     def fetch_osv_vuln(self, vuln_id: str) -> Dict[str, Any]:
@@ -1799,14 +1813,15 @@ class LiveDataClient:
             r = self.session.get(OSV_VULN.format(id=vuln_id), timeout=self.timeout)
             r.raise_for_status()
             data = r.json()
+            if not isinstance(data, dict):
+                raise ValueError("OSV vulnerability detail is not an object")
             self.vuln_detail_cache[vuln_id] = data
             time.sleep(self.sleep_sec)
             return data
         except Exception as e:
-            eprint(f"[warn] OSV vuln detail unavailable for {vuln_id}: {e}")
-            data = {"id": vuln_id}
-            self.vuln_detail_cache[vuln_id] = data
-            return data
+            raise VulnerabilityEvidenceUnavailable(
+                f"OSV_VULN_DETAIL_UNAVAILABLE: {vuln_id}: {str(e)[-500:]}"
+            ) from e
 
 
     def fetch_text(self, url: str, quiet: bool = True) -> Optional[str]:
@@ -3028,8 +3043,7 @@ def collect_direct_dependencies(pkg_json: Dict[str, Any]) -> List[Tuple[str, str
 
 
 def is_non_registry_spec(spec: str) -> bool:
-    s = spec.strip()
-    return s.startswith(("workspace:", "file:", "link:", "portal:", "git+", "github:", "http://", "https://"))
+    return is_fixed_manifest_spec(spec)
 
 
 def _is_fixed_dependency_input(row: DependencyRow) -> bool:
@@ -4923,8 +4937,32 @@ def _aggregate_vulnerability_summary(rows: List[DependencyRow]) -> str:
     return " ".join(parts) if parts else ("0" if known else "unknown")
 
 
+
+def _assert_duplicate_dependency_source_contract(rows: Sequence[DependencyRow]) -> None:
+    if len(rows) < 2:
+        return
+    fixed = [row for row in rows if is_non_registry_spec(row.requested_spec)]
+    managed = [row for row in rows if not is_non_registry_spec(row.requested_spec)]
+    name = rows[0].name
+    if fixed and managed:
+        detail = ", ".join(
+            f"{row.kind}={row.requested_spec}"
+            for row in sorted(rows, key=lambda item: (item.kind, item.requested_spec))
+        )
+        raise BaselineConstraintVerificationError(
+            f"HETEROGENEOUS_DIRECT_DEPENDENCY_DECLARATION: {name}: "
+            f"registry-managed and fixed source declarations cannot share one solver identity; {detail}"
+        )
+    fixed_specs = sorted({row.requested_spec.strip() for row in fixed})
+    if len(fixed_specs) > 1:
+        raise BaselineConstraintVerificationError(
+            f"FIXED_DEPENDENCY_DECLARATION_MISMATCH: {name}: "
+            f"fixed declarations disagree: {fixed_specs!r}"
+        )
+
 def _aggregate_duplicate_package_row(rows: List[DependencyRow]) -> DependencyRow:
     """Build one solver identity without discarding stricter duplicate intents."""
+    _assert_duplicate_dependency_source_contract(rows)
     representative = sorted(rows, key=lambda row: (row.kind, row.requested_spec))[0]
     if len(rows) == 1:
         return representative
@@ -8119,13 +8157,17 @@ def _build_proven_envelope_for_mode(
         )
 
     requires_execution = bool(_changed_assignment(assignment, rows_by_name) or removals)
+    requires_fixed_resolver_proof = any(
+        _is_fixed_dependency_input(row) for row in rows_by_name.values()
+    )
+    requires_resolver_proof = requires_execution or requires_fixed_resolver_proof
     source_head, source_clean = _proof_source_head_and_clean(
         spec.path,
         require_git=requires_execution,
     )
-    if requires_execution and not source_clean:
+    if requires_resolver_proof and not source_clean:
         raise BaselineConstraintVerificationError(
-            f"PROVEN_DEPENDENCY_SOURCE_DIRTY: {project}/{mode}: executable ProofEnvelope "
+            f"PROVEN_DEPENDENCY_SOURCE_DIRTY: {project}/{mode}: resolver ProofEnvelope "
             "requires the clean source snapshot verified by Baseline"
         )
 
@@ -8160,7 +8202,7 @@ def _build_proven_envelope_for_mode(
         if resolver_record is not None
         else ""
     )
-    if requires_execution and (
+    if requires_resolver_proof and (
         len(observed_resolved_hash) != 64
         or any(ch not in "0123456789abcdef" for ch in observed_resolved_hash.lower())
     ):
@@ -8175,7 +8217,7 @@ def _build_proven_envelope_for_mode(
         proof_store.lookup_pass("project", identity.project_proof_key) is not None
     )
 
-    if requires_execution and not resolver_pass:
+    if requires_resolver_proof and not resolver_pass:
         raise BaselineConstraintVerificationError(
             f"PROVEN_DEPENDENCY_RESOLVER_PROOF_MISSING: {project}/{mode}: "
             f"ResolverInputKey={identity.resolver_input_key}"
@@ -8216,7 +8258,7 @@ def _build_proven_envelope_for_mode(
         verification_commands=config.commands,
         project_checks=config.project_checks,
         resolver_proof_status=(
-            "passed" if resolver_pass else "not-required-no-op"
+            "passed" if resolver_pass else "not-required-no-fixed-inputs"
         ),
         preparation_proof_status=(
             "passed"
@@ -8551,6 +8593,47 @@ def resolve_peer_compatibility_with_verification(
                         "authoritative learned/exact constraints were not respected"
                     )
                 if not changed and not removals:
+                    # Zero managed delta still needs resolver proof when fixed
+                    # inputs participate in the real package-manager graph.
+                    if fixed_input_names:
+                        eprint(
+                            f"[info] {project}: Baseline verify {mode}: no managed target changes; "
+                            f"certifying resolver state with fixedInputs={len(fixed_input_names)}"
+                        )
+                        noop_result = verify_assignment(
+                            spec.path,
+                            verification_assignment,
+                            config=config,
+                            run_project_checks=False,
+                            remove_packages=(),
+                            progress=lambda message: (
+                                progress_reporter.emit(
+                                    project,
+                                    mode,
+                                    "noop-fixed-resolver-verification",
+                                    iteration=iteration,
+                                    assignment=fingerprint,
+                                    message=message,
+                                ),
+                                eprint(f"[info] {project}: {message}"),
+                            ),
+                            progress_label=f"Baseline {mode} no-op fixed resolver {fingerprint}",
+                        )
+                        if noop_result.kind == "infrastructure":
+                            raise BaselineConstraintVerificationError(
+                                f"BASELINE_VERIFY_INFRA_ERROR: {project}/{mode}: {noop_result.summary}. "
+                                "No-op dependency proof was not produced."
+                            )
+                        if noop_result.kind == "unknown":
+                            raise BaselineConstraintVerificationError(
+                                f"BASELINE_VERIFY_UNKNOWN_ERROR: {project}/{mode}: {noop_result.summary}. "
+                                "No-op dependency proof was not produced."
+                            )
+                        if not noop_result.ok:
+                            raise BaselineConstraintVerificationError(
+                                f"BASELINE_NOOP_RESOLVER_INVALID: {project}/{mode}: "
+                                f"fixed-input resolver state is not installable: {noop_result.summary}"
+                            )
                     if unknown_budget_names:
                         eprint(
                             f"[warn] {project}: Baseline verify {mode}: solver UNKNOWN_BUDGET for "
@@ -8565,6 +8648,7 @@ def resolve_peer_compatibility_with_verification(
                         "mode-passed-no-changes",
                         iteration=iteration,
                         assignment=fingerprint,
+                        fixedResolverProofRequired=bool(fixed_input_names),
                         **liveness.snapshot(learned_constraints=len(learned[project][mode])),
                     )
                     break

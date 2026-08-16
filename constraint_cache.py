@@ -22,6 +22,8 @@ import time
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
+from verification_proof import fixed_resolver_input_fingerprint
+
 from typing import (
     Dict,
     Iterable,
@@ -32,7 +34,7 @@ from typing import (
 )
 
 CACHE_SCHEMA_VERSION = 1
-SOLVER_SCHEMA_VERSION = "peer-ir-v2-fixed-inputs"
+SOLVER_SCHEMA_VERSION = "peer-ir-v3-fixed-source-identity"
 _ENV_FILES = (
     "package.json",
     "package-lock.json",
@@ -117,6 +119,7 @@ def resolver_environment_fingerprint(
             "nodeLinker": os.environ.get("YARN_NODE_LINKER") or os.environ.get("npm_config_node_linker") or "",
         },
         "files": files,
+        "fixedResolverInputsKey": fixed_resolver_input_fingerprint(project_dir),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return _sha256_bytes(encoded.encode("utf-8"))[:32]

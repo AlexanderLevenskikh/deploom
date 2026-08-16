@@ -6,12 +6,16 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 import threading
 from pathlib import Path
 from typing import Mapping, Sequence
+from urllib.parse import unquote, urlparse
 
-PROOF_SCHEMA_VERSION = "baseline-proof-v3"
+from semantic_version import NpmSpec
+
+PROOF_SCHEMA_VERSION = "baseline-proof-v4-fixed-source-identity"
 
 _RESOLVER_FILES = (
     "package.json",
@@ -130,6 +134,147 @@ def _fallback_source_fingerprint(project_dir: Path) -> str:
             continue
         files.append((relative.as_posix(), _hash_file(path)))
     return _canonical_hash({"kind": "content-tree", "files": files})
+
+
+_REGISTRY_DIST_TAG = re.compile(r"^[A-Za-z][A-Za-z0-9._-]*$")
+_FIXED_SPEC_PREFIXES = (
+    "workspace:",
+    "file:",
+    "link:",
+    "portal:",
+    "git+",
+    "git://",
+    "ssh://",
+    "github:",
+    "gitlab:",
+    "bitbucket:",
+    "http://",
+    "https://",
+    "npm:",
+    "patch:",
+    "catalog:",
+)
+_LOCAL_FIXED_PREFIXES = ("file:", "link:", "portal:")
+_WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+_DIRECT_DEPENDENCY_SECTIONS = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)
+
+
+def is_fixed_manifest_spec(spec: str) -> bool:
+    # Fixed by default: only a proven semver selector or ordinary dist-tag is
+    # allowed into the registry-managed solver domain.
+    value = str(spec or "").strip()
+    if not value:
+        return True
+    lowered = value.lower()
+    if lowered.startswith(_FIXED_SPEC_PREFIXES):
+        return True
+    try:
+        NpmSpec(value)
+        return False
+    except ValueError:
+        return _REGISTRY_DIST_TAG.fullmatch(value) is None
+
+
+def _looks_like_local_fixed_path(spec: str) -> bool:
+    value = str(spec or "").strip()
+    lowered = value.lower()
+    return (
+        lowered.startswith(_LOCAL_FIXED_PREFIXES)
+        or value.startswith(("./", "../", "~/", "/"))
+        or _WINDOWS_ABSOLUTE_PATH.match(value) is not None
+    )
+
+
+def _local_fixed_target(project_dir: Path, spec: str) -> Path:
+    lowered = spec.lower()
+    if lowered.startswith(_LOCAL_FIXED_PREFIXES):
+        prefix, raw = spec.split(":", 1)
+        payload = raw.strip()
+        if prefix.lower() == "file":
+            parsed = urlparse(spec)
+            if parsed.scheme.lower() == "file" and parsed.path:
+                payload = unquote(parsed.path)
+                if os.name == "nt" and re.match(r"^/[A-Za-z]:/", payload):
+                    payload = payload[1:]
+    else:
+        payload = spec.strip()
+    path = Path(payload).expanduser()
+    if not path.is_absolute():
+        path = project_dir / path
+    return path.resolve()
+
+
+def _external_fixed_target_identity(project_dir: Path, spec: str) -> Mapping[str, object]:
+    target = _local_fixed_target(project_dir, spec)
+    base = {
+        "path": str(target).replace("\\", "/"),
+        "spec": spec,
+    }
+    if not target.exists():
+        return {**base, "kind": "missing"}
+    if target.is_file():
+        return {**base, "kind": "file", "sha256": _hash_file(target)}
+    if target.is_dir():
+        return {
+            **base,
+            "kind": "directory",
+            "contentTree": _fallback_source_fingerprint(target),
+        }
+    return {**base, "kind": "other"}
+
+
+def fixed_resolver_input_fingerprint(project_dir: Path) -> str:
+    # Root manifest/lock/config files are hashed separately by ResolverInputKey.
+    # This key adds the source/content identity that those files cannot capture.
+    project_dir = project_dir.resolve()
+    manifest_path = project_dir / "package.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise SourceIdentityUnavailable(
+            f"SOURCE_IDENTITY_MANIFEST_UNAVAILABLE: {manifest_path}: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise SourceIdentityUnavailable(
+            f"SOURCE_IDENTITY_MANIFEST_UNAVAILABLE: {manifest_path}: root must be an object"
+        )
+
+    fixed: list[Mapping[str, object]] = []
+    workspace_snapshot = ""
+    for section in _DIRECT_DEPENDENCY_SECTIONS:
+        values = manifest.get(section)
+        if not isinstance(values, dict):
+            continue
+        for name, raw_spec in sorted(values.items(), key=lambda item: str(item[0]).lower()):
+            spec = str(raw_spec or "").strip()
+            if not is_fixed_manifest_spec(spec):
+                continue
+            entry: dict[str, object] = {
+                "section": section,
+                "name": str(name),
+                "spec": spec,
+            }
+            lowered = spec.lower()
+            if lowered.startswith("workspace:"):
+                if not workspace_snapshot:
+                    workspace_snapshot = source_snapshot_fingerprint(project_dir)
+                entry["workspaceSourceSnapshotKey"] = workspace_snapshot
+            elif _looks_like_local_fixed_path(spec):
+                entry["target"] = dict(_external_fixed_target_identity(project_dir, spec))
+            fixed.append(entry)
+
+    return _canonical_hash(
+        {
+            "schema": PROOF_SCHEMA_VERSION,
+            "fixedResolverInputs": fixed,
+        },
+        length=64,
+    )
 
 
 def source_snapshot_fingerprint(project_dir: Path) -> str:
@@ -326,6 +471,7 @@ def build_verification_proof_identity(
     project_dir = project_dir.resolve()
     environment_key = environment_snapshot_fingerprint(environment)
     source_key = source_snapshot_fingerprint(project_dir)
+    fixed_resolver_inputs_key = fixed_resolver_input_fingerprint(project_dir)
     assignment_key = _canonical_hash({
         "assignment": sorted((str(k), str(v)) for k, v in assignment.items()),
         "removals": sorted(str(item) for item in remove_packages),
@@ -335,6 +481,7 @@ def build_verification_proof_identity(
         "schema": PROOF_SCHEMA_VERSION,
         "projectResolverFiles": _resolver_ancestor_files(project_dir),
         "userConfigFiles": _user_config_files(environment),
+        "fixedResolverInputsKey": fixed_resolver_inputs_key,
         "assignmentKey": assignment_key,
         "environmentKey": environment_key,
         "registry": str(registry or "").rstrip("/"),

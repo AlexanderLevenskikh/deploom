@@ -33,6 +33,7 @@ from verification_proof import (
     VerificationProofStore,
     build_verification_proof_identity,
     emit_verification_event,
+    is_fixed_manifest_spec,
 )
 
 @dataclasses.dataclass(frozen=True)
@@ -531,6 +532,37 @@ def _apply_assignment(
     sections = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
     removals = {str(name) for name in remove_packages}
     for name in sorted(set(assignment) | removals):
+        declarations: List[Tuple[str, str]] = []
+        for section in sections:
+            deps = manifest.get(section)
+            if isinstance(deps, dict) and name in deps:
+                declarations.append((section, str(deps[name])))
+        fixed_declarations = [
+            (section, spec)
+            for section, spec in declarations
+            if is_fixed_manifest_spec(spec)
+        ]
+        managed_declarations = [
+            (section, spec)
+            for section, spec in declarations
+            if not is_fixed_manifest_spec(spec)
+        ]
+        if fixed_declarations:
+            detail = ", ".join(f"{section}={spec}" for section, spec in declarations)
+            if managed_declarations:
+                raise AssignmentMaterializationError(
+                    f"ASSIGNMENT_HETEROGENEOUS_SOURCE_CONFLICT: {name}: "
+                    f"fixed and registry declarations cannot be materialized as one exact version; {detail}"
+                )
+            if name in removals:
+                raise AssignmentMaterializationError(
+                    f"ASSIGNMENT_REMOVES_FIXED_INPUT: {name}: fixed declaration is immutable; {detail}"
+                )
+            if name in assignment:
+                raise AssignmentMaterializationError(
+                    f"ASSIGNMENT_TARGETS_FIXED_INPUT: {name}: fixed declaration is immutable; {detail}"
+                )
+
         package_changed = False
         package_seen = False
         for section in sections:

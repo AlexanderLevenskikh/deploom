@@ -521,7 +521,7 @@ class FixedNonRegistryInputTests(unittest.TestCase):
 
     def test_constraint_cache_schema_invalidates_pre_h_solver_learning(self) -> None:
         self.assertEqual(
-            "peer-ir-v2-fixed-inputs",
+            "peer-ir-v3-fixed-source-identity",
             constraint_cache.SOLVER_SCHEMA_VERSION,
         )
 
