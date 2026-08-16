@@ -83,7 +83,16 @@ from constraint_verify import (
 )
 from baseline_constraint_verifier import (
     BaselineVerifyConfig, BaselineVerifyResult, assignment_fingerprint,
-    discover_baseline_project_checks, structural_project_failure_signatures, verify_assignment,
+    detect_package_manager, discover_baseline_project_checks, resolve_executable,
+    structural_project_failure_signatures, verify_assignment,
+)
+from verification_proof import (
+    VerificationProofStore,
+    build_verification_proof_identity,
+)
+from proven_dependency_state import (
+    build_proven_dependency_envelope,
+    write_proven_dependency_state,
 )
 from constraint_cache import (
     LearnedConstraintProof,
@@ -7246,6 +7255,186 @@ class BaselineLocalizationCheckpointStore:
                 self._write_locked(payload)
 
 
+def _proof_source_head_and_clean(
+    project_dir: Path,
+    *,
+    require_git: bool,
+) -> Tuple[str, bool]:
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(project_dir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        if require_git:
+            raise BaselineConstraintVerificationError(
+                f"PROVEN_DEPENDENCY_SOURCE_UNREADABLE: {project_dir}: {exc}"
+            ) from exc
+        return "non-git", True
+
+    if head.returncode != 0 or not head.stdout.strip():
+        if require_git:
+            raise BaselineConstraintVerificationError(
+                f"PROVEN_DEPENDENCY_SOURCE_UNREADABLE: {project_dir}: "
+                "actionable dependency proof requires a git HEAD"
+            )
+        # verification_proof.source_snapshot_fingerprint() already provides a
+        # content-tree identity outside Git. No-op state therefore needs no
+        # invented commit hash.
+        return "non-git", True
+
+    try:
+        status = subprocess.run(
+            [
+                "git", "-C", str(project_dir), "status", "--porcelain=v1",
+                "--untracked-files=all", "--", ".",
+                ":(exclude).dependency-roadmap/**",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BaselineConstraintVerificationError(
+            f"PROVEN_DEPENDENCY_SOURCE_UNREADABLE: {project_dir}: {exc}"
+        ) from exc
+
+    if status.returncode != 0:
+        raise BaselineConstraintVerificationError(
+            f"PROVEN_DEPENDENCY_SOURCE_UNREADABLE: {project_dir}: git status failed"
+        )
+
+    return head.stdout.strip(), not bool(status.stdout)
+
+
+def _build_proven_envelope_for_mode(
+    project: str,
+    mode: str,
+    spec: ProjectSpec,
+    rows_by_name: Dict[str, DependencyRow],
+    assignment: Dict[str, str],
+    removals: Set[str],
+    config: BaselineVerifyConfig,
+    client: LiveDataClient,
+) -> Dict[str, Any]:
+    manager = detect_package_manager(spec.path)
+    executable = resolve_executable(manager)
+    if not executable:
+        raise BaselineConstraintVerificationError(
+            f"PROVEN_DEPENDENCY_PROOF_IDENTITY_UNAVAILABLE: {project}/{mode}: "
+            f"package manager {manager} is not available"
+        )
+
+    requires_execution = bool(_changed_assignment(assignment, rows_by_name) or removals)
+    source_head, source_clean = _proof_source_head_and_clean(
+        spec.path,
+        require_git=requires_execution,
+    )
+    if requires_execution and not source_clean:
+        raise BaselineConstraintVerificationError(
+            f"PROVEN_DEPENDENCY_SOURCE_DIRTY: {project}/{mode}: executable ProofEnvelope "
+            "requires the clean source snapshot verified by Baseline"
+        )
+
+    identity = build_verification_proof_identity(
+        spec.path,
+        assignment=assignment,
+        remove_packages=tuple(sorted(removals)),
+        manager=manager,
+        manager_executable=executable,
+        registry=client.registry,
+        project_checks=(
+            config.project_checks
+            if config.project_checks != "off" and config.commands
+            else "off"
+        ),
+        commands=(
+            config.commands
+            if config.project_checks != "off" and config.commands
+            else ()
+        ),
+        environment=dict(os.environ),
+    )
+    proof_store = VerificationProofStore(
+        Path(config.proof_cache_dir) if config.proof_cache_dir else None
+    )
+    resolver_pass = (
+        proof_store.lookup_pass("resolver", identity.resolver_input_key) is not None
+    )
+    preparation_pass = (
+        proof_store.lookup_pass("preparation", identity.preparation_proof_key) is not None
+    )
+    project_pass = (
+        proof_store.lookup_pass("project", identity.project_proof_key) is not None
+    )
+
+    if requires_execution and not resolver_pass:
+        raise BaselineConstraintVerificationError(
+            f"PROVEN_DEPENDENCY_RESOLVER_PROOF_MISSING: {project}/{mode}: "
+            f"ResolverInputKey={identity.resolver_input_key}"
+        )
+    requires_project_checks = (
+        requires_execution
+        and config.project_checks != "off"
+        and bool(config.commands)
+    )
+    if requires_project_checks and not preparation_pass:
+        raise BaselineConstraintVerificationError(
+            f"PROVEN_DEPENDENCY_PREPARATION_PROOF_MISSING: {project}/{mode}: "
+            f"PreparationProofKey={identity.preparation_proof_key}"
+        )
+    if (
+        requires_project_checks
+        and config.project_checks == "strict"
+        and not project_pass
+    ):
+        raise BaselineConstraintVerificationError(
+            f"PROVEN_DEPENDENCY_PROJECT_PROOF_MISSING: {project}/{mode}: strict "
+            f"ProjectProofKey={identity.project_proof_key}"
+        )
+
+    return build_proven_dependency_envelope(
+        project=project,
+        mode=mode,
+        proof_schema=identity.schema_version,
+        source_head=source_head,
+        source_snapshot_key=identity.source_snapshot_key,
+        assignment_key=identity.assignment_key,
+        resolver_input_key=identity.resolver_input_key,
+        preparation_proof_key=identity.preparation_proof_key,
+        project_proof_key=identity.project_proof_key,
+        assignment=assignment,
+        removals=tuple(sorted(removals)),
+        verification_commands=config.commands,
+        project_checks=config.project_checks,
+        resolver_proof_status=(
+            "passed" if resolver_pass else "not-required-no-op"
+        ),
+        preparation_proof_status=(
+            "passed"
+            if preparation_pass
+            else ("not-required" if not requires_project_checks else "missing")
+        ),
+        project_proof_status=(
+            "passed"
+            if project_pass
+            else (
+                "not-required"
+                if not requires_project_checks
+                else "diagnostic-red"
+            )
+        ),
+    )
+
+
 def resolve_peer_compatibility_with_verification(
     rows_by_project: Dict[str, List[DependencyRow]],
     projects_by_name: Dict[str, ProjectSpec],
@@ -7255,6 +7444,7 @@ def resolve_peer_compatibility_with_verification(
     residual_targets_by_project: Optional[Dict[str, Dict[str, str]]] = None,
     external_evidence_by_project: Optional[Dict[str, CompatibilityEvidence]] = None,
     progress_path: Optional[Path] = None,
+    proof_envelopes_out: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
 ) -> Dict[str, Dict[str, Dict[str, str]]]:
     """Solve -> materialize -> learn nogood -> solve, before Executor exists.
 
@@ -7279,6 +7469,7 @@ def resolve_peer_compatibility_with_verification(
         BaselineVerifyResult,
     ] = {}
     adaptive_control_cache: Dict[Tuple[str, str], BaselineVerifyResult] = {}
+    verification_config_by_project: Dict[str, BaselineVerifyConfig] = {}
 
     for project, rows in rows_by_project.items():
         spec = projects_by_name.get(project)
@@ -7315,8 +7506,11 @@ def resolve_peer_compatibility_with_verification(
             proof_cache_dir=str(verification_proof_cache_dir) if verification_proof_cache_dir is not None else "",
         )
         if not config.enabled:
-            eprint(f"[info] {project}: Baseline constraint verification disabled by configuration")
-            continue
+            raise BaselineConstraintVerificationError(
+                f"BASELINE_VERIFICATION_REQUIRED: {project}: constraintVerify.enabled=false "
+                "cannot produce an executable dependency plan. Use a report-only workflow instead."
+            )
+        verification_config_by_project[project] = config
 
         external_evidence = (external_evidence_by_project or {}).get(project)
         if external_evidence is not None:
@@ -7336,15 +7530,46 @@ def resolve_peer_compatibility_with_verification(
                     f"BASELINE_VERIFY_INCONCLUSIVE_EXTERNAL_EVIDENCE: {project}: {exc}. "
                     "The post-Executor report was preserved but did not become solver authority."
                 ) from None
-            for evidence_mode in modes:
-                if evidence_nogood not in learned[project][evidence_mode]:
-                    learned[project][evidence_mode].append(dict(evidence_nogood))
-            evidence_detail = ", ".join(f"{name}@{version}" for name, version in sorted(evidence_nogood.items()))
-            eprint(
-                f"[info] {project}: post-Executor compatibility evidence reproduced and localized before re-solve: "
-                f"NOT({evidence_detail}); signatures={','.join(evidence_signatures)}; "
-                f"sourceBranch={external_evidence.branch_ref}"
+            evidence_detail = ", ".join(
+                f"{name}@{version}" for name, version in sorted(evidence_nogood.items())
             )
+            exact_external_assignment = dict(external_evidence.exact_assignment)
+            if exact_external_assignment:
+                evidence_mode = external_evidence.target_mode
+                if exact_external_assignment not in global_exact_exclusions[project][evidence_mode]:
+                    global_exact_exclusions[project][evidence_mode].append(
+                        exact_external_assignment
+                    )
+                exact_fingerprint = assignment_fingerprint(exact_external_assignment)
+                eprint(
+                    f"[warn] {project}: post-Executor evidence certified the full ProofEnvelope "
+                    f"assignment as failing for {evidence_mode}; exact={exact_fingerprint}; "
+                    f"localizedCandidate=NOT({evidence_detail}) remains diagnostic-only; "
+                    f"authority={EVIDENCE_CONFIRMED_CONSTRAINT}"
+                )
+                progress_reporter.emit(
+                    project,
+                    evidence_mode,
+                    "external-evidence-exact-assignment-blocked",
+                    assignment=exact_fingerprint,
+                    envelopeKey=external_evidence.proof_envelope_key,
+                    localizedCandidate=evidence_detail,
+                    authority=EVIDENCE_CONFIRMED_CONSTRAINT,
+                    topologyMerged=False,
+                )
+            else:
+                eprint(
+                    f"[warn] {project}: legacy post-Executor evidence has no ProofEnvelope; "
+                    f"localized candidate NOT({evidence_detail}) stays diagnostic-only and "
+                    "does not become solver authority"
+                )
+                progress_reporter.emit(
+                    project,
+                    external_evidence.target_mode,
+                    "external-evidence-diagnostic-only",
+                    literals=len(evidence_nogood),
+                    authority=EVIDENCE_DIAGNOSTIC_HINT,
+                )
 
         def adaptive_structural_evidence(result: BaselineVerifyResult) -> Tuple[str, ...]:
             """Return structural signatures introduced by this assignment.
@@ -7481,7 +7706,7 @@ def resolve_peer_compatibility_with_verification(
                 verification_assignment = _verification_assignment(assignment, rows_by_name)
                 removals = _types_stub_removals_for_assignment(rows_by_name, assignment, mode, client)
                 fingerprint = assignment_fingerprint(verification_assignment)
-                if not changed:
+                if not changed and not removals:
                     if unknown_budget_names:
                         eprint(
                             f"[warn] {project}: Baseline verify {mode}: solver UNKNOWN_BUDGET for "
@@ -8260,6 +8485,51 @@ def resolve_peer_compatibility_with_verification(
             for row in rows_by_project.get(project, []):
                 setattr(row, f"target_{mode}_dynamic_locked", True)
 
+    for project, mode_assignments in final_assignments.items():
+        spec = projects_by_name.get(project)
+        config = verification_config_by_project.get(project)
+        if spec is None or config is None:
+            raise BaselineConstraintVerificationError(
+                f"PROVEN_DEPENDENCY_PROOF_CONTEXT_MISSING: {project}"
+            )
+        rows = rows_by_project.get(project, [])
+        rows_for_name: Dict[str, List[DependencyRow]] = defaultdict(list)
+        for row in rows:
+            rows_for_name[row.name].append(row)
+        rows_by_name = {
+            name: _aggregate_duplicate_package_row(items)
+            for name, items in rows_for_name.items()
+        }
+
+        for mode, proven in mode_assignments.items():
+            removals = _types_stub_removals_for_assignment(
+                rows_by_name, dict(proven), mode, client
+            )
+            for row in rows:
+                if row.name not in removals:
+                    continue
+                exact_literal = str(proven.get(row.name) or row.current_version)
+                _set_mode_target(
+                    row,
+                    mode,
+                    exact_literal,
+                    "PROVEN_REMOVE_TARGET: removal is part of the exact Baseline ProofEnvelope",
+                )
+                setattr(row, f"target_{mode}_dynamic_locked", True)
+
+            if proof_envelopes_out is not None:
+                envelope = _build_proven_envelope_for_mode(
+                    project,
+                    mode,
+                    spec,
+                    rows_by_name,
+                    dict(proven),
+                    set(removals),
+                    config,
+                    client,
+                )
+                proof_envelopes_out.setdefault(project, {})[mode] = envelope
+
     assert_proven_assignment_conformance(
         rows_by_project,
         final_assignments,
@@ -9018,6 +9288,8 @@ def write_html(
     roadmap_json_path: Optional[Path] = None,
     knowledge_entries: Optional[List[Dict[str, Any]]] = None,
     knowledge_log_path: Optional[Path] = None,
+    proven_dependency_state: Optional[Dict[str, Any]] = None,
+    proven_dependency_state_path: Optional[Path] = None,
 ) -> None:
     """Write an interactive self-contained HTML report.
 
@@ -9053,6 +9325,8 @@ def write_html(
         "roadmapJsonPath": str(roadmap_json_path or ""),
         "knowledgeLogPath": str(knowledge_log_path or ""),
         "knowledgeEntries": knowledge_entries,
+        "provenDependencyState": proven_dependency_state or {"schemaVersion": 1, "projects": {}},
+        "provenDependencyStatePath": str(proven_dependency_state_path or ""),
         "projectHealth": {project: dataclasses.asdict(health) for project, health in (health_by_project or {}).items()},
         "suggestions": {
             "global": [dataclasses.asdict(item) for item in global_suggestions],
@@ -10295,6 +10569,19 @@ function knowledgeForRows(rows){
     (entry.packages || []).some(packageName => packages.has(packageName))
   );
 }
+function proofEnvelopeForProject(project, mode){
+  const state = REPORT_CONTEXT.provenDependencyState || {};
+  return state?.projects?.[project]?.[mode] || null;
+}
+function proofEnvelopesForProjects(projects, mode){
+  const result = {};
+  for (const project of projects) {
+    const envelope = proofEnvelopeForProject(project, mode);
+    if (!envelope) throw new Error(`PROVEN_DEPENDENCY_PROOF_MISSING: ${project}/${mode}`);
+    result[project] = envelope;
+  }
+  return result;
+}
 function scopeManifestRowFor(r){
   const test = testPolicyForRow(r);
   const shouldUpdate = rowNeedsAction(r);
@@ -10732,6 +11019,7 @@ function buildFullPromptFromCurrentView(){
     excludedRows: excludedRows.length,
     projects,
     projectScopes,
+    proofEnvelopes: proofEnvelopesForProjects(projects, mode),
     rows: scopeManifest
   }, null, 2);
   const actionJson = JSON.stringify(scopeManifest.filter(r => r.shouldUpdate), null, 2);
@@ -10987,6 +11275,7 @@ function compactScopeManifestForRows(rows, mode, now){
     excludedRows: excludedRows.length,
     projects,
     projectScopes,
+    proofEnvelopes: proofEnvelopesForProjects(projects, mode),
     columns: ['project','group','subgroup','kind','package','section','requestedSpec','current','target','targetReason','shouldUpdate','action','lagPolicyMonths','lagPolicyTarget','targetArtifactStatus','targetArtifactUrl','targetArtifactError','compatibilityCohort','compatibilityNote','scopeExcluded','exclusionReason','exclusionSource','testPolicy','testReason'],
     rows: manifestRows.map(r => [
       r.project,
@@ -12818,11 +13107,13 @@ def main() -> None:
     if residual_targets_by_project:
         count = sum(len(targets) for targets in residual_targets_by_project.values())
         eprint(f"[info] residual stability: loaded {count} previously approved target(s); merged matches are hard-fixed, pending matches are preferred")
+    proven_dependency_envelopes: Dict[str, Dict[str, Dict[str, Any]]] = {}
     proven_assignments = resolve_peer_compatibility_with_verification(
         rows_by_project, projects_by_name, client,
         residual_targets_by_project=residual_targets_by_project,
         external_evidence_by_project=external_evidence_by_project,
         progress_path=baseline_progress_path,
+        proof_envelopes_out=proven_dependency_envelopes,
     )
     # Everything below this line is a consumer of the proven assignment.
     enrich_registry_target_evidence(
@@ -12843,6 +13134,18 @@ def main() -> None:
         raise RuntimeError(
             "FINAL_BASELINE_COMPATIBILITY_INVALID: " + " | ".join(final_peer_issues[:20])
         )
+
+    proven_dependency_state_path = (
+        settings_base / ".dependency-roadmap" / "state" / "proven-dependency-state.json"
+    )
+    proven_dependency_state = write_proven_dependency_state(
+        proven_dependency_state_path,
+        proven_dependency_envelopes,
+    )
+    eprint(
+        f"[info] persisted content-addressed ProofEnvelope state: "
+        f"{proven_dependency_state_path}"
+    )
     # Health status is based on installed versions, but lag_blockers also carry
     # plannedTargetYellow/Green. Recompute only after every Supervisor, peer and
     # registry pass has finalized targets; otherwise target closure can claim
@@ -12932,6 +13235,8 @@ def main() -> None:
             roadmap_json_path=json_out_path,
             knowledge_entries=knowledge_entries,
             knowledge_log_path=knowledge_log_path,
+            proven_dependency_state=proven_dependency_state,
+            proven_dependency_state_path=proven_dependency_state_path,
         )
     eprint(
         f"[done] wrote {out_path} and {html_out_path}; "

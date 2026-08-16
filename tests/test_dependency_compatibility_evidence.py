@@ -93,6 +93,46 @@ class CompatibilityEvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "also present after restoring"):
                 localize_compatibility_evidence(evidence, base_config=config, verify=always_fails)
 
+    def test_loads_exact_assignment_from_valid_proof_envelope(self) -> None:
+        from proven_dependency_state import build_proven_dependency_envelope
+
+        with tempfile.TemporaryDirectory() as temp:
+            envelope = build_proven_dependency_envelope(
+                project="Demo",
+                mode="yellow",
+                proof_schema="baseline-proof-v2",
+                source_head="abc123",
+                source_snapshot_key="source-key",
+                assignment_key="assignment-key",
+                resolver_input_key="resolver-key",
+                preparation_proof_key="preparation-key",
+                project_proof_key="project-key",
+                assignment={"a": "2.0.0", "b": "1.0.0"},
+                removals=(),
+                verification_commands=("yarn lint:types",),
+                project_checks="adaptive",
+                resolver_proof_status="passed",
+                preparation_proof_status="passed",
+                project_proof_status="diagnostic-red",
+            )
+            path = Path(temp) / "evidence.json"
+            path.write_text(json.dumps({
+                "schemaVersion": 1,
+                "project": "Demo",
+                "projectPath": temp,
+                "branchRef": "CD-1-cohort-demo",
+                "targetMode": "yellow",
+                "commands": ["yarn lint:types"],
+                "actions": [
+                    {"package": "a", "current": "1.0.0", "target": "2.0.0", "action": "update"},
+                ],
+                "proofEnvelope": envelope,
+            }), encoding="utf-8")
+            evidence = load_compatibility_evidence(path)
+            self.assertEqual(envelope["envelopeKey"], evidence.proof_envelope_key)
+            self.assertEqual({"a": "2.0.0", "b": "1.0.0"}, dict(evidence.exact_assignment))
+
+
 
 if __name__ == "__main__":
     unittest.main()

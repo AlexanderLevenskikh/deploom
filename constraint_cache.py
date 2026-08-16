@@ -154,7 +154,13 @@ class LearnedConstraintProof:
 
 @contextmanager
 def _exclusive_cache_write_lock(path: Path):
-    """Cross-process lock for the tiny read-modify-replace cache transaction."""
+    """Cross-process lock for the tiny read-modify-replace cache transaction.
+
+    On Windows, CREATE_NEW/O_EXCL against an existing lock file may surface as
+    PermissionError (sharing violation) rather than FileExistsError. Treat that
+    as contention only while the lock path exists. A PermissionError without
+    an existing lock remains a real infrastructure/permissions failure.
+    """
     lock_path = path.with_name(path.name + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + 10.0
@@ -165,26 +171,53 @@ def _exclusive_cache_write_lock(path: Path):
             os.write(fd, f"pid={os.getpid()} created={time.time()}\n".encode("utf-8"))
             break
         except FileExistsError:
+            pass
+        except PermissionError:
+            # Windows sharing violations can be EACCES while another writer
+            # owns the already-existing lock. Do not hide a genuine ACL/path
+            # permission failure when no lock file exists.
             try:
-                # A crashed writer must not deadlock future Baselines forever.
-                if time.time() - lock_path.stat().st_mtime > 120.0:
+                if not lock_path.exists():
+                    raise
+            except OSError:
+                raise
+
+        try:
+            # A crashed writer must not deadlock future Baselines forever.
+            if time.time() - lock_path.stat().st_mtime > 120.0:
+                try:
                     lock_path.unlink()
-                    continue
-            except FileNotFoundError:
+                except PermissionError:
+                    # A live Windows owner can deny delete sharing. This is
+                    # active contention, not stale-lock authority.
+                    pass
                 continue
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"constraint cache lock timed out: {lock_path}")
-            time.sleep(0.05)
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            # Same Windows sharing behavior while the owner is still active.
+            pass
+
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"constraint cache lock timed out: {lock_path}")
+        time.sleep(0.05)
+
     try:
         yield
     finally:
         if fd is not None:
             os.close(fd)
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
-
+        cleanup_deadline = time.monotonic() + 1.0
+        while True:
+            try:
+                lock_path.unlink()
+                break
+            except FileNotFoundError:
+                break
+            except PermissionError:
+                if time.monotonic() >= cleanup_deadline:
+                    raise
+                time.sleep(0.01)
 
 def _read_cache(path: Optional[Path]) -> Dict[str, object]:
     if path is None or not path.is_file():

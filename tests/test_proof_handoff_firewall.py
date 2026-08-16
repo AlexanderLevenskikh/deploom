@@ -154,6 +154,37 @@ class ProofHandoffFirewallTests(unittest.TestCase):
         self.assertIn("function versionExactlyMatches(", migration)
         self.assertNotIn("function versionAtLeast(", migration)
 
+    def test_proof_envelope_transport_is_on_production_path(self) -> None:
+        source = (ROOT / "dependency_live_roadmap_generator.py").read_text(encoding="utf-8")
+        main = source[source.index("def main() -> None:"):]
+        self.assertIn("proven_dependency_envelopes", main)
+        self.assertIn("write_proven_dependency_state(", main)
+        self.assertIn("proven_dependency_state=proven_dependency_state", main)
+
+        baseline = source[
+            source.index("def resolve_peer_compatibility_with_verification("):
+            source.index("def _peer_scope_blocker(")
+        ]
+        self.assertIn("if not changed and not removals:", baseline)
+        self.assertIn("BASELINE_VERIFICATION_REQUIRED", baseline)
+        self.assertIn("external-evidence-exact-assignment-blocked", baseline)
+        self.assertIn("external_evidence.exact_assignment", baseline)
+        self.assertIn("PROVEN_REMOVE_TARGET", baseline)
+
+        migration = (ROOT / "desktop" / "electron" / "migration-progress.ts").read_text(encoding="utf-8")
+        self.assertIn("validateScopeProofEnvelope(", migration)
+        self.assertIn("proofEnvelopeContentKey(", migration)
+
+        materialization = (ROOT / "desktop" / "electron" / "materialization-proof.ts").read_text(encoding="utf-8")
+        self.assertIn("schemaVersion: 2", materialization)
+        self.assertIn("observedResolvedVersions", materialization)
+        self.assertIn("provenEnvelopeKey", materialization)
+
+        desktop = (ROOT / "desktop" / "electron" / "main.ts").read_text(encoding="utf-8")
+        self.assertIn("PROVEN_DEPENDENCY_SOURCE_SNAPSHOT_DRIFT", desktop)
+        self.assertIn("proofEnvelope.envelopeKey", desktop)
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 export type MigrationBranchPlan = {
   branch: string
   // Stable logical branch emitted by the Dashboard. Git may use a continuation
@@ -204,6 +206,81 @@ export function scopeActionsFromPrompt(markdown: string, projectName: string): S
 
 export function scopeTargetsFromPrompt(markdown: string, projectName: string): Record<string, string> {
   return Object.fromEntries(scopeActionsFromPrompt(markdown, projectName).map((row) => [row.package, row.target]))
+}
+
+export type ProvenDependencyEnvelope = {
+  schemaVersion: 1
+  proofSchema: string
+  envelopeKey: string
+  project: string
+  mode: string
+  sourceHead: string
+  sourceSnapshotKey: string
+  assignmentKey: string
+  resolverInputKey: string
+  preparationProofKey: string
+  projectProofKey: string
+  exactDirectAssignment: Record<string, string>
+  removals: string[]
+  verificationCommands: string[]
+  projectChecks: string
+  resolverProofStatus: string
+  preparationProofStatus: string
+  projectProofStatus: string
+}
+
+function canonicalProofJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalProofJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalProofJson(item)}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+export function proofEnvelopeContentKey(value: unknown): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
+  const payload = Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).filter(([key]) => key !== 'envelopeKey'),
+  )
+  return createHash('sha256').update(canonicalProofJson(payload)).digest('hex')
+}
+
+export function proofEnvelopeFromPrompt(markdown: string, projectName: string): ProvenDependencyEnvelope | undefined {
+  const manifest = migrationScopeManifestFromPrompt(markdown)
+  const envelopes = manifest?.proofEnvelopes
+  if (!envelopes || typeof envelopes !== 'object' || Array.isArray(envelopes)) return undefined
+  const raw = (envelopes as Record<string, unknown>)[projectName]
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  return raw as ProvenDependencyEnvelope
+}
+
+export function validateScopeProofEnvelope(
+  markdown: string,
+  projectName: string,
+): { ok: boolean; reason: string; envelope?: ProvenDependencyEnvelope } {
+  const manifest = migrationScopeManifestFromPrompt(markdown)
+  const envelope = proofEnvelopeFromPrompt(markdown, projectName)
+  if (!manifest || !envelope) return { ok: false, reason: 'proof envelope missing' }
+  if (envelope.schemaVersion !== 1 || envelope.project !== projectName) return { ok: false, reason: 'proof envelope project/schema mismatch' }
+  if (typeof manifest.targetMode !== 'string' || envelope.mode !== manifest.targetMode) return { ok: false, reason: 'proof envelope target mode mismatch' }
+  if (!envelope.envelopeKey || proofEnvelopeContentKey(envelope) !== envelope.envelopeKey) return { ok: false, reason: 'proof envelope content hash mismatch' }
+  if (!envelope.sourceHead || !envelope.sourceSnapshotKey || !envelope.assignmentKey || !envelope.resolverInputKey) return { ok: false, reason: 'proof envelope identity incomplete' }
+  if (!envelope.exactDirectAssignment || typeof envelope.exactDirectAssignment !== 'object' || Array.isArray(envelope.exactDirectAssignment)) return { ok: false, reason: 'proof envelope assignment missing' }
+  if (!Array.isArray(envelope.removals)) return { ok: false, reason: 'proof envelope removals invalid' }
+
+  const removals = new Set(envelope.removals.map(String))
+  const actions = scopeActions(manifest, projectName)
+  if (actions.length && envelope.resolverProofStatus !== 'passed') return { ok: false, reason: `resolver proof status is ${envelope.resolverProofStatus || 'missing'}` }
+
+  for (const action of actions) {
+    const expected = envelope.exactDirectAssignment[action.package]
+    if (expected !== action.target) return { ok: false, reason: `proof assignment mismatch for ${action.package}: envelope=${expected ?? '<missing>'}, prompt=${action.target}` }
+    if (action.action === 'remove' && !removals.has(action.package)) return { ok: false, reason: `prompt removes ${action.package} outside proven removals` }
+    if (action.action === 'update' && removals.has(action.package)) return { ok: false, reason: `prompt updates ${action.package} although proof requires removal` }
+    if (!['update', 'remove'].includes(action.action)) return { ok: false, reason: `unsupported actionable proof action ${action.action}` }
+  }
+  return { ok: true, reason: 'prompt scope is an exact subset of ProofEnvelope', envelope }
 }
 
 function versionExactlyMatches(actual: string, target: string): boolean {

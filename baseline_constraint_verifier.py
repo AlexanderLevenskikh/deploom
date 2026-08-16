@@ -576,6 +576,7 @@ def verify_assignment(
     attempt_started = time.monotonic()
     attempt_deadline = attempt_started + config.attempt_timeout_seconds
     base_env = dict(os.environ)
+    remove_packages = tuple(sorted({str(item) for item in remove_packages}))
     telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
     assignment_hash = assignment_fingerprint(assignment)
     proof_identity: Optional[VerificationProofIdentity] = None
@@ -728,12 +729,22 @@ def verify_assignment(
             materialized_manifest = json.loads((workspace_project / "package.json").read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError) as exc:
             return BaselineVerifyResult(False, "unknown", f"ASSIGNMENT_MANIFEST_UNREADABLE: {exc}")
+        removal_names = set(remove_packages)
         for expected_name, expected_version in sorted(assignment.items()):
             observed_versions = []
             for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
                 values = materialized_manifest.get(section)
                 if isinstance(values, dict) and expected_name in values:
                     observed_versions.append(str(values[expected_name]))
+            if expected_name in removal_names:
+                if observed_versions:
+                    return BaselineVerifyResult(
+                        False,
+                        "unknown",
+                        f"ASSIGNMENT_MANIFEST_DRIFT: {expected_name} was proven for removal but remains declared as {observed_versions!r}",
+                        workspace=str(workspace_project),
+                    )
+                continue
             if not observed_versions or any(value != expected_version for value in observed_versions):
                 return BaselineVerifyResult(
                     False,

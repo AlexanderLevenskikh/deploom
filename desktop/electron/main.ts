@@ -4,7 +4,7 @@ const { autoUpdater } = updaterPackage
 import { buildClaudeAgentArgs, buildClaudeResumeArgs, buildCodexAgentArgs, buildCodexResumeArgs, buildOpenCodeAgentArgs, buildOpenCodeResumeArgs, parseOpencodeModelsOutput } from './agent-command.js'
 import { agentBatchCompletionFingerprint, agentScopeFingerprint, extractAgentSessionId, resumableAgentSessionId } from './agent-session.js'
 import { restoreVerifiedAgentCompletion, updateFlowProgress, type FlowAction } from './flow-state.js'
-import { adoptEmptyContinuationBranches, adoptHistoricalContinuationBranches, adoptPreferredScopeBranches, buildMigrationProgress, continuationMigrationPlan, integratedBranchTargets, leftoverConflictMarkerLines, liveGitWorktreeRecords, mergeInProgressNote, mergePackageJsonThreeWay, migrationBranchStateText, migrationCompletionIssues, migrationBatchScopeDriftIssues, migrationGroupScopeDriftIssues, migrationPlanFromPrompt, migrationScopeManifestFromPrompt, migrationStateSummary, nextIncompleteMigrationBranch, recoverContinuationScopeBranches, rebindMigrationPromptBranchIdentity, replaceMigrationPlanInPrompt, relevantGitStatus, relevantGitStatusLines, workspaceNoiseGitExcludePathspecs, rollbackIncompleteMigrationActions, satisfiedScopePackagesFromPrompt, scopeActionsFromPrompt, scopeTargetsFromPrompt, type MigrationBranchProgress, type MigrationBranchRuntime, type MigrationBranchRuntimePhase, type MigrationPlan, type MigrationProgress } from './migration-progress.js'
+import { adoptEmptyContinuationBranches, adoptHistoricalContinuationBranches, adoptPreferredScopeBranches, buildMigrationProgress, continuationMigrationPlan, integratedBranchTargets, leftoverConflictMarkerLines, liveGitWorktreeRecords, mergeInProgressNote, mergePackageJsonThreeWay, migrationBranchStateText, migrationCompletionIssues, migrationBatchScopeDriftIssues, migrationGroupScopeDriftIssues, migrationPlanFromPrompt, migrationScopeManifestFromPrompt, migrationStateSummary, nextIncompleteMigrationBranch, recoverContinuationScopeBranches, rebindMigrationPromptBranchIdentity, replaceMigrationPlanInPrompt, relevantGitStatus, relevantGitStatusLines, workspaceNoiseGitExcludePathspecs, rollbackIncompleteMigrationActions, satisfiedScopePackagesFromPrompt, scopeActionsFromPrompt, scopeTargetsFromPrompt, validateScopeProofEnvelope, type MigrationBranchProgress, type MigrationBranchRuntime, type MigrationBranchRuntimePhase, type MigrationPlan, type MigrationProgress } from './migration-progress.js'
 import { buildGroupScopedPrompt, buildProjectPrompt } from './prompt-harness.js'
 import { rebindOperationalProjectPath } from './prompt-paths.js'
 import { buildAgentExecutionBatches } from './agent-batching.js'
@@ -1918,6 +1918,15 @@ function writeDependencyCompatibilityEvidence(input: {
   materializationProof?: string
   includePackages?: ReadonlySet<string>
 }): string {
+  const proofEnvelopeValidation = validateScopeProofEnvelope(
+    input.fullGroupPrompt,
+    input.project.name,
+  )
+  if (!proofEnvelopeValidation.ok || !proofEnvelopeValidation.envelope) {
+    throw new Error(
+      `DEPENDENCY_COMPATIBILITY_EVIDENCE_INVALID: ${input.branch}: ${proofEnvelopeValidation.reason}`,
+    )
+  }
   const actions = scopeActionsFromPrompt(input.fullGroupPrompt, input.project.name)
     .filter((item) => item.action === 'update' && item.current && item.target)
     .filter((item) => !input.includePackages || input.includePackages.has(item.package))
@@ -1940,6 +1949,7 @@ function writeDependencyCompatibilityEvidence(input: {
     actions,
     reason: input.reason.slice(0, 6000),
     materializationProof: input.materializationProof ?? '',
+    proofEnvelope: proofEnvelopeValidation.envelope,
     createdAt: new Date().toISOString(),
   }
   const temporary = `${path}.tmp`
@@ -2046,6 +2056,15 @@ async function materializeApprovedDependencyAssignment(
   const actions = scopeActionsFromPrompt(fullGroupPrompt, project.name)
   if (!actions.length) return { safeToSplitSemanticBatches: false, changedPackages: [] }
 
+  const proofEnvelopeValidation = validateScopeProofEnvelope(fullGroupPrompt, project.name)
+  if (!proofEnvelopeValidation.ok || !proofEnvelopeValidation.envelope) {
+    throw new Error(
+      `MIGRATION_REPLAN_REQUIRED: PROVEN_DEPENDENCY_PROOF_INVALID: ${branchName}: ${proofEnvelopeValidation.reason}. `
+      + 'Dashboard/prompt no longer carries the exact Baseline proof identity; Executor is not allowed to guess dependency state.',
+    )
+  }
+  const proofEnvelope = proofEnvelopeValidation.envelope
+
   let packageText: string
   let packageJson: unknown
   try {
@@ -2085,6 +2104,11 @@ async function materializeApprovedDependencyAssignment(
       packageManager: manager,
       packageManagerVersion: runtime.packageManagerVersion,
       nodeVersion: runtime.nodeVersion,
+      provenEnvelopeKey: proofEnvelope.envelopeKey,
+      provenAssignmentKey: proofEnvelope.assignmentKey,
+      resolverInputKey: proofEnvelope.resolverInputKey,
+      sourceSnapshotKey: proofEnvelope.sourceSnapshotKey,
+      projectProofKey: proofEnvelope.projectProofKey,
     })
     if (existingValidation.ok) {
       send('flow:job-output', {
@@ -2099,6 +2123,26 @@ async function materializeApprovedDependencyAssignment(
       stream: 'system',
       line: `${branchName}: targets уже записаны, но materialization proof отсутствует/устарел (${existingValidation.reason}). Повторно доказываю lockfile/resolved state детерминированным install до LLM.`,
     })
+  }
+
+  const nonDependencyDirty = relevantGitStatus(statusBefore.stdout)
+  if (nonDependencyDirty) {
+    throw new Error(
+      `MIGRATION_REPLAN_REQUIRED: PROVEN_DEPENDENCY_SOURCE_SNAPSHOT_DIRTY: ${branchName}: `
+      + `source/config changed before Control Plane materialization: ${nonDependencyDirty.split('\n').slice(0, 8).join('; ')}. `
+      + 'A fresh Baseline ProofEnvelope is required.',
+    )
+  }
+  const sourceHead = await spawnCapture('git', ['-C', project.path, 'rev-parse', 'HEAD'], project.path, 20_000)
+  if (sourceHead.code !== 0 || !sourceHead.stdout.trim()) {
+    throw new Error(`PROVEN_DEPENDENCY_SOURCE_UNREADABLE: ${branchName}: cannot read pre-materialization HEAD.`)
+  }
+  if (sourceHead.stdout.trim() !== proofEnvelope.sourceHead) {
+    throw new Error(
+      `MIGRATION_REPLAN_REQUIRED: PROVEN_DEPENDENCY_SOURCE_SNAPSHOT_DRIFT: ${branchName}: `
+      + `Baseline source=${proofEnvelope.sourceHead.slice(0, 12)}, current=${sourceHead.stdout.trim().slice(0, 12)}. `
+      + 'A fresh ProofEnvelope is required before dependency materialization.',
+    )
   }
 
   const applied = applyDependencyActionsToPackageJson(packageText, actions)
@@ -2168,6 +2212,11 @@ async function materializeApprovedDependencyAssignment(
     project: project.name,
     branch: branchName,
     actions,
+    provenEnvelopeKey: proofEnvelope.envelopeKey,
+    provenAssignmentKey: proofEnvelope.assignmentKey,
+    resolverInputKey: proofEnvelope.resolverInputKey,
+    sourceSnapshotKey: proofEnvelope.sourceSnapshotKey,
+    projectProofKey: proofEnvelope.projectProofKey,
     packageManager: manager,
     packageManagerVersion: runtime.packageManagerVersion,
     nodeVersion: runtime.nodeVersion,
@@ -2183,6 +2232,11 @@ async function materializeApprovedDependencyAssignment(
     packageManager: manager,
     packageManagerVersion: runtime.packageManagerVersion,
     nodeVersion: runtime.nodeVersion,
+    provenEnvelopeKey: proofEnvelope.envelopeKey,
+    provenAssignmentKey: proofEnvelope.assignmentKey,
+    resolverInputKey: proofEnvelope.resolverInputKey,
+    sourceSnapshotKey: proofEnvelope.sourceSnapshotKey,
+    projectProofKey: proofEnvelope.projectProofKey,
   })
   if (!proofValidation.ok) throw new Error(`DEPENDENCY_MATERIALIZATION_PROOF_INVALID: ${branchName}: ${proofValidation.reason}`)
   send('flow:job-output', {

@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
+from proven_dependency_state import validate_proven_dependency_envelope
+
 from baseline_constraint_verifier import (
     BaselineVerifyConfig,
     BaselineVerifyResult,
@@ -45,6 +47,8 @@ class CompatibilityEvidence:
     actions: Tuple[CompatibilityEvidenceAction, ...]
     reason: str = ""
     materialization_proof: str = ""
+    proof_envelope_key: str = ""
+    exact_assignment: Tuple[Tuple[str, str], ...] = ()
 
 
 class CompatibilityEvidenceError(RuntimeError):
@@ -84,6 +88,28 @@ def load_compatibility_evidence(path: Path) -> CompatibilityEvidence:
         raise CompatibilityEvidenceError("evidence requires at least one deterministic verification command")
     if not actions:
         raise CompatibilityEvidenceError("evidence contains no update actions that can be localized")
+
+    proof_envelope_key = ""
+    exact_assignment: Tuple[Tuple[str, str], ...] = ()
+    proof_envelope = raw.get("proofEnvelope")
+    if proof_envelope is not None:
+        if not isinstance(proof_envelope, dict):
+            raise CompatibilityEvidenceError("proofEnvelope must be an object")
+        valid, reason = validate_proven_dependency_envelope(proof_envelope)
+        if not valid:
+            raise CompatibilityEvidenceError(f"invalid proofEnvelope: {reason}")
+        if str(proof_envelope.get("project") or "") != project:
+            raise CompatibilityEvidenceError("proofEnvelope project does not match evidence project")
+        if str(proof_envelope.get("mode") or "") != target_mode:
+            raise CompatibilityEvidenceError("proofEnvelope mode does not match targetMode")
+        assignment_raw = proof_envelope.get("exactDirectAssignment")
+        if not isinstance(assignment_raw, dict):
+            raise CompatibilityEvidenceError("proofEnvelope exactDirectAssignment missing")
+        proof_envelope_key = str(proof_envelope.get("envelopeKey") or "")
+        exact_assignment = tuple(
+            sorted((str(name), str(version)) for name, version in assignment_raw.items())
+        )
+
     return CompatibilityEvidence(
         project=project,
         project_path=project_path.resolve(),
@@ -93,6 +119,8 @@ def load_compatibility_evidence(path: Path) -> CompatibilityEvidence:
         actions=tuple(actions),
         reason=str(raw.get("reason") or ""),
         materialization_proof=str(raw.get("materializationProof") or ""),
+        proof_envelope_key=proof_envelope_key,
+        exact_assignment=exact_assignment,
     )
 
 

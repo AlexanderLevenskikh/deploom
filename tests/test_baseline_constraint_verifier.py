@@ -492,6 +492,31 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
             self.assertEqual(identity.resolver_input_key, captured["reuse"])
 
 
+    def test_remove_only_assignment_is_verified_as_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(
+                json.dumps({
+                    "packageManager": "npm@11.0.0",
+                    "devDependencies": {"@types/demo": "1.0.0"},
+                }),
+                encoding="utf-8",
+            )
+            with patch("baseline_constraint_verifier.resolve_executable", return_value="npm"), \
+                    patch(
+                        "baseline_constraint_verifier._run",
+                        return_value=CompletedProcess(["npm", "install"], 0, stdout="ok"),
+                    ):
+                result = verify_assignment(
+                    root,
+                    {"@types/demo": "1.0.0"},
+                    remove_packages=("@types/demo",),
+                    config=BaselineVerifyConfig(project_checks="off"),
+                )
+            self.assertTrue(result.ok, result.summary)
+            self.assertEqual("passed", result.kind)
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,24 +1,32 @@
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 
 export type MaterializationAction = {
   package: string
   target: string
   action: string
+  section?: string
 }
 
 export type DependencyMaterializationProof = {
-  schemaVersion: 1
+  schemaVersion: 2
   project: string
   branch: string
   assignmentHash: string
   actions: MaterializationAction[]
+  provenEnvelopeKey: string
+  provenAssignmentKey: string
+  resolverInputKey: string
+  sourceSnapshotKey: string
+  projectProofKey: string
   dependencySections: Record<string, Record<string, string>>
   dependencySectionsHash: string
   dependencyControlFields: Record<string, unknown>
   dependencyStateHash: string
   lockfiles: Record<string, string>
+  observedResolvedVersions: Record<string, string>
+  observedResolvedHash: string
   packageManager: string
   packageManagerVersion: string
   nodeVersion: string
@@ -45,8 +53,17 @@ function canonicalJson(value: unknown): string {
 
 export function normalizeMaterializationActions(actions: readonly MaterializationAction[]): MaterializationAction[] {
   return actions
-    .map((item) => ({ package: String(item.package), target: String(item.target), action: String(item.action || 'update') }))
-    .sort((a, b) => a.package.localeCompare(b.package) || a.target.localeCompare(b.target) || a.action.localeCompare(b.action))
+    .map((item) => ({
+      package: String(item.package),
+      target: String(item.target),
+      action: String(item.action || 'update'),
+      ...(item.section ? { section: String(item.section) } : {}),
+    }))
+    .sort((a, b) =>
+      a.package.localeCompare(b.package)
+      || a.target.localeCompare(b.target)
+      || a.action.localeCompare(b.action)
+      || String(a.section ?? '').localeCompare(String(b.section ?? '')))
 }
 
 export function materializationAssignmentHash(actions: readonly MaterializationAction[]): string {
@@ -98,6 +115,50 @@ export function lockfileHashes(projectPath: string): Record<string, string> {
   return result
 }
 
+function installedPackageJsonPath(projectPath: string, packageName: string): string | undefined {
+  const parts = packageName.startsWith('@') ? packageName.split('/') : [packageName]
+  let cursor = resolve(projectPath)
+  while (true) {
+    const candidate = join(cursor, 'node_modules', ...parts, 'package.json')
+    if (existsSync(candidate)) return candidate
+    const parent = dirname(cursor)
+    if (parent === cursor) return undefined
+    cursor = parent
+  }
+}
+
+export function observedResolvedVersions(
+  projectPath: string,
+  actions: readonly MaterializationAction[],
+): Record<string, string> {
+  const observed: Record<string, string> = {}
+  for (const action of normalizeMaterializationActions(actions)) {
+    if (action.action !== 'update' || action.section === 'peerDependencies') continue
+
+    const packagePath = installedPackageJsonPath(projectPath, action.package)
+    if (!packagePath) {
+      if (action.section === 'optionalDependencies') {
+        observed[action.package] = '<optional-not-installed>'
+        continue
+      }
+      throw new Error(`OBSERVED_RESOLVED_ASSIGNMENT_MISSING: ${action.package}@${action.target}`)
+    }
+
+    let version = ''
+    try {
+      const raw = JSON.parse(readFileSync(packagePath, 'utf8')) as { version?: unknown }
+      version = typeof raw.version === 'string' ? raw.version.trim() : ''
+    } catch (error) {
+      throw new Error(`OBSERVED_RESOLVED_ASSIGNMENT_INVALID: ${action.package}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    if (version !== action.target) {
+      throw new Error(`OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: ${action.package} expected=${action.target} observed=${version || '<missing-version>'}`)
+    }
+    observed[action.package] = version
+  }
+  return Object.fromEntries(Object.entries(observed).sort(([a], [b]) => a.localeCompare(b)))
+}
+
 export function materializationProofPath(workspacePath: string, project: string, branch: string): string {
   const safe = (value: string) => value.replace(/[^a-zA-Z0-9._-]+/g, '-')
   return join(workspacePath, '.dependency-roadmap', 'state', 'materialization-proofs', safe(project), `${safe(branch)}.json`)
@@ -108,6 +169,11 @@ export function createMaterializationProof(input: {
   project: string
   branch: string
   actions: readonly MaterializationAction[]
+  provenEnvelopeKey: string
+  provenAssignmentKey: string
+  resolverInputKey: string
+  sourceSnapshotKey: string
+  projectProofKey: string
   packageManager: string
   packageManagerVersion: string
   nodeVersion: string
@@ -118,17 +184,26 @@ export function createMaterializationProof(input: {
   const actions = normalizeMaterializationActions(input.actions)
   const dependencySections = dependencySectionsFromPackageJson(packageJson)
   const dependencyControlFields = dependencyControlFieldsFromPackageJson(packageJson)
+  const observed = observedResolvedVersions(input.projectPath, actions)
+
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     project: input.project,
     branch: input.branch,
     assignmentHash: materializationAssignmentHash(actions),
     actions,
+    provenEnvelopeKey: input.provenEnvelopeKey,
+    provenAssignmentKey: input.provenAssignmentKey,
+    resolverInputKey: input.resolverInputKey,
+    sourceSnapshotKey: input.sourceSnapshotKey,
+    projectProofKey: input.projectProofKey,
     dependencySections,
     dependencySectionsHash: sha256(canonicalJson(dependencySections)),
     dependencyControlFields,
     dependencyStateHash: sha256(canonicalJson({ dependencySections, dependencyControlFields })),
     lockfiles: lockfileHashes(input.projectPath),
+    observedResolvedVersions: observed,
+    observedResolvedHash: sha256(canonicalJson(observed)),
     packageManager: input.packageManager,
     packageManagerVersion: input.packageManagerVersion,
     nodeVersion: input.nodeVersion,
@@ -148,7 +223,7 @@ export function readMaterializationProof(path: string): DependencyMaterializatio
   if (!existsSync(path)) return undefined
   try {
     const value = JSON.parse(readFileSync(path, 'utf8')) as DependencyMaterializationProof
-    return value?.schemaVersion === 1 ? value : undefined
+    return value?.schemaVersion === 2 ? value : undefined
   } catch {
     return undefined
   }
@@ -163,19 +238,45 @@ export function validateMaterializationProof(input: {
   packageManager: string
   packageManagerVersion?: string
   nodeVersion?: string
+  provenEnvelopeKey?: string
+  provenAssignmentKey?: string
+  resolverInputKey?: string
+  sourceSnapshotKey?: string
+  projectProofKey?: string
 }): { ok: boolean; reason: string } {
   const proof = input.proof
   if (!proof) return { ok: false, reason: 'proof missing' }
   if (proof.project !== input.project || proof.branch !== input.branch) return { ok: false, reason: 'project/branch identity mismatch' }
   if (proof.assignmentHash !== materializationAssignmentHash(input.actions)) return { ok: false, reason: 'assignment hash mismatch' }
+  if (input.provenEnvelopeKey && proof.provenEnvelopeKey !== input.provenEnvelopeKey) return { ok: false, reason: 'proven envelope mismatch' }
+  if (input.provenAssignmentKey && proof.provenAssignmentKey !== input.provenAssignmentKey) return { ok: false, reason: 'proven assignment mismatch' }
+  if (input.resolverInputKey && proof.resolverInputKey !== input.resolverInputKey) return { ok: false, reason: 'resolver proof identity mismatch' }
+  if (input.sourceSnapshotKey && proof.sourceSnapshotKey !== input.sourceSnapshotKey) return { ok: false, reason: 'source snapshot identity mismatch' }
+  if (input.projectProofKey && proof.projectProofKey !== input.projectProofKey) return { ok: false, reason: 'project proof identity mismatch' }
   if (proof.packageManager !== input.packageManager) return { ok: false, reason: 'package-manager mismatch' }
   if (input.packageManagerVersion && proof.packageManagerVersion !== input.packageManagerVersion) return { ok: false, reason: 'package-manager version mismatch' }
   if (input.nodeVersion && proof.nodeVersion !== input.nodeVersion) return { ok: false, reason: 'Node version mismatch' }
+
   let packageJson: unknown
-  try { packageJson = JSON.parse(readFileSync(join(input.projectPath, 'package.json'), 'utf8')) as unknown } catch { return { ok: false, reason: 'package.json unreadable' } }
+  try {
+    packageJson = JSON.parse(readFileSync(join(input.projectPath, 'package.json'), 'utf8')) as unknown
+  } catch {
+    return { ok: false, reason: 'package.json unreadable' }
+  }
   if (dependencySectionsHash(packageJson) !== proof.dependencySectionsHash) return { ok: false, reason: 'dependency sections changed' }
   if (dependencyStateHash(packageJson) !== proof.dependencyStateHash) return { ok: false, reason: 'dependency control fields changed' }
+
   const currentLockfiles = lockfileHashes(input.projectPath)
   if (canonicalJson(currentLockfiles) !== canonicalJson(proof.lockfiles)) return { ok: false, reason: 'lockfile digest changed' }
-  return { ok: true, reason: 'materialization proof matches current dependency state' }
+
+  let observed: Record<string, string>
+  try {
+    observed = observedResolvedVersions(input.projectPath, proof.actions)
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+  }
+  if (sha256(canonicalJson(observed)) !== proof.observedResolvedHash) {
+    return { ok: false, reason: 'observed resolved tuple changed' }
+  }
+  return { ok: true, reason: 'materialization proof matches ProofEnvelope and current dependency state' }
 }

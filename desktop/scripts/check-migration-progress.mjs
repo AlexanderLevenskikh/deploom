@@ -1,4 +1,4 @@
-import { adoptEmptyContinuationBranches, adoptHistoricalContinuationBranches, adoptPreferredScopeBranches, buildMigrationProgress, continuationMigrationPlan, countTrackedDirtyChanges, integratedBranchTargets, leftoverConflictMarkerLines, liveGitWorktreeRecords, mergeInProgressNote, mergePackageJsonThreeWay, migrationCompletionIssues, migrationBatchScopeDriftIssues, migrationGroupScopeDriftIssues, migrationPlanFromPrompt, migrationStateSummary, missingGitignorePatterns, nextIncompleteMigrationBranch, recoverContinuationScopeBranches, rebindMigrationPromptBranchIdentity, replaceMigrationPlanInPrompt, rollbackIncompleteMigrationActions, relevantGitStatus, relevantGitStatusLines, satisfiedScopePackagesFromPrompt, strayUntrackedPaths, threeWayMergeDependencyMaps } from "../dist-electron/migration-progress.js";
+import { adoptEmptyContinuationBranches, adoptHistoricalContinuationBranches, adoptPreferredScopeBranches, buildMigrationProgress, continuationMigrationPlan, countTrackedDirtyChanges, integratedBranchTargets, leftoverConflictMarkerLines, liveGitWorktreeRecords, mergeInProgressNote, mergePackageJsonThreeWay, migrationCompletionIssues, migrationBatchScopeDriftIssues, migrationGroupScopeDriftIssues, migrationPlanFromPrompt, migrationStateSummary, missingGitignorePatterns, nextIncompleteMigrationBranch, recoverContinuationScopeBranches, rebindMigrationPromptBranchIdentity, replaceMigrationPlanInPrompt, rollbackIncompleteMigrationActions, relevantGitStatus, relevantGitStatusLines, proofEnvelopeContentKey, satisfiedScopePackagesFromPrompt, strayUntrackedPaths, threeWayMergeDependencyMaps, validateScopeProofEnvelope } from "../dist-electron/migration-progress.js";
 
 const worktrees = liveGitWorktreeRecords(`worktree C:/repo\nHEAD abc\nbranch refs/heads/main\n\nworktree C:/missing\nHEAD def\nbranch refs/heads/stale\nprunable gitdir file points to non-existent location\n`);
 if (worktrees.length !== 1 || worktrees[0].branch !== "main") throw new Error(`Prunable worktree leaked into live Git state: ${JSON.stringify(worktrees)}`);
@@ -441,3 +441,53 @@ if (leftoverConflictMarkerLines("docs.md:1: trailing whitespace.\n+line one  ").
 if (leftoverConflictMarkerLines("").length !== 0) throw new Error("Clean diff --check output must report no markers");
 
 console.log("Migration branch progress OK");
+// The prompt must carry the exact Baseline ProofEnvelope across the
+// Python -> Dashboard -> Electron boundary. A local scope is only a subset.
+const proofEnvelopePayload = {
+  schemaVersion: 1,
+  proofSchema: 'baseline-proof-v2',
+  project: 'Demo',
+  mode: 'yellow',
+  sourceHead: 'abc123',
+  sourceSnapshotKey: 'source-key',
+  assignmentKey: 'assignment-key',
+  resolverInputKey: 'resolver-key',
+  preparationProofKey: 'preparation-key',
+  projectProofKey: 'project-key',
+  exactDirectAssignment: { a: '2.0.0', '@types/a': '1.0.0' },
+  removals: ['@types/a'],
+  verificationCommands: ['yarn lint:types'],
+  projectChecks: 'adaptive',
+  resolverProofStatus: 'passed',
+  preparationProofStatus: 'passed',
+  projectProofStatus: 'diagnostic-red',
+};
+const proofEnvelope = {
+  ...proofEnvelopePayload,
+  envelopeKey: proofEnvelopeContentKey(proofEnvelopePayload),
+};
+const proofManifest = {
+  schemaVersion: 2,
+  targetMode: 'yellow',
+  proofEnvelopes: { Demo: proofEnvelope },
+  columns: ['project','package','section','current','target','shouldUpdate','action'],
+  rows: [
+    ['Demo','a','dependencies','1.0.0','2.0.0',true,'update'],
+    ['Demo','@types/a','devDependencies','1.0.0','1.0.0',true,'remove'],
+  ],
+};
+const proofPrompt = `## Exact compact scope manifest\n\n\`\`\`json\n${JSON.stringify(proofManifest)}\n\`\`\``;
+let proofValidation = validateScopeProofEnvelope(proofPrompt, 'Demo');
+if (!proofValidation.ok) throw new Error(`Valid ProofEnvelope rejected: ${proofValidation.reason}`);
+
+const targetDriftPrompt = proofPrompt.replace('"2.0.0",true,"update"', '"2.1.0",true,"update"');
+proofValidation = validateScopeProofEnvelope(targetDriftPrompt, 'Demo');
+if (proofValidation.ok || !proofValidation.reason.includes('assignment mismatch')) throw new Error(`Prompt target drift must fail ProofEnvelope validation: ${proofValidation.reason}`);
+
+const tamperedEnvelope = {
+  ...proofEnvelope,
+  exactDirectAssignment: { ...proofEnvelope.exactDirectAssignment, a: '2.1.0' },
+};
+const envelopeDriftPrompt = proofPrompt.replace(JSON.stringify(proofEnvelope), JSON.stringify(tamperedEnvelope));
+proofValidation = validateScopeProofEnvelope(envelopeDriftPrompt, 'Demo');
+if (proofValidation.ok || !proofValidation.reason.includes('content hash')) throw new Error(`Envelope content drift must fail hash validation: ${proofValidation.reason}`);
