@@ -2,7 +2,7 @@ import { Activity, CheckCircle2, CircleAlert, LoaderCircle } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { deriveRunMonitor, type MonitorHealth, type RunMonitorPhase } from '../data/processMonitor'
 import { latestJobId } from '../data/logPresentation'
-import { useLanguage } from '../i18n'
+import { useLanguage, type TranslationKey } from '../i18n'
 import type { FlowAction, JobOutput, MigrationProgress } from '../types'
 
 type Props = {
@@ -10,62 +10,33 @@ type Props = {
   active: boolean
   jobId?: string
   action?: FlowAction
+  runStartedAt?: number
   migrationProgress?: MigrationProgress
 }
 
-const PHASE_COPY: Record<RunMonitorPhase, { ru: string; en: string }> = {
-  idle: { ru: 'Нет активной операции', en: 'No active operation' },
-  scan: { ru: 'Анализ зависимостей', en: 'Dependency analysis' },
-  planning: { ru: 'Построение плана', en: 'Building plan' },
-  solving: { ru: 'Решение ограничений', en: 'Solving constraints' },
-  verifying: { ru: 'Проверка проекта', en: 'Project verification' },
-  localizing: { ru: 'Локализация конфликта', en: 'Conflict localization' },
-  confirming: { ru: 'Подтверждение найденного набора', en: 'Confirming localized set' },
-  reproducing: { ru: 'Подтверждение причины', en: 'Reproducing culprit' },
-  retrying: { ru: 'Повторная попытка', en: 'Retrying' },
-  migrating: { ru: 'Миграция', en: 'Migration' },
-  repairing: { ru: 'Исправление группы', en: 'Repairing group' },
-  merging: { ru: 'Merge', en: 'Merge' },
-  running: { ru: 'Выполнение', en: 'Running' },
-  finished: { ru: 'Последняя операция завершена', en: 'Last operation finished' },
-}
-
-const RUNTIME_COPY: Record<string, { ru: string; en: string }> = {
-  planning: { ru: 'Supervisor планирует', en: 'Supervisor planning' },
-  queued: { ru: 'В очереди', en: 'Queued' },
-  starting: { ru: 'Открывается слот агента', en: 'Opening agent slot' },
-  running: { ru: 'Агент работает', en: 'Agent working' },
-  bootstrapping: { ru: 'Подготовка окружения', en: 'Preparing environment' },
-  verifying: { ru: 'Проверка группы', en: 'Verifying group' },
-  repairing: { ru: 'Исправление после проверки', en: 'Repairing after verification' },
-  failed: { ru: 'Ожидает Supervisor', en: 'Waiting for Supervisor' },
-  ready: { ru: 'Готова к merge', en: 'Ready to merge' },
-  merging: { ru: 'Выполняется merge', en: 'Merging' },
-  'integration-verifying': { ru: 'Проверка после merge', en: 'Verifying merged branch' },
-}
-
-function formatDuration(seconds: number | undefined, language: 'ru' | 'en'): string | undefined {
+function formatDuration(seconds: number | undefined, units: { hour: string; minute: string; second: string }): string | undefined {
   if (seconds === undefined) return undefined
   const total = Math.max(0, Math.floor(seconds))
   const hours = Math.floor(total / 3600)
   const minutes = Math.floor((total % 3600) / 60)
   const secs = total % 60
-  if (hours) return language === 'ru' ? `${hours} ч ${minutes} мин` : `${hours}h ${minutes}m`
-  if (minutes) return language === 'ru' ? `${minutes} мин ${secs} с` : `${minutes}m ${secs}s`
-  return language === 'ru' ? `${secs} с` : `${secs}s`
+  if (hours) return `${hours}${units.hour} ${minutes}${units.minute}`
+  if (minutes) return `${minutes}${units.minute} ${secs}${units.second}`
+  return `${secs}${units.second}`
 }
 
-function healthCopy(health: MonitorHealth | undefined, age: string | undefined, language: 'ru' | 'en') {
-  if (!health || !age) return undefined
-  if (health === 'healthy') return language === 'ru' ? `Работает · сигнал ${age} назад` : `Working · signal ${age} ago`
-  if (health === 'quiet') return language === 'ru' ? `Долгая операция · сигнал ${age} назад` : `Long operation · signal ${age} ago`
-  if (health === 'warning') return language === 'ru' ? `Давно нет новых сообщений · ${age}` : `No new messages for ${age}`
-  return language === 'ru' ? `Нет новых сигналов ${age} · watchdog продолжает контроль` : `No signal for ${age} · watchdog is still monitoring`
+function phaseKey(phase: RunMonitorPhase): TranslationKey {
+  return `monitor.phase.${phase}` as TranslationKey
 }
 
-export function RunMonitor({ logs, active, jobId, action, migrationProgress }: Props) {
-  const { language, text } = useLanguage()
+function healthKey(health: MonitorHealth): TranslationKey {
+  return `monitor.health.${health}` as TranslationKey
+}
+
+export function RunMonitor({ logs, active, jobId, action, runStartedAt, migrationProgress }: Props) {
+  const { t } = useLanguage()
   const [now, setNow] = useState(() => Date.now())
+
   useEffect(() => {
     if (!active) return
     const timer = window.setInterval(() => setNow(Date.now()), 1_000)
@@ -74,67 +45,88 @@ export function RunMonitor({ logs, active, jobId, action, migrationProgress }: P
 
   const effectiveJobId = jobId ?? latestJobId(logs)
   const state = useMemo(
-    () => deriveRunMonitor(logs, active, effectiveJobId, migrationProgress, action, now),
-    [action, active, effectiveJobId, logs, migrationProgress, now],
+    () => deriveRunMonitor(logs, active, effectiveJobId, migrationProgress, action, now, runStartedAt),
+    [action, active, effectiveJobId, logs, migrationProgress, now, runStartedAt],
   )
-  const duration = formatDuration(state.elapsedSeconds, language)
-  const stepDuration = formatDuration(state.stepElapsedSeconds, language)
-  const signalAge = formatDuration(state.lastSignalAgeSeconds, language)
-  const phase = PHASE_COPY[state.phase][language]
-  const health = healthCopy(state.health, signalAge, language)
 
+  const durationUnits = { hour: t('duration.hourShort'), minute: t('duration.minuteShort'), second: t('duration.secondShort') }
+  const totalDuration = formatDuration(state.runElapsedSeconds, durationUnits)
+  const attemptDuration = formatDuration(state.attemptElapsedSeconds, durationUnits)
+  const stepDuration = formatDuration(state.stepElapsedSeconds, durationUnits)
+  const signalAge = formatDuration(state.lastSignalAgeSeconds, durationUnits)
+  const phase = t(phaseKey(state.phase))
+  const health = state.health && signalAge ? t(healthKey(state.health), { age: signalAge }) : undefined
+
+  const activitySummary = (() => {
+    if (state.activity === 'scan' && state.dependency) return t('monitor.activity.scan', state.dependency)
+    if (state.activity === 'planning') return t('monitor.activity.planning')
+    if (state.activity === 'solving' || state.activity === 'searching-next') {
+      const base = t(state.activity === 'searching-next' ? 'monitor.activity.searchingNext' : 'monitor.activity.solving')
+      return state.baseline?.iteration && state.baseline.maxIterations
+        ? `${base} · ${t('monitor.iteration')} ${state.baseline.iteration}/${state.baseline.maxIterations}`
+        : base
+    }
+    if (state.activity === 'verifying-assignment') return t('monitor.activity.verifying')
+    if (state.activity === 'confirming-exact') return t('monitor.activity.confirmingExact')
+    if (state.activity === 'certifying-conflict') return t('monitor.activity.certifying')
+    if (state.activity === 'project-check') return t('monitor.activity.projectCheck')
+    if (state.activity === 'localizing' && state.localization) {
+      return t('monitor.localizationSummary', { history: state.localization.shrinkHistory.join(' → ') })
+    }
+    if (state.activity === 'confirming-localized' && state.localization) {
+      return t('monitor.confirmationSummary', { history: state.localization.shrinkHistory.join(' → ') })
+    }
+    if (state.activity === 'reproducing') return t('monitor.activity.reproducing')
+    if (state.activity === 'retrying') return t('monitor.activity.retrying')
+    if (state.activity === 'migrating') return t('monitor.activity.migrating')
+    if (state.activity === 'repairing') return t('monitor.activity.repairing')
+    if (state.activity === 'merging') return t('monitor.activity.merging')
+    return state.currentOperation || (active ? t('monitor.activity.running') : undefined)
+  })()
+
+  // The retry counter is metadata, not the progress of the work performed by
+  // that attempt. Live dependency/check/migration progress must win over 2/3.
   let progress: { value: number; max: number; label: string } | undefined
-  if (state.dependency) progress = {
-    value: state.dependency.current,
-    max: state.dependency.total,
-    label: text(`Пакеты ${state.dependency.current} из ${state.dependency.total}`, `Packages ${state.dependency.current} of ${state.dependency.total}`),
-  }
-  if (state.projectCheck) progress = {
-    value: state.projectCheck.current,
-    max: state.projectCheck.total,
-    label: text(`Проверки ${state.projectCheck.current} из ${state.projectCheck.total}`, `Checks ${state.projectCheck.current} of ${state.projectCheck.total}`),
-  }
-  if (state.reproduction) progress = {
-    value: state.reproduction.current,
-    max: state.reproduction.total,
-    label: text(`Подтверждение ${state.reproduction.current} из ${state.reproduction.total}`, `Reproduction ${state.reproduction.current} of ${state.reproduction.total}`),
-  }
-  if (state.retry) progress = {
-    value: state.retry.current,
-    max: state.retry.total,
-    label: text(`Попытка ${state.retry.current} из ${state.retry.total}`, `Attempt ${state.retry.current} of ${state.retry.total}`),
-  }
-  if (state.migration?.totalBranches) progress = {
-    value: state.migration.completedBranches,
-    max: state.migration.totalBranches,
-    label: text(`В merged ${state.migration.completedBranches} из ${state.migration.totalBranches} групп`, `Merged ${state.migration.completedBranches} of ${state.migration.totalBranches} groups`),
+  if (state.dependency) {
+    progress = {
+      value: state.dependency.current,
+      max: state.dependency.total,
+      label: t('monitor.packages', { current: state.dependency.current, total: state.dependency.total }),
+    }
+  } else if (state.projectCheck) {
+    progress = {
+      value: state.projectCheck.current,
+      max: state.projectCheck.total,
+      label: t('monitor.checks', { current: state.projectCheck.current, total: state.projectCheck.total }),
+    }
+  } else if (state.reproduction) {
+    progress = {
+      value: state.reproduction.current,
+      max: state.reproduction.total,
+      label: t('monitor.reproduction', { current: state.reproduction.current, total: state.reproduction.total }),
+    }
+  } else if (state.migration?.totalBranches) {
+    progress = {
+      value: state.migration.completedBranches,
+      max: state.migration.totalBranches,
+      label: t('monitor.mergedGroups', { current: state.migration.completedBranches, total: state.migration.totalBranches }),
+    }
+  } else if (state.retry) {
+    progress = {
+      value: state.retry.current,
+      max: state.retry.total,
+      label: t('monitor.attempt', { current: state.retry.current, total: state.retry.total }),
+    }
   }
 
   const percent = progress ? Math.min(100, Math.max(0, progress.value / Math.max(1, progress.max) * 100)) : undefined
-  const runtimeLabel = state.migration?.runtimePhase ? RUNTIME_COPY[state.migration.runtimePhase]?.[language] : undefined
-  const summary = state.localization
-    ? state.phase === 'confirming'
-      ? text(
-          `Подтверждаем найденный набор последовательно. Сужение: ${state.localization.shrinkHistory.join(' → ')} групп.`,
-          `Confirming the localized set serially. Shrink: ${state.localization.shrinkHistory.join(' → ')} groups.`,
-        )
-      : text(
-          `Ищем минимальный конфликт. Уже сузили: ${state.localization.shrinkHistory.join(' → ')} групп.${state.localization.activeChecks ? ` Сейчас параллельно проверяются ${state.localization.activeChecks} варианта.` : ''}`,
-          `Finding the minimal conflict. Shrunk: ${state.localization.shrinkHistory.join(' → ')} groups.${state.localization.activeChecks ? ` ${state.localization.activeChecks} candidates are running in parallel.` : ''}`,
-        )
-    : state.migration
-      ? text(
-          `Миграция: ${state.migration.completedBranches} из ${state.migration.totalBranches} групп уже в merged.${state.migration.label ? ` Сейчас: ${state.migration.label}${runtimeLabel ? ` · ${runtimeLabel}` : ''}.` : ''}`,
-          `Migration: ${state.migration.completedBranches} of ${state.migration.totalBranches} groups are merged.${state.migration.label ? ` Current: ${state.migration.label}${runtimeLabel ? ` · ${runtimeLabel}` : ''}.` : ''}`,
-        )
-      : state.currentOperation
 
   return (
     <section className={`run-monitor ${active ? 'active' : 'idle'}`} aria-live="polite">
       <div className="run-monitor-heading">
         <div>
           {active ? <LoaderCircle className="spin" size={15} /> : state.phase === 'finished' ? <CheckCircle2 size={15} /> : <Activity size={15} />}
-          <strong>{text('Монитор выполнения', 'Run monitor')}</strong>
+          <strong>{t('monitor.title')}</strong>
         </div>
         <span className="run-monitor-phase">{phase}</span>
       </div>
@@ -146,7 +138,7 @@ export function RunMonitor({ logs, active, jobId, action, migrationProgress }: P
         </div>
       ) : null}
 
-      {summary ? <div className="run-monitor-summary">{summary}</div> : null}
+      {activitySummary ? <div className="run-monitor-summary">{activitySummary}</div> : null}
 
       {progress ? (
         <div className="run-monitor-progress">
@@ -158,33 +150,30 @@ export function RunMonitor({ logs, active, jobId, action, migrationProgress }: P
           <div className="run-monitor-shrink">
             {state.localization.shrinkHistory.map((units, index) => <span key={`${units}-${index}`}>{index ? '→ ' : ''}{units}</span>)}
           </div>
-          <small>{text(
-            `Бюджет проверок: ${state.localization.checksStarted}/${state.localization.maxChecks} · это лимит поиска, не процент готовности`,
-            `Check budget: ${state.localization.checksStarted}/${state.localization.maxChecks} · this is a search limit, not completion percent`,
-          )}</small>
+          <small>{t('monitor.checkBudgetHint', { started: state.localization.checksStarted, max: state.localization.maxChecks })}</small>
         </div>
       ) : active ? <div className="run-monitor-track indeterminate"><div /></div> : null}
 
       <div className="run-monitor-facts">
-        {state.dependency ? <div><span>{text('Сейчас', 'Current')}</span><strong title={state.dependency.name}>{state.dependency.name}</strong></div> : null}
-        {state.solver?.componentsTotal ? <div><span>{text('Компоненты', 'Components')}</span><strong>{state.solver.componentsDone ?? 0}/{state.solver.componentsTotal}</strong></div> : null}
-        {state.solver?.changed !== undefined ? <div><span>{text('Изменений', 'Changes')}</span><strong>{state.solver.changed}</strong></div> : null}
-        {state.projectCheck ? <div><span>{text('Команда', 'Command')}</span><strong title={state.projectCheck.name}>{state.projectCheck.name}</strong></div> : null}
-        {state.localization ? <div><span>{text('Осталось групп', 'Units left')}</span><strong>{state.localization.currentUnits}</strong></div> : null}
-        {state.localization?.activeChecks !== undefined ? <div><span>{text('Параллельно', 'Parallel')}</span><strong>{state.localization.activeChecks}</strong></div> : null}
-        {state.localization?.packages !== undefined ? <div><span>{text('Пакетов в наборе', 'Packages in set')}</span><strong>{state.localization.packages}</strong></div> : null}
-        {state.localization ? <div><span>{text('Бюджет проверок', 'Check budget')}</span><strong>{state.localization.checksStarted}/{state.localization.maxChecks}</strong></div> : null}
-        {state.reproduction?.literals !== undefined ? <div><span>{text('Проверяем literals', 'Testing literals')}</span><strong>{state.reproduction.literals}</strong></div> : null}
-        {state.migration?.label ? <div><span>{text('Текущая группа', 'Current group')}</span><strong title={state.migration.branch}>{state.migration.label}</strong></div> : null}
-        {state.migration?.branchPackages !== undefined ? <div><span>{text('Цели группы', 'Group targets')}</span><strong>{state.migration.metPackages ?? 0}/{state.migration.branchPackages}</strong></div> : null}
-        {state.migration ? <div><span>{text('Зависимости merged', 'Merged dependencies')}</span><strong>{state.migration.completedDependencies}/{state.migration.totalDependencies}</strong></div> : null}
-        {state.migration?.readyBranches ? <div><span>{text('Готовы к merge', 'Ready to merge')}</span><strong>{state.migration.readyBranches}</strong></div> : null}
-        {state.migration?.queuedBranches ? <div><span>{text('В очереди', 'Queued')}</span><strong>{state.migration.queuedBranches}</strong></div> : null}
-        {state.migration?.failedBranches ? <div><span>{text('Ждут Supervisor', 'Waiting for Supervisor')}</span><strong>{state.migration.failedBranches}</strong></div> : null}
-        {state.assignment ? <div><span>Assignment</span><strong title={state.assignment}>{state.assignment.slice(0, 12)}</strong></div> : null}
-        {duration ? <div><span>{text('Всего localization', 'Localization total')}</span><strong>{duration}</strong></div> : null}
-        {stepDuration ? <div><span>{text('Текущий шаг', 'Current step')}</span><strong>{stepDuration}</strong></div> : null}
-        {signalAge ? <div><span>{text('Последний сигнал', 'Last signal')}</span><strong>{text(`${signalAge} назад`, `${signalAge} ago`)}</strong></div> : null}
+        {state.retry ? <div><span>{t('monitor.attemptTime')}</span><strong>{state.retry.current}/{state.retry.total}{attemptDuration ? ` · ${attemptDuration}` : ''}</strong></div> : null}
+        {state.baseline?.iteration ? <div><span>{t('monitor.iteration')}</span><strong>{state.baseline.iteration}{state.baseline.maxIterations ? `/${state.baseline.maxIterations}` : ''}</strong></div> : null}
+        {state.dependency ? <div><span>{t('common.current')}</span><strong title={state.dependency.name}>{state.dependency.name}</strong></div> : null}
+        {state.solver?.componentsTotal ? <div><span>{t('monitor.components')}</span><strong>{state.solver.componentsDone ?? 0}/{state.solver.componentsTotal}</strong></div> : null}
+        {state.solver?.changed !== undefined ? <div><span>{t('monitor.changes')}</span><strong>{state.solver.changed}</strong></div> : null}
+        {state.projectCheck ? <div><span>{t('monitor.command')}</span><strong title={state.projectCheck.name}>{state.projectCheck.name}</strong></div> : null}
+        {state.localization ? <div><span>{t('monitor.unitsLeft')}</span><strong>{state.localization.currentUnits}</strong></div> : null}
+        {state.localization?.activeChecks !== undefined ? <div><span>{t('monitor.parallel')}</span><strong>{state.localization.activeChecks}</strong></div> : null}
+        {state.localization?.packages !== undefined ? <div><span>{t('monitor.packagesInSet')}</span><strong>{state.localization.packages}</strong></div> : null}
+        {state.localization ? <div><span>{t('monitor.checkBudget')}</span><strong>{state.localization.checksStarted}/{state.localization.maxChecks}</strong></div> : null}
+        {state.migration?.label ? <div><span>{t('monitor.group')}</span><strong title={state.migration.branch}>{state.migration.label}</strong></div> : null}
+        {state.migration?.branchPackages !== undefined ? <div><span>{t('monitor.groupTargets')}</span><strong>{state.migration.metPackages ?? 0}/{state.migration.branchPackages}</strong></div> : null}
+        {state.migration ? <div><span>{t('monitor.mergedDependencies')}</span><strong>{state.migration.completedDependencies}/{state.migration.totalDependencies}</strong></div> : null}
+        {state.migration?.readyBranches ? <div><span>{t('monitor.readyToMerge')}</span><strong>{state.migration.readyBranches}</strong></div> : null}
+        {state.migration?.queuedBranches ? <div><span>{t('monitor.queued')}</span><strong>{state.migration.queuedBranches}</strong></div> : null}
+        {state.migration?.failedBranches ? <div><span>{t('monitor.waitSupervisor')}</span><strong>{state.migration.failedBranches}</strong></div> : null}
+        {totalDuration ? <div><span>{t('monitor.totalTime')}</span><strong>{totalDuration}</strong></div> : null}
+        {stepDuration ? <div><span>{t('monitor.currentPhaseTime')}</span><strong>{stepDuration}</strong></div> : null}
+        {signalAge ? <div><span>{t('monitor.lastSignal')}</span><strong>{t('monitor.ago', { value: signalAge })}</strong></div> : null}
       </div>
     </section>
   )

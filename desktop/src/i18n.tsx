@@ -1,11 +1,15 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { en, type TranslationKey } from './i18n/locales/en'
+import { ru } from './i18n/locales/ru'
 
 export type Language = 'ru' | 'en'
+export type TranslationValues = Record<string, string | number>
 
 type LanguageContextValue = {
   language: Language
   setLanguage: (language: Language) => void
-  text: (ru: string, en: string) => string
+  t: (key: TranslationKey, values?: TranslationValues) => string
+  text: (ruText: string, enText: string) => string
 }
 
 const STORAGE_KEY = 'deploom.language'
@@ -18,8 +22,15 @@ function initialLanguage(): Language {
   } catch {
     // Local storage can be unavailable in hardened environments.
   }
-  // Preserve the current product behaviour for existing users.
-  return 'ru'
+  return 'en'
+}
+
+function interpolate(template: string, values?: TranslationValues): string {
+  if (!values) return template
+  return template.replace(/\{([a-zA-Z0-9_]+)\}/g, (match, key: string) => {
+    const value = values[key]
+    return value === undefined ? match : String(value)
+  })
 }
 
 export function LanguageProvider({ children }: { children: ReactNode }) {
@@ -37,7 +48,10 @@ export function LanguageProvider({ children }: { children: ReactNode }) {
   const value = useMemo<LanguageContextValue>(() => ({
     language,
     setLanguage,
-    text: (ru, en) => language === 'ru' ? ru : en,
+    t: (key, values) => interpolate((language === 'ru' ? ru : en)[key], values),
+    // Compatibility bridge for highly dynamic copy while the canonical static
+    // UI copy lives in typed locale dictionaries.
+    text: (ruText, enText) => language === 'ru' ? ruText : enText,
   }), [language])
 
   return <LanguageContext.Provider value={value}>{children}</LanguageContext.Provider>
@@ -48,3 +62,5 @@ export function useLanguage(): LanguageContextValue {
   if (!value) throw new Error('useLanguage must be used inside LanguageProvider')
   return value
 }
+
+export type { TranslationKey }

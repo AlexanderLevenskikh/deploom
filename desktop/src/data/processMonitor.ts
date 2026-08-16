@@ -16,13 +16,35 @@ export type RunMonitorPhase =
   | 'running'
   | 'finished'
 
+export type RunMonitorActivity =
+  | 'idle'
+  | 'scan'
+  | 'planning'
+  | 'solving'
+  | 'verifying-assignment'
+  | 'confirming-exact'
+  | 'certifying-conflict'
+  | 'searching-next'
+  | 'project-check'
+  | 'localizing'
+  | 'confirming-localized'
+  | 'reproducing'
+  | 'retrying'
+  | 'migrating'
+  | 'repairing'
+  | 'merging'
+  | 'running'
+  | 'finished'
+
 export type MonitorHealth = 'healthy' | 'quiet' | 'warning' | 'stale'
 
 export type RunMonitorState = {
   phase: RunMonitorPhase
+  activity: RunMonitorActivity
   active: boolean
   currentOperation?: string
-  elapsedSeconds?: number
+  runElapsedSeconds?: number
+  attemptElapsedSeconds?: number
   stepElapsedSeconds?: number
   lastSignalAt?: number
   lastSignalAgeSeconds?: number
@@ -30,6 +52,7 @@ export type RunMonitorState = {
   dependency?: { current: number; total: number; name: string }
   projectCheck?: { current: number; total: number; name: string; status?: 'pass' | 'red' }
   solver?: { componentsDone?: number; componentsTotal?: number; changed?: number; constraints?: number }
+  baseline?: { iteration?: number; maxIterations?: number }
   assignment?: string
   localization?: {
     initialUnits: number
@@ -102,6 +125,14 @@ function phaseForRuntime(phase: MigrationBranchRuntimePhase | undefined): RunMon
   return 'migrating'
 }
 
+function activityForRuntime(phase: MigrationBranchRuntimePhase | undefined): RunMonitorActivity {
+  if (phase === 'repairing') return 'repairing'
+  if (phase === 'merging') return 'merging'
+  if (phase === 'verifying' || phase === 'integration-verifying') return 'project-check'
+  if (phase === 'planning') return 'planning'
+  return 'migrating'
+}
+
 function activeMigrationBranch(progress: MigrationProgress): MigrationBranchProgress | undefined {
   const working = progress.branches.find((branch) =>
     branch.runtime && !['planning', 'queued', 'failed', 'ready'].includes(branch.runtime.phase),
@@ -143,6 +174,13 @@ function latestReceivedAt(logs: readonly JobOutput[]): number | undefined {
   return undefined
 }
 
+function earliestReceivedAt(logs: readonly JobOutput[]): number | undefined {
+  for (const entry of logs) {
+    if (entry.receivedAt !== undefined) return entry.receivedAt
+  }
+  return undefined
+}
+
 export function deriveRunMonitor(
   logs: readonly JobOutput[],
   active: boolean,
@@ -150,11 +188,30 @@ export function deriveRunMonitor(
   migrationProgress?: MigrationProgress,
   action?: FlowAction,
   now = Date.now(),
+  runStartedAt?: number,
 ): RunMonitorState {
-  const scoped = jobId ? logs.filter((entry) => entry.jobId === jobId) : logs
-  let state: RunMonitorState = { phase: active ? 'running' : 'idle', active }
-  let stepStartedAt: number | undefined
+  // A FLOW command is one logical run even when the Electron orchestrator
+  // starts another child process for a bounded retry. Prefer the explicit run
+  // start over a process/job id so heartbeat and elapsed time keep following
+  // the current attempt instead of freezing on attempt 1.
+  const scoped = runStartedAt !== undefined
+    ? logs.filter((entry) => entry.receivedAt === undefined || entry.receivedAt >= runStartedAt - 1_000)
+    : jobId ? logs.filter((entry) => entry.jobId === jobId) : logs
+
+  let state: RunMonitorState = {
+    phase: active ? 'running' : 'idle',
+    activity: active ? 'running' : 'idle',
+    active,
+  }
+  const logicalRunStartedAt = runStartedAt ?? earliestReceivedAt(scoped)
+  let attemptStartedAt = logicalRunStartedAt
+  let phaseStartedAt = logicalRunStartedAt
   let lastSignalAt = latestReceivedAt(scoped)
+
+  const move = (phase: RunMonitorPhase, activity: RunMonitorActivity, at?: number) => {
+    if ((state.phase !== phase || state.activity !== activity) && at !== undefined) phaseStartedAt = at
+    state = { ...state, phase, activity }
+  }
 
   for (const entry of scoped) {
     if (entry.stream !== 'system') continue
@@ -162,35 +219,50 @@ export function deriveRunMonitor(
     const receivedAt = entry.receivedAt
     let match: RegExpExecArray | null
 
+    match = /transient retry (\d+)\/(\d+)/i.exec(line)
+    if (match) {
+      attemptStartedAt = receivedAt ?? attemptStartedAt
+      move('retrying', 'retrying', receivedAt)
+      state = { ...state, retry: { current: Number(match[1]), total: Number(match[2]) }, dependency: undefined, projectCheck: undefined }
+      continue
+    }
+
     match = /\[dependency (\d+)\/(\d+)\]\s+([^:]+):/i.exec(line)
     if (match) {
+      move('scan', 'scan', receivedAt)
       state = {
         ...state,
-        phase: 'scan',
         dependency: { current: Number(match[1]), total: Number(match[2]), name: match[3].trim() },
+        projectCheck: undefined,
       }
-      if (receivedAt) lastSignalAt = receivedAt
       continue
     }
 
     if (/target planning started/i.test(line)) {
-      state = { ...state, phase: 'planning', dependency: undefined, currentOperation: undefined }
-      if (receivedAt) lastSignalAt = receivedAt
+      move('planning', 'planning', receivedAt)
+      state = { ...state, dependency: undefined, currentOperation: undefined }
+      continue
+    }
+
+    match = /Baseline solve-and-verify \w+ started;.*maxIterations=(\d+)/i.exec(line)
+    if (match) {
+      move('solving', 'solving', receivedAt)
+      state = { ...state, baseline: { ...state.baseline, maxIterations: Number(match[1]) }, dependency: undefined }
       continue
     }
 
     match = /peer solver \w+;\s+packages=(\d+),\s+components=(\d+),\s+candidates=(\d+)/i.exec(line)
     if (match) {
-      state = { ...state, phase: 'solving', dependency: undefined, currentOperation: `Z3 ? ${match[2]} components ? ${match[3]} candidates` }
-      if (receivedAt) lastSignalAt = receivedAt
+      move('solving', 'solving', receivedAt)
+      state = { ...state, dependency: undefined, currentOperation: undefined }
       continue
     }
 
     match = /exact z3 \w+ SUMMARY;\s+components=(\d+)\/(\d+),\s+changed=(\d+),\s+constraints=(\d+)/i.exec(line)
     if (match) {
+      move('solving', 'solving', receivedAt)
       state = {
         ...state,
-        phase: 'solving',
         solver: {
           componentsDone: Number(match[1]),
           componentsTotal: Number(match[2]),
@@ -198,34 +270,55 @@ export function deriveRunMonitor(
           constraints: Number(match[4]),
         },
       }
-      if (receivedAt) lastSignalAt = receivedAt
       continue
     }
 
-    match = /Baseline verify \w+ iteration \d+:\s+materializing \d+ changed direct package\(s\),\s+assignment=([a-f0-9]+)/i.exec(line)
+    match = /Baseline verify \w+ iteration (\d+):.*assignment=([a-f0-9]+)/i.exec(line)
     if (match) {
-      state = { ...state, phase: 'verifying', dependency: undefined, assignment: match[1], currentOperation: undefined }
-      if (receivedAt) lastSignalAt = receivedAt
+      move('verifying', 'verifying-assignment', receivedAt)
+      state = {
+        ...state,
+        dependency: undefined,
+        projectCheck: undefined,
+        assignment: match[2],
+        baseline: { ...state.baseline, iteration: Number(match[1]) },
+        currentOperation: undefined,
+      }
+      continue
+    }
+
+    match = /Baseline exact-assignment confirmation \w+ started;\s*assignment=([a-f0-9]+)/i.exec(line)
+    if (match) {
+      move('confirming', 'confirming-exact', receivedAt)
+      state = { ...state, assignment: match[1], currentOperation: undefined }
+      continue
+    }
+
+    if (/graph certification \w+ \d+\/\d+:/i.test(line) || /graph-guided generalization proposal \w+/i.test(line)) {
+      move('confirming', 'certifying-conflict', receivedAt)
+      continue
+    }
+
+    if (/blocked exact failing assignment .* as global exact exclusion/i.test(line) || /global exact coordinator \w+ accepted;/i.test(line)) {
+      move('solving', 'searching-next', receivedAt)
       continue
     }
 
     match = /project check (\d+)\/(\d+) started:\s+(.+)$/i.exec(line)
     if (match) {
+      move('verifying', 'project-check', receivedAt)
       state = {
         ...state,
-        phase: 'verifying',
         projectCheck: { current: Number(match[1]), total: Number(match[2]), name: match[3].trim() },
       }
-      stepStartedAt = receivedAt ?? stepStartedAt
-      if (receivedAt) lastSignalAt = receivedAt
       continue
     }
 
     match = /project check (\d+)\/(\d+) (PASS|RED)(?: exit=\d+)?:\s+(.+)$/i.exec(line)
     if (match) {
+      move('verifying', 'project-check', receivedAt)
       state = {
         ...state,
-        phase: 'verifying',
         projectCheck: {
           current: Number(match[1]),
           total: Number(match[2]),
@@ -233,16 +326,15 @@ export function deriveRunMonitor(
           status: match[3].toUpperCase() === 'PASS' ? 'pass' : 'red',
         },
       }
-      if (receivedAt) lastSignalAt = receivedAt
       continue
     }
 
     match = /Baseline localization \w+ started;\s+units=(\d+),\s+maxChecks=(\d+)/i.exec(line)
     if (match) {
       const units = Number(match[1])
+      move('localizing', 'localizing', receivedAt)
       state = {
         ...state,
-        phase: 'localizing',
         projectCheck: undefined,
         currentOperation: undefined,
         localization: {
@@ -253,18 +345,15 @@ export function deriveRunMonitor(
           shrinkHistory: [units],
         },
       }
-      stepStartedAt = receivedAt
-      if (receivedAt) lastSignalAt = receivedAt
       continue
     }
 
     match = /Baseline localization \w+ wave-start;.*checksStarted=(\d+),\s+maxChecks=(\d+),\s+currentUnits=(\d+)/i.exec(line)
     if (match && state.localization) {
       const currentUnits = Number(match[3])
+      move('localizing', 'localizing', receivedAt)
       state = {
         ...state,
-        phase: 'localizing',
-        elapsedSeconds: fieldNumber(line, 'elapsedSeconds') ?? state.elapsedSeconds,
         localization: {
           ...state.localization,
           currentUnits,
@@ -277,18 +366,15 @@ export function deriveRunMonitor(
           confirming: false,
         },
       }
-      stepStartedAt = receivedAt ?? stepStartedAt
-      if (receivedAt) lastSignalAt = receivedAt
       continue
     }
 
     match = /Baseline localization \w+ heartbeat;.*checksStarted=(\d+),\s+maxChecks=(\d+),\s+currentUnits=(\d+)/i.exec(line)
     if (match && state.localization) {
       const currentUnits = Number(match[3])
+      move('localizing', 'localizing', receivedAt)
       state = {
         ...state,
-        phase: 'localizing',
-        elapsedSeconds: fieldNumber(line, 'elapsedSeconds') ?? state.elapsedSeconds,
         localization: {
           ...state.localization,
           currentUnits,
@@ -300,16 +386,14 @@ export function deriveRunMonitor(
           wave: fieldText(line, 'wave') ?? state.localization.wave,
         },
       }
-      if (receivedAt) lastSignalAt = receivedAt
       continue
     }
 
-    match = /Baseline localization \w+ confirmation-start;.*checksStarted=(\d+),\s+maxChecks=(\d+),\s+currentUnits=(\d+)/i.exec(line)
+    match = /Baseline localization \w+ confirmation-(?:start|heartbeat);.*checksStarted=(\d+),\s+maxChecks=(\d+),\s+currentUnits=(\d+)/i.exec(line)
     if (match && state.localization) {
+      move('confirming', 'confirming-localized', receivedAt)
       state = {
         ...state,
-        phase: 'confirming',
-        elapsedSeconds: fieldNumber(line, 'elapsedSeconds') ?? state.elapsedSeconds,
         localization: {
           ...state.localization,
           currentUnits: Number(match[3]),
@@ -319,37 +403,15 @@ export function deriveRunMonitor(
           wave: fieldText(line, 'wave') ?? state.localization.wave,
         },
       }
-      stepStartedAt = receivedAt ?? stepStartedAt
-      if (receivedAt) lastSignalAt = receivedAt
-      continue
-    }
-
-    match = /Baseline localization \w+ confirmation-heartbeat;.*checksStarted=(\d+),\s+maxChecks=(\d+),\s+currentUnits=(\d+)/i.exec(line)
-    if (match && state.localization) {
-      state = {
-        ...state,
-        phase: 'confirming',
-        elapsedSeconds: fieldNumber(line, 'elapsedSeconds') ?? state.elapsedSeconds,
-        localization: {
-          ...state.localization,
-          currentUnits: Number(match[3]),
-          checksStarted: Number(match[1]),
-          maxChecks: Number(match[2]),
-          confirming: true,
-          wave: fieldText(line, 'wave') ?? state.localization.wave,
-        },
-      }
-      if (receivedAt) lastSignalAt = receivedAt
       continue
     }
 
     match = /Baseline localization \w+ shrink;.*currentUnits=(\d+).*units=(\d+),\s+packages=(\d+)/i.exec(line)
     if (match && state.localization) {
       const units = Number(match[2])
+      move('localizing', 'localizing', receivedAt)
       state = {
         ...state,
-        phase: 'localizing',
-        elapsedSeconds: fieldNumber(line, 'elapsedSeconds') ?? state.elapsedSeconds,
         localization: {
           ...state.localization,
           currentUnits: units,
@@ -358,18 +420,15 @@ export function deriveRunMonitor(
           confirming: false,
         },
       }
-      stepStartedAt = receivedAt ?? stepStartedAt
-      if (receivedAt) lastSignalAt = receivedAt
       continue
     }
 
     match = /Baseline localization \w+ finish;.*checksStarted=(\d+),\s+maxChecks=(\d+),\s+currentUnits=(\d+),\s+units=(\d+),\s+packages=(\d+)/i.exec(line)
     if (match && state.localization) {
       const units = Number(match[4])
+      move('localizing', 'localizing', receivedAt)
       state = {
         ...state,
-        phase: 'localizing',
-        elapsedSeconds: fieldNumber(line, 'elapsedSeconds') ?? state.elapsedSeconds,
         localization: {
           ...state.localization,
           currentUnits: units,
@@ -381,37 +440,22 @@ export function deriveRunMonitor(
           confirming: false,
         },
       }
-      if (receivedAt) lastSignalAt = receivedAt
       continue
     }
 
     match = /Baseline reproduction \w+ (\d+)\/(\d+) started;\s+literals=(\d+)/i.exec(line)
     if (match) {
+      move('reproducing', 'reproducing', receivedAt)
       state = {
         ...state,
-        phase: 'reproducing',
         reproduction: { current: Number(match[1]), total: Number(match[2]), literals: Number(match[3]) },
       }
-      stepStartedAt = receivedAt ?? stepStartedAt
-      if (receivedAt) lastSignalAt = receivedAt
-      continue
-    }
-
-    match = /transient retry (\d+)\/(\d+)/i.exec(line)
-    if (match) {
-      state = { ...state, phase: 'retrying', retry: { current: Number(match[1]), total: Number(match[2]) } }
-      stepStartedAt = receivedAt ?? stepStartedAt
-      if (receivedAt) lastSignalAt = receivedAt
       continue
     }
 
     match = /:\s*([^:]+):\s*running;\s*elapsed=(\d+(?:\.\d+)?)s;\s*hardTimeout=/i.exec(line)
     if (match) {
-      state = {
-        ...state,
-        currentOperation: match[1].trim(),
-      }
-      if (receivedAt) lastSignalAt = receivedAt
+      state = { ...state, currentOperation: match[1].trim() }
       continue
     }
   }
@@ -420,9 +464,11 @@ export function deriveRunMonitor(
   if (migrationActive) {
     const migration = migrationState(migrationProgress)
     const branch = activeMigrationBranch(migrationProgress)
+    const nextPhase = phaseForRuntime(migration.runtimePhase)
+    const nextActivity = activityForRuntime(migration.runtimePhase)
+    move(nextPhase, nextActivity, branch?.runtime?.updatedAt ? Date.parse(branch.runtime.updatedAt) : undefined)
     state = {
       ...state,
-      phase: phaseForRuntime(migration.runtimePhase),
       migration,
       currentOperation: migration.runtimeDetail || migration.label || migration.branch || state.currentOperation,
     }
@@ -430,9 +476,17 @@ export function deriveRunMonitor(
     if (Number.isFinite(runtimeAt)) lastSignalAt = Math.max(lastSignalAt ?? 0, runtimeAt)
   }
 
-  if (stepStartedAt !== undefined && active) {
-    state.stepElapsedSeconds = Math.max(0, (now - stepStartedAt) / 1000)
+  const clockEnd = active ? now : lastSignalAt ?? now
+  if (logicalRunStartedAt !== undefined) {
+    state.runElapsedSeconds = Math.max(0, (clockEnd - logicalRunStartedAt) / 1000)
   }
+  if (attemptStartedAt !== undefined) {
+    state.attemptElapsedSeconds = Math.max(0, (clockEnd - attemptStartedAt) / 1000)
+  }
+  if (phaseStartedAt !== undefined) {
+    state.stepElapsedSeconds = Math.max(0, (clockEnd - phaseStartedAt) / 1000)
+  }
+
   if (lastSignalAt !== undefined) {
     const lastSignalAgeSeconds = Math.max(0, (now - lastSignalAt) / 1000)
     state = {
@@ -443,6 +497,6 @@ export function deriveRunMonitor(
     }
   }
 
-  if (!active && state.phase !== 'idle') state = { ...state, active: false, phase: 'finished' }
+  if (!active && state.phase !== 'idle') state = { ...state, active: false, phase: 'finished', activity: 'finished' }
   return state
 }

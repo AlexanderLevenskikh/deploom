@@ -7,12 +7,28 @@ const monitorSource = await readFile(new URL("../src/data/processMonitor.ts", im
 const appSource = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
 const flowSource = await readFile(new URL("../src/components/FlowWorkspace.tsx", import.meta.url), "utf8");
 const failureModalSource = await readFile(new URL("../src/components/BranchFailureModal.tsx", import.meta.url), "utf8");
+const enLocaleSource = await readFile(new URL("../src/i18n/locales/en.ts", import.meta.url), "utf8");
+const ruLocaleSource = await readFile(new URL("../src/i18n/locales/ru.ts", import.meta.url), "utf8");
 const mainSource = await readFile(new URL("../electron/main.ts", import.meta.url), "utf8");
 if (!mainSource.includes("stallWarningMs: 2 * 60_000") || !mainSource.includes("stallAbortMs: 15 * 60_000")) throw new Error("Baseline/generate commands must expose silence watchdog thresholds");
 if (!mainSource.includes("HARD_STALL") || !mainSource.includes("метка возможного зависания")) throw new Error("Long deterministic jobs must surface visible stall markers");
 if (!mainSource.includes("deterministicWatchdogFailure") || !mainSource.includes("полный Baseline автоматически повторно не запускаю")) throw new Error("A watchdog stop must not trigger three identical full Baseline retries");
 if (!appSource.includes("for (const branch of details.migrationProgress?.branches ?? []) sessionBranches.add(branch.branch)")) throw new Error("Every planned migration group must appear before its first log/session");
-if (!flowSource.includes("migration-error-indicator") || !flowSource.includes("Ожидает Supervisor") || !failureModalSource.includes("Автопилот исправит") || !failureModalSource.includes("Требуется вмешательство")) throw new Error("Failed groups must expose warning/error reasons without implying user intervention");
+const failedGroupI18nContract = [
+  [flowSource, "migration-error-indicator"],
+  [flowSource, "t('flow.runtime.failed')"],
+  [failureModalSource, "t('branchFailure.autopilot')"],
+  [failureModalSource, "t('branchFailure.userRequired')"],
+  [enLocaleSource, '"flow.runtime.failed": "Waiting for Supervisor"'],
+  [ruLocaleSource, '"flow.runtime.failed": "Ожидает Supervisor"'],
+  [enLocaleSource, '"branchFailure.autopilot": "Autopilot will handle it"'],
+  [ruLocaleSource, '"branchFailure.autopilot": "Автопилот исправит"'],
+  [enLocaleSource, '"branchFailure.userRequired": "Action required"'],
+  [ruLocaleSource, '"branchFailure.userRequired": "Требуется вмешательство"'],
+];
+for (const [contractSource, marker] of failedGroupI18nContract) {
+  if (!contractSource.includes(marker)) throw new Error(`Failed-group i18n contract missing: ${marker}`);
+}
 if (!panelSource.includes("followLogRef.current") || !panelSource.includes("scrollHeight - element.scrollTop - element.clientHeight <= 48")) throw new Error("Log panel must preserve manual scroll position while new entries arrive");
 if (panelSource.includes("scrollIntoView({ block: 'end' })")) throw new Error("Unconditional log autoscroll must not return");
 if (!panelSource.includes("<RunMonitor") || !appSource.includes("language-switch")) throw new Error("Run monitor / language switch is missing");
@@ -69,7 +85,17 @@ if (conversation[1].kind !== "message" || conversation[1].title !== "Агент"
 const groupSource = { kind: 'group', id: 'libs-group-2', label: 'Группа 2' };
 const sourced = module.presentLogs([{ jobId: 'worker::group::libs-group-2', stream: 'stdout', source: groupSource, line: '{"type":"text","part":{"type":"text","text":"Работаю."}}\n' }]);
 if (sourced[0]?.source?.id !== groupSource.id) throw new Error(`Group source metadata was lost in presentation: ${JSON.stringify(sourced)}`);
-for (const required of ['Все сообщения', 'Система / оркестратор', 'onSendAgentNote(message, addressedGroup.id)', 'sourceLabel(entry.source)']) if (!panelSource.includes(required)) throw new Error(`Session-filtered chat contract missing: ${required}`);
+for (const required of ["t('log.allMessages')", "t('log.systemOrchestrator')", 'onSendAgentNote(message, addressedGroup.id)', 'sourceLabel(entry.source)']) {
+  if (!panelSource.includes(required)) throw new Error(`Session-filtered chat contract missing: ${required}`);
+}
+for (const [localeSource, marker] of [
+  [enLocaleSource, '"log.allMessages": "All messages"'],
+  [ruLocaleSource, '"log.allMessages": "Все сообщения"'],
+  [enLocaleSource, '"log.systemOrchestrator": "System / orchestrator"'],
+  [ruLocaleSource, '"log.systemOrchestrator": "Система / оркестратор"'],
+]) {
+  if (!localeSource.includes(marker)) throw new Error(`Session-filter locale contract missing: ${marker}`);
+}
 
 const usage = module.summarizeTokenUsage(sample);
 if (usage.total !== 19856 || usage.input !== 19793 || usage.output !== 63 || usage.cost !== 0.12) throw new Error(`Token usage was not summarized: ${JSON.stringify(usage)}`);

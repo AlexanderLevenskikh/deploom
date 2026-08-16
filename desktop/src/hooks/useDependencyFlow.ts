@@ -85,7 +85,8 @@ export function useDependencyFlow() {
   const [payload, setPayload] = useState<BootstrapPayload>()
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string>()
-  type ActiveRun = { jobId: string; action: ActionInput['action']; workspaceId?: string; projectName?: string }
+  type ActiveRun = { jobId: string; action: ActionInput['action']; workspaceId?: string; projectName?: string; startedAt: number }
+  type ActiveRunStart = Omit<ActiveRun, 'startedAt'> & { startedAt?: number }
   const [activeRuns, setActiveRuns] = useState<Record<string, ActiveRun>>({})
   const [logs, setLogs] = useState<JobOutput[]>([])
   const viewEpochRef = useRef(0)
@@ -104,7 +105,7 @@ export function useDependencyFlow() {
   const selectedActiveRun = activeRuns[contextKey(selectedWorkspaceId, selectedProjectName)]
   const activeJobId = selectedActiveRun?.jobId
   const anyActiveJob = Object.keys(activeRuns).length > 0
-  const rememberActiveRun = (run: ActiveRun) => setActiveRuns((current) => ({ ...current, [contextKey(run.workspaceId, run.projectName)]: run }))
+  const rememberActiveRun = (run: ActiveRunStart) => setActiveRuns((current) => ({ ...current, [contextKey(run.workspaceId, run.projectName)]: { ...run, startedAt: run.startedAt ?? Date.now() } }))
   const forgetActiveJob = (jobId: string) => setActiveRuns((current) => Object.fromEntries(Object.entries(current).filter(([, run]) => run.jobId !== jobId)) as Record<string, ActiveRun>)
   const [lastDownload, setLastDownload] = useState<DownloadSaved>()
   const [pendingRoadmapRecalc, setPendingRoadmapRecalc] = useState<Array<{ workspaceId: string; projectName: string }>>()
@@ -565,7 +566,7 @@ export function useDependencyFlow() {
   ), [logs, selectedProject?.name, selectedWorkspaceId])
 
   return {
-    payload, loading, error, activeJobId, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject,
+    payload, loading, error, activeJobId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject,
     load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches,
     runAction, startAutopilot, stopAutopilot, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }

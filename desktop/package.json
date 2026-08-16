@@ -20,6 +20,8 @@
         "check:project-settings": "node scripts/check-project-settings.mjs",
         "check:workspace-bootstrap": "node scripts/check-workspace-bootstrap.mjs",
         "check:log-presentation": "node scripts/check-log-presentation.mjs",
+        "check:i18n": "node scripts/check-i18n.mjs",
+        "check:run-monitor": "node scripts/check-run-monitor.mjs",
         "check:app-icon": "node scripts/check-app-icon.mjs",
         "lint": "oxlint",
         "preview": "vite preview",

@@ -4537,7 +4537,7 @@ function nonRetryableDeterministicFailure(result: { code: number; stderr: string
   // These failures describe a completed deterministic proof attempt. Re-running
   // registry discovery + solving + localization cannot make them transiently
   // disappear; doing so only repeats hours of identical work.
-  return /BASELINE_VERIFY_INCONCLUSIVE_PROJECT_ERROR|BASELINE_PLAN_BROKEN|BASELINE_CONSTRAINT_LOOP_STUCK/i.test(text)
+  return /BASELINE_VERIFY_INCONCLUSIVE_PROJECT_ERROR|BASELINE_PLAN_BROKEN|BASELINE_CONSTRAINT_LOOP_STUCK|BASELINE_CONSTRAINT_BUDGET_EXHAUSTED/i.test(text)
 }
 
 async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code: number; stderr: string; stdout: string }> {

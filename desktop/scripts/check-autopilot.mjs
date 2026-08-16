@@ -7,6 +7,8 @@ const root = path.resolve(here, '..')
 const hook = fs.readFileSync(path.join(root, 'src', 'hooks', 'useDependencyFlow.ts'), 'utf8')
 const policy = fs.readFileSync(path.join(root, 'src', 'autopilot-policy.ts'), 'utf8')
 const workspace = fs.readFileSync(path.join(root, 'src', 'components', 'FlowWorkspace.tsx'), 'utf8')
+const enLocale = fs.readFileSync(path.join(root, 'src', 'i18n', 'locales', 'en.ts'), 'utf8')
+const ruLocale = fs.readFileSync(path.join(root, 'src', 'i18n', 'locales', 'ru.ts'), 'utf8')
 const app = fs.readFileSync(path.join(root, 'src', 'App.tsx'), 'utf8')
 const main = fs.readFileSync(path.join(root, 'electron', 'main.ts'), 'utf8')
 const promptHarness = fs.readFileSync(path.join(root, 'electron', 'prompt-harness.ts'), 'utf8')
@@ -68,11 +70,11 @@ mustContain(main, "if (input.action === 'baseline') clearPlannerDeferrals(worksp
 mustContain(main, 'baselineStartCommands(input, project)', 'fresh baseline is captured from a clean source checkout')
 mustContain(main, 'cleanupSupersededMigrationAfterBaseline', 'successful baseline closes the previous execution epoch')
 mustContain(main, 'forgetProjectPromptState(job.workspace, project.name, oldPromptPath)', 'old immutable prompt cannot survive a fresh baseline')
-mustContain(workspace, "planning: 'Ожидает новый план'", 'planner is not rendered as a per-branch worker')
-mustContain(workspace, 'Supervisor пересчитывает общий план', 'planner has one global Supervisor status')
+mustContain(workspace, "planning: t('flow.runtime.planning')", 'planner is not rendered as a per-branch worker')
+mustContain(workspace, "t('flow.supervisorReplans')", 'planner has one global Supervisor status')
 mustContain(main, "for (const branch of planningBranches) setBranchRuntime(job, branch, 'planning')", 'planner branch runtime carries no repeated per-branch planner detail')
-mustContain(workspace, 'Автопилот до результата', 'autopilot UX')
-mustContain(workspace, 'Автопилот устраняет · {recovery.code}', 'recoverable state stays internal while autopilot is active')
+mustContain(workspace, "t('flow.autopilot.start')", 'autopilot UX')
+mustContain(workspace, "text('Автопилот устраняет', 'Autopilot is resolving')", 'recoverable state stays internal while autopilot is active')
 mustContain(app, 'flow.autopilotProjectName === project.name', 'autopilot button follows launch state before backend job registration')
 mustContain(hook, 'autopilotProjectName: autopilotRef.current?.projectName', 'autopilot project is exposed independently of active job')
 mustContain(hook, 'Автопилот не смог запуститься', 'launch failures from refresh through first job are visible instead of becoming unhandled promises')
@@ -85,13 +87,24 @@ mustContain(githubCi, 'npm run check:autopilot-scenarios', 'scenario matrix is m
 mustContain(githubCi, 'npm run check:parallel-groups', 'parallel worktree contract is mandatory in CI')
 mustContain(githubCi, "node-version: '22'", 'desktop CI uses the minimum supported Node major')
 mustContain(scenarios, 'ts.transpileModule', 'scenario harness works without native TypeScript imports on Node 20/22')
-mustContain(workspace, 'Остановить автопилот', 'autopilot stop UX')
+mustContain(workspace, "t('flow.autopilot.stop')", 'autopilot stop UX')
 mustContain(workspace, 'className="autopilot-actions"', 'autopilot is rendered on a separate action row')
-mustContain(workspace, '«Продолжить» автономно доводит текущий этап', 'Continue versus Autopilot contract')
+mustContain(workspace, 'AUTOPILOT_HELP[language]', 'Continue versus Autopilot contract')
 mustContain(workspace, 'tabIndex={0}', 'autopilot help is keyboard focusable')
-mustContain(workspace, 'Открыть handoff', 'best-effort handoff UX')
+mustContain(workspace, "text('Открыть handoff', 'Open handoff')", 'best-effort handoff UX')
 mustContain(main, 'writeBestEffortHandoff(job)', 'deterministic best-effort handoff artifact')
 mustContain(main, 'Previous planner machine result requires an independent residual audit', 'blocked planner gets residual audit')
 mustContain(main, 'Residual-audit скорректировал planner result', 'audited deferrals continue FLOW')
+
+for (const [localeSource, marker, label] of [
+  [enLocale, '"flow.runtime.planning": "Waiting for a new plan"', 'EN planner status'],
+  [ruLocale, '"flow.runtime.planning": "Ожидает новый план"', 'RU planner status'],
+  [enLocale, '"flow.supervisorReplans": "Supervisor is recalculating the overall plan"', 'EN supervisor status'],
+  [ruLocale, '"flow.supervisorReplans": "Supervisor пересчитывает общий план"', 'RU supervisor status'],
+  [enLocale, '"flow.autopilot.start": "Autopilot to result"', 'EN autopilot start'],
+  [ruLocale, '"flow.autopilot.start": "Автопилот до результата"', 'RU autopilot start'],
+  [enLocale, '"flow.autopilot.stop": "Stop Autopilot"', 'EN autopilot stop'],
+  [ruLocale, '"flow.autopilot.stop": "Остановить автопилот"', 'RU autopilot stop'],
+]) mustContain(localeSource, marker, label)
 
 console.log('Autopilot contract OK')
