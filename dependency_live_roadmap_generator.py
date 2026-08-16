@@ -5306,6 +5306,106 @@ def _candidate_domain(row: DependencyRow, mode: str, client: LiveDataClient) -> 
     )
     return list(dict.fromkeys(ordered))
 
+def _known_peer_range_satisfaction(spec: str, version: str) -> Optional[bool]:
+    """Return exact semver peer satisfaction, or None when static proof is unavailable.
+
+    Fixed inputs are immutable constants, but metadata that cannot be parsed is
+    never converted into a hard exclusion. The real package manager remains the
+    authority for every skipped/unknown relation.
+    """
+    parsed = safe_version(version)
+    if parsed is None:
+        return None
+    try:
+        return bool(NpmSpec(str(spec)).match(parsed))
+    except Exception:
+        return None
+
+
+def _apply_fixed_peer_constant_constraints(
+    solver_rows_by_name: Mapping[str, DependencyRow],
+    fixed_rows_by_name: Mapping[str, DependencyRow],
+    domains: Mapping[str, List[str]],
+    client: LiveDataClient,
+) -> Tuple[Dict[str, List[str]], Dict[str, int]]:
+    """Project immutable fixed peers into managed finite domains.
+
+    Fixed packages never become Solver variables. Instead, any peer relation
+    that can be proven from exact local/registry metadata becomes a unary hard
+    domain restriction on the managed endpoint. Existing current/current debt is
+    grandfathered exactly like the ordinary peer model: only a moved managed
+    candidate can be excluded. Missing/unparseable metadata stays UNKNOWN and is
+    left to fresh package-manager verification.
+    """
+    pruned: Dict[str, List[str]] = {
+        str(name): list(values)
+        for name, values in domains.items()
+    }
+    evaluated = 0
+    unknown = 0
+    excluded: Set[Tuple[str, str]] = set()
+
+    # managed candidate -> fixed provider
+    for managed_name, managed_row in sorted(solver_rows_by_name.items()):
+        kept: List[str] = []
+        for version in pruned.get(managed_name, [managed_row.current_version]):
+            if version == managed_row.current_version:
+                kept.append(version)
+                continue
+            blocked = False
+            for peer_name, spec, _optional in _peer_entries(managed_row, version, client):
+                fixed_row = fixed_rows_by_name.get(peer_name)
+                if fixed_row is None:
+                    continue
+                satisfied = _known_peer_range_satisfaction(spec, fixed_row.current_version)
+                if satisfied is None:
+                    unknown += 1
+                    continue
+                evaluated += 1
+                if not satisfied:
+                    blocked = True
+                    excluded.add((managed_name, version))
+                    break
+            if not blocked:
+                kept.append(version)
+        if managed_row.current_version not in kept:
+            kept.append(managed_row.current_version)
+        pruned[managed_name] = list(dict.fromkeys(kept))
+
+    # fixed source -> managed provider
+    for _fixed_name, fixed_row in sorted(fixed_rows_by_name.items()):
+        for peer_name, spec, _optional in _peer_entries(
+            fixed_row, fixed_row.current_version, client
+        ):
+            managed_row = solver_rows_by_name.get(peer_name)
+            if managed_row is None:
+                continue
+            kept: List[str] = []
+            for version in pruned.get(peer_name, [managed_row.current_version]):
+                if version == managed_row.current_version:
+                    kept.append(version)
+                    continue
+                satisfied = _known_peer_range_satisfaction(spec, version)
+                if satisfied is None:
+                    unknown += 1
+                    kept.append(version)
+                    continue
+                evaluated += 1
+                if satisfied:
+                    kept.append(version)
+                else:
+                    excluded.add((peer_name, version))
+            if managed_row.current_version not in kept:
+                kept.append(managed_row.current_version)
+            pruned[peer_name] = list(dict.fromkeys(kept))
+
+    return pruned, {
+        "evaluated": evaluated,
+        "excluded": len(excluded),
+        "unknown": unknown,
+    }
+
+
 def _potential_peer_graph(
     rows_by_name: Dict[str, DependencyRow],
     domains: Dict[str, List[str]],
@@ -6584,13 +6684,19 @@ def resolve_peer_compatibility(
                     domains[name] = [row.current_version]
                 else:
                     domains[name] = _candidate_domain(row, mode, client)
+            domains, fixed_peer_stats = _apply_fixed_peer_constant_constraints(
+                solver_rows_by_name, fixed_rows_by_name, domains, client,
+            )
             graph = _potential_peer_graph(solver_rows_by_name, domains, client)
             merge_nogood_edges(graph, learned_nogoods)
             components = _graph_components(graph)
             eprint(
                 f"[info] {project}: peer solver {mode}; packages={len(solver_rows_by_name)}, "
                 f"fixedInputs={len(fixed_rows_by_name)}, direct={len(rows_by_name)}, "
-                f"components={len(components)}, candidates={sum(len(domain) for domain in domains.values())}"
+                f"components={len(components)}, candidates={sum(len(domain) for domain in domains.values())}, "
+                f"fixedPeerChecks={fixed_peer_stats['evaluated']}, "
+                f"fixedPeerExcluded={fixed_peer_stats['excluded']}, "
+                f"fixedPeerUnknown={fixed_peer_stats['unknown']}"
             )
             assignment: Dict[str, str] = {}
             status_by_name: Dict[str, str] = {}
@@ -7478,6 +7584,26 @@ def _adaptive_graph_guided_generalization_proposal(
     )
 
     seed_source = "fresh"
+    seed_is_bounded = False
+    if fresh_seed is None:
+        # Oversized first-pass components used to fall straight through to an
+        # exact full-assignment exclusion. Build a bounded DIAGNOSTIC seed now;
+        # fresh certification and proof-preserving minimization still gate authority.
+        fresh_hints = _failure_package_hints(result, rows_by_name)
+        if fresh_hints:
+            initial_budget = min(
+                GRAPH_GENERALIZATION_ESCALATED_MAX_LITERALS,
+                max(GRAPH_GENERALIZATION_LITERAL_BUDGET_STEPS[0], len(fresh_hints)),
+            )
+            fresh_seed = _bounded_graph_guided_generalization_candidate(
+                rows_by_name, assignment, mode, client, learned_nogoods, result,
+                context_radius=1, literal_budget=initial_budget,
+                required_packages=tuple(sorted(fresh_hints)),
+            )
+            if fresh_seed is not None:
+                seed_source = "bounded-fresh"
+                seed_is_bounded = True
+
     if fresh_seed is not None:
         seed = dict(fresh_seed)
         seed_shape = tuple(sorted(seed))
@@ -7489,16 +7615,10 @@ def _adaptive_graph_guided_generalization_proposal(
             if seed_store is not None
             else ()
         )
-        seed_shape = tuple(
-            name for name in stored_shape
-            if name in assignment
-        )
+        seed_shape = tuple(name for name in stored_shape if name in assignment)
         if not seed_shape or len(seed_shape) >= len(assignment):
             return None
-        seed = {
-            name: str(assignment[name])
-            for name in seed_shape
-        }
+        seed = {name: str(assignment[name]) for name in seed_shape}
         seed_source = "carry-forward"
 
     seed_fingerprint = assignment_fingerprint(seed)
@@ -7522,7 +7642,7 @@ def _adaptive_graph_guided_generalization_proposal(
         len(seed),
     )
 
-    if repeat_count <= 1 and seed_source == "fresh":
+    if repeat_count <= 1 and seed_source in {"fresh", "bounded-fresh"}:
         candidate_fingerprint = assignment_fingerprint(seed)
         if (navigation_key, candidate_fingerprint) not in failed_candidates:
             return GraphGeneralizationProposal(
@@ -7534,7 +7654,7 @@ def _adaptive_graph_guided_generalization_proposal(
                 predicate_key=predicate_key,
                 family_key=family_key,
                 literal_budget=literal_budget,
-                bounded_slice=False,
+                bounded_slice=seed_is_bounded,
                 seed_source=seed_source,
             )
 
