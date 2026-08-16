@@ -34,13 +34,19 @@ requireText(monitor, /minimizing-conflict/, 'monitor must expose Block F conflic
 requireText(view, /monitor\.minimization/, 'RunMonitor must render conflict minimization')
 requireText(monitor, /allowedIterations/, 'monitor must expose the live adaptive iteration budget')
 requireText(monitor, /learnedConstraints/, 'monitor must expose learned-constraint progress')
+requireText(monitor, /entry\.stream !== 'system' && action !== 'baseline'/, 'Baseline process stdout/stderr must feed deterministic monitor parsing')
+if (!monitor.includes('/\\[dependency (\\d+)\\/(\\d+)\\]')) throw new Error('monitor must parse dependency scan progress')
+requireText(monitor, /fieldNumber\(line, 'fixedInputs'\)/, 'monitor must parse Block H fixed-input peer-solver telemetry')
+requireText(monitor, /solverManagedInputs/, 'monitor must expose Block H solver-managed input count')
+requireText(view, /monitor\.solverManagedInputs/, 'RunMonitor must render solver-managed input count')
+requireText(view, /monitor\.fixedInputs/, 'RunMonitor must render fixed resolver input count')
 requireText(view, /state\.conflict\.boundedSlice \? 'true' : 'false'/, 'boundedSlice must render without untyped common.yes/common.no keys')
 requireText(logPanel, /DEPLOOM_PROGRESS_V2 /, 'machine Baseline telemetry must be filtered from user-facing logs')
 if (/common\.yes|common\.no/.test(view)) throw new Error('RunMonitor must not use nonexistent common.yes/common.no translation keys')
 const structuredIndex = monitor.indexOf('const structured = structuredBaselineProgress(line)')
-const systemGateIndex = monitor.indexOf("if (entry.stream !== 'system') continue")
+const systemGateIndex = monitor.indexOf("if (entry.stream !== 'system' && action !== 'baseline') continue")
 if (structuredIndex < 0 || systemGateIndex < 0 || structuredIndex > systemGateIndex) {
-  throw new Error('structured Baseline telemetry must be parsed before the system-stream prose gate')
+  throw new Error('structured Baseline telemetry must be parsed before the Baseline-aware prose gate')
 }
 if (!/entry\.line\.includes\('DEPLOOM_PROGRESS_V2 '\)/.test(logPanel)) {
   throw new Error('machine telemetry filter must tolerate transport prefixes')

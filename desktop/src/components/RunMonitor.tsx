@@ -169,6 +169,8 @@ export function RunMonitor({ logs, active, jobId, action, runStartedAt, migratio
         {state.baseline?.learnedConstraints !== undefined ? <div><span>{t('monitor.learnedConstraints')}</span><strong>{state.baseline.learnedConstraints}</strong></div> : null}
         {state.baseline?.certifiedExtensions !== undefined ? <div><span>{t('monitor.certifiedExtensions')}</span><strong>{state.baseline.certifiedExtensions}</strong></div> : null}
         {state.baseline?.exactExclusions !== undefined ? <div><span>{t('monitor.exactExclusions')}</span><strong>{state.baseline.exactExclusions}</strong></div> : null}
+        {state.baseline?.solverManagedInputs !== undefined ? <div><span>{t('monitor.solverManagedInputs')}</span><strong>{state.baseline.solverManagedInputs}</strong></div> : null}
+        {state.baseline?.fixedInputs !== undefined ? <div><span>{t('monitor.fixedInputs')}</span><strong>{state.baseline.fixedInputs}</strong></div> : null}
         {state.conflict?.candidate ? <div><span>{t('monitor.conflictCandidate')}</span><strong title={state.conflict.candidate}>{state.conflict.candidate}</strong></div> : null}
         {state.conflict?.literals !== undefined ? <div><span>{t('monitor.literals')}</span><strong>{state.conflict.literals}</strong></div> : null}
         {state.conflict?.literalBudget !== undefined ? <div><span>{t('monitor.literalBudget')}</span><strong>{state.conflict.literalBudget}</strong></div> : null}

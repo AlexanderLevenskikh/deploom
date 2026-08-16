@@ -219,6 +219,8 @@ export const en = {
   "monitor.learnedConstraints": "Learned constraints",
   "monitor.certifiedExtensions": "Learning extensions",
   "monitor.exactExclusions": "Exact exclusions",
+  "monitor.solverManagedInputs": "Solver-managed inputs",
+  "monitor.fixedInputs": "Fixed resolver inputs",
   "monitor.conflictCandidate": "Conflict candidate",
   "monitor.literals": "Literals",
   "monitor.literalBudget": "Literal budget",

@@ -221,6 +221,8 @@ export const ru: Record<TranslationKey, string> = {
   "monitor.learnedConstraints": "Доказанные ограничения",
   "monitor.certifiedExtensions": "Продления обучения",
   "monitor.exactExclusions": "Точные исключения",
+  "monitor.solverManagedInputs": "Входы Solver",
+  "monitor.fixedInputs": "Фиксированные входы",
   "monitor.conflictCandidate": "Кандидат конфликта",
   "monitor.literals": "Литералы",
   "monitor.literalBudget": "Лимит литералов",

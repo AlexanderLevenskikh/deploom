@@ -67,6 +67,8 @@ export type RunMonitorState = {
     exactSinceLearning?: number
     generalizationAttempts?: number
     diagnostics?: number
+    solverManagedInputs?: number
+    fixedInputs?: number
   }
   assignment?: string
   conflict?: {
@@ -345,6 +347,8 @@ export function deriveRunMonitor(
         exactSinceLearning: structuredNumber(structured, 'exactSinceLearning') ?? state.baseline?.exactSinceLearning,
         generalizationAttempts: structuredNumber(structured, 'generalizationAttempts') ?? state.baseline?.generalizationAttempts,
         diagnostics: structuredNumber(structured, 'diagnostics') ?? state.baseline?.diagnostics,
+        solverManagedInputs: structuredNumber(structured, 'solverManagedInputs') ?? state.baseline?.solverManagedInputs,
+        fixedInputs: structuredNumber(structured, 'fixedInputs') ?? state.baseline?.fixedInputs,
       }
 
       state = {
@@ -390,7 +394,11 @@ export function deriveRunMonitor(
       continue
     }
 
-    if (entry.stream !== 'system') continue
+    // Baseline's Python child writes deterministic progress to process
+    // stdout/stderr. Restrict cross-stream prose parsing to the Baseline action;
+    // other actions retain the system-stream boundary so agent output cannot
+    // masquerade as orchestrator progress.
+    if (entry.stream !== 'system' && action !== 'baseline') continue
 
     match = /transient retry (\d+)\/(\d+)/i.exec(line)
     if (match) {
@@ -424,10 +432,26 @@ export function deriveRunMonitor(
       continue
     }
 
-    match = /peer solver \w+;\s+packages=(\d+),\s+components=(\d+),\s+candidates=(\d+)/i.exec(line)
-    if (match) {
+    if (/peer solver \w+;/i.test(line)) {
+      const managedPackages = fieldNumber(line, 'packages')
+      const fixedInputs = fieldNumber(line, 'fixedInputs')
+      const components = fieldNumber(line, 'components')
       move('solving', 'solving', receivedAt)
-      state = { ...state, dependency: undefined, currentOperation: undefined }
+      state = {
+        ...state,
+        dependency: undefined,
+        currentOperation: undefined,
+        baseline: {
+          ...state.baseline,
+          solverManagedInputs: managedPackages ?? state.baseline?.solverManagedInputs,
+          fixedInputs: fixedInputs ?? state.baseline?.fixedInputs,
+        },
+        solver: {
+          ...state.solver,
+          componentsDone: 0,
+          componentsTotal: components ?? state.solver?.componentsTotal,
+        },
+      }
       continue
     }
 
