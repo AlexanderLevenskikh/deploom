@@ -117,6 +117,31 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertEqual("dependency", result.kind)
 
+    def test_unclassified_lifecycle_failure_is_preparation_not_project_debt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(
+                json.dumps({"packageManager": "npm@11.0.0", "dependencies": {"demo": "1.0.0"}}),
+                encoding="utf-8",
+            )
+            runs = [
+                CompletedProcess(["npm", "install"], 0, stdout="resolver ok"),
+                CompletedProcess(["npm", "install"], 7, stdout="postinstall deterministic toolchain failure"),
+            ]
+            with patch("baseline_constraint_verifier.resolve_executable", return_value="npm"), \
+                    patch("baseline_constraint_verifier._run", side_effect=runs), \
+                    patch("baseline_constraint_verifier.build_verification_proof_identity"):
+                result = verify_assignment(
+                    root,
+                    {"demo": "2.0.0"},
+                    config=BaselineVerifyConfig(project_checks="strict", commands=("npm run typecheck",)),
+                    run_project_checks=True,
+                )
+            self.assertFalse(result.ok)
+            self.assertEqual("preparation", result.kind)
+            self.assertIn("lifecycle/preparation failed", result.summary)
+
+
 
     def test_yarn_resolver_only_install_explicitly_disables_scripts(self) -> None:
         self.assertEqual(["install", "--ignore-scripts"], install_args("yarn", ignore_scripts=True))
@@ -315,6 +340,36 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
             self.assertEqual(("node_modules/.vite", "src/node_modules/.vitest"), removed)
             self.assertFalse((root / "node_modules/.vite").exists())
             self.assertFalse((root / "src/node_modules/.vitest").exists())
+    def test_run_uses_sealed_base_environment_snapshot(self) -> None:
+        captured = {}
+
+        class FakeProcess:
+            pid = 1234
+            returncode = 0
+
+            def __init__(self, _argv, **kwargs):
+                captured.update(kwargs.get("env") or {})
+
+            def poll(self):
+                return 0
+
+            def communicate(self, timeout=None):
+                return ("ok", None)
+
+        with patch("baseline_constraint_verifier.subprocess.Popen", FakeProcess):
+            result = _run(
+                ["demo"],
+                Path("."),
+                timeout_seconds=5,
+                base_env={"BASE_ONLY": "sealed", "PATH": "fixed"},
+                env={"OVERRIDE": "yes"},
+            )
+        self.assertEqual(0, result.returncode)
+        self.assertEqual("sealed", captured["BASE_ONLY"])
+        self.assertEqual("yes", captured["OVERRIDE"])
+        self.assertEqual("fixed", captured["PATH"])
+
+
 
     def test_windows_process_tree_termination_uses_taskkill_tree_force(self) -> None:
         class FakeProcess:

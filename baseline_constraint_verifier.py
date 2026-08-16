@@ -28,6 +28,12 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
+from verification_proof import (
+    VerificationProofIdentity,
+    build_verification_proof_identity,
+    emit_verification_event,
+)
+
 @dataclasses.dataclass(frozen=True)
 class BaselineVerifyConfig:
     enabled: bool = True
@@ -40,6 +46,8 @@ class BaselineVerifyConfig:
     progress_interval_seconds: int = 15
     project_checks: str = "adaptive"  # off | diagnostic | adaptive | strict
     commands: Tuple[str, ...] = ()
+    registry: str = ""
+    telemetry_path: str = ""
 
     @staticmethod
     def from_mapping(value: Optional[Mapping[str, object]], *, fallback_commands: Sequence[str] = ()) -> "BaselineVerifyConfig":
@@ -93,7 +101,7 @@ class BaselineProjectFailure:
 @dataclasses.dataclass
 class BaselineVerifyResult:
     ok: bool
-    kind: str  # passed | dependency | project | infrastructure | unknown
+    kind: str  # passed | dependency | preparation | project | infrastructure | unknown
     summary: str
     command: str = ""
     output: str = ""
@@ -102,7 +110,7 @@ class BaselineVerifyResult:
 
     @property
     def hard_failure(self) -> bool:
-        return self.kind == "dependency" or self.kind == "project"
+        return self.kind in {"dependency", "preparation", "project"}
 
 
 class AssignmentMaterializationError(RuntimeError):
@@ -401,6 +409,7 @@ def _run(
     *,
     timeout_seconds: int,
     env: Optional[Mapping[str, str]] = None,
+    base_env: Optional[Mapping[str, str]] = None,
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "command",
     progress_interval_seconds: int = 15,
@@ -413,7 +422,7 @@ def _run(
     indefinitely. This runner owns the whole tree and reports liveness while it
     waits.
     """
-    merged_env = os.environ.copy()
+    merged_env = dict(base_env) if base_env is not None else os.environ.copy()
     if env:
         merged_env.update({str(k): str(v) for k, v in env.items()})
     started = time.monotonic()
@@ -563,6 +572,29 @@ def verify_assignment(
     project_dir = project_dir.resolve()
     attempt_started = time.monotonic()
     attempt_deadline = attempt_started + config.attempt_timeout_seconds
+    base_env = dict(os.environ)
+    telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
+    assignment_hash = assignment_fingerprint(assignment)
+    proof_identity: Optional[VerificationProofIdentity] = None
+
+    def event(name: str, **fields: object) -> None:
+        payload = {
+            "projectPath": str(project_dir),
+            "label": progress_label,
+            "assignment": assignment_hash,
+            "elapsedMs": int((time.monotonic() - attempt_started) * 1000),
+            **fields,
+        }
+        if proof_identity is not None:
+            payload.update(proof_identity.event_fields())
+        emit_verification_event(telemetry_path, name, **payload)
+
+    event(
+        "verify.attempt.start",
+        runProjectChecks=run_project_checks,
+        projectChecks=config.project_checks,
+        commands=list(config.commands),
+    )
 
     def phase_timeout() -> int:
         remaining = int(attempt_deadline - time.monotonic())
@@ -577,9 +609,16 @@ def verify_assignment(
     temp_root = Path(tempfile.mkdtemp(prefix="dependency-flow-baseline-verify-"))
     try:
         workspace_root = temp_root / "repo"
+        workspace_started = time.monotonic()
+        event("verify.workspace.start")
         try:
             workspace_project = _materialize_workspace(project_dir, workspace_root)
             changed = _apply_assignment(workspace_project, assignment, remove_packages=remove_packages)
+            event(
+                "verify.workspace.finish",
+                durationMs=int((time.monotonic() - workspace_started) * 1000),
+                changedPackages=len(changed),
+            )
         except AssignmentMaterializationError as exc:
             # A solver/planner assignment that cannot be represented by the
             # project manifest is not package-manager evidence and must never
@@ -599,6 +638,19 @@ def verify_assignment(
                 workspace=str(workspace_project),
             )
 
+        proof_identity = build_verification_proof_identity(
+            project_dir,
+            assignment=assignment,
+            remove_packages=tuple(sorted(str(item) for item in remove_packages)),
+            manager=manager,
+            manager_executable=executable,
+            registry=config.registry,
+            project_checks=config.project_checks if run_project_checks else "off",
+            commands=config.commands if run_project_checks else (),
+            environment=base_env,
+        )
+        event("proof.identity", manager=manager)
+
         install = install_args(manager, ignore_scripts=True)
         argv, _ = _command_prefix(executable, install)
         install_env = {
@@ -607,16 +659,33 @@ def verify_assignment(
             "YARN_ENABLE_SCRIPTS": "false",
             "npm_config_ignore_scripts": "true",
         }
+        resolver_started = time.monotonic()
+        event("verify.resolver.start", command=" ".join(argv))
         try:
-            result = _run(argv, workspace_project, timeout_seconds=phase_timeout(), env=install_env, progress=phase_progress("resolver-install"), progress_label="package-manager resolver install", progress_interval_seconds=config.progress_interval_seconds)
+            result = _run(
+                argv,
+                workspace_project,
+                timeout_seconds=phase_timeout(),
+                env=install_env,
+                base_env=base_env,
+                progress=phase_progress("resolver-install"),
+                progress_label="package-manager resolver install",
+                progress_interval_seconds=config.progress_interval_seconds,
+            )
         except subprocess.TimeoutExpired as exc:
             return BaselineVerifyResult(False, "infrastructure", f"package-manager verification timed out: {exc}", command=" ".join(argv))
         except OSError as exc:
             return BaselineVerifyResult(False, "infrastructure", f"package-manager launch failed: {exc}", command=" ".join(argv))
 
         output = result.stdout or ""
+        kind = "passed" if result.returncode == 0 else _classify_install_failure(output)
+        event(
+            "verify.resolver.finish",
+            durationMs=int((time.monotonic() - resolver_started) * 1000),
+            exitCode=result.returncode,
+            outcome=kind,
+        )
         if result.returncode != 0:
-            kind = _classify_install_failure(output)
             tail = "\n".join(output.splitlines()[-80:])
             return BaselineVerifyResult(
                 False,
@@ -656,20 +725,30 @@ def verify_assignment(
             # learned as a false solver nogood in strict/adaptive refinement.
             full_install = install_args(manager, ignore_scripts=False)
             full_argv, _ = _command_prefix(executable, full_install)
+            preparation_started = time.monotonic()
+            event("verify.preparation.start", command=" ".join(full_argv))
             try:
                 full_result = _run(
                     full_argv,
                     workspace_project,
                     timeout_seconds=phase_timeout(),
                     env={"CI": "1", "YARN_ENABLE_IMMUTABLE_INSTALLS": "false", "YARN_ENABLE_SCRIPTS": "true", "npm_config_ignore_scripts": "false"},
+                    base_env=base_env,
                     progress=phase_progress("lifecycle-install"), progress_label="package-manager lifecycle install",
                     progress_interval_seconds=config.progress_interval_seconds,
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 return BaselineVerifyResult(False, "infrastructure", f"project-preflight install failed: {exc}", command=" ".join(full_argv))
+            preparation_classified = "passed" if full_result.returncode == 0 else _classify_install_failure(full_result.stdout or "")
+            event(
+                "verify.preparation.finish",
+                durationMs=int((time.monotonic() - preparation_started) * 1000),
+                exitCode=full_result.returncode,
+                outcome=preparation_classified,
+            )
             if full_result.returncode != 0:
                 tail = "\n".join((full_result.stdout or "").splitlines()[-80:])
-                classified = _classify_install_failure(full_result.stdout or "")
+                classified = preparation_classified
                 if classified in {"infrastructure", "dependency"}:
                     return BaselineVerifyResult(
                         False,
@@ -679,8 +758,8 @@ def verify_assignment(
                     )
                 return BaselineVerifyResult(
                     False,
-                    "project",
-                    "assignment resolves, but lifecycle install needs migration repair",
+                    "preparation",
+                    "assignment resolves, but lifecycle/preparation failed deterministically",
                     command=" ".join(full_argv), output=tail, workspace=str(workspace_project),
                 )
 
@@ -690,15 +769,39 @@ def verify_assignment(
                 if removed_caches:
                     _emit_progress(progress, f"{progress_label}: normalized transient caches before {command}: {', '.join(removed_caches)}")
                 _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} started: {command}")
+                check_started = time.monotonic()
+                event(
+                    "verify.project-check.start",
+                    command=command,
+                    check=command_index,
+                    checks=len(config.commands),
+                )
                 shell_argv: Sequence[str]
                 if os.name == "nt":
                     shell_argv = [os.environ.get("COMSPEC") or "cmd.exe", "/d", "/s", "/c", command]
                 else:
                     shell_argv = ["/bin/sh", "-lc", command]
                 try:
-                    check_result = _run(shell_argv, workspace_project, timeout_seconds=phase_timeout(), progress=phase_progress(f"project-check:{command}"), progress_label=command, progress_interval_seconds=config.progress_interval_seconds)
+                    check_result = _run(
+                        shell_argv,
+                        workspace_project,
+                        timeout_seconds=phase_timeout(),
+                        base_env=base_env,
+                        progress=phase_progress(f"project-check:{command}"),
+                        progress_label=command,
+                        progress_interval_seconds=config.progress_interval_seconds,
+                    )
                 except (OSError, subprocess.TimeoutExpired) as exc:
                     return BaselineVerifyResult(False, "infrastructure", f"project check launch failed: {exc}", command=command)
+                event(
+                    "verify.project-check.finish",
+                    command=command,
+                    check=command_index,
+                    checks=len(config.commands),
+                    durationMs=int((time.monotonic() - check_started) * 1000),
+                    exitCode=check_result.returncode,
+                    outcome="passed" if check_result.returncode == 0 else "failed",
+                )
                 if check_result.returncode == 0:
                     _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} PASS: {command}")
                     continue
@@ -725,6 +828,7 @@ def verify_assignment(
                 )
 
         _emit_progress(progress, f"{progress_label}: completed; elapsed={int(time.monotonic() - attempt_started)}s")
+        event("verify.attempt.finish", outcome="passed")
         return BaselineVerifyResult(
             True, "passed", f"resolver preflight passed for {len(changed)} changed direct package(s)",
             command=" ".join(argv), workspace=str(workspace_project),

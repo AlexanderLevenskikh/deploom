@@ -6972,6 +6972,16 @@ def resolve_peer_compatibility_with_verification(
             if fallback_commands:
                 eprint(f"[info] {project}: Baseline structural checks auto-discovered: {', '.join(fallback_commands)}")
         config = BaselineVerifyConfig.from_mapping(spec.constraint_verify_config, fallback_commands=fallback_commands)
+        verification_telemetry_path = (
+            progress_path.with_name("baseline-verification-telemetry.jsonl")
+            if progress_path is not None
+            else None
+        )
+        config = dataclasses.replace(
+            config,
+            registry=client.registry,
+            telemetry_path=str(verification_telemetry_path) if verification_telemetry_path is not None else "",
+        )
         if not config.enabled:
             eprint(f"[info] {project}: Baseline constraint verification disabled by configuration")
             continue
@@ -7167,7 +7177,7 @@ def resolve_peer_compatibility_with_verification(
                         # checks. The old path created a second clone and repeated the
                         # resolver install before project preflight.
                         combined = verify_assignment(
-                            spec.path, changed, config=config, run_project_checks=True, remove_packages=removals,
+                            spec.path, verification_assignment, config=config, run_project_checks=True, remove_packages=removals,
                             progress=lambda message: (progress_reporter.emit(project, mode, "assignment-verification", iteration=iteration, assignment=fingerprint, message=message), eprint(f"[info] {project}: {message}")),
                             progress_label=f"Baseline {mode} iteration {iteration} assignment {fingerprint}",
                         )
@@ -7271,14 +7281,14 @@ def resolve_peer_compatibility_with_verification(
                 # Proof-preserving fast path: forbid exactly the full assignment
                 # that failed, then re-solve immediately. A localized witness is
                 # not automatically a context-independent Solver nogood.
-                if result.kind in {"dependency", "project"}:
+                if result.kind in {"dependency", "preparation", "project"}:
                     exact_nogood = dict(verification_assignment)
                     if not exact_nogood:
                         raise BaselineConstraintVerificationError(
                             f"BASELINE_PLAN_BROKEN: {project}/{mode}: failing assignment has no solver-owned literals"
                         )
 
-                    confirmation_project_checks = result.kind == "project"
+                    confirmation_project_checks = result.kind in {"preparation", "project"}
                     expected_signature = dependency_failure_signature(
                         summary=result.summary, output=result.output
                     )
@@ -7320,6 +7330,15 @@ def resolve_peer_compatibility_with_verification(
                         )
                         confirmed_exact_failure = (
                             confirmation.kind == "dependency" and observed_signature == expected_signature
+                        )
+                    elif result.kind == "preparation":
+                        observed_signature = dependency_failure_signature(
+                            summary=confirmation.summary,
+                            output=confirmation.output,
+                        )
+                        confirmed_exact_failure = (
+                            confirmation.kind == "preparation"
+                            and observed_signature == expected_signature
                         )
                     elif config.project_checks == "adaptive":
                         observed_structural = (

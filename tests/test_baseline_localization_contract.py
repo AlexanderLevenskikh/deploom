@@ -4,6 +4,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
 from types import SimpleNamespace
 
 import dependency_live_roadmap_generator as roadmap
@@ -79,6 +81,20 @@ class BaselineLocalizationContractTests(unittest.TestCase):
                 "The solver clause is deliberately richer than the probe delta; "
                 "using it for reproduction changes the experiment.",
             )
+
+    def test_combined_preflight_uses_full_verification_assignment(self) -> None:
+        source = (ROOT / "dependency_live_roadmap_generator.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "combined = verify_assignment(\n"
+            "                            spec.path, verification_assignment, config=config, run_project_checks=True",
+            source,
+        )
+        self.assertNotIn(
+            "combined = verify_assignment(\n"
+            "                            spec.path, changed, config=config, run_project_checks=True",
+            source,
+        )
+
 
 
 if __name__ == "__main__":
