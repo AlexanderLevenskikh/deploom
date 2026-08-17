@@ -58,6 +58,25 @@ def _int_field(event: Mapping[str, Any], name: str) -> int:
     return max(0, parsed)
 
 
+def _verification_purpose(label: object) -> str:
+    text = str(label or "").lower()
+    if "nogood minimization" in text:
+        return "minimization"
+    if "graph certification" in text:
+        return "graph-certification"
+    if "exact confirmation" in text:
+        return "exact-confirmation"
+    if "baseline control" in text:
+        return "control"
+    if "reproduction" in text:
+        return "reproduction"
+    if "localization" in text:
+        return "localization"
+    if "iteration" in text and "assignment" in text:
+        return "assignment"
+    return "other"
+
+
 def _new_bucket() -> dict[str, Any]:
     return {
         "events": 0,
@@ -70,6 +89,8 @@ def _new_bucket() -> dict[str, Any]:
         "proofPublishes": Counter(),
         "outcomes": Counter(),
         "projectCommands": Counter(),
+        "resolverPurposeMs": Counter(),
+        "resolverPurposeExecutions": Counter(),
     }
 
 
@@ -83,6 +104,10 @@ def _consume(bucket: dict[str, Any], event: Mapping[str, Any]) -> None:
     duration_key = _DURATION_EVENTS.get(name)
     if duration_key:
         bucket["durations"][duration_key] += _int_field(event, "durationMs")
+    if name == "verify.resolver.finish":
+        purpose = _verification_purpose(event.get("label"))
+        bucket["resolverPurposeMs"][purpose] += _int_field(event, "durationMs")
+        bucket["resolverPurposeExecutions"][purpose] += 1
 
     if name == "verify.attempt.start":
         bucket["attempts"] += 1
@@ -118,6 +143,13 @@ def _freeze_bucket(bucket: Mapping[str, Any]) -> dict[str, Any]:
     proof_publishes = dict(sorted(bucket["proofPublishes"].items()))
     outcomes = dict(sorted(bucket["outcomes"].items()))
     commands = dict(sorted(bucket["projectCommands"].items()))
+    resolver_by_purpose = {
+        purpose: {
+            "executions": int(bucket["resolverPurposeExecutions"].get(purpose, 0)),
+            "durationMs": int(duration_ms),
+        }
+        for purpose, duration_ms in sorted(bucket["resolverPurposeMs"].items())
+    }
     return {
         "events": int(bucket["events"]),
         "attempts": int(bucket["attempts"]),
@@ -129,6 +161,7 @@ def _freeze_bucket(bucket: Mapping[str, Any]) -> dict[str, Any]:
         "proofPublishes": proof_publishes,
         "outcomes": outcomes,
         "projectCommands": commands,
+        "resolverByPurpose": resolver_by_purpose,
         # Counts only: no invented wall-clock saving estimate.
         "avoidedWork": {
             "resolverExecutionsByProofHit": int(proof_hits.get("resolver", 0)),
@@ -202,9 +235,24 @@ def render_performance_markdown(summary: Mapping[str, Any]) -> str:
         f"- Avoided lifecycle preparations (count): {avoided.get('lifecyclePreparationsBySnapshotHit', 0)}",
         f"- Malformed telemetry lines ignored: {summary.get('malformedTelemetryLines', 0)}",
         "",
-        "> Telemetry is observability only. These counters never create or strengthen dependency proof.",
+        "## Resolver cost by purpose",
         "",
     ]
+    resolver_by_purpose = dict(overall.get("resolverByPurpose") or {})
+    if resolver_by_purpose:
+        for purpose in sorted(resolver_by_purpose):
+            item = dict(resolver_by_purpose[purpose] or {})
+            rows.append(
+                f"- {purpose}: executions={item.get('executions', 0)}, "
+                f"time={_seconds(item.get('durationMs', 0))}"
+            )
+    else:
+        rows.append("- no resolver-finish telemetry")
+    rows.extend([
+        "",
+        "> Telemetry is observability only. These counters never create or strengthen dependency proof.",
+        "",
+    ])
     projects = dict(summary.get("projects") or {})
     if projects:
         rows.extend(["## Per project", ""])

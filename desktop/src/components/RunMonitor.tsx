@@ -100,6 +100,19 @@ export function RunMonitor({ logs, active, jobId, action, runStartedAt, migratio
       max: state.dependency.total,
       label: t('monitor.packages', { current: state.dependency.current, total: state.dependency.total }),
     }
+  } else if (
+    state.activity === 'minimizing-conflict'
+    && state.minimization?.currentCheck !== undefined
+    && state.minimization?.maxChecks
+  ) {
+    progress = {
+      value: state.minimization.currentCheck,
+      max: state.minimization.maxChecks,
+      label: t('monitor.minimizationProgress', {
+        current: state.minimization.currentCheck,
+        max: state.minimization.maxChecks,
+      }),
+    }
   } else if (state.projectCheck) {
     progress = {
       value: state.projectCheck.current,
@@ -176,8 +189,11 @@ export function RunMonitor({ logs, active, jobId, action, runStartedAt, migratio
         {state.conflict?.literalBudget !== undefined ? <div><span>{t('monitor.literalBudget')}</span><strong>{state.conflict.literalBudget}</strong></div> : null}
         {state.conflict?.boundedSlice !== undefined ? <div><span>{t('monitor.boundedSlice')}</span><strong>{state.conflict.boundedSlice ? 'true' : 'false'}</strong></div> : null}
         {state.conflict?.seedSource ? <div><span>{t('monitor.seedSource')}</span><strong>{state.conflict.seedSource}</strong></div> : null}
-        {state.minimization?.originalLiterals !== undefined ? <div><span>{t('monitor.minimization')}</span><strong>{state.minimization.originalLiterals}{state.minimization.minimizedLiterals !== undefined ? `→${state.minimization.minimizedLiterals}` : ''}</strong></div> : null}
-        {state.minimization?.checks !== undefined ? <div><span>{t('monitor.minimizationChecks')}</span><strong>{state.minimization.checks}</strong></div> : null}
+        {state.minimization?.originalLiterals !== undefined ? <div><span>{t('monitor.minimization')}</span><strong>{state.minimization.shrinkHistory?.length ? state.minimization.shrinkHistory.join('→') : state.minimization.originalLiterals}{state.minimization.minimizedLiterals !== undefined && !state.minimization.shrinkHistory?.length ? `→${state.minimization.minimizedLiterals}` : ''}</strong></div> : null}
+        {state.minimization?.currentLiterals !== undefined ? <div><span>{t('monitor.currentCandidateSize')}</span><strong>{state.minimization.currentLiterals}</strong></div> : null}
+        {state.minimization?.currentCheck !== undefined ? <div><span>{t('monitor.minimizationChecks')}</span><strong>{state.minimization.currentCheck}{state.minimization.maxChecks ? `/≤${state.minimization.maxChecks}` : ''}</strong></div> : state.minimization?.checks !== undefined ? <div><span>{t('monitor.minimizationChecks')}</span><strong>{state.minimization.checks}</strong></div> : null}
+        {state.minimization?.proof !== undefined && state.minimization?.proofs ? <div><span>{t('monitor.minimizationProof')}</span><strong>{state.minimization.proof}/{state.minimization.proofs}</strong></div> : null}
+        {state.minimization?.familyIndex !== undefined && state.minimization?.familyCount ? <div><span>{t('monitor.predicateFamily')}</span><strong>{state.minimization.familyIndex}/{state.minimization.familyCount}</strong></div> : null}
         {state.minimization?.acceptedShrinks !== undefined ? <div><span>{t('monitor.acceptedShrinks')}</span><strong>{state.minimization.acceptedShrinks}</strong></div> : null}
         {state.dependency ? <div><span>{t('common.current')}</span><strong title={state.dependency.name}>{state.dependency.name}</strong></div> : null}
         {state.solver?.componentsTotal ? <div><span>{t('monitor.components')}</span><strong>{state.solver.componentsDone ?? 0}/{state.solver.componentsTotal}</strong></div> : null}

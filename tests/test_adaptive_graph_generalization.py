@@ -221,13 +221,33 @@ class AdaptiveGraphGeneralizationTests(unittest.TestCase):
         )
         self.assertIn("if certified and stable_predicate:", source)
         self.assertIn(
-            "learned[project][mode].append(generalized_nogood)",
+            "for generalized in new_constraints:",
+            source,
+        )
+        self.assertIn(
+            "learned[project][mode].append(generalized)",
             source,
         )
         self.assertNotIn(
             "learned[project][mode].append(graph_generalization",
             source,
         )
+        certification_index = source.index("if certified and stable_predicate:")
+        family_split_index = source.index(
+            "predicate_families = _adaptive_predicate_families(",
+            certification_index,
+        )
+        family_results_index = source.index(
+            "family_results: List[Tuple[str, Dict[str, str], NogoodMinimizationResult]]",
+            family_split_index,
+        )
+        authority_loop_index = source.index(
+            "for generalized in new_constraints:",
+            family_results_index,
+        )
+        self.assertLess(certification_index, family_split_index)
+        self.assertLess(family_split_index, family_results_index)
+        self.assertLess(family_results_index, authority_loop_index)
 
 
     def test_repeat_navigation_uses_structured_resolver_predicate(self) -> None:
@@ -639,10 +659,19 @@ class ProofPreservingNogoodMinimizationTests(unittest.TestCase):
             2,
             source,
         )
-        self.assertLess(
-            source.index("minimization = _proof_preserving_minimize_nogood("),
-            source.index("learned[project][mode].append(generalized_nogood)"),
+        graph_minimization_index = source.index(
+            "minimization = _proof_preserving_minimize_nogood("
         )
+        family_authority_loop_index = source.index(
+            "for generalized in new_constraints:",
+            graph_minimization_index,
+        )
+        family_authority_index = source.index(
+            "learned[project][mode].append(generalized)",
+            family_authority_loop_index,
+        )
+        self.assertLess(graph_minimization_index, family_authority_loop_index)
+        self.assertLess(family_authority_loop_index, family_authority_index)
         self.assertLess(
             source.index("localized_minimization = _proof_preserving_minimize_nogood("),
             source.index("learned[project][mode].append(nogood)"),
@@ -774,12 +803,22 @@ class CrossIterationConflictHistoryTests(unittest.TestCase):
             "for proof_index in range(proof_count):",
             consensus_index,
         )
-        authority_index = source.index(
-            "learned[project][mode].append(generalized_nogood)",
+        minimization_index = source.index(
+            "minimization = _proof_preserving_minimize_nogood(",
             certification_index,
         )
+        authority_loop_index = source.index(
+            "for generalized in new_constraints:",
+            minimization_index,
+        )
+        authority_index = source.index(
+            "learned[project][mode].append(generalized)",
+            authority_loop_index,
+        )
         self.assertLess(consensus_index, certification_index)
-        self.assertLess(certification_index, authority_index)
+        self.assertLess(certification_index, minimization_index)
+        self.assertLess(minimization_index, authority_loop_index)
+        self.assertLess(authority_loop_index, authority_index)
         helper = inspect.getsource(
             roadmap._cross_iteration_consensus_proposal
         )

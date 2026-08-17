@@ -83,9 +83,20 @@ export type RunMonitorState = {
   }
   minimization?: {
     source?: string
+    candidate?: string
     originalLiterals?: number
+    currentLiterals?: number
     minimizedLiterals?: number
     checks?: number
+    currentCheck?: number
+    maxChecks?: number
+    proof?: number
+    proofs?: number
+    predicateFamily?: string
+    familyIndex?: number
+    familyCount?: number
+    message?: string
+    status?: 'running' | 'certified' | 'rejected' | 'completed'
     acceptedShrinks?: number
     shrinkHistory?: number[]
     exhausted?: boolean
@@ -375,16 +386,48 @@ export function deriveRunMonitor(
       }
 
       if (structured.phase.startsWith('constraint-minimization-')) {
+        const originalLiterals = structuredNumber(structured, 'originalLiterals') ?? state.minimization?.originalLiterals
+        const currentLiterals = structuredNumber(structured, 'literals')
+          ?? structuredNumber(structured, 'minimizedLiterals')
+          ?? state.minimization?.currentLiterals
+        const currentCheck = structuredNumber(structured, 'check') ?? state.minimization?.currentCheck
+        const explicitHistory = structuredNumberArray(structured, 'shrinkHistory')
+        let shrinkHistory = explicitHistory ?? state.minimization?.shrinkHistory ?? []
+        if (!shrinkHistory.length && originalLiterals !== undefined) shrinkHistory = [originalLiterals]
+        if (structured.phase === 'constraint-minimization-check-certified' && currentLiterals !== undefined) {
+          shrinkHistory = pushShrink(shrinkHistory, currentLiterals)
+        }
+        const message = structuredText(structured, 'message')
+        const status = structured.phase === 'constraint-minimization-check-certified'
+          ? 'certified'
+          : structured.phase === 'constraint-minimization-check-rejected'
+            ? 'rejected'
+            : structured.phase === 'constraint-minimization-completed'
+              ? 'completed'
+              : 'running'
         state = {
           ...state,
+          projectCheck: undefined,
+          currentOperation: message ?? state.currentOperation,
           minimization: {
             ...state.minimization,
             source: structuredText(structured, 'source') ?? state.minimization?.source,
-            originalLiterals: structuredNumber(structured, 'originalLiterals') ?? state.minimization?.originalLiterals,
+            candidate: structuredText(structured, 'candidate') ?? state.minimization?.candidate,
+            originalLiterals,
+            currentLiterals,
             minimizedLiterals: structuredNumber(structured, 'minimizedLiterals') ?? state.minimization?.minimizedLiterals,
-            checks: structuredNumber(structured, 'checks') ?? structuredNumber(structured, 'check') ?? state.minimization?.checks,
+            checks: structuredNumber(structured, 'checks') ?? state.minimization?.checks,
+            currentCheck,
+            maxChecks: structuredNumber(structured, 'maxChecks') ?? state.minimization?.maxChecks,
+            proof: structuredNumber(structured, 'proof') ?? state.minimization?.proof,
+            proofs: structuredNumber(structured, 'proofs') ?? state.minimization?.proofs,
+            predicateFamily: structuredText(structured, 'predicateFamily') ?? state.minimization?.predicateFamily,
+            familyIndex: structuredNumber(structured, 'familyIndex') ?? state.minimization?.familyIndex,
+            familyCount: structuredNumber(structured, 'families') ?? state.minimization?.familyCount,
+            message: message ?? state.minimization?.message,
+            status,
             acceptedShrinks: structuredNumber(structured, 'acceptedShrinks') ?? state.minimization?.acceptedShrinks,
-            shrinkHistory: structuredNumberArray(structured, 'shrinkHistory') ?? state.minimization?.shrinkHistory,
+            shrinkHistory,
             exhausted: structuredBoolean(structured, 'exhausted') ?? state.minimization?.exhausted,
           },
         }

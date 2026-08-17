@@ -3233,6 +3233,131 @@ def _prefetch_registry_metadata(
     )
 
 
+OSV_PREFETCH_PARALLELISM = 4
+
+
+def _prefetch_osv_evidence(
+    client: LiveDataClient,
+    project: ProjectSpec,
+    dependencies: Sequence[Tuple[str, str, str]],
+    *,
+    lock: Optional[Path],
+    include_prerelease: bool,
+    max_candidates: int,
+    progress_label: str = "",
+    max_workers: int = OSV_PREFETCH_PARALLELISM,
+) -> None:
+    """Warm fresh OSV evidence concurrently without changing authority or freshness.
+
+    Every package/version query still goes to OSV in this invocation. Worker
+    sessions are isolated; results are merged only after all workers complete,
+    in deterministic package/key order. UNKNOWN never becomes an empty result.
+    """
+    jobs: Dict[str, Set[str]] = defaultdict(set)
+    metadata_by_name: Dict[str, Dict[str, Any]] = {}
+    for name, kind, spec in dependencies:
+        if is_non_registry_spec(spec):
+            continue
+        meta = client.npm_cache.get(name)
+        if not isinstance(meta, dict):
+            continue
+        try:
+            current, _source = resolved_current_version(
+                project.path, name, spec, kind, lock
+            )
+            candidates, _cap_note = versions_from_current(
+                meta, current, include_prerelease, max_candidates
+            )
+            structural, _notes = client.registry_structural_candidates(
+                meta, candidates
+            )
+            if current not in structural:
+                structural = [current, *structural]
+            jobs[name].update(str(version) for version in structural if str(version))
+            metadata_by_name[name] = meta
+        except (TypeError, ValueError):
+            # Prefetch is an optimization only. The canonical sequential path
+            # below will surface malformed package/version input normally.
+            continue
+
+    names = sorted(name for name, versions in jobs.items() if versions)
+    if not names:
+        return
+    workers = max(1, min(int(max_workers), 16, len(names)))
+    started = time.perf_counter()
+    def fetch_one(name: str) -> Tuple[Dict[Tuple[str, str], Any], Dict[str, Any]]:
+        worker = LiveDataClient(
+            client.registry,
+            timeout=client.timeout,
+            batch_size=client.batch_size,
+            sleep_sec=client.sleep_sec,
+            use_system_proxy=client.use_system_proxy,
+        )
+        try:
+            worker.npm_cache[name] = metadata_by_name[name]
+            worker.query_osv_versions(name, sorted(jobs[name], key=version_sort_key))
+            return dict(worker.osv_cache), dict(worker.vuln_detail_cache)
+        finally:
+            worker.session.close()
+
+    results: Dict[str, Tuple[Dict[Tuple[str, str], Any], Dict[str, Any]]] = {}
+    errors: Dict[str, BaseException] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch_one, name): name for name in names}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except BaseException as exc:
+                errors[name] = exc
+
+    if errors:
+        first_name = sorted(errors)[0]
+        first_error = errors[first_name]
+        # Parallel prefetch is never a proof boundary. Do not make a healthy
+        # sequential OSV path fail merely because the optimization hit rate
+        # limiting/contention; merge nothing and let the canonical loop query
+        # every package normally.
+        eprint(
+            f"[warn] {progress_label}: parallel OSV prefetch unavailable for {first_name}; "
+            f"falling back to sequential fresh queries: {first_error}"
+        )
+        return
+
+    def same_json(left: object, right: object) -> bool:
+        return json.dumps(
+            left, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ) == json.dumps(
+            right, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+
+    for name in names:
+        osv_cache, detail_cache = results[name]
+        for key in sorted(osv_cache):
+            value = osv_cache[key]
+            if key in client.osv_cache and not same_json(client.osv_cache[key], value):
+                raise VulnerabilityEvidenceUnavailable(
+                    f"OSV_PREFETCH_INCONSISTENT: {key[0]}@{key[1]} changed within one invocation"
+                )
+            client.osv_cache[key] = value
+        for vuln_id in sorted(detail_cache):
+            value = detail_cache[vuln_id]
+            if (
+                vuln_id in client.vuln_detail_cache
+                and not same_json(client.vuln_detail_cache[vuln_id], value)
+            ):
+                raise VulnerabilityEvidenceUnavailable(
+                    f"OSV_PREFETCH_INCONSISTENT_DETAIL: {vuln_id} changed within one invocation"
+                )
+            client.vuln_detail_cache[vuln_id] = value
+
+    eprint(
+        f"[info] {progress_label}: OSV evidence prefetch completed; "
+        f"packages={len(names)}; parallelism={workers}; "
+        f"elapsed={time.perf_counter() - started:.1f}s"
+    )
+
+
 def analyze_project(
     project: ProjectSpec,
     client: LiveDataClient,
@@ -3262,6 +3387,15 @@ def analyze_project(
     _prefetch_registry_metadata(
         client,
         dependencies,
+        progress_label=label,
+    )
+    _prefetch_osv_evidence(
+        client,
+        project,
+        dependencies,
+        lock=lock,
+        include_prerelease=include_prerelease,
+        max_candidates=max_candidates,
         progress_label=label,
     )
 
@@ -7830,6 +7964,25 @@ def _adaptive_graph_guided_generalization_proposal(
 
 
 
+def _adaptive_predicate_families(
+    stable_predicate: str,
+    *,
+    adaptive_project: bool,
+) -> Tuple[str, ...]:
+    """Split a certified multi-signature project failure into independent families.
+
+    The split itself is navigation only. Every family still has to survive the
+    same fresh proof-preserving minimization gate before it becomes Solver
+    authority.
+    """
+    value = str(stable_predicate or "").strip()
+    if not value:
+        return ()
+    if not adaptive_project:
+        return (value,)
+    return tuple(sorted({item for item in value.split("|") if item}))
+
+
 GRAPH_GENERALIZATION_HISTORY_LIMIT = 6
 
 
@@ -9342,219 +9495,338 @@ def resolve_peer_compatibility_with_verification(
                                 certified_candidate
                             )
 
-                            def certify_generalized_minimization(
+                            adaptive_project_predicate = (
+                                result.kind == "project"
+                                and config.project_checks == "adaptive"
+                            )
+                            predicate_families = _adaptive_predicate_families(
+                                stable_predicate,
+                                adaptive_project=adaptive_project_predicate,
+                            )
+                            if not predicate_families:
+                                raise BaselineConstraintVerificationError(
+                                    f"BASELINE_CONSTRAINT_MINIMIZATION_INCONCLUSIVE: "
+                                    f"{project}/{mode}: certified graph candidate has no stable predicate"
+                                )
+
+                            minimization_budget = _nogood_minimization_check_budget(
+                                len(certified_candidate)
+                            )
+                            # Reuse is restricted to an identical exact trial
+                            # inside this invocation. Every cache entry below was
+                            # produced by fresh real-PM verification; no diagnostic
+                            # graph evidence is promoted to authority.
+                            trial_proof_cache: Dict[str, List[str]] = {}
+
+                            def run_generalized_trial_proof(
                                 trial: Dict[str, str],
                                 minimization_check: int,
+                                minimization_proof: int,
+                                required_predicate: str,
+                                family_index: int,
                             ) -> str:
                                 trial_fingerprint = assignment_fingerprint(trial)
-                                trial_removals = _types_stub_removals_for_assignment(
-                                    rows_by_name, trial, mode, client
-                                )
-                                observed_predicate = ""
-                                for minimization_proof_index in range(proof_count):
-                                    minimization_proof = minimization_proof_index + 1
+                                cached = trial_proof_cache.setdefault(trial_fingerprint, [])
+                                if len(cached) >= minimization_proof:
+                                    observed = cached[minimization_proof - 1]
                                     progress_reporter.emit(
-                                        project,
-                                        mode,
-                                        "constraint-minimization-check-started",
-                                        iteration=iteration,
-                                        assignment=fingerprint,
+                                        project, mode, "constraint-minimization-proof-reused",
+                                        iteration=iteration, assignment=fingerprint,
                                         source="graph-generalization",
                                         originalCandidate=original_candidate_fingerprint,
                                         candidate=trial_fingerprint,
-                                        literals=len(trial),
-                                        check=minimization_check,
-                                        proof=minimization_proof,
-                                        proofs=proof_count,
-                                        authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                        originalLiterals=len(certified_candidate),
+                                        literals=len(trial), check=minimization_check,
+                                        maxChecks=minimization_budget,
+                                        proof=minimization_proof, proofs=proof_count,
+                                        predicateFamily=required_predicate,
+                                        familyIndex=family_index,
+                                        families=len(predicate_families),
+                                        observedPredicate=observed,
+                                        authority=EVIDENCE_CONFIRMED_CONSTRAINT,
                                     )
-                                    trial_result = verify_assignment(
-                                        spec.path,
-                                        trial,
-                                        config=(
-                                            confirmation_config
-                                            if result.kind == "project"
-                                            else config
-                                        ),
-                                        run_project_checks=confirmation_project_checks,
-                                        remove_packages=trial_removals,
-                                        progress=lambda message, trial_fingerprint=trial_fingerprint, minimization_check=minimization_check, minimization_proof=minimization_proof: progress_reporter.emit(
-                                            project,
-                                            mode,
-                                            "constraint-minimization-check-running",
-                                            iteration=iteration,
-                                            assignment=fingerprint,
-                                            source="graph-generalization",
-                                            candidate=trial_fingerprint,
-                                            check=minimization_check,
-                                            proof=minimization_proof,
-                                            proofs=proof_count,
-                                            message=message,
-                                        ),
-                                        progress_label=(
-                                            f"Baseline nogood minimization {mode} "
-                                            f"check {minimization_check} proof "
-                                            f"{minimization_proof}/{proof_count} "
-                                            f"{trial_fingerprint}"
-                                        ),
+                                    eprint(
+                                        f"[info] {project}: Baseline conflict minimization {mode} "
+                                        f"check {minimization_check}/{minimization_budget} "
+                                        f"proof {minimization_proof}/{proof_count}: reused exact fresh "
+                                        f"trial evidence; literals={len(trial)}, "
+                                        f"family={family_index}/{len(predicate_families)}"
                                     )
-                                    if trial_result.kind in {"infrastructure", "unknown"}:
-                                        raise BaselineConstraintVerificationError(
-                                            f"BASELINE_CONSTRAINT_MINIMIZATION_INCONCLUSIVE: "
-                                            f"{project}/{mode}: fresh minimization proof "
-                                            f"{minimization_check} is {trial_result.kind}: "
-                                            f"{trial_result.summary}"
-                                        )
+                                    return observed
+                                if len(cached) != minimization_proof - 1:
+                                    raise BaselineConstraintVerificationError(
+                                        f"BASELINE_CONSTRAINT_MINIMIZATION_PROOF_ORDER_INVALID: "
+                                        f"{project}/{mode}: candidate={trial_fingerprint}, "
+                                        f"proof={minimization_proof}, cached={len(cached)}"
+                                    )
 
-                                    trial_predicate = ""
-                                    if result.kind == "dependency":
-                                        if (
-                                            trial_result.kind == "dependency"
-                                            and not trial_result.ok
-                                        ):
-                                            trial_predicate = (
-                                                matching_dependency_failure_signature(
-                                                    expected_summary=result.summary,
-                                                    expected_output=result.output,
-                                                    observed_summary=trial_result.summary,
-                                                    observed_output=trial_result.output,
-                                                )
-                                            )
-                                    elif result.kind == "preparation":
-                                        if (
-                                            trial_result.kind == "preparation"
-                                            and not trial_result.ok
-                                        ):
-                                            observed = dependency_failure_signature(
-                                                summary=trial_result.summary,
-                                                output=trial_result.output,
-                                            )
-                                            if observed == expected_signature:
-                                                trial_predicate = observed
-                                    elif config.project_checks == "adaptive":
-                                        if (
-                                            trial_result.kind == "project"
-                                            and not trial_result.ok
-                                        ):
-                                            trial_structural = set(
-                                                adaptive_structural_evidence(
-                                                    trial_result
-                                                )
-                                            )
-                                            stable = sorted(
-                                                trial_structural
-                                                & expected_structural
-                                            )
-                                            if stable:
-                                                trial_predicate = "|".join(stable)
-                                    else:
-                                        if (
-                                            trial_result.kind == "project"
-                                            and not trial_result.ok
-                                        ):
-                                            observed = dependency_failure_signature(
-                                                summary=trial_result.summary,
-                                                output=trial_result.output,
-                                            )
-                                            if observed == expected_signature:
-                                                trial_predicate = observed
-
-                                    if (
-                                        not trial_predicate
-                                        or trial_predicate != stable_predicate
-                                    ):
+                                trial_removals = _types_stub_removals_for_assignment(
+                                    rows_by_name, trial, mode, client
+                                )
+                                progress_reporter.emit(
+                                    project, mode, "constraint-minimization-check-started",
+                                    iteration=iteration, assignment=fingerprint,
+                                    source="graph-generalization",
+                                    originalCandidate=original_candidate_fingerprint,
+                                    candidate=trial_fingerprint,
+                                    originalLiterals=len(certified_candidate),
+                                    literals=len(trial), check=minimization_check,
+                                    maxChecks=minimization_budget,
+                                    proof=minimization_proof, proofs=proof_count,
+                                    predicateFamily=required_predicate,
+                                    familyIndex=family_index,
+                                    families=len(predicate_families),
+                                    authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                )
+                                eprint(
+                                    f"[info] {project}: Baseline conflict minimization {mode} "
+                                    f"check {minimization_check}/{minimization_budget} "
+                                    f"proof {minimization_proof}/{proof_count} started; "
+                                    f"literals={len(trial)}, family={family_index}/{len(predicate_families)}, "
+                                    f"candidate={trial_fingerprint}"
+                                )
+                                trial_result = verify_assignment(
+                                    spec.path,
+                                    trial,
+                                    config=(confirmation_config if result.kind == "project" else config),
+                                    run_project_checks=confirmation_project_checks,
+                                    remove_packages=trial_removals,
+                                    progress=lambda message, trial_fingerprint=trial_fingerprint, minimization_check=minimization_check, minimization_proof=minimization_proof, required_predicate=required_predicate, family_index=family_index: (
                                         progress_reporter.emit(
-                                            project,
-                                            mode,
-                                            "constraint-minimization-check-rejected",
-                                            iteration=iteration,
-                                            assignment=fingerprint,
+                                            project, mode, "constraint-minimization-check-running",
+                                            iteration=iteration, assignment=fingerprint,
                                             source="graph-generalization",
+                                            originalCandidate=original_candidate_fingerprint,
                                             candidate=trial_fingerprint,
-                                            literals=len(trial),
-                                            check=minimization_check,
+                                            originalLiterals=len(certified_candidate),
+                                            literals=len(trial), check=minimization_check,
+                                            maxChecks=minimization_budget,
+                                            proof=minimization_proof, proofs=proof_count,
+                                            predicateFamily=required_predicate,
+                                            familyIndex=family_index,
+                                            families=len(predicate_families), message=message,
+                                        ),
+                                        eprint(
+                                            f"[info] {project}: Baseline conflict minimization {mode} "
+                                            f"check {minimization_check}/{minimization_budget} "
+                                            f"proof {minimization_proof}/{proof_count}: {message}"
+                                        ),
+                                    ),
+                                    progress_label=(
+                                        f"Baseline nogood minimization {mode} check {minimization_check} "
+                                        f"proof {minimization_proof}/{proof_count} {trial_fingerprint}"
+                                    ),
+                                )
+                                if trial_result.kind in {"infrastructure", "unknown"}:
+                                    raise BaselineConstraintVerificationError(
+                                        f"BASELINE_CONSTRAINT_MINIMIZATION_INCONCLUSIVE: "
+                                        f"{project}/{mode}: fresh minimization proof {minimization_check} "
+                                        f"is {trial_result.kind}: {trial_result.summary}"
+                                    )
+
+                                trial_predicate = ""
+                                if result.kind == "dependency":
+                                    if trial_result.kind == "dependency" and not trial_result.ok:
+                                        trial_predicate = matching_dependency_failure_signature(
+                                            expected_summary=result.summary,
+                                            expected_output=result.output,
+                                            observed_summary=trial_result.summary,
+                                            observed_output=trial_result.output,
+                                        )
+                                elif result.kind == "preparation":
+                                    if trial_result.kind == "preparation" and not trial_result.ok:
+                                        observed = dependency_failure_signature(
+                                            summary=trial_result.summary, output=trial_result.output,
+                                        )
+                                        if observed == expected_signature:
+                                            trial_predicate = observed
+                                elif adaptive_project_predicate:
+                                    if trial_result.kind == "project" and not trial_result.ok:
+                                        trial_structural = set(adaptive_structural_evidence(trial_result))
+                                        stable = sorted(trial_structural & expected_structural)
+                                        if stable:
+                                            trial_predicate = "|".join(stable)
+                                else:
+                                    if trial_result.kind == "project" and not trial_result.ok:
+                                        observed = dependency_failure_signature(
+                                            summary=trial_result.summary, output=trial_result.output,
+                                        )
+                                        if observed == expected_signature:
+                                            trial_predicate = observed
+
+                                cached.append(trial_predicate)
+                                progress_reporter.emit(
+                                    project, mode, "constraint-minimization-proof-observed",
+                                    iteration=iteration, assignment=fingerprint,
+                                    source="graph-generalization", candidate=trial_fingerprint,
+                                    literals=len(trial), check=minimization_check,
+                                    maxChecks=minimization_budget,
+                                    proof=minimization_proof, proofs=proof_count,
+                                    predicateFamily=required_predicate,
+                                    familyIndex=family_index, families=len(predicate_families),
+                                    observedPredicate=trial_predicate,
+                                )
+                                return trial_predicate
+
+                            def certify_generalized_minimization(
+                                trial: Dict[str, str],
+                                minimization_check: int,
+                                required_predicate: str,
+                                family_index: int,
+                            ) -> str:
+                                trial_fingerprint = assignment_fingerprint(trial)
+                                for minimization_proof in range(1, proof_count + 1):
+                                    observed = run_generalized_trial_proof(
+                                        trial, minimization_check, minimization_proof,
+                                        required_predicate, family_index,
+                                    )
+                                    if adaptive_project_predicate:
+                                        reproduced = required_predicate in {
+                                            item for item in observed.split("|") if item
+                                        }
+                                    else:
+                                        reproduced = observed == required_predicate
+                                    if not reproduced:
+                                        progress_reporter.emit(
+                                            project, mode, "constraint-minimization-check-rejected",
+                                            iteration=iteration, assignment=fingerprint,
+                                            source="graph-generalization",
+                                            originalCandidate=original_candidate_fingerprint,
+                                            candidate=trial_fingerprint,
+                                            originalLiterals=len(certified_candidate),
+                                            literals=len(trial), check=minimization_check,
+                                            maxChecks=minimization_budget,
+                                            proof=minimization_proof, proofs=proof_count,
+                                            predicateFamily=required_predicate,
+                                            familyIndex=family_index, families=len(predicate_families),
                                             reason="authoritative-predicate-not-reproduced",
                                             authority=EVIDENCE_DIAGNOSTIC_HINT,
                                         )
+                                        eprint(
+                                            f"[info] {project}: Baseline conflict minimization {mode} "
+                                            f"check {minimization_check}/{minimization_budget} rejected; "
+                                            f"literals={len(trial)}, family={family_index}/{len(predicate_families)}"
+                                        )
                                         return ""
-                                    if (
-                                        observed_predicate
-                                        and observed_predicate != trial_predicate
-                                    ):
-                                        return ""
-                                    observed_predicate = trial_predicate
 
                                 progress_reporter.emit(
-                                    project,
-                                    mode,
-                                    "constraint-minimization-check-certified",
-                                    iteration=iteration,
-                                    assignment=fingerprint,
+                                    project, mode, "constraint-minimization-check-certified",
+                                    iteration=iteration, assignment=fingerprint,
                                     source="graph-generalization",
+                                    originalCandidate=original_candidate_fingerprint,
                                     candidate=trial_fingerprint,
-                                    literals=len(trial),
-                                    check=minimization_check,
-                                    predicate=observed_predicate,
+                                    originalLiterals=len(certified_candidate),
+                                    literals=len(trial), check=minimization_check,
+                                    maxChecks=minimization_budget, proofs=proof_count,
+                                    predicate=required_predicate,
+                                    predicateFamily=required_predicate,
+                                    familyIndex=family_index, families=len(predicate_families),
                                     authority=EVIDENCE_CONFIRMED_CONSTRAINT,
                                 )
-                                return observed_predicate
-
-                            minimization = _proof_preserving_minimize_nogood(
-                                certified_candidate,
-                                certify_generalized_minimization,
-                                initial_predicate=stable_predicate,
-                            )
-                            if not minimization.predicate:
-                                raise BaselineConstraintVerificationError(
-                                    f"BASELINE_CONSTRAINT_MINIMIZATION_INCONCLUSIVE: "
-                                    f"{project}/{mode}: already-certified graph candidate "
-                                    "lost its authoritative predicate during minimization"
-                                )
-
-                            generalized_nogood = dict(minimization.minimized)
-                            candidate_fingerprint = assignment_fingerprint(
-                                generalized_nogood
-                            )
-                            if len(generalized_nogood) < len(certified_candidate):
                                 eprint(
-                                    f"[warn] {project}: proof-preserving constraint "
-                                    f"minimized {mode}; "
-                                    f"{len(certified_candidate)}->{len(generalized_nogood)} "
-                                    f"literals; checks={minimization.checks}; "
-                                    f"history={'->'.join(str(item) for item in minimization.shrink_history)}; "
+                                    f"[info] {project}: Baseline conflict minimization {mode} accepted shrink; "
+                                    f"literals={len(trial)}, family={family_index}/{len(predicate_families)}, "
                                     f"authority={EVIDENCE_CONFIRMED_CONSTRAINT}"
                                 )
-                            progress_reporter.emit(
-                                project,
-                                mode,
-                                "constraint-minimization-completed",
-                                iteration=iteration,
-                                assignment=fingerprint,
-                                source="graph-generalization",
-                                originalCandidate=original_candidate_fingerprint,
-                                candidate=candidate_fingerprint,
-                                originalLiterals=len(certified_candidate),
-                                minimizedLiterals=len(generalized_nogood),
-                                checks=minimization.checks,
-                                acceptedShrinks=minimization.accepted_shrinks,
-                                shrinkHistory=list(minimization.shrink_history),
-                                exhausted=minimization.exhausted,
-                                predicate=minimization.predicate,
-                                authority=EVIDENCE_CONFIRMED_CONSTRAINT,
-                            )
+                                return required_predicate
 
-                            if generalized_nogood in learned[project][mode]:
-                                raise BaselineConstraintVerificationError(
-                                    f"BASELINE_CONSTRAINT_LOOP_STUCK: {project}/{mode}: "
-                                    f"certified generalized constraint {candidate_fingerprint} "
-                                    "was already learned"
+                            family_results: List[Tuple[str, Dict[str, str], NogoodMinimizationResult]] = []
+                            for family_index, required_predicate in enumerate(predicate_families, start=1):
+                                progress_reporter.emit(
+                                    project, mode, "constraint-minimization-family-started",
+                                    iteration=iteration, assignment=fingerprint,
+                                    source="graph-generalization",
+                                    originalCandidate=original_candidate_fingerprint,
+                                    candidate=original_candidate_fingerprint,
+                                    originalLiterals=len(certified_candidate),
+                                    literals=len(certified_candidate), check=0,
+                                    maxChecks=minimization_budget, proof=0, proofs=proof_count,
+                                    predicateFamily=required_predicate,
+                                    familyIndex=family_index, families=len(predicate_families),
+                                    shrinkHistory=[len(certified_candidate)],
+                                    authority=EVIDENCE_CONFIRMED_CONSTRAINT,
                                 )
-                            learned[project][mode].append(generalized_nogood)
+                                eprint(
+                                    f"[info] {project}: Baseline conflict minimization {mode} "
+                                    f"family {family_index}/{len(predicate_families)} started; "
+                                    f"literals={len(certified_candidate)}, maxChecks={minimization_budget}, "
+                                    f"predicate={required_predicate}"
+                                )
+                                minimization = _proof_preserving_minimize_nogood(
+                                    certified_candidate,
+                                    lambda trial, check, required_predicate=required_predicate, family_index=family_index: certify_generalized_minimization(
+                                        trial, check, required_predicate, family_index
+                                    ),
+                                    max_checks=minimization_budget,
+                                    initial_predicate=required_predicate,
+                                )
+                                if not minimization.predicate:
+                                    raise BaselineConstraintVerificationError(
+                                        f"BASELINE_CONSTRAINT_MINIMIZATION_INCONCLUSIVE: "
+                                        f"{project}/{mode}: certified graph candidate lost "
+                                        f"predicate family {required_predicate!r} during minimization"
+                                    )
+                                generalized = dict(minimization.minimized)
+                                generalized_fingerprint = assignment_fingerprint(generalized)
+                                family_results.append((required_predicate, generalized, minimization))
+                                if len(generalized) < len(certified_candidate):
+                                    eprint(
+                                        f"[warn] {project}: proof-preserving constraint minimized {mode}; "
+                                        f"family={family_index}/{len(predicate_families)}; "
+                                        f"{len(certified_candidate)}->{len(generalized)} literals; "
+                                        f"checks={minimization.checks}; "
+                                        f"history={'->'.join(str(item) for item in minimization.shrink_history)}; "
+                                        f"authority={EVIDENCE_CONFIRMED_CONSTRAINT}"
+                                    )
+                                progress_reporter.emit(
+                                    project, mode, "constraint-minimization-completed",
+                                    iteration=iteration, assignment=fingerprint,
+                                    source="graph-generalization",
+                                    originalCandidate=original_candidate_fingerprint,
+                                    candidate=generalized_fingerprint,
+                                    originalLiterals=len(certified_candidate),
+                                    minimizedLiterals=len(generalized), literals=len(generalized),
+                                    checks=minimization.checks, maxChecks=minimization_budget,
+                                    acceptedShrinks=minimization.accepted_shrinks,
+                                    shrinkHistory=list(minimization.shrink_history),
+                                    exhausted=minimization.exhausted,
+                                    predicate=minimization.predicate,
+                                    predicateFamily=required_predicate,
+                                    familyIndex=family_index, families=len(predicate_families),
+                                    authority=EVIDENCE_CONFIRMED_CONSTRAINT,
+                                )
+
+                            new_constraints: List[Dict[str, str]] = []
+                            new_family_results: List[Tuple[str, Dict[str, str], NogoodMinimizationResult]] = []
+                            for family_result in family_results:
+                                _predicate, generalized, _minimization = family_result
+                                if generalized in learned[project][mode] or generalized in new_constraints:
+                                    continue
+                                new_constraints.append(generalized)
+                                new_family_results.append(family_result)
+                            if not new_constraints:
+                                raise BaselineConstraintVerificationError(
+                                    f"BASELINE_CONSTRAINT_LOOP_STUCK: {project}/{mode}: all freshly "
+                                    "certified predicate-family constraints were already learned"
+                                )
+
+                            for generalized in new_constraints:
+                                learned[project][mode].append(generalized)
                             liveness.observe_learned_constraints(len(learned[project][mode]))
                             localization_checkpoint_store.clear(project, mode)
+
+                            learned_fingerprints = [assignment_fingerprint(item) for item in new_constraints]
+                            strongest_family = min(
+                                new_family_results,
+                                key=lambda item: (len(item[1]), assignment_fingerprint(item[1]), item[0]),
+                            )
+                            strongest = strongest_family[1]
+                            strongest_minimization = strongest_family[2]
+                            candidate_fingerprint = assignment_fingerprint(strongest)
                             eprint(
-                                f"[warn] {project}: graph-guided constraint certified; "
-                                f"NOT({candidate_fingerprint}), literals={len(generalized_nogood)}, "
+                                f"[warn] {project}: graph-guided constraint family certified; "
+                                f"learned={len(new_constraints)}, "
+                                f"literals={[len(item) for item in new_constraints]}, "
                                 f"authority={EVIDENCE_CONFIRMED_CONSTRAINT}; re-solving"
                             )
                             progress_reporter.emit(
@@ -9562,13 +9834,15 @@ def resolve_peer_compatibility_with_verification(
                                 iteration=iteration, assignment=fingerprint,
                                 candidate=candidate_fingerprint,
                                 originalCandidate=original_candidate_fingerprint,
-                                originalLiterals=len(certified_candidate),
-                                literals=len(generalized_nogood),
-                                minimizationChecks=minimization.checks,
-                                shrinkHistory=list(minimization.shrink_history),
+                                originalLiterals=len(certified_candidate), literals=len(strongest),
+                                minimizationChecks=sum(item[2].checks for item in family_results),
+                                shrinkHistory=list(strongest_minimization.shrink_history),
+                                learnedCandidates=learned_fingerprints,
+                                learnedThisIteration=len(new_constraints),
+                                predicateFamilies=list(predicate_families),
                                 contextRadius=(proposal.context_radius if proposal is not None else 1),
                                 repeatCount=(proposal.repeat_count if proposal is not None else 1),
-                                literalBudget=(proposal.literal_budget if proposal is not None else len(generalized_nogood)),
+                                literalBudget=(proposal.literal_budget if proposal is not None else len(strongest)),
                                 boundedSlice=(proposal.bounded_slice if proposal is not None else False),
                                 seedSource=(proposal.seed_source if proposal is not None else "legacy"),
                                 authority=EVIDENCE_CONFIRMED_CONSTRAINT,
@@ -9911,6 +10185,9 @@ def resolve_peer_compatibility_with_verification(
                     localized_original
                 )
                 localized_proof_count = 2 if learn_project_failure else 1
+                localized_minimization_budget = _nogood_minimization_check_budget(
+                    len(localized_original)
+                )
 
                 def certify_localized_minimization(
                     trial: Dict[str, str],
@@ -9924,24 +10201,46 @@ def resolve_peer_compatibility_with_verification(
 
                     for minimization_proof_index in range(localized_proof_count):
                         minimization_proof = minimization_proof_index + 1
+                        progress_reporter.emit(
+                            project, mode, "constraint-minimization-check-started",
+                            iteration=iteration, assignment=fingerprint,
+                            source="localized",
+                            originalCandidate=localized_original_fingerprint,
+                            candidate=trial_fingerprint,
+                            originalLiterals=len(localized_original), literals=len(trial),
+                            check=minimization_check, maxChecks=localized_minimization_budget,
+                            proof=minimization_proof, proofs=localized_proof_count,
+                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                        )
+                        eprint(
+                            f"[info] {project}: Baseline conflict minimization {mode} "
+                            f"check {minimization_check}/{localized_minimization_budget} "
+                            f"proof {minimization_proof}/{localized_proof_count} started; "
+                            f"literals={len(trial)}, candidate={trial_fingerprint}"
+                        )
                         trial_result = verify_assignment(
                             spec.path,
                             trial,
                             config=config,
                             run_project_checks=learn_project_failure,
                             remove_packages=trial_removals,
-                            progress=lambda message, trial_fingerprint=trial_fingerprint, minimization_check=minimization_check, minimization_proof=minimization_proof: progress_reporter.emit(
-                                project,
-                                mode,
-                                "constraint-minimization-check-running",
-                                iteration=iteration,
-                                assignment=fingerprint,
-                                source="localized",
-                                candidate=trial_fingerprint,
-                                check=minimization_check,
-                                proof=minimization_proof,
-                                proofs=localized_proof_count,
-                                message=message,
+                            progress=lambda message, trial_fingerprint=trial_fingerprint, minimization_check=minimization_check, minimization_proof=minimization_proof: (
+                                progress_reporter.emit(
+                                    project, mode, "constraint-minimization-check-running",
+                                    iteration=iteration, assignment=fingerprint,
+                                    source="localized",
+                                    originalCandidate=localized_original_fingerprint,
+                                    candidate=trial_fingerprint,
+                                    originalLiterals=len(localized_original), literals=len(trial),
+                                    check=minimization_check, maxChecks=localized_minimization_budget,
+                                    proof=minimization_proof, proofs=localized_proof_count,
+                                    message=message,
+                                ),
+                                eprint(
+                                    f"[info] {project}: Baseline conflict minimization {mode} "
+                                    f"check {minimization_check}/{localized_minimization_budget} "
+                                    f"proof {minimization_proof}/{localized_proof_count}: {message}"
+                                ),
                             ),
                             progress_label=(
                                 f"Baseline localized nogood minimization {mode} "
@@ -10012,6 +10311,7 @@ def resolve_peer_compatibility_with_verification(
                 localized_minimization = _proof_preserving_minimize_nogood(
                     localized_original,
                     certify_localized_minimization,
+                    max_checks=localized_minimization_budget,
                     initial_predicate="",
                 )
                 if not localized_minimization.predicate:
@@ -10033,7 +10333,9 @@ def resolve_peer_compatibility_with_verification(
                     candidate=assignment_fingerprint(nogood),
                     originalLiterals=len(localized_original),
                     minimizedLiterals=len(nogood),
+                    literals=len(nogood),
                     checks=localized_minimization.checks,
+                    maxChecks=localized_minimization_budget,
                     acceptedShrinks=localized_minimization.accepted_shrinks,
                     shrinkHistory=list(localized_minimization.shrink_history),
                     exhausted=localized_minimization.exhausted,
