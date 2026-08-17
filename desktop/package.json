@@ -37,6 +37,7 @@
         "check:agent-efficiency": "node scripts/check-agent-efficiency.mjs",
         "check:executor-context": "node scripts/check-executor-context.mjs",
         "check:materialization-proof": "node scripts/check-materialization-proof.mjs",
+        "check:resolved-state-proof": "node scripts/check-resolved-state-proof.mjs",
         "check:flow-recovery": "node scripts/check-flow-recovery.mjs",
         "check:migration-verification": "node scripts/check-migration-verification.mjs",
         "check:planner-session": "node scripts/check-planner-session.mjs",
