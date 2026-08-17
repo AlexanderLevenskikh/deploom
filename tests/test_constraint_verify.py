@@ -541,8 +541,8 @@ class FixedNonRegistryInputTests(unittest.TestCase):
             )
             lock = project / "yarn.lock"
             lock.write_text(
-                'external_lib@git+https://example.invalid/external_lib.git#main:\\n'
-                '  resolved "https://example.invalid/external_lib.git#aaaaaaaa"\\n',
+                'external_lib@git+https://example.invalid/external_lib.git#main:\n'
+                '  resolved "https://example.invalid/external_lib.git#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n',
                 encoding="utf-8",
             )
             stable_command = {
@@ -560,8 +560,8 @@ class FixedNonRegistryInputTests(unittest.TestCase):
                     registry="https://registry.example",
                 )
                 lock.write_text(
-                    'external_lib@git+https://example.invalid/external_lib.git#main:\\n'
-                    '  resolved "https://example.invalid/external_lib.git#bbbbbbbb"\\n',
+                    'external_lib@git+https://example.invalid/external_lib.git#main:\n'
+                    '  resolved "https://example.invalid/external_lib.git#bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"\n',
                     encoding="utf-8",
                 )
                 after = constraint_cache.resolver_environment_fingerprint(

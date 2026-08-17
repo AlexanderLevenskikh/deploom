@@ -105,6 +105,7 @@ class CompatibilityEvidenceTests(unittest.TestCase):
                 source_snapshot_key="source-key",
                 assignment_key="assignment-key",
                 resolver_input_key="resolver-key",
+                fixed_resolver_inputs_key="e" * 64,
                 preparation_proof_key="preparation-key",
                 project_proof_key="project-key",
                 observed_resolved_hash="b" * 64,

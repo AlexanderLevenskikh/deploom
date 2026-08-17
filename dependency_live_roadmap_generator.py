@@ -8800,6 +8800,7 @@ def _build_proven_envelope_for_mode(
         source_snapshot_key=identity.source_snapshot_key,
         assignment_key=identity.assignment_key,
         resolver_input_key=identity.resolver_input_key,
+        fixed_resolver_inputs_key=identity.fixed_resolver_inputs_key,
         preparation_proof_key=identity.preparation_proof_key,
         project_proof_key=identity.project_proof_key,
         observed_resolved_hash=observed_resolved_hash,

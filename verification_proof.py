@@ -230,7 +230,412 @@ def _external_fixed_target_identity(project_dir: Path, spec: str) -> Mapping[str
     return {**base, "kind": "other"}
 
 
-def fixed_resolver_input_fingerprint(project_dir: Path) -> str:
+
+_GIT_FIXED_PREFIXES = (
+    "git+",
+    "git://",
+    "ssh://",
+    "github:",
+    "gitlab:",
+    "bitbucket:",
+)
+_HTTP_FIXED_PREFIXES = ("http://", "https://")
+_IMMUTABLE_GIT_COMMIT = re.compile(r"^[0-9a-fA-F]{40,64}$")
+_IMMUTABLE_FRAGMENT_DIGEST = re.compile(r"^[0-9a-fA-F]{40,128}$")
+_SRI_TOKEN = re.compile(r"^(?:sha1|sha256|sha384|sha512)-[A-Za-z0-9+/=_-]+$", re.IGNORECASE)
+_GITHUB_SHORTHAND = re.compile(r"^[^@./\\s][^/\\s]*/[^/\\s#]+(?:#.+)?$")
+_FIXED_SOURCE_CONTROL_PATHS = (
+    ("resolutions",),
+    ("overrides",),
+    ("pnpm", "overrides"),
+)
+
+
+def _immutable_fragment(value: str, pattern: re.Pattern[str]) -> str:
+    text = str(value or "").strip()
+    if "#" not in text:
+        return ""
+    fragment = text.rsplit("#", 1)[1].strip()
+    return fragment.lower() if pattern.fullmatch(fragment) else ""
+
+
+def _content_integrity(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    tokens = [token for token in text.split() if token]
+    return text if tokens and all(_SRI_TOKEN.fullmatch(token) for token in tokens) else ""
+
+
+def _string_leaves(value: object, path: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], str]]:
+    if isinstance(value, str):
+        return [(path, value)]
+    if not isinstance(value, dict):
+        return []
+    result: list[tuple[tuple[str, ...], str]] = []
+    for key in sorted(value, key=lambda item: str(item).lower()):
+        result.extend(_string_leaves(value[key], (*path, str(key))))
+    return result
+
+
+def _manifest_fixed_control_identity(project_dir: Path, spec: str) -> Mapping[str, object]:
+    lowered = spec.lower()
+    if lowered.startswith("workspace:"):
+        return {"kind": "workspace", "sourceSnapshotKey": source_snapshot_fingerprint(project_dir)}
+    if _looks_like_local_fixed_path(spec):
+        return dict(_external_fixed_target_identity(project_dir, spec))
+    commit = _immutable_fragment(spec, _IMMUTABLE_GIT_COMMIT)
+    if commit and _looks_like_git_fixed_source(spec, spec):
+        return {"kind": "git-commit", "locator": spec.rsplit("#", 1)[0], "commit": commit}
+    raise SourceIdentityUnavailable(
+        "FIXED_SOURCE_IMMUTABLE_IDENTITY_UNAVAILABLE: resolver control contains "
+        f"non-registry source {spec!r} without a manifest-pinned immutable identity"
+    )
+
+
+def _manifest_direct_reference(manifest: Mapping[str, object], name: str) -> str:
+    specs: list[str] = []
+    for section in _DIRECT_DEPENDENCY_SECTIONS:
+        values = manifest.get(section)
+        if isinstance(values, dict) and name in values:
+            specs.append(str(values[name] or "").strip())
+    unique = sorted({item for item in specs if item})
+    if len(unique) != 1:
+        raise SourceIdentityUnavailable(
+            "FIXED_SOURCE_IMMUTABLE_IDENTITY_UNAVAILABLE: resolver control "
+            f"references ${name} but the direct manifest identity is missing or ambiguous"
+        )
+    return unique[0]
+
+
+def _split_yarn_lock_keys(header: str) -> list[str]:
+    text = header.strip().rstrip(":").strip()
+    result: list[str] = []
+    current: list[str] = []
+    quote = ""
+    escaped = False
+    for char in text:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\" and quote:
+            escaped = True
+            current.append(char)
+            continue
+        if char in {"'", '"'}:
+            if not quote:
+                quote = char
+                continue
+            if quote == char:
+                quote = ""
+                continue
+        if char == "," and not quote:
+            value = "".join(current).strip().strip("'\"")
+            if value:
+                result.append(value)
+            current = []
+            continue
+        current.append(char)
+    value = "".join(current).strip().strip("'\"")
+    if value:
+        result.append(value)
+    return result
+
+
+def _yarn_scalar(line: str, field: str) -> str:
+    stripped = line.strip()
+    prefix = field + " "
+    if not stripped.startswith(prefix):
+        return ""
+    return stripped[len(prefix):].strip().strip("'\"")
+
+
+def _yarn_lock_fixed_record(
+    project_dir: Path,
+    package_name: str,
+    spec: str,
+) -> Mapping[str, object]:
+    lock = project_dir / "yarn.lock"
+    if not lock.is_file():
+        return {}
+    try:
+        lines = lock.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        raise SourceIdentityUnavailable(
+            f"FIXED_SOURCE_LOCKFILE_UNREADABLE: {lock}: {exc}"
+        ) from exc
+
+    wanted = f"{package_name}@{spec}"
+    keys: list[str] = []
+    record: dict[str, object] = {}
+
+    def finish() -> Mapping[str, object]:
+        if wanted in keys:
+            return dict(record)
+        return {}
+
+    for raw in lines:
+        if raw and not raw[0].isspace() and raw.rstrip().endswith(":"):
+            found = finish()
+            if found:
+                return found
+            keys = _split_yarn_lock_keys(raw)
+            record = {}
+            continue
+        if not keys:
+            continue
+        for field in ("version", "resolved", "integrity"):
+            value = _yarn_scalar(raw, field)
+            if value:
+                record[field] = value
+    return finish()
+
+
+def _npm_lock_fixed_record(
+    project_dir: Path,
+    package_name: str,
+) -> Mapping[str, object]:
+    lock: Path | None = None
+    for candidate in (project_dir / "npm-shrinkwrap.json", project_dir / "package-lock.json"):
+        if candidate.is_file():
+            lock = candidate
+            break
+    if lock is None:
+        return {}
+    try:
+        payload = json.loads(lock.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise SourceIdentityUnavailable(
+            f"FIXED_SOURCE_LOCKFILE_UNREADABLE: {lock}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise SourceIdentityUnavailable(
+            f"FIXED_SOURCE_LOCKFILE_INVALID: {lock}: root must be an object"
+        )
+
+    packages = payload.get("packages")
+    if isinstance(packages, dict):
+        entry = packages.get(f"node_modules/{package_name}")
+        if isinstance(entry, dict):
+            return dict(entry)
+    dependencies = payload.get("dependencies")
+    if isinstance(dependencies, dict):
+        entry = dependencies.get(package_name)
+        if isinstance(entry, dict):
+            return dict(entry)
+    return {}
+
+
+def _fixed_lock_record(
+    project_dir: Path,
+    *,
+    manager: str,
+    package_name: str,
+    spec: str,
+) -> Mapping[str, object]:
+    normalized = str(manager or "").strip().lower()
+    if not normalized:
+        if (project_dir / "yarn.lock").is_file():
+            normalized = "yarn"
+        elif (project_dir / "pnpm-lock.yaml").is_file():
+            normalized = "pnpm"
+        else:
+            normalized = "npm"
+    if normalized == "yarn":
+        return _yarn_lock_fixed_record(project_dir, package_name, spec)
+    if normalized == "npm":
+        return _npm_lock_fixed_record(project_dir, package_name)
+    # pnpm/catalog/other remote-source closure needs a parser for the exact
+    # manager lock semantics. Until that exists, authority fails closed rather
+    # than reusing proof from the manifest string alone.
+    return {}
+
+
+def _looks_like_git_fixed_source(spec: str, resolved: str) -> bool:
+    spec_value = str(spec or "").strip()
+    resolved_value = str(resolved or "").strip()
+    spec_lower = spec_value.lower()
+    resolved_lower = resolved_value.lower()
+    return (
+        spec_lower.startswith(_GIT_FIXED_PREFIXES)
+        or spec_lower.startswith("git@")
+        or ".git#" in spec_lower
+        or resolved_lower.startswith(("git+", "git://", "ssh://"))
+        or resolved_lower.startswith("git@")
+        or ".git#" in resolved_lower
+        or _GITHUB_SHORTHAND.fullmatch(spec_value) is not None
+    )
+
+
+def _immutable_remote_fixed_identity(
+    project_dir: Path,
+    *,
+    manager: str,
+    package_name: str,
+    spec: str,
+) -> Mapping[str, object]:
+    # A manifest-pinned full Git object id is already immutable. Keep the source
+    # locator in the aggregate hash, but never persist it outside that hash.
+    manifest_commit = _immutable_fragment(spec, _IMMUTABLE_GIT_COMMIT)
+    if manifest_commit and _looks_like_git_fixed_source(spec, spec):
+        return {"kind": "git-commit", "locator": spec.rsplit("#", 1)[0], "commit": manifest_commit}
+
+    record = _fixed_lock_record(
+        project_dir,
+        manager=manager,
+        package_name=package_name,
+        spec=spec,
+    )
+    resolved = str(record.get("resolved") or "").strip()
+    locked_version = str(record.get("version") or "").strip()
+    integrity = _content_integrity(record.get("integrity"))
+
+    if _looks_like_git_fixed_source(spec, resolved or locked_version):
+        commit = (
+            _immutable_fragment(resolved, _IMMUTABLE_GIT_COMMIT)
+            or _immutable_fragment(locked_version, _IMMUTABLE_GIT_COMMIT)
+            or manifest_commit
+        )
+        if not commit:
+            raise SourceIdentityUnavailable(
+                "FIXED_SOURCE_IMMUTABLE_IDENTITY_UNAVAILABLE: "
+                f"{package_name}: git source {spec!r} has no resolved immutable commit in the canonical lockfile"
+            )
+        return {
+            "kind": "git-commit",
+            "resolved": (resolved or locked_version or spec).rsplit("#", 1)[0],
+            "commit": commit,
+        }
+
+    # HTTP tarballs, npm aliases and future fixed protocols may be authoritative
+    # only when the canonical lockfile supplies a content identity.
+    if integrity:
+        return {
+            "kind": "content-integrity",
+            "resolved": resolved,
+            "integrity": integrity,
+        }
+
+    # A digest fragment is authoritative here only when it came from the
+    # canonical lockfile's resolved record. An arbitrary `https://...#deadbeef`
+    # manifest fragment is just a URL fragment unless the package manager has
+    # recorded it as resolved evidence; treating it as content proof would be
+    # unsound.
+    digest = _immutable_fragment(resolved, _IMMUTABLE_FRAGMENT_DIGEST)
+    if digest:
+        return {
+            "kind": "resolved-fragment-digest",
+            "resolved": resolved.rsplit("#", 1)[0] if resolved else spec.rsplit("#", 1)[0],
+            "digest": digest,
+        }
+
+    raise SourceIdentityUnavailable(
+        "FIXED_SOURCE_IMMUTABLE_IDENTITY_UNAVAILABLE: "
+        f"{package_name}: fixed source {spec!r} has no resolved commit/content/integrity identity "
+        f"for package manager {str(manager or 'unknown')!r}"
+    )
+
+
+def remote_fixed_resolver_input_fingerprint(
+    project_dir: Path,
+    *,
+    manager: str = "",
+) -> str:
+    """Hash only remote fixed inputs that can resolve differently during install.
+
+    Local file/link/portal and workspace sources remain bound by the ordinary
+    fixedResolverInputsKey on the original checkout. They must not be
+    re-identified from a temporary verifier clone because absolute paths and
+    the clone's dirty assignment snapshot are intentionally different.
+    """
+    project_dir = project_dir.resolve()
+    manifest_path = project_dir / "package.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise SourceIdentityUnavailable(
+            f"SOURCE_IDENTITY_MANIFEST_UNAVAILABLE: {manifest_path}: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise SourceIdentityUnavailable(
+            f"SOURCE_IDENTITY_MANIFEST_UNAVAILABLE: {manifest_path}: root must be an object"
+        )
+
+    remote: list[Mapping[str, object]] = []
+    for section in _DIRECT_DEPENDENCY_SECTIONS:
+        values = manifest.get(section)
+        if not isinstance(values, dict):
+            continue
+        for name, raw_spec in sorted(values.items(), key=lambda item: str(item[0]).lower()):
+            spec = str(raw_spec or "").strip()
+            if not is_fixed_manifest_spec(spec):
+                continue
+            lowered = spec.lower()
+            if lowered.startswith("workspace:") or _looks_like_local_fixed_path(spec):
+                continue
+            remote.append({
+                "section": section,
+                "name": str(name),
+                "spec": spec,
+                "resolvedSource": dict(_immutable_remote_fixed_identity(
+                    project_dir,
+                    manager=manager,
+                    package_name=str(name),
+                    spec=spec,
+                )),
+            })
+
+    controls: list[Mapping[str, object]] = []
+    for control_path in _FIXED_SOURCE_CONTROL_PATHS:
+        value: object = manifest
+        for segment in control_path:
+            if not isinstance(value, dict) or segment not in value:
+                value = None
+                break
+            value = value[segment]
+        for leaf_path, raw_spec in _string_leaves(value):
+            spec = str(raw_spec or "").strip()
+            if spec.startswith("$") and len(spec) > 1:
+                reference_name = spec[1:]
+                referenced_spec = _manifest_direct_reference(manifest, reference_name)
+                if (
+                    is_fixed_manifest_spec(referenced_spec)
+                    and not referenced_spec.lower().startswith("workspace:")
+                    and not _looks_like_local_fixed_path(referenced_spec)
+                ):
+                    controls.append({
+                        "path": list((*control_path, *leaf_path)),
+                        "spec": spec,
+                        "reference": reference_name,
+                        "referencedSpec": referenced_spec,
+                    })
+                continue
+            if not is_fixed_manifest_spec(spec):
+                continue
+            if spec.lower().startswith("workspace:") or _looks_like_local_fixed_path(spec):
+                continue
+            controls.append({
+                "path": list((*control_path, *leaf_path)),
+                "spec": spec,
+                "identity": dict(_manifest_fixed_control_identity(project_dir, spec)),
+            })
+
+    return _canonical_hash(
+        {
+            "schema": PROOF_SCHEMA_VERSION,
+            "remoteFixedResolverInputs": remote,
+            "remoteFixedResolverControlInputs": controls,
+        },
+        length=64,
+    )
+
+
+def fixed_resolver_input_fingerprint(
+    project_dir: Path,
+    *,
+    manager: str = "",
+) -> str:
     # Root manifest/lock/config files are hashed separately by ResolverInputKey.
     # This key adds the source/content identity that those files cannot capture.
     project_dir = project_dir.resolve()
@@ -268,12 +673,51 @@ def fixed_resolver_input_fingerprint(project_dir: Path) -> str:
                 entry["workspaceSourceSnapshotKey"] = workspace_snapshot
             elif _looks_like_local_fixed_path(spec):
                 entry["target"] = dict(_external_fixed_target_identity(project_dir, spec))
+            else:
+                entry["resolvedSource"] = dict(_immutable_remote_fixed_identity(
+                    project_dir,
+                    manager=manager,
+                    package_name=str(name),
+                    spec=spec,
+                ))
             fixed.append(entry)
+
+    fixed_controls: list[Mapping[str, object]] = []
+    for control_path in _FIXED_SOURCE_CONTROL_PATHS:
+        value: object = manifest
+        for segment in control_path:
+            if not isinstance(value, dict) or segment not in value:
+                value = None
+                break
+            value = value[segment]
+        for leaf_path, raw_spec in _string_leaves(value):
+            spec = str(raw_spec or "").strip()
+            if spec.startswith("$") and len(spec) > 1:
+                reference_name = spec[1:]
+                referenced_spec = _manifest_direct_reference(manifest, reference_name)
+                fixed_controls.append({
+                    "path": list((*control_path, *leaf_path)),
+                    "spec": spec,
+                    "identity": {
+                        "kind": "manifest-reference",
+                        "name": reference_name,
+                        "referencedSpec": referenced_spec,
+                    },
+                })
+                continue
+            if not is_fixed_manifest_spec(spec):
+                continue
+            fixed_controls.append({
+                "path": list((*control_path, *leaf_path)),
+                "spec": spec,
+                "identity": dict(_manifest_fixed_control_identity(project_dir, spec)),
+            })
 
     return _canonical_hash(
         {
             "schema": PROOF_SCHEMA_VERSION,
             "fixedResolverInputs": fixed,
+            "fixedResolverControlInputs": fixed_controls,
         },
         length=64,
     )
@@ -535,7 +979,7 @@ def _resolver_context_payload(
         "effectiveYarnConfig": _effective_yarn_config_identity(
             project_dir, environment, manager
         ),
-        "fixedResolverInputsKey": fixed_resolver_input_fingerprint(project_dir),
+        "fixedResolverInputsKey": fixed_resolver_input_fingerprint(project_dir, manager=manager),
         "environmentKey": environment_key,
         "registry": str(registry or "").rstrip("/"),
         "platform": platform.system().lower(),
@@ -655,6 +1099,8 @@ def _proof_record_identity_valid(
     ):
         if not _valid_hex_identity(identity.get(field), lengths=(32,)):
             return False
+    if not _valid_hex_identity(identity.get("fixedResolverInputsKey"), lengths=(64,)):
+        return False
     if not _valid_hex_identity(identity.get("resolvedStateKey"), lengths=(64,)):
         return False
     return True
@@ -707,6 +1153,7 @@ class VerificationProofIdentity:
     environment_key: str
     source_snapshot_key: str
     resolver_input_key: str
+    fixed_resolver_inputs_key: str
     resolved_state_key: str
     preparation_proof_key: str
     project_proof_key: str
@@ -719,6 +1166,7 @@ class VerificationProofIdentity:
             "environmentKey": self.environment_key,
             "sourceSnapshotKey": self.source_snapshot_key,
             "resolverInputKey": self.resolver_input_key,
+            "fixedResolverInputsKey": self.fixed_resolver_inputs_key,
             "resolvedStateKey": self.resolved_state_key,
             "preparationProofKey": self.preparation_proof_key,
             "projectProofKey": self.project_proof_key,
@@ -787,6 +1235,7 @@ def build_verification_proof_identity(
         environment_key=environment_key,
         source_snapshot_key=source_key,
         resolver_input_key=resolver_key,
+        fixed_resolver_inputs_key=str(resolver_context["fixedResolverInputsKey"]),
         resolved_state_key="",
         preparation_proof_key=preparation_key,
         project_proof_key=project_key,

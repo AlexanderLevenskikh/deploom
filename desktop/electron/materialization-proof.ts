@@ -10,7 +10,7 @@ export type MaterializationAction = {
 }
 
 export type DependencyMaterializationProof = {
-  schemaVersion: 3
+  schemaVersion: 4
   project: string
   branch: string
   assignmentHash: string
@@ -18,6 +18,7 @@ export type DependencyMaterializationProof = {
   provenEnvelopeKey: string
   provenAssignmentKey: string
   resolverInputKey: string
+  fixedResolverInputsKey: string
   sourceSnapshotKey: string
   projectProofKey: string
   dependencySections: Record<string, Record<string, string>>
@@ -238,6 +239,7 @@ export function createMaterializationProof(input: {
   provenEnvelopeKey: string
   provenAssignmentKey: string
   resolverInputKey: string
+  fixedResolverInputsKey: string
   sourceSnapshotKey: string
   projectProofKey: string
   provenExactDirectAssignment?: Readonly<Record<string, string>>
@@ -295,6 +297,9 @@ export function createMaterializationProof(input: {
     provenObservedResolvedHash = currentHash
   }
 
+  if (!/^[0-9a-f]{64}$/i.test(input.fixedResolverInputsKey)) {
+    throw new Error('PROVEN_FIXED_SOURCE_IDENTITY_INVALID')
+  }
   if (!/^[0-9a-f]{64}$/i.test(input.provenResolvedStateKey)) {
     throw new Error('PROVEN_RESOLVED_STATE_KEY_INVALID')
   }
@@ -309,7 +314,7 @@ export function createMaterializationProof(input: {
   }
 
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     project: input.project,
     branch: input.branch,
     assignmentHash: materializationAssignmentHash(actions),
@@ -317,6 +322,7 @@ export function createMaterializationProof(input: {
     provenEnvelopeKey: input.provenEnvelopeKey,
     provenAssignmentKey: input.provenAssignmentKey,
     resolverInputKey: input.resolverInputKey,
+    fixedResolverInputsKey: input.fixedResolverInputsKey,
     sourceSnapshotKey: input.sourceSnapshotKey,
     projectProofKey: input.projectProofKey,
     dependencySections,
@@ -351,7 +357,7 @@ export function readMaterializationProof(path: string): DependencyMaterializatio
   if (!existsSync(path)) return undefined
   try {
     const value = JSON.parse(readFileSync(path, 'utf8')) as DependencyMaterializationProof
-    return value?.schemaVersion === 3 ? value : undefined
+    return value?.schemaVersion === 4 ? value : undefined
   } catch {
     return undefined
   }
@@ -369,6 +375,7 @@ export function validateMaterializationProof(input: {
   provenEnvelopeKey?: string
   provenAssignmentKey?: string
   resolverInputKey?: string
+  fixedResolverInputsKey?: string
   sourceSnapshotKey?: string
   projectProofKey?: string
   provenExactDirectAssignment?: Readonly<Record<string, string>>
@@ -385,6 +392,7 @@ export function validateMaterializationProof(input: {
   if (input.provenEnvelopeKey && proof.provenEnvelopeKey !== input.provenEnvelopeKey) return { ok: false, reason: 'proven envelope mismatch' }
   if (input.provenAssignmentKey && proof.provenAssignmentKey !== input.provenAssignmentKey) return { ok: false, reason: 'proven assignment mismatch' }
   if (input.resolverInputKey && proof.resolverInputKey !== input.resolverInputKey) return { ok: false, reason: 'resolver proof identity mismatch' }
+  if (input.fixedResolverInputsKey && proof.fixedResolverInputsKey !== input.fixedResolverInputsKey) return { ok: false, reason: 'fixed source proof identity mismatch' }
   if (input.sourceSnapshotKey && proof.sourceSnapshotKey !== input.sourceSnapshotKey) return { ok: false, reason: 'source snapshot identity mismatch' }
   if (input.projectProofKey && proof.projectProofKey !== input.projectProofKey) return { ok: false, reason: 'project proof identity mismatch' }
   if (input.provenObservedResolvedHash && proof.provenObservedResolvedHash !== input.provenObservedResolvedHash) return { ok: false, reason: 'proven observed resolved hash mismatch' }

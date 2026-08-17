@@ -209,7 +209,7 @@ export function scopeTargetsFromPrompt(markdown: string, projectName: string): R
 }
 
 export type ProvenDependencyEnvelope = {
-  schemaVersion: 3
+  schemaVersion: 4
   proofSchema: string
   envelopeKey: string
   project: string
@@ -218,6 +218,7 @@ export type ProvenDependencyEnvelope = {
   sourceSnapshotKey: string
   assignmentKey: string
   resolverInputKey: string
+  fixedResolverInputsKey: string
   preparationProofKey: string
   projectProofKey: string
   observedResolvedHash: string
@@ -266,10 +267,11 @@ export function validateScopeProofEnvelope(
   const manifest = migrationScopeManifestFromPrompt(markdown)
   const envelope = proofEnvelopeFromPrompt(markdown, projectName)
   if (!manifest || !envelope) return { ok: false, reason: 'proof envelope missing' }
-  if (envelope.schemaVersion !== 3 || envelope.project !== projectName) return { ok: false, reason: 'proof envelope project/schema mismatch' }
+  if (envelope.schemaVersion !== 4 || envelope.project !== projectName) return { ok: false, reason: 'proof envelope project/schema mismatch' }
   if (typeof manifest.targetMode !== 'string' || envelope.mode !== manifest.targetMode) return { ok: false, reason: 'proof envelope target mode mismatch' }
   if (!envelope.envelopeKey || proofEnvelopeContentKey(envelope) !== envelope.envelopeKey) return { ok: false, reason: 'proof envelope content hash mismatch' }
   if (!envelope.sourceHead || !envelope.sourceSnapshotKey || !envelope.assignmentKey || !envelope.resolverInputKey) return { ok: false, reason: 'proof envelope identity incomplete' }
+  if (!/^[0-9a-f]{64}$/i.test(envelope.fixedResolverInputsKey || '')) return { ok: false, reason: 'proof envelope fixed source identity missing' }
   if (!envelope.exactDirectAssignment || typeof envelope.exactDirectAssignment !== 'object' || Array.isArray(envelope.exactDirectAssignment)) return { ok: false, reason: 'proof envelope assignment missing' }
   if (!Array.isArray(envelope.removals)) return { ok: false, reason: 'proof envelope removals invalid' }
 

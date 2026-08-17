@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 PROVEN_DEPENDENCY_STATE_SCHEMA_VERSION = 1
-PROVEN_DEPENDENCY_ENVELOPE_SCHEMA_VERSION = 3
+PROVEN_DEPENDENCY_ENVELOPE_SCHEMA_VERSION = 4
 RESOLVER_PROOF_STATUS_PASSED = "passed"
 RESOLVER_PROOF_STATUS_NOT_REQUIRED_NO_OP = "not-required-no-op"
 RESOLVER_PROOF_STATUSES = frozenset({
@@ -48,6 +48,7 @@ def build_proven_dependency_envelope(
     source_snapshot_key: str,
     assignment_key: str,
     resolver_input_key: str,
+    fixed_resolver_inputs_key: str,
     preparation_proof_key: str,
     project_proof_key: str,
     observed_resolved_hash: str,
@@ -71,6 +72,11 @@ def build_proven_dependency_envelope(
         raise ValueError(f"preparation proof status invalid: {preparation_status or 'missing'}")
     if project_status not in PROJECT_PROOF_STATUSES:
         raise ValueError(f"project proof status invalid: {project_status or 'missing'}")
+    fixed_inputs_key = str(fixed_resolver_inputs_key or "").lower()
+    if len(fixed_inputs_key) != 64 or any(
+        ch not in "0123456789abcdef" for ch in fixed_inputs_key
+    ):
+        raise ValueError("fixedResolverInputsKey invalid")
 
     payload: dict[str, Any] = {
         "schemaVersion": PROVEN_DEPENDENCY_ENVELOPE_SCHEMA_VERSION,
@@ -81,6 +87,7 @@ def build_proven_dependency_envelope(
         "sourceSnapshotKey": str(source_snapshot_key),
         "assignmentKey": str(assignment_key),
         "resolverInputKey": str(resolver_input_key),
+        "fixedResolverInputsKey": fixed_inputs_key,
         "preparationProofKey": str(preparation_proof_key),
         "projectProofKey": str(project_proof_key),
         "observedResolvedHash": str(observed_resolved_hash),
@@ -128,6 +135,12 @@ def validate_proven_dependency_envelope(
         return False, "removals invalid"
     if any(name not in assignment for name in removals):
         return False, "removal is not part of exactDirectAssignment"
+    fixed_inputs_key = str(envelope.get("fixedResolverInputsKey") or "").lower()
+    if len(fixed_inputs_key) != 64 or any(
+        ch not in "0123456789abcdef" for ch in fixed_inputs_key
+    ):
+        return False, "fixedResolverInputsKey missing or invalid"
+
     resolver_status = str(envelope.get("resolverProofStatus") or "")
     if resolver_status not in RESOLVER_PROOF_STATUSES:
         return False, f"resolver proof status invalid: {resolver_status or 'missing'}"

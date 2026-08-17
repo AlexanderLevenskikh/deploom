@@ -8,6 +8,7 @@ import os
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -23,12 +24,191 @@ class GuardResult:
     notification_only: tuple[str, ...] = ()
 
 
+
+
+# The rendezvous file name is not authority. Ownership is a live Windows kernel
+# FILE HANDLE opened with shareMode=0. A stale file is deliberately harmless.
+_SNAPSHOT_LEASE_BUSY_ERRORS = frozenset({32, 33})  # sharing / lock violation
+
+
+@dataclasses.dataclass
+class _SnapshotLease:
+    path: Path
+    handle: int
+    closed: bool = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        handle = int(self.handle or 0)
+        self.handle = 0
+        if os.name == "nt" and handle:
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle(wintypes.HANDLE(handle))
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+
+
+@dataclasses.dataclass(frozen=True)
+class _SnapshotLeaseAttempt:
+    lease: Optional[_SnapshotLease]
+    reason: str = ""
+    win_error: int = 0
+
+
+def _snapshot_lease_path(prepared_workspace_root: Path) -> Path:
+    identity = os.path.normcase(str(prepared_workspace_root.resolve()))
+    digest = hashlib.sha256(identity.encode("utf-8", errors="surrogatepass")).hexdigest()
+    root = Path(os.environ.get("TEMP") or os.environ.get("TMP") or tempfile.gettempdir())
+    return root / "deploom-prepared-snapshot-leases" / f"{digest}.lease"
+
+
+def _open_snapshot_lease(prepared_workspace_root: Path) -> _SnapshotLeaseAttempt:
+    """One non-blocking OS-level lease attempt."""
+    if os.name != "nt":
+        return _SnapshotLeaseAttempt(None, "unsupported-platform", 0)
+
+    from ctypes import wintypes
+
+    lease_path = _snapshot_lease_path(prepared_workspace_root)
+    try:
+        lease_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return _SnapshotLeaseAttempt(None, "lease-directory-error", 0)
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    OPEN_ALWAYS = 4
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    handle = kernel32.CreateFileW(
+        str(lease_path),
+        GENERIC_READ | GENERIC_WRITE,
+        0,  # shareMode=0: live handle == exclusive snapshot ownership
+        None,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    handle_value = ctypes.cast(handle, ctypes.c_void_p).value
+    if handle_value in (None, invalid):
+        error = int(ctypes.get_last_error())
+        reason = "lease-busy" if error in _SNAPSHOT_LEASE_BUSY_ERRORS else "lease-open-error"
+        return _SnapshotLeaseAttempt(None, reason, error)
+    return _SnapshotLeaseAttempt(_SnapshotLease(lease_path, int(handle_value)))
+
+
+def _try_acquire_snapshot_lease(
+    prepared_workspace_root: Path,
+    *,
+    progress: Optional[ProgressCallback] = None,
+) -> Optional[_SnapshotLease]:
+    """Try exclusive ownership for a junction-backed consumer.
+
+    Busy means another live consumer owns the shared payload, so this fast path
+    is not used. The caller's private-copy fallback acquires the SAME lease
+    before reading snapshot bytes; it never races a transient shared mutation.
+    """
+    if os.name != "nt":
+        return None
+    attempt = _open_snapshot_lease(prepared_workspace_root)
+    if attempt.lease is not None:
+        return attempt.lease
+    if progress:
+        progress(
+            f"NTFS fast clone unavailable: reason={attempt.reason}; "
+            f"winError={attempt.win_error}; private copy will use the snapshot lease"
+        )
+    return None
+
+
+def acquire_snapshot_copy_lease(
+    prepared_workspace_root: Path,
+    *,
+    timeout_seconds: int,
+    progress: Optional[ProgressCallback] = None,
+) -> Optional[_SnapshotLease]:
+    """Acquire exclusive ownership before ANY private read of shared snapshot.
+
+    Waiting is correctness-critical: copying immediately after a fast-path lease
+    collision could read bytes while the live junction consumer is transiently
+    mutating them. Only sharing/lock violations are retried. Every other lease
+    error fails closed; timeout is infrastructure failure, never proof evidence.
+    """
+    if os.name != "nt":
+        return None
+    started = time.monotonic()
+    deadline = started + max(1, int(timeout_seconds))
+    announced = False
+    while True:
+        attempt = _open_snapshot_lease(prepared_workspace_root)
+        if attempt.lease is not None:
+            if announced and progress:
+                progress(
+                    "prepared snapshot private-copy lease acquired after contention; "
+                    f"waited={int(time.monotonic() - started)}s"
+                )
+            return attempt.lease
+        if attempt.reason != "lease-busy":
+            raise RuntimeError(
+                "PREPARED_SNAPSHOT_LEASE_UNAVAILABLE: "
+                f"reason={attempt.reason}; winError={attempt.win_error}"
+            )
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "PREPARED_SNAPSHOT_LEASE_TIMEOUT: another live consumer retained "
+                f"the prepared snapshot for >={max(1, int(timeout_seconds))}s"
+            )
+        if not announced and progress:
+            progress(
+                "prepared snapshot is owned by another live verification consumer; "
+                "waiting before proof-safe private copy"
+            )
+            announced = True
+        time.sleep(0.10)
+
+
+def try_acquire_snapshot_cleanup_lease(
+    prepared_workspace_root: Path,
+) -> Optional[_SnapshotLease]:
+    """Best-effort exclusive ownership for cache retirement.
+
+    Eviction is never allowed to delete bytes under a live junction/copy
+    reader. On contention or lock infrastructure failure we intentionally leak
+    the unregistered temp snapshot until process cleanup rather than race proof
+    execution.
+    """
+    if os.name != "nt":
+        return None
+    return _open_snapshot_lease(prepared_workspace_root).lease
+
+
 @dataclasses.dataclass
 class _GuardedClone:
     target_root: Path
     project: Path
     junctions: list[Path]
     guard: "_DependencyTreeGuard"
+    lease: "_SnapshotLease"
     stopped: Optional[GuardResult] = None
 
 
@@ -637,6 +817,14 @@ def try_materialize_guarded_clone(
     if not dependency_roots or not dependency_integrity:
         return None
 
+    lease = _try_acquire_snapshot_lease(
+        prepared_workspace_root,
+        progress=progress,
+    )
+    if lease is None:
+        return None
+    lease_transferred = False
+
     try:
         clone = subprocess.run(
             ["git", "clone", "--quiet", "--shared", "--no-hardlinks", str(source_root), str(target)],
@@ -697,9 +885,11 @@ def try_materialize_guarded_clone(
             project=project,
             junctions=junctions,
             guard=guard,
+            lease=lease,
         )
         with _ACTIVE_LOCK:
             _ACTIVE[_key(target)] = state
+        lease_transferred = True
         if progress:
             progress(
                 f"NTFS fast clone ready: source/config copied, "
@@ -707,8 +897,14 @@ def try_materialize_guarded_clone(
             )
         return project
     except Exception:
-        shutil.rmtree(target, ignore_errors=True)
+        if lease_transferred:
+            cleanup_guarded_clone(target)
+        else:
+            shutil.rmtree(target, ignore_errors=True)
         return None
+    finally:
+        if not lease_transferred:
+            lease.close()
 
 
 def guarded_clone_is_active(target: Path) -> bool:
@@ -732,6 +928,11 @@ def cleanup_guarded_clone(target: Path) -> GuardResult:
     if state is None:
         return GuardResult()
     result = state.stopped if state.stopped is not None else state.guard.stop()
-    for junction in sorted(state.junctions, key=lambda item: len(item.parts), reverse=True):
-        _remove_junction(junction)
+    try:
+        for junction in sorted(state.junctions, key=lambda item: len(item.parts), reverse=True):
+            _remove_junction(junction)
+    finally:
+        # Lease survives watcher stop and the complete project command. It is
+        # released only after every junction from this consumer is gone.
+        state.lease.close()
     return result

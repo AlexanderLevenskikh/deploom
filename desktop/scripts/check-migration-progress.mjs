@@ -444,7 +444,7 @@ console.log("Migration branch progress OK");
 // The prompt must carry the exact Baseline ProofEnvelope across the
 // Python -> Dashboard -> Electron boundary. A local scope is only a subset.
 const proofEnvelopePayload = {
-  schemaVersion: 3,
+  schemaVersion: 4,
   proofSchema: 'baseline-proof-v3',
   project: 'Demo',
   mode: 'yellow',
@@ -452,6 +452,7 @@ const proofEnvelopePayload = {
   sourceSnapshotKey: 'source-key',
   assignmentKey: 'assignment-key',
   resolverInputKey: 'resolver-key',
+  fixedResolverInputsKey: 'f'.repeat(64),
   preparationProofKey: 'preparation-key',
   projectProofKey: 'project-key',
   observedResolvedHash: '0'.repeat(64),

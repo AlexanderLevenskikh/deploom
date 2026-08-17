@@ -36,6 +36,7 @@ try {
     provenEnvelopeKey: 'envelope-key',
     provenAssignmentKey: 'assignment-key',
     resolverInputKey: 'resolver-key',
+    fixedResolverInputsKey: 'f'.repeat(64),
     sourceSnapshotKey: 'source-key',
     projectProofKey: 'project-key',
     provenExactDirectAssignment,
@@ -63,7 +64,7 @@ try {
     gitHead: 'deadbeef',
     createdAt: '2026-08-14T00:00:00.000Z',
   })
-  if (proof.schemaVersion !== 3) throw new Error('proof schema was not upgraded')
+  if (proof.schemaVersion !== 4) throw new Error('proof schema was not upgraded')
   if (proof.assignmentHash !== materializationAssignmentHash(actions)) throw new Error('assignment hash is not deterministic')
   if (proof.observedResolvedVersions.a !== '2.0.0') throw new Error(`resolved tuple was not observed: ${JSON.stringify(proof.observedResolvedVersions)}`)
 
@@ -82,6 +83,13 @@ try {
     packageManager: 'yarn', packageManagerVersion: '1.22.22', nodeVersion: 'v24.0.0',
   })
   if (result.ok || !result.reason.includes('envelope')) throw new Error('envelope drift must invalidate proof')
+
+  result = validateMaterializationProof({
+    projectPath: dir, proof: read, project: 'Demo', branch: 'CD-1-demo',
+    actions, ...identity, fixedResolverInputsKey: 'e'.repeat(64),
+    packageManager: 'yarn', packageManagerVersion: '1.22.22', nodeVersion: 'v24.0.0',
+  })
+  if (result.ok || !result.reason.includes('fixed source')) throw new Error('fixed source identity drift must invalidate proof')
 
   // Unrelated scripts may change during semantic migration.
   writeFileSync(packagePath, JSON.stringify({

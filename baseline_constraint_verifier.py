@@ -36,6 +36,9 @@ from verification_proof import (
     bind_resolved_state_identity,
     build_verification_proof_identity,
     emit_verification_event,
+    fixed_resolver_input_fingerprint,
+    remote_fixed_resolver_input_fingerprint,
+    SourceIdentityUnavailable,
     is_fixed_manifest_spec,
 )
 from resolved_dependency_state import (
@@ -48,7 +51,9 @@ from resolved_dependency_state import (
     restore_resolved_dependency_state,
 )
 from prepared_workspace_fastpath import (
+    acquire_snapshot_copy_lease,
     build_dependency_integrity_manifest,
+    try_acquire_snapshot_cleanup_lease,
     cleanup_guarded_clone,
     guarded_clone_is_active,
     stop_guarded_clone,
@@ -712,12 +717,28 @@ def _lookup_prepared_workspace_snapshot(
         return snapshot
 
 
+def _retire_prepared_workspace_snapshot(snapshot: PreparedWorkspaceSnapshot) -> bool:
+    if os.name != "nt":
+        shutil.rmtree(snapshot.workspace_root.parent, ignore_errors=True)
+        return True
+    lease = try_acquire_snapshot_cleanup_lease(snapshot.workspace_root)
+    if lease is None:
+        # A live reader owns the snapshot (or the lease substrate itself is
+        # uncertain). Deleting it would be less safe than leaking a temp tree.
+        return False
+    try:
+        shutil.rmtree(snapshot.workspace_root.parent, ignore_errors=True)
+        return True
+    finally:
+        lease.close()
+
+
 def _evict_prepared_workspace_snapshot(key: str, source_project: Path) -> None:
     slot = _prepared_snapshot_slot(key, source_project)
     with _PREPARED_SNAPSHOT_LOCK:
         snapshot = _PREPARED_SNAPSHOTS.pop(slot, None)
     if snapshot is not None:
-        shutil.rmtree(snapshot.workspace_root.parent, ignore_errors=True)
+        _retire_prepared_workspace_snapshot(snapshot)
 
 
 def _enforce_prepared_snapshot_budget(protected_slot: Tuple[str, str]) -> None:
@@ -733,7 +754,7 @@ def _enforce_prepared_snapshot_budget(protected_slot: Tuple[str, str]) -> None:
             if victim is not None:
                 victims.append(victim)
     for victim in victims:
-        shutil.rmtree(victim.workspace_root.parent, ignore_errors=True)
+        _retire_prepared_workspace_snapshot(victim)
 
 
 def _publish_prepared_workspace_snapshot(
@@ -856,14 +877,23 @@ def _materialize_prepared_workspace_snapshot(
             "shared-tree notification; using proof-safe full copy"
         )
 
-    _copy_tree_snapshot(
+    copy_lease = acquire_snapshot_copy_lease(
         snapshot.workspace_root,
-        target,
-        progress=progress,
-        progress_label=progress_label,
         timeout_seconds=timeout_seconds,
-        progress_interval_seconds=progress_interval_seconds,
-    )
+        progress=progress,
+    ) if os.name == "nt" else None
+    try:
+        _copy_tree_snapshot(
+            snapshot.workspace_root,
+            target,
+            progress=progress,
+            progress_label=progress_label,
+            timeout_seconds=timeout_seconds,
+            progress_interval_seconds=progress_interval_seconds,
+        )
+    finally:
+        if copy_lease is not None:
+            copy_lease.close()
     project = target / snapshot.project_relative
     if not project.is_dir():
         raise RuntimeError(
@@ -1221,6 +1251,55 @@ def verify_assignment(
             )
         event("proof.identity", manager=manager)
 
+        def fixed_source_identity_gate(stage: str) -> Optional[BaselineVerifyResult]:
+            try:
+                # The complete identity is rebound to the original checkout.
+                # Local/workspace paths are intentionally not re-identified
+                # from the temporary assignment clone.
+                current_source_fixed_key = fixed_resolver_input_fingerprint(
+                    project_dir, manager=manager
+                )
+                expected_remote_key = remote_fixed_resolver_input_fingerprint(
+                    project_dir, manager=manager
+                )
+                observed_remote_key = remote_fixed_resolver_input_fingerprint(
+                    workspace_project, manager=manager
+                )
+            except (SourceIdentityUnavailable, OSError, ValueError) as exc:
+                event(
+                    "verify.fixed-source.identity-unavailable",
+                    stage=stage,
+                    detail=str(exc),
+                )
+                return BaselineVerifyResult(
+                    False,
+                    "unknown",
+                    f"FIXED_SOURCE_IDENTITY_UNAVAILABLE_DURING_{stage.upper()}: {exc}",
+                    workspace=str(workspace_project),
+                )
+            expected_fixed_key = proof_identity.fixed_resolver_inputs_key
+            if (
+                current_source_fixed_key == expected_fixed_key
+                and observed_remote_key == expected_remote_key
+            ):
+                return None
+            event(
+                "verify.fixed-source.identity-drift",
+                stage=stage,
+                expectedFixedResolverInputsKey=expected_fixed_key,
+                observedFixedResolverInputsKey=current_source_fixed_key,
+                expectedRemoteFixedResolverInputsKey=expected_remote_key,
+                observedRemoteFixedResolverInputsKey=observed_remote_key,
+            )
+            return BaselineVerifyResult(
+                False,
+                "unknown",
+                "FIXED_SOURCE_IDENTITY_DRIFT_DURING_" + stage.upper() + ": "
+                + f"expected={expected_fixed_key} observed={current_source_fixed_key} "
+                + f"remoteExpected={expected_remote_key} remoteObserved={observed_remote_key}",
+                workspace=str(workspace_project),
+            )
+
         proof_store = VerificationProofStore(
             Path(config.proof_cache_dir) if config.proof_cache_dir else None
         )
@@ -1359,6 +1438,10 @@ def verify_assignment(
                     output=tail,
                     workspace=str(workspace_project),
                 )
+
+        fixed_identity_result = fixed_source_identity_gate("resolver")
+        if fixed_identity_result is not None:
+            return fixed_identity_result
 
         try:
             materialized_manifest = json.loads((workspace_project / "package.json").read_text(encoding="utf-8"))
@@ -1522,6 +1605,10 @@ def verify_assignment(
                         "assignment resolves, but lifecycle/preparation failed deterministically",
                         **common,
                     )
+
+                fixed_identity_result = fixed_source_identity_gate("lifecycle")
+                if fixed_identity_result is not None:
+                    return fixed_identity_result
 
                 try:
                     lifecycle_observed = observed_resolved_assignment(
@@ -1734,7 +1821,7 @@ def verify_assignment(
                         # identity; ResolverProof may be reused, while lifecycle
                         # preparation is rebuilt because the shared snapshot was
                         # quarantined.
-                        return verify_assignment(
+                        return _retry_assignment_without_prepared_fastpath(
                             project_dir,
                             assignment,
                             config=config,
@@ -1743,7 +1830,6 @@ def verify_assignment(
                             progress=progress,
                             progress_label=progress_label,
                             proof_identity=proof_identity,
-                            _allow_prepared_fastpath=False,
                         )
 
                     # Allowed root cache writes are cache-only. Remove them
@@ -1852,6 +1938,39 @@ def assignment_fingerprint(assignment: Mapping[str, str]) -> str:
 
 
 _verify_assignment_uncached = verify_assignment
+
+
+def _retry_assignment_without_prepared_fastpath(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    *,
+    config: BaselineVerifyConfig,
+    run_project_checks: bool,
+    remove_packages: Iterable[str],
+    progress: Optional[ProgressCallback],
+    progress_label: str,
+    proof_identity: VerificationProofIdentity,
+) -> BaselineVerifyResult:
+    # Project checks run only after ResolverProof + ResolvedState have been
+    # captured. Preserve that exact proof identity and restore the exact
+    # ResolvedState on retry instead of needlessly resolving from the network
+    # again. The quarantined prepared snapshot is still rebuilt, and every
+    # project clone is forced onto the private full-copy path.
+    retry_config = dataclasses.replace(
+        config,
+        reuse_resolver_proof_key=proof_identity.resolver_input_key,
+    )
+    return _verify_assignment_uncached(
+        project_dir,
+        assignment,
+        config=retry_config,
+        run_project_checks=run_project_checks,
+        remove_packages=remove_packages,
+        progress=progress,
+        progress_label=progress_label,
+        proof_identity=proof_identity,
+        _allow_prepared_fastpath=False,
+    )
 
 
 def verify_assignment(
