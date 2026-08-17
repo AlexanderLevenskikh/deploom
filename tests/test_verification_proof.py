@@ -167,9 +167,33 @@ class VerificationProofIdentityTests(unittest.TestCase):
             self._project(project)
             identity = self._identity(project)
             store = VerificationProofStore(root / "cas")
+            observed = {"demo": "2.0.0"}
+            observed_hash = __import__("hashlib").sha256(
+                json.dumps(observed, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            state = capture_resolved_dependency_state(
+                project,
+                manager="npm",
+                resolver_input_key=identity.resolver_input_key,
+                observed_resolved_hash=observed_hash,
+                proof_cache_dir=store.root,
+            )
+            identity = bind_resolved_state_identity(
+                identity,
+                state.key,
+                project_checks="adaptive",
+                commands=("npm run typecheck",),
+            )
+            metadata = {
+                "observedResolvedVersions": observed,
+                "observedResolvedHash": observed_hash,
+                **resolved_state_metadata(state),
+            }
 
             self.assertIsNone(store.lookup_pass("project", identity.project_proof_key))
-            self.assertTrue(store.publish_pass("project", identity.project_proof_key, identity))
+            self.assertTrue(store.publish_pass(
+                "project", identity.project_proof_key, identity, metadata=metadata
+            ))
             record = store.lookup_pass("project", identity.project_proof_key)
             self.assertIsNotNone(record)
             self.assertEqual(identity.project_proof_key, record.key)
@@ -196,6 +220,12 @@ class VerificationProofIdentityTests(unittest.TestCase):
                 resolver_input_key=identity.resolver_input_key,
                 observed_resolved_hash=observed_hash,
                 proof_cache_dir=store.root,
+            )
+            identity = bind_resolved_state_identity(
+                identity,
+                state.key,
+                project_checks="adaptive",
+                commands=("npm run typecheck",),
             )
             self.assertTrue(store.publish_pass(
                 "resolver",

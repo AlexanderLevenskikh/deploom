@@ -16,7 +16,8 @@ class FastPathNotificationSemanticsRegressionTests(unittest.TestCase):
     def test_windows_notification_action_is_part_of_guard_authority(self) -> None:
         source = Path(fastpath.__file__).read_text(encoding="utf-8")
         self.assertIn('action = int.from_bytes(raw[offset + 4:offset + 8], "little")', source)
-        self.assertIn("_notification_is_authoritative_mutation(", source)
+        self.assertIn("_classify_integrity_notification(", source)
+        self.assertIn("build_dependency_integrity_manifest(", source)
         self.assertIn("FILE_ACTION_MODIFIED", source)
 
     def test_only_root_verification_caches_are_ephemeral(self) -> None:
@@ -26,23 +27,47 @@ class FastPathNotificationSemanticsRegressionTests(unittest.TestCase):
         self.assertFalse(fastpath._is_ephemeral_change("package/.cache/result"))
         self.assertFalse(fastpath._is_ephemeral_change("package/.vite/chunk.js"))
 
-    def test_directory_modified_is_non_authoritative_but_missing_path_fails_closed(self) -> None:
+    def test_integrity_classifier_ignores_directories_but_fails_closed_for_missing_or_changed_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "dir").mkdir()
-            self.assertFalse(
-                fastpath._notification_is_authoritative_mutation(
-                    root,
+            package = root / "pkg.js"
+            package.write_text("sealed\n", encoding="utf-8")
+            manifest = {
+                fastpath._integrity_key(package, root): fastpath._fingerprint_path(package)
+            }
+            self.assertEqual(
+                "ignored",
+                fastpath._classify_integrity_notification(
+                    root, root,
                     fastpath._DirectoryWatcher.FILE_ACTION_MODIFIED,
-                    "dir",
-                )
+                    "dir", manifest,
+                ),
             )
-            self.assertTrue(
-                fastpath._notification_is_authoritative_mutation(
-                    root,
+            self.assertEqual(
+                "mutation",
+                fastpath._classify_integrity_notification(
+                    root, root,
                     fastpath._DirectoryWatcher.FILE_ACTION_MODIFIED,
-                    "missing",
-                )
+                    "missing", manifest,
+                ),
+            )
+            self.assertEqual(
+                "notification-only",
+                fastpath._classify_integrity_notification(
+                    root, root,
+                    fastpath._DirectoryWatcher.FILE_ACTION_MODIFIED,
+                    "pkg.js", manifest,
+                ),
+            )
+            package.write_text("mutated\n", encoding="utf-8")
+            self.assertEqual(
+                "mutation",
+                fastpath._classify_integrity_notification(
+                    root, root,
+                    fastpath._DirectoryWatcher.FILE_ACTION_MODIFIED,
+                    "pkg.js", manifest,
+                ),
             )
 
 

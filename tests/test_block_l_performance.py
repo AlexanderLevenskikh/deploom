@@ -117,7 +117,9 @@ class BlockLPerformanceTests(unittest.TestCase):
 
         # Fast path is not an unguarded shared writable tree.
         self.assertIn("stop_guarded_clone(command_root)", source)
-        self.assertIn("PREPARED_DEPENDENCY_TREE_MUTATION", source)
+        self.assertIn("verify.project-check.fastpath-rejected", source)
+        self.assertIn("_disable_prepared_snapshot_fastpath(", source)
+        self.assertIn("_allow_prepared_fastpath=False", source)
         self.assertIn("_evict_prepared_workspace_snapshot(", source)
 
         # The check always runs against the materialized command workspace,

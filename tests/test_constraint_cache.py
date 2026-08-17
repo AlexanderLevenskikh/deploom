@@ -38,10 +38,11 @@ class ConstraintCacheTests(unittest.TestCase):
             root = Path(temp)
             (root / "package.json").write_text('{"name":"demo","packageManager":"yarn@1.22.22"}\n', encoding="utf-8")
             (root / "yarn.lock").write_text("", encoding="utf-8")
-            with mock.patch("constraint_cache._command_identity") as identity:
-                identity.side_effect = lambda _root, command: {"command": command, "executable": f"/{command}", "version": "v1"}
+            with mock.patch("verification_proof._version_identity", return_value="manager-v1"), \
+                    mock.patch("verification_proof._node_identity", return_value="node-v1"):
                 first = resolver_environment_fingerprint(root, registry="https://nexus/a")
-                identity.side_effect = lambda _root, command: {"command": command, "executable": f"/{command}", "version": "v2" if command == "node" else "v1"}
+            with mock.patch("verification_proof._version_identity", return_value="manager-v1"), \
+                    mock.patch("verification_proof._node_identity", return_value="node-v2"):
                 second = resolver_environment_fingerprint(root, registry="https://nexus/a")
             self.assertNotEqual(first, second)
 
@@ -53,7 +54,7 @@ class ConstraintCacheTests(unittest.TestCase):
             project.mkdir()
             proof = LearnedConstraintProof(
                 project_path=str(project.resolve()),
-                environment_fingerprint="env-a",
+                environment_fingerprint="a" * 64,
                 literals={"a": "2", "b": "3"},
                 failure_signature="sig",
                 verified_count=2,
@@ -61,16 +62,16 @@ class ConstraintCacheTests(unittest.TestCase):
             self.assertTrue(persist_verified_nogood(cache, proof))
             self.assertFalse(persist_verified_nogood(cache, proof))
             self.assertEqual([{"a": "2", "b": "3"}], load_verified_nogoods(
-                cache, project_path=project, environment_fingerprint="env-a"
+                cache, project_path=project, environment_fingerprint="a" * 64
             ))
             self.assertEqual([], load_verified_nogoods(
-                cache, project_path=project, environment_fingerprint="env-b"
+                cache, project_path=project, environment_fingerprint="b" * 64
             ))
 
             payload = json.loads(cache.read_text(encoding="utf-8"))
             payload["entries"].append({
                 "projectPath": str(project.resolve()),
-                "environmentFingerprint": "env-a",
+                "resolverContextKey": "a" * 64,
                 "literals": {"x": "9"},
                 "failureSignature": "sig2",
                 "source": "package-manager-resolver",
@@ -78,7 +79,7 @@ class ConstraintCacheTests(unittest.TestCase):
             })
             cache.write_text(json.dumps(payload), encoding="utf-8")
             self.assertEqual([{"a": "2", "b": "3"}], load_verified_nogoods(
-                cache, project_path=project, environment_fingerprint="env-a"
+                cache, project_path=project, environment_fingerprint="a" * 64
             ))
 
     def test_failure_signature_ignores_temp_workspace_name_and_whitespace(self):
@@ -104,7 +105,7 @@ class ConstraintCacheTests(unittest.TestCase):
             def proof(project: Path, literal: str) -> LearnedConstraintProof:
                 return LearnedConstraintProof(
                     project_path=str(project.resolve()),
-                    environment_fingerprint="env",
+                    environment_fingerprint="e" * 64,
                     literals={literal: "2.0.0"},
                     failure_signature=f"sig-{literal}",
                     verified_count=2,
@@ -116,11 +117,11 @@ class ConstraintCacheTests(unittest.TestCase):
 
             self.assertEqual(
                 [{"a2": "2.0.0"}],
-                load_verified_nogoods(cache, project_path=project_a, environment_fingerprint="env"),
+                load_verified_nogoods(cache, project_path=project_a, environment_fingerprint="e" * 64),
             )
             self.assertEqual(
                 [{"b1": "2.0.0"}],
-                load_verified_nogoods(cache, project_path=project_b, environment_fingerprint="env"),
+                load_verified_nogoods(cache, project_path=project_b, environment_fingerprint="e" * 64),
             )
 
     def test_parallel_cache_writers_do_not_lose_proofs(self):
@@ -132,7 +133,7 @@ class ConstraintCacheTests(unittest.TestCase):
             proofs = [
                 LearnedConstraintProof(
                     project_path=str(project.resolve()),
-                    environment_fingerprint="env",
+                    environment_fingerprint="e" * 64,
                     literals={f"p{index}": "2.0.0"},
                     failure_signature=f"sig-{index}",
                     verified_count=2,

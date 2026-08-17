@@ -90,12 +90,17 @@ from baseline_constraint_verifier import (
 from verification_proof import (
     VerificationProofStore,
     bind_resolved_state_identity,
+    build_project_trial_key,
+    build_resolver_context_key,
+    build_resolver_trial_key,
     build_verification_proof_identity,
     is_fixed_manifest_spec,
     source_snapshot_fingerprint,
 )
 from resolved_dependency_state import load_resolved_dependency_state
 from proven_dependency_state import (
+    RESOLVER_PROOF_STATUS_NOT_REQUIRED_NO_OP,
+    RESOLVER_PROOF_STATUS_PASSED,
     build_proven_dependency_envelope,
     write_proven_dependency_state,
 )
@@ -104,7 +109,6 @@ from constraint_cache import (
     dependency_failure_signature,
     load_verified_nogoods,
     persist_verified_nogood,
-    resolver_environment_fingerprint,
     dependency_failure_navigation_signature,
     matching_dependency_failure_signature,
 )
@@ -8670,7 +8674,9 @@ def _build_proven_envelope_for_mode(
         verification_commands=config.commands,
         project_checks=config.project_checks,
         resolver_proof_status=(
-            "passed" if resolver_pass else "not-required-no-fixed-inputs"
+            RESOLVER_PROOF_STATUS_PASSED
+            if resolver_pass
+            else RESOLVER_PROOF_STATUS_NOT_REQUIRED_NO_OP
         ),
         preparation_proof_status=(
             "passed"
@@ -8721,12 +8727,10 @@ def resolve_peer_compatibility_with_verification(
     graph_generalization_seed_packages: Dict[str, Tuple[str, ...]] = {}
     graph_generalization_history_by_family: Dict[str, List[Tuple[str, ...]]] = {}
     final_assignments: Dict[str, Dict[str, Dict[str, str]]] = {}
-    resolver_cache: Dict[Tuple[str, Tuple[Tuple[str, str], ...], Tuple[str, ...]], BaselineVerifyResult] = {}
-    project_preflight_cache: Dict[
-        Tuple[str, Tuple[Tuple[str, str], ...], Tuple[str, ...], Tuple[str, ...]],
-        BaselineVerifyResult,
-    ] = {}
-    adaptive_control_cache: Dict[Tuple[str, str], BaselineVerifyResult] = {}
+    resolver_cache: Dict[str, BaselineVerifyResult] = {}
+    # Project cache keys include the resulting ResolvedStateKey, source snapshot,
+    # command set and check policy. Display fingerprints never participate.
+    project_preflight_cache: Dict[str, BaselineVerifyResult] = {}
     verification_config_by_project: Dict[str, BaselineVerifyConfig] = {}
 
     for project, rows in rows_by_project.items():
@@ -8769,6 +8773,23 @@ def resolve_peer_compatibility_with_verification(
                 "cannot produce an executable dependency plan. Use a report-only workflow instead."
             )
         verification_config_by_project[project] = config
+
+        identity_manager = detect_package_manager(spec.path)
+        identity_executable = resolve_executable(identity_manager)
+        project_resolver_context_key = ""
+        if identity_executable:
+            project_resolver_context_key = build_resolver_context_key(
+                spec.path,
+                manager=identity_manager,
+                manager_executable=identity_executable,
+                registry=client.registry,
+                environment=dict(os.environ),
+            )
+        project_source_snapshot_key = (
+            source_snapshot_fingerprint(spec.path)
+            if config.project_checks != "off" and config.commands
+            else ""
+        )
 
         external_evidence = (external_evidence_by_project or {}).get(project)
         if external_evidence is not None:
@@ -8865,20 +8886,18 @@ def resolve_peer_compatibility_with_verification(
             for command, candidate_signatures in candidate_by_command:
                 if not candidate_signatures:
                     continue
-                key = (str(spec.path.resolve()), command)
-                control = adaptive_control_cache.get(key)
-                if control is None:
-                    control_config = dataclasses.replace(config, project_checks="diagnostic", commands=(command,))
-                    control = verify_assignment(
-                        spec.path, {}, config=control_config, run_project_checks=True, remove_packages=(),
-                        progress=lambda message, command=command: (
-                            progress_reporter.emit(project, "control", "adaptive-control", command=command, message=message),
-                            eprint(f"[info] {project}: Baseline control {command}: {message}"),
-                        ),
-                        progress_label=f"Baseline control {command}",
-                    )
-                    if control.kind not in {"infrastructure", "unknown"}:
-                        adaptive_control_cache[key] = control
+                # Do not maintain an alternate project/command-only authority cache.
+                # verify_assignment already owns the strong Resolver/ProjectProof
+                # cache and binds project reuse to an exact ResolvedStateKey.
+                control_config = dataclasses.replace(config, project_checks="diagnostic", commands=(command,))
+                control = verify_assignment(
+                    spec.path, {}, config=control_config, run_project_checks=True, remove_packages=(),
+                    progress=lambda message, command=command: (
+                        progress_reporter.emit(project, "control", "adaptive-control", command=command, message=message),
+                        eprint(f"[info] {project}: Baseline control {command}: {message}"),
+                    ),
+                    progress_label=f"Baseline control {command}",
+                )
                 if control.kind in {"infrastructure", "unknown"}:
                     raise BaselineConstraintVerificationError(
                         f"BASELINE_VERIFY_INCONCLUSIVE_CONTROL: {project}: adaptive structural comparison "
@@ -8900,24 +8919,27 @@ def resolve_peer_compatibility_with_verification(
             return bool(adaptive_structural_evidence(result))
 
         backend_options = _peer_solver_backend_options(spec.constraint_verify_config)
-        project_environment_fingerprint = resolver_environment_fingerprint(
-            spec.path, registry=client.registry
-        )
         if backend_options["persistentLearning"] and spec.constraint_cache_path is not None:
-            cached_nogoods = load_verified_nogoods(
-                spec.constraint_cache_path,
-                project_path=spec.path,
-                environment_fingerprint=project_environment_fingerprint,
-            )
-            if cached_nogoods:
-                for cached_mode in modes:
-                    for nogood in cached_nogoods:
-                        if nogood not in learned[project][cached_mode]:
-                            learned[project][cached_mode].append(dict(nogood))
+            if not project_resolver_context_key:
                 eprint(
-                    f"[info] {project}: loaded {len(cached_nogoods)} persistent verified resolver constraint(s); "
-                    f"environment={project_environment_fingerprint[:12]}"
+                    f"[warn] {project}: package-manager executable is unavailable; "
+                    "persistent resolver constraints are not loaded without a canonical ResolverContextKey"
                 )
+            else:
+                cached_nogoods = load_verified_nogoods(
+                    spec.constraint_cache_path,
+                    project_path=spec.path,
+                    environment_fingerprint=project_resolver_context_key,
+                )
+                if cached_nogoods:
+                    for cached_mode in modes:
+                        for nogood in cached_nogoods:
+                            if nogood not in learned[project][cached_mode]:
+                                learned[project][cached_mode].append(dict(nogood))
+                    eprint(
+                        f"[info] {project}: loaded {len(cached_nogoods)} persistent verified resolver constraint(s); "
+                        f"resolverContext={project_resolver_context_key[:12]}"
+                    )
 
         persistent_control_ok: Optional[bool] = None
 
@@ -9065,12 +9087,17 @@ def resolve_peer_compatibility_with_verification(
                     )
                     break
 
-                cache_key = (str(spec.path.resolve()), tuple(sorted(verification_assignment.items())), tuple(sorted(removals)))
-                project_cache_key = (
-                    str(spec.path.resolve()), tuple(sorted(verification_assignment.items())),
-                    tuple(sorted(removals)), tuple(config.commands),
-                )
-                result = resolver_cache.get(cache_key)
+                if not project_resolver_context_key:
+                    # The verifier will report the missing package manager as an
+                    # infrastructure failure. Do not invent a cache identity.
+                    resolver_trial_key = ""
+                else:
+                    resolver_trial_key = build_resolver_trial_key(
+                        resolver_context_key=project_resolver_context_key,
+                        assignment=verification_assignment,
+                        remove_packages=tuple(sorted(removals)),
+                    )
+                result = resolver_cache.get(resolver_trial_key) if resolver_trial_key else None
                 if result is None:
                     eprint(
                         f"[info] {project}: Baseline verify {mode} iteration {iteration}: "
@@ -9078,22 +9105,36 @@ def resolve_peer_compatibility_with_verification(
                         f"fixedInputs={len(fixed_input_names)}; {len(changed)} changed), assignment={fingerprint}"
                     )
                     if config.project_checks != "off" and config.commands:
-                        # One isolated workspace proves resolver state first and then
-                        # promotes the *same immutable assignment* to lifecycle/project
-                        # checks. The old path created a second clone and repeated the
-                        # resolver install before project preflight.
                         combined = verify_assignment(
                             spec.path, verification_assignment, config=config, run_project_checks=True, remove_packages=removals,
                             progress=lambda message: (progress_reporter.emit(project, mode, "assignment-verification", iteration=iteration, assignment=fingerprint, message=message), eprint(f"[info] {project}: {message}")),
                             progress_label=f"Baseline {mode} iteration {iteration} assignment {fingerprint}",
                         )
-                        if combined.kind not in {"infrastructure", "unknown"}:
-                            project_preflight_cache[project_cache_key] = combined
+                        if (
+                            combined.kind not in {"infrastructure", "unknown"}
+                            and resolver_trial_key
+                            and combined.resolved_state_key
+                        ):
+                            combined_project_key = build_project_trial_key(
+                                resolver_trial_key=resolver_trial_key,
+                                resolved_state_key=combined.resolved_state_key,
+                                source_snapshot_key=project_source_snapshot_key,
+                                project_checks=config.project_checks,
+                                commands=config.commands,
+                            )
+                            project_preflight_cache[combined_project_key] = combined
                         if combined.kind == "project":
+                            # Resolver authority passed before the project checks;
+                            # preserve its exact ResolvedState so any later project
+                            # cache lookup can include that state in its key.
                             result = BaselineVerifyResult(
                                 True, "passed",
                                 f"resolver preflight passed before project checks ({combined.summary})",
                                 command=combined.command, workspace=combined.workspace,
+                                observed_resolved_versions=combined.observed_resolved_versions,
+                                observed_resolved_hash=combined.observed_resolved_hash,
+                                resolved_state_key=combined.resolved_state_key,
+                                resolved_lockfile_hash=combined.resolved_lockfile_hash,
                             )
                         else:
                             result = combined
@@ -9103,10 +9144,16 @@ def resolve_peer_compatibility_with_verification(
                             progress=lambda message: (progress_reporter.emit(project, mode, "resolver-verification", iteration=iteration, assignment=fingerprint, message=message), eprint(f"[info] {project}: {message}")),
                             progress_label=f"Baseline {mode} iteration {iteration} resolver {fingerprint}",
                         )
-                    if result.kind not in {"infrastructure", "unknown"}:
-                        resolver_cache[cache_key] = result
+                    if resolver_trial_key and (
+                        result.ok
+                        or (result.kind == "dependency" and not result.resolved_state_key)
+                    ):
+                        resolver_cache[resolver_trial_key] = result
                 else:
-                    eprint(f"[info] {project}: Baseline verify {mode}: reused assignment proof {fingerprint}")
+                    eprint(
+                        f"[info] {project}: Baseline verify {mode}: reused exact ResolverTrialKey "
+                        f"{resolver_trial_key[:12]} (display assignment={fingerprint})"
+                    )
 
                 if result.kind == "infrastructure":
                     raise BaselineConstraintVerificationError(
@@ -9130,18 +9177,43 @@ def resolve_peer_compatibility_with_verification(
                     _annotate_constraint_preflight(rows, mode, assignment, result, iteration=iteration)
                     # Code/lifecycle checks are evidence, not version authority by default.
                     if config.project_checks != "off" and config.commands:
-                        project_result = project_preflight_cache.get(project_cache_key)
+                        project_cache_key = ""
+                        if resolver_trial_key and result.resolved_state_key:
+                            project_cache_key = build_project_trial_key(
+                                resolver_trial_key=resolver_trial_key,
+                                resolved_state_key=result.resolved_state_key,
+                                source_snapshot_key=project_source_snapshot_key,
+                                project_checks=config.project_checks,
+                                commands=config.commands,
+                            )
+                        project_result = (
+                            project_preflight_cache.get(project_cache_key)
+                            if project_cache_key
+                            else None
+                        )
                         if project_result is None:
                             project_result = verify_assignment(
                                 spec.path, verification_assignment, config=config, run_project_checks=True, remove_packages=removals,
                                 progress=lambda message: (progress_reporter.emit(project, mode, "project-preflight", iteration=iteration, assignment=fingerprint, message=message), eprint(f"[info] {project}: {message}")),
                                 progress_label=f"Baseline {mode} iteration {iteration} project preflight {fingerprint}",
                             )
-                            if project_result.kind not in {"infrastructure", "unknown"}:
-                                project_preflight_cache[project_cache_key] = project_result
+                            if (
+                                project_result.kind not in {"infrastructure", "unknown"}
+                                and resolver_trial_key
+                                and project_result.resolved_state_key
+                            ):
+                                exact_project_key = build_project_trial_key(
+                                    resolver_trial_key=resolver_trial_key,
+                                    resolved_state_key=project_result.resolved_state_key,
+                                    source_snapshot_key=project_source_snapshot_key,
+                                    project_checks=config.project_checks,
+                                    commands=config.commands,
+                                )
+                                project_preflight_cache[exact_project_key] = project_result
                         else:
                             eprint(
-                                f"[info] {project}: Baseline project preflight reused assignment proof {fingerprint}"
+                                f"[info] {project}: Baseline project preflight reused exact ProjectTrialKey "
+                                f"{project_cache_key[:12]} (display assignment={fingerprint})"
                             )
                         if project_result.kind == "infrastructure":
                             raise BaselineConstraintVerificationError(
@@ -9516,7 +9588,7 @@ def resolve_peer_compatibility_with_verification(
                             # inside this invocation. Every cache entry below was
                             # produced by fresh real-PM verification; no diagnostic
                             # graph evidence is promoted to authority.
-                            trial_proof_cache: Dict[str, List[str]] = {}
+                            trial_proof_cache: Dict[str, List[Tuple[str, str, str]]] = {}
 
                             def run_generalized_trial_proof(
                                 trial: Dict[str, str],
@@ -9526,9 +9598,63 @@ def resolve_peer_compatibility_with_verification(
                                 family_index: int,
                             ) -> str:
                                 trial_fingerprint = assignment_fingerprint(trial)
-                                cached = trial_proof_cache.setdefault(trial_fingerprint, [])
+                                trial_removals = _types_stub_removals_for_assignment(
+                                    rows_by_name, trial, mode, client
+                                )
+                                resolver_trial_identity = build_resolver_trial_key(
+                                    resolver_context_key=project_resolver_context_key,
+                                    assignment=trial,
+                                    remove_packages=trial_removals,
+                                )
+                                # Request identity is full 256-bit and includes the
+                                # required predicate. The resulting ResolvedStateKey
+                                # is stored in each cache record and validated before reuse.
+                                trial_request_key = hashlib.sha256(json.dumps({
+                                    "resolverTrialKey": resolver_trial_identity,
+                                    "sourceSnapshotKey": project_source_snapshot_key,
+                                    "projectChecks": (
+                                        confirmation_config.project_checks
+                                        if confirmation_project_checks
+                                        else "off"
+                                    ),
+                                    "commands": list(
+                                        confirmation_config.commands
+                                        if confirmation_project_checks
+                                        else ()
+                                    ),
+                                    "predicateIdentity": required_predicate,
+                                    "proofPolicy": "constraint-minimization-fresh-v1",
+                                }, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                                cached = trial_proof_cache.setdefault(trial_request_key, [])
                                 if len(cached) >= minimization_proof:
-                                    observed = cached[minimization_proof - 1]
+                                    cached_evidence_key, cached_state_key, observed = cached[minimization_proof - 1]
+                                    if cached_state_key:
+                                        expected_evidence_key = build_project_trial_key(
+                                            resolver_trial_key=resolver_trial_identity,
+                                            resolved_state_key=cached_state_key,
+                                            source_snapshot_key=project_source_snapshot_key,
+                                            project_checks=(
+                                                confirmation_config.project_checks
+                                                if confirmation_project_checks
+                                                else "off"
+                                            ),
+                                            commands=(
+                                                confirmation_config.commands
+                                                if confirmation_project_checks
+                                                else ()
+                                            ),
+                                            predicate_identity=required_predicate,
+                                        )
+                                        if cached_evidence_key != expected_evidence_key:
+                                            raise BaselineConstraintVerificationError(
+                                                f"BASELINE_TRIAL_CACHE_IDENTITY_INVALID: {project}/{mode}: "
+                                                f"candidate={trial_fingerprint}"
+                                            )
+                                    elif cached_evidence_key != resolver_trial_identity:
+                                        raise BaselineConstraintVerificationError(
+                                            f"BASELINE_TRIAL_CACHE_IDENTITY_INVALID: {project}/{mode}: "
+                                            f"candidate={trial_fingerprint}"
+                                        )
                                     progress_reporter.emit(
                                         project, mode, "constraint-minimization-proof-reused",
                                         iteration=iteration, assignment=fingerprint,
@@ -9654,7 +9780,37 @@ def resolve_peer_compatibility_with_verification(
                                         if observed == expected_signature:
                                             trial_predicate = observed
 
-                                cached.append(trial_predicate)
+                                if trial_result.resolved_state_key:
+                                    evidence_key = build_project_trial_key(
+                                        resolver_trial_key=resolver_trial_identity,
+                                        resolved_state_key=trial_result.resolved_state_key,
+                                        source_snapshot_key=project_source_snapshot_key,
+                                        project_checks=(
+                                            confirmation_config.project_checks
+                                            if confirmation_project_checks
+                                            else "off"
+                                        ),
+                                        commands=(
+                                            confirmation_config.commands
+                                            if confirmation_project_checks
+                                            else ()
+                                        ),
+                                        predicate_identity=required_predicate,
+                                    )
+                                    cached.append((
+                                        evidence_key,
+                                        trial_result.resolved_state_key,
+                                        trial_predicate,
+                                    ))
+                                else:
+                                    # Resolver failures have no ResolvedState by
+                                    # definition; their exact ResolverTrialKey is
+                                    # the authority identity for this observation.
+                                    cached.append((
+                                        resolver_trial_identity,
+                                        "",
+                                        trial_predicate,
+                                    ))
                                 progress_reporter.emit(
                                     project, mode, "constraint-minimization-proof-observed",
                                     iteration=iteration, assignment=fingerprint,
@@ -10019,7 +10175,7 @@ def resolve_peer_compatibility_with_verification(
                 localization_identity_payload = {
                     "algorithm": "baseline-ddmin-resume-v1",
                     "sourceHead": source_head,
-                    "environment": project_environment_fingerprint,
+                    "environment": project_resolver_context_key,
                     "mode": mode,
                     "assignment": sorted(assignment.items()),
                     "commands": list(config.commands),
@@ -10396,7 +10552,7 @@ def resolve_peer_compatibility_with_verification(
                                 spec.constraint_cache_path,
                                 LearnedConstraintProof(
                                     project_path=str(spec.path.resolve()),
-                                    environment_fingerprint=project_environment_fingerprint,
+                                    environment_fingerprint=project_resolver_context_key,
                                     literals=dict(nogood),
                                     failure_signature=signatures[0],
                                     verified_count=len(signatures),
@@ -10405,7 +10561,7 @@ def resolve_peer_compatibility_with_verification(
                             eprint(
                                 f"[info] {project}: persistent resolver constraint "
                                 f"{'stored' if persisted else 'already known'}; "
-                                f"proofs={len(signatures)}, environment={project_environment_fingerprint[:12]}"
+                                f"proofs={len(signatures)}, resolverContext={project_resolver_context_key[:12]}"
                             )
                         else:
                             eprint(

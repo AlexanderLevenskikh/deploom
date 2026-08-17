@@ -1502,9 +1502,26 @@ def verify_assignment(
                 )
                 if full_result.returncode != 0:
                     tail = "\n".join((full_result.stdout or "").splitlines()[-80:])
+                    common = dict(
+                        command=" ".join(full_argv),
+                        output=tail,
+                        workspace=str(workspace_project),
+                        observed_resolved_versions=observed_versions,
+                        observed_resolved_hash=observed_hash,
+                        resolved_state_key=resolved_state.key if resolved_state is not None else "",
+                        resolved_lockfile_hash=resolved_state.lockfile_hash if resolved_state is not None else "",
+                    )
                     if preparation_classified in {"infrastructure", "dependency"}:
-                        return BaselineVerifyResult(False, preparation_classified, "assignment resolves without lifecycle scripts, but lifecycle install failed", command=" ".join(full_argv), output=tail, workspace=str(workspace_project))
-                    return BaselineVerifyResult(False, "preparation", "assignment resolves, but lifecycle/preparation failed deterministically", command=" ".join(full_argv), output=tail, workspace=str(workspace_project))
+                        return BaselineVerifyResult(
+                            False, preparation_classified,
+                            "assignment resolves without lifecycle scripts, but lifecycle install failed",
+                            **common,
+                        )
+                    return BaselineVerifyResult(
+                        False, "preparation",
+                        "assignment resolves, but lifecycle/preparation failed deterministically",
+                        **common,
+                    )
 
                 try:
                     lifecycle_observed = observed_resolved_assignment(
@@ -1803,6 +1820,10 @@ def verify_assignment(
                     False, "project", f"project preflight failed: {summary_commands}",
                     command=first.command, output=output[-16000:], workspace=str(workspace_project),
                     project_failures=tuple(project_failures),
+                    observed_resolved_versions=observed_versions,
+                    observed_resolved_hash=observed_hash,
+                    resolved_state_key=resolved_state.key if resolved_state is not None else "",
+                    resolved_lockfile_hash=resolved_state.lockfile_hash if resolved_state is not None else "",
                 )
 
             assert resolved_state is not None

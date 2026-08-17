@@ -73,7 +73,9 @@ class BlockPQContracts(unittest.TestCase):
 
     def test_predicate_family_minimization_reuses_only_exact_trial_evidence(self) -> None:
         source = (ROOT / "dependency_live_roadmap_generator.py").read_text(encoding="utf-8")
-        self.assertIn("trial_proof_cache: Dict[str, List[str]]", source)
+        self.assertIn("trial_proof_cache: Dict[str, List[Tuple[str, str, str]]]", source)
+        self.assertIn("resolver_trial_identity = build_resolver_trial_key(", source)
+        self.assertIn("cached_evidence_key", source)
         self.assertIn("trial_fingerprint = assignment_fingerprint(trial)", source)
         self.assertIn('"constraint-minimization-proof-reused"', source)
         self.assertIn("required_predicate in {", source)

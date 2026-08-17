@@ -144,8 +144,8 @@ class BlockJProofIdentityTests(unittest.TestCase):
                 json.dumps({"name": "external_lib", "version": "3.0.0", "peerDependencies": {"managed_pkg": "^1"}}),
                 encoding="utf-8",
             )
-            stable = {"command": "fixture", "executable": "fixture", "version": "1"}
-            with mock.patch.object(constraint_cache, "_command_identity", return_value=stable):
+            with mock.patch("verification_proof._version_identity", return_value="manager-v1"), \
+                    mock.patch("verification_proof._node_identity", return_value="node-v1"):
                 first = constraint_cache.resolver_environment_fingerprint(
                     project, registry="https://registry.example.invalid/npm"
                 )

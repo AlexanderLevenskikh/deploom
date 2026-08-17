@@ -22,7 +22,10 @@ import time
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
-from verification_proof import fixed_resolver_input_fingerprint
+from verification_proof import (
+    PROOF_SCHEMA_VERSION,
+    build_resolver_context_key,
+)
 
 from typing import (
     Dict,
@@ -33,7 +36,8 @@ from typing import (
     Tuple,
 )
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
+CONSTRAINT_ENTRY_SCHEMA = "verified-resolver-nogood-v2"
 SOLVER_SCHEMA_VERSION = "peer-ir-v3-fixed-source-identity"
 _ENV_FILES = (
     "package.json",
@@ -91,38 +95,24 @@ def resolver_environment_fingerprint(
     registry: str,
     solver_schema: str = SOLVER_SCHEMA_VERSION,
 ) -> str:
-    """Return a conservative fingerprint for hard-clause reuse.
+    """Compatibility wrapper for the canonical resolver context key.
 
-    The complete package manifest and lock/config files are intentionally part
-    of the fingerprint.  This may invalidate more cache entries than strictly
-    necessary, but never reuses a package-manager proof after material resolver
-    inputs changed.
+    Production loading/persistence receives this key from the same canonical
+    builder used by VerificationProofIdentity. ``solver_schema`` is stored and
+    validated separately in each durable constraint record rather than being
+    folded into a second, weaker environment fingerprint.
     """
+    del solver_schema
     project_dir = project_dir.resolve()
-    files: Dict[str, str] = {}
-    for relative in _ENV_FILES:
-        path = project_dir / relative
-        if path.is_file():
-            try:
-                files[relative] = _sha256_bytes(path.read_bytes())
-            except OSError:
-                files[relative] = "unreadable"
-    package_manager = _package_manager_name(project_dir)
-    payload = {
-        "schema": solver_schema,
-        "registry": str(registry or "").rstrip("/"),
-        "platform": platform.system().lower(),
-        "machine": platform.machine().lower(),
-        "runtime": {
-            "node": _command_identity(project_dir, "node"),
-            "packageManager": _command_identity(project_dir, package_manager),
-            "nodeLinker": os.environ.get("YARN_NODE_LINKER") or os.environ.get("npm_config_node_linker") or "",
-        },
-        "files": files,
-        "fixedResolverInputsKey": fixed_resolver_input_fingerprint(project_dir),
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return _sha256_bytes(encoded.encode("utf-8"))[:32]
+    manager = _package_manager_name(project_dir)
+    executable = shutil.which(manager) or manager
+    return build_resolver_context_key(
+        project_dir,
+        manager=manager,
+        manager_executable=executable,
+        registry=registry,
+        environment=dict(os.environ),
+    )
 
 
 _FAILURE_PATH = re.compile(r"dependency-flow-baseline-verify-[^\\/\s]+", re.IGNORECASE)
@@ -291,23 +281,41 @@ def dependency_failure_navigation_signature(*, summary: str, output: str) -> str
 @dataclasses.dataclass(frozen=True)
 class LearnedConstraintProof:
     project_path: str
+    # Legacy Python field name retained for API compatibility. In cache schema
+    # v2 this MUST be the canonical 64-hex ResolverContextKey.
     environment_fingerprint: str
     literals: Dict[str, str]
     failure_signature: str
     source: str = "package-manager-resolver"
     verified_count: int = 2
     created_at: str = ""
+    solver_schema: str = SOLVER_SCHEMA_VERSION
 
     def normalized_literals(self) -> Dict[str, str]:
         return {str(name): str(version) for name, version in sorted(self.literals.items())}
 
+    def resolver_context_key(self) -> str:
+        value = str(self.environment_fingerprint or "").lower()
+        if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+            raise ValueError("CONSTRAINT_CACHE_RESOLVER_CONTEXT_KEY_INVALID")
+        return value
+
     def to_json(self) -> Dict[str, object]:
-        return {
+        literals = self.normalized_literals()
+        context_key = self.resolver_context_key()
+        payload = {
+            "entrySchema": CONSTRAINT_ENTRY_SCHEMA,
+            "proofSchema": PROOF_SCHEMA_VERSION,
+            "solverSchema": str(self.solver_schema),
             "projectPath": self.project_path,
-            "environmentFingerprint": self.environment_fingerprint,
-            "literals": self.normalized_literals(),
+            "resolverContextKey": context_key,
+            "literals": literals,
             "failureSignature": self.failure_signature,
             "source": self.source,
+        }
+        return {
+            **payload,
+            "entryKey": _constraint_entry_key(payload),
             "verifiedCount": int(self.verified_count),
             "createdAt": self.created_at or dt.datetime.now(dt.timezone.utc).isoformat(),
         }
@@ -380,17 +388,113 @@ def _exclusive_cache_write_lock(path: Path):
                     raise
                 time.sleep(0.01)
 
+def _constraint_entry_key(payload: Mapping[str, object]) -> str:
+    canonical = {
+        "entrySchema": str(payload.get("entrySchema") or ""),
+        "proofSchema": str(payload.get("proofSchema") or ""),
+        "solverSchema": str(payload.get("solverSchema") or ""),
+        "projectPath": str(payload.get("projectPath") or ""),
+        "resolverContextKey": str(payload.get("resolverContextKey") or "").lower(),
+        "literals": dict(sorted(
+            (str(k), str(v))
+            for k, v in dict(payload.get("literals") or {}).items()
+        )),
+        "failureSignature": str(payload.get("failureSignature") or ""),
+        "source": str(payload.get("source") or ""),
+    }
+    encoded = json.dumps(
+        canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return _sha256_bytes(encoded)
+
+
+def _empty_cache() -> Dict[str, object]:
+    return {
+        "schemaVersion": CACHE_SCHEMA_VERSION,
+        "proofSchema": PROOF_SCHEMA_VERSION,
+        "entrySchema": CONSTRAINT_ENTRY_SCHEMA,
+        "entries": [],
+    }
+
+
+def _valid_context_key(value: object) -> bool:
+    text = str(value or "").lower()
+    return len(text) == 64 and all(ch in "0123456789abcdef" for ch in text)
+
+
+def _validated_constraint_entry(raw: object) -> Optional[Dict[str, object]]:
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("entrySchema") != CONSTRAINT_ENTRY_SCHEMA:
+        return None
+    if raw.get("proofSchema") != PROOF_SCHEMA_VERSION:
+        return None
+    if raw.get("solverSchema") != SOLVER_SCHEMA_VERSION:
+        return None
+    project_path = str(raw.get("projectPath") or "")
+    context_key = str(raw.get("resolverContextKey") or "").lower()
+    failure_signature = str(raw.get("failureSignature") or "")
+    source = str(raw.get("source") or "")
+    if not project_path or not _valid_context_key(context_key):
+        return None
+    if not failure_signature or source != "package-manager-resolver":
+        return None
+    try:
+        verified_count = int(raw.get("verifiedCount") or 0)
+    except (TypeError, ValueError):
+        return None
+    if verified_count < 2:
+        return None
+    literals_raw = raw.get("literals")
+    if not isinstance(literals_raw, dict) or not literals_raw:
+        return None
+    literals = {
+        str(name): str(version)
+        for name, version in sorted(literals_raw.items())
+        if isinstance(name, str) and isinstance(version, str) and name and version
+    }
+    if len(literals) != len(literals_raw) or not literals:
+        return None
+    authority_payload = {
+        "entrySchema": CONSTRAINT_ENTRY_SCHEMA,
+        "proofSchema": PROOF_SCHEMA_VERSION,
+        "solverSchema": SOLVER_SCHEMA_VERSION,
+        "projectPath": project_path,
+        "resolverContextKey": context_key,
+        "literals": literals,
+        "failureSignature": failure_signature,
+        "source": source,
+    }
+    entry_key = _constraint_entry_key(authority_payload)
+    if str(raw.get("entryKey") or "").lower() != entry_key:
+        return None
+    return {
+        **authority_payload,
+        "entryKey": entry_key,
+        "verifiedCount": verified_count,
+        "createdAt": str(raw.get("createdAt") or ""),
+    }
+
+
 def _read_cache(path: Optional[Path]) -> Dict[str, object]:
     if path is None or not path.is_file():
-        return {"schemaVersion": CACHE_SCHEMA_VERSION, "entries": []}
+        return _empty_cache()
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return {"schemaVersion": CACHE_SCHEMA_VERSION, "entries": []}
-    if not isinstance(value, dict) or value.get("schemaVersion") != CACHE_SCHEMA_VERSION:
-        return {"schemaVersion": CACHE_SCHEMA_VERSION, "entries": []}
+        return _empty_cache()
+    # Legacy schema v1 is intentionally NOT migrated into authority. It had a
+    # weaker environment identity. A later successful fresh proof may persist
+    # a new v2 record under the canonical ResolverContextKey.
+    if (
+        not isinstance(value, dict)
+        or value.get("schemaVersion") != CACHE_SCHEMA_VERSION
+        or value.get("proofSchema") != PROOF_SCHEMA_VERSION
+        or value.get("entrySchema") != CONSTRAINT_ENTRY_SCHEMA
+    ):
+        return _empty_cache()
     if not isinstance(value.get("entries"), list):
-        value["entries"] = []
+        return _empty_cache()
     return value
 
 
@@ -400,74 +504,102 @@ def load_verified_nogoods(
     project_path: Path,
     environment_fingerprint: str,
 ) -> List[Dict[str, str]]:
+    context_key = str(environment_fingerprint or "").lower()
+    if not _valid_context_key(context_key):
+        return []
     cache = _read_cache(path)
     project_key = str(project_path.resolve())
     result: List[Dict[str, str]] = []
     seen = set()
     for raw in cache.get("entries", []):
-        if not isinstance(raw, dict):
+        validated = _validated_constraint_entry(raw)
+        if validated is None:
+            continue
+        raw = validated
+        if raw.get("entrySchema") != CONSTRAINT_ENTRY_SCHEMA:
+            continue
+        if raw.get("proofSchema") != PROOF_SCHEMA_VERSION:
+            continue
+        if raw.get("solverSchema") != SOLVER_SCHEMA_VERSION:
             continue
         if str(raw.get("projectPath") or "") != project_key:
             continue
-        if str(raw.get("environmentFingerprint") or "") != environment_fingerprint:
+        if str(raw.get("resolverContextKey") or "").lower() != context_key:
             continue
         if str(raw.get("source") or "") != "package-manager-resolver":
+            continue
+        if not _valid_context_key(raw.get("resolverContextKey")):
             continue
         try:
             verified_count = int(raw.get("verifiedCount") or 0)
         except (TypeError, ValueError):
             continue
-        if verified_count < 2 or not str(raw.get("failureSignature") or ""):
+        failure_signature = str(raw.get("failureSignature") or "")
+        if verified_count < 2 or not failure_signature:
             continue
         literals_raw = raw.get("literals")
         if not isinstance(literals_raw, dict) or not literals_raw:
             continue
-        literals = {str(name): str(version) for name, version in sorted(literals_raw.items()) if str(name) and str(version)}
+        literals = {
+            str(name): str(version)
+            for name, version in sorted(literals_raw.items())
+            if isinstance(name, str) and isinstance(version, str) and name and version
+        }
+        if len(literals) != len(literals_raw) or not literals:
+            continue
+        authority_payload = {
+            "entrySchema": raw.get("entrySchema"),
+            "proofSchema": raw.get("proofSchema"),
+            "solverSchema": raw.get("solverSchema"),
+            "projectPath": raw.get("projectPath"),
+            "resolverContextKey": raw.get("resolverContextKey"),
+            "literals": literals,
+            "failureSignature": failure_signature,
+            "source": raw.get("source"),
+        }
+        expected_entry_key = _constraint_entry_key(authority_payload)
+        if str(raw.get("entryKey") or "").lower() != expected_entry_key:
+            continue
         key = tuple(sorted(literals.items()))
-        if literals and key not in seen:
+        if key not in seen:
             seen.add(key)
             result.append(literals)
     return result
 
 
-def persist_verified_nogood(path: Optional[Path], proof: LearnedConstraintProof, *, max_entries: int = 1000) -> bool:
-    """Atomically persist one proven clause. Returns True when cache changed.
-
-    ``max_entries`` is intentionally a per-project retention bound. A busy
-    project must never evict verified clauses belonging to another project.
-    """
+def persist_verified_nogood(
+    path: Optional[Path],
+    proof: LearnedConstraintProof,
+    *,
+    max_entries: int = 1000,
+) -> bool:
+    """Atomically persist one proven clause after full authority validation."""
     if path is None or proof.verified_count < 2 or not proof.failure_signature or not proof.literals:
         return False
+    # Fail closed before touching the existing cache. A short/display hash or
+    # old environment fingerprint can never become a durable Solver clause.
+    normalized = proof.to_json()
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with _exclusive_cache_write_lock(path):
             cache = _read_cache(path)
-            entries = [item for item in cache.get("entries", []) if isinstance(item, dict)]
-            normalized = proof.to_json()
-            identity = (
-                normalized["projectPath"],
-                normalized["environmentFingerprint"],
-                tuple(sorted(dict(normalized["literals"]).items())),
-            )
+            entries = [
+                validated
+                for item in cache.get("entries", [])
+                if (validated := _validated_constraint_entry(item)) is not None
+            ]
+            identity = str(normalized["entryKey"])
             for existing in entries:
-                existing_literals = existing.get("literals") if isinstance(existing.get("literals"), dict) else {}
-                existing_identity = (
-                    str(existing.get("projectPath") or ""),
-                    str(existing.get("environmentFingerprint") or ""),
-                    tuple(sorted((str(k), str(v)) for k, v in existing_literals.items())),
-                )
-                if existing_identity == identity:
-                    changed = False
-                    if int(existing.get("verifiedCount") or 0) < int(normalized["verifiedCount"]):
-                        existing["verifiedCount"] = normalized["verifiedCount"]
-                        changed = True
-                    if not existing.get("failureSignature"):
-                        existing["failureSignature"] = normalized["failureSignature"]
-                        changed = True
-                    if not changed:
-                        return False
-                    break
+                if str(existing.get("entryKey") or "") != identity:
+                    continue
+                changed = False
+                if int(existing.get("verifiedCount") or 0) < int(normalized["verifiedCount"]):
+                    existing["verifiedCount"] = normalized["verifiedCount"]
+                    changed = True
+                if not changed:
+                    return False
+                break
             else:
                 entries.append(normalized)
 
@@ -487,8 +619,15 @@ def persist_verified_nogood(path: Optional[Path], proof: LearnedConstraintProof,
                         retained.append(item)
                     entries = retained
 
-            payload = {"schemaVersion": CACHE_SCHEMA_VERSION, "entries": entries}
-            fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+            payload = {
+                "schemaVersion": CACHE_SCHEMA_VERSION,
+                "proofSchema": PROOF_SCHEMA_VERSION,
+                "entrySchema": CONSTRAINT_ENTRY_SCHEMA,
+                "entries": entries,
+            }
+            fd, temp_name = tempfile.mkstemp(
+                prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
+            )
             try:
                 with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                     json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
@@ -502,8 +641,8 @@ def persist_verified_nogood(path: Optional[Path], proof: LearnedConstraintProof,
                     pass
             return True
     except TimeoutError as exc:
-        # Durable cache is an optimization/evidence store, never solver
-        # authority for the current run. Losing the persistence opportunity must
-        # not invalidate an otherwise proven session-local result.
+        # Persistence remains an optimization/evidence store. Failure to write
+        # cannot weaken or change the already proven session-local constraint.
         warnings.warn(str(exc), RuntimeWarning, stacklevel=2)
         return False
+

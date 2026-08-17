@@ -432,7 +432,7 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
         self.assertTrue(any("HARD_TIMEOUT" in message for message in messages))
 
     def test_exact_resolver_proof_cache_hit_skips_uncached_verifier(self) -> None:
-        from verification_proof import VerificationProofStore, build_verification_proof_identity
+        from verification_proof import VerificationProofStore, bind_resolved_state_identity, build_verification_proof_identity
         from resolved_dependency_state import capture_resolved_dependency_state, resolved_state_metadata
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -467,6 +467,12 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 observed_resolved_hash=observed_hash,
                 proof_cache_dir=cache,
             )
+            identity = bind_resolved_state_identity(
+                identity,
+                state.key,
+                project_checks='off',
+                commands=(),
+            )
             VerificationProofStore(cache).publish_pass(
                 "resolver", identity.resolver_input_key, identity,
                 metadata={
@@ -490,7 +496,7 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
             uncached.assert_not_called()
 
     def test_resolver_cache_hit_marks_combined_verification_for_resolver_skip(self) -> None:
-        from verification_proof import VerificationProofStore, build_verification_proof_identity
+        from verification_proof import VerificationProofStore, bind_resolved_state_identity, build_verification_proof_identity
         from resolved_dependency_state import capture_resolved_dependency_state, resolved_state_metadata
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -533,6 +539,12 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 observed_resolved_hash=observed_hash,
                 proof_cache_dir=cache,
             )
+            identity = bind_resolved_state_identity(
+                identity,
+                state.key,
+                project_checks='adaptive',
+                commands=('npm run typecheck',),
+            )
             VerificationProofStore(cache).publish_pass(
                 "resolver", identity.resolver_input_key, identity,
                 metadata={
@@ -559,7 +571,7 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
             self.assertEqual(identity.resolver_input_key, captured["reuse"])
 
     def test_resolver_cache_hit_emits_bound_resolved_state_once(self) -> None:
-        from verification_proof import VerificationProofStore, build_verification_proof_identity
+        from verification_proof import VerificationProofStore, bind_resolved_state_identity, build_verification_proof_identity
         from resolved_dependency_state import capture_resolved_dependency_state, resolved_state_metadata
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -598,6 +610,12 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 resolver_input_key=identity.resolver_input_key,
                 observed_resolved_hash=observed_hash,
                 proof_cache_dir=cache,
+            )
+            identity = bind_resolved_state_identity(
+                identity,
+                state.key,
+                project_checks='off',
+                commands=(),
             )
             VerificationProofStore(cache).publish_pass(
                 "resolver", identity.resolver_input_key, identity,

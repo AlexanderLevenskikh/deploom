@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from proven_dependency_state import (
+    RESOLVER_PROOF_STATUS_NOT_REQUIRED_NO_OP,
     build_proven_dependency_envelope,
     proof_envelope_key,
     validate_proven_dependency_envelope,
@@ -123,6 +124,45 @@ class ProvenDependencyStateTests(unittest.TestCase):
                     require_git=True,
                 )
 
+
+    def test_true_noop_round_trips_through_same_status_model(self):
+        envelope = build_proven_dependency_envelope(
+            project="Demo",
+            mode="default",
+            proof_schema="baseline-proof-v5-resolved-state",
+            source_head="abc123",
+            source_snapshot_key="source-key",
+            assignment_key="assignment-key",
+            resolver_input_key="resolver-key",
+            preparation_proof_key="preparation-key",
+            project_proof_key="project-key",
+            observed_resolved_hash="",
+            resolved_state_key="",
+            resolved_lockfile_path="",
+            resolved_lockfile_hash="",
+            assignment={},
+            removals=(),
+            verification_commands=(),
+            project_checks="off",
+            resolver_proof_status=RESOLVER_PROOF_STATUS_NOT_REQUIRED_NO_OP,
+            preparation_proof_status="not-required",
+            project_proof_status="not-required",
+        )
+        valid, reason = validate_proven_dependency_envelope(envelope)
+        self.assertTrue(valid, reason)
+
+    def test_builder_rejects_legacy_or_unknown_status_before_artifact_exists(self):
+        with self.assertRaisesRegex(ValueError, "resolver proof status invalid"):
+            build_proven_dependency_envelope(
+                project="Demo", mode="default", proof_schema="p", source_head="h",
+                source_snapshot_key="s", assignment_key="a", resolver_input_key="r",
+                preparation_proof_key="prep", project_proof_key="project",
+                observed_resolved_hash="", resolved_state_key="",
+                resolved_lockfile_path="", resolved_lockfile_hash="",
+                assignment={}, removals=(), verification_commands=(), project_checks="off",
+                resolver_proof_status="not-required-no-fixed-inputs",
+                preparation_proof_status="not-required", project_proof_status="not-required",
+            )
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ from urllib.parse import unquote, urlparse
 from semantic_version import NpmSpec
 
 PROOF_SCHEMA_VERSION = "baseline-proof-v5-resolved-state"
+RESOLVER_CONTEXT_SCHEMA_VERSION = "resolver-context-v1-canonical"
+TRIAL_PROOF_KEY_SCHEMA_VERSION = "trial-proof-key-v1"
 
 _RESOLVER_FILES = (
     "package.json",
@@ -501,6 +503,203 @@ def _node_identity(environment: Mapping[str, str]) -> str:
     return _canonical_hash({"node": "missing"})
 
 
+
+def _require_hex_authority_key(value: str, name: str, *, length: int = 64) -> str:
+    normalized = str(value or "").lower()
+    if len(normalized) != length or any(ch not in "0123456789abcdef" for ch in normalized):
+        raise ValueError(f"{name}_INVALID")
+    return normalized
+
+
+def _resolver_context_payload(
+    project_dir: Path,
+    *,
+    manager: str,
+    manager_executable: str,
+    registry: str,
+    environment: Mapping[str, str],
+) -> dict[str, object]:
+    """Canonical effective package-manager context shared by every authority path.
+
+    Assignment/removals deliberately do not live here. Persistent nogoods bind
+    to this context; individual resolver proofs then add their exact assignment.
+    Keeping one builder prevents a weaker durable-cache identity from drifting
+    away from the real package-manager proof identity again.
+    """
+    project_dir = project_dir.resolve()
+    environment_key = environment_snapshot_fingerprint(environment)
+    return {
+        "schema": PROOF_SCHEMA_VERSION,
+        "projectResolverFiles": _resolver_ancestor_files(project_dir),
+        "userConfigFiles": _user_config_files(environment),
+        "effectiveYarnConfig": _effective_yarn_config_identity(
+            project_dir, environment, manager
+        ),
+        "fixedResolverInputsKey": fixed_resolver_input_fingerprint(project_dir),
+        "environmentKey": environment_key,
+        "registry": str(registry or "").rstrip("/"),
+        "platform": platform.system().lower(),
+        "machine": platform.machine().lower(),
+        "manager": str(manager).lower(),
+        "managerIdentity": _version_identity(manager_executable, environment),
+        "nodeIdentity": _node_identity(environment),
+        "resolverPolicy": "real-package-manager:scripts-off",
+    }
+
+
+def build_resolver_context_key(
+    project_dir: Path,
+    *,
+    manager: str,
+    manager_executable: str,
+    registry: str,
+    environment: Mapping[str, str],
+) -> str:
+    payload = _resolver_context_payload(
+        project_dir,
+        manager=manager,
+        manager_executable=manager_executable,
+        registry=registry,
+        environment=environment,
+    )
+    return _canonical_hash(
+        {
+            "schema": RESOLVER_CONTEXT_SCHEMA_VERSION,
+            "resolverContext": payload,
+        },
+        length=64,
+    )
+
+
+def build_resolver_trial_key(
+    *,
+    resolver_context_key: str,
+    assignment: Mapping[str, str],
+    remove_packages: Sequence[str],
+) -> str:
+    context_key = _require_hex_authority_key(
+        resolver_context_key, "RESOLVER_CONTEXT_KEY"
+    )
+    return _canonical_hash(
+        {
+            "schema": TRIAL_PROOF_KEY_SCHEMA_VERSION,
+            "kind": "resolver-trial",
+            "resolverContextKey": context_key,
+            "assignment": sorted((str(k), str(v)) for k, v in assignment.items()),
+            "removals": sorted(str(item) for item in remove_packages),
+        },
+        length=64,
+    )
+
+
+def build_project_trial_key(
+    *,
+    resolver_trial_key: str,
+    resolved_state_key: str,
+    source_snapshot_key: str,
+    project_checks: str,
+    commands: Sequence[str],
+    predicate_identity: str = "",
+) -> str:
+    resolver_key = _require_hex_authority_key(
+        resolver_trial_key, "RESOLVER_TRIAL_KEY"
+    )
+    state_key = _require_hex_authority_key(
+        resolved_state_key, "RESOLVED_STATE_KEY"
+    )
+    if not str(source_snapshot_key or ""):
+        raise ValueError("SOURCE_SNAPSHOT_KEY_INVALID")
+    return _canonical_hash(
+        {
+            "schema": TRIAL_PROOF_KEY_SCHEMA_VERSION,
+            "kind": "project-trial",
+            "resolverTrialKey": resolver_key,
+            "resolvedStateKey": state_key,
+            "sourceSnapshotKey": str(source_snapshot_key),
+            "projectChecks": str(project_checks),
+            "commands": [str(item) for item in commands],
+            "predicateIdentity": str(predicate_identity or ""),
+            "proofPolicy": "fresh-project-observation-v1",
+        },
+        length=64,
+    )
+
+
+def _valid_hex_identity(value: object, *, lengths: tuple[int, ...] = (32, 64)) -> bool:
+    text = str(value or "").lower()
+    return len(text) in lengths and all(ch in "0123456789abcdef" for ch in text)
+
+
+def _proof_record_identity_valid(
+    proof_type: str,
+    key: str,
+    identity: Mapping[str, str],
+) -> bool:
+    if identity.get("proofSchema") != PROOF_SCHEMA_VERSION:
+        return False
+    key_field = {
+        "resolver": "resolverInputKey",
+        "preparation": "preparationProofKey",
+        "project": "projectProofKey",
+    }.get(proof_type)
+    if key_field is None or identity.get(key_field) != key:
+        return False
+    for field in (
+        "assignmentKey",
+        "environmentKey",
+        "sourceSnapshotKey",
+        "resolverInputKey",
+        "preparationProofKey",
+        "projectProofKey",
+        "localizationExperimentKey",
+    ):
+        if not _valid_hex_identity(identity.get(field), lengths=(32,)):
+            return False
+    if not _valid_hex_identity(identity.get("resolvedStateKey"), lengths=(64,)):
+        return False
+    return True
+
+
+def _proof_record_metadata_valid(
+    metadata: Mapping[str, object],
+    identity: Mapping[str, str],
+) -> bool:
+    observed = metadata.get("observedResolvedVersions")
+    observed_hash = metadata.get("observedResolvedHash")
+    resolved_state_key = metadata.get("resolvedStateKey")
+    resolved_resolver_key = metadata.get("resolvedStateResolverInputKey")
+    resolved_manager = metadata.get("resolvedPackageManager")
+    resolved_lock_path = metadata.get("resolvedLockfilePath")
+    resolved_lock_hash = metadata.get("resolvedLockfileHash")
+    resolved_artifact = metadata.get("resolvedStateArtifact")
+    resolved_observed_hash = metadata.get("resolvedStateObservedHash")
+    return bool(
+        isinstance(observed, dict)
+        and all(
+            isinstance(name, str) and isinstance(version, str)
+            for name, version in observed.items()
+        )
+        and isinstance(observed_hash, str)
+        and len(observed_hash) == 64
+        and _canonical_hash(dict(sorted(observed.items())), length=64) == observed_hash
+        and isinstance(resolved_state_key, str)
+        and resolved_state_key == identity.get("resolvedStateKey")
+        and _valid_hex_identity(resolved_state_key, lengths=(64,))
+        and isinstance(resolved_resolver_key, str)
+        and resolved_resolver_key == identity.get("resolverInputKey")
+        and isinstance(resolved_manager, str)
+        and bool(resolved_manager)
+        and isinstance(resolved_lock_path, str)
+        and bool(resolved_lock_path)
+        and isinstance(resolved_lock_hash, str)
+        and _valid_hex_identity(resolved_lock_hash, lengths=(64,))
+        and isinstance(resolved_artifact, str)
+        and bool(resolved_artifact)
+        and isinstance(resolved_observed_hash, str)
+        and resolved_observed_hash == observed_hash
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class VerificationProofIdentity:
     schema_version: str
@@ -540,29 +739,26 @@ def build_verification_proof_identity(
     environment: Mapping[str, str],
 ) -> VerificationProofIdentity:
     project_dir = project_dir.resolve()
-    environment_key = environment_snapshot_fingerprint(environment)
     source_key = source_snapshot_fingerprint(project_dir)
-    fixed_resolver_inputs_key = fixed_resolver_input_fingerprint(project_dir)
     assignment_key = _canonical_hash({
         "assignment": sorted((str(k), str(v)) for k, v in assignment.items()),
         "removals": sorted(str(item) for item in remove_packages),
     })
 
+    # IMPORTANT: persistent learned constraints and resolver proofs share this
+    # exact effective package-manager context builder. The assignment is added
+    # only at the resolver-proof layer below.
+    resolver_context = _resolver_context_payload(
+        project_dir,
+        manager=manager,
+        manager_executable=manager_executable,
+        registry=registry,
+        environment=environment,
+    )
+    environment_key = str(resolver_context["environmentKey"])
     resolver_inputs = {
-        "schema": PROOF_SCHEMA_VERSION,
-        "projectResolverFiles": _resolver_ancestor_files(project_dir),
-        "userConfigFiles": _user_config_files(environment),
-        "effectiveYarnConfig": _effective_yarn_config_identity(project_dir, environment, manager),
-        "fixedResolverInputsKey": fixed_resolver_inputs_key,
+        **resolver_context,
         "assignmentKey": assignment_key,
-        "environmentKey": environment_key,
-        "registry": str(registry or "").rstrip("/"),
-        "platform": platform.system().lower(),
-        "machine": platform.machine().lower(),
-        "manager": manager,
-        "managerIdentity": _version_identity(manager_executable, environment),
-        "nodeIdentity": _node_identity(environment),
-        "resolverPolicy": "real-package-manager:scripts-off",
     }
     resolver_key = _canonical_hash(resolver_inputs)
 
@@ -596,7 +792,6 @@ def build_verification_proof_identity(
         project_proof_key=project_key,
         localization_experiment_key=localization_key,
     )
-
 
 
 
@@ -689,48 +884,15 @@ class VerificationProofStore:
             isinstance(k, str) and isinstance(v, str) for k, v in identity.items()
         ):
             return None
+        if not _proof_record_identity_valid(proof_type, key, identity):
+            return None
         metadata = payload.get("metadata")
         if metadata is None:
             metadata = {}
         if not isinstance(metadata, dict):
             return None
-        if proof_type == "resolver":
-            observed = metadata.get("observedResolvedVersions")
-            observed_hash = metadata.get("observedResolvedHash")
-            resolved_state_key = metadata.get("resolvedStateKey")
-            resolved_resolver_key = metadata.get("resolvedStateResolverInputKey")
-            resolved_manager = metadata.get("resolvedPackageManager")
-            resolved_lock_path = metadata.get("resolvedLockfilePath")
-            resolved_lock_hash = metadata.get("resolvedLockfileHash")
-            resolved_artifact = metadata.get("resolvedStateArtifact")
-            resolved_observed_hash = metadata.get("resolvedStateObservedHash")
-            if (
-                not isinstance(observed, dict)
-                or not all(
-                    isinstance(name, str) and isinstance(version, str)
-                    for name, version in observed.items()
-                )
-                or not isinstance(observed_hash, str)
-                or len(observed_hash) != 64
-                or _canonical_hash(
-                    dict(sorted(observed.items())), length=64
-                ) != observed_hash
-                or not isinstance(resolved_state_key, str)
-                or len(resolved_state_key) != 64
-                or not isinstance(resolved_resolver_key, str)
-                or resolved_resolver_key != key
-                or not isinstance(resolved_manager, str)
-                or not resolved_manager
-                or not isinstance(resolved_lock_path, str)
-                or not resolved_lock_path
-                or not isinstance(resolved_lock_hash, str)
-                or len(resolved_lock_hash) != 64
-                or not isinstance(resolved_artifact, str)
-                or not resolved_artifact
-                or not isinstance(resolved_observed_hash, str)
-                or resolved_observed_hash != observed_hash
-            ):
-                return None
+        if not _proof_record_metadata_valid(metadata, identity):
+            return None
         return CachedProofRecord(
             proof_type=proof_type,
             key=key,
@@ -750,6 +912,12 @@ class VerificationProofStore:
         path = self._path(proof_type, key)
         if path is None:
             return False
+        identity_fields = identity.event_fields()
+        effective_metadata = dict(metadata or {})
+        if not _proof_record_identity_valid(proof_type, key, identity_fields):
+            return False
+        if not _proof_record_metadata_valid(effective_metadata, identity_fields):
+            return False
         payload = {
             "schemaVersion": 1,
             "proofSchema": PROOF_SCHEMA_VERSION,
@@ -757,8 +925,8 @@ class VerificationProofStore:
             "key": key,
             "outcome": "passed",
             "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "identity": identity.event_fields(),
-            "metadata": dict(metadata or {}),
+            "identity": identity_fields,
+            "metadata": effective_metadata,
         }
         temp: Path | None = None
         try:

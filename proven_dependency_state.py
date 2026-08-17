@@ -9,6 +9,14 @@ from typing import Any, Mapping, Sequence
 
 PROVEN_DEPENDENCY_STATE_SCHEMA_VERSION = 1
 PROVEN_DEPENDENCY_ENVELOPE_SCHEMA_VERSION = 3
+RESOLVER_PROOF_STATUS_PASSED = "passed"
+RESOLVER_PROOF_STATUS_NOT_REQUIRED_NO_OP = "not-required-no-op"
+RESOLVER_PROOF_STATUSES = frozenset({
+    RESOLVER_PROOF_STATUS_PASSED,
+    RESOLVER_PROOF_STATUS_NOT_REQUIRED_NO_OP,
+})
+PREPARATION_PROOF_STATUSES = frozenset({"passed", "not-required", "missing"})
+PROJECT_PROOF_STATUSES = frozenset({"passed", "not-required", "diagnostic-red", "missing"})
 
 
 def _canonical_json(value: Any) -> str:
@@ -54,6 +62,16 @@ def build_proven_dependency_envelope(
     preparation_proof_status: str,
     project_proof_status: str,
 ) -> dict[str, Any]:
+    resolver_status = str(resolver_proof_status)
+    preparation_status = str(preparation_proof_status)
+    project_status = str(project_proof_status)
+    if resolver_status not in RESOLVER_PROOF_STATUSES:
+        raise ValueError(f"resolver proof status invalid: {resolver_status or 'missing'}")
+    if preparation_status not in PREPARATION_PROOF_STATUSES:
+        raise ValueError(f"preparation proof status invalid: {preparation_status or 'missing'}")
+    if project_status not in PROJECT_PROOF_STATUSES:
+        raise ValueError(f"project proof status invalid: {project_status or 'missing'}")
+
     payload: dict[str, Any] = {
         "schemaVersion": PROVEN_DEPENDENCY_ENVELOPE_SCHEMA_VERSION,
         "proofSchema": str(proof_schema),
@@ -76,9 +94,9 @@ def build_proven_dependency_envelope(
         "removals": sorted({str(name) for name in removals}),
         "verificationCommands": [str(command) for command in verification_commands],
         "projectChecks": str(project_checks),
-        "resolverProofStatus": str(resolver_proof_status),
-        "preparationProofStatus": str(preparation_proof_status),
-        "projectProofStatus": str(project_proof_status),
+        "resolverProofStatus": resolver_status,
+        "preparationProofStatus": preparation_status,
+        "projectProofStatus": project_status,
     }
     return {**payload, "envelopeKey": proof_envelope_key(payload)}
 
@@ -111,13 +129,13 @@ def validate_proven_dependency_envelope(
     if any(name not in assignment for name in removals):
         return False, "removal is not part of exactDirectAssignment"
     resolver_status = str(envelope.get("resolverProofStatus") or "")
-    if resolver_status not in {"passed", "not-required-no-op"}:
+    if resolver_status not in RESOLVER_PROOF_STATUSES:
         return False, f"resolver proof status invalid: {resolver_status or 'missing'}"
     observed_hash = str(envelope.get("observedResolvedHash") or "")
     resolved_state_key = str(envelope.get("resolvedStateKey") or "")
     resolved_lockfile_path = str(envelope.get("resolvedLockfilePath") or "")
     resolved_lockfile_hash = str(envelope.get("resolvedLockfileHash") or "")
-    if resolver_status == "passed":
+    if resolver_status == RESOLVER_PROOF_STATUS_PASSED:
         if len(observed_hash) != 64 or any(
             ch not in "0123456789abcdef" for ch in observed_hash.lower()
         ):
@@ -134,6 +152,16 @@ def validate_proven_dependency_envelope(
             return False, "resolvedLockfileHash missing or invalid for resolver PASS"
     elif observed_hash or resolved_state_key or resolved_lockfile_path or resolved_lockfile_hash:
         return False, "no-op envelope must not claim a resolved package-manager state"
+
+    preparation_status = str(envelope.get("preparationProofStatus") or "")
+    if preparation_status not in PREPARATION_PROOF_STATUSES:
+        return False, f"preparation proof status invalid: {preparation_status or 'missing'}"
+    project_status = str(envelope.get("projectProofStatus") or "")
+    if project_status not in PROJECT_PROOF_STATUSES:
+        return False, f"project proof status invalid: {project_status or 'missing'}"
+    if resolver_status == RESOLVER_PROOF_STATUS_NOT_REQUIRED_NO_OP:
+        if preparation_status != "not-required" or project_status != "not-required":
+            return False, "no-op envelope must not claim preparation/project proof work"
     return True, "proof envelope valid"
 
 
