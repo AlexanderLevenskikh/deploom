@@ -63,7 +63,7 @@ class PreparedWorkspaceFastPathTests(unittest.TestCase):
             cleanup_guarded_clone(target)
             self.assertFalse(guarded_clone_is_active(target))
 
-    def test_ephemeral_vite_cache_does_not_count_as_dependency_mutation(self) -> None:
+    def test_ephemeral_local_caches_do_not_count_as_dependency_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "source"
@@ -77,9 +77,10 @@ class PreparedWorkspaceFastPathTests(unittest.TestCase):
             subprocess.run(["git", "add", "."], cwd=source, check=True)
             subprocess.run(["git", "commit", "-m", "fixture"], cwd=source, check=True, stdout=subprocess.DEVNULL)
             subprocess.run(["git", "clone", "--quiet", str(source), str(prepared)], check=True)
-            cache = prepared / "node_modules" / ".vite"
-            cache.mkdir(parents=True)
-            (cache / "seed").write_text("seed\n", encoding="utf-8")
+            for cache_name in (".vite", ".cache"):
+                cache = prepared / "node_modules" / cache_name
+                cache.mkdir(parents=True)
+                (cache / "seed").write_text("seed\n", encoding="utf-8")
 
             project = try_materialize_guarded_clone(
                 source_project=source,
@@ -89,7 +90,8 @@ class PreparedWorkspaceFastPathTests(unittest.TestCase):
             )
             self.assertIsNotNone(project)
             assert project is not None
-            (project / "node_modules" / ".vite" / "generated").write_text("cache\n", encoding="utf-8")
+            for cache_name in (".vite", ".cache"):
+                (project / "node_modules" / cache_name / "generated").write_text("cache\n", encoding="utf-8")
             time.sleep(0.25)
             result = stop_guarded_clone(target)
             self.assertFalse(result.errors, result.errors)

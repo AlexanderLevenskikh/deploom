@@ -343,17 +343,30 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
             structural_project_failure_signatures(result),
         )
 
-    def test_ephemeral_vite_vitest_caches_are_cleaned_deterministically(self) -> None:
+    def test_ephemeral_verification_caches_are_cleaned_deterministically(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for relative in ("node_modules/.vite", "src/node_modules/.vitest"):
+            for relative in (
+                "node_modules/.vite",
+                "node_modules/.cache",
+                "src/node_modules/.vitest",
+                "src/node_modules/.cache",
+            ):
                 target = root / relative
                 target.mkdir(parents=True, exist_ok=True)
                 (target / "cache.json").write_text("{}", encoding="utf-8")
             removed = clean_ephemeral_verification_caches(root)
-            self.assertEqual(("node_modules/.vite", "src/node_modules/.vitest"), removed)
-            self.assertFalse((root / "node_modules/.vite").exists())
-            self.assertFalse((root / "src/node_modules/.vitest").exists())
+            self.assertEqual(
+                (
+                    "node_modules/.vite",
+                    "node_modules/.cache",
+                    "src/node_modules/.vitest",
+                    "src/node_modules/.cache",
+                ),
+                removed,
+            )
+            for relative in removed:
+                self.assertFalse((root / relative).exists())
     def test_run_uses_sealed_base_environment_snapshot(self) -> None:
         captured = {}
 

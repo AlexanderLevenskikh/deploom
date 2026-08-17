@@ -212,8 +212,10 @@ SASS_COMPILER_API_FAILURE = re.compile(
 EPHEMERAL_VERIFICATION_CACHE_PATHS = (
     "node_modules/.vite",
     "node_modules/.vitest",
+    "node_modules/.cache",
     "src/node_modules/.vite",
     "src/node_modules/.vitest",
+    "src/node_modules/.cache",
 )
 
 ProgressCallback = Callable[[str], None]
@@ -1647,7 +1649,7 @@ def verify_assignment(
                             workspace=str(command_project),
                         )
 
-                    # Allowed .vite/.vitest writes are cache-only. Remove them
+                    # Allowed root cache writes are cache-only. Remove them
                     # from the sealed dependency base before any later check.
                     prepared_project = snapshot.workspace_root / snapshot.project_relative
                     normalized_shared = clean_ephemeral_verification_caches(prepared_project)

@@ -19,6 +19,13 @@ class FastPathNotificationSemanticsRegressionTests(unittest.TestCase):
         self.assertIn("_notification_is_authoritative_mutation(", source)
         self.assertIn("FILE_ACTION_MODIFIED", source)
 
+    def test_only_root_verification_caches_are_ephemeral(self) -> None:
+        self.assertTrue(fastpath._is_ephemeral_change(".vite/deps/chunk.js"))
+        self.assertTrue(fastpath._is_ephemeral_change(".vitest/results.json"))
+        self.assertTrue(fastpath._is_ephemeral_change(".cache/eslint/result"))
+        self.assertFalse(fastpath._is_ephemeral_change("package/.cache/result"))
+        self.assertFalse(fastpath._is_ephemeral_change("package/.vite/chunk.js"))
+
     def test_directory_modified_is_non_authoritative_but_missing_path_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -243,7 +243,7 @@ def _populate_node_modules_shell(
 
 def _is_ephemeral_change(relative: str) -> bool:
     parts = [part.lower() for part in relative.replace("\\", "/").split("/") if part]
-    return ".vite" in parts or ".vitest" in parts
+    return bool(parts) and parts[0] in {".vite", ".vitest", ".cache"}
 
 
 class _DirectoryWatcher:
