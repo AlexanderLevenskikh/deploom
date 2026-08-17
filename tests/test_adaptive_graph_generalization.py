@@ -537,7 +537,7 @@ class AdaptiveGraphGeneralizationTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 class BaselineLivenessBudgetTests(unittest.TestCase):
-    def test_exact_exclusions_do_not_extend_but_fresh_learning_does(self) -> None:
+    def test_authoritative_exact_exclusions_and_fresh_learning_share_extension_budget(self) -> None:
         budget = roadmap.BaselineLivenessBudget(
             base_iterations=8,
             max_learning_extensions=8,
@@ -546,13 +546,20 @@ class BaselineLivenessBudgetTests(unittest.TestCase):
         self.assertEqual(8, budget.allowed_iterations)
         self.assertEqual(16, budget.hard_iterations)
 
-        budget.record_exact_exclusion()
-        self.assertEqual(8, budget.allowed_iterations)
+        # A freshly confirmed exact tuple exclusion strengthens the authoritative
+        # formula just like a learned generalized clause, so it must buy the
+        # follow-up solve that can actually consume that new fact.
+        self.assertTrue(budget.record_exact_exclusion())
+        self.assertEqual(9, budget.allowed_iterations)
+        self.assertEqual(1, budget.exact_extension_credits)
+        self.assertEqual(1, budget.certified_extensions)
         self.assertEqual(1, budget.exact_since_learning)
 
+        # Fresh generalized authority uses the same bounded extension pool.
         budget.observe_learned_constraints(4)
-        self.assertEqual(9, budget.allowed_iterations)
-        self.assertEqual(1, budget.certified_extensions)
+        self.assertEqual(10, budget.allowed_iterations)
+        self.assertEqual(2, budget.certified_extensions)
+        self.assertEqual(1, budget.learned_extensions)
         self.assertEqual(0, budget.exact_since_learning)
 
     def test_learning_extensions_are_hard_capped_and_snapshot_is_complete(self) -> None:
@@ -677,13 +684,16 @@ class ProofPreservingNogoodMinimizationTests(unittest.TestCase):
             source.index("learned[project][mode].append(nogood)"),
         )
 
-    def test_convergence_has_semantic_plateau_and_hard_stop_codes(self) -> None:
+    def test_convergence_has_typed_plateau_and_hard_safety_terminal_codes(self) -> None:
         source = inspect.getsource(
             roadmap.resolve_peer_compatibility_with_verification
         )
         self.assertIn("BASELINE_VERIFICATION_PLATEAU", source)
-        self.assertIn("BASELINE_VERIFICATION_HARD_BUDGET_EXHAUSTED", source)
+        self.assertIn("BASELINE_VERIFICATION_HARD_SAFETY_LIMIT", source)
+        self.assertIn("BaselineTerminalStatus.PLATEAU", source)
+        self.assertIn("BaselineTerminalStatus.HARD_SAFETY_LIMIT", source)
         self.assertIn("BASELINE_SOLVER_REPEATED_FAILED_ASSIGNMENT", source)
+        self.assertNotIn("BASELINE_VERIFICATION_HARD_BUDGET_EXHAUSTED", source)
 class CrossIterationConflictHistoryTests(unittest.TestCase):
     def _proposal(
         self,

@@ -63,7 +63,11 @@ def merge_nogood_edges(graph: Dict[str, set[str]], nogoods: Iterable[Mapping[str
 
 
 class GlobalExactExclusionError(RuntimeError):
-    """Global exact-assignment exclusions could not be satisfied exactly."""
+    """Global exact-assignment coordination stopped with a typed proof reason."""
+
+    def __init__(self, message: str, *, reason: str = "solver-unknown") -> None:
+        super().__init__(message)
+        self.reason = str(reason or "solver-unknown")
 
 
 @dataclass(frozen=True)
@@ -166,7 +170,8 @@ def coordinate_global_exact_exclusions(
                 for item in alternatives[component_index]
             ):
                 raise GlobalExactExclusionError(
-                    f"component {component_index} repeated an already ranked assignment"
+                    f"component {component_index} repeated an already ranked assignment",
+                    reason="solver-unknown",
                 )
             alternatives[component_index].append(candidate)
             emit(
@@ -210,7 +215,8 @@ def coordinate_global_exact_exclusions(
         explored += 1
         if explored > max(1, int(max_states)):
             raise GlobalExactExclusionError(
-                f"global exact exclusion coordinator exceeded {max_states} states"
+                f"global exact exclusion coordinator exceeded {max_states} states",
+                reason="budget-exhausted",
             )
 
         assignment = compose(state)
@@ -252,7 +258,8 @@ def coordinate_global_exact_exclusions(
             queued.add(frozen_state)
 
     raise GlobalExactExclusionError(
-        "all ranked component combinations were exhausted by global exact exclusions"
+        "all ranked component combinations were exhausted by global exact exclusions",
+        reason="unsat-proven",
     )
 def _partitions(items: Sequence[VerificationUnit], count: int) -> List[List[VerificationUnit]]:
     count = max(1, min(count, len(items)))

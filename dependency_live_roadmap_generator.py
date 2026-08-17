@@ -61,6 +61,7 @@ import tarfile
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from enum import Enum
 from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -6841,9 +6842,19 @@ def _coordinate_solver_global_exclusions(
             )
         if status == "unsat":
             return None
+        reason = (
+            "solver-unavailable"
+            if status == "unavailable"
+            else (
+                "budget-exhausted"
+                if status == "unknown_refinement_budget"
+                else "solver-unknown"
+            )
+        )
         raise GlobalExactExclusionError(
             f"component {component_index} alternative solve returned {status or 'error'}: "
-            f"{str(report.get('detail') or '')[:240]}"
+            f"{str(report.get('detail') or '')[:240]}",
+            reason=reason,
         )
 
     def coordinator_progress(event: str, details: Mapping[str, object]) -> None:
@@ -7030,20 +7041,50 @@ def resolve_peer_compatibility(
                             f"refinements={exact_report.get('refinements', 0)}, "
                             f"elapsedMs={exact_report.get('elapsedMs', 0)}"
                         )
-                    elif exact_status in {"unknown", "unknown_refinement_budget", "sat_unproven", "unsat"}:
-                        raise BaselineConstraintVerificationError(
-                            f"EXACT_SOLVER_PROOF_REQUIRED: {project}/{mode}: "
-                            f"component={','.join(component)} status={exact_status}; "
-                            f"detail={str(exact_report.get('detail') or '')[:500]}. "
-                            "Missing/unfinished exact proof is not a dependency decision and cannot be "
-                            "silently converted to the current tuple."
+                    elif exact_status == "unsat":
+                        raise _baseline_terminal_error(
+                            BaselineTerminalStatus.UNSAT_PROVEN,
+                            "EXACT_SOLVER_UNSAT_PROVEN",
+                            f"{project}/{mode}: component={','.join(component)}; "
+                            f"detail={str(exact_report.get('detail') or '')[:500]}; "
+                            "the authoritative finite-domain component has no satisfying assignment",
+                            source="z3",
+                        )
+                    elif exact_status == "unknown_refinement_budget":
+                        raise _baseline_terminal_error(
+                            BaselineTerminalStatus.BUDGET_EXHAUSTED,
+                            "EXACT_SOLVER_BUDGET_EXHAUSTED",
+                            f"{project}/{mode}: component={','.join(component)}; "
+                            f"detail={str(exact_report.get('detail') or '')[:500]}; "
+                            "exact refinement budget ended without a proof",
+                            source="z3",
+                        )
+                    elif exact_status in {"unknown", "sat_unproven"}:
+                        raise _baseline_terminal_error(
+                            BaselineTerminalStatus.SOLVER_UNKNOWN,
+                            "EXACT_SOLVER_UNKNOWN",
+                            f"{project}/{mode}: component={','.join(component)} status={exact_status}; "
+                            f"detail={str(exact_report.get('detail') or '')[:500]}; "
+                            "unfinished exact proof is not a dependency decision",
+                            source="z3",
+                        )
+                    elif exact_status == "unavailable":
+                        raise _baseline_terminal_error(
+                            BaselineTerminalStatus.SOLVER_UNAVAILABLE,
+                            "EXACT_SOLVER_UNAVAILABLE",
+                            f"{project}/{mode}: component={','.join(component)}; "
+                            f"detail={str(exact_report.get('detail') or '')[:500]}; "
+                            "no heuristic fallback was used",
+                            source="z3",
                         )
                     else:
-                        raise BaselineConstraintVerificationError(
-                            f"EXACT_SOLVER_{exact_status.upper() or 'ERROR'}: {project}/{mode}: "
-                            f"Z3 backend is unavailable or invalid for component {','.join(component)}; "
-                            f"detail={str(exact_report.get('detail') or '')[:500]}. "
-                            "No heuristic fallback was used."
+                        raise _baseline_terminal_error(
+                            _terminal_status_for_exact_solver(exact_status),
+                            "EXACT_SOLVER_ERROR",
+                            f"{project}/{mode}: component={','.join(component)} status={exact_status or 'error'}; "
+                            f"detail={str(exact_report.get('detail') or '')[:500]}; "
+                            "no heuristic fallback was used",
+                            source="z3",
                         )
                     mode_exact_reports.append(dict(exact_report))
 
@@ -7156,9 +7197,17 @@ def resolve_peer_compatibility(
                         residual_targets,
                     )
                 except GlobalExactExclusionError as exc:
-                    raise BaselineConstraintVerificationError(
-                        f"GLOBAL_EXACT_EXCLUSION_COORDINATOR_FAILED: "
-                        f"{project}/{mode}: {exc}"
+                    terminal_status = _terminal_status_for_global_exact_reason(exc.reason)
+                    stop_code = {
+                        BaselineTerminalStatus.UNSAT_PROVEN: "GLOBAL_EXACT_EXCLUSION_UNSAT_PROVEN",
+                        BaselineTerminalStatus.BUDGET_EXHAUSTED: "GLOBAL_EXACT_EXCLUSION_BUDGET_EXHAUSTED",
+                        BaselineTerminalStatus.SOLVER_UNAVAILABLE: "GLOBAL_EXACT_EXCLUSION_SOLVER_UNAVAILABLE",
+                    }.get(terminal_status, "GLOBAL_EXACT_EXCLUSION_SOLVER_UNKNOWN")
+                    raise _baseline_terminal_error(
+                        terminal_status,
+                        stop_code,
+                        f"{project}/{mode}: {exc}",
+                        source="global-exact-coordinator",
                     ) from None
 
             if mode_exact_reports:
@@ -7322,8 +7371,75 @@ def resolve_peer_compatibility(
 
 
 
+class BaselineTerminalStatus(str, Enum):
+    SAT_PROVEN = "SAT_PROVEN"
+    UNSAT_PROVEN = "UNSAT_PROVEN"
+    SOLVER_UNKNOWN = "SOLVER_UNKNOWN"
+    SOLVER_UNAVAILABLE = "SOLVER_UNAVAILABLE"
+    BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
+    PLATEAU = "PLATEAU"
+    INFRASTRUCTURE_FAILURE = "INFRASTRUCTURE_FAILURE"
+    HARD_SAFETY_LIMIT = "HARD_SAFETY_LIMIT"
+
+
 class BaselineConstraintVerificationError(RuntimeError):
     """A pre-agent verification failure that must not be converted into replan."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        terminal_status: BaselineTerminalStatus | str | None = None,
+        terminal_source: str = "",
+        stop_code: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.terminal_status = (
+            terminal_status.value
+            if isinstance(terminal_status, BaselineTerminalStatus)
+            else str(terminal_status or "")
+        )
+        self.terminal_source = str(terminal_source or "")
+        self.stop_code = str(stop_code or "")
+
+
+def _baseline_terminal_error(
+    status: BaselineTerminalStatus,
+    stop_code: str,
+    message: str,
+    *,
+    source: str,
+) -> BaselineConstraintVerificationError:
+    return BaselineConstraintVerificationError(
+        f"{stop_code}: terminalStatus={status.value}; terminalSource={source}; {message}",
+        terminal_status=status,
+        terminal_source=source,
+        stop_code=stop_code,
+    )
+
+
+def _terminal_status_for_exact_solver(status: str) -> BaselineTerminalStatus:
+    normalized = str(status or "").strip().lower()
+    if normalized == "optimal":
+        return BaselineTerminalStatus.SAT_PROVEN
+    if normalized == "unsat":
+        return BaselineTerminalStatus.UNSAT_PROVEN
+    if normalized == "unknown_refinement_budget":
+        return BaselineTerminalStatus.BUDGET_EXHAUSTED
+    if normalized == "unavailable":
+        return BaselineTerminalStatus.SOLVER_UNAVAILABLE
+    return BaselineTerminalStatus.SOLVER_UNKNOWN
+
+
+def _terminal_status_for_global_exact_reason(reason: str) -> BaselineTerminalStatus:
+    normalized = str(reason or "").strip().lower()
+    if normalized == "unsat-proven":
+        return BaselineTerminalStatus.UNSAT_PROVEN
+    if normalized == "budget-exhausted":
+        return BaselineTerminalStatus.BUDGET_EXHAUSTED
+    if normalized == "solver-unavailable":
+        return BaselineTerminalStatus.SOLVER_UNAVAILABLE
+    return BaselineTerminalStatus.SOLVER_UNKNOWN
 
 
 def _changed_assignment(
@@ -8241,8 +8357,10 @@ def _normalize_baseline_progress_details(details: Mapping[str, object]) -> Dict[
 
 
 class BaselineLivenessBudget:
-    # Progress-aware soft budget with a bounded hard safety ceiling.
-    # Only newly learned authoritative solver constraints extend the budget.
+    # Progress-aware soft budget with an independent bounded hard safety ceiling.
+    # Every NEW authoritative formula strengthening may buy one more solve. This
+    # includes both generalized learned clauses and freshly confirmed full-tuple
+    # exact exclusions; diagnostic/navigation evidence never extends liveness.
 
     def __init__(
         self,
@@ -8252,10 +8370,14 @@ class BaselineLivenessBudget:
         starting_learned_constraints: int = 0,
     ) -> None:
         self.base_iterations = max(1, int(base_iterations))
+        # Historical public/config name kept for compatibility. Semantically this
+        # is now the total authority-extension budget shared by all clause kinds.
         self.max_learning_extensions = max(0, int(max_learning_extensions))
         self.starting_learned_constraints = max(0, int(starting_learned_constraints))
         self.learned_constraints = self.starting_learned_constraints
         self.certified_extensions = 0
+        self.learned_extensions = 0
+        self.exact_extension_credits = 0
         self.exact_exclusions = 0
         self.exact_since_learning = 0
         self.generalization_attempts = 0
@@ -8272,23 +8394,32 @@ class BaselineLivenessBudget:
             self.base_iterations + self.certified_extensions,
         )
 
+    def _grant_authority_extensions(self, count: int) -> int:
+        requested = max(0, int(count))
+        available = max(0, self.max_learning_extensions - self.certified_extensions)
+        granted = min(requested, available)
+        self.certified_extensions += granted
+        return granted
+
     def observe_learned_constraints(self, learned_constraints: int) -> None:
         current = max(self.starting_learned_constraints, int(learned_constraints))
         if current <= self.learned_constraints:
             return
+        delta = current - self.learned_constraints
         self.learned_constraints = current
-        self.certified_extensions = min(
-            self.max_learning_extensions,
-            max(0, current - self.starting_learned_constraints),
-        )
+        granted = self._grant_authority_extensions(delta)
+        self.learned_extensions += granted
         self.exact_since_learning = 0
 
     def record_certified_constraint(self) -> None:
         self.observe_learned_constraints(self.learned_constraints + 1)
 
-    def record_exact_exclusion(self) -> None:
+    def record_exact_exclusion(self) -> bool:
         self.exact_exclusions += 1
         self.exact_since_learning += 1
+        granted = self._grant_authority_extensions(1)
+        self.exact_extension_credits += granted
+        return bool(granted)
 
     def record_generalization_attempt(self) -> None:
         self.generalization_attempts += 1
@@ -8303,7 +8434,10 @@ class BaselineLivenessBudget:
             "allowedIterations": self.allowed_iterations,
             "hardIterations": self.hard_iterations,
             "learningExtensionLimit": self.max_learning_extensions,
+            "authorityExtensionLimit": self.max_learning_extensions,
             "certifiedExtensions": self.certified_extensions,
+            "learnedExtensions": self.learned_extensions,
+            "exactExtensionCredits": self.exact_extension_credits,
             "learnedConstraints": self.learned_constraints,
             "exactExclusions": self.exact_exclusions,
             "exactSinceLearning": self.exact_since_learning,
@@ -8326,7 +8460,10 @@ class BaselineProgressReporter:
                 self._terminal = False
             if self._terminal and ("check" in phase or "heartbeat" in phase or "running" in phase):
                 return
-            if phase in {"localization-timeout", "mode-passed", "mode-passed-no-changes", "budget-exhausted"}:
+            if phase in {
+                "localization-timeout", "mode-passed", "mode-passed-no-changes",
+                "budget-exhausted", "solver-terminal", "verification-terminal",
+            }:
                 self._terminal = True
             payload = {
                 "schemaVersion": 1,
@@ -8998,16 +9135,30 @@ def resolve_peer_compatibility_with_verification(
                     **liveness.snapshot(learned_constraints=len(learned[project][mode])),
                 )
                 solver_statuses: Dict[str, Dict[str, Dict[str, str]]] = {}
-                candidate_map = resolve_peer_compatibility(
-                    {project: rows}, client,
-                    modes=(mode,),
-                    learned_nogoods_by_project_mode=learned,
-                    global_exact_exclusions_by_project_mode=global_exact_exclusions,
-                    apply_results=False,
-                    solver_statuses_out=solver_statuses,
-                    shadow_solver_config_by_project={project: spec.constraint_verify_config},
-                    residual_targets_by_project=residual_targets_by_project,
-                )
+                try:
+                    candidate_map = resolve_peer_compatibility(
+                        {project: rows}, client,
+                        modes=(mode,),
+                        learned_nogoods_by_project_mode=learned,
+                        global_exact_exclusions_by_project_mode=global_exact_exclusions,
+                        apply_results=False,
+                        solver_statuses_out=solver_statuses,
+                        shadow_solver_config_by_project={project: spec.constraint_verify_config},
+                        residual_targets_by_project=residual_targets_by_project,
+                    )
+                except BaselineConstraintVerificationError as exc:
+                    if exc.terminal_status:
+                        progress_reporter.emit(
+                            project,
+                            mode,
+                            "solver-terminal",
+                            iteration=iteration,
+                            terminalStatus=exc.terminal_status,
+                            terminalSource=exc.terminal_source,
+                            stopCode=exc.stop_code,
+                            **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                        )
+                    raise
                 assignment = candidate_map[project][mode]
                 component_statuses = solver_statuses.get(project, {}).get(mode, {})
                 unknown_budget_names = sorted(
@@ -9054,14 +9205,18 @@ def resolve_peer_compatibility_with_verification(
                             progress_label=f"Baseline {mode} no-op fixed resolver {fingerprint}",
                         )
                         if noop_result.kind == "infrastructure":
-                            raise BaselineConstraintVerificationError(
-                                f"BASELINE_VERIFY_INFRA_ERROR: {project}/{mode}: {noop_result.summary}. "
-                                "No-op dependency proof was not produced."
+                            raise _baseline_terminal_error(
+                                BaselineTerminalStatus.INFRASTRUCTURE_FAILURE,
+                                "BASELINE_VERIFY_INFRA_ERROR",
+                                f"{project}/{mode}: {noop_result.summary}; no-op dependency proof was not produced",
+                                source="package-manager-verification",
                             )
                         if noop_result.kind == "unknown":
-                            raise BaselineConstraintVerificationError(
-                                f"BASELINE_VERIFY_UNKNOWN_ERROR: {project}/{mode}: {noop_result.summary}. "
-                                "No-op dependency proof was not produced."
+                            raise _baseline_terminal_error(
+                                BaselineTerminalStatus.SOLVER_UNKNOWN,
+                                "BASELINE_VERIFY_UNKNOWN_ERROR",
+                                f"{project}/{mode}: {noop_result.summary}; no-op dependency proof was not produced",
+                                source="package-manager-verification",
                             )
                         if not noop_result.ok:
                             raise BaselineConstraintVerificationError(
@@ -9082,6 +9237,11 @@ def resolve_peer_compatibility_with_verification(
                         "mode-passed-no-changes",
                         iteration=iteration,
                         assignment=fingerprint,
+                        terminalStatus=(
+                            BaselineTerminalStatus.SOLVER_UNKNOWN.value
+                            if unknown_budget_names
+                            else BaselineTerminalStatus.SAT_PROVEN.value
+                        ),
                         fixedResolverProofRequired=bool(fixed_input_names),
                         **liveness.snapshot(learned_constraints=len(learned[project][mode])),
                     )
@@ -9156,9 +9316,18 @@ def resolve_peer_compatibility_with_verification(
                     )
 
                 if result.kind == "infrastructure":
-                    raise BaselineConstraintVerificationError(
-                        f"BASELINE_VERIFY_INFRA_ERROR: {project}/{mode}: {result.summary}. "
-                        "Dependency plan was preserved; fix infrastructure and rerun generation."
+                    progress_reporter.emit(
+                        project, mode, "verification-terminal", iteration=iteration,
+                        assignment=fingerprint,
+                        terminalStatus=BaselineTerminalStatus.INFRASTRUCTURE_FAILURE.value,
+                        terminalSource="package-manager-verification",
+                        stopCode="BASELINE_VERIFY_INFRA_ERROR",
+                    )
+                    raise _baseline_terminal_error(
+                        BaselineTerminalStatus.INFRASTRUCTURE_FAILURE,
+                        "BASELINE_VERIFY_INFRA_ERROR",
+                        f"{project}/{mode}: {result.summary}; dependency plan was preserved; fix infrastructure and rerun generation",
+                        source="package-manager-verification",
                     )
                 if result.kind == "unknown":
                     diagnostic_tail = _sanitized_baseline_failure_tail(result.output)
@@ -9167,10 +9336,18 @@ def resolve_peer_compatibility_with_verification(
                         if diagnostic_tail
                         else ""
                     )
-                    raise BaselineConstraintVerificationError(
-                        f"BASELINE_VERIFY_UNKNOWN_ERROR: {project}/{mode}: {result.summary}. "
-                        "Resolver failure was not classified as dependency evidence, so no compatibility constraint was learned."
-                        f"{diagnostic}"
+                    progress_reporter.emit(
+                        project, mode, "verification-terminal", iteration=iteration,
+                        assignment=fingerprint,
+                        terminalStatus=BaselineTerminalStatus.SOLVER_UNKNOWN.value,
+                        terminalSource="package-manager-verification",
+                        stopCode="BASELINE_VERIFY_UNKNOWN_ERROR",
+                    )
+                    raise _baseline_terminal_error(
+                        BaselineTerminalStatus.SOLVER_UNKNOWN,
+                        "BASELINE_VERIFY_UNKNOWN_ERROR",
+                        f"{project}/{mode}: {result.summary}; resolver failure was not classified as dependency evidence, so no compatibility constraint was learned{diagnostic}",
+                        source="package-manager-verification",
                     )
 
                 if result.ok:
@@ -9266,6 +9443,11 @@ def resolve_peer_compatibility_with_verification(
                             "mode-passed",
                             iteration=iteration,
                             assignment=fingerprint,
+                            terminalStatus=(
+                                BaselineTerminalStatus.SOLVER_UNKNOWN.value
+                                if unknown_budget_names or sat_unproven_names
+                                else BaselineTerminalStatus.SAT_PROVEN.value
+                            ),
                             **liveness.snapshot(learned_constraints=len(learned[project][mode])),
                         )
                         break
@@ -10048,7 +10230,7 @@ def resolve_peer_compatibility_with_verification(
                         )
 
                     global_exact_exclusions[project][mode].append(exact_nogood)
-                    liveness.record_exact_exclusion()
+                    extension_granted = liveness.record_exact_exclusion()
                     localization_checkpoint_store.clear(project, mode)
                     eprint(
                         f"[warn] {project}: blocked exact failing assignment {fingerprint} "
@@ -10062,6 +10244,7 @@ def resolve_peer_compatibility_with_verification(
                         literals=len(exact_nogood), origin=result.kind,
                         authority=EVIDENCE_CONFIRMED_CONSTRAINT,
                         topologyMerged=False,
+                        extensionGranted=extension_granted,
                         **liveness.snapshot(learned_constraints=len(learned[project][mode])),
                     )
                     continue
@@ -10223,10 +10406,18 @@ def resolve_peer_compatibility_with_verification(
                         ),
                     )
                 except LocalizationTimeoutError as exc:
-                    progress_reporter.emit(project, mode, "localization-timeout", iteration=iteration, assignment=fingerprint, error=str(exc))
-                    raise BaselineConstraintVerificationError(
-                        f"BASELINE_LOCALIZATION_TIMEOUT: {project}/{mode}: {exc}. "
-                        "Dependency plan was preserved and no compatibility constraint was learned."
+                    progress_reporter.emit(
+                        project, mode, "localization-timeout", iteration=iteration,
+                        assignment=fingerprint, error=str(exc),
+                        terminalStatus=BaselineTerminalStatus.BUDGET_EXHAUSTED.value,
+                        terminalSource="conflict-localization",
+                        stopCode="BASELINE_LOCALIZATION_TIMEOUT",
+                    )
+                    raise _baseline_terminal_error(
+                        BaselineTerminalStatus.BUDGET_EXHAUSTED,
+                        "BASELINE_LOCALIZATION_TIMEOUT",
+                        f"{project}/{mode}: {exc}; dependency plan was preserved and no compatibility constraint was learned",
+                        source="conflict-localization",
                     ) from None
                 eprint(
                     f"[info] {project}: Baseline localization {mode} completed; culpritUnits={len(culprit_units)}, "
@@ -10591,15 +10782,20 @@ def resolve_peer_compatibility_with_verification(
                     learned_constraints=len(learned[project][mode])
                 )
                 hard_exhausted = iteration >= summary["hardIterations"]
+                terminal_status = (
+                    BaselineTerminalStatus.HARD_SAFETY_LIMIT
+                    if hard_exhausted
+                    else BaselineTerminalStatus.PLATEAU
+                )
                 stop_code = (
-                    "BASELINE_VERIFICATION_HARD_BUDGET_EXHAUSTED"
+                    "BASELINE_VERIFICATION_HARD_SAFETY_LIMIT"
                     if hard_exhausted
                     else "BASELINE_VERIFICATION_PLATEAU"
                 )
                 stop_reason = (
                     "absolute-hard-safety-ceiling"
                     if hard_exhausted
-                    else "soft-budget-ended-without-fresh-generalized-learning"
+                    else "soft-budget-ended-without-fresh-authoritative-progress"
                 )
                 progress_reporter.emit(
                     project,
@@ -10609,24 +10805,30 @@ def resolve_peer_compatibility_with_verification(
                     assignment=last_fingerprint,
                     reason=stop_reason,
                     stopCode=stop_code,
+                    terminalStatus=terminal_status.value,
+                    terminalSource="solve-and-verify",
                     uniqueConfirmedFailedAssignments=len(
                         confirmed_failed_assignments
                     ),
                     **summary,
                 )
-                raise BaselineConstraintVerificationError(
-                    f"{stop_code}: {project}/{mode}: no resolver-green assignment "
+                raise _baseline_terminal_error(
+                    terminal_status,
+                    stop_code,
+                    f"{project}/{mode}: no resolver-green assignment "
                     f"after {iteration} solve-and-verify iteration(s); "
                     f"reason={stop_reason}; "
                     f"baseIterations={summary['baseIterations']}, "
                     f"allowedIterations={summary['allowedIterations']}, "
                     f"hardIterations={summary['hardIterations']}, "
                     f"certifiedExtensions={summary['certifiedExtensions']}, "
+                    f"learnedExtensions={summary['learnedExtensions']}, "
+                    f"exactExtensionCredits={summary['exactExtensionCredits']}, "
                     f"learnedConstraints={summary['learnedConstraints']}, "
                     f"exactExclusions={summary['exactExclusions']}, "
                     f"exactSinceLearning={summary['exactSinceLearning']}, "
-                    f"uniqueConfirmedFailedAssignments="
-                    f"{len(confirmed_failed_assignments)}"
+                    f"uniqueConfirmedFailedAssignments={len(confirmed_failed_assignments)}",
+                    source="solve-and-verify",
                 )
 
     # Re-run only as a fail-closed consistency assertion while legacy target/cohort

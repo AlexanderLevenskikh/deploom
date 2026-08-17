@@ -337,10 +337,9 @@ class PeerSolverModelTests(unittest.TestCase):
         ), mock.patch.object(
             roadmap, "_solve_peer_component", side_effect=AssertionError("legacy fallback is forbidden")
         ):
-            with self.assertRaisesRegex(
-                roadmap.BaselineConstraintVerificationError,
-                "EXACT_SOLVER_PROOF_REQUIRED",
-            ):
+            with self.assertRaises(
+                roadmap.BaselineConstraintVerificationError
+            ) as raised:
                 roadmap.resolve_peer_compatibility(
                     by_project,
                     client,
@@ -348,6 +347,13 @@ class PeerSolverModelTests(unittest.TestCase):
                     apply_results=False,
                     shadow_solver_config_by_project={"Demo": {"solverBackend": "z3"}},
                 )
+
+        error = raised.exception
+        self.assertEqual("SOLVER_UNKNOWN", error.terminal_status)
+        self.assertEqual("z3", error.terminal_source)
+        self.assertEqual("EXACT_SOLVER_UNKNOWN", error.stop_code)
+        self.assertIn("EXACT_SOLVER_UNKNOWN", str(error))
+        self.assertIn("unfinished exact proof is not a dependency decision", str(error))
 
     def test_shadow_z3_runs_before_legacy_search(self):
         client = self.make_client()

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import ctypes
 import dataclasses
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -80,18 +82,61 @@ def _integrity_key(path: Path, prepared_root: Path) -> str:
     return os.path.normcase(relative.replace("/", os.sep)).replace("\\", "/")
 
 
-def _fingerprint_path(path: Path) -> str:
-    if path.is_symlink():
+def _integrity_hash_workers() -> int:
+    """Bound parallel hashing so NTFS/AV latency is hidden without I/O flooding."""
+    raw = str(os.environ.get("DEPLOOM_INTEGRITY_HASH_WORKERS") or "").strip()
+    if raw:
+        try:
+            return max(1, min(32, int(raw)))
+        except ValueError:
+            pass
+    # node_modules sealing on Windows is normally metadata/filter-driver bound,
+    # not SHA-256 CPU bound. A moderate pool overlaps that latency without an
+    # unbounded queue against Defender/EDR/NTFS.
+    return min(12, max(4, (os.cpu_count() or 4) // 2))
+
+
+def _fingerprint_path_with_size(path: Path) -> tuple[str, int]:
+    """Return the exact content fingerprint plus bytes consumed from the file."""
+    metadata = os.lstat(path)
+    if stat.S_ISLNK(metadata.st_mode):
         payload = os.readlink(path).encode("utf-8", errors="surrogatepass")
-        return "symlink:" + hashlib.sha256(payload).hexdigest()
+        return "symlink:" + hashlib.sha256(payload).hexdigest(), int(metadata.st_size)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"unsupported dependency payload type: {path}")
+
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    total = 0
+    with path.open("rb", buffering=1024 * 1024) as handle:
         while True:
             chunk = handle.read(1024 * 1024)
             if not chunk:
                 break
+            total += len(chunk)
             digest.update(chunk)
-    return "file:" + digest.hexdigest()
+    return "file:" + digest.hexdigest(), total
+
+
+def _fingerprint_path(path: Path) -> str:
+    # Watcher classification uses the same byte-level fingerprint as sealing.
+    return _fingerprint_path_with_size(path)[0]
+
+
+def _seal_dependency_candidate(
+    path: Path,
+    prepared_root: Path,
+) -> Optional[tuple[str, str, int]]:
+    """Hash one os.walk file candidate, preserving fail-closed semantics."""
+    try:
+        metadata = os.lstat(path)
+        if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+            return None
+        fingerprint, size = _fingerprint_path_with_size(path)
+        return _integrity_key(path, prepared_root), fingerprint, size
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"PREPARED_DEPENDENCY_INTEGRITY_CAPTURE_FAILED: {path}: {exc}"
+        ) from exc
 
 
 def build_dependency_integrity_manifest(
@@ -100,56 +145,72 @@ def build_dependency_integrity_manifest(
     progress: Optional[ProgressCallback] = None,
     progress_interval_seconds: int = 15,
 ) -> dict[str, str]:
-    """Seal dependency payload bytes before any junction-backed consumer exists.
+    """Seal every dependency payload byte before any junction consumer exists.
 
-    This is proof metadata, not heuristic evidence. A later filesystem
-    notification is classified as notification-only only when the affected
-    file still has the exact sealed content fingerprint. Any missing or
-    unreadable fingerprint fails closed.
+    Proof semantics are unchanged: every regular dependency file/symlink gets
+    the same SHA-256 fingerprint and unreadable payloads fail closed. Only the
+    execution strategy is parallelized. Final mapping order is canonical.
     """
     prepared_root = prepared_root.resolve()
-    manifest: dict[str, str] = {}
     started = time.monotonic()
     interval = max(1, int(progress_interval_seconds or 15))
     next_progress = started + interval
-    files = 0
-    total_bytes = 0
+    candidates: list[Path] = []
 
+    # Inventory discovery stays deterministic and single-threaded. The prepared
+    # stage is private here; no junction-backed consumer exists until sealing is
+    # complete.
     for dependency_root in _dependency_roots(prepared_root):
         for current, dirs, names in os.walk(dependency_root, followlinks=False):
             dirs.sort(key=str.lower)
             names.sort(key=str.lower)
             current_path = Path(current)
-            for name in names:
-                path = current_path / name
-                try:
-                    if not path.is_file() and not path.is_symlink():
-                        continue
-                    manifest[_integrity_key(path, prepared_root)] = _fingerprint_path(path)
-                    files += 1
-                    try:
-                        total_bytes += path.stat().st_size
-                    except OSError:
-                        pass
-                except OSError as exc:
-                    raise RuntimeError(
-                        f"PREPARED_DEPENDENCY_INTEGRITY_CAPTURE_FAILED: {path}: {exc}"
-                    ) from exc
+            candidates.extend(current_path / name for name in names)
 
-                now = time.monotonic()
-                if progress and now >= next_progress:
-                    progress(
-                        "sealed dependency integrity manifest: "
-                        f"files={files}, bytes={total_bytes}, elapsed={int(now - started)}s"
-                    )
-                    next_progress = now + interval
+    manifest: dict[str, str] = {}
+    files = 0
+    total_bytes = 0
+    workers = _integrity_hash_workers()
+    if progress:
+        progress(
+            "sealed dependency integrity manifest hashing: "
+            f"candidates={len(candidates)}, workers={workers}"
+        )
 
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="deploom-integrity",
+    ) as executor:
+        future_paths = {
+            executor.submit(_seal_dependency_candidate, path, prepared_root): path
+            for path in candidates
+        }
+        for future in as_completed(future_paths):
+            result = future.result()
+            if result is None:
+                continue
+            key, fingerprint, size = result
+            manifest[key] = fingerprint
+            files += 1
+            total_bytes += size
+
+            now = time.monotonic()
+            if progress and now >= next_progress:
+                progress(
+                    "sealed dependency integrity manifest: "
+                    f"files={files}/{len(candidates)}, bytes={total_bytes}, "
+                    f"workers={workers}, elapsed={int(now - started)}s"
+                )
+                next_progress = now + interval
+
+    canonical = dict(sorted(manifest.items()))
     if progress:
         progress(
             "sealed dependency integrity manifest ready: "
-            f"files={files}, bytes={total_bytes}, elapsed={int(time.monotonic() - started)}s"
+            f"files={files}, bytes={total_bytes}, workers={workers}, "
+            f"elapsed={int(time.monotonic() - started)}s"
         )
-    return manifest
+    return canonical
 
 
 def _run_overlay_robocopy(

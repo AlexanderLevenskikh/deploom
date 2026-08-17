@@ -141,7 +141,11 @@ class ProofHandoffFirewallTests(unittest.TestCase):
             "result.dynamicLocked || (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('desktop-export'))",
             source,
         )
-        self.assertIn("EXACT_SOLVER_PROOF_REQUIRED", source)
+        self.assertIn("BaselineTerminalStatus.SOLVER_UNKNOWN", source)
+        self.assertIn("EXACT_SOLVER_UNKNOWN", source)
+        self.assertIn("BaselineTerminalStatus.UNSAT_PROVEN", source)
+        self.assertIn("EXACT_SOLVER_UNSAT_PROVEN", source)
+        self.assertNotIn("EXACT_SOLVER_PROOF_REQUIRED", source)
 
         node_function = source[
             source.index("def _project_node_versions("):
