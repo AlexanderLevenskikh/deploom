@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 import hashlib
 import json
 import re
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 SKIP_DIRS = {'.git', '.idea', '.vs', 'node_modules', 'dist', 'dist-electron', 'release', '__pycache__', '.cache', '.npm'}
@@ -79,8 +80,27 @@ def candidate_identifiers(text: str):
 
 
 def files():
-    for path in ROOT.rglob('*'):
-        if not path.is_file() or any(part in SKIP_DIRS for part in path.relative_to(ROOT).parts):
+    # Scan exactly the Git-tracked public release surface.
+    # Local agent worktrees and downloaded patchers are not release inputs.
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "-z"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"cannot enumerate tracked public release surface: {exc}") from exc
+
+    for raw in completed.stdout.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            relative = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError("tracked path is not valid UTF-8") from exc
+        path = ROOT / relative
+        if not path.is_file():
             continue
         yield path
 

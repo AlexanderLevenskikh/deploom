@@ -44,3 +44,6 @@ desktop/release/
 desktop/.npm/
 desktop/.cache/
 .dependency-roadmap/
+
+# Local agent-managed worktrees
+.claude/worktrees/

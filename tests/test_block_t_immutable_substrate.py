@@ -176,19 +176,19 @@ class BlockTFixedSourceIdentityTests(unittest.TestCase):
     def test_yarn_git_semver_ref_uses_resolved_commit_not_moving_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
-            spec = "git+ssh://git@example.invalid:team/libjs.git#semver:2.132.0"
+            spec = "git+ssh://git@example.invalid:team/fixture-lib.git#semver:2.132.0"
             (project / "package.json").write_text(
                 json.dumps({
                     "packageManager": "yarn@1.22.22",
-                    "dependencies": {"libjs": spec},
+                    "dependencies": {"fixture-lib": spec},
                 }),
                 encoding="utf-8",
             )
             first_commit = "f" * 40
             (project / "yarn.lock").write_text(
-                f'"libjs@{spec}":\n'
+                f'"fixture-lib@{spec}":\n'
                 '  version "2.132.0"\n'
-                f'  resolved "git+ssh://git@example.invalid:team/libjs.git#{first_commit}"\n',
+                f'  resolved "git+ssh://git@example.invalid:team/fixture-lib.git#{first_commit}"\n',
                 encoding="utf-8",
             )
             first = proof.fixed_resolver_input_fingerprint(project, manager="yarn")
