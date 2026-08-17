@@ -245,6 +245,9 @@ type UpdateStatus = { state: 'idle' | 'checking' | 'available' | 'downloading' |
 const jobs = new Map<string, JobRecord>()
 let mainWindow: BrowserWindow | null = null
 let currentUpdateStatus: UpdateStatus = { state: 'idle' }
+let downloadedUpdateVersion: string | undefined
+let updateCheckInFlight: ReturnType<typeof autoUpdater.checkForUpdates> | undefined
+let updateInstallInProgress = false
 let stopUpdateChecks: (() => void) | undefined
 
 function statePath(): string {
@@ -1474,6 +1477,48 @@ function migrationRuntime(workspace: WorkspaceRecord, projectName: string): Reco
 function publishUpdateStatus(status: UpdateStatus): void {
   currentUpdateStatus = status
   send('flow:update-status', status)
+}
+
+function publishUpdaterError(error: unknown): UpdateStatus {
+  const status = updateErrorStatus(error)
+  const visibleStatus: UpdateStatus = downloadedUpdateVersion
+    ? { ...status, state: 'ready', version: downloadedUpdateVersion }
+    : status
+  publishUpdateStatus(visibleStatus)
+  return visibleStatus
+}
+
+function checkForLatestUpdate(): ReturnType<typeof autoUpdater.checkForUpdates> {
+  if (updateCheckInFlight) return updateCheckInFlight
+  const request = autoUpdater.checkForUpdates().finally(() => {
+    if (updateCheckInFlight === request) updateCheckInFlight = undefined
+  })
+  updateCheckInFlight = request
+  return request
+}
+
+async function installLatestUpdate(): Promise<void> {
+  if (!app.isPackaged || updateInstallInProgress) return
+  updateInstallInProgress = true
+  try {
+    // A package may have been downloaded before a newer release appeared.
+    // Refresh the feed and wait for that newest package instead of installing
+    // the stale cached one and making the user upgrade again on next launch.
+    const result = await checkForLatestUpdate()
+    if (!result?.isUpdateAvailable) return
+    const latestVersion = result.updateInfo.version
+    if (downloadedUpdateVersion !== latestVersion) {
+      await (result.downloadPromise ?? autoUpdater.downloadUpdate())
+    }
+    if (downloadedUpdateVersion !== latestVersion) {
+      throw new Error(`Update ${latestVersion} did not finish downloading.`)
+    }
+    autoUpdater.quitAndInstall(false, true)
+  } catch (error) {
+    publishUpdaterError(error)
+  } finally {
+    updateInstallInProgress = false
+  }
 }
 
 function findWorkspace(state: DesktopState, id?: string): WorkspaceRecord {
@@ -4884,18 +4929,15 @@ function setupIpc(): void {
   ipcMain.handle('flow:check-for-updates', async () => {
     if (!app.isPackaged) return { currentVersion: app.getVersion(), development: true }
     try {
-      const result = await autoUpdater.checkForUpdates()
+      const result = await checkForLatestUpdate()
       return { currentVersion: app.getVersion(), availableVersion: result?.updateInfo.version }
     } catch (error) {
-      const status = updateErrorStatus(error)
-      publishUpdateStatus(status)
+      const status = publishUpdaterError(error)
       return { currentVersion: app.getVersion(), error: status }
     }
   })
 
-  ipcMain.handle('flow:install-update', () => {
-    autoUpdater.quitAndInstall(false, true)
-  })
+  ipcMain.handle('flow:install-update', installLatestUpdate)
   ipcMain.handle('flow:pick-directory', async () => {
     const result = await dialog.showOpenDialog(mainWindow!, { properties: ['openDirectory', 'createDirectory'] })
     return result.canceled ? undefined : result.filePaths[0]
@@ -5292,16 +5334,27 @@ function setupAutoUpdater(): void {
   // electron-builder embeds the public GitHub feed in app-update.yml.
   // No client API key or setFeedURL override is required.
   autoUpdater.autoDownload = true
-  autoUpdater.autoInstallOnAppQuit = true
-  autoUpdater.on('checking-for-update', () => publishUpdateStatus({ state: 'checking', version: currentUpdateStatus.version }))
+  // Only the explicit install action may replace the running app. Besides
+  // avoiding stale intermediate installs, this prevents the NSIS updater from
+  // killing a manually reopened app a few seconds after a normal quit.
+  autoUpdater.autoInstallOnAppQuit = false
+  autoUpdater.on('checking-for-update', () => publishUpdateStatus({ state: 'checking', version: downloadedUpdateVersion ?? currentUpdateStatus.version }))
   autoUpdater.on('update-available', (info) => publishUpdateStatus({ state: 'available', version: info.version }))
-  autoUpdater.on('update-not-available', (info) => publishUpdateStatus({ state: 'current', version: info.version }))
+  autoUpdater.on('update-not-available', (info) => {
+    downloadedUpdateVersion = undefined
+    publishUpdateStatus({ state: 'current', version: info.version })
+  })
   autoUpdater.on('download-progress', (progress) => publishUpdateStatus({ state: 'downloading', version: currentUpdateStatus.version, percent: Math.round(progress.percent) }))
-  autoUpdater.on('update-downloaded', (info) => publishUpdateStatus({ state: 'ready', version: info.version }))
-  autoUpdater.on('error', (error) => publishUpdateStatus({ ...updateErrorStatus(error), version: currentUpdateStatus.version }))
+  autoUpdater.on('update-downloaded', (info) => {
+    downloadedUpdateVersion = info.version
+    publishUpdateStatus({ state: 'ready', version: info.version })
+  })
+  autoUpdater.on('error', (error) => {
+    publishUpdaterError(error)
+  })
   const check = () => {
-    void autoUpdater.checkForUpdates().catch((error: unknown) => {
-      publishUpdateStatus(updateErrorStatus(error))
+    void checkForLatestUpdate().catch((error: unknown) => {
+      publishUpdaterError(error)
     })
   }
   stopUpdateChecks?.()

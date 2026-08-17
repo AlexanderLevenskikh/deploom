@@ -1,4 +1,4 @@
-import { Bell, Boxes, ExternalLink, GitFork, Pause, Play, RefreshCw, RotateCcw, Settings, Workflow } from 'lucide-react'
+import { Bell, Boxes, Download, ExternalLink, GitFork, Pause, Play, Settings, Workflow } from 'lucide-react'
 import { useState } from 'react'
 import './App.css'
 import { AddProjectDialog } from './components/AddProjectDialog'
@@ -38,16 +38,12 @@ function App() {
   const knownLogSources = [...sessionBranches].map((branch) => ({ kind: 'group' as const, id: branch, label: branchLabels.get(branch) || branch }))
   const openDashboard = () => setTab('dashboard')
   const updateReady = flow.updateStatus.state === 'ready'
-  const updateLabel = flow.updateStatus.state === 'ready'
-    ? t('app.update.restart', { version: flow.updateStatus.version ?? t('app.update.newVersion') })
-    : flow.updateStatus.state === 'downloading'
-      ? t('app.update.downloading', { percent: flow.updateStatus.percent ?? 0 })
-      : flow.updateStatus.state === 'checking' || flow.updateStatus.state === 'available'
-        ? t('app.update.checking')
-        : flow.updateStatus.state === 'error' ? t('app.update.unavailable') : t('app.update.none')
+  const updateDownloading = flow.updateStatus.state === 'checking' || flow.updateStatus.state === 'available' || flow.updateStatus.state === 'downloading'
   const updateTitle = updateReady
     ? t('app.update.installTitle', { version: flow.updateStatus.version ?? '' }).trim()
-    : flow.updateStatus.message || t('app.update.waitTitle')
+    : flow.updateStatus.message || (flow.updateStatus.state === 'downloading'
+      ? t('app.update.downloading', { percent: flow.updateStatus.percent ?? 0 })
+      : t('app.update.waitTitle'))
 
   return (
     <div className="app-shell">
@@ -60,7 +56,7 @@ function App() {
             <button className={language === 'en' ? 'active' : ''} aria-pressed={language === 'en'} onClick={() => setLanguage('en')}>EN</button>
           </div>
           <label className="notification-toggle" title={t('app.notificationsTitle')}><input type="checkbox" checked={payload.notificationsEnabled} onChange={(event) => void flow.setNotificationsEnabled(event.target.checked)} /><Bell size={15} /><span>{t('app.notifications')}</span></label>
-          <button className={`button ${updateReady ? 'primary' : 'secondary'}`} disabled={!updateReady} title={updateTitle} onClick={() => void flow.installUpdate()}>{updateReady ? <RotateCcw size={16} /> : <RefreshCw className={flow.updateStatus.state === 'checking' || flow.updateStatus.state === 'downloading' ? 'spin' : ''} size={16} />}{updateLabel}</button>
+          <button className={`icon-button update-download-button${updateReady ? ' ready' : ''}${updateDownloading ? ' downloading' : ''}`} disabled={!updateReady} aria-busy={updateDownloading} aria-label={updateTitle} title={updateTitle} onClick={() => void flow.installUpdate()}><Download size={17} /></button>
           <button className="button secondary" disabled={!details.dashboardExists} onClick={openDashboard}><ExternalLink size={16} /> Dashboard</button>
           {flow.activeJobId ? <button className="button secondary" onClick={() => void flow.cancelJob()}><Pause size={16} /> {t('app.stop')}</button> : <button className="button secondary" disabled={!project} onClick={() => project && void flow.runAction({ action: 'preflight', workspaceId: details.workspace.id, projectName: project.name })}><Play size={16} /> {t('app.check')}</button>}
           <button className="icon-button" title={t('app.settingsTitle')} onClick={() => void flow.openPath(`${details.workspace.path}/${details.workspace.settingsPath}`)}><Settings size={18} /></button>
