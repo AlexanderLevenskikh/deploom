@@ -247,6 +247,12 @@ def _is_ephemeral_change(relative: str) -> bool:
 
 
 class _DirectoryWatcher:
+    FILE_ACTION_ADDED = 0x00000001
+    FILE_ACTION_REMOVED = 0x00000002
+    FILE_ACTION_MODIFIED = 0x00000003
+    FILE_ACTION_RENAMED_OLD_NAME = 0x00000004
+    FILE_ACTION_RENAMED_NEW_NAME = 0x00000005
+
     FILE_LIST_DIRECTORY = 0x0001
     FILE_SHARE_READ = 0x00000001
     FILE_SHARE_WRITE = 0x00000002
@@ -265,7 +271,7 @@ class _DirectoryWatcher:
 
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
-        self.events: list[str] = []
+        self.events: list[tuple[int, str]] = []
         self.errors: list[str] = []
         self._stop = threading.Event()
         self._handle = None
@@ -342,6 +348,7 @@ class _DirectoryWatcher:
                 while offset + 12 <= size:
                     raw = buffer.raw
                     next_offset = int.from_bytes(raw[offset:offset + 4], "little")
+                    action = int.from_bytes(raw[offset + 4:offset + 8], "little")
                     name_len = int.from_bytes(raw[offset + 8:offset + 12], "little")
                     end = offset + 12 + name_len
                     if end > size:
@@ -351,7 +358,7 @@ class _DirectoryWatcher:
                         break
                     name = raw[offset + 12:end].decode("utf-16-le", errors="replace")
                     if name:
-                        self.events.append(name.replace("\\", "/"))
+                        self.events.append((action, name.replace("\\", "/")))
                     if next_offset == 0:
                         break
                     offset += next_offset
@@ -385,6 +392,29 @@ class _DirectoryWatcher:
             self.errors.append(f"dependency watcher did not stop for {self.root}")
 
 
+
+def _notification_is_authoritative_mutation(root: Path, action: int, relative: str) -> bool:
+    if action in {
+        _DirectoryWatcher.FILE_ACTION_ADDED,
+        _DirectoryWatcher.FILE_ACTION_REMOVED,
+        _DirectoryWatcher.FILE_ACTION_RENAMED_OLD_NAME,
+        _DirectoryWatcher.FILE_ACTION_RENAMED_NEW_NAME,
+    }:
+        return True
+    if action != _DirectoryWatcher.FILE_ACTION_MODIFIED:
+        return True
+
+    target = root.joinpath(*[part for part in relative.replace("\\", "/").split("/") if part])
+    try:
+        if target.is_dir():
+            return False
+        if target.is_file():
+            return True
+    except OSError:
+        return True
+    return True
+
+
 class _DependencyTreeGuard:
     def __init__(self, roots: list[Path]) -> None:
         self.watchers = [_DirectoryWatcher(root) for root in roots]
@@ -405,8 +435,10 @@ class _DependencyTreeGuard:
         for watcher in self.watchers:
             watcher.stop()
             errors.extend(watcher.errors)
-            for event in watcher.events:
-                if not _is_ephemeral_change(event):
+            for action, event in watcher.events:
+                if _is_ephemeral_change(event):
+                    continue
+                if _notification_is_authoritative_mutation(watcher.root, action, event):
                     mutations.append(f"{watcher.root}:{event}")
         return GuardResult(
             mutations=tuple(sorted(set(mutations))),
