@@ -48,6 +48,7 @@ from resolved_dependency_state import (
     restore_resolved_dependency_state,
 )
 from prepared_workspace_fastpath import (
+    build_dependency_integrity_manifest,
     cleanup_guarded_clone,
     guarded_clone_is_active,
     stop_guarded_clone,
@@ -536,22 +537,24 @@ class PreparedWorkspaceSnapshot:
     storage_mode: str
     observed_resolved_versions: Mapping[str, str]
     observed_resolved_hash: str
+    dependency_integrity: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
 
 _PREPARED_SNAPSHOT_LOCK = threading.Lock()
 _PREPARED_SNAPSHOT_ROOT: Optional[Path] = None
 _PREPARED_SNAPSHOTS: Dict[Tuple[str, str], PreparedWorkspaceSnapshot] = {}
 _PREPARED_SNAPSHOT_MAX_COUNT = 2
+_PREPARED_FASTPATH_DISABLED: set[Tuple[str, str]] = set()
 
 
 def _cleanup_prepared_snapshot_root() -> None:
     global _PREPARED_SNAPSHOT_ROOT
     root = _PREPARED_SNAPSHOT_ROOT
-    if root is None:
-        return
-    shutil.rmtree(root, ignore_errors=True)
+    if root is not None:
+        shutil.rmtree(root, ignore_errors=True)
     _PREPARED_SNAPSHOT_ROOT = None
     _PREPARED_SNAPSHOTS.clear()
+    _PREPARED_FASTPATH_DISABLED.clear()
 
 
 atexit.register(_cleanup_prepared_snapshot_root)
@@ -681,6 +684,18 @@ def _prepared_snapshot_slot(key: str, source_project: Path) -> Tuple[str, str]:
     return str(key), str(source_project.resolve())
 
 
+def _disable_prepared_snapshot_fastpath(key: str, source_project: Path) -> None:
+    slot = _prepared_snapshot_slot(key, source_project)
+    with _PREPARED_SNAPSHOT_LOCK:
+        _PREPARED_FASTPATH_DISABLED.add(slot)
+
+
+def _prepared_snapshot_fastpath_allowed(key: str, source_project: Path) -> bool:
+    slot = _prepared_snapshot_slot(key, source_project)
+    with _PREPARED_SNAPSHOT_LOCK:
+        return slot not in _PREPARED_FASTPATH_DISABLED
+
+
 def _lookup_prepared_workspace_snapshot(
     key: str, source_project: Path
 ) -> Optional[PreparedWorkspaceSnapshot]:
@@ -770,6 +785,14 @@ def _publish_prepared_workspace_snapshot(
                 progress_interval_seconds=progress_interval_seconds,
             )
 
+        dependency_integrity: Mapping[str, str] = {}
+        if os.name == "nt":
+            dependency_integrity = build_dependency_integrity_manifest(
+                stage_workspace,
+                progress=progress,
+                progress_interval_seconds=progress_interval_seconds,
+            )
+
         snapshot = PreparedWorkspaceSnapshot(
             key=str(key),
             workspace_root=stage_workspace,
@@ -780,6 +803,7 @@ def _publish_prepared_workspace_snapshot(
                 (str(name), str(version)) for name, version in observed_versions.items()
             )),
             observed_resolved_hash=str(observed_hash),
+            dependency_integrity=dict(dependency_integrity),
         )
         with _PREPARED_SNAPSHOT_LOCK:
             raced = _PREPARED_SNAPSHOTS.get(slot)
@@ -801,6 +825,7 @@ def _materialize_prepared_workspace_snapshot(
     snapshot: PreparedWorkspaceSnapshot,
     target: Path,
     *,
+    allow_fastpath: bool = True,
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "prepared snapshot clone copy",
     timeout_seconds: int = 1800,
@@ -808,16 +833,28 @@ def _materialize_prepared_workspace_snapshot(
 ) -> Path:
     # Zero-config Windows/NTFS fast path: clone only source/config, then expose
     # the immutable prepared dependency bytes through junctions guarded by
-    # ReadDirectoryChangesW. Any package-tree mutation fails closed.
-    fast = try_materialize_guarded_clone(
-        source_project=snapshot.source_project,
-        prepared_workspace_root=snapshot.workspace_root,
-        project_relative=snapshot.project_relative,
-        target=target,
-        progress=progress,
+    # ReadDirectoryChangesW. Any package-tree notification invalidates this
+    # optimization and is retried through proof-safe private copies.
+    fastpath_allowed = (
+        allow_fastpath
+        and _prepared_snapshot_fastpath_allowed(snapshot.key, snapshot.source_project)
     )
-    if fast is not None:
-        return fast
+    if fastpath_allowed:
+        fast = try_materialize_guarded_clone(
+            source_project=snapshot.source_project,
+            prepared_workspace_root=snapshot.workspace_root,
+            project_relative=snapshot.project_relative,
+            target=target,
+            dependency_integrity=snapshot.dependency_integrity,
+            progress=progress,
+        )
+        if fast is not None:
+            return fast
+    elif progress and allow_fastpath:
+        progress(
+            "NTFS fast clone disabled for this preparation identity after a prior "
+            "shared-tree notification; using proof-safe full copy"
+        )
 
     _copy_tree_snapshot(
         snapshot.workspace_root,
@@ -1092,6 +1129,7 @@ def verify_assignment(
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "assignment verification",
     proof_identity: Optional[VerificationProofIdentity] = None,
+    _allow_prepared_fastpath: bool = True,
 ) -> BaselineVerifyResult:
     """Materialize one exact direct-dependency assignment in an isolated clone."""
     project_dir = project_dir.resolve()
@@ -1567,6 +1605,7 @@ def verify_assignment(
                     command_project = _materialize_prepared_workspace_snapshot(
                         snapshot,
                         command_root,
+                        allow_fastpath=_allow_prepared_fastpath,
                         progress=progress,
                         progress_label=f"{progress_label}: project-clone:{command_index}/{len(config.commands)}",
                         timeout_seconds=clone_timeout,
@@ -1630,23 +1669,64 @@ def verify_assignment(
                         return BaselineVerifyResult(False, "infrastructure", f"project check launch failed: {exc}", command=command)
 
                     guard_result = stop_guarded_clone(command_root)
-                    if guard_result.errors or guard_result.mutations:
-                        # Detach junctions before evicting the shared prepared
-                        # tree; otherwise Windows may keep target handles alive.
+                    if (
+                        guard_result.errors
+                        or guard_result.mutations
+                        or guard_result.notification_only
+                    ):
+                        # Any notification means this optimization is no longer
+                        # authoritative for the preparation identity. Even an
+                        # integrity-matched final state may have been transiently
+                        # mutated while another consumer was reading it.
                         cleanup_guarded_clone(command_root)
+                        _disable_prepared_snapshot_fastpath(
+                            proof_identity.preparation_proof_key, project_dir
+                        )
                         _evict_prepared_workspace_snapshot(
                             proof_identity.preparation_proof_key, project_dir
                         )
-                        detail = "; ".join([
-                            *(f"watcher-error={item}" for item in guard_result.errors),
-                            *(f"dependency-mutation={item}" for item in guard_result.mutations[:12]),
-                        ])
-                        return BaselineVerifyResult(
-                            False,
-                            "unknown",
-                            f"PREPARED_DEPENDENCY_TREE_MUTATION: project check {command} attempted to mutate the shared proven dependency tree; {detail}",
+                        rejection_reason = (
+                            "watcher-error"
+                            if guard_result.errors
+                            else (
+                                "confirmed-content-mutation"
+                                if guard_result.mutations
+                                else "integrity-matched-notification"
+                            )
+                        )
+                        event(
+                            "verify.project-check.fastpath-rejected",
                             command=command,
-                            workspace=str(command_project),
+                            check=command_index,
+                            checks=len(config.commands),
+                            reason=rejection_reason,
+                            watcherErrors=list(guard_result.errors),
+                            confirmedMutations=list(guard_result.mutations),
+                            integrityMatchedNotifications=list(
+                                guard_result.notification_only
+                            ),
+                        )
+                        _emit_progress(
+                            progress,
+                            f"{progress_label}: NTFS fast clone rejected during {command} "
+                            f"({rejection_reason}); rebuilding trusted preparation and "
+                            "retrying with proof-safe full-copy project clones",
+                        )
+                        # The failed fast-path check is infrastructure evidence,
+                        # never dependency evidence. Re-enter with the same proof
+                        # identity; ResolverProof may be reused, while lifecycle
+                        # preparation is rebuilt because the shared snapshot was
+                        # quarantined.
+                        return verify_assignment(
+                            project_dir,
+                            assignment,
+                            config=config,
+                            run_project_checks=run_project_checks,
+                            remove_packages=remove_packages,
+                            progress=progress,
+                            progress_label=progress_label,
+                            proof_identity=proof_identity,
+                            _allow_prepared_fastpath=False,
                         )
 
                     # Allowed root cache writes are cache-only. Remove them

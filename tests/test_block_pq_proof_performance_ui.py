@@ -57,6 +57,20 @@ class BlockPQContracts(unittest.TestCase):
         self.assertIn("OSV_PREFETCH_INCONSISTENT", source)
         self.assertIn("falling back to sequential fresh queries", source)
 
+    def test_ntfs_fastpath_rejection_retries_with_full_copy_without_learning(self) -> None:
+        verifier = (ROOT / "baseline_constraint_verifier.py").read_text(encoding="utf-8")
+        fastpath = (ROOT / "prepared_workspace_fastpath.py").read_text(encoding="utf-8")
+        self.assertIn("verify.project-check.fastpath-rejected", verifier)
+        self.assertIn("_allow_prepared_fastpath=False", verifier)
+        self.assertIn("_disable_prepared_snapshot_fastpath", verifier)
+        self.assertIn("guard_result.notification_only", verifier)
+        self.assertIn("build_dependency_integrity_manifest", verifier)
+        self.assertIn("integrityMatchedNotifications", verifier)
+        self.assertIn("confirmed-content-mutation", verifier)
+        self.assertIn("notification-only", fastpath)
+        self.assertIn("_fingerprint_path", fastpath)
+        self.assertNotIn('endswith("esbuild.exe")', verifier)
+
     def test_predicate_family_minimization_reuses_only_exact_trial_evidence(self) -> None:
         source = (ROOT / "dependency_live_roadmap_generator.py").read_text(encoding="utf-8")
         self.assertIn("trial_proof_cache: Dict[str, List[str]]", source)

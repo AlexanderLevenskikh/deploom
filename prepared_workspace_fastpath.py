@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import ctypes
 import dataclasses
+import hashlib
 import os
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
 ProgressCallback = Callable[[str], None]
 
@@ -16,6 +18,7 @@ ProgressCallback = Callable[[str], None]
 class GuardResult:
     mutations: tuple[str, ...] = ()
     errors: tuple[str, ...] = ()
+    notification_only: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass
@@ -70,6 +73,83 @@ def _dependency_roots(prepared_root: Path) -> list[Path]:
             dirs.remove("node_modules")
     unique = {os.path.normcase(str(path)): path for path in result}
     return [unique[key] for key in sorted(unique)]
+
+
+def _integrity_key(path: Path, prepared_root: Path) -> str:
+    relative = path.relative_to(prepared_root).as_posix()
+    return os.path.normcase(relative.replace("/", os.sep)).replace("\\", "/")
+
+
+def _fingerprint_path(path: Path) -> str:
+    if path.is_symlink():
+        payload = os.readlink(path).encode("utf-8", errors="surrogatepass")
+        return "symlink:" + hashlib.sha256(payload).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return "file:" + digest.hexdigest()
+
+
+def build_dependency_integrity_manifest(
+    prepared_root: Path,
+    *,
+    progress: Optional[ProgressCallback] = None,
+    progress_interval_seconds: int = 15,
+) -> dict[str, str]:
+    """Seal dependency payload bytes before any junction-backed consumer exists.
+
+    This is proof metadata, not heuristic evidence. A later filesystem
+    notification is classified as notification-only only when the affected
+    file still has the exact sealed content fingerprint. Any missing or
+    unreadable fingerprint fails closed.
+    """
+    prepared_root = prepared_root.resolve()
+    manifest: dict[str, str] = {}
+    started = time.monotonic()
+    interval = max(1, int(progress_interval_seconds or 15))
+    next_progress = started + interval
+    files = 0
+    total_bytes = 0
+
+    for dependency_root in _dependency_roots(prepared_root):
+        for current, dirs, names in os.walk(dependency_root, followlinks=False):
+            dirs.sort(key=str.lower)
+            names.sort(key=str.lower)
+            current_path = Path(current)
+            for name in names:
+                path = current_path / name
+                try:
+                    if not path.is_file() and not path.is_symlink():
+                        continue
+                    manifest[_integrity_key(path, prepared_root)] = _fingerprint_path(path)
+                    files += 1
+                    try:
+                        total_bytes += path.stat().st_size
+                    except OSError:
+                        pass
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"PREPARED_DEPENDENCY_INTEGRITY_CAPTURE_FAILED: {path}: {exc}"
+                    ) from exc
+
+                now = time.monotonic()
+                if progress and now >= next_progress:
+                    progress(
+                        "sealed dependency integrity manifest: "
+                        f"files={files}, bytes={total_bytes}, elapsed={int(now - started)}s"
+                    )
+                    next_progress = now + interval
+
+    if progress:
+        progress(
+            "sealed dependency integrity manifest ready: "
+            f"files={files}, bytes={total_bytes}, elapsed={int(time.monotonic() - started)}s"
+        )
+    return manifest
 
 
 def _run_overlay_robocopy(
@@ -393,30 +473,47 @@ class _DirectoryWatcher:
 
 
 
-def _notification_is_authoritative_mutation(root: Path, action: int, relative: str) -> bool:
+def _classify_integrity_notification(
+    prepared_root: Path,
+    root: Path,
+    action: int,
+    relative: str,
+    integrity_manifest: Mapping[str, str],
+) -> str:
+    """Return ignored | notification-only | mutation for one watcher event."""
     if action in {
         _DirectoryWatcher.FILE_ACTION_ADDED,
         _DirectoryWatcher.FILE_ACTION_REMOVED,
         _DirectoryWatcher.FILE_ACTION_RENAMED_OLD_NAME,
         _DirectoryWatcher.FILE_ACTION_RENAMED_NEW_NAME,
     }:
-        return True
+        return "mutation"
     if action != _DirectoryWatcher.FILE_ACTION_MODIFIED:
-        return True
+        return "mutation"
 
     target = root.joinpath(*[part for part in relative.replace("\\", "/").split("/") if part])
     try:
         if target.is_dir():
-            return False
-        if target.is_file():
-            return True
-    except OSError:
-        return True
-    return True
+            return "ignored"
+        if not target.is_file() and not target.is_symlink():
+            return "mutation"
+        expected = integrity_manifest.get(_integrity_key(target, prepared_root))
+        if not expected:
+            return "mutation"
+        return "notification-only" if _fingerprint_path(target) == expected else "mutation"
+    except (OSError, ValueError):
+        return "mutation"
 
 
 class _DependencyTreeGuard:
-    def __init__(self, roots: list[Path]) -> None:
+    def __init__(
+        self,
+        prepared_root: Path,
+        roots: list[Path],
+        integrity_manifest: Mapping[str, str],
+    ) -> None:
+        self.prepared_root = prepared_root.resolve()
+        self.integrity_manifest = dict(integrity_manifest)
         self.watchers = [_DirectoryWatcher(root) for root in roots]
 
     def start(self) -> bool:
@@ -432,17 +529,29 @@ class _DependencyTreeGuard:
     def stop(self) -> GuardResult:
         mutations: list[str] = []
         errors: list[str] = []
+        notification_only: list[str] = []
         for watcher in self.watchers:
             watcher.stop()
             errors.extend(watcher.errors)
             for action, event in watcher.events:
                 if _is_ephemeral_change(event):
                     continue
-                if _notification_is_authoritative_mutation(watcher.root, action, event):
-                    mutations.append(f"{watcher.root}:{event}")
+                detail = f"{watcher.root}:{event}"
+                classification = _classify_integrity_notification(
+                    self.prepared_root,
+                    watcher.root,
+                    action,
+                    event,
+                    self.integrity_manifest,
+                )
+                if classification == "mutation":
+                    mutations.append(detail)
+                elif classification == "notification-only":
+                    notification_only.append(detail)
         return GuardResult(
             mutations=tuple(sorted(set(mutations))),
             errors=tuple(errors),
+            notification_only=tuple(sorted(set(notification_only))),
         )
 
 
@@ -452,6 +561,7 @@ def try_materialize_guarded_clone(
     prepared_workspace_root: Path,
     project_relative: Path,
     target: Path,
+    dependency_integrity: Optional[Mapping[str, str]] = None,
     progress: Optional[ProgressCallback] = None,
 ) -> Optional[Path]:
     if os.name != "nt":
@@ -463,7 +573,7 @@ def try_materialize_guarded_clone(
     prepared_workspace_root = prepared_workspace_root.resolve()
     target = target.resolve()
     dependency_roots = _dependency_roots(prepared_workspace_root)
-    if not dependency_roots:
+    if not dependency_roots or not dependency_integrity:
         return None
 
     try:
@@ -488,7 +598,6 @@ def try_materialize_guarded_clone(
             return None
 
         junctions: list[Path] = []
-        clone_dependency_roots: list[Path] = []
         for dependency_root in dependency_roots:
             relative = dependency_root.relative_to(prepared_workspace_root)
             clone_root = target / relative
@@ -499,13 +608,15 @@ def try_materialize_guarded_clone(
                 shutil.rmtree(target, ignore_errors=True)
                 return None
             junctions.extend(created)
-            clone_dependency_roots.append(clone_root.resolve())
 
-        guard_roots = [
-            *dependency_roots,
-            *clone_dependency_roots,
-        ]
-        guard = _DependencyTreeGuard(guard_roots)
+        # Only the sealed dependency roots are authoritative shared state.
+        # The clone's node_modules shell (.bin/caches/junction entries) is local
+        # execution state and must not itself create false mutation evidence.
+        guard = _DependencyTreeGuard(
+            prepared_workspace_root,
+            dependency_roots,
+            dependency_integrity,
+        )
         if not guard.start():
             for existing in reversed(junctions):
                 _remove_junction(existing)
