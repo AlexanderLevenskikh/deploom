@@ -17,6 +17,8 @@ type Props = {
   onSendAgentNote: (note: string, branch?: string) => Promise<boolean>
   onCancel: () => void
   onClear: () => void
+  showRunMonitor?: boolean
+  showEnvironment?: boolean
 }
 
 type LogView = 'activity' | 'raw'
@@ -60,7 +62,7 @@ const GENERATED_TITLES: Record<string, TranslationKey> = {
   'Записываю файл': 'log.tool.write',
 }
 
-export function LogPanel({ logs, knownSources = [], environment, active, activeJobId, activeAction, runStartedAt, migrationProgress, onSendAgentNote, onCancel, onClear }: Props) {
+export function LogPanel({ logs, knownSources = [], environment, active, activeJobId, activeAction, runStartedAt, migrationProgress, onSendAgentNote, onCancel, onClear, showRunMonitor = true, showEnvironment = true }: Props) {
   const { language, t } = useLanguage()
   const [view, setView] = useState<LogView>('activity')
   const [selectedSource, setSelectedSource] = useState('all')
@@ -159,7 +161,7 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
         </div>
       </div>
 
-      <RunMonitor logs={logs} active={active} jobId={activeJobId} action={activeAction} runStartedAt={runStartedAt} migrationProgress={migrationProgress} />
+      {showRunMonitor ? <RunMonitor logs={logs} active={active} jobId={activeJobId} action={activeAction} runStartedAt={runStartedAt} migrationProgress={migrationProgress} /> : null}
 
       <div className="log-controls"><div className="log-tabs" role="tablist" aria-label={t('log.viewAria')}>
         <button role="tab" aria-selected={view === 'activity'} className={view === 'activity' ? 'active' : ''} onClick={() => setView('activity')}>{t('log.activity')}</button>
@@ -188,13 +190,15 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
         </div>
       )}
 
-      <div className="context-heading"><strong>{t('log.environment')}</strong></div>
-      <div className="environment-list">
-        {Object.entries(environment).map(([name, info]) => (
-          <div className="environment-row" key={name}><span className={`status-dot ${info.available ? 'success' : 'danger'}`} /><strong>{name}</strong><span>{info.available ? info.version : t('log.notFound')}</span></div>
-        ))}
-      </div>
-      <div className="download-hint"><Download size={16} /><span>{t('log.downloadHint')}</span></div>
+      {showEnvironment ? <>
+        <div className="context-heading"><strong>{t('log.environment')}</strong></div>
+        <div className="environment-list">
+          {Object.entries(environment).map(([name, info]) => (
+            <div className="environment-row" key={name}><span className={`status-dot ${info.available ? 'success' : 'danger'}`} /><strong>{name}</strong><span>{info.available ? info.version : t('log.notFound')}</span></div>
+          ))}
+        </div>
+        <div className="download-hint"><Download size={16} /><span>{t('log.downloadHint')}</span></div>
+      </> : null}
     </aside>
   )
 }

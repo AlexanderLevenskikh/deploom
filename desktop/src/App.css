@@ -189,3 +189,60 @@
 .modal-reason { color:var(--muted); max-width:280px; overflow-wrap:anywhere; }
 .modal-actions { display:flex; justify-content:flex-end; gap:8px; padding-top:8px; border-top:1px solid var(--border); }
 .migration-error-modal { width:min(680px, 100%); }.migration-error-detail { max-height:280px; margin:0; overflow:auto; padding:10px 12px; border:1px solid var(--border); border-radius:5px; font:10px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space:pre-wrap; overflow-wrap:anywhere; }.migration-error-detail.warning { border-color:#e6c36a; background:var(--amber-soft); color:#73510b; }.migration-error-detail.error { border-color:#f0b9bb; background:var(--red-soft); color:#7f1d1d; }
+
+/* BLOCK_P_UI_RECOVERY_V1 */
+:root {
+  color-scheme: light;
+  --app-bg: #f5f7fb;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --surface-hover: #f2f6ff;
+  --text: #111827;
+  --text-muted: #667085;
+  --border: #d9e2ef;
+  --accent: #2563eb;
+  --accent-soft: #dbeafe;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --app-bg: #0c111d;
+    --surface: #121827;
+    --surface-raised: #192235;
+    --surface-hover: #202b42;
+    --text: #eef2ff;
+    --text-muted: #a5b4c7;
+    --border: #2b3650;
+    --accent: #7aa2ff;
+    --accent-soft: #1f2e55;
+  }
+}
+html[data-theme='light'] { color-scheme: light; }
+html[data-theme='dark'] { color-scheme: dark; }
+body, .app-shell { background: var(--app-bg); color: var(--text); }
+.app-grid { grid-template-columns: 236px minmax(620px, 1fr) minmax(430px, 0.64fr); }
+.theme-switch { display: inline-flex; gap: 4px; padding: 3px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); }
+.theme-switch button { width: 28px; height: 26px; border: 0; border-radius: 999px; background: transparent; color: var(--text-muted); cursor: pointer; }
+.theme-switch button.active { background: var(--accent-soft); color: var(--accent); }
+.monitoring-panel { display: flex; flex-direction: column; min-height: 0; border-left: 1px solid var(--border); background: var(--surface); }
+.monitoring-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px; border-bottom: 1px solid var(--border); }
+.monitoring-heading-title { display: flex; align-items: center; gap: 8px; }
+.monitoring-heading select { min-width: 190px; }
+.monitoring-body { min-height: 0; overflow: auto; padding: 14px; }
+.monitoring-overview { display: grid; gap: 14px; }
+.monitoring-progress-card { display: grid; place-items: center; gap: 12px; padding: 20px 12px; border: 1px solid var(--border); border-radius: 22px; background: linear-gradient(180deg, var(--surface-raised), var(--surface)); }
+.monitoring-ring { --progress: 0; width: 160px; height: 160px; border-radius: 50%; display: grid; place-items: center; background: radial-gradient(circle at 50% 50%, var(--surface) 0 58%, transparent 59%), conic-gradient(var(--accent) calc(var(--progress) * 1%), var(--accent-soft) 0); box-shadow: inset 0 0 0 1px var(--border); position: relative; }
+.monitoring-ring.running::after { content: ''; position: absolute; inset: 7px; border-radius: inherit; border: 2px solid transparent; border-top-color: var(--accent); animation: monitoringSpin 1.7s linear infinite; }
+.monitoring-ring strong { font-size: 34px; }
+.monitoring-ring span { color: var(--text-muted); font-size: 12px; }
+.monitoring-summary { text-align: center; line-height: 1.45; }
+.monitoring-summary strong { display: block; font-size: 16px; }
+.monitoring-summary span { color: var(--text-muted); }
+.monitoring-facts, .hardware-grid { display: grid; gap: 8px; }
+.monitoring-fact, .hardware-card { padding: 12px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface-raised); }
+.monitoring-fact span, .hardware-card span { color: var(--text-muted); display: block; font-size: 12px; margin-bottom: 4px; }
+.hardware-card strong { display: inline-flex; gap: 6px; align-items: center; }
+.monitoring-panel .log-panel { border-left: 0; height: auto; min-height: 100%; }
+.environment-only { display: grid; gap: 8px; }
+@keyframes monitoringSpin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .monitoring-ring.running::after { animation: none; } }

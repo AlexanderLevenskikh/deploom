@@ -9202,6 +9202,9 @@ def resolve_peer_compatibility_with_verification(
                     f"another live Baseline owns the recovery slot "
                     f"(pid={recovery_plan.active_owner_pid})"
                 )
+            if baseline_resume_policy() == "continue" and not recovery_plan.resumable:
+                progress_reporter.emit(project, mode, "recovery-continue-unavailable", reason=recovery_plan.reason, previousStatus=recovery_plan.previous_status, changedEpochs=list(recovery_plan.changed_epochs), invalidatedComponents=list(recovery_plan.invalidated_components), recheckFrom=recovery_plan.recheck_from, authority="ORCHESTRATION_HINT")
+                raise BaselineConstraintVerificationError(f"BASELINE_RECOVERY_CONTINUE_UNAVAILABLE: {project}/{mode}: reason={recovery_plan.reason or 'checkpoint-missing'}; previousStatus={recovery_plan.previous_status or '<none>'}. Use Start over explicitly to reset the Baseline checkpoint.")
             if (
                 recovery_plan.reason == "restart-requested"
                 or "predicate" in recovery_plan.changed_epochs

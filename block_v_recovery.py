@@ -676,6 +676,8 @@ class BaselineRunRecoveryStore:
                 entries = payload.get("entries")
                 entry = entries.get(self._slot(project, mode)) if isinstance(entries, dict) else None
                 plan = self._plan_from_entry(entry, identity=identity, epochs=epochs)
+                if normalized == "continue" and not plan.resumable:
+                    self._release_locked(project, mode)
 
         if plan.reason == "active-run":
             self.append_event(
@@ -779,8 +781,10 @@ def _epoch_order(name: str) -> int:
 
 def normalize_resume_policy(value: object) -> str:
     text = str(value or "auto").strip().lower()
-    if text in {"auto", "continue", "resume"}:
+    if text == "auto":
         return "auto"
+    if text in {"continue", "resume"}:
+        return "continue"
     if text in {"restart", "fresh", "start-over", "start_over"}:
         return "restart"
     if text in {"off", "disabled", "none"}:

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, net, Notification, protocol, session, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
 import updaterPackage from 'electron-updater'
 const { autoUpdater } = updaterPackage
 import { buildClaudeAgentArgs, buildClaudeResumeArgs, buildCodexAgentArgs, buildCodexResumeArgs, buildOpenCodeAgentArgs, buildOpenCodeResumeArgs, parseOpencodeModelsOutput } from './agent-command.js'
@@ -42,10 +42,11 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveSpawnInvocation } from './process-launcher.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { basename, delimiter, dirname, join, normalize, resolve, isAbsolute, relative, sep } from 'node:path'
 import { createServer as createNetServer } from 'node:net'
+import os from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -57,6 +58,10 @@ protocol.registerSchemesAsPrivileged([
 ])
 
 type AgentProvider = 'codex' | 'opencode' | 'claude'
+type ThemePreference = 'system' | 'light' | 'dark'
+type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
+type BaselineRecoveryInfo = { available: boolean; mode?: 'yellow' | 'green'; status?: string; phase?: string; updatedAt?: string; generation?: number; iteration?: number; lastAssignment?: string; lastPredicate?: string; learnedConstraints?: number; exactExclusions?: number; reason?: string }
+
 
 type GitPlan = {
   sourceBranch?: string
@@ -92,6 +97,7 @@ type DesktopState = {
   schemaVersion: 1
   selectedWorkspaceId?: string
   notificationsEnabled?: boolean
+  themePreference?: ThemePreference
   workspaces: WorkspaceRecord[]
 }
 
@@ -115,6 +121,7 @@ type WorkspaceDetails = {
   projectLevels: Record<string, ProjectLevel>
   targetClosure?: TargetClosure
   migrationProgress?: MigrationProgress
+  baselineRecovery?: BaselineRecoveryInfo
 }
 
 type AgentSessionState = { provider: AgentProvider; id: string; interrupted: boolean; updatedAt: string; scopeFingerprint?: string }
@@ -130,7 +137,7 @@ type TeamFlowState = {
   // reinterpreted under the new session-lifetime model mid-migration.
   projects: Record<string, {
     lastAction: string
-    status: 'running' | 'passed' | 'failed'
+    status: 'running' | 'passed' | 'failed' | 'paused'
     updatedAt: string
     target?: string
     releaseBranch?: string
@@ -165,7 +172,7 @@ type ActionInput = {
   gateCommand?: string
   resumeAgent?: boolean
   restartMigration?: boolean
-  baselineResume?: 'auto' | 'restart'
+  baselineResume?: 'auto' | 'continue' | 'restart'
   agentNote?: string
   sourceCommit?: string
   autopilot?: boolean
@@ -197,6 +204,7 @@ type JobRecord = {
   releaseGateCommand?: string
   child?: ChildProcessWithoutNullStreams
   cancelled: boolean
+  pauseRequested?: boolean
   agentProvider?: AgentProvider
   agentSessionId?: string
   agentScopeFingerprint?: string
@@ -279,8 +287,42 @@ function updateErrorStatus(error: unknown): UpdateStatus {
   return { state: 'error', message: summarizeUpdaterError(raw, 300) }
 }
 
+
+function normalizeThemePreference(value: unknown): ThemePreference {
+  return value === 'light' || value === 'dark' || value === 'system' ? value : 'system'
+}
+function applyThemePreference(value: unknown): ThemePreference {
+  const preference = normalizeThemePreference(value)
+  nativeTheme.themeSource = preference
+  return preference
+}
+function currentThemePreference(): ThemePreference { return normalizeThemePreference(loadState().themePreference) }
+let previousCpuSample: { idle: number; total: number } | undefined
+function systemCpuLoadPct(): number | undefined {
+  const cpus = os.cpus(); let idle = 0; let total = 0
+  for (const cpu of cpus) { idle += cpu.times.idle; total += Object.values(cpu.times).reduce((sum, value) => sum + value, 0) }
+  const previous = previousCpuSample; previousCpuSample = { idle, total }
+  if (!previous) return undefined
+  const totalDelta = total - previous.total; const idleDelta = idle - previous.idle
+  return totalDelta > 0 ? Math.max(0, Math.min(100, (1 - idleDelta / totalDelta) * 100)) : undefined
+}
+function hardwareSnapshot(): HardwareSnapshot {
+  const totalBytes = os.totalmem(); const freeBytes = os.freemem(); const usedBytes = Math.max(0, totalBytes - freeBytes)
+  const metrics = app.getAppMetrics(); const processMemory = metrics.reduce((sum, metric) => sum + (metric.memory?.workingSetSize ?? 0) * 1024, 0); const processCpu = metrics.reduce((sum, metric) => sum + (metric.cpu?.percentCPUUsage ?? 0), 0); const loadPct = systemCpuLoadPct()
+  return { capturedAt: new Date().toISOString(), cpu: { logicalCores: os.cpus().length, ...(loadPct !== undefined ? { loadPct } : {}) }, memory: { totalBytes, freeBytes, usedBytes, usedPct: totalBytes > 0 ? usedBytes / totalBytes * 100 : 0 }, process: { ...(processMemory ? { memoryBytes: processMemory } : {}), ...(processCpu ? { cpuPct: processCpu } : {}) } }
+}
+function baselineRecoverySlot(projectName: string, mode: 'yellow' | 'green'): string { return createHash('sha256').update(`${projectName}\0${mode}`).digest('hex').slice(0, 24) }
+function baselineRecoveryInfo(workspace: WorkspaceRecord, projectName: string | undefined): BaselineRecoveryInfo | undefined {
+  if (!projectName) return undefined; const path = join(workspace.path, '.dependency-roadmap', 'state', 'baseline-run-recovery.json')
+  if (!existsSync(path)) return { available: false, reason: 'checkpoint-missing' }
+  try { const payload = JSON.parse(readFileSync(path, 'utf8')) as { entries?: Record<string, unknown> }; const entries = payload.entries && typeof payload.entries === 'object' ? payload.entries : {}; const candidates = (['yellow', 'green'] as const).flatMap((mode) => { const entry = entries[baselineRecoverySlot(projectName, mode)]; return entry && typeof entry === 'object' ? [{ mode, entry: entry as Record<string, unknown> }] : [] })
+    if (!candidates.length) return { available: false, reason: 'checkpoint-missing' }
+    const chosen = candidates.map((item) => ({ ...item, updatedAtMs: Date.parse(String(item.entry.updatedAt || '')) || 0 })).sort((left, right) => right.updatedAtMs - left.updatedAtMs)[0]; const entry = chosen.entry; const state = entry.state && typeof entry.state === 'object' ? entry.state as Record<string, unknown> : {}; const iteration = Number(state.iteration); const generation = Number(entry.generation); const learned = Array.isArray(state.learnedConstraints) ? state.learnedConstraints.length : undefined; const exact = Array.isArray(state.globalExactExclusions) ? state.globalExactExclusions.length : undefined
+    return { available: true, mode: chosen.mode, status: typeof entry.status === 'string' ? entry.status : undefined, phase: typeof entry.phase === 'string' ? entry.phase : undefined, updatedAt: typeof entry.updatedAt === 'string' ? entry.updatedAt : undefined, ...(Number.isFinite(generation) ? { generation } : {}), ...(Number.isFinite(iteration) ? { iteration } : {}), lastAssignment: typeof state.lastAssignment === 'string' ? state.lastAssignment : undefined, lastPredicate: typeof state.lastPredicate === 'string' ? state.lastPredicate : undefined, ...(learned !== undefined ? { learnedConstraints: learned } : {}), ...(exact !== undefined ? { exactExclusions: exact } : {}) }
+  } catch (error) { return { available: false, reason: error instanceof Error ? error.message : String(error) } }
+}
 function emptyState(): DesktopState {
-  return { schemaVersion: 1, notificationsEnabled: true, workspaces: [] }
+  return { schemaVersion: 1, notificationsEnabled: true, themePreference: 'system', workspaces: [] }
 }
 
 function loadState(): DesktopState {
@@ -475,7 +517,7 @@ function writeBestEffortHandoff(job: JobRecord): string | undefined {
   }
 }
 
-function updateTeamState(job: JobRecord, status: 'running' | 'passed' | 'failed'): void {
+function updateTeamState(job: JobRecord, status: 'running' | 'passed' | 'failed' | 'paused'): void {
   if (!job.projectName) return
   const path = teamStatePath(job.workspace)
   const current = readTeamState(job.workspace) ?? { schemaVersion: 1, updatedAt: new Date().toISOString(), projects: {} }
@@ -1404,6 +1446,7 @@ async function workspaceDetails(workspace: WorkspaceRecord): Promise<WorkspaceDe
     projectLevels: readProjectLevels(workspace),
     targetClosure: readTargetClosure(workspace, project, savedTarget === 'green' ? 'green' : 'yellow'),
     migrationProgress,
+    baselineRecovery: baselineRecoveryInfo(workspace, project?.name),
   }
 }
 
@@ -1566,7 +1609,7 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
       return [{
         label: 'Создание исходного baseline', command: 'python', cwd: workspace.path,
         args: [...commonGeneratorArgs, '--capture-baseline', '--baseline-label', input.label?.trim() || `dependency-flow-${new Date().toISOString().slice(0, 10)}`],
-        env: { DEPLOOM_BASELINE_RESUME: input.baselineResume === 'restart' ? 'restart' : 'auto' },
+        env: { DEPLOOM_BASELINE_RESUME: input.baselineResume === 'restart' ? 'restart' : input.baselineResume === 'continue' ? 'continue' : 'auto' },
         stallWarningMs: 2 * 60_000,
         stallAbortMs: 15 * 60_000,
       }]
@@ -4862,6 +4905,13 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
     exitCode = 0
     if (!teamStateFinalized) updateTeamState(job, 'passed')
   } catch (error) {
+    if (job.pauseRequested && job.action === 'baseline') {
+      exitCode = 0
+      errorMessage = ''
+      updateTeamState(job, 'paused')
+      send('flow:job-output', { jobId: job.id, stream: 'system', workspaceId: job.workspace.id, projectName: job.projectName, line: 'Baseline paused at the last safe checkpoint. Use Continue to resume, or Start over to reset the checkpoint.' })
+      return
+    }
     exitCode = exitCode || 1
     errorMessage = error instanceof Error ? error.message : String(error)
     let recovered = false
@@ -4917,7 +4967,7 @@ function setupIpc(): void {
   ipcMain.handle('flow:bootstrap', async () => {
     const state = loadState()
     const workspace = selectedWorkspace(state)
-    return { state, appVersion: app.getVersion(), environment: await environmentInfo(), details: workspace ? await workspaceDetails(workspace) : undefined, defaults: { templateRemote: DEFAULT_TEMPLATE_REMOTE, toolRemote: DEFAULT_TOOL_REMOTE }, updateStatus: currentUpdateStatus, notificationsEnabled: notificationsEnabled(state) }
+    return { state, appVersion: app.getVersion(), environment: await environmentInfo(), details: workspace ? await workspaceDetails(workspace) : undefined, defaults: { templateRemote: DEFAULT_TEMPLATE_REMOTE, toolRemote: DEFAULT_TOOL_REMOTE }, updateStatus: currentUpdateStatus, notificationsEnabled: notificationsEnabled(state), themePreference: currentThemePreference() }
   })
 
   ipcMain.handle('flow:set-notifications-enabled', (_event, enabled: boolean) => {
@@ -5179,6 +5229,21 @@ function setupIpc(): void {
     return { jobId: job.id, preview: commands.map((item) => `${item.command} ${item.args.join(' ')}`) }
   })
 
+  ipcMain.handle('flow:get-hardware-snapshot', () => hardwareSnapshot())
+  ipcMain.handle('flow:get-theme-preference', () => currentThemePreference())
+  ipcMain.handle('flow:set-theme-preference', (_event, value: unknown) => { const state = loadState(); const preference = applyThemePreference(value); saveState({ ...state, themePreference: preference }); return { preference } })
+
+  ipcMain.handle('flow:pause-job', (_event, jobId: string) => {
+    const job = jobs.get(jobId)
+    if (!job) return false
+    if (job.action !== 'baseline') return false
+    job.pauseRequested = true
+    job.cancelled = true
+    send('flow:job-output', { jobId: job.id, stream: 'system', workspaceId: job.workspace.id, projectName: job.projectName, line: 'Пауза Baseline: останавливаю текущий subprocess. Последний safe checkpoint сохранён; незавершённая операция будет повторена при «Продолжить».' })
+    if (job.child) killProcessTree(job.child)
+    return true
+  })
+
   ipcMain.handle('flow:cancel-job', (_event, jobId: string) => {
     const job = jobs.get(jobId)
     if (!job) return false
@@ -5404,6 +5469,7 @@ async function createWindow(): Promise<void> {
 }
 
 app.whenReady().then(async () => {
+  applyThemePreference(loadState().themePreference)
   app.setAppUserModelId('io.github.alexanderlevenskikh.deploom')
   setupIpc()
   await setupDashboardProtocol()

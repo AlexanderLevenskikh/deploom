@@ -4,7 +4,7 @@ import './App.css'
 import { AddProjectDialog } from './components/AddProjectDialog'
 import { DashboardWorkspace } from './components/DashboardWorkspace'
 import { FlowWorkspace } from './components/FlowWorkspace'
-import { LogPanel } from './components/LogPanel'
+import { MonitoringPanel } from './components/MonitoringPanel'
 import { ProjectRail } from './components/ProjectRail'
 import { SetupScreen } from './components/SetupScreen'
 import { useDependencyFlow } from './hooks/useDependencyFlow'
@@ -14,10 +14,11 @@ type WorkspaceTab = 'flow' | 'dashboard'
 
 function App() {
   const flow = useDependencyFlow()
-  const { language, setLanguage, t } = useLanguage()
+  const { language, setLanguage, t, text } = useLanguage()
   const [tab, setTab] = useState<WorkspaceTab>('flow')
   const [setupBusy, setSetupBusy] = useState(false)
   const [showAddProject, setShowAddProject] = useState(false)
+  const themePreference = flow.themePreference
   const payload = flow.payload
   const details = payload?.details
 
@@ -51,6 +52,11 @@ function App() {
         <div className="app-brand"><div className="brand-mark small"><GitFork size={18} /></div><strong>DepLoom</strong></div>
         <label className="workspace-select">Workspace<select value={details.workspace.id} onChange={(event) => void flow.selectWorkspace(event.target.value)}>{payload.state.workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}</select></label>
         <div className="header-actions">
+          <div className="theme-switch" role="group" aria-label={text('Тема интерфейса', 'Interface theme')}>
+            <button className={themePreference === 'light' ? 'active' : ''} aria-pressed={themePreference === 'light'} title={text('Светлая тема', 'Light theme')} onClick={() => void flow.setThemePreference('light')}>☀</button>
+            <button className={themePreference === 'system' ? 'active' : ''} aria-pressed={themePreference === 'system'} title={text('Системная тема', 'System theme')} onClick={() => void flow.setThemePreference('system')}>◐</button>
+            <button className={themePreference === 'dark' ? 'active' : ''} aria-pressed={themePreference === 'dark'} title={text('Тёмная тема', 'Dark theme')} onClick={() => void flow.setThemePreference('dark')}>☾</button>
+          </div>
           <div className="language-switch" role="group" aria-label={t('app.interfaceLanguage')}>
             <button className={language === 'ru' ? 'active' : ''} aria-pressed={language === 'ru'} onClick={() => setLanguage('ru')}>RU</button>
             <button className={language === 'en' ? 'active' : ''} aria-pressed={language === 'en'} onClick={() => setLanguage('en')}>EN</button>
@@ -77,7 +83,7 @@ function App() {
           {tab === 'dashboard' ? <DashboardWorkspace details={details} onRefresh={flow.refresh} onOpenExternal={() => flow.openPath(details.dashboardPath)} /> : null}
         </main>
 
-        <LogPanel logs={flow.logs} knownSources={knownLogSources} environment={payload.environment} active={Boolean(flow.activeJobId)} activeJobId={flow.activeJobId} activeAction={flow.activeAction} runStartedAt={flow.activeRunStartedAt} migrationProgress={details.migrationProgress} onSendAgentNote={flow.sendAgentNote} onCancel={() => void flow.cancelJob()} onClear={flow.clearLogs} />
+        <MonitoringPanel logs={flow.logs} knownSources={knownLogSources} environment={payload.environment} active={Boolean(flow.activeJobId)} activeJobId={flow.activeJobId} activeAction={flow.activeAction} runStartedAt={flow.activeRunStartedAt} migrationProgress={details.migrationProgress} baselineRecovery={details.baselineRecovery} onSendAgentNote={flow.sendAgentNote} onPauseBaseline={flow.activeAction === 'baseline' ? flow.pauseJob : undefined} onCancel={() => void flow.cancelJob()} onClear={flow.clearLogs} getHardwareSnapshot={flow.getHardwareSnapshot} />
       </div>
 
       {showAddProject ? <AddProjectDialog workspaceId={details.workspace.id} onClose={() => setShowAddProject(false)} onPickDirectory={flow.pickDirectory} onSubmit={flow.addProject} /> : null}

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ActionInput, AgentProvider, BootstrapPayload, DownloadSaved, FlowAction, JobFinished, JobOutput, ProjectSpec, TargetLevel, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
+import type { ActionInput, AgentProvider, BootstrapPayload, DownloadSaved, FlowAction, HardwareSnapshot, JobFinished, JobOutput, ProjectSpec, TargetLevel, ThemePreference, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
 import { goalSeekingStopReason, nextAutopilotAction, type AutopilotPolicyState } from '../autopilot-policy'
 
 const DEMO_WORKSPACE: WorkspaceRecord = {
@@ -110,6 +110,7 @@ export function useDependencyFlow() {
   const [lastDownload, setLastDownload] = useState<DownloadSaved>()
   const [pendingRoadmapRecalc, setPendingRoadmapRecalc] = useState<Array<{ workspaceId: string; projectName: string }>>()
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>({ state: 'idle' })
+  const [themePreference, setThemePreferenceState] = useState<ThemePreference>('system')
   const [autopilotActive, setAutopilotActive] = useState(false)
   const autopilotRef = useRef<AutopilotState | undefined>(undefined)
   const api = window.dependencyFlow
@@ -120,6 +121,7 @@ export function useDependencyFlow() {
       const nextPayload = api ? await api.bootstrap() : DEMO
       setPayload(nextPayload)
       setUpdateStatus(nextPayload.updateStatus ?? { state: 'idle' })
+      setThemePreferenceState(nextPayload.themePreference ?? 'system')
       setError(undefined)
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : String(loadError))
@@ -491,6 +493,10 @@ export function useDependencyFlow() {
     if (api && activeJobId) await api.cancelJob(activeJobId)
   }, [activeJobId, api])
 
+  const pauseJob = useCallback(async () => { if (!api || !activeJobId) return false; return api.pauseJob(activeJobId) }, [activeJobId, api])
+  const getHardwareSnapshot = useCallback(async (): Promise<HardwareSnapshot> => { if (!api) throw new Error('Desktop API is unavailable'); return api.getHardwareSnapshot() }, [api])
+  const setThemePreference = useCallback(async (preference: ThemePreference) => { setThemePreferenceState(preference); if (!api) return; const result = await api.setThemePreference(preference); setThemePreferenceState(result.preference); document.documentElement.dataset.theme = result.preference === 'system' ? '' : result.preference }, [api])
+
   const cancelJob = useCallback(async () => {
     if (api && activeJobId) await api.cancelJob(activeJobId)
   }, [activeJobId, api])
@@ -568,6 +574,6 @@ export function useDependencyFlow() {
   return {
     payload, loading, error, activeJobId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject,
     load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches,
-    runAction, startAutopilot, stopAutopilot, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
+    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, themePreference, setThemePreference, clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }
 }

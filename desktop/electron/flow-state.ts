@@ -1,5 +1,5 @@
 export type FlowAction = 'preflight' | 'sync-tool' | 'baseline' | 'generate' | 'generate-all' | 'audit' | 'agent' | 'recover' | 'release' | 'commit-state' | 'push-workspace'
-export type FlowRunStatus = 'running' | 'passed' | 'failed'
+export type FlowRunStatus = 'running' | 'passed' | 'failed' | 'paused'
 
 export type FlowProgressState = {
   lastAction: string
@@ -27,6 +27,12 @@ export function updateFlowProgress(
     }
   }
   if (status === 'passed' && action !== 'recover') completedActions.add(action)
+  if (status === 'paused') return {
+    lastAction: preservePosition ? previous!.lastAction : action,
+    status: preservePosition ? previous!.status : status,
+    target: target ?? previous?.target,
+    completedActions: [...completedActions],
+  }
   if (status === 'failed') {
     const actionIndex = FLOW_ACTION_ORDER.indexOf(action)
     if (actionIndex >= 0) {

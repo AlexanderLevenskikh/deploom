@@ -1,6 +1,11 @@
 export type AgentProvider = 'codex' | 'opencode' | 'claude'
 export type FlowAction = 'preflight' | 'sync-tool' | 'baseline' | 'generate' | 'generate-all' | 'audit' | 'agent' | 'recover' | 'release' | 'commit-state' | 'push-workspace'
 export type TargetLevel = 'yellow' | 'green'
+export type ThemePreference = 'system' | 'light' | 'dark'
+
+export type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
+export type BaselineRecoveryInfo = { available: boolean; mode?: 'yellow' | 'green'; status?: string; phase?: string; updatedAt?: string; generation?: number; iteration?: number; lastAssignment?: string; lastPredicate?: string; learnedConstraints?: number; exactExclusions?: number; reason?: string }
+
 export type ProjectLevel = { status: 'red' | 'yellow' | 'green'; lagOkPct?: number; remainingYellow?: number; remainingGreen?: number; measuredAt?: string }
 
 export type ProjectSpec = {
@@ -35,6 +40,7 @@ export type DesktopState = {
   schemaVersion: 1
   selectedWorkspaceId?: string
   notificationsEnabled?: boolean
+  themePreference?: ThemePreference
   workspaces: WorkspaceRecord[]
 }
 
@@ -51,7 +57,7 @@ export type TeamFlowState = {
   // under that loop. A project has one or the other, never both.
   projects: Record<string, {
     lastAction: string
-    status: 'running' | 'passed' | 'failed'
+    status: 'running' | 'passed' | 'failed' | 'paused'
     updatedAt: string
     target?: string
     releaseBranch?: string
@@ -155,6 +161,7 @@ export type WorkspaceDetails = {
   projectLevels: Record<string, ProjectLevel>
   targetClosure?: TargetClosure
   migrationProgress?: MigrationProgress
+  baselineRecovery?: BaselineRecoveryInfo
 }
 
 export type BootstrapPayload = {
@@ -165,6 +172,7 @@ export type BootstrapPayload = {
   defaults: { templateRemote: string; toolRemote: string }
   updateStatus?: UpdateStatus
   notificationsEnabled: boolean
+  themePreference?: ThemePreference
 }
 
 export type ActionInput = {
@@ -179,7 +187,7 @@ export type ActionInput = {
   gateCommand?: string
   resumeAgent?: boolean
   restartMigration?: boolean
-  baselineResume?: 'auto' | 'restart'
+  baselineResume?: 'auto' | 'continue' | 'restart'
   agentNote?: string
   // Internal marker: suppress per-stage desktop notifications while the
   // Autopilot owns the whole multi-stage FLOW. The final Autopilot notification
@@ -207,6 +215,7 @@ export type DependencyFlowApi = {
   refreshWorkspace: () => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   runAction: (input: ActionInput) => Promise<{ jobId: string; preview: string[] }>
   cancelJob: (jobId: string) => Promise<boolean>
+  pauseJob: (jobId: string) => Promise<boolean>
   sendAgentNote: (input: { jobId: string; note: string; branch?: string }) => Promise<boolean>
   recoverWithAgent: (input: { workspaceId?: string; projectName: string; note: string }) => Promise<{ jobId: string }>
   openPath: (targetPath: string) => Promise<string>
@@ -214,6 +223,9 @@ export type DependencyFlowApi = {
   setNotificationsEnabled: (enabled: boolean) => Promise<{ enabled: boolean }>
   notifyAutopilotComplete: (input: { projectName: string; published: boolean }) => Promise<void>
   installUpdate: () => Promise<void>
+  getHardwareSnapshot: () => Promise<HardwareSnapshot>
+  getThemePreference: () => Promise<ThemePreference>
+  setThemePreference: (preference: ThemePreference) => Promise<{ preference: ThemePreference }>
   onUpdateStatus: (handler: (event: UpdateStatus) => void) => () => void
   onJobOutput: (handler: (event: JobOutput) => void) => () => void
   onMigrationProgressChanged: (handler: (event: { jobId: string; workspaceId?: string; projectName?: string; branch: string; phase?: MigrationBranchRuntimePhase }) => void) => () => void
