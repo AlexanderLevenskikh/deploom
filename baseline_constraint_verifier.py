@@ -53,6 +53,7 @@ from resolved_dependency_state import (
 from prepared_workspace_fastpath import (
     acquire_snapshot_copy_lease,
     build_dependency_integrity_manifest,
+    WorkspaceChangeGuard,
     try_acquire_snapshot_cleanup_lease,
     cleanup_guarded_clone,
     guarded_clone_is_active,
@@ -1721,8 +1722,21 @@ def verify_assignment(
                 return BaselineVerifyResult(False, "infrastructure", "PREPARED_SNAPSHOT_UNAVAILABLE: project checks require a sealed preparation tree")
 
             project_failures: List[BaselineProjectFailure] = []
+            reusable_private_root: Optional[Path] = None
+            reusable_private_project: Optional[Path] = None
+
             for command_index, command in enumerate(config.commands, start=1):
-                command_root = temp_root / f"project-check-{command_index:02d}"
+                reusing_private_trial = bool(
+                    reusable_private_root is not None
+                    and reusable_private_project is not None
+                    and reusable_private_root.is_dir()
+                    and reusable_private_project.is_dir()
+                )
+                command_root = (
+                    reusable_private_root
+                    if reusing_private_trial and reusable_private_root is not None
+                    else temp_root / "project-check-transaction"
+                )
                 clone_started = time.monotonic()
                 clone_timeout = snapshot_copy_timeout()
                 event(
@@ -1732,46 +1746,61 @@ def verify_assignment(
                     checks=len(config.commands),
                     preparationProofKey=proof_identity.preparation_proof_key,
                     hardTimeoutSeconds=clone_timeout,
+                    reusedPrivateTrial=reusing_private_trial,
                 )
-                _emit_progress(
-                    progress,
-                    f"{progress_label}: project clone {command_index}/{len(config.commands)} started; "
-                    f"hardTimeout={clone_timeout}s",
-                )
-                try:
-                    command_fastpath_allowed = (
-                        _allow_prepared_fastpath
-                        and bool(snapshot.dependency_integrity)
-                        and _prepared_command_fastpath_allowed(
-                            project_dir, command
-                        )
+
+                if reusing_private_trial:
+                    assert reusable_private_project is not None
+                    command_project = reusable_private_project
+                    clone_isolation = "reused-private-trial"
+                    _emit_progress(
+                        progress,
+                        f"{progress_label}: project check {command_index}/{len(config.commands)} "
+                        "reusing unchanged private verification trial; clone skipped",
                     )
-                    if (
-                        _allow_prepared_fastpath
-                        and bool(snapshot.dependency_integrity)
-                        and not command_fastpath_allowed
-                    ):
-                        _emit_progress(
-                            progress,
-                            f"{progress_label}: NTFS fast clone command quarantine "
-                            f"for {command}; using proof-safe private copy",
-                        )
-                    command_project = _materialize_prepared_workspace_snapshot(
-                        snapshot,
-                        command_root,
-                        allow_fastpath=command_fastpath_allowed,
-                        progress=progress,
-                        progress_label=f"{progress_label}: project-clone:{command_index}/{len(config.commands)}",
-                        timeout_seconds=clone_timeout,
-                        progress_interval_seconds=config.progress_interval_seconds,
+                else:
+                    if command_root.exists():
+                        shutil.rmtree(command_root, ignore_errors=True)
+                    _emit_progress(
+                        progress,
+                        f"{progress_label}: project clone {command_index}/{len(config.commands)} started; "
+                        f"hardTimeout={clone_timeout}s",
                     )
-                except Exception as exc:
-                    return BaselineVerifyResult(False, "infrastructure", f"PREPARED_SNAPSHOT_CLONE_FAILED: {command}: {exc}", command=command)
-                clone_isolation = (
-                    "ntfs-junction-guarded"
-                    if guarded_clone_is_active(command_root)
-                    else "fresh-prepared-snapshot-clone"
-                )
+                    try:
+                        command_fastpath_allowed = (
+                            _allow_prepared_fastpath
+                            and bool(snapshot.dependency_integrity)
+                            and _prepared_command_fastpath_allowed(
+                                project_dir, command
+                            )
+                        )
+                        if (
+                            _allow_prepared_fastpath
+                            and bool(snapshot.dependency_integrity)
+                            and not command_fastpath_allowed
+                        ):
+                            _emit_progress(
+                                progress,
+                                f"{progress_label}: NTFS fast clone command quarantine "
+                                f"for {command}; using proof-safe private copy",
+                            )
+                        command_project = _materialize_prepared_workspace_snapshot(
+                            snapshot,
+                            command_root,
+                            allow_fastpath=command_fastpath_allowed,
+                            progress=progress,
+                            progress_label=f"{progress_label}: project-clone:{command_index}/{len(config.commands)}",
+                            timeout_seconds=clone_timeout,
+                            progress_interval_seconds=config.progress_interval_seconds,
+                        )
+                    except Exception as exc:
+                        return BaselineVerifyResult(False, "infrastructure", f"PREPARED_SNAPSHOT_CLONE_FAILED: {command}: {exc}", command=command)
+                    clone_isolation = (
+                        "ntfs-junction-guarded"
+                        if guarded_clone_is_active(command_root)
+                        else "fresh-prepared-snapshot-clone"
+                    )
+
                 clone_duration_ms = int((time.monotonic() - clone_started) * 1000)
                 event(
                     "verify.project-check.clone.finish",
@@ -1781,16 +1810,31 @@ def verify_assignment(
                     durationMs=clone_duration_ms,
                     preparationProofKey=proof_identity.preparation_proof_key,
                     isolation=clone_isolation,
+                    reusedPrivateTrial=reusing_private_trial,
                 )
                 _emit_progress(
                     progress,
                     f"{progress_label}: project clone {command_index}/{len(config.commands)} PASS; "
                     f"elapsed={clone_duration_ms // 1000}s; isolation={clone_isolation}",
                 )
+
+                workspace_guard: Optional[WorkspaceChangeGuard] = None
+                workspace_guard_started = False
                 try:
                     removed_caches = clean_ephemeral_verification_caches(command_project)
                     if removed_caches:
                         _emit_progress(progress, f"{progress_label}: normalized transient caches before {command}: {', '.join(removed_caches)}")
+
+                    if clone_isolation in {"fresh-prepared-snapshot-clone", "reused-private-trial"}:
+                        workspace_guard = WorkspaceChangeGuard(command_root)
+                        workspace_guard_started = workspace_guard.start()
+                        if not workspace_guard_started:
+                            _emit_progress(
+                                progress,
+                                f"{progress_label}: private-trial mutation guard unavailable; "
+                                "current check remains proof-safe, but this trial will not be reused",
+                            )
+
                     _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} started: {command}")
                     check_started = time.monotonic()
                     event(
@@ -1945,8 +1989,56 @@ def verify_assignment(
                     project_failures.append(BaselineProjectFailure(command, check_result.returncode, tail))
                     _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} RED exit={check_result.returncode}: {command}")
                 finally:
-                    cleanup_guarded_clone(command_root)
-                    shutil.rmtree(command_root, ignore_errors=True)
+                    workspace_changes = workspace_guard.stop() if workspace_guard is not None else None
+
+                    if clone_isolation == "ntfs-junction-guarded":
+                        cleanup_guarded_clone(command_root)
+                        shutil.rmtree(command_root, ignore_errors=True)
+                        reusable_private_root = None
+                        reusable_private_project = None
+                    elif (
+                        workspace_guard_started
+                        and workspace_changes is not None
+                        and not workspace_changes.errors
+                        and not workspace_changes.changes
+                        and command_root.is_dir()
+                        and command_project.is_dir()
+                    ):
+                        reusable_private_root = command_root
+                        reusable_private_project = command_project
+                        event(
+                            "verify.project-check.trial-reuse-ready",
+                            command=command,
+                            check=command_index,
+                            checks=len(config.commands),
+                            preparationProofKey=proof_identity.preparation_proof_key,
+                        )
+                        _emit_progress(
+                            progress,
+                            f"{progress_label}: private verification trial remained unchanged; "
+                            "next project check may reuse it without cloning",
+                        )
+                    else:
+                        if workspace_changes is not None:
+                            event(
+                                "verify.project-check.trial-reuse-rejected",
+                                command=command,
+                                check=command_index,
+                                checks=len(config.commands),
+                                preparationProofKey=proof_identity.preparation_proof_key,
+                                reason=(
+                                    "watcher-error"
+                                    if workspace_changes.errors
+                                    else "workspace-mutated"
+                                    if workspace_changes.changes
+                                    else "watcher-unavailable"
+                                ),
+                                changes=list(workspace_changes.changes[:64]),
+                                watcherErrors=list(workspace_changes.errors),
+                            )
+                        reusable_private_root = None
+                        reusable_private_project = None
+                        shutil.rmtree(command_root, ignore_errors=True)
 
             if project_failures:
                 summary_commands = ", ".join(item.command for item in project_failures)

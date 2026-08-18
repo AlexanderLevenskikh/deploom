@@ -132,6 +132,10 @@ export function useDependencyFlow() {
 
   useEffect(() => { void load() }, [load])
 
+  useEffect(() => {
+    document.documentElement.dataset.theme = themePreference === 'system' ? '' : themePreference
+  }, [themePreference])
+
   // A refresh walks the project's git history, so it can outlast the poll
   // interval on a busy machine. Without this guard the polls pile up, multiply
   // the git load that made them slow, and land out of order -- an older

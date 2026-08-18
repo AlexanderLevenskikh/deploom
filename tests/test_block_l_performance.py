@@ -91,7 +91,7 @@ class BlockLPerformanceTests(unittest.TestCase):
         self.assertEqual(["a", "b"], list(main.npm_cache))
         self.assertNotIn("local", main.npm_cache)
 
-    def test_production_path_has_snapshot_reuse_and_per_command_isolation(self) -> None:
+    def test_production_path_has_snapshot_reuse_and_fail_closed_transactional_isolation(self) -> None:
         source = Path(verifier.__file__).read_text(encoding="utf-8")
 
         # Snapshot reuse remains mandatory.
@@ -99,15 +99,18 @@ class BlockLPerformanceTests(unittest.TestCase):
         self.assertIn("_publish_prepared_workspace_snapshot(", source)
         self.assertIn("verify.preparation.snapshot-hit", source)
 
-        # Every project command still gets its own command root and cleanup.
-        self.assertIn(
-            'command_root = temp_root / f"project-check-{command_index:02d}"',
-            source,
-        )
+        # Project checks reuse one fully-private trial only when a whole-workspace
+        # watcher proves that the previous command produced no filesystem events.
+        # Any event or watcher uncertainty discards the trial before the next check.
+        self.assertIn('else temp_root / "project-check-transaction"', source)
         self.assertIn("for command_index, command in enumerate(config.commands, start=1):", source)
+        self.assertIn('clone_isolation = "reused-private-trial"', source)
+        self.assertIn("WorkspaceChangeGuard(command_root)", source)
+        self.assertIn("verify.project-check.trial-reuse-ready", source)
+        self.assertIn("verify.project-check.trial-reuse-rejected", source)
         self.assertIn("shutil.rmtree(command_root, ignore_errors=True)", source)
 
-        # The production path now has two proof-preserving isolation backends:
+        # The production path still has proof-preserving isolation backends:
         # guarded NTFS zero-copy fast path plus safe full-copy fallback.
         self.assertIn('"ntfs-junction-guarded"', source)
         self.assertIn('"fresh-prepared-snapshot-clone"', source)

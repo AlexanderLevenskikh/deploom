@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 from block_vex_storage import verification_root
+from prepared_workspace_fastpath import try_acquire_snapshot_cleanup_lease
 
 ARTIFACT_INDEX_SCHEMA = 1
 ARTIFACT_AUTHORITY = "PRECONDITION_CACHE"
@@ -39,6 +40,11 @@ def configure_prepared_artifact_store(proof_cache_dir: str | Path | None) -> Opt
     (root / "trees").mkdir(parents=True, exist_ok=True)
     with _LOCK:
         _CONFIGURED_ROOT = root
+
+    # PreparedArtifact is a performance cache. Keep it bounded by default;
+    # pruning never changes proof authority and uses the same live snapshot
+    # lease before removing any tree.
+    prune_prepared_artifact_store(max_count=8)
     return root
 
 def configured_prepared_artifact_root() -> Optional[Path]:
@@ -207,22 +213,38 @@ def invalidate_prepared_artifact_record(key: str, *, remove_tree: bool = False) 
     path = _record_path(key)
     if path is None:
         return
-    tree: Optional[Path] = None
+
+    workspace: Optional[Path] = None
     if remove_tree and path.is_file():
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(payload, dict) and isinstance(payload.get("workspaceRoot"), str):
                 candidate = Path(str(payload["workspaceRoot"]))
                 if is_durable_prepared_path(candidate):
-                    tree = candidate.parent
+                    workspace = candidate
         except (OSError, ValueError, TypeError):
-            tree = None
+            workspace = None
+
     try:
         path.unlink(missing_ok=True)
     except OSError:
         pass
-    if tree is not None:
-        shutil.rmtree(tree, ignore_errors=True)
+
+    if workspace is None:
+        return
+
+    lease = None
+    if os.name == "nt":
+        lease = try_acquire_snapshot_cleanup_lease(workspace)
+        if lease is None:
+            # Locator is already invalidated. Leaving an unreachable tree is
+            # safer than deleting bytes under a live cross-process reader.
+            return
+    try:
+        shutil.rmtree(workspace.parent, ignore_errors=True)
+    finally:
+        if lease is not None:
+            lease.close()
 
 
 def prune_prepared_artifact_store(max_count: int = 8) -> int:

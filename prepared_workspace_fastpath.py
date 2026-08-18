@@ -24,6 +24,53 @@ class GuardResult:
     notification_only: tuple[str, ...] = ()
 
 
+@dataclasses.dataclass(frozen=True)
+class WorkspaceChangeResult:
+    # Observed writes in one fully-private verification trial.
+    changes: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
+
+
+class WorkspaceChangeGuard:
+    # Conservative whole-workspace mutation detector. A clean result only
+    # permits reuse of the already-private trial for the next check. Any event,
+    # watcher error, unsupported platform, or overflow forces fresh materialization.
+
+    def __init__(self, root: Path) -> None:
+        self.root = root.resolve()
+        self._watcher: Optional["_DirectoryWatcher"] = None
+        self._started = False
+        self._stopped: Optional[WorkspaceChangeResult] = None
+
+    def start(self) -> bool:
+        if os.name != "nt":
+            return False
+        watcher = _DirectoryWatcher(self.root)
+        self._watcher = watcher
+        self._started = watcher.start()
+        return self._started
+
+    def stop(self) -> WorkspaceChangeResult:
+        if self._stopped is not None:
+            return self._stopped
+        watcher = self._watcher
+        if watcher is None:
+            self._stopped = WorkspaceChangeResult(errors=("workspace watcher unavailable",))
+            return self._stopped
+        if self._started:
+            watcher.stop()
+        changes = tuple(sorted({
+            f"{action}:{name.replace(chr(92), '/')}"
+            for action, name in watcher.events
+            if name
+        }))
+        self._stopped = WorkspaceChangeResult(
+            changes=changes,
+            errors=tuple(watcher.errors),
+        )
+        return self._stopped
+
+
 
 
 # The rendezvous file name is not authority. Ownership is a live Windows kernel

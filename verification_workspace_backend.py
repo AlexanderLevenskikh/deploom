@@ -48,10 +48,16 @@ def _copy_workers(*, refs_same_volume: bool = False) -> int:
     ).strip()
     if raw:
         try:
-            return max(1, min(32, int(raw)))
+            return max(1, min(128, int(raw)))
         except ValueError:
             pass
-    return 24 if refs_same_volume else 8
+
+    # node_modules copies are dominated by per-file metadata/filter latency.
+    # Scale with the machine instead of pinning every user to the old 8/24
+    # defaults; robocopy supports /MT up to 128.
+    logical = max(1, int(os.cpu_count() or 4))
+    adaptive = max(16, min(128, logical * 4))
+    return max(32, adaptive) if refs_same_volume else adaptive
 
 
 def workspace_backend_summary(root: Optional[Path] = None) -> str:
@@ -66,7 +72,7 @@ def workspace_backend_summary(root: Optional[Path] = None) -> str:
             )
         return (
             "windows-private-copy "
-            "(set DEPLOOM_VERIFICATION_ROOT to a ReFS/Dev Drive for CoW-eligible trials)"
+            "(zero-config private verification; optional optimized roots are auto-detected/configurable)"
         )
     if sys.platform == "darwin":
         return "macos-apfs-clone-first (private-copy fallback)"
@@ -109,7 +115,7 @@ def materialize_private_tree(
                     "/E",
                     "/COPY:DAT",
                     "/DCOPY:DAT",
-                    "/R:1",
+                    "/R:3",
                     "/W:1",
                     "/NFL",
                     "/NDL",
@@ -175,3 +181,5 @@ def materialize_private_tree(
 
     shutil.copytree(source, target, symlinks=True)
     return "portable-deep-copy"
+
+# BLOCK_VG_ZERO_CONFIG_TRANSACTIONAL_UI_V1

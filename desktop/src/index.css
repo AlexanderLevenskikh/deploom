@@ -29,3 +29,55 @@ html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 button, input, select { font: inherit; letter-spacing: 0; }
 button { color: inherit; }
 code { font-family: var(--mono); font-size: 12px; }
+
+/* BLOCK_VG_DARK_THEME_COMPLETION_V1 */
+html[data-theme='light'] {
+  color-scheme: light;
+}
+
+html[data-theme='dark'] {
+  color-scheme: dark;
+  --text: #eef2ff;
+  --muted: #a7b2c7;
+  --subtle: #8290a8;
+  --border: #2a3650;
+  --border-strong: #3a4965;
+  --surface: #151d2d;
+  --surface-hover: #202b42;
+  --blue: #6ea8ff;
+  --blue-hover: #8bb8ff;
+  --blue-soft: #172b50;
+  --green: #62d384;
+  --green-soft: #163524;
+  --amber: #f1b54d;
+  --amber-soft: #3a2b13;
+  --red: #ff737b;
+  --red-soft: #3b181d;
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme='light']) {
+    color-scheme: dark;
+    --text: #eef2ff;
+    --muted: #a7b2c7;
+    --subtle: #8290a8;
+    --border: #2a3650;
+    --border-strong: #3a4965;
+    --surface: #151d2d;
+    --surface-hover: #202b42;
+    --blue: #6ea8ff;
+    --blue-hover: #8bb8ff;
+    --blue-soft: #172b50;
+    --green: #62d384;
+    --green-soft: #163524;
+    --amber: #f1b54d;
+    --amber-soft: #3a2b13;
+    --red: #ff737b;
+    --red-soft: #3b181d;
+  }
+}
+
+body {
+  background: var(--surface);
+  color: var(--text);
+}

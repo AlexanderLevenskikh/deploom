@@ -13,6 +13,8 @@ import dataclasses
 import os
 import shutil
 import string
+import sys
+import tempfile
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -39,6 +41,8 @@ class VerificationStorageProfile:
     explicit: bool = False
     automatic: bool = False
     refs_same_volume_capable: bool = False
+    default: bool = False
+    fallback_from: str = ""
 
     @property
     def optimized(self) -> bool:
@@ -101,6 +105,51 @@ def windows_filesystem(path: Path) -> str:
         return ""
 
 
+
+def _default_verification_root(
+    environment: Optional[Mapping[str, str]] = None,
+) -> Path:
+    # Zero-configuration user cache root. Verification bytes are performance
+    # substrate, not project state, so large trees stay outside the repository.
+    env = environment if environment is not None else os.environ
+    if os.name == "nt":
+        base = str(env.get("LOCALAPPDATA") or env.get("TEMP") or "").strip()
+        if base:
+            return Path(base).expanduser().absolute() / "DepLoom" / "verification"
+        return Path.home() / "AppData" / "Local" / "DepLoom" / "verification"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "DepLoom" / "verification"
+    base = str(env.get("XDG_CACHE_HOME") or "").strip()
+    if base:
+        return Path(base).expanduser().absolute() / "deploom" / "verification"
+    return Path.home() / ".cache" / "deploom" / "verification"
+
+
+def _ensure_writable_root(root: Path) -> Optional[Path]:
+    # Create and write-probe a performance root; uncertainty falls back.
+    probe_path: Optional[Path] = None
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        fd, raw_probe = tempfile.mkstemp(prefix=".deploom-write-probe-", dir=str(root))
+        os.close(fd)
+        probe_path = Path(raw_probe)
+        probe_path.unlink()
+        return root
+    except OSError:
+        if probe_path is not None:
+            try:
+                probe_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return None
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return os.path.normcase(str(left.resolve())) == os.path.normcase(str(right.resolve()))
+    except OSError:
+        return os.path.normcase(str(left.absolute())) == os.path.normcase(str(right.absolute()))
+
 def _candidate_refs_roots() -> list[tuple[int, Path]]:
     """Return ReFS volume roots ranked by free space.
 
@@ -134,22 +183,28 @@ def _candidate_refs_roots() -> list[tuple[int, Path]]:
 def verification_root(
     environment: Optional[Mapping[str, str]] = None,
 ) -> Optional[Path]:
+    # Resolve the verification root with a zero-config, non-invasive fallback.
+    # Explicit/auto ReFS remains optional; missing/read-only roots fall back.
     env = environment if environment is not None else os.environ
     raw = str(env.get("DEPLOOM_VERIFICATION_ROOT") or "").strip()
     auto = str(env.get("DEPLOOM_VEX_AUTO_REFS") or "").strip().lower() in {
         "1", "true", "yes", "on"
     }
+
+    preferred: Optional[Path] = None
     if raw and raw.lower() not in {"auto", "refs", "devdrive"}:
-        root = Path(raw).expanduser().absolute()
-        root.mkdir(parents=True, exist_ok=True)
-        return root
-    if raw.lower() in {"auto", "refs", "devdrive"} or auto:
+        preferred = Path(raw).expanduser().absolute()
+    elif raw.lower() in {"auto", "refs", "devdrive"} or auto:
         candidates = _candidate_refs_roots()
         if candidates:
-            root = candidates[0][1] / "DepLoom" / "verification"
-            root.mkdir(parents=True, exist_ok=True)
-            return root
-    return None
+            preferred = candidates[0][1] / "DepLoom" / "verification"
+
+    if preferred is not None:
+        usable = _ensure_writable_root(preferred)
+        if usable is not None:
+            return usable
+
+    return _ensure_writable_root(_default_verification_root(env))
 
 
 def verification_storage_profile(
@@ -157,12 +212,26 @@ def verification_storage_profile(
 ) -> VerificationStorageProfile:
     env = environment if environment is not None else os.environ
     raw = str(env.get("DEPLOOM_VERIFICATION_ROOT") or "").strip()
-    automatic = raw.lower() in {"auto", "refs", "devdrive"} or str(
+    requested_auto = raw.lower() in {"auto", "refs", "devdrive"} or str(
         env.get("DEPLOOM_VEX_AUTO_REFS") or ""
     ).strip().lower() in {"1", "true", "yes", "on"}
+    explicit_raw = bool(raw and raw.lower() not in {"auto", "refs", "devdrive"})
+    requested_explicit = Path(raw).expanduser().absolute() if explicit_raw else None
+
     root = verification_root(env)
     if root is None:
         return VerificationStorageProfile(None)
+
+    default_root = _default_verification_root(env)
+    is_default = _same_path(root, default_root)
+    explicit = bool(requested_explicit is not None and _same_path(root, requested_explicit))
+    automatic = bool(requested_auto and not is_default)
+    fallback_from = ""
+    if is_default and explicit_raw:
+        fallback_from = raw
+    elif is_default and requested_auto:
+        fallback_from = "auto-refs"
+
     filesystem = windows_filesystem(root) if os.name == "nt" else ""
     volume_root = _windows_volume_root(root) if os.name == "nt" else str(root.anchor)
     try:
@@ -174,9 +243,11 @@ def verification_storage_profile(
         filesystem=filesystem,
         volume_root=volume_root,
         free_bytes=free,
-        explicit=bool(raw and not automatic),
+        explicit=explicit,
         automatic=automatic,
         refs_same_volume_capable=bool(os.name == "nt" and filesystem == "refs"),
+        default=is_default,
+        fallback_from=fallback_from,
     )
 
 
@@ -208,7 +279,11 @@ def package_manager_cache_environment(
     ):
         return {}
 
-    if profile.optimized and profile.root is not None:
+    # Keep package-manager artifacts isolated from the user's native cache,
+    # but place them in the zero-config verification root when available.
+    # This preserves the existing isolation contract without requiring ReFS
+    # or writing large caches into the project workspace.
+    if profile.root is not None:
         base = profile.root / "package-manager-artifacts" / normalized
     elif proof_cache_dir:
         base = (
@@ -218,7 +293,10 @@ def package_manager_cache_environment(
         )
     else:
         return {}
-    base.mkdir(parents=True, exist_ok=True)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return {}
 
     if normalized == "npm":
         return {"npm_config_cache": str(base)}
@@ -239,5 +317,8 @@ def storage_summary(
         if profile.filesystem == "refs"
         else (profile.filesystem or "unknown-filesystem")
     )
-    source = "auto" if profile.automatic else "explicit"
-    return f"{mode}; root={profile.root}; source={source}; freeGiB={free_gib:.1f}"
+    source = "auto" if profile.automatic else ("explicit" if profile.explicit else "default")
+    fallback = f"; fallbackFrom={profile.fallback_from}" if profile.fallback_from else ""
+    return f"{mode}; root={profile.root}; source={source}; freeGiB={free_gib:.1f}{fallback}"
+
+# BLOCK_VG_ZERO_CONFIG_TRANSACTIONAL_UI_V1

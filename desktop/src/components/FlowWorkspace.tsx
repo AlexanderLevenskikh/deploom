@@ -141,7 +141,8 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
     const stage = FLOW_STAGES[stageIndex]
     if (!stage.action) { onOpenDashboard(); return }
     const resumeAgent = stage.action === 'agent' && (resumeOverride ?? canResumeAgent)
-    if (stage.confirmationKey && !window.confirm(t(stage.confirmationKey))) return
+    const skipBaselineModeConfirmation = stage.action === 'baseline' && Boolean(baselineResume && baselineResume !== 'auto')
+    if (stage.confirmationKey && !skipBaselineModeConfirmation && !window.confirm(t(stage.confirmationKey))) return
     const noteToSend = stage.action === 'agent' && !restartMigration ? agentNote.trim() || undefined : undefined
     await onRun({ action: stage.action, workspaceId: details.workspace.id, projectName: project.name, target, label, releaseBranch, gateCommand, resumeAgent, restartMigration, baselineResume: stage.action === 'baseline' ? (baselineResume ?? 'auto') : undefined, agentNote: noteToSend, commitMessage: `chore(deps): save ${project.name} roadmap state` })
     if (noteToSend) setAgentNote('')
@@ -319,7 +320,7 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
           <div className="documents-contract">
             <FileText size={18} /><div><strong>{t('flow.documents.title')}</strong><p>{t('flow.documents.description')}</p></div>
           </div>
-          {FLOW_STAGES[displayedIndex].confirmationKey ? <div className="confirmation"><AlertTriangle size={18} /><span>{t(FLOW_STAGES[displayedIndex].confirmationKey)}</span></div> : null}
+          {FLOW_STAGES[displayedIndex].confirmationKey && !(FLOW_STAGES[displayedIndex].action === 'baseline' && details.baselineRecovery?.available) ? <div className="confirmation"><AlertTriangle size={18} /><span>{t(FLOW_STAGES[displayedIndex].confirmationKey)}</span></div> : null}
           <div className="stage-actions">
             {FLOW_STAGES[displayedIndex].action === 'agent' && !canResumeAgent ? <button className="button secondary" disabled={active} title={text('Необязательно: Desktop сам построит актуальный prompt. Используйте только чтобы явно подменить его файлом.', 'Optional: Desktop builds the current prompt automatically. Use this only to explicitly replace it with a file.')} onClick={() => void onChoosePrompt(project.name)}><FileText size={16} /> {t('flow.customPrompt')}</button> : null}
             {FLOW_STAGES[displayedIndex].action === 'agent' ? <button className="button secondary" disabled={active} onClick={() => { if (window.confirm(text('Текущие изменения сохранятся в safety stash. Ветки Branch plan (work-ветки и merged) для этого проекта будут удалены локально, сохранённая сессия агента забудется. Начать миграцию заново?', 'Current changes will be saved to a safety stash. Branch-plan work and merged branches for this project will be removed locally and the saved agent session will be forgotten. Start migration over?'))) void execute(displayedIndex, false, true) }}><RotateCcw size={16} /> {t('flow.restartMigration')}</button> : null}

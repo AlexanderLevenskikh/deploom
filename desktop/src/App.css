@@ -246,3 +246,173 @@ body, .app-shell { background: var(--app-bg); color: var(--text); }
 .environment-only { display: grid; gap: 8px; }
 @keyframes monitoringSpin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .monitoring-ring.running::after { animation: none; } }
+
+
+/* BLOCK_VG_UI_LAYOUT_THEME_COMPLETION_V1 */
+html[data-theme='light'] {
+  --app-bg: #f5f7fb;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --surface-hover: #f2f6ff;
+  --text: #111827;
+  --text-muted: #667085;
+  --accent: #2563eb;
+  --accent-soft: #dbeafe;
+}
+
+html[data-theme='dark'] {
+  --app-bg: #0c111d;
+  --surface: #121827;
+  --surface-raised: #192235;
+  --surface-hover: #202b42;
+  --text: #eef2ff;
+  --text-muted: #a7b2c7;
+  --accent: #6ea8ff;
+  --accent-soft: #1f2e55;
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme='light']) {
+    --app-bg: #0c111d;
+    --surface: #121827;
+    --surface-raised: #192235;
+    --surface-hover: #202b42;
+    --text: #eef2ff;
+    --text-muted: #a7b2c7;
+    --accent: #6ea8ff;
+    --accent-soft: #1f2e55;
+  }
+}
+
+.app-header,
+.main-workspace,
+.project-row,
+.add-workspace,
+.button,
+.button.secondary,
+.workspace-select select,
+.tab-switch button,
+.stage-list,
+.stage-list button,
+.stage-marker,
+.status-bar,
+.language-switch,
+.run-monitor,
+.setup-panel,
+.setup-choice,
+.modal-panel,
+.stage-detail {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+
+.project-rail,
+.setup-screen {
+  background: var(--app-bg);
+}
+
+input,
+select,
+textarea {
+  background: var(--surface-raised);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--subtle);
+}
+
+.progress-track,
+.run-monitor-track {
+  background: var(--border);
+}
+
+.documents-contract p,
+.run-monitor-summary {
+  color: var(--text-muted);
+}
+
+.error-banner {
+  color: var(--red);
+}
+
+.migration-worktree-warning,
+.run-monitor-health.warning {
+  color: var(--amber);
+}
+
+.run-monitor-health.healthy {
+  color: var(--green);
+}
+
+.run-monitor-health.stale {
+  color: var(--red);
+}
+
+.monitoring-panel {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.monitoring-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+
+.monitoring-body > .run-monitor {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  max-height: none;
+  border-bottom: 0;
+}
+
+.monitoring-body > .log-panel {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.monitoring-body > .environment-only,
+.monitoring-body > .hardware-grid,
+.monitoring-body > .monitoring-overview {
+  width: 100%;
+}
+
+.monitoring-ring > div {
+  min-width: 0;
+  max-width: 124px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  text-align: center;
+}
+
+.monitoring-ring strong {
+  display: block;
+  font-size: 32px;
+  line-height: 1;
+}
+
+.monitoring-ring span {
+  display: block;
+  max-width: 118px;
+  line-height: 1.2;
+  text-align: center;
+}
+
+@media (max-width: 1250px) {
+  .app-grid {
+    grid-template-columns: 210px minmax(560px, 1fr) minmax(340px, 0.6fr);
+  }
+}
