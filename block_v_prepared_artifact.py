@@ -16,6 +16,8 @@ import threading
 from pathlib import Path
 from typing import Mapping, Optional
 
+from block_vex_storage import verification_root
+
 ARTIFACT_INDEX_SCHEMA = 1
 ARTIFACT_AUTHORITY = "PRECONDITION_CACHE"
 _LOCK = threading.RLock()
@@ -23,11 +25,11 @@ _CONFIGURED_ROOT: Optional[Path] = None
 
 
 def configure_prepared_artifact_store(proof_cache_dir: str | Path | None) -> Optional[Path]:
-    """Configure a durable root. DEPLOOM_VERIFICATION_ROOT may place it on ReFS/Dev Drive."""
+    """Configure durable PreparedArtifact storage."""
     global _CONFIGURED_ROOT
-    explicit = str(os.environ.get("DEPLOOM_VERIFICATION_ROOT") or "").strip()
-    if explicit:
-        root = Path(explicit).expanduser().resolve() / "baseline-prepared-artifacts"
+    accelerated = verification_root()
+    if accelerated is not None:
+        root = accelerated / "baseline-prepared-artifacts"
     elif proof_cache_dir:
         root = Path(proof_cache_dir).expanduser().resolve().parent / "baseline-prepared-artifacts"
     else:
@@ -38,7 +40,6 @@ def configure_prepared_artifact_store(proof_cache_dir: str | Path | None) -> Opt
     with _LOCK:
         _CONFIGURED_ROOT = root
     return root
-
 
 def configured_prepared_artifact_root() -> Optional[Path]:
     with _LOCK:
@@ -248,10 +249,11 @@ def prune_prepared_artifact_store(max_count: int = 8) -> int:
 
 
 def verification_trial_parent(proof_cache_dir: str | Path | None = None) -> Optional[Path]:
-    """Optional common parent for fresh writable trials; keeps CoW candidates same-volume."""
-    explicit = str(os.environ.get("DEPLOOM_VERIFICATION_ROOT") or "").strip()
-    if explicit:
-        root = Path(explicit).expanduser().resolve() / "trials"
+    """Common parent for fresh trials when an optimized root was selected."""
+    accelerated = verification_root()
+    if accelerated is not None:
+        root = accelerated / "trials"
         root.mkdir(parents=True, exist_ok=True)
         return root
     return None
+

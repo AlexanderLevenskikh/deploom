@@ -14,6 +14,7 @@ from typing import Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
 from semantic_version import NpmSpec
+from block_vex_storage import semantic_verification_environment
 
 PROOF_SCHEMA_VERSION = "baseline-proof-v5-resolved-state"
 RESOLVER_CONTEXT_SCHEMA_VERSION = "resolver-context-v1-canonical"
@@ -78,10 +79,11 @@ def _hash_file(path: Path) -> str:
 
 
 def environment_snapshot_fingerprint(environment: Mapping[str, str]) -> str:
-    """Hash the complete inherited process environment without persisting secrets."""
+    """Hash semantic child environment without persisting secrets."""
+    semantic = semantic_verification_environment(environment)
     payload = [
         (str(key), hashlib.sha256(str(value).encode("utf-8")).hexdigest())
-        for key, value in sorted(environment.items())
+        for key, value in sorted(semantic.items())
     ]
     return _canonical_hash({"schema": PROOF_SCHEMA_VERSION, "environment": payload})
 

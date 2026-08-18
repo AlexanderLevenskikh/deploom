@@ -9,49 +9,65 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from verification_process_supervisor import run_supervised
+from block_vex_storage import windows_filesystem
+
+# BLOCK_VEX_VERIFICATION_SUBSTRATE_V1
 
 ProgressCallback = Callable[[str], None]
 
 
-def _copy_workers() -> int:
-    raw = str(os.environ.get("DEPLOOM_WORKSPACE_COPY_WORKERS") or "").strip()
+def _windows_volume_root(path: Path) -> str:
+    if os.name != "nt":
+        return ""
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        ok = ctypes.windll.kernel32.GetVolumePathNameW(  # type: ignore[attr-defined]
+            str(path.expanduser().absolute()), buffer, len(buffer)
+        )
+        return buffer.value.lower() if ok and buffer.value else ""
+    except Exception:
+        return str(path.expanduser().absolute().anchor).lower()
+
+
+def _same_windows_volume(source: Path, target: Path) -> bool:
+    if os.name != "nt":
+        return False
+    source_root = _windows_volume_root(source)
+    target_root = _windows_volume_root(target.parent if not target.exists() else target)
+    return bool(source_root and source_root == target_root)
+
+
+def _copy_workers(*, refs_same_volume: bool = False) -> int:
+    raw = str(
+        os.environ.get(
+            "DEPLOOM_VEX_REFS_COPY_WORKERS"
+            if refs_same_volume
+            else "DEPLOOM_WORKSPACE_COPY_WORKERS"
+        )
+        or ""
+    ).strip()
     if raw:
         try:
             return max(1, min(32, int(raw)))
         except ValueError:
             pass
-    return 8
-
-
-def _windows_filesystem(path: Path) -> str:
-    if os.name != "nt":
-        return ""
-    try:
-        root = Path(path.resolve().anchor or str(path.resolve()))
-        volume = ctypes.create_unicode_buffer(261)
-        fs_name = ctypes.create_unicode_buffer(261)
-        serial = ctypes.c_uint32()
-        max_component = ctypes.c_uint32()
-        flags = ctypes.c_uint32()
-        ok = ctypes.windll.kernel32.GetVolumeInformationW(  # type: ignore[attr-defined]
-            str(root), volume, len(volume), ctypes.byref(serial),
-            ctypes.byref(max_component), ctypes.byref(flags), fs_name, len(fs_name),
-        )
-        return fs_name.value.lower() if ok else ""
-    except Exception:
-        return ""
+    return 24 if refs_same_volume else 8
 
 
 def workspace_backend_summary(root: Optional[Path] = None) -> str:
     if os.name == "nt":
         probe = root or Path(os.environ.get("DEPLOOM_VERIFICATION_ROOT") or Path.cwd())
-        fs = _windows_filesystem(probe)
+        fs = windows_filesystem(probe)
         if fs == "refs":
-            # Windows 11 24H2+/Server 2025 can accelerate supported copy APIs on
-            # ReFS. We deliberately keep robocopy/private-copy semantics here;
-            # the label does not claim that a particular copy was block-cloned.
-            return "windows-refs-private-copy (native block-clone capable; proof-safe copy fallback)"
-        return "windows-private-copy (ReFS/Dev Drive accelerator capable; NTFS-safe fallback)"
+            return (
+                "windows-refs-same-volume-optimized "
+                "(native block-clone eligible on supported Windows copy paths; "
+                "proof-safe private-copy fallback)"
+            )
+        return (
+            "windows-private-copy "
+            "(set DEPLOOM_VERIFICATION_ROOT to a ReFS/Dev Drive for CoW-eligible trials)"
+        )
     if sys.platform == "darwin":
         return "macos-apfs-clone-first (private-copy fallback)"
     if sys.platform.startswith("linux"):
@@ -69,11 +85,6 @@ def materialize_private_tree(
     progress_interval_seconds: int = 15,
     runner=run_supervised,
 ) -> str:
-    """Create a writable private tree without weakening verification semantics.
-
-    Native clone/reflink paths are performance accelerators only. Any unsupported
-    operation falls back to the same deep/private-copy semantics used by Block U.
-    """
     source = source.resolve()
     target = target.resolve()
     if target.exists():
@@ -81,27 +92,49 @@ def materialize_private_tree(
     target.parent.mkdir(parents=True, exist_ok=True)
 
     if os.name == "nt":
+        source_fs = windows_filesystem(source)
+        target_fs = windows_filesystem(target.parent)
+        refs_same_volume = (
+            source_fs == "refs"
+            and target_fs == "refs"
+            and _same_windows_volume(source, target)
+        )
         robocopy = shutil.which("robocopy")
         if robocopy:
             result = runner(
                 [
-                    robocopy, str(source), str(target),
-                    "/E", "/COPY:DAT", "/DCOPY:DAT", "/R:1", "/W:1",
-                    "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/SL",
-                    f"/MT:{_copy_workers()}",
+                    robocopy,
+                    str(source),
+                    str(target),
+                    "/E",
+                    "/COPY:DAT",
+                    "/DCOPY:DAT",
+                    "/R:1",
+                    "/W:1",
+                    "/NFL",
+                    "/NDL",
+                    "/NJH",
+                    "/NJS",
+                    "/NP",
+                    "/SL",
+                    f"/MT:{_copy_workers(refs_same_volume=refs_same_volume)}",
                 ],
                 source,
                 timeout_seconds=max(1, int(timeout_seconds)),
                 progress=progress,
-                progress_label=progress_label,
+                progress_label=(
+                    f"{progress_label}: refs-same-volume"
+                    if refs_same_volume
+                    else progress_label
+                ),
                 progress_interval_seconds=progress_interval_seconds,
             )
             if result.returncode < 8:
-                return (
-                    "windows-refs-private"
-                    if _windows_filesystem(target) == "refs"
-                    else "windows-robocopy-private"
-                )
+                if refs_same_volume:
+                    return "windows-refs-same-volume-native-copy-eligible"
+                if target_fs == "refs":
+                    return "windows-refs-cross-volume-private"
+                return "windows-robocopy-private"
             shutil.rmtree(target, ignore_errors=True)
             raise RuntimeError(
                 "WORKSPACE_ROBOCOPY_FAILED: "

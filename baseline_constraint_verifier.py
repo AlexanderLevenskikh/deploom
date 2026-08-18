@@ -66,6 +66,11 @@ from verification_workspace_backend import (
     workspace_backend_summary,
 )
 # BLOCK_V_DURABLE_VERIFICATION_V1
+from block_vex_storage import (
+    package_manager_cache_environment,
+    semantic_verification_environment,
+    storage_summary,
+)
 from block_v_prepared_artifact import (
     configure_prepared_artifact_store,
     invalidate_prepared_artifact_record,
@@ -924,29 +929,12 @@ def _package_manager_cache_environment(
     config: BaselineVerifyConfig,
     manager: str,
 ) -> Dict[str, str]:
-    """Configure artifact caches without changing resolver authority.
-
-    Yarn Classic keeps its native user cache. Pointing YARN_CACHE_FOLDER at a
-    fresh DepLoom-private directory turns every first Baseline into a cold
-    transitive refetch and does not strengthen the proof: the authoritative
-    boundary is still the fresh isolated install plus observed direct tree.
-    """
-    if manager == "yarn":
-        return {}
-    if not config.proof_cache_dir:
-        return {}
-    root = (
-        Path(config.proof_cache_dir).resolve().parent
-        / "package-manager-artifacts"
-        / str(manager).lower()
+    """Configure performance-only package caches."""
+    return package_manager_cache_environment(
+        manager=manager,
+        proof_cache_dir=config.proof_cache_dir or None,
+        inherited_environment=os.environ,
     )
-    root.mkdir(parents=True, exist_ok=True)
-    if manager == "npm":
-        return {"npm_config_cache": str(root)}
-    if manager == "pnpm":
-        return {"npm_config_store_dir": str(root)}
-    return {}
-
 
 def _git_root_and_relative(project_dir: Path) -> Tuple[Optional[Path], Path]:
     try:
@@ -1183,7 +1171,7 @@ def verify_assignment(
     project_dir = project_dir.resolve()
     attempt_started = time.monotonic()
     attempt_deadline = attempt_started + config.attempt_timeout_seconds
-    base_env = dict(os.environ)
+    base_env = semantic_verification_environment(os.environ)
     remove_packages = tuple(sorted({str(item) for item in remove_packages}))
     telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
     assignment_hash = assignment_fingerprint(assignment)
@@ -1225,6 +1213,7 @@ def verify_assignment(
     _emit_progress(progress, f"{progress_label}: started; attemptHardTimeout={config.attempt_timeout_seconds}s")
     configure_prepared_artifact_store(config.proof_cache_dir or None)
     _emit_progress(progress, f"{progress_label}: verification substrate: {workspace_backend_summary(prepared_snapshot_storage_root())}")
+    _emit_progress(progress, f"{progress_label}: verification storage: {storage_summary()}")
     trial_parent = verification_trial_parent(config.proof_cache_dir or None)
     temp_root = Path(tempfile.mkdtemp(
         prefix="dependency-flow-baseline-verify-",
@@ -2076,7 +2065,7 @@ def verify_assignment(
             progress_label=progress_label,
         )
 
-    environment = dict(os.environ)
+    environment = semantic_verification_environment(os.environ)
     identity = build_verification_proof_identity(
         project_dir,
         assignment=assignment,
