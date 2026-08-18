@@ -5,63 +5,53 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import constraint_cache
+import constraint_cache as cache_module
 
 
 class ConstraintCacheWindowsLockTests(unittest.TestCase):
-    def test_permission_error_for_existing_lock_is_contention(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            cache = root / "cache.json"
-            lock_path = root / "cache.json.lock"
-            lock_path.write_text("held\n", encoding="utf-8")
-
-            real_open = constraint_cache.os.open
-            attempts = 0
-
-            def windows_open(path, flags):
-                nonlocal attempts
-                attempts += 1
-                if attempts == 1:
-                    raise PermissionError(
-                        13,
-                        "simulated Windows sharing violation",
-                        path,
-                    )
-                return real_open(path, flags)
-
-            def release_owner(_seconds):
-                lock_path.unlink(missing_ok=True)
-
-            with mock.patch.object(
-                constraint_cache.os,
-                "open",
-                side_effect=windows_open,
-            ), mock.patch.object(
-                constraint_cache.time,
-                "sleep",
-                side_effect=release_owner,
-            ):
-                with constraint_cache._exclusive_cache_write_lock(cache):
-                    self.assertTrue(lock_path.exists())
-
-            self.assertGreaterEqual(attempts, 2)
-            self.assertFalse(lock_path.exists())
-
-    def test_permission_error_without_lock_is_not_hidden(self) -> None:
+    def test_transient_permission_error_without_visible_lock_is_retried(self):
+        """A Windows sharing race must be retried, not misclassified as ACL failure."""
         with tempfile.TemporaryDirectory() as temp:
             cache = Path(temp) / "cache.json"
+            original_open = cache_module.os.open
+            calls = {"count": 0}
+
+            def transient_open(path, flags, *args, **kwargs):
+                if str(path).endswith("cache.json.lock") and calls["count"] == 0:
+                    calls["count"] += 1
+                    raise PermissionError(
+                        13,
+                        "simulated transient Windows CREATE_NEW sharing race",
+                        str(path),
+                    )
+                return original_open(path, flags, *args, **kwargs)
+
             with mock.patch.object(
-                constraint_cache.os,
+                cache_module.os,
                 "open",
-                side_effect=PermissionError(
-                    13,
-                    "real permission failure",
-                    str(cache) + ".lock",
-                ),
+                side_effect=transient_open,
             ):
+                with cache_module._exclusive_cache_write_lock(cache):
+                    pass
+
+            self.assertEqual(1, calls["count"])
+            self.assertFalse(cache.with_name("cache.json.lock").exists())
+
+    def test_persistent_permission_error_still_fails_closed(self):
+        """The grace retry must not turn a real permissions failure into success."""
+        with tempfile.TemporaryDirectory() as temp:
+            cache = Path(temp) / "cache.json"
+
+            def denied(path, flags, *args, **kwargs):
+                raise PermissionError(
+                    13,
+                    "simulated persistent ACL failure",
+                    str(path),
+                )
+
+            with mock.patch.object(cache_module.os, "open", side_effect=denied):
                 with self.assertRaises(PermissionError):
-                    with constraint_cache._exclusive_cache_write_lock(cache):
+                    with cache_module._exclusive_cache_write_lock(cache):
                         pass
 
 

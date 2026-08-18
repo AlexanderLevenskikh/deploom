@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import warnings
 from contextlib import contextmanager
@@ -39,6 +40,8 @@ from typing import (
 CACHE_SCHEMA_VERSION = 2
 CONSTRAINT_ENTRY_SCHEMA = "verified-resolver-nogood-v2"
 SOLVER_SCHEMA_VERSION = "peer-ir-v3-fixed-source-identity"
+_CACHE_WRITE_THREAD_LOCK = threading.RLock()
+_WINDOWS_PERMISSION_GRACE_SECONDS = 0.25
 _ENV_FILES = (
     "package.json",
     "package-lock.json",
@@ -323,70 +326,116 @@ class LearnedConstraintProof:
 
 @contextmanager
 def _exclusive_cache_write_lock(path: Path):
-    """Cross-process lock for the tiny read-modify-replace cache transaction.
+    """Serialize cache writers across threads and processes.
 
-    On Windows, CREATE_NEW/O_EXCL against an existing lock file may surface as
-    PermissionError (sharing violation) rather than FileExistsError. Treat that
-    as contention only while the lock path exists. A PermissionError without
-    an existing lock remains a real infrastructure/permissions failure.
+    Same-process writers are serialized by an RLock. The lock file provides
+    cross-process exclusion. On Windows CREATE_NEW/O_EXCL can transiently return
+    PermissionError/EACCES while another process is releasing the lock file.
+    That race can be observed after the path has already disappeared, so a
+    short bounded grace retry is required before classifying it as a real
+    permissions failure.
+
+    Authority is fail-closed:
+    - transient sharing races are retried;
+    - persistent permissions failures are raised;
+    - lock acquisition timeout is raised;
+    - no failed acquisition can publish cache contents.
     """
     lock_path = path.with_name(path.name + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + 10.0
-    fd: Optional[int] = None
-    while True:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, f"pid={os.getpid()} created={time.time()}\n".encode("utf-8"))
-            break
-        except FileExistsError:
-            pass
-        except PermissionError:
-            # Windows sharing violations can be EACCES while another writer
-            # owns the already-existing lock. Do not hide a genuine ACL/path
-            # permission failure when no lock file exists.
-            try:
-                if not lock_path.exists():
-                    raise
-            except OSError:
-                raise
 
-        try:
-            # A crashed writer must not deadlock future Baselines forever.
-            if time.time() - lock_path.stat().st_mtime > 120.0:
-                try:
-                    lock_path.unlink()
-                except PermissionError:
-                    # A live Windows owner can deny delete sharing. This is
-                    # active contention, not stale-lock authority.
-                    pass
-                continue
-        except FileNotFoundError:
-            continue
-        except PermissionError:
-            # Same Windows sharing behavior while the owner is still active.
-            pass
+    with _CACHE_WRITE_THREAD_LOCK:
+        deadline = time.monotonic() + 10.0
+        permission_grace_started: Optional[float] = None
+        fd: Optional[int] = None
 
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"constraint cache lock timed out: {lock_path}")
-        time.sleep(0.05)
-
-    try:
-        yield
-    finally:
-        if fd is not None:
-            os.close(fd)
-        cleanup_deadline = time.monotonic() + 1.0
         while True:
             try:
-                lock_path.unlink()
+                fd = os.open(
+                    str(lock_path),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                )
+                os.write(
+                    fd,
+                    f"pid={os.getpid()} created={time.time()}\n".encode("utf-8"),
+                )
                 break
-            except FileNotFoundError:
-                break
+            except FileExistsError:
+                # Normal contention. Any earlier "path disappeared" grace is no
+                # longer relevant because a lock is visibly present again.
+                permission_grace_started = None
             except PermissionError:
-                if time.monotonic() >= cleanup_deadline:
+                now = time.monotonic()
+                try:
+                    lock_exists = lock_path.exists()
+                except OSError:
+                    # If even probing the path is denied, keep the operation
+                    # fail-closed rather than guessing that the lock is absent.
                     raise
-                time.sleep(0.01)
+
+                if lock_exists:
+                    # Windows may report EACCES instead of EEXIST while another
+                    # process owns CREATE_NEW. Treat it as ordinary contention.
+                    permission_grace_started = None
+                else:
+                    # TOCTOU: the owning process may have deleted the lock after
+                    # CREATE_NEW returned its sharing violation but before this
+                    # existence check. Retry briefly; a persistent ACL failure
+                    # still escapes after the bounded grace period.
+                    if permission_grace_started is None:
+                        permission_grace_started = now
+                    elif now - permission_grace_started >= _WINDOWS_PERMISSION_GRACE_SECONDS:
+                        raise
+
+            try:
+                stat = lock_path.stat()
+            except FileNotFoundError:
+                stat = None
+            except PermissionError:
+                # Active Windows sharing contention. Acquisition retry below is
+                # still bounded by the main deadline.
+                stat = None
+
+            if stat is not None and time.time() - stat.st_mtime > 120.0:
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except PermissionError:
+                    # A live Windows owner can deny delete sharing.
+                    pass
+                else:
+                    permission_grace_started = None
+                    continue
+
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"constraint cache lock timed out: {lock_path}"
+                )
+
+            time.sleep(
+                0.01
+                if permission_grace_started is not None
+                else 0.05
+            )
+
+        try:
+            yield
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+            cleanup_deadline = time.monotonic() + 1.0
+            while True:
+                try:
+                    lock_path.unlink()
+                    break
+                except FileNotFoundError:
+                    break
+                except PermissionError:
+                    if time.monotonic() >= cleanup_deadline:
+                        raise
+                    time.sleep(0.01)
 
 def _constraint_entry_key(payload: Mapping[str, object]) -> str:
     canonical = {

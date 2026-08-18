@@ -8891,10 +8891,13 @@ def resolve_peer_compatibility_with_verification(
         baseline_resume_policy,
         baseline_run_identity,
         build_run_state,
+        derive_recovery_epochs,
         restore_liveness_budget,
         restore_run_state,
     )
     run_recovery_store = BaselineRunRecoveryStore(progress_path)
+    # BLOCK_VD2_SEMANTIC_RECOVERY_V1
+    recovery_epochs = derive_recovery_epochs(Path(__file__).resolve().parent)
     # BLOCK_V_PREDICATE_GUIDANCE_V2
     from block_v_predicate_search import (
         PredicateObservation,
@@ -9191,8 +9194,18 @@ def resolve_peer_compatibility_with_verification(
             recovery_plan = run_recovery_store.begin(
                 project, mode, identity=recovery_identity,
                 policy=baseline_resume_policy(),
+                epochs=recovery_epochs,
             )
-            if recovery_plan.reason == "restart-requested":
+            if recovery_plan.reason == "active-run":
+                raise BaselineConstraintVerificationError(
+                    f"BASELINE_RECOVERY_CONCURRENT_RUN: {project}/{mode}: "
+                    f"another live Baseline owns the recovery slot "
+                    f"(pid={recovery_plan.active_owner_pid})"
+                )
+            if (
+                recovery_plan.reason == "restart-requested"
+                or "predicate" in recovery_plan.changed_epochs
+            ):
                 predicate_state_store.clear_run(project, mode)
             predicate_diagnostic_preferences.setdefault(project, {})[mode] = (
                 predicate_state_store.preferred_versions(
@@ -9227,6 +9240,9 @@ def resolve_peer_compatibility_with_verification(
                     exactExclusions=len(restored_exclusions),
                     interrupted=recovery_plan.interrupted,
                     changedEpochs=list(recovery_plan.changed_epochs),
+                    invalidatedComponents=list(recovery_plan.invalidated_components),
+                    recheckFrom=recovery_plan.recheck_from,
+                    preservedAuthority=recovery_plan.preserved_authority,
                     authority="ORCHESTRATION_HINT",
                 )
             elif recovery_plan.found and recovery_plan.reason == "authority-epoch-changed":
@@ -9234,6 +9250,8 @@ def resolve_peer_compatibility_with_verification(
                     project, mode, "recovery-recheck-required",
                     recheckFrom=recovery_plan.recheck_from,
                     changedEpochs=list(recovery_plan.changed_epochs),
+                    invalidatedComponents=list(recovery_plan.invalidated_components),
+                    preservedAuthority=recovery_plan.preserved_authority,
                     authority="ORCHESTRATION_HINT",
                 )
 
@@ -9289,12 +9307,12 @@ def resolve_peer_compatibility_with_verification(
                 if status in {"completed", "passed"}:
                     run_recovery_store.mark_terminal(
                         project, mode, identity=recovery_identity, status=status,
-                        state=state, phase=phase,
+                        state=state, phase=phase, epochs=recovery_epochs,
                     )
                 else:
                     run_recovery_store.checkpoint(
                         project, mode, identity=recovery_identity,
-                        state=state, status=status, phase=phase,
+                        state=state, status=status, phase=phase, epochs=recovery_epochs,
                     )
 
             # This is a SAFE cursor: no current subprocess is represented as done.
