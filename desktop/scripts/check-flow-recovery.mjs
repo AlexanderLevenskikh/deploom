@@ -84,8 +84,10 @@ if (!releasePrompt.includes("Human prose in chat is diagnostic only")) throw new
 const mainSource = readFileSync(new URL("../electron/main.ts", import.meta.url), "utf8");
 for (const retryContract of [
   "function nonRetryableDeterministicFailure",
+  "function deterministicPythonProgrammingFailure",
   "BASELINE_VERIFY_INCONCLUSIVE_PROJECT_ERROR",
   "!nonRetryableDeterministicFailure(result)",
+  "NameError|UnboundLocalError",
 ]) {
   if (!mainSource.includes(retryContract)) throw new Error(`Deterministic Baseline retry contract missing: ${retryContract}`);
 }

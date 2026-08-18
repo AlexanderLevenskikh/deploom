@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import unittest
+from pathlib import Path
 
 from block_v_predicate_search import PredicateObservation, PredicateProbePolicy
 from block_vf_active_search import (
@@ -13,6 +15,23 @@ from block_vf_active_search import (
 
 
 class ActivePredicateSearchTests(unittest.TestCase):
+    def test_generator_imports_probe_preference_used_by_solver(self):
+        generator = Path(__file__).resolve().parents[1] / "dependency_live_roadmap_generator.py"
+        tree = ast.parse(generator.read_text(encoding="utf-8"), filename=str(generator))
+        imported = {
+            alias.asname or alias.name
+            for node in tree.body
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+        }
+        used = {
+            node.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        }
+        self.assertIn("prioritize_probe_preference", used)
+        self.assertIn("prioritize_probe_preference", imported)
+
     def test_repeat_threshold_activates_and_uses_control_point_then_interior(self):
         observations = [
             PredicateObservation("pkg", "5.1.1", "P", True, "a"),

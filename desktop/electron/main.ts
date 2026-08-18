@@ -4689,8 +4689,17 @@ function deterministicWatchdogFailure(result: { code: number; stderr: string; st
   return /BASELINE_LOCALIZATION_TIMEOUT|HARD_TIMEOUT|HARD_STALL|verification timed out|project check launch failed:.*timed out/i.test(text)
 }
 
+function deterministicPythonProgrammingFailure(result: { code: number; stderr: string; stdout: string }): boolean {
+  // An unhandled interpreter/programming error in the bundled generator cannot
+  // become healthy by rerunning the exact same installed code. Keep transient
+  // network/registry failures retryable; only classify explicit Python tracebacks
+  // ending in structural programming/import exceptions here.
+  const text = result.stderr.trim()
+  return /Traceback \(most recent call last\):/i.test(text) && /(?:NameError|UnboundLocalError|SyntaxError|IndentationError|ModuleNotFoundError|ImportError):[^\r\n]*\s*$/i.test(text)
+}
+
 function nonRetryableDeterministicFailure(result: { code: number; stderr: string; stdout: string }): boolean {
-  if (deterministicWatchdogFailure(result)) return true
+  if (deterministicWatchdogFailure(result) || deterministicPythonProgrammingFailure(result)) return true
   const text = `${result.stderr}\n${result.stdout}`
   // These failures describe a completed deterministic proof attempt. Re-running
   // registry discovery + solving + localization cannot make them transiently
@@ -4873,6 +4882,13 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
           jobId: job.id,
           stream: 'stderr',
           line: `[error] ${spec.label}: watchdog/timeout считается детерминированным stop-сигналом; полный Baseline автоматически повторно не запускаю. Последний baseline-verification-progress.json сохранён для диагностики.`,
+        })
+      }
+      if (result.code !== 0 && deterministicPythonProgrammingFailure(result)) {
+        send('flow:job-output', {
+          jobId: job.id,
+          stream: 'stderr',
+          line: `[error] ${spec.label}: обнаружен внутренний Python programming/import failure; повтор того же установленного кода не выполняю. Исправьте/обновите DepLoom и используйте Baseline Continue для восстановления с durable safe point.`,
         })
       }
       exitCode = result.code

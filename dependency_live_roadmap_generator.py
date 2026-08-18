@@ -130,6 +130,7 @@ from lockfile_consistency import (
     select_lockfile,
 )
 from semantic_version import NpmSpec, Version
+from block_v_predicate_search import prioritize_probe_preference
 
 NPM_REGISTRY = "https://registry.npmjs.org"
 OSV_QUERY_BATCH = "https://api.osv.dev/v1/querybatch"
