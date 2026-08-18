@@ -551,6 +551,10 @@ _PREPARED_SNAPSHOTS: Dict[Tuple[str, str], PreparedWorkspaceSnapshot] = {}
 _PREPARED_SNAPSHOT_MAX_COUNT = 2
 _PREPARED_FASTPATH_DISABLED: set[Tuple[str, str]] = set()
 
+# BLOCK_U_TIME_TO_RESULT_V1
+# Process-local optimization state only. It is never proof/Solver authority.
+_PREPARED_FASTPATH_COMMAND_DISABLED: set[Tuple[str, str]] = set()
+
 
 def _cleanup_prepared_snapshot_root() -> None:
     global _PREPARED_SNAPSHOT_ROOT
@@ -560,6 +564,7 @@ def _cleanup_prepared_snapshot_root() -> None:
     _PREPARED_SNAPSHOT_ROOT = None
     _PREPARED_SNAPSHOTS.clear()
     _PREPARED_FASTPATH_DISABLED.clear()
+    _PREPARED_FASTPATH_COMMAND_DISABLED.clear()
 
 
 atexit.register(_cleanup_prepared_snapshot_root)
@@ -701,6 +706,53 @@ def _prepared_snapshot_fastpath_allowed(key: str, source_project: Path) -> bool:
         return slot not in _PREPARED_FASTPATH_DISABLED
 
 
+def _prepared_command_fastpath_slot(
+    source_project: Path, command: str
+) -> Tuple[str, str]:
+    return str(source_project.resolve()), str(command).strip()
+
+
+def _disable_prepared_command_fastpath(
+    source_project: Path, command: str
+) -> None:
+    slot = _prepared_command_fastpath_slot(source_project, command)
+    with _PREPARED_SNAPSHOT_LOCK:
+        _PREPARED_FASTPATH_COMMAND_DISABLED.add(slot)
+
+
+def _prepared_command_fastpath_allowed(
+    source_project: Path, command: str
+) -> bool:
+    slot = _prepared_command_fastpath_slot(source_project, command)
+    with _PREPARED_SNAPSHOT_LOCK:
+        return slot not in _PREPARED_FASTPATH_COMMAND_DISABLED
+
+
+def _ntfs_fastpath_min_commands() -> int:
+    # A new one-command targeted proof is cheaper as one proof-safe private
+    # copy than hashing ~100k+ dependency files just to save that one copy.
+    raw = str(os.environ.get("DEPLOOM_NTFS_FASTPATH_MIN_COMMANDS") or "").strip()
+    if raw:
+        try:
+            return max(1, min(32, int(raw)))
+        except ValueError:
+            pass
+    return 2
+
+
+def _prepared_snapshot_fastpath_worth_sealing(
+    commands: Sequence[str], source_project: Path
+) -> bool:
+    if os.name != "nt":
+        return False
+    eligible = tuple(
+        command
+        for command in commands
+        if _prepared_command_fastpath_allowed(source_project, command)
+    )
+    return len(eligible) >= _ntfs_fastpath_min_commands()
+
+
 def _lookup_prepared_workspace_snapshot(
     key: str, source_project: Path
 ) -> Optional[PreparedWorkspaceSnapshot]:
@@ -765,6 +817,7 @@ def _publish_prepared_workspace_snapshot(
     observed_versions: Mapping[str, str],
     observed_hash: str,
     source_project: Path,
+    seal_dependency_integrity: bool = True,
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "prepared snapshot publish copy",
     timeout_seconds: int = 1800,
@@ -807,7 +860,7 @@ def _publish_prepared_workspace_snapshot(
             )
 
         dependency_integrity: Mapping[str, str] = {}
-        if os.name == "nt":
+        if os.name == "nt" and seal_dependency_integrity:
             dependency_integrity = build_dependency_integrity_manifest(
                 stage_workspace,
                 progress=progress,
@@ -1528,6 +1581,14 @@ def verify_assignment(
             )
 
         if run_project_checks and config.project_checks != "off" and config.commands:
+            # The integrity manifest exists solely for the junction-backed clone
+            # optimization. Private full-copy project clones do not consume it.
+            preparation_fastpath_enabled = (
+                _allow_prepared_fastpath
+                and _prepared_snapshot_fastpath_worth_sealing(
+                    config.commands, project_dir
+                )
+            )
             snapshot = _lookup_prepared_workspace_snapshot(
                 proof_identity.preparation_proof_key, project_dir
             )
@@ -1665,6 +1726,7 @@ def verify_assignment(
                         observed_versions=observed_versions,
                         observed_hash=observed_hash,
                         source_project=project_dir,
+                        seal_dependency_integrity=preparation_fastpath_enabled,
                         progress=progress,
                         progress_label=f"{progress_label}: snapshot-publish",
                         timeout_seconds=snapshot_timeout,
@@ -1706,10 +1768,27 @@ def verify_assignment(
                     f"hardTimeout={clone_timeout}s",
                 )
                 try:
+                    command_fastpath_allowed = (
+                        _allow_prepared_fastpath
+                        and bool(snapshot.dependency_integrity)
+                        and _prepared_command_fastpath_allowed(
+                            project_dir, command
+                        )
+                    )
+                    if (
+                        _allow_prepared_fastpath
+                        and bool(snapshot.dependency_integrity)
+                        and not command_fastpath_allowed
+                    ):
+                        _emit_progress(
+                            progress,
+                            f"{progress_label}: NTFS fast clone command quarantine "
+                            f"for {command}; using proof-safe private copy",
+                        )
                     command_project = _materialize_prepared_workspace_snapshot(
                         snapshot,
                         command_root,
-                        allow_fastpath=_allow_prepared_fastpath,
+                        allow_fastpath=command_fastpath_allowed,
                         progress=progress,
                         progress_label=f"{progress_label}: project-clone:{command_index}/{len(config.commands)}",
                         timeout_seconds=clone_timeout,
@@ -1783,6 +1862,9 @@ def verify_assignment(
                         # integrity-matched final state may have been transiently
                         # mutated while another consumer was reading it.
                         cleanup_guarded_clone(command_root)
+                        # This is performance state only. The command is still
+                        # freshly executed in an isolated private clone.
+                        _disable_prepared_command_fastpath(project_dir, command)
                         _disable_prepared_snapshot_fastpath(
                             proof_identity.preparation_proof_key, project_dir
                         )
