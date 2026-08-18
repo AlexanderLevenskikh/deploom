@@ -1,0 +1,97 @@
+diff --git a/dependency_live_roadmap_generator.py b/dependency_live_roadmap_generator.py
+--- a/dependency_live_roadmap_generator.py
++++ b/dependency_live_roadmap_generator.py
+@@ -6,6 +6,7 @@
+     select_lockfile,
+ )
+ from semantic_version import NpmSpec, Version
++from block_v_predicate_search import prioritize_probe_preference
+ 
+ NPM_REGISTRY = "https://registry.npmjs.org"
+ OSV_QUERY_BATCH = "https://api.osv.dev/v1/querybatch"
+diff --git a/tests/test_block_vf_active_search.py b/tests/test_block_vf_active_search.py
+--- a/tests/test_block_vf_active_search.py
++++ b/tests/test_block_vf_active_search.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+ 
++import ast
+ import unittest
++from pathlib import Path
+ 
+ from block_v_predicate_search import PredicateObservation, PredicateProbePolicy
+ from block_vf_active_search import (
+@@ -13,6 +15,23 @@
+ 
+ 
+ class ActivePredicateSearchTests(unittest.TestCase):
++    def test_generator_imports_probe_preference_used_by_solver(self):
++        generator = Path(__file__).resolve().parents[1] / "dependency_live_roadmap_generator.py"
++        tree = ast.parse(generator.read_text(encoding="utf-8"), filename=str(generator))
++        imported = {
++            alias.asname or alias.name
++            for node in tree.body
++            if isinstance(node, ast.ImportFrom)
++            for alias in node.names
++        }
++        used = {
++            node.id
++            for node in ast.walk(tree)
++            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
++        }
++        self.assertIn("prioritize_probe_preference", used)
++        self.assertIn("prioritize_probe_preference", imported)
++
+     def test_repeat_threshold_activates_and_uses_control_point_then_interior(self):
+         observations = [
+             PredicateObservation("pkg", "5.1.1", "P", True, "a"),
+diff --git a/desktop/electron/main.ts b/desktop/electron/main.ts
+--- a/desktop/electron/main.ts
++++ b/desktop/electron/main.ts
+@@ -4,8 +4,17 @@
+   return /BASELINE_LOCALIZATION_TIMEOUT|HARD_TIMEOUT|HARD_STALL|verification timed out|project check launch failed:.*timed out/i.test(text)
+ }
+ 
++function deterministicPythonProgrammingFailure(result: { code: number; stderr: string; stdout: string }): boolean {
++  // An unhandled interpreter/programming error in the bundled generator cannot
++  // become healthy by rerunning the exact same installed code. Keep transient
++  // network/registry failures retryable; only classify explicit Python tracebacks
++  // ending in structural programming/import exceptions here.
++  const text = result.stderr.trim()
++  return /Traceback \(most recent call last\):/i.test(text) && /(?:NameError|UnboundLocalError|SyntaxError|IndentationError|ModuleNotFoundError|ImportError):[^\r\n]*\s*$/i.test(text)
++}
++
+ function nonRetryableDeterministicFailure(result: { code: number; stderr: string; stdout: string }): boolean {
+-  if (deterministicWatchdogFailure(result)) return true
++  if (deterministicWatchdogFailure(result) || deterministicPythonProgrammingFailure(result)) return true
+   const text = `${result.stderr}\n${result.stdout}`
+   // These failures describe a completed deterministic proof attempt. Re-running
+   // registry discovery + solving + localization cannot make them transiently
+@@ -21,6 +30,13 @@
+           line: `[error] ${spec.label}: watchdog/timeout считается детерминированным stop-сигналом; полный Baseline автоматически повторно не запускаю. Последний baseline-verification-progress.json сохранён для диагностики.`,
+         })
+       }
++      if (result.code !== 0 && deterministicPythonProgrammingFailure(result)) {
++        send('flow:job-output', {
++          jobId: job.id,
++          stream: 'stderr',
++          line: `[error] ${spec.label}: обнаружен внутренний Python programming/import failure; повтор того же установленного кода не выполняю. Исправьте/обновите DepLoom и используйте Baseline Continue для восстановления с durable safe point.`,
++        })
++      }
+       exitCode = result.code
+       if (exitCode !== 0) throw new Error(`${spec.label}: команда завершилась с кодом ${exitCode} после ${attemptsPerformed} попыток.${result.stderr.trim() ? `\n\n${result.stderr.trim()}` : ''}`)
+     }
+diff --git a/desktop/scripts/check-flow-recovery.mjs b/desktop/scripts/check-flow-recovery.mjs
+--- a/desktop/scripts/check-flow-recovery.mjs
++++ b/desktop/scripts/check-flow-recovery.mjs
+@@ -1,8 +1,10 @@
+ const mainSource = readFileSync(new URL("../electron/main.ts", import.meta.url), "utf8");
+ for (const retryContract of [
+   "function nonRetryableDeterministicFailure",
++  "function deterministicPythonProgrammingFailure",
+   "BASELINE_VERIFY_INCONCLUSIVE_PROJECT_ERROR",
+   "!nonRetryableDeterministicFailure(result)",
++  "NameError|UnboundLocalError",
+ ]) {
+   if (!mainSource.includes(retryContract)) throw new Error(`Deterministic Baseline retry contract missing: ${retryContract}`);
+ }
