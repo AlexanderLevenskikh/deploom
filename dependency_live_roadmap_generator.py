@@ -6893,6 +6893,7 @@ def resolve_peer_compatibility(
     shadow_solver_config_by_project: Optional[Dict[str, Dict[str, Any]]] = None,
     shadow_reports_out: Optional[Dict[str, Dict[str, List[Dict[str, Any]]]]] = None,
     residual_targets_by_project: Optional[Dict[str, Dict[str, str]]] = None,
+    diagnostic_preferences_by_project_mode: Optional[Dict[str, Dict[str, Dict[str, str]]]] = None,
 ) -> Dict[str, Dict[str, Dict[str, str]]]:
     """Resolve peer-connected package versions as constraints, never by display group.
 
@@ -6948,6 +6949,36 @@ def resolve_peer_compatibility(
                     domains[name] = [row.current_version]
                 else:
                     domains[name] = _candidate_domain(row, mode, client)
+
+            # BLOCK_VF_ACTIVE_PREDICATE_SEARCH_V1
+            # Predicate probes may reorder fallback *cost* but never remove
+            # a version. Explicit residual/approved targets keep precedence.
+            diagnostic_preferences = dict(
+                ((diagnostic_preferences_by_project_mode or {})
+                 .get(project, {})
+                 .get(mode, {}))
+            )
+            for preferred_name, preferred_version in sorted(diagnostic_preferences.items()):
+                if preferred_name in residual_targets:
+                    continue
+                preferred_row = solver_rows_by_name.get(preferred_name)
+                preferred_domain = domains.get(preferred_name)
+                if preferred_row is None or not preferred_domain:
+                    continue
+                reordered = prioritize_probe_preference(
+                    preferred_domain,
+                    preferred_version=preferred_version,
+                    current_version=preferred_row.current_version,
+                )
+                if reordered == preferred_domain:
+                    continue
+                domains[preferred_name] = reordered
+                eprint(
+                    f"[info] {project}: predicate-guided solver preference {mode}; "
+                    f"package={preferred_name}, preferred={preferred_version}, "
+                    "authority=DIAGNOSTIC_HINT; domain remains complete"
+                )
+
             domains, fixed_peer_stats = _apply_fixed_peer_constant_constraints(
                 solver_rows_by_name, fixed_rows_by_name, domains, client,
             )
@@ -8864,18 +8895,34 @@ def resolve_peer_compatibility_with_verification(
         restore_run_state,
     )
     run_recovery_store = BaselineRunRecoveryStore(progress_path)
-    # BLOCK_V_PREDICATE_GUIDANCE_V1
+    # BLOCK_V_PREDICATE_GUIDANCE_V2
     from block_v_predicate_search import (
         PredicateObservation,
+        PredicateProbePolicy,
         load_hint_snapshot,
         predicate_package,
+        prioritize_probe_preference,
         rank_version_probes,
+    )
+    from block_v_predicate_state import PredicateSearchStateStore
+    from block_vf_active_search import (
+        PROBE_OUTCOME_ABSENT,
+        PROBE_OUTCOME_INCONCLUSIVE,
+        PROBE_OUTCOME_PRESENT,
+        ProbeExecution,
+        run_active_predicate_search,
     )
     compatibility_hints = load_hint_snapshot(
         os.environ.get("DEPLOOM_COMPATIBILITY_HINTS")
     )
+    predicate_state_store = PredicateSearchStateStore(progress_path)
     predicate_probe_observations: Dict[
         Tuple[str, str, str, str], List[PredicateObservation]
+    ] = {}
+    # Navigation preferences are per project/mode and never enter hard-model
+    # constraints. They only reorder complete fallback domains.
+    predicate_diagnostic_preferences: Dict[
+        str, Dict[str, Dict[str, str]]
     ] = {}
     learned: Dict[str, Dict[str, List[Dict[str, str]]]] = {
         project: {mode: [] for mode in modes} for project in rows_by_project
@@ -8912,6 +8959,9 @@ def resolve_peer_compatibility_with_verification(
             if fallback_commands:
                 eprint(f"[info] {project}: Baseline structural checks auto-discovered: {', '.join(fallback_commands)}")
         config = BaselineVerifyConfig.from_mapping(spec.constraint_verify_config, fallback_commands=fallback_commands)
+        predicate_probe_policy = PredicateProbePolicy.from_sources(
+            spec.constraint_verify_config, os.environ
+        )
         verification_telemetry_path = (
             progress_path.with_name("baseline-verification-telemetry.jsonl")
             if progress_path is not None
@@ -9142,6 +9192,13 @@ def resolve_peer_compatibility_with_verification(
                 project, mode, identity=recovery_identity,
                 policy=baseline_resume_policy(),
             )
+            if recovery_plan.reason == "restart-requested":
+                predicate_state_store.clear_run(project, mode)
+            predicate_diagnostic_preferences.setdefault(project, {})[mode] = (
+                predicate_state_store.preferred_versions(
+                    project, mode, run_identity=recovery_identity
+                )
+            )
             restored_failed: Set[str] = set()
             restored_iteration = 0
             restored_liveness: Dict[str, object] = {}
@@ -9263,6 +9320,7 @@ def resolve_peer_compatibility_with_verification(
                         solver_statuses_out=solver_statuses,
                         shadow_solver_config_by_project={project: spec.constraint_verify_config},
                         residual_targets_by_project=residual_targets_by_project,
+                        diagnostic_preferences_by_project_mode=predicate_diagnostic_preferences,
                     )
                 except BaselineConstraintVerificationError as exc:
                     if exc.terminal_status:
@@ -9764,10 +9822,12 @@ def resolve_peer_compatibility_with_verification(
                         )
                     confirmed_failed_assignments.add(fingerprint)
 
-                    # BLOCK_V_PREDICATE_GUIDANCE_V1
-                    # Advisory-only active verification guidance. It may choose
-                    # a high-information exact version for a future diagnostic
-                    # intervention, but it cannot prune candidates or add a clause.
+                    # BLOCK_VF_ACTIVE_PREDICATE_EXECUTION_V1
+                    # Exact confirmation above is the authority boundary. Point
+                    # probes below are diagnostic experiments only. A useful probe
+                    # may steer the next exact solve by reordering a complete domain,
+                    # but cannot create a clause or prune any version.
+                    predicate_search_steered = False
                     if expected_structural:
                         for target_predicate in sorted(expected_structural):
                             predicate_pkg = predicate_package(target_predicate)
@@ -9776,12 +9836,41 @@ def resolve_peer_compatibility_with_verification(
                             )
                             if not predicate_pkg or not current_probe_version:
                                 continue
+                            meta = client.npm_cache.get(predicate_pkg)
+                            row = rows_by_name.get(predicate_pkg)
+                            if not isinstance(meta, dict) or row is None:
+                                continue
+
                             observation_key = (
                                 project, mode, predicate_pkg.lower(), target_predicate
                             )
-                            observations = predicate_probe_observations.setdefault(
-                                observation_key, []
+                            session = predicate_state_store.load_session(
+                                project, mode,
+                                run_identity=recovery_identity,
+                                package=predicate_pkg,
+                                predicate=target_predicate,
                             )
+                            observations = predicate_probe_observations.setdefault(
+                                observation_key, list(session.observations)
+                            )
+                            for restored_point in session.observations:
+                                if restored_point not in observations:
+                                    observations.append(restored_point)
+
+                            # If a prior soft preference itself reproduced the same
+                            # predicate, it has served its purpose and must not keep
+                            # steering future solves. This is navigation state only.
+                            if session.preferred_version == current_probe_version:
+                                predicate_state_store.clear_preferred_version(
+                                    project, mode,
+                                    run_identity=recovery_identity,
+                                    package=predicate_pkg,
+                                    predicate=target_predicate,
+                                )
+                                predicate_diagnostic_preferences.setdefault(project, {}).setdefault(mode, {}).pop(
+                                    predicate_pkg, None
+                                )
+
                             point = PredicateObservation(
                                 package=predicate_pkg,
                                 version=current_probe_version,
@@ -9795,10 +9884,14 @@ def resolve_peer_compatibility_with_verification(
                             )
                             if point not in observations:
                                 observations.append(point)
-                            meta = client.npm_cache.get(predicate_pkg)
-                            row = rows_by_name.get(predicate_pkg)
-                            if not isinstance(meta, dict) or row is None:
-                                continue
+                            predicate_state_store.save_observations(
+                                project, mode,
+                                run_identity=recovery_identity,
+                                package=predicate_pkg,
+                                predicate=target_predicate,
+                                observations=observations,
+                            )
+
                             published = published_versions(
                                 meta, include_prerelease=False
                             )
@@ -9816,28 +9909,235 @@ def resolve_peer_compatibility_with_verification(
                                 observations=observations,
                                 hints=compatibility_hints,
                             )
-                            if not ranked:
-                                continue
-                            suggested = ranked[0]
-                            progress_reporter.emit(
-                                project, mode, "predicate-probe-suggested",
-                                iteration=iteration,
-                                assignment=fingerprint,
-                                predicate=target_predicate,
+                            if ranked:
+                                suggested = ranked[0]
+                                progress_reporter.emit(
+                                    project, mode, "predicate-probe-suggested",
+                                    iteration=iteration,
+                                    assignment=fingerprint,
+                                    predicate=target_predicate,
+                                    package=predicate_pkg,
+                                    currentVersion=current_probe_version,
+                                    suggestedVersion=suggested.version,
+                                    remainingCandidates=len(ranked),
+                                    reasons=list(suggested.reasons),
+                                    authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                )
+                                eprint(
+                                    f"[info] {project}: predicate-guided probe suggestion {mode}; "
+                                    f"predicate={target_predicate}, package={predicate_pkg}, "
+                                    f"current={current_probe_version}, suggested={suggested.version}, "
+                                    f"remaining={len(ranked)}, reasons={','.join(suggested.reasons)}, "
+                                    f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
+                                )
+
+                            def run_predicate_probe(
+                                probe_version: str,
+                                probe_assignment: Mapping[str, str],
+                            ) -> ProbeExecution:
+                                probe_materialization = dict(probe_assignment)
+                                probe_fingerprint = assignment_fingerprint(
+                                    probe_materialization
+                                )
+                                probe_removals = _types_stub_removals_for_assignment(
+                                    rows_by_name, probe_materialization, mode, client
+                                )
+                                progress_reporter.emit(
+                                    project, mode, "predicate-probe-active-started",
+                                    iteration=iteration,
+                                    assignment=fingerprint,
+                                    candidate=probe_fingerprint,
+                                    package=predicate_pkg,
+                                    version=probe_version,
+                                    predicate=target_predicate,
+                                    authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                )
+                                eprint(
+                                    f"[info] {project}: predicate-guided active probe {mode}; "
+                                    f"package={predicate_pkg}, version={probe_version}, "
+                                    f"predicate={target_predicate}, candidate={probe_fingerprint}, "
+                                    f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
+                                )
+                                probe_result = verify_assignment(
+                                    spec.path,
+                                    probe_materialization,
+                                    config=confirmation_config,
+                                    run_project_checks=True,
+                                    remove_packages=probe_removals,
+                                    progress=lambda message, probe_version=probe_version, probe_fingerprint=probe_fingerprint: (
+                                        progress_reporter.emit(
+                                            project, mode, "predicate-probe-active-running",
+                                            iteration=iteration, assignment=fingerprint,
+                                            candidate=probe_fingerprint,
+                                            package=predicate_pkg, version=probe_version,
+                                            predicate=target_predicate, message=message,
+                                        ),
+                                        eprint(
+                                            f"[info] {project}: predicate probe {mode} "
+                                            f"{predicate_pkg}@{probe_version}: {message}"
+                                        ),
+                                    ),
+                                    progress_label=(
+                                        f"Baseline predicate probe {mode} "
+                                        f"{predicate_pkg}@{probe_version} {probe_fingerprint}"
+                                    ),
+                                )
+                                if probe_result.kind in {"infrastructure", "unknown", "dependency", "preparation"}:
+                                    return ProbeExecution(
+                                        version=probe_version,
+                                        outcome=PROBE_OUTCOME_INCONCLUSIVE,
+                                        assignment_fingerprint=probe_fingerprint,
+                                        detail=f"{probe_result.kind}:{probe_result.summary}",
+                                    )
+                                if probe_result.ok:
+                                    return ProbeExecution(
+                                        version=probe_version,
+                                        outcome=PROBE_OUTCOME_ABSENT,
+                                        assignment_fingerprint=probe_fingerprint,
+                                    )
+                                if probe_result.kind != "project":
+                                    return ProbeExecution(
+                                        version=probe_version,
+                                        outcome=PROBE_OUTCOME_INCONCLUSIVE,
+                                        assignment_fingerprint=probe_fingerprint,
+                                        detail=f"unexpected:{probe_result.kind}",
+                                    )
+                                probe_structural = set(
+                                    structural_project_failure_signatures(probe_result)
+                                )
+                                present = target_predicate in probe_structural
+                                return ProbeExecution(
+                                    version=probe_version,
+                                    outcome=(
+                                        PROBE_OUTCOME_PRESENT
+                                        if present
+                                        else PROBE_OUTCOME_ABSENT
+                                    ),
+                                    assignment_fingerprint=probe_fingerprint,
+                                    other_predicates=tuple(sorted(
+                                        item for item in probe_structural
+                                        if item != target_predicate
+                                    )),
+                                )
+
+                            search_result = run_active_predicate_search(
                                 package=predicate_pkg,
-                                currentVersion=current_probe_version,
-                                suggestedVersion=suggested.version,
-                                remainingCandidates=len(ranked),
-                                reasons=list(suggested.reasons),
-                                authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                predicate=target_predicate,
+                                base_assignment=verification_assignment,
+                                project_current_version=row.current_version,
+                                versions=probe_domain,
+                                observations=observations,
+                                attempted_versions=session.attempted_versions,
+                                hints=compatibility_hints,
+                                policy=predicate_probe_policy,
+                                run_probe=run_predicate_probe,
                             )
-                            eprint(
-                                f"[info] {project}: predicate-guided probe suggestion {mode}; "
-                                f"predicate={target_predicate}, package={predicate_pkg}, "
-                                f"current={current_probe_version}, suggested={suggested.version}, "
-                                f"remaining={len(ranked)}, reasons={','.join(suggested.reasons)}, "
-                                f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
-                            )
+                            if search_result.activated:
+                                predicate_probe_observations[observation_key] = list(
+                                    search_result.observations
+                                )
+                                predicate_state_store.save_observations(
+                                    project, mode,
+                                    run_identity=recovery_identity,
+                                    package=predicate_pkg,
+                                    predicate=target_predicate,
+                                    observations=search_result.observations,
+                                )
+                                for probe_execution in search_result.executions:
+                                    predicate_state_store.mark_attempt(
+                                        project, mode,
+                                        run_identity=recovery_identity,
+                                        package=predicate_pkg,
+                                        predicate=target_predicate,
+                                        version=probe_execution.version,
+                                    )
+                                    progress_reporter.emit(
+                                        project, mode, "predicate-probe-observed",
+                                        iteration=iteration, assignment=fingerprint,
+                                        package=predicate_pkg,
+                                        version=probe_execution.version,
+                                        predicate=target_predicate,
+                                        outcome=probe_execution.outcome,
+                                        detail=probe_execution.detail,
+                                        authority=(
+                                            "POINT_EVIDENCE"
+                                            if probe_execution.outcome != PROBE_OUTCOME_INCONCLUSIVE
+                                            else EVIDENCE_DIAGNOSTIC_HINT
+                                        ),
+                                    )
+                                    eprint(
+                                        f"[info] {project}: predicate probe observation {mode}; "
+                                        f"package={predicate_pkg}, version={probe_execution.version}, "
+                                        f"predicate={target_predicate}, outcome={probe_execution.outcome}, "
+                                        f"authority={'POINT_EVIDENCE' if probe_execution.outcome != PROBE_OUTCOME_INCONCLUSIVE else EVIDENCE_DIAGNOSTIC_HINT}"
+                                    )
+
+                            preferred_version = search_result.preferred_version
+                            if preferred_version:
+                                predicate_state_store.set_preferred_version(
+                                    project, mode,
+                                    run_identity=recovery_identity,
+                                    package=predicate_pkg,
+                                    predicate=target_predicate,
+                                    version=preferred_version,
+                                )
+                                predicate_diagnostic_preferences.setdefault(project, {}).setdefault(mode, {})[
+                                    predicate_pkg
+                                ] = preferred_version
+                                progress_reporter.emit(
+                                    project, mode, "predicate-search-steering-selected",
+                                    iteration=iteration, assignment=fingerprint,
+                                    package=predicate_pkg,
+                                    predicate=target_predicate,
+                                    preferredVersion=preferred_version,
+                                    repeatCount=search_result.repeat_count,
+                                    probes=len(search_result.executions),
+                                    remainingCandidates=search_result.remaining_candidates,
+                                    authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                )
+                                eprint(
+                                    f"[info] {project}: predicate-guided search selected soft fallback {mode}; "
+                                    f"package={predicate_pkg}, preferred={preferred_version}, "
+                                    f"predicate={target_predicate}, repeat={search_result.repeat_count}, "
+                                    f"probes={len(search_result.executions)}, "
+                                    f"authority={EVIDENCE_DIAGNOSTIC_HINT}; solver domain remains complete"
+                                )
+
+                                # The current full assignment itself was freshly
+                                # confirmed above, so excluding exactly that point is
+                                # authoritative. Probe observations remain diagnostic.
+                                if exact_nogood in global_exact_exclusions[project][mode]:
+                                    raise BaselineConstraintVerificationError(
+                                        f"BASELINE_CONSTRAINT_LOOP_STUCK: {project}/{mode}: "
+                                        f"global exact assignment {fingerprint} was already excluded"
+                                    )
+                                global_exact_exclusions[project][mode].append(exact_nogood)
+                                extension_granted = liveness.record_exact_exclusion()
+                                localization_checkpoint_store.clear(project, mode)
+                                checkpoint_baseline_run(
+                                    "predicate-search-steered",
+                                    completed_iteration=iteration,
+                                    last_assignment=fingerprint,
+                                    last_predicate=target_predicate,
+                                )
+                                progress_reporter.emit(
+                                    project, mode, "predicate-search-steered",
+                                    iteration=iteration, assignment=fingerprint,
+                                    package=predicate_pkg,
+                                    predicate=target_predicate,
+                                    preferredVersion=preferred_version,
+                                    literals=len(exact_nogood),
+                                    extensionGranted=extension_granted,
+                                    exactAssignmentAuthority=EVIDENCE_CONFIRMED_CONSTRAINT,
+                                    probeAuthority=EVIDENCE_DIAGNOSTIC_HINT,
+                                    topologyMerged=False,
+                                    **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                                )
+                                predicate_search_steered = True
+                                break
+
+                    if predicate_search_steered:
+                        continue
 
                     generalized_nogood: Optional[Dict[str, str]] = None
                     proposal = _adaptive_graph_guided_generalization_proposal(
@@ -11145,6 +11445,7 @@ def resolve_peer_compatibility_with_verification(
             if name in rows_by_project
         },
         residual_targets_by_project=residual_targets_by_project,
+        diagnostic_preferences_by_project_mode=predicate_diagnostic_preferences,
     )
     for project, mode_assignments in final_assignments.items():
         for mode, proven in mode_assignments.items():

@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Block V-C predicate-guided active verification utilities.
+"""Block V predicate-guided active verification utilities.
 
-The module ranks *all* still-unobserved exact version points.  It cannot prune a
-candidate, create a solver clause, or convert an external hint into authority.
-That type/API boundary is intentional: hints may affect cost, never correctness.
+The ranker returns *all* still-unobserved exact version points.  It cannot prune
+an authoritative solver candidate, create a solver clause, or convert an
+external hint / predicate observation into authority.  Hints and point evidence
+may affect experiment ordering and a soft solver preference only.
 """
 from __future__ import annotations
 
 import dataclasses
 import json
-import math
+import os
 import re
 from pathlib import Path
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 HINT_AUTHORITY = "DIAGNOSTIC_HINT"
 OBSERVATION_AUTHORITY = "POINT_EVIDENCE"
@@ -46,6 +47,82 @@ class ProbeCandidate:
     predicate: str
     score: tuple[int, int, int, int, tuple[int, int, int, int, str]]
     reasons: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class PredicateProbePolicy:
+    """Bounded diagnostic exploration policy.
+
+    This policy controls only experiment *cost*.  It never changes the solver
+    domain or proof authority.  The defaults are intentionally conservative:
+    active probing starts only after the same package/predicate has been freshly
+    observed at two distinct failing direct versions.
+    """
+
+    enabled: bool = True
+    repeat_threshold: int = 2
+    probe_budget: int = 3
+
+    @classmethod
+    def from_sources(
+        cls,
+        config: Optional[Mapping[str, object]] = None,
+        environment: Optional[Mapping[str, str]] = None,
+    ) -> "PredicateProbePolicy":
+        raw = dict(config or {})
+        env = environment if environment is not None else os.environ
+
+        enabled = _coerce_bool(raw.get("predicateActiveSearch"), True)
+        if "DEPLOOM_PREDICATE_ACTIVE_SEARCH" in env:
+            enabled = _coerce_bool(env.get("DEPLOOM_PREDICATE_ACTIVE_SEARCH"), enabled)
+
+        repeat_threshold = _bounded_int(
+            raw.get("predicateProbeRepeatThreshold", 2), minimum=2, maximum=8, default=2
+        )
+        if env.get("DEPLOOM_PREDICATE_REPEAT_THRESHOLD"):
+            repeat_threshold = _bounded_int(
+                env.get("DEPLOOM_PREDICATE_REPEAT_THRESHOLD"),
+                minimum=2,
+                maximum=8,
+                default=repeat_threshold,
+            )
+
+        probe_budget = _bounded_int(
+            raw.get("predicateProbeBudget", 3), minimum=1, maximum=8, default=3
+        )
+        if env.get("DEPLOOM_PREDICATE_PROBE_BUDGET"):
+            probe_budget = _bounded_int(
+                env.get("DEPLOOM_PREDICATE_PROBE_BUDGET"),
+                minimum=1,
+                maximum=8,
+                default=probe_budget,
+            )
+        return cls(
+            enabled=bool(enabled),
+            repeat_threshold=repeat_threshold,
+            probe_budget=probe_budget,
+        )
+
+
+def _coerce_bool(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "enabled", "enable"}:
+        return True
+    if text in {"0", "false", "no", "off", "disabled", "disable"}:
+        return False
+    return default
+
+
+def _bounded_int(value: object, *, minimum: int, maximum: int, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))
 
 
 def _semver_key(value: str) -> tuple[int, int, int, int, str]:
@@ -123,6 +200,45 @@ def _matching_hint_score(
     return score, tuple(sorted(set(reasons)))
 
 
+def _stable_observed_status(
+    *,
+    package: str,
+    predicate: str,
+    observations: Sequence[PredicateObservation],
+) -> dict[str, bool]:
+    """Return only exact version points whose observations do not disagree.
+
+    Conflicting observations can occur because the same direct version was
+    probed under different surrounding assignments or because project behavior
+    is nondeterministic.  Such a point must provide *no* boundary implication.
+    It remains eligible for a future diagnostic probe.  This fixes the old
+    first-observation-wins behavior while preserving the no-pruning invariant.
+    """
+    values: dict[str, set[bool]] = {}
+    for item in observations:
+        if item.package.lower() != package.lower() or item.predicate != predicate:
+            continue
+        values.setdefault(item.version, set()).add(bool(item.present))
+    return {
+        version: next(iter(statuses))
+        for version, statuses in values.items()
+        if len(statuses) == 1
+    }
+
+
+def predicate_repeat_count(
+    *,
+    package: str,
+    predicate: str,
+    observations: Sequence[PredicateObservation],
+) -> int:
+    """Count distinct, non-conflicting exact versions where the predicate was present."""
+    status = _stable_observed_status(
+        package=package, predicate=predicate, observations=observations
+    )
+    return sum(1 for present in status.values() if present)
+
+
 def _boundary_score(
     version: str,
     ordered: Sequence[str],
@@ -164,8 +280,7 @@ def _exploration_score(version: str, ordered: Sequence[str], observed: set[str])
         # First probe: favour newest exact version because the solver normally
         # optimizes toward useful/newer updates. This is only ordering.
         return index
-    distance = min(abs(index - position) for position in observed_positions)
-    return distance
+    return min(abs(index - position) for position in observed_positions)
 
 
 def rank_version_probes(
@@ -176,23 +291,16 @@ def rank_version_probes(
     observations: Sequence[PredicateObservation] = (),
     hints: Sequence[DiagnosticHint] = (),
 ) -> tuple[ProbeCandidate, ...]:
-    """Return a deterministic permutation of every unobserved exact version.
+    """Return a deterministic permutation of every non-stably-observed version.
 
-    Completeness invariant: the returned version set is exactly
-    ``versions - already_observed_versions``.  No heuristic can remove a point.
+    Completeness invariant: a heuristic never removes an authoritative solver
+    candidate.  Exact points with contradictory observations are intentionally
+    considered ambiguous and therefore remain probe-eligible.
     """
     unique = sorted({str(item) for item in versions if str(item)}, key=_semver_key)
-    relevant = [
-        item for item in observations
-        if item.package.lower() == package.lower() and item.predicate == predicate
-    ]
-    observed_status: dict[str, bool] = {}
-    for item in relevant:
-        # If repeated exact point observations disagree, treat it as observed but
-        # give it no range implication. The caller should flag nondeterminism.
-        if item.version in observed_status and observed_status[item.version] != item.present:
-            continue
-        observed_status[item.version] = item.present
+    observed_status = _stable_observed_status(
+        package=package, predicate=predicate, observations=observations
+    )
     observed_versions = set(observed_status)
     result: list[ProbeCandidate] = []
     for version in unique:
@@ -235,7 +343,7 @@ def controlled_probe_assignment(
     package: str,
     version: str,
 ) -> dict[str, str]:
-    """Change exactly one solver-owned dimension for a diagnostic intervention."""
+    """Change exactly one solver-owned direct dimension for a diagnostic intervention."""
     if package not in base_assignment:
         raise KeyError(f"PREDICATE_PROBE_PACKAGE_NOT_IN_ASSIGNMENT: {package}")
     result = dict(base_assignment)
@@ -257,3 +365,33 @@ def predicate_package(predicate: str) -> str:
         if text.startswith(prefix):
             return text[len(prefix):].strip()
     return ""
+
+
+def prioritize_probe_preference(
+    versions: Sequence[str],
+    *,
+    preferred_version: str,
+    current_version: str,
+) -> list[str]:
+    """Move one diagnostic fallback directly behind the canonical first choice.
+
+    The first domain element (normally the desired/exact policy target) is never
+    displaced.  The current/source version is never promoted by diagnostic
+    evidence.  The output is a permutation of the exact same version set.
+    """
+    original = list(dict.fromkeys(str(item) for item in versions if str(item)))
+    preferred = str(preferred_version or "")
+    if (
+        not original
+        or not preferred
+        or preferred == str(current_version or "")
+        or preferred not in original
+        or preferred == original[0]
+    ):
+        return original
+    reordered = [original[0], preferred] + [
+        item for item in original[1:] if item != preferred
+    ]
+    if len(reordered) != len(original) or set(reordered) != set(original):
+        raise AssertionError("PREDICATE_PROBE_PREFERENCE_PRUNED_DOMAIN")
+    return reordered
