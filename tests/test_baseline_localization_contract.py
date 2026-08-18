@@ -82,16 +82,38 @@ class BaselineLocalizationContractTests(unittest.TestCase):
                 "using it for reproduction changes the experiment.",
             )
 
-    def test_combined_preflight_uses_full_verification_assignment(self) -> None:
+    def test_resolver_screen_and_full_preflight_use_full_verification_assignment(self) -> None:
         source = (ROOT / "dependency_live_roadmap_generator.py").read_text(encoding="utf-8")
+
+        # Block U intentionally removed the historical combined resolver+project
+        # call. Resolver authority is proven first.
         self.assertIn(
-            "combined = verify_assignment(\n"
-            "                            spec.path, verification_assignment, config=config, run_project_checks=True",
+            "result = verify_assignment(\n"
+            "                        spec.path,\n"
+            "                        verification_assignment,\n",
             source,
         )
+
+        # Adaptive screening also materializes the same full exact assignment.
+        self.assertIn(
+            "screen_result = verify_assignment(\n"
+            "                                spec.path,\n"
+            "                                verification_assignment,\n",
+            source,
+        )
+
+        # A candidate that survives screening must still execute the complete
+        # configured ProjectProof using the full exact direct assignment.
+        self.assertIn(
+            "project_result = verify_assignment(\n"
+            "                                spec.path, verification_assignment, config=config, run_project_checks=True",
+            source,
+        )
+
+        # The changed-only delta remains a localization concept, never the
+        # authoritative project-preflight materialization.
         self.assertNotIn(
-            "combined = verify_assignment(\n"
-            "                            spec.path, changed, config=config, run_project_checks=True",
+            "spec.path, changed, config=config, run_project_checks=True",
             source,
         )
 

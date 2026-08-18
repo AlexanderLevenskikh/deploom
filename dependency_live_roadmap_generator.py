@@ -9265,46 +9265,30 @@ def resolve_peer_compatibility_with_verification(
                         f"proving exact solver-managed assignment ({len(verification_assignment)} managed direct; "
                         f"fixedInputs={len(fixed_input_names)}; {len(changed)} changed), assignment={fingerprint}"
                     )
-                    if config.project_checks != "off" and config.commands:
-                        combined = verify_assignment(
-                            spec.path, verification_assignment, config=config, run_project_checks=True, remove_packages=removals,
-                            progress=lambda message: (progress_reporter.emit(project, mode, "assignment-verification", iteration=iteration, assignment=fingerprint, message=message), eprint(f"[info] {project}: {message}")),
-                            progress_label=f"Baseline {mode} iteration {iteration} assignment {fingerprint}",
-                        )
-                        if (
-                            combined.kind not in {"infrastructure", "unknown"}
-                            and resolver_trial_key
-                            and combined.resolved_state_key
-                        ):
-                            combined_project_key = build_project_trial_key(
-                                resolver_trial_key=resolver_trial_key,
-                                resolved_state_key=combined.resolved_state_key,
-                                source_snapshot_key=project_source_snapshot_key,
-                                project_checks=config.project_checks,
-                                commands=config.commands,
-                            )
-                            project_preflight_cache[combined_project_key] = combined
-                        if combined.kind == "project":
-                            # Resolver authority passed before the project checks;
-                            # preserve its exact ResolvedState so any later project
-                            # cache lookup can include that state in its key.
-                            result = BaselineVerifyResult(
-                                True, "passed",
-                                f"resolver preflight passed before project checks ({combined.summary})",
-                                command=combined.command, workspace=combined.workspace,
-                                observed_resolved_versions=combined.observed_resolved_versions,
-                                observed_resolved_hash=combined.observed_resolved_hash,
-                                resolved_state_key=combined.resolved_state_key,
-                                resolved_lockfile_hash=combined.resolved_lockfile_hash,
-                            )
-                        else:
-                            result = combined
-                    else:
-                        result = verify_assignment(
-                            spec.path, verification_assignment, config=config, run_project_checks=False, remove_packages=removals,
-                            progress=lambda message: (progress_reporter.emit(project, mode, "resolver-verification", iteration=iteration, assignment=fingerprint, message=message), eprint(f"[info] {project}: {message}")),
-                            progress_label=f"Baseline {mode} iteration {iteration} resolver {fingerprint}",
-                        )
+                    # BLOCK_U_EARLY_PROJECT_SCREEN_V1
+                    # Resolver authority first. Project checks are scheduled below
+                    # so adaptive mode can reject a freshly introduced structural
+                    # regression before paying for the complete project suite.
+                    result = verify_assignment(
+                        spec.path,
+                        verification_assignment,
+                        config=config,
+                        run_project_checks=False,
+                        remove_packages=removals,
+                        progress=lambda message: (
+                            progress_reporter.emit(
+                                project, mode, "resolver-verification",
+                                iteration=iteration,
+                                assignment=fingerprint,
+                                message=message,
+                            ),
+                            eprint(f"[info] {project}: {message}"),
+                        ),
+                        progress_label=(
+                            f"Baseline {mode} iteration {iteration} "
+                            f"resolver {fingerprint}"
+                        ),
+                    )
                     if resolver_trial_key and (
                         result.ok
                         or (result.kind == "dependency" and not result.resolved_state_key)
@@ -9369,6 +9353,97 @@ def resolve_peer_compatibility_with_verification(
                             if project_cache_key
                             else None
                         )
+                        screen_structural_evidence: Tuple[str, ...] = ()
+                        if (
+                            project_result is None
+                            and config.project_checks == "adaptive"
+                            and len(config.commands) > 1
+                        ):
+                            screen_command = config.commands[0]
+                            screen_config = dataclasses.replace(
+                                config, commands=(screen_command,)
+                            )
+                            progress_reporter.emit(
+                                project, mode, "adaptive-screen-started",
+                                iteration=iteration,
+                                assignment=fingerprint,
+                                command=screen_command,
+                            )
+                            screen_result = verify_assignment(
+                                spec.path,
+                                verification_assignment,
+                                config=screen_config,
+                                run_project_checks=True,
+                                remove_packages=removals,
+                                progress=lambda message: (
+                                    progress_reporter.emit(
+                                        project, mode, "adaptive-screen-running",
+                                        iteration=iteration,
+                                        assignment=fingerprint,
+                                        command=screen_command,
+                                        message=message,
+                                    ),
+                                    eprint(
+                                        f"[info] {project}: Baseline adaptive "
+                                        f"screen {screen_command}: {message}"
+                                    ),
+                                ),
+                                progress_label=(
+                                    f"Baseline {mode} iteration {iteration} "
+                                    f"adaptive screen {fingerprint}"
+                                ),
+                            )
+                            if screen_result.kind == "infrastructure":
+                                raise BaselineConstraintVerificationError(
+                                    f"BASELINE_VERIFY_INFRA_ERROR: "
+                                    f"{project}/{mode}: adaptive screen "
+                                    f"{screen_command}: {screen_result.summary}"
+                                )
+                            if screen_result.kind == "unknown":
+                                raise BaselineConstraintVerificationError(
+                                    f"BASELINE_VERIFY_UNKNOWN_ERROR: "
+                                    f"{project}/{mode}: adaptive screen "
+                                    f"{screen_command}: {screen_result.summary}"
+                                )
+                            if not screen_result.ok:
+                                screen_structural_evidence = (
+                                    adaptive_structural_evidence(screen_result)
+                                )
+                            if screen_structural_evidence:
+                                project_result = screen_result
+                                progress_reporter.emit(
+                                    project, mode,
+                                    "adaptive-screen-introduced-regression",
+                                    iteration=iteration,
+                                    assignment=fingerprint,
+                                    command=screen_command,
+                                    structuralEvidence=list(
+                                        screen_structural_evidence
+                                    ),
+                                )
+                                eprint(
+                                    f"[warn] {project}: adaptive screen rejected "
+                                    f"assignment {fingerprint} before remaining "
+                                    f"{len(config.commands) - 1} project check(s); "
+                                    f"introduced="
+                                    f"{', '.join(screen_structural_evidence)}"
+                                )
+                            else:
+                                progress_reporter.emit(
+                                    project, mode, "adaptive-screen-complete",
+                                    iteration=iteration,
+                                    assignment=fingerprint,
+                                    command=screen_command,
+                                    outcome=(
+                                        "pass"
+                                        if screen_result.ok
+                                        else "baseline-preexisting-or-nonstructural"
+                                    ),
+                                )
+
+                        # Successful candidates still need the full configured
+                        # ProjectProof. Screening only short-circuits a freshly
+                        # proven introduced structural regression.
                         if project_result is None:
                             project_result = verify_assignment(
                                 spec.path, verification_assignment, config=config, run_project_checks=True, remove_packages=removals,
@@ -9404,7 +9479,10 @@ def resolve_peer_compatibility_with_verification(
                                 "Project preflight failure was not classified as dependency evidence."
                             )
                         _annotate_constraint_preflight(rows, mode, assignment, project_result, iteration=iteration)
-                        structural_evidence = adaptive_structural_evidence(project_result)
+                        structural_evidence = (
+                            screen_structural_evidence
+                            or adaptive_structural_evidence(project_result)
+                        )
                         structural_failure = bool(structural_evidence)
                         if not project_result.ok and (
                             config.project_checks == "strict" or structural_failure

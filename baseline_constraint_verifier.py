@@ -59,6 +59,12 @@ from prepared_workspace_fastpath import (
     stop_guarded_clone,
     try_materialize_guarded_clone,
 )
+# BLOCK_U_VERIFICATION_SUBSTRATE_V1
+from verification_process_supervisor import run_supervised
+from verification_workspace_backend import (
+    materialize_private_tree,
+    workspace_backend_summary,
+)
 
 @dataclasses.dataclass(frozen=True)
 class BaselineVerifyConfig:
@@ -476,45 +482,17 @@ def _run(
     progress_label: str = "command",
     progress_interval_seconds: int = 15,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a child with heartbeat and a hard process-tree timeout.
-
-    `subprocess.run(timeout=...)` kills only the immediate process on Windows.
-    Package-manager shims commonly spawn cmd -> yarn/npm -> node descendants; a
-    descendant retaining stdout can keep communicate()/worker shutdown alive
-    indefinitely. This runner owns the whole tree and reports liveness while it
-    waits.
-    """
-    merged_env = dict(base_env) if base_env is not None else os.environ.copy()
-    if env:
-        merged_env.update({str(k): str(v) for k, v in env.items()})
-    started = time.monotonic()
-    popen_kwargs = dict(
-        cwd=str(cwd), env=merged_env, text=True, encoding="utf-8", errors="replace",
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=False,
+    """Run a verifier child through the cross-platform Block U supervisor."""
+    return run_supervised(
+        argv,
+        cwd,
+        timeout_seconds=timeout_seconds,
+        env=env,
+        base_env=base_env,
+        progress=progress,
+        progress_label=progress_label,
+        progress_interval_seconds=progress_interval_seconds,
     )
-    if os.name != "nt":
-        popen_kwargs["start_new_session"] = True
-    process = subprocess.Popen(list(argv), **popen_kwargs)
-    interval = max(1, min(int(progress_interval_seconds or 15), int(timeout_seconds)))
-    while True:
-        elapsed = time.monotonic() - started
-        remaining = timeout_seconds - elapsed
-        if remaining <= 0:
-            _emit_progress(progress, f"{progress_label}: HARD_TIMEOUT after {int(elapsed)}s; terminating process tree pid={process.pid}")
-            _terminate_process_tree(process)
-            try:
-                process.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                _terminate_process_tree(process)
-            raise subprocess.TimeoutExpired(list(argv), timeout_seconds)
-        try:
-            stdout, _stderr = process.communicate(timeout=min(interval, remaining))
-            return subprocess.CompletedProcess(list(argv), process.returncode or 0, stdout=stdout or "", stderr=None)
-        except subprocess.TimeoutExpired:
-            _emit_progress(
-                progress,
-                f"{progress_label}: running; elapsed={int(time.monotonic() - started)}s; hardTimeout={timeout_seconds}s; pid={process.pid}",
-            )
 
 
 def clean_ephemeral_verification_caches(project_dir: Path) -> Tuple[str, ...]:
@@ -589,47 +567,14 @@ def _run_snapshot_copy(
     progress_label: str = "snapshot copy",
     progress_interval_seconds: int = 15,
 ) -> subprocess.CompletedProcess[str]:
-    started = time.monotonic()
-    popen_kwargs = dict(
-        cwd=str(cwd),
-        env=os.environ.copy(),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        shell=False,
+    return run_supervised(
+        argv,
+        cwd,
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+        progress_label=progress_label,
+        progress_interval_seconds=progress_interval_seconds,
     )
-    if os.name != "nt":
-        popen_kwargs["start_new_session"] = True
-    process = subprocess.Popen(list(argv), **popen_kwargs)
-    interval = max(1, min(int(progress_interval_seconds or 15), int(timeout_seconds)))
-    while True:
-        elapsed = time.monotonic() - started
-        remaining = timeout_seconds - elapsed
-        if remaining <= 0:
-            _emit_progress(
-                progress,
-                f"{progress_label}: HARD_TIMEOUT after {int(elapsed)}s; "
-                f"terminating process tree pid={process.pid}",
-            )
-            _terminate_process_tree(process)
-            try:
-                process.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                _terminate_process_tree(process)
-            raise subprocess.TimeoutExpired(list(argv), timeout_seconds)
-        try:
-            stdout, _stderr = process.communicate(timeout=min(interval, remaining))
-            return subprocess.CompletedProcess(
-                list(argv), process.returncode or 0, stdout=stdout or "", stderr=None
-            )
-        except subprocess.TimeoutExpired:
-            _emit_progress(
-                progress,
-                f"{progress_label}: running; elapsed={int(time.monotonic() - started)}s; "
-                f"hardTimeout={timeout_seconds}s; pid={process.pid}",
-            )
 
 
 def _copy_tree_snapshot(
@@ -641,53 +586,22 @@ def _copy_tree_snapshot(
     timeout_seconds: int = 1800,
     progress_interval_seconds: int = 15,
 ) -> None:
-    """Safe full-copy fallback when the zero-copy Windows backend is unavailable."""
-    source = source.resolve()
-    target = target.resolve()
-    if target.exists():
-        raise RuntimeError(f"PREPARED_SNAPSHOT_TARGET_EXISTS: {target}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-
-    if os.name == "nt":
-        robocopy = shutil.which("robocopy")
-        if robocopy:
-            result = _run_snapshot_copy(
-                [
-                    robocopy, str(source), str(target), "/E", "/COPY:DAT",
-                    "/DCOPY:DAT", "/R:1", "/W:1", "/NFL", "/NDL",
-                    "/NJH", "/NJS", "/NP", "/SL", "/MT:32",
-                ],
-                source,
-                timeout_seconds=max(1, int(timeout_seconds)),
-                progress=progress,
-                progress_label=progress_label,
-                progress_interval_seconds=progress_interval_seconds,
-            )
-            if result.returncode < 8:
-                return
-            shutil.rmtree(target, ignore_errors=True)
-            raise RuntimeError(
-                "PREPARED_SNAPSHOT_ROBOCOPY_FAILED: "
-                f"exit={result.returncode}: {(result.stdout or '')[-1200:]}"
-            )
-
-    if os.name != "nt":
-        cp = shutil.which("cp")
-        if cp:
-            target.mkdir(parents=True, exist_ok=False)
-            result = _run_snapshot_copy(
-                [cp, "-a", "--reflink=auto", f"{source}/.", str(target)],
-                source,
-                timeout_seconds=max(1, int(timeout_seconds)),
-                progress=progress,
-                progress_label=progress_label,
-                progress_interval_seconds=progress_interval_seconds,
-            )
-            if result.returncode == 0:
-                return
-            shutil.rmtree(target, ignore_errors=True)
-
-    shutil.copytree(source, target, symlinks=True)
+    """Materialize a proof-safe private tree through the platform backend."""
+    mode = materialize_private_tree(
+        source,
+        target,
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+        progress_label=progress_label,
+        progress_interval_seconds=progress_interval_seconds,
+        # Preserve the verifier-level heartbeat/timeout hook. WorkspaceBackend
+        # still owns platform selection; the caller owns command supervision.
+        runner=_run_snapshot_copy,
+    )
+    _emit_progress(
+        progress,
+        f"{progress_label}: materialization backend={mode}",
+    )
 
 
 def _prepared_snapshot_slot(key: str, source_project: Path) -> Tuple[str, str]:
@@ -1258,6 +1172,7 @@ def verify_assignment(
         return lambda message: _emit_progress(progress, f"{progress_label}: {phase}: {message}")
 
     _emit_progress(progress, f"{progress_label}: started; attemptHardTimeout={config.attempt_timeout_seconds}s")
+    _emit_progress(progress, f"{progress_label}: verification substrate: {workspace_backend_summary()}")
     temp_root = Path(tempfile.mkdtemp(prefix="dependency-flow-baseline-verify-"))
     try:
         workspace_root = temp_root / "repo"
