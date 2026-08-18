@@ -179,6 +179,7 @@ export type ActionInput = {
   gateCommand?: string
   resumeAgent?: boolean
   restartMigration?: boolean
+  baselineResume?: 'auto' | 'restart'
   agentNote?: string
   // Internal marker: suppress per-stage desktop notifications while the
   // Autopilot owns the whole multi-stage FLOW. The final Autopilot notification

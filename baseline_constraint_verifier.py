@@ -65,6 +65,16 @@ from verification_workspace_backend import (
     materialize_private_tree,
     workspace_backend_summary,
 )
+# BLOCK_V_DURABLE_VERIFICATION_V1
+from block_v_prepared_artifact import (
+    configure_prepared_artifact_store,
+    invalidate_prepared_artifact_record,
+    is_durable_prepared_path,
+    load_prepared_artifact_record,
+    prepared_snapshot_storage_root,
+    publish_prepared_artifact_record,
+    verification_trial_parent,
+)
 
 @dataclasses.dataclass(frozen=True)
 class BaselineVerifyConfig:
@@ -537,7 +547,9 @@ _PREPARED_FASTPATH_COMMAND_DISABLED: set[Tuple[str, str]] = set()
 def _cleanup_prepared_snapshot_root() -> None:
     global _PREPARED_SNAPSHOT_ROOT
     root = _PREPARED_SNAPSHOT_ROOT
-    if root is not None:
+    # Block V durable PreparedArtifacts intentionally survive process exit.
+    # Only the historical process-local temporary root is deleted here.
+    if root is not None and not is_durable_prepared_path(root):
         shutil.rmtree(root, ignore_errors=True)
     _PREPARED_SNAPSHOT_ROOT = None
     _PREPARED_SNAPSHOTS.clear()
@@ -552,7 +564,8 @@ def _prepared_snapshot_root() -> Path:
     global _PREPARED_SNAPSHOT_ROOT
     with _PREPARED_SNAPSHOT_LOCK:
         if _PREPARED_SNAPSHOT_ROOT is None:
-            _PREPARED_SNAPSHOT_ROOT = Path(
+            durable = prepared_snapshot_storage_root()
+            _PREPARED_SNAPSHOT_ROOT = durable or Path(
                 tempfile.mkdtemp(prefix="dependency-flow-prepared-snapshots-")
             )
         return _PREPARED_SNAPSHOT_ROOT
@@ -673,17 +686,39 @@ def _lookup_prepared_workspace_snapshot(
     slot = _prepared_snapshot_slot(key, source_project)
     with _PREPARED_SNAPSHOT_LOCK:
         snapshot = _PREPARED_SNAPSHOTS.pop(slot, None)
-        if snapshot is None:
-            return None
-        if not snapshot.workspace_root.is_dir():
-            return None
-        # Dict insertion order becomes a tiny LRU. Snapshot eviction never
-        # weakens proof; it only forces rematerialization on a future miss.
+        if snapshot is not None and snapshot.workspace_root.is_dir():
+            # Dict insertion order becomes a tiny LRU. Snapshot eviction never
+            # weakens proof; it only forces rematerialization on a future miss.
+            _PREPARED_SNAPSHOTS[slot] = snapshot
+            return snapshot
+
+    # Cross-process Block V lookup. The locator itself is PRECONDITION_CACHE
+    # only; the caller separately requires an exact PreparationProof HIT before
+    # allowing this tree to skip lifecycle preparation.
+    record = load_prepared_artifact_record(key, source_project)
+    if record is None:
+        return None
+    snapshot = PreparedWorkspaceSnapshot(
+        key=str(record["key"]),
+        workspace_root=Path(record["workspaceRoot"]),
+        project_relative=Path(record["projectRelative"]),
+        source_project=source_project.resolve(),
+        storage_mode=str(record["storageMode"]),
+        observed_resolved_versions=dict(record["observedResolvedVersions"]),
+        observed_resolved_hash=str(record["observedResolvedHash"]),
+        # Persistent artifacts deliberately do not resurrect the old guarded
+        # junction fast path. Fresh project checks use private clone/copy only.
+        dependency_integrity={},
+    )
+    with _PREPARED_SNAPSHOT_LOCK:
         _PREPARED_SNAPSHOTS[slot] = snapshot
-        return snapshot
+    return snapshot
 
 
 def _retire_prepared_workspace_snapshot(snapshot: PreparedWorkspaceSnapshot) -> bool:
+    # Memory-budget eviction must not delete a durable cross-process artifact.
+    if is_durable_prepared_path(snapshot.workspace_root):
+        return True
     if os.name != "nt":
         shutil.rmtree(snapshot.workspace_root.parent, ignore_errors=True)
         return True
@@ -703,8 +738,13 @@ def _evict_prepared_workspace_snapshot(key: str, source_project: Path) -> None:
     slot = _prepared_snapshot_slot(key, source_project)
     with _PREPARED_SNAPSHOT_LOCK:
         snapshot = _PREPARED_SNAPSHOTS.pop(slot, None)
-    if snapshot is not None:
+    durable = bool(snapshot is not None and is_durable_prepared_path(snapshot.workspace_root))
+    if snapshot is not None and not durable:
         _retire_prepared_workspace_snapshot(snapshot)
+    # Eviction is used only when the prepared state became suspect or mismatched.
+    # Remove the durable locator only. Another process may still be reading the
+    # immutable tree; lazy garbage collection is safer than deleting it here.
+    invalidate_prepared_artifact_record(key, remove_tree=False)
 
 
 def _enforce_prepared_snapshot_budget(protected_slot: Tuple[str, str]) -> None:
@@ -802,6 +842,16 @@ def _publish_prepared_workspace_snapshot(
                 published = raced
         if raced is not None:
             shutil.rmtree(stage, ignore_errors=True)
+        if is_durable_prepared_path(published.workspace_root):
+            publish_prepared_artifact_record(
+                key=published.key,
+                workspace_root=published.workspace_root,
+                project_relative=published.project_relative,
+                source_project=published.source_project,
+                storage_mode=published.storage_mode,
+                observed_resolved_versions=published.observed_resolved_versions,
+                observed_resolved_hash=published.observed_resolved_hash,
+            )
         _enforce_prepared_snapshot_budget(slot)
         return published
     except Exception:
@@ -825,6 +875,7 @@ def _materialize_prepared_workspace_snapshot(
     # optimization and is retried through proof-safe private copies.
     fastpath_allowed = (
         allow_fastpath
+        and not is_durable_prepared_path(snapshot.workspace_root)
         and _prepared_snapshot_fastpath_allowed(snapshot.key, snapshot.source_project)
     )
     if fastpath_allowed:
@@ -1172,8 +1223,13 @@ def verify_assignment(
         return lambda message: _emit_progress(progress, f"{progress_label}: {phase}: {message}")
 
     _emit_progress(progress, f"{progress_label}: started; attemptHardTimeout={config.attempt_timeout_seconds}s")
-    _emit_progress(progress, f"{progress_label}: verification substrate: {workspace_backend_summary()}")
-    temp_root = Path(tempfile.mkdtemp(prefix="dependency-flow-baseline-verify-"))
+    configure_prepared_artifact_store(config.proof_cache_dir or None)
+    _emit_progress(progress, f"{progress_label}: verification substrate: {workspace_backend_summary(prepared_snapshot_storage_root())}")
+    trial_parent = verification_trial_parent(config.proof_cache_dir or None)
+    temp_root = Path(tempfile.mkdtemp(
+        prefix="dependency-flow-baseline-verify-",
+        dir=str(trial_parent) if trial_parent is not None else None,
+    ))
     try:
         workspace_root = temp_root / "repo"
         workspace_started = time.monotonic()
@@ -1500,12 +1556,23 @@ def verify_assignment(
             # optimization. Private full-copy project clones do not consume it.
             preparation_fastpath_enabled = (
                 _allow_prepared_fastpath
+                and prepared_snapshot_storage_root() is None
                 and _prepared_snapshot_fastpath_worth_sealing(
                     config.commands, project_dir
                 )
             )
-            snapshot = _lookup_prepared_workspace_snapshot(
-                proof_identity.preparation_proof_key, project_dir
+            # Durable filesystem bytes never become authority by themselves.
+            # Cross-process reuse is enabled only when the existing exact proof
+            # store independently confirms the same PreparationProofKey.
+            preparation_record = proof_store.lookup_pass(
+                "preparation", proof_identity.preparation_proof_key
+            )
+            snapshot = (
+                _lookup_prepared_workspace_snapshot(
+                    proof_identity.preparation_proof_key, project_dir
+                )
+                if preparation_record is not None
+                else None
             )
             if snapshot is not None and snapshot.observed_resolved_hash != observed_hash:
                 event(

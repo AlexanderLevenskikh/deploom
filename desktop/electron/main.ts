@@ -165,6 +165,7 @@ type ActionInput = {
   gateCommand?: string
   resumeAgent?: boolean
   restartMigration?: boolean
+  baselineResume?: 'auto' | 'restart'
   agentNote?: string
   sourceCommit?: string
   autopilot?: boolean
@@ -1565,6 +1566,7 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
       return [{
         label: 'Создание исходного baseline', command: 'python', cwd: workspace.path,
         args: [...commonGeneratorArgs, '--capture-baseline', '--baseline-label', input.label?.trim() || `dependency-flow-${new Date().toISOString().slice(0, 10)}`],
+        env: { DEPLOOM_BASELINE_RESUME: input.baselineResume === 'restart' ? 'restart' : 'auto' },
         stallWarningMs: 2 * 60_000,
         stallAbortMs: 15 * 60_000,
       }]

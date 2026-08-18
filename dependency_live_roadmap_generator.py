@@ -8854,6 +8854,29 @@ def resolve_peer_compatibility_with_verification(
     """
     progress_reporter = BaselineProgressReporter(progress_path)
     localization_checkpoint_store = BaselineLocalizationCheckpointStore(progress_path)
+    # BLOCK_V_BASELINE_RECOVERY_V1
+    from block_v_recovery import (
+        BaselineRunRecoveryStore,
+        baseline_resume_policy,
+        baseline_run_identity,
+        build_run_state,
+        restore_liveness_budget,
+        restore_run_state,
+    )
+    run_recovery_store = BaselineRunRecoveryStore(progress_path)
+    # BLOCK_V_PREDICATE_GUIDANCE_V1
+    from block_v_predicate_search import (
+        PredicateObservation,
+        load_hint_snapshot,
+        predicate_package,
+        rank_version_probes,
+    )
+    compatibility_hints = load_hint_snapshot(
+        os.environ.get("DEPLOOM_COMPATIBILITY_HINTS")
+    )
+    predicate_probe_observations: Dict[
+        Tuple[str, str, str, str], List[PredicateObservation]
+    ] = {}
     learned: Dict[str, Dict[str, List[Dict[str, str]]]] = {
         project: {mode: [] for mode in modes} for project in rows_by_project
     }
@@ -9098,11 +9121,72 @@ def resolve_peer_compatibility_with_verification(
         solver_managed_inputs = len(rows_by_name) - len(fixed_input_names)
 
         for mode in modes:
+            recovery_identity = baseline_run_identity(
+                project=project,
+                mode=mode,
+                source_snapshot_key=project_source_snapshot_key,
+                resolver_context_key=project_resolver_context_key,
+                config={
+                    "commands": list(config.commands),
+                    "projectChecks": config.project_checks,
+                    "registry": config.registry,
+                    "maxIterations": config.max_iterations,
+                    "maxDeltaChecks": config.max_delta_checks,
+                    "parallelism": config.parallelism,
+                    "timeoutSeconds": config.timeout_seconds,
+                    "attemptTimeoutSeconds": config.attempt_timeout_seconds,
+                    "localizationTimeoutSeconds": config.localization_timeout_seconds,
+                },
+            )
+            recovery_plan = run_recovery_store.begin(
+                project, mode, identity=recovery_identity,
+                policy=baseline_resume_policy(),
+            )
+            restored_failed: Set[str] = set()
+            restored_iteration = 0
+            restored_liveness: Dict[str, object] = {}
+            if recovery_plan.resumable:
+                (
+                    restored_learned, restored_exclusions, restored_failed,
+                    restored_iteration, restored_liveness,
+                ) = restore_run_state(recovery_plan.state)
+                for clause in restored_learned:
+                    if clause not in learned[project][mode]:
+                        learned[project][mode].append(clause)
+                for clause in restored_exclusions:
+                    if clause not in global_exact_exclusions[project][mode]:
+                        global_exact_exclusions[project][mode].append(clause)
+                eprint(
+                    f"[info] {project}: Baseline recovery {mode}; "
+                    f"resumeFromCompletedIteration={restored_iteration}, "
+                    f"learned={len(restored_learned)}, exactExclusions={len(restored_exclusions)}, "
+                    f"interrupted={str(recovery_plan.interrupted).lower()}, "
+                    f"authority=ORCHESTRATION_HINT"
+                )
+                progress_reporter.emit(
+                    project, mode, "recovery-resumed",
+                    completedIteration=restored_iteration,
+                    learnedConstraints=len(restored_learned),
+                    exactExclusions=len(restored_exclusions),
+                    interrupted=recovery_plan.interrupted,
+                    changedEpochs=list(recovery_plan.changed_epochs),
+                    authority="ORCHESTRATION_HINT",
+                )
+            elif recovery_plan.found and recovery_plan.reason == "authority-epoch-changed":
+                progress_reporter.emit(
+                    project, mode, "recovery-recheck-required",
+                    recheckFrom=recovery_plan.recheck_from,
+                    changedEpochs=list(recovery_plan.changed_epochs),
+                    authority="ORCHESTRATION_HINT",
+                )
+
             liveness = BaselineLivenessBudget(
                 base_iterations=config.max_iterations,
                 max_learning_extensions=config.max_iterations,
                 starting_learned_constraints=len(learned[project][mode]),
             )
+            if restored_liveness:
+                restore_liveness_budget(liveness, restored_liveness)
             eprint(
                 f"[info] {project}: Baseline solve-and-verify {mode} started; "
                 f"maxIterations={config.max_iterations}, hardIterations={liveness.hard_iterations}, "
@@ -9124,8 +9208,41 @@ def resolve_peer_compatibility_with_verification(
                 **liveness.snapshot(learned_constraints=len(learned[project][mode])),
             )
             last_fingerprint = ""
-            confirmed_failed_assignments: Set[str] = set()
-            iteration = 0
+            confirmed_failed_assignments: Set[str] = set(restored_failed)
+            iteration = restored_iteration
+
+            def checkpoint_baseline_run(
+                phase: str,
+                *,
+                completed_iteration: Optional[int] = None,
+                last_assignment: str = "",
+                last_predicate: str = "",
+                status: str = "running",
+            ) -> None:
+                safe_iteration = iteration if completed_iteration is None else completed_iteration
+                state = build_run_state(
+                    iteration=safe_iteration,
+                    learned_constraints=learned[project][mode],
+                    global_exact_exclusions=global_exact_exclusions[project][mode],
+                    confirmed_failed_assignments=sorted(confirmed_failed_assignments),
+                    liveness=liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                    last_assignment=last_assignment,
+                    last_predicate=last_predicate,
+                )
+                if status in {"completed", "passed"}:
+                    run_recovery_store.mark_terminal(
+                        project, mode, identity=recovery_identity, status=status,
+                        state=state, phase=phase,
+                    )
+                else:
+                    run_recovery_store.checkpoint(
+                        project, mode, identity=recovery_identity,
+                        state=state, status=status, phase=phase,
+                    )
+
+            # This is a SAFE cursor: no current subprocess is represented as done.
+            # If the process dies later, this completed-iteration state is retried fresh.
+            checkpoint_baseline_run("ready", completed_iteration=iteration)
             while iteration < liveness.allowed_iterations:
                 iteration += 1
                 progress_reporter.emit(
@@ -9232,6 +9349,10 @@ def resolve_peer_compatibility_with_verification(
                     else:
                         eprint(f"[info] {project}: Baseline verify {mode}: no target changes to materialize")
                     final_assignments.setdefault(project, {})[mode] = assignment
+                    checkpoint_baseline_run(
+                        "mode-passed-no-changes", completed_iteration=iteration,
+                        last_assignment=fingerprint, status="completed",
+                    )
                     progress_reporter.emit(
                         project,
                         mode,
@@ -9516,6 +9637,10 @@ def resolve_peer_compatibility_with_verification(
                                 f"[info] {project}: Baseline solve-and-verify {mode} PASSED "
                                 f"after {iteration} iteration(s); assignment={fingerprint}"
                             )
+                        checkpoint_baseline_run(
+                            "mode-passed", completed_iteration=iteration,
+                            last_assignment=fingerprint, status="completed",
+                        )
                         progress_reporter.emit(
                             project,
                             mode,
@@ -9638,6 +9763,82 @@ def resolve_peer_compatibility_with_verification(
                             "no solver constraint was learned"
                         )
                     confirmed_failed_assignments.add(fingerprint)
+
+                    # BLOCK_V_PREDICATE_GUIDANCE_V1
+                    # Advisory-only active verification guidance. It may choose
+                    # a high-information exact version for a future diagnostic
+                    # intervention, but it cannot prune candidates or add a clause.
+                    if expected_structural:
+                        for target_predicate in sorted(expected_structural):
+                            predicate_pkg = predicate_package(target_predicate)
+                            current_probe_version = str(
+                                verification_assignment.get(predicate_pkg, "")
+                            )
+                            if not predicate_pkg or not current_probe_version:
+                                continue
+                            observation_key = (
+                                project, mode, predicate_pkg.lower(), target_predicate
+                            )
+                            observations = predicate_probe_observations.setdefault(
+                                observation_key, []
+                            )
+                            point = PredicateObservation(
+                                package=predicate_pkg,
+                                version=current_probe_version,
+                                predicate=target_predicate,
+                                present=True,
+                                assignment_fingerprint=fingerprint,
+                                other_predicates=tuple(sorted(
+                                    item for item in expected_structural
+                                    if item != target_predicate
+                                )),
+                            )
+                            if point not in observations:
+                                observations.append(point)
+                            meta = client.npm_cache.get(predicate_pkg)
+                            row = rows_by_name.get(predicate_pkg)
+                            if not isinstance(meta, dict) or row is None:
+                                continue
+                            published = published_versions(
+                                meta, include_prerelease=False
+                            )
+                            structural_versions, _ = client.registry_structural_candidates(
+                                meta, published
+                            )
+                            probe_domain = [
+                                version for version in structural_versions
+                                if compare_semver(version, row.current_version) in {0, 1}
+                            ]
+                            ranked = rank_version_probes(
+                                package=predicate_pkg,
+                                predicate=target_predicate,
+                                versions=probe_domain,
+                                observations=observations,
+                                hints=compatibility_hints,
+                            )
+                            if not ranked:
+                                continue
+                            suggested = ranked[0]
+                            progress_reporter.emit(
+                                project, mode, "predicate-probe-suggested",
+                                iteration=iteration,
+                                assignment=fingerprint,
+                                predicate=target_predicate,
+                                package=predicate_pkg,
+                                currentVersion=current_probe_version,
+                                suggestedVersion=suggested.version,
+                                remainingCandidates=len(ranked),
+                                reasons=list(suggested.reasons),
+                                authority=EVIDENCE_DIAGNOSTIC_HINT,
+                            )
+                            eprint(
+                                f"[info] {project}: predicate-guided probe suggestion {mode}; "
+                                f"predicate={target_predicate}, package={predicate_pkg}, "
+                                f"current={current_probe_version}, suggested={suggested.version}, "
+                                f"remaining={len(ranked)}, reasons={','.join(suggested.reasons)}, "
+                                f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
+                            )
+
                     generalized_nogood: Optional[Dict[str, str]] = None
                     proposal = _adaptive_graph_guided_generalization_proposal(
                         rows_by_name,
@@ -10246,6 +10447,12 @@ def resolve_peer_compatibility_with_verification(
                                 f"literals={[len(item) for item in new_constraints]}, "
                                 f"authority={EVIDENCE_CONFIRMED_CONSTRAINT}; re-solving"
                             )
+                            checkpoint_baseline_run(
+                                "generalization-certified",
+                                completed_iteration=iteration,
+                                last_assignment=fingerprint,
+                                last_predicate=stable_predicate,
+                            )
                             progress_reporter.emit(
                                 project, mode, "generalization-certified",
                                 iteration=iteration, assignment=fingerprint,
@@ -10316,6 +10523,11 @@ def resolve_peer_compatibility_with_verification(
                         f"as global exact exclusion; literals={len(exact_nogood)}, "
                         f"authority={EVIDENCE_CONFIRMED_CONSTRAINT}; "
                         "solver components remain independent"
+                    )
+                    checkpoint_baseline_run(
+                        "exact-assignment-blocked",
+                        completed_iteration=iteration,
+                        last_assignment=fingerprint,
                     )
                     progress_reporter.emit(
                         project, mode, "exact-assignment-blocked",
@@ -10842,6 +11054,12 @@ def resolve_peer_compatibility_with_verification(
                 eprint(
                     f"[info] {project}: learned constraint {mode} #{len(learned[project][mode])}: "
                     f"NOT({detail}); verification checks localized in parallel"
+                )
+                checkpoint_baseline_run(
+                    "constraint-learned",
+                    completed_iteration=iteration,
+                    last_assignment=fingerprint,
+                    last_predicate=localized_minimization.predicate,
                 )
                 progress_reporter.emit(
                     project,
