@@ -592,6 +592,21 @@ try {
 
                 if (
                     Test-Path `
+                        "scripts/check-public-sanitization.py"
+                ) {
+                    Write-Host ""
+                    Write-Host "== check-public-sanitization =="
+
+                    & python `
+                        scripts/check-public-sanitization.py
+
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "check-public-sanitization failed."
+                    }
+                }
+
+                if (
+                    Test-Path `
                         "scripts/check-release-assets.mjs"
                 ) {
                     Write-Host ""

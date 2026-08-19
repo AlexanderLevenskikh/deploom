@@ -257,6 +257,18 @@ type JobRecord = {
 type UpdateStatus = { state: 'idle' | 'checking' | 'available' | 'downloading' | 'current' | 'ready' | 'error'; version?: string; percent?: number; message?: string; authRequired?: boolean }
 
 const jobs = new Map<string, JobRecord>()
+const PROJECT_PARALLEL_ACTIONS = new Set<FlowAction>(['preflight', 'baseline'])
+
+function projectRunConflicts(existing: JobRecord, workspace: WorkspaceRecord, project: ProjectSpec, action: FlowAction): boolean {
+  if (existing.workspace.id !== workspace.id) return false
+  if (existing.projectName === project.name) return true
+
+  // Baseline/preflight operate on one project and may run side by side across
+  // different projects. Other FLOW actions can publish/mutate shared workspace
+  // state and therefore retain the workspace-wide exclusion.
+  return !(PROJECT_PARALLEL_ACTIONS.has(action) && PROJECT_PARALLEL_ACTIONS.has(existing.action))
+}
+
 let mainWindow: BrowserWindow | null = null
 let currentUpdateStatus: UpdateStatus = { state: 'idle' }
 let downloadedUpdateVersion: string | undefined
@@ -1681,9 +1693,27 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
       const explicitIntent = input.baselineIntent ? normalizeBaselineIntent(input.baselineIntent) : undefined
       const effectiveIntent = explicitIntent ?? persistedIntent
       if (explicitIntent) saveBaselineIntent(workspace, project.name, explicitIntent)
+
+      // Concurrent project Baselines must not race on the workspace's shared
+      // dependency-roadmap.{md,json,html} publication. Baseline evidence and
+      // verification caches stay on their normal exact/project identities; only
+      // human-facing generator outputs are redirected to a project-private sink.
+      const baselineProjectStem = project.name.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'project'
+      const baselineProjectOutput = join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-project-output', baselineProjectStem)
+      mkdirSync(baselineProjectOutput, { recursive: true })
+      const baselineOutputArgs = [
+        '--out', join(baselineProjectOutput, 'dependency-roadmap.md'),
+        '--json-out', join(baselineProjectOutput, 'dependency-roadmap.json'),
+        '--html-out', join(baselineProjectOutput, 'dependency-roadmap.html'),
+        // The canonical Baseline history entry is still captured below. The
+        // automatic dashboard snapshot is workspace-global and is deferred to
+        // the normal generate stage to avoid cross-project publication races.
+        '--no-history-snapshot',
+      ]
+
       return [{
         label: 'Создание исходного baseline', command: 'python', cwd: workspace.path,
-        args: [...commonGeneratorArgs, '--capture-baseline', '--baseline-label', input.label?.trim() || `dependency-flow-${new Date().toISOString().slice(0, 10)}`],
+        args: [...commonGeneratorArgs, ...baselineOutputArgs, '--capture-baseline', '--baseline-label', input.label?.trim() || `dependency-flow-${new Date().toISOString().slice(0, 10)}`],
         env: {
           DEPLOOM_BASELINE_RESUME: input.baselineResume === 'restart' ? 'restart' : input.baselineResume === 'continue' ? 'continue' : 'auto',
           DEPLOOM_BASELINE_INTENT_JSON: JSON.stringify({ schemaVersion: 1, policies: effectiveIntent.policies }),
@@ -5279,12 +5309,16 @@ function setupIpc(): void {
     // button was ever disabled. Two commands racing on the same working tree
     // (e.g. baseline's git status/generator run vs. the agent's own git
     // switch/commit/merge) can corrupt the very state the gate above depends
-    // on, so refuse a second job for a workspace that already has one in flight.
+    // Same-project jobs remain exclusive. Across different projects, only
+    // project-isolated actions (preflight/baseline) may overlap. Mutating FLOW
+    // stages still retain the workspace-wide lock.
     const runningJob = [...jobs.values()].find((existing) =>
-      existing.workspace.id === workspace.id &&
-      !(input.action === 'preflight' && existing.projectName !== project.name)
+      projectRunConflicts(existing, workspace, project, input.action)
     )
-    if (runningJob) throw new Error(`Для этого workspace уже выполняется «${runningJob.action}». Дождитесь завершения или отмените текущую команду.`)
+    if (runningJob) {
+      const scope = runningJob.projectName === project.name ? `проекта ${project.name}` : 'workspace'
+      throw new Error(`Для ${scope} уже выполняется «${runningJob.action}». Дождитесь завершения или отмените текущую команду.`)
+    }
     const savedRun = readTeamState(workspace)?.projects[project.name]
     const savedReleaseBranch = savedRun?.releaseBranch
     const effectiveTarget: ClosureTarget = savedRun?.target === 'green' || input.target === 'green' ? 'green' : 'yellow'

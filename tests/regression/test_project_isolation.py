@@ -44,10 +44,29 @@ class ProjectIsolationRegressionTests(unittest.TestCase):
         self.assertIn("setContextError(failedWorkspaceId, failedProjectName", finish_block)
         self.assertNotIn("autopilotRef.current?.", finish_block)
 
-    def test_preflight_can_run_for_another_project_without_unlocking_mutating_jobs(self) -> None:
+    def test_preflight_and_baseline_can_run_for_another_project_without_unlocking_mutating_jobs(self) -> None:
         main = (ROOT / "desktop" / "electron" / "main.ts").read_text(encoding="utf-8")
-        self.assertIn("input.action === 'preflight' && existing.projectName !== project.name", main)
-        self.assertIn("const runningJob = [...jobs.values()].find", main)
+
+        self.assertIn(
+            "const PROJECT_PARALLEL_ACTIONS = new Set<FlowAction>(['preflight', 'baseline'])",
+            main,
+        )
+        self.assertIn(
+            "if (existing.projectName === project.name) return true",
+            main,
+        )
+        self.assertIn(
+            "return !(PROJECT_PARALLEL_ACTIONS.has(action) && PROJECT_PARALLEL_ACTIONS.has(existing.action))",
+            main,
+        )
+        self.assertIn(
+            "projectRunConflicts(existing, workspace, project, input.action)",
+            main,
+        )
+        self.assertIn(
+            "const runningJob = [...jobs.values()].find",
+            main,
+        )
 
 
     def test_project_generator_outputs_are_snapshotted_per_project(self) -> None:
