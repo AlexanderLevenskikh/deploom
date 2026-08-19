@@ -1212,7 +1212,9 @@ def verify_assignment(
         return lambda message: _emit_progress(progress, f"{progress_label}: {phase}: {message}")
 
     _emit_progress(progress, f"{progress_label}: started; attemptHardTimeout={config.attempt_timeout_seconds}s")
+    _emit_progress(progress, f"{progress_label}: prepared-artifact cache configure: started")
     configure_prepared_artifact_store(config.proof_cache_dir or None)
+    _emit_progress(progress, f"{progress_label}: prepared-artifact cache configure: ready; cleanup=background")
     _emit_progress(progress, f"{progress_label}: verification substrate: {workspace_backend_summary(prepared_snapshot_storage_root())}")
     _emit_progress(progress, f"{progress_label}: verification storage: {storage_summary()}")
     trial_parent = verification_trial_parent(config.proof_cache_dir or None)

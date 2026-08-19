@@ -8,11 +8,13 @@ maps that exact key to an immutable on-disk tree across process restarts.
 """
 from __future__ import annotations
 
+import ctypes
 import datetime as dt
 import json
 import os
 import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -23,6 +25,15 @@ ARTIFACT_INDEX_SCHEMA = 1
 ARTIFACT_AUTHORITY = "PRECONDITION_CACHE"
 _LOCK = threading.RLock()
 _CONFIGURED_ROOT: Optional[Path] = None
+
+# BLOCK_V_PREPARED_ARTIFACT_ASYNC_GC_V2
+# PreparedArtifact is a performance cache. Heavy physical deletion must never
+# block the authoritative verifier critical path.
+_MAINTENANCE_THREADS_LOCK = threading.Lock()
+_MAINTENANCE_THREADS: dict[str, threading.Thread] = {}
+_DEFAULT_MAX_ARTIFACTS = 8
+_DEFAULT_GC_INITIAL_DELAY_SECONDS = 30.0
+_DEFAULT_GC_PAUSE_SECONDS = 5.0
 
 
 def configure_prepared_artifact_store(proof_cache_dir: str | Path | None) -> Optional[Path]:
@@ -41,15 +52,200 @@ def configure_prepared_artifact_store(proof_cache_dir: str | Path | None) -> Opt
     with _LOCK:
         _CONFIGURED_ROOT = root
 
-    # PreparedArtifact is a performance cache. Keep it bounded by default;
-    # pruning never changes proof authority and uses the same live snapshot
-    # lease before removing any tree.
-    prune_prepared_artifact_store(max_count=8)
+    # Maintenance is asynchronous. The old synchronous rmtree here could
+    # spend many minutes deleting an old node_modules tree immediately after
+    # "resolver started", producing no verifier heartbeat and triggering the
+    # Desktop HARD_STALL watchdog.
+    schedule_prepared_artifact_maintenance(
+        root=root,
+        max_count=_DEFAULT_MAX_ARTIFACTS,
+        initial_delay_seconds=_DEFAULT_GC_INITIAL_DELAY_SECONDS,
+    )
     return root
 
 def configured_prepared_artifact_root() -> Optional[Path]:
     with _LOCK:
         return _CONFIGURED_ROOT
+
+
+
+def _windows_background_io_mode(begin: bool) -> bool:
+    # Best-effort low-priority mode for cache deletion on Windows.
+    if os.name != "nt":
+        return False
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentThread.restype = ctypes.c_void_p
+        kernel32.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        kernel32.SetThreadPriority.restype = ctypes.c_int
+        # THREAD_MODE_BACKGROUND_BEGIN / THREAD_MODE_BACKGROUND_END
+        priority = 0x00010000 if begin else 0x00020000
+        return bool(kernel32.SetThreadPriority(kernel32.GetCurrentThread(), priority))
+    except Exception:
+        return False
+
+
+def _maintenance_root_key(root: Path) -> str:
+    try:
+        value = str(root.resolve())
+    except OSError:
+        value = str(root.absolute())
+    return os.path.normcase(value)
+
+
+def _retired_trash_root(root: Path) -> Path:
+    target = root / "trash"
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _retire_workspace_tree(key: str, workspace: Path) -> Optional[Path]:
+    # Atomically detach before slow deletion. If deletion is interrupted, the
+    # tree remains discoverable under trash/ and can be retried later.
+    root = configured_prepared_artifact_root()
+    if root is None:
+        return None
+
+    try:
+        trees = (root / "trees").resolve()
+        container = workspace.parent.resolve()
+        container.relative_to(trees)
+    except (OSError, ValueError):
+        return None
+
+    if container == trees:
+        return None
+
+    target = _retired_trash_root(root) / (
+        f"{container.name}.{_valid_key(key)[:12]}.{os.getpid()}.{time.time_ns()}"
+    )
+    try:
+        os.replace(container, target)
+    except OSError:
+        return None
+    return target
+
+
+def reap_prepared_artifact_trash(
+    *,
+    root: Optional[Path] = None,
+    max_removals: int = 1,
+) -> int:
+    # Detached trees have no published locator and no proof authority.
+    target_root = root or configured_prepared_artifact_root()
+    if target_root is None:
+        return 0
+
+    trash = target_root / "trash"
+    if not trash.is_dir():
+        return 0
+
+    limit = max(1, int(max_removals))
+    try:
+        candidates = sorted(
+            [path for path in trash.iterdir() if path.is_dir()],
+            key=lambda path: path.stat().st_mtime,
+        )
+    except OSError:
+        return 0
+
+    removed = 0
+    for path in candidates:
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            # Keep partial trash for a future maintenance pass.
+            continue
+        removed += 1
+        if removed >= limit:
+            break
+    return removed
+
+
+def _prepared_artifact_maintenance_worker(
+    root: Path,
+    *,
+    max_count: int,
+    initial_delay_seconds: float,
+) -> None:
+    root_key = _maintenance_root_key(root)
+    maintenance_lease = None
+    background_mode = False
+
+    try:
+        if initial_delay_seconds > 0:
+            time.sleep(initial_delay_seconds)
+        if not root.is_dir():
+            return
+
+        # Only one heavy cleaner per verification store across Windows
+        # processes. Independent project Baselines may still verify in parallel.
+        if os.name == "nt":
+            maintenance_lease = try_acquire_snapshot_cleanup_lease(root)
+            if maintenance_lease is None:
+                return
+            background_mode = _windows_background_io_mode(True)
+
+        while True:
+            configured = configured_prepared_artifact_root()
+            if configured is None or _maintenance_root_key(configured) != root_key:
+                return
+
+            # Bound one pass to one old trash tree and one over-limit artifact.
+            reaped = reap_prepared_artifact_trash(root=root, max_removals=1)
+            pruned = prune_prepared_artifact_store(
+                max_count=max_count,
+                max_removals=1,
+            )
+
+            if reaped == 0 and pruned == 0:
+                return
+
+            time.sleep(_DEFAULT_GC_PAUSE_SECONDS)
+    finally:
+        if background_mode:
+            _windows_background_io_mode(False)
+        if maintenance_lease is not None:
+            maintenance_lease.close()
+
+        with _MAINTENANCE_THREADS_LOCK:
+            current = _MAINTENANCE_THREADS.get(root_key)
+            if current is threading.current_thread():
+                _MAINTENANCE_THREADS.pop(root_key, None)
+
+
+def schedule_prepared_artifact_maintenance(
+    *,
+    root: Optional[Path] = None,
+    max_count: int = _DEFAULT_MAX_ARTIFACTS,
+    initial_delay_seconds: float = _DEFAULT_GC_INITIAL_DELAY_SECONDS,
+) -> bool:
+    # No synthetic verifier heartbeat is emitted here. Background cache work
+    # must never hide a genuine authoritative verifier stall.
+    target = root or configured_prepared_artifact_root()
+    if target is None:
+        return False
+
+    root_key = _maintenance_root_key(target)
+
+    with _MAINTENANCE_THREADS_LOCK:
+        existing = _MAINTENANCE_THREADS.get(root_key)
+        if existing is not None and existing.is_alive():
+            return False
+
+        worker = threading.Thread(
+            target=_prepared_artifact_maintenance_worker,
+            kwargs={
+                "root": target,
+                "max_count": max(1, int(max_count)),
+                "initial_delay_seconds": max(0.0, float(initial_delay_seconds)),
+            },
+            name="deploom-prepared-artifact-gc",
+            daemon=True,
+        )
+        _MAINTENANCE_THREADS[root_key] = worker
+        worker.start()
+        return True
 
 
 def prepared_snapshot_storage_root() -> Optional[Path]:
@@ -209,10 +405,10 @@ def load_prepared_artifact_record(
     }
 
 
-def invalidate_prepared_artifact_record(key: str, *, remove_tree: bool = False) -> None:
+def invalidate_prepared_artifact_record(key: str, *, remove_tree: bool = False) -> bool:
     path = _record_path(key)
     if path is None:
-        return
+        return False
 
     workspace: Optional[Path] = None
     if remove_tree and path.is_file():
@@ -225,35 +421,60 @@ def invalidate_prepared_artifact_record(key: str, *, remove_tree: bool = False) 
         except (OSError, ValueError, TypeError):
             workspace = None
 
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-    if workspace is None:
-        return
-
     lease = None
-    if os.name == "nt":
-        lease = try_acquire_snapshot_cleanup_lease(workspace)
-        if lease is None:
-            # Locator is already invalidated. Leaving an unreachable tree is
-            # safer than deleting bytes under a live cross-process reader.
-            return
+    retired_tree: Optional[Path] = None
+
+    if workspace is not None and workspace.exists():
+        if os.name == "nt":
+            lease = try_acquire_snapshot_cleanup_lease(workspace)
+            if lease is None:
+                # A live verifier still owns this artifact. Preserve both the
+                # locator and tree and retry on a later maintenance pass.
+                return False
+
+        retired_tree = _retire_workspace_tree(key, workspace)
+        if retired_tree is None:
+            if lease is not None:
+                lease.close()
+            # Do not invalidate a usable cache locator unless tree retirement
+            # became crash-safe.
+            return False
+
     try:
-        shutil.rmtree(workspace.parent, ignore_errors=True)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            return False
+
+        if retired_tree is not None:
+            try:
+                shutil.rmtree(retired_tree)
+            except OSError:
+                # Tree is already detached under trash/. A later background
+                # pass can resume deletion without affecting proof identity.
+                pass
+
+        return not path.exists()
     finally:
         if lease is not None:
             lease.close()
 
 
-def prune_prepared_artifact_store(max_count: int = 8) -> int:
-    """Best-effort LRU-ish pruning by index mtime; never affects proof authority."""
+def prune_prepared_artifact_store(
+    max_count: int = 8,
+    *,
+    max_removals: Optional[int] = None,
+) -> int:
+    # Best-effort LRU-ish pruning. configure_prepared_artifact_store never calls
+    # this synchronously; automatic maintenance always uses max_removals=1.
     root = configured_prepared_artifact_root()
     if root is None:
         return 0
+
     limit = max(1, int(max_count))
+    removal_limit = None if max_removals is None else max(1, int(max_removals))
     index = root / "index"
+
     try:
         records = sorted(
             [path for path in index.glob("*.json") if path.is_file()],
@@ -262,11 +483,14 @@ def prune_prepared_artifact_store(max_count: int = 8) -> int:
         )
     except OSError:
         return 0
+
     removed = 0
     for record in records[limit:]:
-        key = record.stem
-        invalidate_prepared_artifact_record(key, remove_tree=True)
-        removed += 1
+        if invalidate_prepared_artifact_record(record.stem, remove_tree=True):
+            removed += 1
+            if removal_limit is not None and removed >= removal_limit:
+                break
+
     return removed
 
 
