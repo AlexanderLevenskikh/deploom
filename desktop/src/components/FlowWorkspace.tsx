@@ -152,10 +152,17 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
     setBaselineIntentDialog({ mode, resume, plan, decision })
   }
 
+  const baselinePolicyIdentity = (intent: BaselineIntent) =>
+    JSON.stringify(Object.entries(intent.policies ?? {}).sort(([left], [right]) => left.localeCompare(right)))
+
   const runBaselineIntent = async (intent: BaselineIntent) => {
     const pending = baselineIntentDialog
     if (!pending) return
-    await onRun({ action: 'baseline', workspaceId: details.workspace.id, projectName: project.name, target, label, releaseBranch, gateCommand, baselineResume: pending.resume, baselineIntent: intent, commitMessage: `chore(deps): save ${project.name} roadmap state` })
+    const policyChanged =
+      pending.mode === 'decision' &&
+      baselinePolicyIdentity(pending.plan.intent) !== baselinePolicyIdentity(intent)
+    const effectiveBaselineResume = policyChanged ? 'restart' : pending.resume
+    await onRun({ action: 'baseline', workspaceId: details.workspace.id, projectName: project.name, target, label, releaseBranch, gateCommand, baselineResume: effectiveBaselineResume, baselineIntent: intent, commitMessage: `chore(deps): save ${project.name} roadmap state` })
     setBaselineIntentDialog(undefined)
     if (pending.mode === 'decision') { setBaselineDecisionDismissed(false); onClearBaselineDecision() }
   }

@@ -16,6 +16,8 @@ for (const sentinel of [
 
 for (const sentinel of [
   'BaselineIntentDialog',
+  'baselinePolicyIdentity',
+  "policyChanged ? 'restart' : pending.resume",
   "baselineResume !== 'continue'",
   'baselineDecision',
   'onGetBaselineIntentPlan',
@@ -39,6 +41,7 @@ for (const sentinel of [
   'DEPLOOM_BASELINE_INTENT_JSON',
   'DEPLOOM_BASELINE_EXTRA_ITERATIONS',
   'DEPLOOM_BASELINE_DECISION_GRANT_ITERATIONS',
+  'baselineHumanDecisionRequired',
   "flow:baseline-intent-plan",
 ]) if (!main.includes(sentinel)) throw new Error(`Baseline intent main-process contract missing: ${sentinel}`)
 
@@ -48,6 +51,8 @@ for (const sentinel of [
   'BLOCK_VH_BASELINE_INTENT_HUMAN_LOOP_V1',
   'DEPLOOM_BASELINE_DECISION_V1 ',
   'BASELINE_HUMAN_DECISION_REQUIRED',
+  'raise SystemExit(3)',
+  '"baselineIntent": {',
   'USER_BASELINE_REQUIRED_UPDATE',
   'USER_BASELINE_KEEP_CURRENT',
   '_apply_baseline_intent_scope',

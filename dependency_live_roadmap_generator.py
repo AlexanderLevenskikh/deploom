@@ -9368,6 +9368,10 @@ def resolve_peer_compatibility_with_verification(
                     "timeoutSeconds": config.timeout_seconds,
                     "attemptTimeoutSeconds": config.attempt_timeout_seconds,
                     "localizationTimeoutSeconds": config.localization_timeout_seconds,
+                    "baselineIntent": {
+                        "keepCurrent": baseline_keep_current,
+                        "required": baseline_required,
+                    },
                 },
             )
             recovery_plan = run_recovery_store.begin(
@@ -16542,4 +16546,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaselineConstraintVerificationError as exc:
+        message = str(exc)
+        if message.startswith(BASELINE_DECISION_MARKER):
+            # Expected product control-flow boundary, not a crash.
+            eprint(message)
+            raise SystemExit(3)
+        raise
