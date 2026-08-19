@@ -4822,6 +4822,11 @@ function nonRetryableDeterministicFailure(result: { code: number; stderr: string
 async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code: number; stderr: string; stdout: string }> {
   const rootJob = job.parallelParent ?? job
   if (job.cancelled || rootJob.cancelled) throw new Error('Выполнение отменено пользователем.')
+  if (['opencode', 'codex', 'claude'].includes(spec.command)) {
+    const modelIndex = spec.args.indexOf('--model')
+    const model = modelIndex >= 0 ? spec.args[modelIndex + 1] : undefined
+    send('flow:job-output', { jobId: job.id, stream: 'system', line: `Agent execution binding: provider=${spec.command}; model=${model || '<provider-default>'}` })
+  }
   send('flow:job-output', { jobId: job.id, stream: 'system', line: `▶ ${spec.label}\n$ ${spec.command} ${spec.args.join(' ')}` })
   let stderr = ''
   let stdout = ''
@@ -5185,6 +5190,39 @@ function setupIpc(): void {
     writeFileSync(temporary, `${JSON.stringify(settings, null, 2)}\n`, 'utf8')
     renameSync(temporary, settingsPath)
     workspace.selectedProject = raw.name.trim()
+    saveState(state)
+    return { state, details: await workspaceDetails(workspace) }
+  })
+
+  ipcMain.handle('flow:remove-project', async (_event, raw: { workspaceId?: string; projectName: string }) => {
+    const state = loadState()
+    const workspace = findWorkspace(state, raw.workspaceId)
+    const projectName = String(raw.projectName || '').trim()
+    if (!projectName) throw new Error('Имя проекта обязательно.')
+    if ([...jobs.values()].some((job) => job.workspace.id === workspace.id)) {
+      throw new Error('Нельзя менять состав workspace во время активной команды. Дождитесь завершения или отмените её.')
+    }
+
+    const settingsPath = resolveSettingsPath(workspace)
+    if (!existsSync(settingsPath)) throw new Error('settings.project.json не найден.')
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as Record<string, unknown>
+    const projects = Array.isArray(settings.projects) ? settings.projects as ProjectSpec[] : []
+    const remaining = projects.filter((project) => project.name !== projectName)
+    if (remaining.length === projects.length) throw new Error(`Проект ${projectName} не найден в settings.project.json.`)
+
+    settings.projects = remaining
+    const temporary = `${settingsPath}.dependency-flow-tmp`
+    writeFileSync(temporary, `${JSON.stringify(settings, null, 2)}\n`, 'utf8')
+    renameSync(temporary, settingsPath)
+
+    if (workspace.selectedProject === projectName) workspace.selectedProject = remaining[0]?.name
+    const removedPromptPath = workspace.latestPromptPaths?.[projectName]
+    if (removedPromptPath) {
+      const next = { ...workspace.latestPromptPaths }
+      delete next[projectName]
+      workspace.latestPromptPaths = next
+      if (workspace.latestPromptPath === removedPromptPath) workspace.latestPromptPath = undefined
+    }
     saveState(state)
     return { state, details: await workspaceDetails(workspace) }
   })

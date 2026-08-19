@@ -215,6 +215,7 @@ export type DependencyFlowApi = {
   registerWorkspace: (input: { path: string; name?: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   cloneWorkspace: (input: { parentPath: string; folderName: string; teamRemote?: string; templateRemote?: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   addProject: (input: { workspaceId?: string; name: string; path: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
+  removeProject: (input: { workspaceId?: string; projectName: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   selectWorkspace: (workspaceId: string) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   updateWorkspace: (input: Partial<WorkspaceRecord> & { id: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   updateProjectBranches: (input: { workspaceId?: string; projectName: string; branchBase?: string; push?: boolean }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>

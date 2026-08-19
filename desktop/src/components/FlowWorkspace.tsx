@@ -6,6 +6,7 @@ import { useLanguage } from '../i18n'
 import { BranchFailureModal } from './BranchFailureModal'
 import { GoalDetailsModal } from './GoalDetailsModal'
 import { QuickSelect } from './QuickSelect'
+import { ModelPicker } from './ModelPicker'
 import { BaselineIntentDialog } from './BaselineIntentDialog'
 import { freshBaselineIntent, normalizeBaselineIntentPlan } from '../data/baselineIntent'
 import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, FlowAction, MigrationBranchProgress, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
@@ -192,6 +193,7 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
       return
     }
     const noteToSend = stage.action === 'agent' && !restartMigration ? agentNote.trim() || undefined : undefined
+    await persistAgentModel()
     await onRun({ action: stage.action, workspaceId: details.workspace.id, projectName: project.name, target, label, releaseBranch, gateCommand, resumeAgent, restartMigration, baselineResume: stage.action === 'baseline' ? (baselineResume ?? 'auto') : undefined, agentNote: noteToSend, commitMessage: `chore(deps): save ${project.name} roadmap state` })
     if (noteToSend) setAgentNote('')
   }
@@ -228,6 +230,12 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
     }
   }
 
+  const startAutopilotWithCurrentModel = async () => {
+    if (!window.confirm(`Автопилот самостоятельно пройдёт оставшиеся этапы FLOW для ${project.name}, будет чинить recoverable-ошибки и использовать best-effort release только при исчерпанном безопасном плане. Публикация ${project.git?.push ? 'разрешена настройкой git.push' : 'НЕ выполняется: git.push выключен'}. Запустить?`)) return
+    await persistAgentModel()
+    await onStartAutopilot({ workspaceId: details.workspace.id, projectName: project.name, target, releaseBranch })
+  }
+
   const persistGitSettings = async (nextBranch = branchBase, nextPush = pushEnabled) => {
     const normalizedBranch = nextBranch.trim() || 'libs'
     setBranchBase(normalizedBranch)
@@ -255,7 +263,7 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
         <div><span>{t('common.branch')}</span><div className="git-plan-control"><input aria-label={t('flow.updateBranch')} value={branchBase} onChange={(event) => setBranchBase(event.target.value)} onBlur={() => void persistGitSettings()} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }} placeholder="libs" /><label className="push-toggle" title={t('flow.pushTitle')}><input type="checkbox" checked={pushEnabled} onChange={(event) => void persistGitSettings(branchBase, event.target.checked)} />Push</label></div></div>
         <div><span>{t('flow.workspace')}</span><strong className={details.git.dirty ? 'warning-text' : 'success-text'}>{details.git.dirty ? t('flow.workspaceDirty', { count: details.git.summary.length }) : t('flow.workspaceClean')}</strong></div>
         <div><span>{t('flow.agent')}</span><QuickSelect value={details.workspace.agent} options={[{ value: 'codex', label: 'Codex' }, { value: 'opencode', label: 'OpenCode' }, { value: 'claude', label: 'Claude' }]} onChange={(value) => void onUpdateWorkspace({ id: details.workspace.id, agent: value as AgentProvider })} ariaLabel={t('flow.agent')} /></div>
-        <div><span>{t('flow.model')}</span><input aria-label={t('flow.modelAria')} list="agent-model-suggestions" value={agentModel} onChange={(event) => setAgentModel(event.target.value)} onBlur={() => void persistAgentModel()} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }} placeholder={t('flow.modelDefault')} title={t('flow.modelTitle')} /><datalist id="agent-model-suggestions">{modelSuggestions.map((option) => <option value={option} key={option} />)}</datalist></div>
+        <div><span>{t('flow.model')}</span><ModelPicker value={agentModel} options={modelSuggestions} onChange={setAgentModel} onCommit={persistAgentModel} placeholder={t('flow.modelDefault')} ariaLabel={t('flow.modelAria')} title={t('flow.modelTitle')} /></div>
       </div>
 
       <div className="run-progress">
@@ -306,11 +314,7 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
             <div className="autopilot-actions">
               {autopilotActive
                 ? <button className="button secondary" onClick={() => void onStopAutopilot()}><Pause size={16} /> {t('flow.autopilot.stop')}</button>
-                : <button className="button secondary" disabled={active} onClick={() => {
-                    if (window.confirm(`Автопилот самостоятельно пройдёт оставшиеся этапы FLOW для ${project.name}, будет чинить recoverable-ошибки и использовать best-effort release только при исчерпанном безопасном плане. Публикация ${project.git?.push ? 'разрешена настройкой git.push' : 'НЕ выполняется: git.push выключен'}. Запустить?`)) {
-                      void onStartAutopilot({ workspaceId: details.workspace.id, projectName: project.name, target, releaseBranch })
-                    }
-                  }}><Play size={16} /> {t('flow.autopilot.start')}</button>}
+                : <button className="button secondary" disabled={active} onClick={() => void startAutopilotWithCurrentModel()}><Play size={16} /> {t('flow.autopilot.start')}</button>}
               <span className="autopilot-help" tabIndex={0} title={AUTOPILOT_HELP[language]} aria-label={AUTOPILOT_HELP[language]}><CircleHelp size={15} /></span>
             </div>
           </div> : flowComplete && selectedStageIndex === null ? <div className="flow-complete">
@@ -379,11 +383,7 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
           <div className="autopilot-actions">
             {autopilotActive
               ? <button className="button secondary" onClick={() => void onStopAutopilot()}><Pause size={16} /> {t('flow.autopilot.stop')}</button>
-              : <button className="button secondary" disabled={active} onClick={() => {
-                  if (window.confirm(`Автопилот самостоятельно пройдёт оставшиеся этапы FLOW для ${project.name}, будет чинить recoverable-ошибки и использовать best-effort release только при исчерпанном безопасном плане. Публикация ${project.git?.push ? 'разрешена настройкой git.push' : 'НЕ выполняется: git.push выключен'}. Запустить?`)) {
-                    void onStartAutopilot({ workspaceId: details.workspace.id, projectName: project.name, target, releaseBranch })
-                  }
-                }}><Play size={16} /> {t('flow.autopilot.start')}</button>}
+              : <button className="button secondary" disabled={active} onClick={() => void startAutopilotWithCurrentModel()}><Play size={16} /> {t('flow.autopilot.start')}</button>}
             <span className="autopilot-help" tabIndex={0} title={AUTOPILOT_HELP[language]} aria-label={AUTOPILOT_HELP[language]}><CircleHelp size={15} /></span>
           </div>
           </>}

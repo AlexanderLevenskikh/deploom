@@ -2,6 +2,7 @@ import { Bell, Boxes, Download, ExternalLink, GitFork, Pause, Play, Settings, Wo
 import { useState } from 'react'
 import './App.css'
 import { AddProjectDialog } from './components/AddProjectDialog'
+import { WorkspaceDialog } from './components/WorkspaceDialog'
 import { DashboardWorkspace } from './components/DashboardWorkspace'
 import { FlowWorkspace } from './components/FlowWorkspace'
 import { MonitoringPanel } from './components/MonitoringPanel'
@@ -19,6 +20,7 @@ function App() {
   const [tab, setTab] = useState<WorkspaceTab>('flow')
   const [setupBusy, setSetupBusy] = useState(false)
   const [showAddProject, setShowAddProject] = useState(false)
+  const [showWorkspaceDialog, setShowWorkspaceDialog] = useState(false)
   const themePreference = flow.themePreference
   const payload = flow.payload
   const details = payload?.details
@@ -71,7 +73,7 @@ function App() {
       </header>
 
       <div className="app-grid">
-        <ProjectRail details={details} selected={project} active={flow.workspaceBusy} onRefreshAll={() => void flow.runAction({ action: 'generate-all', workspaceId: details.workspace.id, label: 'DepLoom: all projects' })} onSelectProject={(name) => void flow.selectProject(name)} onAddProject={() => setShowAddProject(true)} onAddWorkspace={() => void flow.registerExisting()} />
+        <ProjectRail details={details} selected={project} active={flow.workspaceBusy} onRefreshAll={() => void flow.runAction({ action: 'generate-all', workspaceId: details.workspace.id, label: 'DepLoom: all projects' })} onSelectProject={(name) => void flow.selectProject(name)} onAddProject={() => setShowAddProject(true)} onAddWorkspace={() => setShowWorkspaceDialog(true)} onRemoveProject={(name) => void flow.removeProject(name).catch((error) => flow.setError(error instanceof Error ? error.message : String(error)))} />
 
         <main className="main-workspace">
           <div className="workspace-titlebar">
@@ -86,6 +88,8 @@ function App() {
       </div>
 
       {showAddProject ? <AddProjectDialog workspaceId={details.workspace.id} onClose={() => setShowAddProject(false)} onPickDirectory={flow.pickDirectory} onSubmit={flow.addProject} /> : null}
+
+      {showWorkspaceDialog ? <WorkspaceDialog onClose={() => setShowWorkspaceDialog(false)} onPickDirectory={flow.pickDirectory} onConnectExisting={(path) => flow.registerExisting(path)} onCreate={flow.cloneWorkspace} /> : null}
 
       <footer className="status-bar">
         <span>DepLoom {payload.appVersion}</span><span>Template: {details.git.branch}</span><span>Tool: {payload.environment.python.available ? t('app.footer.toolReady') : t('app.footer.noPython')}</span><span className="status-spacer" /><span><i className={`status-dot ${payload.environment[details.workspace.agent]?.available ? 'success' : 'danger'}`} />{details.workspace.agent}: {payload.environment[details.workspace.agent]?.available ? t('app.footer.available') : t('app.footer.notFound')}</span><span>{details.git.dirty ? t('app.footer.workspaceChanged') : t('app.footer.workspaceClean')}</span>

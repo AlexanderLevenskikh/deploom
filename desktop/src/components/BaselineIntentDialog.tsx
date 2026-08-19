@@ -1,5 +1,5 @@
 import { AlertTriangle, Search, ShieldCheck, X } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useDeferredValue, useEffect, useMemo, useState } from 'react'
 import { useLanguage } from '../i18n'
 import type { BaselineDecision, BaselineIntent, BaselineIntentPlan, BaselinePackagePolicy } from '../types'
 import { QuickSelect } from './QuickSelect'
@@ -28,16 +28,17 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
   const [kind, setKind] = useState<'all' | 'runtime' | 'dev' | 'peer'>('all')
   const [policies, setPolicies] = useState<Record<string, BaselinePackagePolicy>>({ ...plan.intent.policies })
   const [busy, setBusy] = useState(false)
+  const deferredQuery = useDeferredValue(query)
 
   useEffect(() => setPolicies({ ...plan.intent.policies }), [plan])
 
   const visible = useMemo(() => {
-    const needle = query.trim().toLowerCase()
+    const needle = deferredQuery.trim().toLowerCase()
     return plan.candidates.filter((item) => {
       if (kind !== 'all' && item.kind !== kind) return false
       return !needle || item.name.toLowerCase().includes(needle)
     })
-  }, [kind, plan.candidates, query])
+  }, [deferredQuery, kind, plan.candidates])
 
   const counts = useMemo(() => {
     const result = { auto: 0, 'keep-current': 0, required: 0 }
@@ -122,7 +123,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
         ) : null}
 
         <div className="baseline-intent-toolbar">
-          <label><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={text('Найти зависимость', 'Find dependency')} /></label>
+          <label><Search size={14} /><input autoFocus spellCheck={false} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={text('Найти зависимость', 'Find dependency')} /></label>
           <QuickSelect value={kind} options={kindOptions} onChange={(value) => setKind(value as typeof kind)} ariaLabel={text('Фильтр типа зависимости', 'Dependency type filter')} />
           <button type="button" className="button secondary" disabled={busy} onClick={() => setPolicies({})}>{text('Все → AUTO', 'All → AUTO')}</button>
           <button type="button" className="button secondary" disabled={busy} onClick={() => setPolicies((current) => ({ ...current, ...Object.fromEntries(plan.candidates.filter((item) => item.kind === 'dev').map((item) => [item.name, 'keep-current' as const] as const)) }))}>{text('DEV → исключить', 'DEV → exclude')}</button>

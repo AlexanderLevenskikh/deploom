@@ -1,6 +1,7 @@
 import { AlertTriangle, ClipboardCopy, Cpu, Monitor, Pause, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { deriveRunMonitor } from '../data/processMonitor'
+import { presentRunError } from '../data/errorPresentation'
 import { latestJobId } from '../data/logPresentation'
 import { useLanguage } from '../i18n'
 import type { BaselineRecoveryInfo, EnvironmentInfo, FlowAction, HardwareSnapshot, JobOutput, JobOutputSource, MigrationProgress } from '../types'
@@ -80,8 +81,7 @@ export function MonitoringPanel({ logs, knownSources = [], environment, active, 
   const monitorState = useMemo(() => deriveRunMonitor(logs, active, effectiveJobId, migrationProgress, activeAction, Date.now(), runStartedAt), [active, activeAction, effectiveJobId, logs, migrationProgress, runStartedAt])
   const progress = estimateProgress(monitorState, active)
   const progressLabel = progress === undefined ? '—' : `${Math.round(progress)}%`
-  const visibleError = useMemo(() => error?.replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, ''), [error])
-
+  const visibleError = useMemo(() => error ? presentRunError(error, text) : undefined, [error, text])
   useEffect(() => {
     if (!error) { lastAutoOpenedError.current = undefined; return }
     if (lastAutoOpenedError.current === error) return

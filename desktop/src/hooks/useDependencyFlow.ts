@@ -370,9 +370,9 @@ export function useDependencyFlow() {
 
   const pickDirectory = useCallback(async () => api?.pickDirectory(), [api])
 
-  const registerExisting = useCallback(async () => {
+  const registerExisting = useCallback(async (providedPath?: string) => {
     if (!api) return
-    const path = await api.pickDirectory()
+    const path = providedPath ?? await api.pickDirectory()
     if (!path) return
     applyWorkspaceResult(await api.registerWorkspace({ path }))
   }, [api, applyWorkspaceResult])
@@ -386,6 +386,13 @@ export function useDependencyFlow() {
     if (!api) throw new Error('Добавление проекта доступно в desktop-приложении.')
     applyWorkspaceResult(await api.addProject(input))
   }, [api, applyWorkspaceResult])
+
+  const removeProject = useCallback(async (projectName: string) => {
+    if (!api) throw new Error('Удаление проекта доступно в desktop-приложении.')
+    const workspaceId = payload?.details?.workspace.id
+    applyWorkspaceResult(await api.removeProject({ workspaceId, projectName }))
+  }, [api, applyWorkspaceResult, payload?.details?.workspace.id])
+
 
   const selectWorkspace = useCallback(async (workspaceId: string) => {
     if (!api) return
@@ -591,7 +598,7 @@ export function useDependencyFlow() {
 
   return {
     payload, loading, error, baselineDecision, activeJobId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject,
-    load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches,
+    load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, removeProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches,
     runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }
 }

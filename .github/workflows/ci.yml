@@ -142,6 +142,7 @@ jobs:
           npm run check:ui-shell
           npm run check:baseline-intent
           npm run check:interaction-contracts
+          npm run check:ui-lifecycle
       - name: Version consistency
         working-directory: desktop
         run: test "$(node -p "require('./package.json').version")" = "$(cat ../VERSION)"

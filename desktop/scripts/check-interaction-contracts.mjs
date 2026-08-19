@@ -8,6 +8,7 @@ const read = (name) => readFileSync(join(components, name), 'utf8')
 
 const add = read('AddProjectDialog.tsx')
 const baseline = read('BaselineIntentDialog.tsx')
+const workspace = read('WorkspaceDialog.tsx')
 const branchFailure = read('BranchFailureModal.tsx')
 const goal = read('GoalDetailsModal.tsx')
 const quick = read('QuickSelect.tsx')
@@ -16,6 +17,7 @@ const css = readFileSync(new URL('../src/App.css', import.meta.url), 'utf8')
 for (const [name, source, sentinels] of [
   ['AddProjectDialog', add, ['dialog-actions', "t('common.cancel')", 'button primary']],
   ['BaselineIntentDialog', baseline, ['baseline-intent-actions', 'Подтвердить и запустить Baseline', 'Изменения состава Baseline ещё не применены', 'baseline-policy-toggle']],
+  ['WorkspaceDialog', workspace, ['dialog-actions', 'Отмена', 'Создать workspace', 'Подключить существующий']],
   ['BranchFailureModal', branchFailure, ['modal-actions', "t('common.understood')", 'onClose']],
   ['GoalDetailsModal', goal, ['modal-actions', "t('common.understood')", 'onClose']],
 ]) {

@@ -54,7 +54,8 @@
         "check:cross-platform": "node scripts/check-cross-platform.mjs",
         "check:ui-shell": "node scripts/check-ui-shell.mjs",
         "check:baseline-intent": "node scripts/check-baseline-intent.mjs",
-        "check:interaction-contracts": "node scripts/check-interaction-contracts.mjs"
+        "check:interaction-contracts": "node scripts/check-interaction-contracts.mjs",
+        "check:ui-lifecycle": "node scripts/check-ui-lifecycle.mjs"
     },
     "dependencies": {
         "electron-updater": "^6.8.9",
