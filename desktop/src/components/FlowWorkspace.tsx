@@ -5,7 +5,9 @@ import { ACTION_ORDER, FLOW_STAGES } from '../data/flow'
 import { useLanguage } from '../i18n'
 import { BranchFailureModal } from './BranchFailureModal'
 import { GoalDetailsModal } from './GoalDetailsModal'
-import type { ActionInput, AgentProvider, FlowAction, MigrationBranchProgress, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
+import { BaselineIntentDialog } from './BaselineIntentDialog'
+import { freshBaselineIntent, normalizeBaselineIntentPlan } from '../data/baselineIntent'
+import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, FlowAction, MigrationBranchProgress, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
 
 const AUTOPILOT_HELP = {
   ru: '«Продолжить» автономно доводит текущий этап: Supervisor, retry и recovery работают без ручных перезапусков. Автопилот делает то же самое и дополнительно сам переходит между этапами FLOW, возвращаясь к migration после недостигнутой цели.',
@@ -17,6 +19,9 @@ type Props = {
   project: ProjectSpec
   activeAction?: FlowAction
   autopilotActive?: boolean
+  baselineDecision?: BaselineDecision
+  onClearBaselineDecision: () => void
+  onGetBaselineIntentPlan: (projectName: string) => Promise<BaselineIntentPlan>
   onRun: (input: ActionInput) => Promise<void>
   onSendAgentNote: (note: string, branch?: string) => Promise<boolean>
   onStartAutopilot: (input: { workspaceId: string; projectName: string; target: TargetLevel; releaseBranch?: string }) => Promise<void>
@@ -30,7 +35,7 @@ type Props = {
   onListAgentModels: (agentProvider: AgentProvider, cwd?: string) => Promise<string[]>
 }
 
-export function FlowWorkspace({ details, project, activeAction, autopilotActive, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels }: Props) {
+export function FlowWorkspace({ details, project, activeAction, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels }: Props) {
   const { language, text, t } = useLanguage()
   const [target, setTarget] = useState<TargetLevel>('yellow')
   const [label, setLabel] = useState('')
@@ -41,6 +46,8 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
   const [goalDetailsOpen, setGoalDetailsOpen] = useState(false)
   const [selectedBranchFailure, setSelectedBranchFailure] = useState<MigrationBranchProgress | null>(null)
   const [selectedStageIndex, setSelectedStageIndex] = useState<number | null>(null)
+  const [baselineIntentDialog, setBaselineIntentDialog] = useState<{ mode: 'prepare' | 'decision'; resume: 'auto' | 'continue' | 'restart'; plan: BaselineIntentPlan; decision?: BaselineDecision }>()
+  const [baselineDecisionDismissed, setBaselineDecisionDismissed] = useState(false)
   const run = details.teamState?.projects[project.name]
   const recovery = run?.recovery
   const agentRecoveryAvailable = recovery?.kind === 'agent'
@@ -137,12 +144,52 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
     return () => { cancelled = true }
   }, [details.workspace.agent, project.path, onListAgentModels])
 
+  const openBaselineIntentDialog = async (mode: 'prepare' | 'decision', resume: 'auto' | 'continue' | 'restart', decision?: BaselineDecision) => {
+    const loaded = normalizeBaselineIntentPlan(await onGetBaselineIntentPlan(project.name))
+    const plan = mode === 'prepare' ? { ...loaded, intent: freshBaselineIntent() } : loaded
+    setBaselineIntentDialog({ mode, resume, plan, decision })
+  }
+
+  const runBaselineIntent = async (intent: BaselineIntent) => {
+    const pending = baselineIntentDialog
+    if (!pending) return
+    await onRun({ action: 'baseline', workspaceId: details.workspace.id, projectName: project.name, target, label, releaseBranch, gateCommand, baselineResume: pending.resume, baselineIntent: intent, commitMessage: `chore(deps): save ${project.name} roadmap state` })
+    setBaselineIntentDialog(undefined)
+    if (pending.mode === 'decision') { setBaselineDecisionDismissed(false); onClearBaselineDecision() }
+  }
+
+  useEffect(() => {
+    if (!baselineDecision || baselineDecisionDismissed || baselineDecision.project !== project.name || baselineIntentDialog?.mode === 'decision') return
+    let cancelled = false
+    void onGetBaselineIntentPlan(project.name).then((rawPlan) => {
+      if (cancelled) return
+      setBaselineIntentDialog({
+        mode: 'decision',
+        resume: 'continue',
+        plan: normalizeBaselineIntentPlan(rawPlan),
+        decision: baselineDecision,
+      })
+    })
+    return () => { cancelled = true }
+  }, [baselineDecision, baselineDecisionDismissed, baselineIntentDialog?.mode, onGetBaselineIntentPlan, project.name])
+
+  useEffect(() => { setBaselineDecisionDismissed(false) }, [baselineDecision])
+
   const execute = async (stageIndex: number, resumeOverride?: boolean, restartMigration?: boolean, baselineResume?: 'auto' | 'continue' | 'restart') => {
     const stage = FLOW_STAGES[stageIndex]
     if (!stage.action) { onOpenDashboard(); return }
     const resumeAgent = stage.action === 'agent' && (resumeOverride ?? canResumeAgent)
-    const skipBaselineModeConfirmation = stage.action === 'baseline' && Boolean(baselineResume && baselineResume !== 'auto')
+    const skipBaselineModeConfirmation = stage.action === 'baseline'
     if (stage.confirmationKey && !skipBaselineModeConfirmation && !window.confirm(t(stage.confirmationKey))) return
+    if (stage.action === 'baseline' && baselineDecision) {
+      setBaselineDecisionDismissed(false)
+      await openBaselineIntentDialog('decision', 'continue', baselineDecision)
+      return
+    }
+    if (stage.action === 'baseline' && baselineResume !== 'continue') {
+      await openBaselineIntentDialog('prepare', baselineResume ?? 'auto')
+      return
+    }
     const noteToSend = stage.action === 'agent' && !restartMigration ? agentNote.trim() || undefined : undefined
     await onRun({ action: stage.action, workspaceId: details.workspace.id, projectName: project.name, target, label, releaseBranch, gateCommand, resumeAgent, restartMigration, baselineResume: stage.action === 'baseline' ? (baselineResume ?? 'auto') : undefined, agentNote: noteToSend, commitMessage: `chore(deps): save ${project.name} roadmap state` })
     if (noteToSend) setAgentNote('')
@@ -311,6 +358,7 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
             'Сессия продолжится только при точном совпадении fingerprint текущего prompt/scope; устаревший контекст автоматически не используется.',
             'The session resumes only when the current prompt/scope fingerprint matches exactly; stale context is never reused automatically.',
           )) : text('Остановленная сессия принадлежит другому агенту.', 'The stopped session belongs to another agent.')}</span></div> : null}
+          {FLOW_STAGES[displayedIndex].action === 'baseline' && baselineDecision ? <div className="resume-notice warning"><strong>{text('Baseline ждёт решения', 'Baseline is waiting for a decision')}</strong><span>{baselineDecision.package ? `${baselineDecision.package} · ${text('измените политику или продолжите поиск', 'change policy or continue searching')}` : text('Измените состав Baseline или продолжите поиск через кнопку «Продолжить».', 'Change Baseline scope or continue searching with the Continue button.')}</span></div> : null}
           {FLOW_STAGES[displayedIndex].action === 'baseline' && details.baselineRecovery?.available ? <div className="resume-notice"><strong>{text('Baseline checkpoint найден', 'Baseline checkpoint found')}</strong><span>{text(`Последняя safe-точка: итерация ${details.baselineRecovery.iteration ?? 0}, статус ${details.baselineRecovery.status ?? 'unknown'}. «Продолжить» использует строгий resume и не начнёт новый baseline молча.`, `Last safe point: iteration ${details.baselineRecovery.iteration ?? 0}, status ${details.baselineRecovery.status ?? 'unknown'}. Continue uses strict resume and will not silently start over.`)}</span></div> : null}
           {FLOW_STAGES[displayedIndex].action === 'agent' && !interruptedSession && hasMigrationProgress ? <div className="resume-notice"><strong>{t('flow.planPartial.title')}</strong><span>{t('flow.planPartial.body')}</span></div> : null}
           {recovery ? autopilotActive && recovery.kind === 'agent'
@@ -320,7 +368,7 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
           <div className="documents-contract">
             <FileText size={18} /><div><strong>{t('flow.documents.title')}</strong><p>{t('flow.documents.description')}</p></div>
           </div>
-          {FLOW_STAGES[displayedIndex].confirmationKey && !(FLOW_STAGES[displayedIndex].action === 'baseline' && details.baselineRecovery?.available) ? <div className="confirmation"><AlertTriangle size={18} /><span>{t(FLOW_STAGES[displayedIndex].confirmationKey)}</span></div> : null}
+          {FLOW_STAGES[displayedIndex].confirmationKey && FLOW_STAGES[displayedIndex].action !== 'baseline' ? <div className="confirmation"><AlertTriangle size={18} /><span>{t(FLOW_STAGES[displayedIndex].confirmationKey)}</span></div> : null}
           <div className="stage-actions">
             {FLOW_STAGES[displayedIndex].action === 'agent' && !canResumeAgent ? <button className="button secondary" disabled={active} title={text('Необязательно: Desktop сам построит актуальный prompt. Используйте только чтобы явно подменить его файлом.', 'Optional: Desktop builds the current prompt automatically. Use this only to explicitly replace it with a file.')} onClick={() => void onChoosePrompt(project.name)}><FileText size={16} /> {t('flow.customPrompt')}</button> : null}
             {FLOW_STAGES[displayedIndex].action === 'agent' ? <button className="button secondary" disabled={active} onClick={() => { if (window.confirm(text('Текущие изменения сохранятся в safety stash. Ветки Branch plan (work-ветки и merged) для этого проекта будут удалены локально, сохранённая сессия агента забудется. Начать миграцию заново?', 'Current changes will be saved to a safety stash. Branch-plan work and merged branches for this project will be removed locally and the saved agent session will be forgotten. Start migration over?'))) void execute(displayedIndex, false, true) }}><RotateCcw size={16} /> {t('flow.restartMigration')}</button> : null}
@@ -342,6 +390,7 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
       </div>
       {goalDetailsOpen && details.targetClosure ? <GoalDetailsModal closure={details.targetClosure} projectName={project.name} onClose={() => setGoalDetailsOpen(false)} /> : null}
       {selectedBranchFailure?.runtime?.phase === 'failed' ? <BranchFailureModal branch={selectedBranchFailure} onClose={() => setSelectedBranchFailure(null)} /> : null}
+      {baselineIntentDialog ? <BaselineIntentDialog mode={baselineIntentDialog.mode} plan={baselineIntentDialog.plan} decision={baselineIntentDialog.decision} onCancel={() => { setBaselineIntentDialog(undefined); if (baselineIntentDialog.mode === 'decision') setBaselineDecisionDismissed(true) }} onSubmit={runBaselineIntent} /> : null}
     </section>
   )
 }

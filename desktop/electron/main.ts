@@ -59,6 +59,10 @@ protocol.registerSchemesAsPrivileged([
 
 type AgentProvider = 'codex' | 'opencode' | 'claude'
 type ThemePreference = 'system' | 'light' | 'dark'
+type BaselinePackagePolicy = 'auto' | 'keep-current' | 'required'
+type BaselineIntent = { schemaVersion: 1; policies: Record<string, BaselinePackagePolicy>; extraIterations?: number; decisionGrantIterations?: number }
+type BaselineIntentCandidate = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string }
+type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent }
 type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
 type BaselineRecoveryInfo = { available: boolean; mode?: 'yellow' | 'green'; status?: string; phase?: string; updatedAt?: string; generation?: number; iteration?: number; lastAssignment?: string; lastPredicate?: string; learnedConstraints?: number; exactExclusions?: number; reason?: string }
 
@@ -173,6 +177,7 @@ type ActionInput = {
   resumeAgent?: boolean
   restartMigration?: boolean
   baselineResume?: 'auto' | 'continue' | 'restart'
+  baselineIntent?: BaselineIntent
   agentNote?: string
   sourceCommit?: string
   autopilot?: boolean
@@ -261,6 +266,72 @@ let stopUpdateChecks: (() => void) | undefined
 
 function statePath(): string {
   return join(app.getPath('userData'), 'dependency-flow-state.json')
+}
+
+
+// BLOCK_VH_BASELINE_INTENT_HUMAN_LOOP_V1
+function normalizeBaselineIntent(value: unknown): BaselineIntent {
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  const rawPolicies = raw.policies && typeof raw.policies === 'object' ? raw.policies as Record<string, unknown> : {}
+  const policies: Record<string, BaselinePackagePolicy> = {}
+  for (const [name, policy] of Object.entries(rawPolicies)) {
+    if (policy === 'keep-current' || policy === 'required') policies[name] = policy
+  }
+  return {
+    schemaVersion: 1,
+    policies,
+    extraIterations: Math.max(0, Math.floor(Number(raw.extraIterations ?? 0) || 0)),
+    decisionGrantIterations: Math.max(0, Math.floor(Number(raw.decisionGrantIterations ?? 0) || 0)),
+  }
+}
+
+function baselineIntentPath(workspace: WorkspaceRecord, projectName: string): string {
+  const safeProject = projectName.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'project'
+  return join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-intent', `${safeProject}.json`)
+}
+
+function loadBaselineIntent(workspace: WorkspaceRecord, projectName: string): BaselineIntent {
+  try { return normalizeBaselineIntent(JSON.parse(readFileSync(baselineIntentPath(workspace, projectName), 'utf8'))) }
+  catch { return normalizeBaselineIntent(undefined) }
+}
+
+function saveBaselineIntent(workspace: WorkspaceRecord, projectName: string, intent: BaselineIntent): void {
+  const normalized = normalizeBaselineIntent(intent)
+  // decisionGrantIterations is invocation-local; persisting it would silently
+  // grant a new tranche after an unrelated crash/restart.
+  atomicWriteJsonSync(baselineIntentPath(workspace, projectName), { ...normalized, decisionGrantIterations: 0 })
+}
+
+function projectInstalledVersion(projectPath: string, packageName: string): string | undefined {
+  try {
+    const manifest = JSON.parse(readFileSync(join(projectPath, 'node_modules', ...packageName.split('/'), 'package.json'), 'utf8')) as { version?: unknown }
+    const version = String(manifest.version ?? '').trim()
+    return version || undefined
+  } catch { return undefined }
+}
+
+function baselineIntentPlan(workspace: WorkspaceRecord, project: ProjectSpec): BaselineIntentPlan {
+  const manifestPath = join(project.path, 'package.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>
+  const result = new Map<string, BaselineIntentCandidate>()
+  const add = (section: string, kind: BaselineIntentCandidate['kind']) => {
+    const values = manifest[section]
+    if (!values || typeof values !== 'object') return
+    for (const [name, rawSpec] of Object.entries(values as Record<string, unknown>)) {
+      if (result.has(name)) continue
+      result.set(name, {
+        name,
+        kind,
+        requestedSpec: String(rawSpec ?? ''),
+        currentVersion: projectInstalledVersion(project.path, name),
+      })
+    }
+  }
+  add('dependencies', 'runtime')
+  add('optionalDependencies', 'runtime')
+  add('devDependencies', 'dev')
+  add('peerDependencies', 'peer')
+  return { candidates: [...result.values()].sort((a, b) => a.name.localeCompare(b.name)), intent: loadBaselineIntent(workspace, project.name) }
 }
 
 type JsonReplacer = (this: unknown, key: string, value: unknown) => unknown
@@ -1605,14 +1676,25 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
     }
     case 'sync-tool':
       return [{ label: 'Проверка встроенного tool', command: 'python', args: [generatorPath(), '--help'], cwd: workspace.path }]
-    case 'baseline':
+    case 'baseline': {
+      const persistedIntent = loadBaselineIntent(workspace, project.name)
+      const explicitIntent = input.baselineIntent ? normalizeBaselineIntent(input.baselineIntent) : undefined
+      const effectiveIntent = explicitIntent ?? persistedIntent
+      if (explicitIntent) saveBaselineIntent(workspace, project.name, explicitIntent)
       return [{
         label: 'Создание исходного baseline', command: 'python', cwd: workspace.path,
         args: [...commonGeneratorArgs, '--capture-baseline', '--baseline-label', input.label?.trim() || `dependency-flow-${new Date().toISOString().slice(0, 10)}`],
-        env: { DEPLOOM_BASELINE_RESUME: input.baselineResume === 'restart' ? 'restart' : input.baselineResume === 'continue' ? 'continue' : 'auto' },
+        env: {
+          DEPLOOM_BASELINE_RESUME: input.baselineResume === 'restart' ? 'restart' : input.baselineResume === 'continue' ? 'continue' : 'auto',
+          DEPLOOM_BASELINE_INTENT_JSON: JSON.stringify({ schemaVersion: 1, policies: effectiveIntent.policies }),
+          DEPLOOM_BASELINE_INTERACTIVE: '1',
+          DEPLOOM_BASELINE_EXTRA_ITERATIONS: String(effectiveIntent.extraIterations ?? 0),
+          DEPLOOM_BASELINE_DECISION_GRANT_ITERATIONS: String(explicitIntent?.decisionGrantIterations ?? 0),
+        },
         stallWarningMs: 2 * 60_000,
         stallAbortMs: 15 * 60_000,
       }]
+    }
     case 'generate':
       return [{
         label: 'Построение свежего roadmap', command: 'python', cwd: workspace.path,
@@ -4950,8 +5032,13 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
       }
     }
     if (!recovered) {
-      updateTeamState(job, 'failed')
-      job.recoveryIssue = await persistRecoveryIssue(job, errorMessage)
+      const baselineDecisionRequired = job.action === 'baseline' && errorMessage.includes('DEPLOOM_BASELINE_DECISION_V1 ')
+      if (baselineDecisionRequired) {
+        updateTeamState(job, 'paused')
+      } else {
+        updateTeamState(job, 'failed')
+        job.recoveryIssue = await persistRecoveryIssue(job, errorMessage)
+      }
     }
   } finally {
     stopOpenCodeServer(job)
@@ -5174,6 +5261,13 @@ function setupIpc(): void {
     const state = loadState()
     const workspace = findWorkspace(state)
     return { state, details: await workspaceDetails(workspace) }
+  })
+
+  ipcMain.handle('flow:baseline-intent-plan', async (_event, input: { workspaceId?: string; projectName: string }) => {
+    const state = loadState()
+    const workspace = findWorkspace(state, input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    return baselineIntentPlan(workspace, project)
   })
 
   ipcMain.handle('flow:run-action', async (_event, input: ActionInput) => {

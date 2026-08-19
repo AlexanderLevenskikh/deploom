@@ -142,6 +142,101 @@ RATE_SLEEP_SEC = 0.05
 REGISTRY_METADATA_MAX_ATTEMPTS = 3
 
 
+# BLOCK_VH_BASELINE_INTENT_HUMAN_LOOP_V1
+BASELINE_DECISION_MARKER = "DEPLOOM_BASELINE_DECISION_V1 "
+BASELINE_INTENT_POLICIES = frozenset({"auto", "keep-current", "required"})
+BASELINE_INTERACTIVE_UNARY_THRESHOLD = 3
+_BASELINE_INTENT_CACHE_RAW = "<unset>"
+_BASELINE_INTENT_CACHE: Dict[str, Any] = {"schemaVersion": 1, "policies": {}}
+
+
+def _baseline_intent_payload() -> Dict[str, Any]:
+    global _BASELINE_INTENT_CACHE_RAW, _BASELINE_INTENT_CACHE
+    raw = str(os.environ.get("DEPLOOM_BASELINE_INTENT_JSON") or "").strip()
+    if raw == _BASELINE_INTENT_CACHE_RAW:
+        return _BASELINE_INTENT_CACHE
+    _BASELINE_INTENT_CACHE_RAW = raw
+    if not raw:
+        _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": {}}
+        return _BASELINE_INTENT_CACHE
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": {}}
+        return _BASELINE_INTENT_CACHE
+    policies: Dict[str, str] = {}
+    if isinstance(parsed, dict) and isinstance(parsed.get("policies"), dict):
+        for name, policy in parsed["policies"].items():
+            normalized = str(policy or "").strip().lower()
+            if normalized in {"keep-current", "required"}:
+                policies[str(name)] = normalized
+    _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": policies}
+    return _BASELINE_INTENT_CACHE
+
+
+def _baseline_intent_policy(package: str) -> str:
+    policy = str((_baseline_intent_payload().get("policies") or {}).get(package) or "auto")
+    return policy if policy in BASELINE_INTENT_POLICIES else "auto"
+
+
+def _baseline_env_nonnegative_int(name: str) -> int:
+    try:
+        return max(0, int(str(os.environ.get(name) or "0").strip() or "0"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _baseline_extra_iterations() -> int:
+    return _baseline_env_nonnegative_int("DEPLOOM_BASELINE_EXTRA_ITERATIONS")
+
+
+def _baseline_decision_grant_iterations() -> int:
+    return _baseline_env_nonnegative_int("DEPLOOM_BASELINE_DECISION_GRANT_ITERATIONS")
+
+
+def _baseline_interactive() -> bool:
+    return str(os.environ.get("DEPLOOM_BASELINE_INTERACTIVE") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _baseline_human_decision_focus(
+    learned_constraints: Sequence[Mapping[str, str]],
+    current_versions: Mapping[str, str],
+    *,
+    min_confirmed: int = BASELINE_INTERACTIVE_UNARY_THRESHOLD,
+) -> Optional[Dict[str, object]]:
+    by_package: Dict[str, Set[str]] = defaultdict(set)
+    for constraint in learned_constraints:
+        if len(constraint) != 1:
+            continue
+        package, version = next(iter(constraint.items()))
+        if _baseline_intent_policy(str(package)) != "auto":
+            continue
+        if str(version) == str(current_versions.get(str(package)) or ""):
+            # If current itself is proven incompatible, KEEP_CURRENT is not a safe
+            # escape hatch to suggest. The normal solver/budget decision remains.
+            continue
+        by_package[str(package)].add(str(version))
+    candidates = [
+        (len(versions), package, sorted(versions))
+        for package, versions in by_package.items()
+        if len(versions) >= max(1, int(min_confirmed))
+    ]
+    if not candidates:
+        return None
+    count, package, versions = sorted(candidates, key=lambda item: (-item[0], item[1]))[0]
+    return {
+        "package": package,
+        "currentVersion": str(current_versions.get(package) or ""),
+        "failedVersions": versions,
+        "confirmedVersions": count,
+    }
+
+
+def _raise_baseline_human_decision(payload: Mapping[str, object]) -> None:
+    rendered = json.dumps(dict(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    raise BaselineConstraintVerificationError(BASELINE_DECISION_MARKER + rendered)
+
+
 class RegistryInfrastructureError(RuntimeError):
     """Registry/network uncertainty must never become dependency policy."""
 
@@ -5517,6 +5612,9 @@ def _candidate_domain(row: DependencyRow, mode: str, client: LiveDataClient) -> 
     registry candidate remains reachable when a conflict asks that package to
     move.  This preserves the distinction between UNKNOWN_BUDGET and UNSAT.
     """
+    intent_policy = _baseline_intent_policy(row.name)
+    if intent_policy == "keep-current":
+        return [row.current_version]
     if row.scope_excluded or row.planner_deferred:
         return [row.current_version]
     desired = _desired_target_for_mode(row, mode)
@@ -5539,6 +5637,9 @@ def _candidate_domain(row: DependencyRow, mode: str, client: LiveDataClient) -> 
     if desired_v is None:
         above = [version for version in eligible if version != row.current_version]
         ordered = [row.current_version] + above
+        if intent_policy == "required":
+            alternatives = [version for version in ordered if version != row.current_version]
+            return list(dict.fromkeys(alternatives or [row.current_version]))
         return list(dict.fromkeys(ordered))
 
     exact = [desired] if desired in eligible else []
@@ -5559,6 +5660,9 @@ def _candidate_domain(row: DependencyRow, mode: str, client: LiveDataClient) -> 
         + sorted(above, key=version_sort_key)
         + [row.current_version]
     )
+    if intent_policy == "required":
+        alternatives = [version for version in ordered if version != row.current_version]
+        return list(dict.fromkeys(alternatives or [row.current_version]))
     return list(dict.fromkeys(ordered))
 
 def _known_peer_range_satisfaction(spec: str, version: str) -> Optional[bool]:
@@ -5718,6 +5822,16 @@ def _assignment_constraint_issue(
             detail = ", ".join(f"{name}@{version}" for name, version in sorted(nogood.items()))
             return f"LEARNED_CONSTRAINT: verified incompatible combination: {detail}"
 
+    for intent_name, intent_version in sorted(assignment.items()):
+        intent_row = rows_by_name.get(intent_name)
+        if intent_row is None:
+            continue
+        intent_policy = _baseline_intent_policy(intent_name)
+        if intent_policy == "keep-current" and intent_version != intent_row.current_version:
+            return f"USER_BASELINE_KEEP_CURRENT: {intent_name} must remain {intent_row.current_version} in this Baseline"
+        if intent_policy == "required" and intent_version == intent_row.current_version:
+            return f"USER_BASELINE_REQUIRED_UPDATE: {intent_name} must move away from current {intent_row.current_version} in this Baseline"
+
     for source_name in sorted(assignment):
         if source_name not in names:
             continue
@@ -5780,6 +5894,11 @@ def _new_assignment_constraint_issue(
 
     source = rows_by_name[name]
     source_version = assignment[name]
+    intent_policy = _baseline_intent_policy(name)
+    if intent_policy == "keep-current" and source_version != source.current_version:
+        return f"USER_BASELINE_KEEP_CURRENT: {name} must remain {source.current_version} in this Baseline"
+    if intent_policy == "required" and source_version == source.current_version:
+        return f"USER_BASELINE_REQUIRED_UPDATE: {name} must move away from current {source.current_version} in this Baseline"
     source_moved = source_version != source.current_version
     if source_moved:
         environment_issue = _project_environment_constraint_issue(source, source_version, client)
@@ -5973,6 +6092,25 @@ def _build_peer_optimization_model(
             return
         seen_requirements.add(key)
         requirements.append(requirement)
+
+    for intent_name in sorted(component):
+        intent_row = rows_by_name[intent_name]
+        intent_policy = _baseline_intent_policy(intent_name)
+        if intent_policy == "required" and intent_row.current_version in domains.get(intent_name, []):
+            add_constraint(
+                [(intent_name, intent_row.current_version)],
+                reason=f"USER_BASELINE_REQUIRED_UPDATE: {intent_name} must move away from current {intent_row.current_version}",
+                provenance="user-baseline-intent",
+            )
+        elif intent_policy == "keep-current":
+            for intent_version in domains.get(intent_name, []):
+                if intent_version == intent_row.current_version:
+                    continue
+                add_constraint(
+                    [(intent_name, intent_version)],
+                    reason=f"USER_BASELINE_KEEP_CURRENT: {intent_name} must remain {intent_row.current_version}",
+                    provenance="user-baseline-intent",
+                )
 
     for nogood in learned_nogoods or []:
         if not nogood or not set(nogood).issubset(component_set):
@@ -6688,6 +6826,11 @@ def _resolution_change_reason(
 ) -> str:
     # Resolution diagnostics describe a deviation from policy intent. Keeping
     # the exact desired version is a successful resolution, not a fallback.
+    intent_policy = _baseline_intent_policy(row.name)
+    if intent_policy == "keep-current" and resolved == row.current_version:
+        return f"USER_BASELINE_KEEP_CURRENT: kept {row.name}@{row.current_version} by explicit Baseline intent"
+    if intent_policy == "required" and resolved == row.current_version:
+        return f"USER_BASELINE_REQUIRED_UPDATE_UNSATISFIED: {row.name} remained at current {row.current_version}"
     if target_is_action(desired) and resolved == desired:
         return ""
     if target_is_action(desired) and desired != row.current_version:
@@ -8408,6 +8551,7 @@ class BaselineLivenessBudget:
         self.starting_learned_constraints = max(0, int(starting_learned_constraints))
         self.learned_constraints = self.starting_learned_constraints
         self.certified_extensions = 0
+        self.user_extensions = 0
         self.learned_extensions = 0
         self.exact_extension_credits = 0
         self.exact_exclusions = 0
@@ -8423,8 +8567,15 @@ class BaselineLivenessBudget:
     def allowed_iterations(self) -> int:
         return min(
             self.hard_iterations,
-            self.base_iterations + self.certified_extensions,
+            self.base_iterations + self.certified_extensions + self.user_extensions,
         )
+
+    def grant_user_extensions(self, count: int) -> int:
+        requested = max(0, int(count))
+        room = max(0, self.max_learning_extensions - self.user_extensions)
+        granted = min(requested, room)
+        self.user_extensions += granted
+        return granted
 
     def _grant_authority_extensions(self, count: int) -> int:
         requested = max(0, int(count))
@@ -8468,6 +8619,7 @@ class BaselineLivenessBudget:
             "learningExtensionLimit": self.max_learning_extensions,
             "authorityExtensionLimit": self.max_learning_extensions,
             "certifiedExtensions": self.certified_extensions,
+            "userExtensions": self.user_extensions,
             "learnedExtensions": self.learned_extensions,
             "exactExtensionCredits": self.exact_extension_credits,
             "learnedConstraints": self.learned_constraints,
@@ -9173,6 +9325,14 @@ def resolve_peer_compatibility_with_verification(
             )
         )
         solver_managed_inputs = len(rows_by_name) - len(fixed_input_names)
+        baseline_current_versions = {name: row.current_version for name, row in rows_by_name.items()}
+        baseline_keep_current = sorted(name for name in rows_by_name if _baseline_intent_policy(name) == "keep-current")
+        baseline_required = sorted(name for name in rows_by_name if _baseline_intent_policy(name) == "required")
+        if baseline_keep_current or baseline_required:
+            eprint(
+                f"[info] {project}: user Baseline intent applied; keepCurrent={baseline_keep_current}, "
+                f"required={baseline_required}; authority=USER_POLICY"
+            )
 
         for mode in modes:
             recovery_identity = baseline_run_identity(
@@ -9264,8 +9424,28 @@ def resolve_peer_compatibility_with_verification(
                 max_learning_extensions=config.max_iterations,
                 starting_learned_constraints=len(learned[project][mode]),
             )
+            user_extra_iterations = _baseline_extra_iterations()
+            liveness.max_learning_extensions = max(
+                liveness.max_learning_extensions,
+                config.max_iterations + user_extra_iterations,
+            )
             if restored_liveness:
                 restore_liveness_budget(liveness, restored_liveness)
+            try:
+                restored_user_extensions = max(0, int(restored_liveness.get("userExtensions") or 0))
+            except (TypeError, ValueError):
+                restored_user_extensions = 0
+            consumed_user_extensions = max(
+                0,
+                restored_iteration - liveness.base_iterations - liveness.certified_extensions,
+            )
+            liveness.user_extensions = min(
+                liveness.max_learning_extensions,
+                max(restored_user_extensions, consumed_user_extensions),
+            )
+            decision_grant_iterations = _baseline_decision_grant_iterations()
+            granted_user_iterations = liveness.grant_user_extensions(decision_grant_iterations)
+            decision_prompt_not_before = restored_iteration + granted_user_iterations
             eprint(
                 f"[info] {project}: Baseline solve-and-verify {mode} started; "
                 f"maxIterations={config.max_iterations}, hardIterations={liveness.hard_iterations}, "
@@ -9345,6 +9525,39 @@ def resolve_peer_compatibility_with_verification(
                         diagnostic_preferences_by_project_mode=predicate_diagnostic_preferences,
                     )
                 except BaselineConstraintVerificationError as exc:
+                    active_intent_packages = sorted(set(baseline_keep_current) | set(baseline_required))
+                    if (
+                        _baseline_interactive()
+                        and exc.terminal_status == BaselineTerminalStatus.UNSAT_PROVEN.value
+                        and active_intent_packages
+                    ):
+                        focus_name = active_intent_packages[0] if len(active_intent_packages) == 1 else ""
+                        checkpoint_baseline_run(
+                            "human-decision-required",
+                            completed_iteration=max(restored_iteration, iteration - 1),
+                            status="decision-required",
+                        )
+                        decision_payload = {
+                            "schemaVersion": 1,
+                            "reason": "policy-unsat",
+                            "project": project,
+                            "mode": mode,
+                            "iteration": iteration,
+                            "hardIterations": liveness.hard_iterations,
+                            "learnedConstraints": len(learned[project][mode]),
+                            **({
+                                "package": focus_name,
+                                "currentVersion": baseline_current_versions.get(focus_name, ""),
+                            } if focus_name else {}),
+                        }
+                        progress_reporter.emit(
+                            project, mode, "human-decision-required",
+                            iteration=iteration,
+                            stopCode="BASELINE_HUMAN_DECISION_REQUIRED",
+                            terminalStatus="HUMAN_DECISION_REQUIRED",
+                            reason="policy-unsat",
+                        )
+                        _raise_baseline_human_decision(decision_payload)
                     if exc.terminal_status:
                         progress_reporter.emit(
                             project,
@@ -10763,6 +10976,38 @@ def resolve_peer_compatibility_with_verification(
                             strongest = strongest_family[1]
                             strongest_minimization = strongest_family[2]
                             candidate_fingerprint = assignment_fingerprint(strongest)
+                            if _baseline_interactive() and iteration >= decision_prompt_not_before:
+                                decision_focus = _baseline_human_decision_focus(
+                                    learned[project][mode], baseline_current_versions,
+                                    min_confirmed=BASELINE_INTERACTIVE_UNARY_THRESHOLD,
+                                )
+                                if decision_focus is not None:
+                                    checkpoint_baseline_run(
+                                        "human-decision-required",
+                                        completed_iteration=iteration,
+                                        last_assignment=fingerprint,
+                                        last_predicate=strongest_family[0],
+                                        status="decision-required",
+                                    )
+                                    decision_payload = {
+                                        "schemaVersion": 1,
+                                        "reason": "repeated-package-conflict",
+                                        "project": project,
+                                        "mode": mode,
+                                        "iteration": iteration,
+                                        "hardIterations": liveness.hard_iterations,
+                                        "learnedConstraints": len(learned[project][mode]),
+                                        "predicate": strongest_family[0],
+                                        **decision_focus,
+                                    }
+                                    progress_reporter.emit(
+                                        project, mode, "human-decision-required",
+                                        iteration=iteration,
+                                        stopCode="BASELINE_HUMAN_DECISION_REQUIRED",
+                                        terminalStatus="HUMAN_DECISION_REQUIRED",
+                                        **{key: value for key, value in decision_payload.items() if key not in {"project", "mode", "iteration", "schemaVersion"}},
+                                    )
+                                    _raise_baseline_human_decision(decision_payload)
                             eprint(
                                 f"[warn] {project}: graph-guided constraint family certified; "
                                 f"learned={len(new_constraints)}, "
@@ -11401,6 +11646,35 @@ def resolve_peer_compatibility_with_verification(
                     learned_constraints=len(learned[project][mode])
                 )
                 hard_exhausted = iteration >= summary["hardIterations"]
+                if hard_exhausted and _baseline_interactive():
+                    decision_focus = _baseline_human_decision_focus(
+                        learned[project][mode], baseline_current_versions,
+                        min_confirmed=1,
+                    ) or {}
+                    checkpoint_baseline_run(
+                        "human-decision-required",
+                        completed_iteration=iteration,
+                        last_assignment=last_fingerprint,
+                        status="decision-required",
+                    )
+                    decision_payload = {
+                        "schemaVersion": 1,
+                        "reason": "budget-exhausted",
+                        "project": project,
+                        "mode": mode,
+                        "iteration": iteration,
+                        "hardIterations": summary["hardIterations"],
+                        "learnedConstraints": summary["learnedConstraints"],
+                        **decision_focus,
+                    }
+                    progress_reporter.emit(
+                        project, mode, "human-decision-required",
+                        iteration=iteration,
+                        stopCode="BASELINE_HUMAN_DECISION_REQUIRED",
+                        terminalStatus="HUMAN_DECISION_REQUIRED",
+                        **{key: value for key, value in decision_payload.items() if key not in {"project", "mode", "iteration", "schemaVersion"}},
+                    )
+                    _raise_baseline_human_decision(decision_payload)
                 terminal_status = (
                     BaselineTerminalStatus.HARD_SAFETY_LIMIT
                     if hard_exhausted
@@ -11554,6 +11828,12 @@ def assert_proven_assignment_conformance(
                 target = str(getattr(row, _target_attr(mode), "") or "")
                 actual = target if target_is_action(target) else row.current_version
                 expected = str(proven[row.name])
+                intent_policy = _baseline_intent_policy(row.name)
+                resolved_version = str(proven.get(row.name) or row.current_version)
+                if intent_policy == "keep-current" and resolved_version != row.current_version:
+                    mismatches.append(f"{project}/{mode}:{row.name} USER_BASELINE_KEEP_CURRENT expected={row.current_version} resolved={resolved_version}")
+                if intent_policy == "required" and resolved_version == row.current_version:
+                    mismatches.append(f"{project}/{mode}:{row.name} USER_BASELINE_REQUIRED_UPDATE remained={resolved_version}")
                 if actual != expected:
                     mismatches.append(
                         f"{project}/{mode}:{row.name} expected={expected} actual={actual}"

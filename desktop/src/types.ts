@@ -2,6 +2,11 @@ export type AgentProvider = 'codex' | 'opencode' | 'claude'
 export type FlowAction = 'preflight' | 'sync-tool' | 'baseline' | 'generate' | 'generate-all' | 'audit' | 'agent' | 'recover' | 'release' | 'commit-state' | 'push-workspace'
 export type TargetLevel = 'yellow' | 'green'
 export type ThemePreference = 'system' | 'light' | 'dark'
+export type BaselinePackagePolicy = 'auto' | 'keep-current' | 'required'
+export type BaselineIntent = { schemaVersion: 1; policies: Record<string, BaselinePackagePolicy>; extraIterations?: number; decisionGrantIterations?: number }
+export type BaselineIntentCandidate = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string }
+export type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent }
+export type BaselineDecision = { schemaVersion: 1; reason: 'repeated-package-conflict' | 'budget-exhausted' | 'policy-unsat'; project: string; mode: string; iteration?: number; hardIterations?: number; learnedConstraints?: number; package?: string; currentVersion?: string; failedVersions?: string[]; predicate?: string }
 
 export type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
 export type BaselineRecoveryInfo = { available: boolean; mode?: 'yellow' | 'green'; status?: string; phase?: string; updatedAt?: string; generation?: number; iteration?: number; lastAssignment?: string; lastPredicate?: string; learnedConstraints?: number; exactExclusions?: number; reason?: string }
@@ -188,6 +193,7 @@ export type ActionInput = {
   resumeAgent?: boolean
   restartMigration?: boolean
   baselineResume?: 'auto' | 'continue' | 'restart'
+  baselineIntent?: BaselineIntent
   agentNote?: string
   // Internal marker: suppress per-stage desktop notifications while the
   // Autopilot owns the whole multi-stage FLOW. The final Autopilot notification
@@ -213,6 +219,7 @@ export type DependencyFlowApi = {
   updateWorkspace: (input: Partial<WorkspaceRecord> & { id: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   updateProjectBranches: (input: { workspaceId?: string; projectName: string; branchBase?: string; push?: boolean }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   refreshWorkspace: () => Promise<{ state: DesktopState; details: WorkspaceDetails }>
+  getBaselineIntentPlan: (input: { workspaceId?: string; projectName: string }) => Promise<BaselineIntentPlan>
   runAction: (input: ActionInput) => Promise<{ jobId: string; preview: string[] }>
   cancelJob: (jobId: string) => Promise<boolean>
   pauseJob: (jobId: string) => Promise<boolean>

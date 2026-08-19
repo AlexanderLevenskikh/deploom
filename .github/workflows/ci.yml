@@ -139,6 +139,8 @@ jobs:
           npm run check:materialization-proof
           npm run check:resolved-state-proof
           npm run check:workspace-bootstrap
+          npm run check:ui-shell
+          npm run check:baseline-intent
       - name: Version consistency
         working-directory: desktop
         run: test "$(node -p "require('./package.json').version")" = "$(cat ../VERSION)"

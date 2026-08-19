@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ActionInput, AgentProvider, BootstrapPayload, DownloadSaved, FlowAction, HardwareSnapshot, JobFinished, JobOutput, ProjectSpec, TargetLevel, ThemePreference, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
+import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntentPlan, BootstrapPayload, DownloadSaved, FlowAction, HardwareSnapshot, JobFinished, JobOutput, ProjectSpec, TargetLevel, ThemePreference, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
+import { parseBaselineDecision } from '../data/baselineIntent'
 import { goalSeekingStopReason, nextAutopilotAction, type AutopilotPolicyState } from '../autopilot-policy'
 
 const DEMO_WORKSPACE: WorkspaceRecord = {
@@ -85,6 +86,7 @@ export function useDependencyFlow() {
   const [payload, setPayload] = useState<BootstrapPayload>()
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string>()
+  const [baselineDecision, setBaselineDecision] = useState<BaselineDecision>()
   type ActiveRun = { jobId: string; action: ActionInput['action']; workspaceId?: string; projectName?: string; startedAt: number }
   type ActiveRunStart = Omit<ActiveRun, 'startedAt'> & { startedAt?: number }
   const [activeRuns, setActiveRuns] = useState<Record<string, ActiveRun>>({})
@@ -94,6 +96,7 @@ export function useDependencyFlow() {
   const selectedProjectName = payload?.details?.workspace.selectedProject ?? payload?.details?.projects[0]?.name
   const selectedContextRef = useRef<{ workspaceId?: string; projectName?: string }>({})
   selectedContextRef.current = { workspaceId: selectedWorkspaceId, projectName: selectedProjectName }
+  useEffect(() => { setBaselineDecision(undefined) }, [selectedProjectName, selectedWorkspaceId])
   const contextKey = (workspaceId?: string, projectName?: string) => `${workspaceId ?? ''}::${projectName ?? ''}`
   const contextIsVisible = (workspaceId?: string, projectName?: string) => {
     const selected = selectedContextRef.current
@@ -185,6 +188,16 @@ export function useDependencyFlow() {
         forgetActiveJob(event.jobId)
         const eventVisible = contextIsVisible(event.workspaceId, event.projectName)
         const autopilot = autopilotRef.current
+        const decision = parseBaselineDecision(event.error)
+        if (decision && eventVisible) {
+          setBaselineDecision(decision)
+          setContextError(event.workspaceId, event.projectName, undefined)
+          if (autopilot && event.projectName === autopilot.projectName) {
+            autopilotRef.current = undefined
+            setAutopilotActive(false)
+          }
+          return
+        }
         if (!autopilot || event.projectName !== autopilot.projectName) {
           if (event.error && eventVisible) setContextError(event.workspaceId, event.projectName, event.error)
           return
@@ -499,6 +512,7 @@ export function useDependencyFlow() {
 
   const pauseJob = useCallback(async () => { if (!api || !activeJobId) return false; return api.pauseJob(activeJobId) }, [activeJobId, api])
   const getHardwareSnapshot = useCallback(async (): Promise<HardwareSnapshot> => { if (!api) throw new Error('Desktop API is unavailable'); return api.getHardwareSnapshot() }, [api])
+  const getBaselineIntentPlan = useCallback(async (projectName: string): Promise<BaselineIntentPlan> => { if (!api) return { candidates: [], intent: { schemaVersion: 1, policies: {}, extraIterations: 0, decisionGrantIterations: 0 } }; return api.getBaselineIntentPlan({ workspaceId: selectedWorkspaceId, projectName }) }, [api, selectedWorkspaceId])
   const setThemePreference = useCallback(async (preference: ThemePreference) => { setThemePreferenceState(preference); if (!api) return; const result = await api.setThemePreference(preference); setThemePreferenceState(result.preference); document.documentElement.dataset.theme = result.preference === 'system' ? '' : result.preference }, [api])
 
   const cancelJob = useCallback(async () => {
@@ -576,8 +590,8 @@ export function useDependencyFlow() {
   ), [logs, selectedProject?.name, selectedWorkspaceId])
 
   return {
-    payload, loading, error, activeJobId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject,
+    payload, loading, error, baselineDecision, activeJobId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject,
     load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches,
-    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, themePreference, setThemePreference, clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
+    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }
 }

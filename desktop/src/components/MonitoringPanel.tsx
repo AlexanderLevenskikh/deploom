@@ -1,5 +1,5 @@
-import { Cpu, Monitor, Pause } from 'lucide-react'
-import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { AlertTriangle, ClipboardCopy, Cpu, Monitor, Pause, X } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { deriveRunMonitor } from '../data/processMonitor'
 import { latestJobId } from '../data/logPresentation'
 import { useLanguage } from '../i18n'
@@ -7,7 +7,7 @@ import type { BaselineRecoveryInfo, EnvironmentInfo, FlowAction, HardwareSnapsho
 import { LogPanel } from './LogPanel'
 import { RunMonitor } from './RunMonitor'
 
-type View = 'overview' | 'run' | 'hardware' | 'logs' | 'environment'
+type View = 'overview' | 'run' | 'hardware' | 'logs' | 'errors' | 'environment'
 
 type Props = {
   logs: JobOutput[]
@@ -19,6 +19,8 @@ type Props = {
   runStartedAt?: number
   migrationProgress?: MigrationProgress
   baselineRecovery?: BaselineRecoveryInfo
+  error?: string
+  onDismissError: () => void
   onSendAgentNote: (note: string, branch?: string) => Promise<boolean>
   onPauseBaseline?: () => Promise<boolean>
   onCancel: () => void
@@ -67,15 +69,24 @@ function readableActivity(state: ReturnType<typeof deriveRunMonitor>, active: bo
   return state.currentOperation || text('Процесс выполняется', 'Run is in progress')
 }
 
-export function MonitoringPanel({ logs, knownSources = [], environment, active, activeJobId, activeAction, runStartedAt, migrationProgress, baselineRecovery, onSendAgentNote, onPauseBaseline, onCancel, onClear, getHardwareSnapshot }: Props) {
+export function MonitoringPanel({ logs, knownSources = [], environment, active, activeJobId, activeAction, runStartedAt, migrationProgress, baselineRecovery, error, onDismissError, onSendAgentNote, onPauseBaseline, onCancel, onClear, getHardwareSnapshot }: Props) {
   const { t, text } = useLanguage()
   const [view, setView] = useState<View>('overview')
   const [hardware, setHardware] = useState<HardwareSnapshot>()
   const [hardwareError, setHardwareError] = useState<string>()
+  const lastAutoOpenedError = useRef<string | undefined>(undefined)
   const effectiveJobId = activeJobId ?? latestJobId(logs)
   const monitorState = useMemo(() => deriveRunMonitor(logs, active, effectiveJobId, migrationProgress, activeAction, Date.now(), runStartedAt), [active, activeAction, effectiveJobId, logs, migrationProgress, runStartedAt])
   const progress = estimateProgress(monitorState, active)
   const progressLabel = progress === undefined ? '—' : `${Math.round(progress)}%`
+  const visibleError = useMemo(() => error?.replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, ''), [error])
+
+  useEffect(() => {
+    if (!error) { lastAutoOpenedError.current = undefined; return }
+    if (lastAutoOpenedError.current === error) return
+    lastAutoOpenedError.current = error
+    setView('errors')
+  }, [error])
 
   useEffect(() => {
     if (view !== 'hardware') return
@@ -108,6 +119,7 @@ export function MonitoringPanel({ logs, knownSources = [], environment, active, 
           <option value="run">{text('Монитор выполнения', 'Run monitor')}</option>
           <option value="hardware">{text('Железо', 'Hardware')}</option>
           <option value="logs">{text('Логи', 'Logs')}</option>
+          <option value="errors">{error ? `⚠ ${text('Ошибки', 'Errors')} · 1` : text('Ошибки', 'Errors')}</option>
           <option value="environment">{text('Окружение', 'Environment')}</option>
         </select>
       </div>
@@ -135,6 +147,12 @@ export function MonitoringPanel({ logs, knownSources = [], environment, active, 
 
         {view === 'run' ? <RunMonitor logs={logs} active={active} jobId={activeJobId} action={activeAction} runStartedAt={runStartedAt} migrationProgress={migrationProgress} /> : null}
         {view === 'logs' ? <LogPanel logs={logs} knownSources={knownSources} environment={environment} active={active} activeJobId={activeJobId} activeAction={activeAction} runStartedAt={runStartedAt} migrationProgress={migrationProgress} onSendAgentNote={onSendAgentNote} onCancel={onCancel} onClear={onClear} showRunMonitor={false} showEnvironment={false} /> : null}
+        {view === 'errors' ? (
+          <section className="monitoring-errors">
+            <div className="monitoring-errors-header"><div><AlertTriangle size={16} /><strong>{text('Ошибки выполнения', 'Run errors')}</strong></div>{error ? <span className="monitoring-error-count">1</span> : null}</div>
+            {error ? <><div className="monitoring-error-card" role="alert"><pre>{visibleError}</pre></div><div className="monitoring-error-actions"><button className="button secondary" onClick={() => visibleError && void navigator.clipboard.writeText(visibleError)}><ClipboardCopy size={14} /> {text('Копировать', 'Copy')}</button><button className="button secondary" onClick={() => setView('logs')}>{text('Открыть логи', 'Open logs')}</button><button className="button secondary" onClick={onDismissError}><X size={14} /> {text('Закрыть ошибку', 'Dismiss error')}</button></div></> : <div className="monitoring-errors-empty">{text('Ошибок выполнения нет', 'No run errors')}</div>}
+          </section>
+        ) : null}
         {view === 'environment' ? <div className="environment-only">{Object.entries(environment).map(([name, info]) => <div className="environment-row" key={name}><span className={`status-dot ${info.available ? 'success' : 'danger'}`} /><strong>{name}</strong><span>{info.available ? info.version : t('log.notFound')}</span></div>)}</div> : null}
         {view === 'hardware' ? (
           <section className="hardware-grid">

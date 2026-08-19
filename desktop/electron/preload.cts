@@ -12,6 +12,7 @@ const api = {
   updateWorkspace: (input: unknown) => ipcRenderer.invoke('flow:update-workspace', input),
   updateProjectBranches: (input: unknown) => ipcRenderer.invoke('flow:update-project-branches', input),
   refreshWorkspace: () => ipcRenderer.invoke('flow:refresh-workspace'),
+  getBaselineIntentPlan: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:baseline-intent-plan', input),
   runAction: (input: unknown) => ipcRenderer.invoke('flow:run-action', input),
   cancelJob: (jobId: string) => ipcRenderer.invoke('flow:cancel-job', jobId),
   pauseJob: (jobId: string) => ipcRenderer.invoke('flow:pause-job', jobId),
