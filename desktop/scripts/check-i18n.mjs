@@ -32,6 +32,7 @@ for (const rel of [
   'src/components/DashboardWorkspace.tsx',
   'src/components/ProjectRail.tsx',
   'src/components/SetupScreen.tsx',
+  'src/components/WorkspaceDialog.tsx',
   'src/components/RunMonitor.tsx',
 ]) {
   const source = read(rel)

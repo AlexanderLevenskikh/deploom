@@ -10,7 +10,7 @@ type Props = {
 }
 
 export function WorkspaceDialog({ onClose, onPickDirectory, onConnectExisting, onCreate }: Props) {
-  const { text } = useLanguage()
+  const { t } = useLanguage()
   const [parentPath, setParentPath] = useState('')
   const [folderName, setFolderName] = useState('deploom-workspace')
   const [teamRemote, setTeamRemote] = useState('')
@@ -67,28 +67,28 @@ export function WorkspaceDialog({ onClose, onPickDirectory, onConnectExisting, o
       <section className="dialog workspace-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-dialog-title">
         <div className="dialog-title">
           <div>
-            <h2 id="workspace-dialog-title">{text('Добавить workspace', 'Add workspace')}</h2>
-            <p>{text('Workspace хранит общую registry/policy конфигурацию. Проекты с разной registry-политикой удобно держать в разных workspace.', 'A workspace owns shared registry/policy configuration. Projects with different registry policies are best kept in separate workspaces.')}</p>
+            <h2 id="workspace-dialog-title">{t('workspaceDialog.title')}</h2>
+            <p>{t('workspaceDialog.description')}</p>
           </div>
-          <button type="button" className="icon-button" disabled={busy} aria-label={text('Закрыть', 'Close')} onClick={onClose}><X size={17} /></button>
+          <button type="button" className="icon-button" disabled={busy} aria-label={t('common.close')} onClick={onClose}><X size={17} /></button>
         </div>
 
         <div className="workspace-connect-card">
-          <div><FolderGit2 size={19} /><div><strong>{text('Подключить существующий', 'Connect existing')}</strong><span>{text('Выберите уже созданный Git workspace.', 'Choose an existing Git workspace.')}</span></div></div>
-          <button type="button" className="button secondary" disabled={busy} onClick={() => void connectExisting()}>{text('Выбрать папку', 'Choose folder')}</button>
+          <div><FolderGit2 size={19} /><div><strong>{t('workspaceDialog.connect.title')}</strong><span>{t('workspaceDialog.connect.description')}</span></div></div>
+          <button type="button" className="button secondary" disabled={busy} onClick={() => void connectExisting()}>{t('workspaceDialog.connect.choose')}</button>
         </div>
 
-        <div className="setup-divider"><span>{text('или создать новый', 'or create new')}</span></div>
+        <div className="setup-divider"><span>{t('workspaceDialog.orCreate')}</span></div>
 
         <form className="workspace-create-form" onSubmit={(event) => void create(event)}>
-          <label>{text('Родительская папка', 'Parent folder')}<div className="input-action"><input value={parentPath} onChange={(event) => setParentPath(event.target.value)} /><button type="button" className="icon-button" disabled={busy} onClick={() => void chooseParent()}><FolderGit2 size={17} /></button></div></label>
-          <label>{text('Имя папки workspace', 'Workspace folder name')}<input value={folderName} onChange={(event) => setFolderName(event.target.value)} /></label>
-          <label>{text('Team remote', 'Team remote')} <span className="optional">{text('необязательно', 'optional')}</span><input value={teamRemote} onChange={(event) => setTeamRemote(event.target.value)} placeholder="git@example/team/dependency-roadmap.git" /></label>
-          <div className="workspace-registry-note">{text('Новый workspace создаётся без registry override: по умолчанию используется публичный npm registry. Nexus можно задать позже в settings.project.json.', 'A new workspace is created without a registry override: the public npm registry is used by default. Nexus can be configured later in settings.project.json.')}</div>
+          <label>{t('workspaceDialog.parentFolder')}<div className="input-action"><input value={parentPath} onChange={(event) => setParentPath(event.target.value)} /><button type="button" className="icon-button" disabled={busy} aria-label={t('workspaceDialog.parentFolder')} onClick={() => void chooseParent()}><FolderGit2 size={17} /></button></div></label>
+          <label>{t('workspaceDialog.folderName')}<input value={folderName} onChange={(event) => setFolderName(event.target.value)} /></label>
+          <label>{t('workspaceDialog.teamRemote')} <span className="optional">{t('common.optional')}</span><input value={teamRemote} onChange={(event) => setTeamRemote(event.target.value)} placeholder="git@example.invalid/team/dependency-roadmap.git" /></label>
+          <div className="workspace-registry-note">{t('workspaceDialog.registryNote')}</div>
           {error ? <div className="dialog-error" role="alert">{error}</div> : null}
           <div className="dialog-actions">
-            <button type="button" className="button secondary" disabled={busy} onClick={onClose}>{text('Отмена', 'Cancel')}</button>
-            <button type="submit" className="button primary" disabled={busy || !parentPath.trim() || !folderName.trim()}><GitFork size={15} /> {busy ? text('Создаю…', 'Creating…') : text('Создать workspace', 'Create workspace')}</button>
+            <button type="button" className="button secondary" disabled={busy} onClick={onClose}>{t('common.cancel')}</button>
+            <button type="submit" className="button primary" disabled={busy || !parentPath.trim() || !folderName.trim()}><GitFork size={15} /> {busy ? t('workspaceDialog.creating') : t('workspaceDialog.create')}</button>
           </div>
         </form>
       </section>

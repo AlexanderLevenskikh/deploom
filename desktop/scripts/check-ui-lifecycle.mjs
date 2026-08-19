@@ -16,7 +16,7 @@ const css = read('../src/App.css')
 for (const [name, source, sentinels] of [
   ['App', app, ['WorkspaceDialog', 'onRemoveProject', 'showWorkspaceDialog']],
   ['ProjectRail', rail, ['project-row-remove', 'Trash2', 'window.confirm']],
-  ['WorkspaceDialog', workspace, ['Подключить существующий', 'Создать workspace', 'dialog-actions']],
+  ['WorkspaceDialog', workspace, ["t('workspaceDialog.connect.title')", "t('workspaceDialog.create')", 'dialog-actions']],
   ['BaselineIntentDialog', baseline, ['useDeferredValue', 'autoFocus', 'deferredQuery']],
   ['MonitoringPanel', monitoring, ['presentRunError', "setView('errors')"]],
   ['FlowWorkspace', flow, ['ModelPicker', 'persistAgentModel', 'startAutopilotWithCurrentModel']],
