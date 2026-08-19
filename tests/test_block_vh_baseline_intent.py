@@ -43,7 +43,7 @@ class BlockVHBaselineIntentTests(unittest.TestCase):
         raw = '{"schemaVersion":1,"policies":{"eslint-plugin-sonarjs":"keep-current"}}'
         with patch.dict(os.environ, {"DEPLOOM_BASELINE_INTENT_JSON": raw}, clear=False):
             gen._BASELINE_INTENT_CACHE_RAW = "<unset>"
-            gen._apply_baseline_intent_scope({"partner-form": [row]})
+            gen._apply_baseline_intent_scope({"demo-project": [row]})
         self.assertTrue(row.scope_excluded)
         self.assertEqual("baseline-intent", row.exclusion_source)
         self.assertIn("Baseline", row.exclusion_reason)
