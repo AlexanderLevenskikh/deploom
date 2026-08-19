@@ -5,6 +5,7 @@ import { ACTION_ORDER, FLOW_STAGES } from '../data/flow'
 import { useLanguage } from '../i18n'
 import { BranchFailureModal } from './BranchFailureModal'
 import { GoalDetailsModal } from './GoalDetailsModal'
+import { QuickSelect } from './QuickSelect'
 import { BaselineIntentDialog } from './BaselineIntentDialog'
 import { freshBaselineIntent, normalizeBaselineIntentPlan } from '../data/baselineIntent'
 import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, FlowAction, MigrationBranchProgress, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
@@ -253,7 +254,7 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
         <fieldset className="target-field"><legend>{t('flow.targetLevel')}</legend><label><input type="radio" checked={target === 'yellow'} onChange={() => setTarget('yellow')} /><span className="target-dot yellow" />{t('levels.yellow')}</label><label><input type="radio" checked={target === 'green'} onChange={() => setTarget('green')} /><span className="target-dot green" />{t('levels.green')}</label></fieldset>
         <div><span>{t('common.branch')}</span><div className="git-plan-control"><input aria-label={t('flow.updateBranch')} value={branchBase} onChange={(event) => setBranchBase(event.target.value)} onBlur={() => void persistGitSettings()} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }} placeholder="libs" /><label className="push-toggle" title={t('flow.pushTitle')}><input type="checkbox" checked={pushEnabled} onChange={(event) => void persistGitSettings(branchBase, event.target.checked)} />Push</label></div></div>
         <div><span>{t('flow.workspace')}</span><strong className={details.git.dirty ? 'warning-text' : 'success-text'}>{details.git.dirty ? t('flow.workspaceDirty', { count: details.git.summary.length }) : t('flow.workspaceClean')}</strong></div>
-        <div><span>{t('flow.agent')}</span><select value={details.workspace.agent} onChange={(event) => void onUpdateWorkspace({ id: details.workspace.id, agent: event.target.value as AgentProvider })}><option value="codex">Codex</option><option value="opencode">OpenCode</option><option value="claude">Claude</option></select></div>
+        <div><span>{t('flow.agent')}</span><QuickSelect value={details.workspace.agent} options={[{ value: 'codex', label: 'Codex' }, { value: 'opencode', label: 'OpenCode' }, { value: 'claude', label: 'Claude' }]} onChange={(value) => void onUpdateWorkspace({ id: details.workspace.id, agent: value as AgentProvider })} ariaLabel={t('flow.agent')} /></div>
         <div><span>{t('flow.model')}</span><input aria-label={t('flow.modelAria')} list="agent-model-suggestions" value={agentModel} onChange={(event) => setAgentModel(event.target.value)} onBlur={() => void persistAgentModel()} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }} placeholder={t('flow.modelDefault')} title={t('flow.modelTitle')} /><datalist id="agent-model-suggestions">{modelSuggestions.map((option) => <option value={option} key={option} />)}</datalist></div>
       </div>
 

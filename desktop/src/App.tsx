@@ -6,6 +6,7 @@ import { DashboardWorkspace } from './components/DashboardWorkspace'
 import { FlowWorkspace } from './components/FlowWorkspace'
 import { MonitoringPanel } from './components/MonitoringPanel'
 import { ProjectRail } from './components/ProjectRail'
+import { QuickSelect } from './components/QuickSelect'
 import { SetupScreen } from './components/SetupScreen'
 import { useDependencyFlow } from './hooks/useDependencyFlow'
 import { useLanguage } from './i18n'
@@ -50,7 +51,7 @@ function App() {
     <div className="app-shell">
       <header className="app-header">
         <div className="app-brand"><div className="brand-mark small"><GitFork size={18} /></div><strong>DepLoom</strong></div>
-        <label className="workspace-select">Workspace<select value={details.workspace.id} onChange={(event) => void flow.selectWorkspace(event.target.value)}>{payload.state.workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name}</option>)}</select></label>
+        <div className="workspace-select"><span>Workspace</span><QuickSelect value={details.workspace.id} options={payload.state.workspaces.map((workspace) => ({ value: workspace.id, label: workspace.name }))} onChange={(value) => void flow.selectWorkspace(value)} ariaLabel="Workspace" /></div>
         <div className="header-actions">
           <div className="theme-switch" role="group" aria-label={t('app.theme.interface')}>
             <button className={themePreference === 'light' ? 'active' : ''} aria-pressed={themePreference === 'light'} title={t('app.theme.light')} onClick={() => void flow.setThemePreference('light')}>☀</button>

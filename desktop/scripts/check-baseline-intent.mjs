@@ -23,8 +23,10 @@ for (const sentinel of [
 
 for (const sentinel of [
   'Продолжить поиск (+',
-  'value="keep-current"',
-  'value="required"',
+  'baseline-policy-toggle',
+  "setPolicy(item.name, 'keep-current')",
+  "setPolicy(item.name, 'required')",
+  'Подтвердить и запустить Baseline',
 ]) if (!dialog.includes(sentinel)) throw new Error(`Baseline intent dialog contract missing: ${sentinel}`)
 
 for (const sentinel of [
@@ -48,6 +50,8 @@ for (const sentinel of [
   'BASELINE_HUMAN_DECISION_REQUIRED',
   'USER_BASELINE_REQUIRED_UPDATE',
   'USER_BASELINE_KEEP_CURRENT',
+  '_apply_baseline_intent_scope',
+  'excluded from this Baseline update/health scope by USER_POLICY',
 ]) if (!generator.includes(sentinel)) throw new Error(`Baseline intent solver/verifier contract missing: ${sentinel}`)
 
 console.log('Baseline intent / human decision loop contract OK')

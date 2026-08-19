@@ -5,6 +5,7 @@ import { latestJobId } from '../data/logPresentation'
 import { useLanguage } from '../i18n'
 import type { BaselineRecoveryInfo, EnvironmentInfo, FlowAction, HardwareSnapshot, JobOutput, JobOutputSource, MigrationProgress } from '../types'
 import { LogPanel } from './LogPanel'
+import { QuickSelect } from './QuickSelect'
 import { RunMonitor } from './RunMonitor'
 
 type View = 'overview' | 'run' | 'hardware' | 'logs' | 'errors' | 'environment'
@@ -58,7 +59,7 @@ function estimateProgress(state: ReturnType<typeof deriveRunMonitor>, active: bo
 function readableActivity(state: ReturnType<typeof deriveRunMonitor>, active: boolean, text: (ru: string, en: string) => string): string {
   if (!active && state.phase === 'finished') return text('Последний процесс завершён', 'Last run finished')
   if (!active) return text('Нет активного процесса', 'No active run')
-  if (state.dependency) return text(`Актуализирую зависимости: ${state.dependency.current}/${state.dependency.total}`, `Refreshing dependencies: ${state.dependency.current}/${state.dependency.total}`)
+  if (state.dependency) return text(`Анализирую зависимости: ${state.dependency.current}/${state.dependency.total}`, `Analyzing dependencies: ${state.dependency.current}/${state.dependency.total}`)
   if (state.activity === 'solving' || state.activity === 'searching-next') return text('Подбираю совместимое множество версий', 'Choosing a compatible version assignment')
   if (state.activity === 'verifying-assignment') return text('Проверяю assignment настоящим package manager', 'Verifying the assignment with the real package manager')
   if (state.activity === 'project-check') return text(`Запускаю проектную проверку${state.projectCheck?.name ? `: ${state.projectCheck.name}` : ''}`, `Running project check${state.projectCheck?.name ? `: ${state.projectCheck.name}` : ''}`)
@@ -114,14 +115,14 @@ export function MonitoringPanel({ logs, knownSources = [], environment, active, 
     <aside className="monitoring-panel">
       <div className="monitoring-heading">
         <div className="monitoring-heading-title"><Monitor size={17} /><strong>{text('Мониторинг', 'Monitoring')}</strong></div>
-        <select value={view} onChange={(event) => setView(event.target.value as View)} aria-label={text('Мониторинг', 'Monitoring')}>
-          <option value="overview">Default</option>
-          <option value="run">{text('Монитор выполнения', 'Run monitor')}</option>
-          <option value="hardware">{text('Железо', 'Hardware')}</option>
-          <option value="logs">{text('Логи', 'Logs')}</option>
-          <option value="errors">{error ? `⚠ ${text('Ошибки', 'Errors')} · 1` : text('Ошибки', 'Errors')}</option>
-          <option value="environment">{text('Окружение', 'Environment')}</option>
-        </select>
+        <QuickSelect value={view} onChange={(value) => setView(value as View)} ariaLabel={text('Мониторинг', 'Monitoring')} options={[
+          { value: 'overview', label: 'Default' },
+          { value: 'run', label: text('Монитор выполнения', 'Run monitor') },
+          { value: 'hardware', label: text('Железо', 'Hardware') },
+          { value: 'logs', label: text('Логи', 'Logs') },
+          { value: 'errors', label: error ? `⚠ ${text('Ошибки', 'Errors')} · 1` : text('Ошибки', 'Errors') },
+          { value: 'environment', label: text('Окружение', 'Environment') },
+        ]} />
       </div>
 
       <div className="monitoring-body">

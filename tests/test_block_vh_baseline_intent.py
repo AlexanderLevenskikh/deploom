@@ -37,6 +37,17 @@ class BlockVHBaselineIntentTests(unittest.TestCase):
         with patch.dict(os.environ, {"DEPLOOM_BASELINE_INTENT_JSON": raw}, clear=False):
             self.assertIsNone(gen._baseline_human_decision_focus(learned, {"pkg": "0.9.0"}, min_confirmed=3))
 
+    def test_keep_current_is_outside_current_baseline_health_scope(self):
+        from types import SimpleNamespace
+        row = SimpleNamespace(name="eslint-plugin-sonarjs", scope_excluded=False, exclusion_reason="", exclusion_source="")
+        raw = '{"schemaVersion":1,"policies":{"eslint-plugin-sonarjs":"keep-current"}}'
+        with patch.dict(os.environ, {"DEPLOOM_BASELINE_INTENT_JSON": raw}, clear=False):
+            gen._BASELINE_INTENT_CACHE_RAW = "<unset>"
+            gen._apply_baseline_intent_scope({"partner-form": [row]})
+        self.assertTrue(row.scope_excluded)
+        self.assertEqual("baseline-intent", row.exclusion_source)
+        self.assertIn("Baseline", row.exclusion_reason)
+
     def test_user_continuation_credit_is_not_mislabeled_as_proof_credit(self):
         budget = gen.BaselineLivenessBudget(base_iterations=8, max_learning_extensions=16)
         budget.certified_extensions = 8

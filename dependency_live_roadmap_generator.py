@@ -178,6 +178,19 @@ def _baseline_intent_policy(package: str) -> str:
     policy = str((_baseline_intent_payload().get("policies") or {}).get(package) or "auto")
     return policy if policy in BASELINE_INTENT_POLICIES else "auto"
 
+# BLOCK_VH3_USER_SCOPE_SEMANTICS
+def _apply_baseline_intent_scope(rows_by_project: Mapping[str, Sequence[DependencyRow]]) -> None:
+    # "keep-current" is the persisted V-H wire value. Product semantics are
+    # explicit: keep the package current in the real graph, but remove it from
+    # this Baseline's update/health target. This is USER_POLICY, not evidence.
+    for rows in rows_by_project.values():
+        for row in rows:
+            if _baseline_intent_policy(row.name) != "keep-current":
+                continue
+            row.scope_excluded = True
+            row.exclusion_reason = "исключено пользователем из текущего Baseline"
+            row.exclusion_source = "baseline-intent"
+
 
 def _baseline_env_nonnegative_int(name: str) -> int:
     try:
@@ -3503,6 +3516,11 @@ def analyze_project(
     for dependency_index, (name, kind, spec) in enumerate(dependencies, start=1):
         dependency_started = time.perf_counter()
         dependency_label = f"{progress_prefix} [dependency {dependency_index}/{len(dependencies)}] {name}".strip()
+        intent_policy = _baseline_intent_policy(name)
+        if intent_policy == "keep-current":
+            eprint(f"[info] {dependency_label}: excluded from this Baseline update/health scope by USER_POLICY; metadata analysis may still run because the package remains in the real manifest/package-manager graph")
+        elif intent_policy == "required":
+            eprint(f"[info] {dependency_label}: REQUIRED update in this Baseline by USER_POLICY")
         eprint(f"[info] {dependency_label}: resolving declared and locked versions")
         current, current_source = resolved_current_version(project.path, name, spec, kind, lock)
         notes: List[str] = []
@@ -16372,6 +16390,7 @@ def main() -> None:
 
     target_started = time.perf_counter()
     eprint("[info] target planning started")
+    _apply_baseline_intent_scope(rows_by_project)
     health_by_project = enrich_project_targets(rows_by_project, planning_baselines)
     apply_supervisor_scope_expansions(rows_by_project)
     enforce_storybook_cohort(rows_by_project, client)

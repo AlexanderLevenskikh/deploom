@@ -4,6 +4,7 @@ import { latestJobId, mergeLogSources, presentLogs, summarizeTokenUsage, type Pr
 import { useLanguage, type Language, type TranslationKey } from '../i18n'
 import type { EnvironmentInfo, FlowAction, JobOutput, JobOutputSource, MigrationProgress } from '../types'
 import { RunMonitor } from './RunMonitor'
+import { QuickSelect } from './QuickSelect'
 
 type Props = {
   logs: JobOutput[]
@@ -166,7 +167,7 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
       <div className="log-controls"><div className="log-tabs" role="tablist" aria-label={t('log.viewAria')}>
         <button role="tab" aria-selected={view === 'activity'} className={view === 'activity' ? 'active' : ''} onClick={() => setView('activity')}>{t('log.activity')}</button>
         <button role="tab" aria-selected={view === 'raw'} className={view === 'raw' ? 'active' : ''} onClick={() => setView('raw')}>Raw</button>
-      </div><label className="log-source-filter">{t('log.session')}<select value={selectedSource} onChange={(event) => { setSelectedSource(event.target.value); setNoteState('idle') }}><option value="all">{t('log.allMessages')}</option><option value="system">{t('log.systemOrchestrator')}</option>{sourceOptions.map(([key, source]) => <option key={key} value={key}>{sourceLabel(source)}</option>)}</select></label></div>
+      </div><div className="log-source-filter"><span>{t('log.session')}</span><QuickSelect value={selectedSource} onChange={(value) => { setSelectedSource(value); setNoteState('idle') }} ariaLabel={t('log.session')} options={[{ value: 'all', label: t('log.allMessages') }, { value: 'system', label: t('log.systemOrchestrator') }, ...sourceOptions.map(([key, source]) => ({ value: key, label: sourceLabel(source) }))]} /></div></div>
 
       <div className="agent-chat-composer">
         <div><strong>{addressedGroup ? t('log.messageSelected', { source: sourceLabel(addressedGroup) }) : t('log.messageAgent')}</strong><span>{addressedGroup ? t('log.selectedLiveOnly') : t('log.selectGroup')}</span></div>

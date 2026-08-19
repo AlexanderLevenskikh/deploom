@@ -2,6 +2,7 @@ import { AlertTriangle, Search, ShieldCheck, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useLanguage } from '../i18n'
 import type { BaselineDecision, BaselineIntent, BaselineIntentPlan, BaselinePackagePolicy } from '../types'
+import { QuickSelect } from './QuickSelect'
 
 type Props = {
   mode: 'prepare' | 'decision'
@@ -12,6 +13,14 @@ type Props = {
 }
 
 const DECISION_TRANCHE = 8
+
+function policyFingerprint(policies: Record<string, BaselinePackagePolicy>): string {
+  return Object.entries(policies)
+    .filter(([, policy]) => policy !== 'auto')
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, policy]) => `${name}\u0000${policy}`)
+    .join('\u0001')
+}
 
 export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit }: Props) {
   const { text } = useLanguage()
@@ -36,6 +45,11 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     return result
   }, [plan.candidates, policies])
 
+  const dirty = useMemo(
+    () => policyFingerprint(policies) !== policyFingerprint(plan.intent.policies),
+    [plan.intent.policies, policies],
+  )
+
   const buildIntent = (extra = 0, grant = 0, nextPolicies = policies): BaselineIntent => ({
     schemaVersion: 1,
     policies: Object.fromEntries(Object.entries(nextPolicies).filter(([, value]) => value !== 'auto')),
@@ -48,6 +62,19 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     try { await onSubmit(intent) } finally { setBusy(false) }
   }
 
+  const requestCancel = () => {
+    if (busy) return
+    if (dirty && !window.confirm(text(
+      'Изменения состава Baseline ещё не применены. Закрыть окно и отбросить их?',
+      'Baseline scope changes have not been applied yet. Close and discard them?',
+    ))) return
+    onCancel()
+  }
+
+  const setPolicy = (name: string, policy: BaselinePackagePolicy) => {
+    setPolicies((current) => ({ ...current, [name]: policy }))
+  }
+
   const continueSearch = () => void submit(buildIntent(DECISION_TRANCHE, DECISION_TRANCHE))
   const applyAndContinue = () => void submit(buildIntent(mode === 'decision' ? DECISION_TRANCHE : 0, mode === 'decision' ? DECISION_TRANCHE : 0))
   const keepFocusAndContinue = () => {
@@ -56,6 +83,13 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     setPolicies(next)
     void submit(buildIntent(DECISION_TRANCHE, DECISION_TRANCHE, next))
   }
+
+  const kindOptions = [
+    { value: 'all', label: text('Все типы', 'All types') },
+    { value: 'runtime', label: 'runtime' },
+    { value: 'dev', label: 'dev' },
+    { value: 'peer', label: 'peer' },
+  ]
 
   return (
     <div className="baseline-intent-backdrop" role="presentation">
@@ -67,10 +101,10 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
               <strong id="baseline-intent-title">{mode === 'decision' ? text('Нужно решение по Baseline', 'Baseline decision required') : text('Что включить в Baseline', 'Choose Baseline scope')}</strong>
               <span>{mode === 'decision'
                 ? text('Автоматический поиск сохранил все подтверждённые constraints и ждёт вашего решения. Совместимость всё равно будет проверена package manager и project checks.', 'Automatic search preserved all confirmed constraints and is waiting for your decision. Compatibility will still be verified by the package manager and project checks.')
-                : text('Можно оставить часть зависимостей текущими или потребовать их обновления именно в этом расчёте. AUTO сохраняет обычную политику DepLoom.', 'You may keep some dependencies current or require their update in this run. AUTO keeps the normal DepLoom policy.')}</span>
+                : text('AUTO — обычная политика DepLoom. «Исключить» оставляет пакет на текущей версии и убирает его из цели этого Baseline. «Обязательно» требует обновления.', 'AUTO uses normal DepLoom policy. Exclude keeps the package at its current version and removes it from this Baseline target. Required forces an update.')}</span>
             </div>
           </div>
-          <button className="icon-button" aria-label={text('Закрыть', 'Close')} onClick={onCancel}><X size={17} /></button>
+          <button type="button" className="icon-button" aria-label={text('Закрыть без применения', 'Close without applying')} onClick={requestCancel}><X size={17} /></button>
         </header>
 
         {mode === 'decision' && decision ? (
@@ -89,20 +123,22 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
 
         <div className="baseline-intent-toolbar">
           <label><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={text('Найти зависимость', 'Find dependency')} /></label>
-          <select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}>
-            <option value="all">{text('Все типы', 'All types')}</option>
-            <option value="runtime">runtime</option>
-            <option value="dev">dev</option>
-            <option value="peer">peer</option>
-          </select>
-          <button className="button secondary" onClick={() => setPolicies({})}>{text('Все → AUTO', 'All → AUTO')}</button>
-          <button className="button secondary" onClick={() => setPolicies((current) => ({ ...current, ...Object.fromEntries(plan.candidates.filter((item) => item.kind === 'dev').map((item) => [item.name, 'keep-current' as const] as const)) }))}>{text('DEV → оставить', 'DEV → keep')}</button>
+          <QuickSelect value={kind} options={kindOptions} onChange={(value) => setKind(value as typeof kind)} ariaLabel={text('Фильтр типа зависимости', 'Dependency type filter')} />
+          <button type="button" className="button secondary" disabled={busy} onClick={() => setPolicies({})}>{text('Все → AUTO', 'All → AUTO')}</button>
+          <button type="button" className="button secondary" disabled={busy} onClick={() => setPolicies((current) => ({ ...current, ...Object.fromEntries(plan.candidates.filter((item) => item.kind === 'dev').map((item) => [item.name, 'keep-current' as const] as const)) }))}>{text('DEV → исключить', 'DEV → exclude')}</button>
         </div>
 
         <div className="baseline-intent-stats">
           <span>AUTO <b>{counts.auto}</b></span>
-          <span>{text('Оставить', 'Keep')} <b>{counts['keep-current']}</b></span>
+          <span>{text('Исключено', 'Excluded')} <b>{counts['keep-current']}</b></span>
           <span>{text('Обязательно', 'Required')} <b>{counts.required}</b></span>
+        </div>
+
+        <div className="baseline-intent-scope-note">
+          {text(
+            'Важно: исключённая зависимость не обновляется и не входит в health-цель этого Baseline, но может появляться в фазе «Анализ зависимостей»: DepLoom всё равно читает manifest/lockfile и metadata, потому что пакет остаётся частью реального package-manager графа.',
+            'Important: an excluded dependency is not updated and is outside this Baseline health target, but it may still appear during dependency analysis because it remains part of the real manifest/lockfile and package-manager graph.',
+          )}
         </div>
 
         <div className="baseline-intent-list">
@@ -115,21 +151,22 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
                 <div><strong>{item.name}</strong><small title={item.requestedSpec}>{item.requestedSpec}</small></div>
                 <span>{item.kind}</span>
                 <code>{item.currentVersion || '—'}</code>
-                <select value={policy} onChange={(event) => setPolicies((current) => ({ ...current, [item.name]: event.target.value as BaselinePackagePolicy }))}>
-                  <option value="auto">AUTO</option>
-                  <option value="keep-current">{text('Оставить текущую', 'Keep current')}</option>
-                  <option value="required">{text('Обязательно обновить', 'Required update')}</option>
-                </select>
+                <div className="baseline-policy-toggle" role="group" aria-label={text(`Правило для ${item.name}`, `Policy for ${item.name}`)}>
+                  <button type="button" className={policy === 'auto' ? 'active' : ''} aria-pressed={policy === 'auto'} disabled={busy} onClick={() => setPolicy(item.name, 'auto')}>AUTO</button>
+                  <button type="button" className={policy === 'keep-current' ? 'active' : ''} aria-pressed={policy === 'keep-current'} disabled={busy} onClick={() => setPolicy(item.name, 'keep-current')}>{text('Исключить', 'Exclude')}</button>
+                  <button type="button" className={policy === 'required' ? 'active required' : ''} aria-pressed={policy === 'required'} disabled={busy} onClick={() => setPolicy(item.name, 'required')}>{text('Обязательно', 'Required')}</button>
+                </div>
               </div>
             )
           })}
         </div>
 
         <footer className="baseline-intent-actions">
-          <button className="button secondary" disabled={busy} onClick={onCancel}>{mode === 'decision' ? text('Оставить на паузе', 'Keep paused') : text('Отмена', 'Cancel')}</button>
-          {mode === 'decision' ? <button className="button secondary" disabled={busy} onClick={continueSearch}>{text(`Продолжить поиск (+${DECISION_TRANCHE})`, `Continue search (+${DECISION_TRANCHE})`)}</button> : null}
-          {mode === 'decision' && decision?.package ? <button className="button secondary" disabled={busy} onClick={keepFocusAndContinue}>{text(`Оставить ${decision.package} текущей`, `Keep ${decision.package} current`)}</button> : null}
-          <button className="button primary" disabled={busy} onClick={applyAndContinue}>{mode === 'decision' ? text('Применить и продолжить', 'Apply and continue') : text('Запустить Baseline', 'Start Baseline')}</button>
+          <span className="baseline-intent-apply-hint">{dirty ? text('Есть неприменённые изменения', 'There are unapplied changes') : text('Состав готов', 'Scope is ready')}</span>
+          <button type="button" className="button secondary" disabled={busy} onClick={requestCancel}>{mode === 'decision' ? text('Оставить на паузе', 'Keep paused') : text('Отмена', 'Cancel')}</button>
+          {mode === 'decision' ? <button type="button" className="button secondary" disabled={busy} onClick={continueSearch}>{text(`Продолжить поиск (+${DECISION_TRANCHE})`, `Continue search (+${DECISION_TRANCHE})`)}</button> : null}
+          {mode === 'decision' && decision?.package ? <button type="button" className="button secondary" disabled={busy} onClick={keepFocusAndContinue}>{text(`Исключить ${decision.package} и продолжить`, `Exclude ${decision.package} and continue`)}</button> : null}
+          <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{mode === 'decision' ? text('Применить и продолжить', 'Apply and continue') : text('Подтвердить и запустить Baseline', 'Confirm and start Baseline')}</button>
         </footer>
       </section>
     </div>
