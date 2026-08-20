@@ -15,6 +15,7 @@ from urllib.parse import unquote, urlparse
 
 from semantic_version import NpmSpec
 from block_vex_storage import semantic_verification_environment
+from workspace_noise import git_exclude_pathspecs
 
 PROOF_SCHEMA_VERSION = "baseline-proof-v5-resolved-state"
 RESOLVER_CONTEXT_SCHEMA_VERSION = "resolver-context-v1-canonical"
@@ -750,6 +751,11 @@ def source_snapshot_fingerprint(project_dir: Path) -> str:
         ".",
         ":(exclude).dependency-roadmap/**",
         ":(glob,exclude)**/.dependency-roadmap/**",
+        # Editor/OS workspace state is intentionally proof-neutral. Desktop's
+        # Baseline source gate applies the same policy; proof identity must not
+        # silently switch from git-clean to git-dirty merely because an IDE
+        # touched workspace.xml during a multi-hour verification run.
+        *git_exclude_pathspecs(),
     ]
     status = _git_success(
         _run_git(

@@ -8810,7 +8810,7 @@ def _proof_source_head_and_clean(
     project_path: Path,
     *,
     require_git: bool = True,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, Tuple[str, ...]]:
     project_path = project_path.resolve()
     root_result = subprocess.run(
         ["git", "-C", str(project_path), "rev-parse", "--show-toplevel"],
@@ -8829,7 +8829,7 @@ def _proof_source_head_and_clean(
                 "requires a git HEAD; non-git content snapshots are diagnostic/no-op only"
             )
         source_key = source_snapshot_fingerprint(project_path)
-        return "non-git", bool(source_key)
+        return "non-git", bool(source_key), ()
 
     git_root = Path(root_result.stdout.strip()).resolve()
     head_result = subprocess.run(
@@ -8866,7 +8866,8 @@ def _proof_source_head_and_clean(
         raise BaselineConstraintVerificationError(
             "PROVEN_DEPENDENCY_SOURCE_SNAPSHOT_INVALID: git status failed while sealing proof source"
         )
-    return head_result.stdout.strip(), not bool(status_result.stdout.strip())
+    relevant_status = tuple(relevant_porcelain_entries(status_result.stdout))
+    return head_result.stdout.strip(), not bool(relevant_status), relevant_status
 
 
 def _build_proven_envelope_for_mode(
@@ -8892,14 +8893,16 @@ def _build_proven_envelope_for_mode(
         _is_fixed_dependency_input(row) for row in rows_by_name.values()
     )
     requires_resolver_proof = requires_execution or requires_fixed_resolver_proof
-    source_head, source_clean = _proof_source_head_and_clean(
+    source_head, source_clean, source_dirty_entries = _proof_source_head_and_clean(
         spec.path,
         require_git=requires_execution,
     )
     if requires_resolver_proof and not source_clean:
+        dirty_summary = "; ".join(source_dirty_entries[:8]) or "<unknown>"
         raise BaselineConstraintVerificationError(
             f"PROVEN_DEPENDENCY_SOURCE_DIRTY: {project}/{mode}: resolver ProofEnvelope "
-            "requires the clean source snapshot verified by Baseline"
+            "requires the clean source snapshot verified by Baseline; "
+            f"relevantStatus={dirty_summary}"
         )
 
     identity = build_verification_proof_identity(
