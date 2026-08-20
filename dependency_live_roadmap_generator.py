@@ -8806,7 +8806,7 @@ class BaselineLocalizationCheckpointStore:
                 self._write_locked(payload)
 
 
-def _proof_source_head_and_clean(
+def _proof_source_head_clean_and_entries(
     project_path: Path,
     *,
     require_git: bool = True,
@@ -8870,6 +8870,21 @@ def _proof_source_head_and_clean(
     return head_result.stdout.strip(), not bool(relevant_status), relevant_status
 
 
+def _proof_source_head_and_clean(
+    project_path: Path,
+    *,
+    require_git: bool = True,
+) -> tuple[str, bool]:
+    # Backward-compatible source-cleanliness contract.
+    # Existing callers/tests consume exactly (head, clean). Detailed
+    # dirty entries stay internal to ProofEnvelope diagnostics.
+    head, clean, _entries = _proof_source_head_clean_and_entries(
+        project_path,
+        require_git=require_git,
+    )
+    return head, clean
+
+
 def _build_proven_envelope_for_mode(
     project: str,
     mode: str,
@@ -8893,7 +8908,7 @@ def _build_proven_envelope_for_mode(
         _is_fixed_dependency_input(row) for row in rows_by_name.values()
     )
     requires_resolver_proof = requires_execution or requires_fixed_resolver_proof
-    source_head, source_clean, source_dirty_entries = _proof_source_head_and_clean(
+    source_head, source_clean, source_dirty_entries = _proof_source_head_clean_and_entries(
         spec.path,
         require_git=requires_execution,
     )

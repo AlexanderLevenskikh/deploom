@@ -57,6 +57,8 @@ class ProofSourceCleanlinessRegressionTests(unittest.TestCase):
     def test_generator_uses_shared_noise_policy_and_reports_relevant_paths(self) -> None:
         generator = (ROOT / "dependency_live_roadmap_generator.py").read_text(encoding="utf-8")
         self.assertIn("from workspace_noise import relevant_porcelain_entries", generator)
+        self.assertIn("def _proof_source_head_clean_and_entries(", generator)
+        self.assertIn("def _proof_source_head_and_clean(", generator)
         self.assertIn("relevant_porcelain_entries(status_result.stdout)", generator)
         self.assertIn("source_dirty_entries", generator)
         self.assertIn("relevantStatus=", generator)
