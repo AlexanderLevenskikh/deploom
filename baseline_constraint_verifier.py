@@ -66,6 +66,11 @@ from verification_workspace_backend import (
     materialize_private_tree,
     workspace_backend_summary,
 )
+from source_snapshot import (
+    SourceCaptureError,
+    SourceSnapshot,
+    materialize_source_for_verification,
+)
 # BLOCK_V_DURABLE_VERIFICATION_V1
 from block_vex_storage import (
     package_manager_cache_environment,
@@ -955,25 +960,26 @@ def _git_root_and_relative(project_dir: Path) -> Tuple[Optional[Path], Path]:
         return root, Path(".")
 
 
-def _materialize_workspace(project_dir: Path, target: Path) -> Path:
-    git_root, relative = _git_root_and_relative(project_dir)
-    if git_root is not None:
-        # A local shared clone is much cheaper than copying node_modules and
-        # still gives diagnostic project checks a real .git directory.
-        result = subprocess.run(
-            ["git", "clone", "--quiet", "--shared", "--no-hardlinks", str(git_root), str(target)],
-            text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=120, check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"temporary git clone failed: {result.stdout.strip()}")
-        return target / relative
 
-    ignore = shutil.ignore_patterns(
-        "node_modules", ".idea", ".vs", ".vscode", ".fleet", "dist", "build", ".cache", ".git"
+# BLOCK_X_SOURCE_TRUTH_V1
+def _materialize_workspace(
+    project_dir: Path,
+    target: Path,
+    *,
+    timeout_seconds: int,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "source snapshot materialization",
+    progress_interval_seconds: int = 15,
+) -> Tuple[Path, SourceSnapshot, str]:
+    """Materialize the sealed SourceSnapshot, never reconstruct source via Git."""
+    return materialize_source_for_verification(
+        project_dir,
+        target,
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+        progress_label=progress_label,
+        progress_interval_seconds=progress_interval_seconds,
     )
-    shutil.copytree(project_dir, target, ignore=ignore, dirs_exist_ok=True)
-    return target
 
 
 def _apply_assignment(
@@ -1168,7 +1174,7 @@ def verify_assignment(
     proof_identity: Optional[VerificationProofIdentity] = None,
     _allow_prepared_fastpath: bool = True,
 ) -> BaselineVerifyResult:
-    """Materialize one exact direct-dependency assignment in an isolated clone."""
+    """Materialize one exact assignment over the sealed SourceSnapshot subject."""
     project_dir = project_dir.resolve()
     attempt_started = time.monotonic()
     attempt_deadline = attempt_started + config.attempt_timeout_seconds
@@ -1227,12 +1233,27 @@ def verify_assignment(
         workspace_started = time.monotonic()
         event("verify.workspace.start")
         try:
-            workspace_project = _materialize_workspace(project_dir, workspace_root)
+            workspace_project, source_snapshot, source_materialization_method = _materialize_workspace(
+                project_dir,
+                workspace_root,
+                timeout_seconds=snapshot_copy_timeout(),
+                progress=phase_progress("source-materialization"),
+                progress_label="sealed source snapshot materialization",
+                progress_interval_seconds=config.progress_interval_seconds,
+            )
             changed = _apply_assignment(workspace_project, assignment, remove_packages=remove_packages)
             event(
                 "verify.workspace.finish",
                 durationMs=int((time.monotonic() - workspace_started) * 1000),
                 changedPackages=len(changed),
+                sourceSnapshotKey=source_snapshot.key,
+                sourceMaterializationMethod=source_materialization_method,
+                sourceFiles=source_snapshot.file_count,
+                sourceBytes=source_snapshot.byte_count,
+            )
+        except SourceCaptureError as exc:
+            return BaselineVerifyResult(
+                False, "infrastructure", f"source snapshot preparation failed: {exc}"
             )
         except AssignmentMaterializationError as exc:
             # A solver/planner assignment that cannot be represented by the
@@ -1255,7 +1276,7 @@ def verify_assignment(
 
         if proof_identity is None:
             proof_identity = build_verification_proof_identity(
-                project_dir,
+                source_snapshot.project_path,
                 assignment=assignment,
                 remove_packages=tuple(sorted(str(item) for item in remove_packages)),
                 manager=manager,
@@ -1264,8 +1285,18 @@ def verify_assignment(
                 project_checks=config.project_checks if run_project_checks else "off",
                 commands=config.commands if run_project_checks else (),
                 environment=base_env,
+                source_snapshot_key=source_snapshot.key,
             )
-        event("proof.identity", manager=manager)
+        elif proof_identity.source_snapshot_key != source_snapshot.key:
+            return BaselineVerifyResult(
+                False,
+                "unknown",
+                "SOURCE_IDENTITY_MISMATCH: supplied proof identity does not match "
+                f"sealed SourceSnapshot; proof={proof_identity.source_snapshot_key} "
+                f"snapshot={source_snapshot.key}",
+                workspace=str(workspace_project),
+            )
+        event("proof.identity", manager=manager, sourceSnapshotKey=source_snapshot.key)
 
         def fixed_source_identity_gate(stage: str) -> Optional[BaselineVerifyResult]:
             try:
@@ -1273,10 +1304,10 @@ def verify_assignment(
                 # Local/workspace paths are intentionally not re-identified
                 # from the temporary assignment clone.
                 current_source_fixed_key = fixed_resolver_input_fingerprint(
-                    project_dir, manager=manager
+                    source_snapshot.project_path, manager=manager
                 )
                 expected_remote_key = remote_fixed_resolver_input_fingerprint(
-                    project_dir, manager=manager
+                    source_snapshot.project_path, manager=manager
                 )
                 observed_remote_key = remote_fixed_resolver_input_fingerprint(
                     workspace_project, manager=manager

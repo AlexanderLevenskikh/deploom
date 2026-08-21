@@ -15,10 +15,16 @@ from urllib.parse import unquote, urlparse
 
 from semantic_version import NpmSpec
 from block_vex_storage import semantic_verification_environment
-from workspace_noise import git_exclude_pathspecs
+from source_snapshot import (
+    SourceCaptureError,
+    active_source_snapshot,
+    proof_subject_project_dir,
+    source_snapshot_fingerprint as captured_source_snapshot_fingerprint,
+)
 
-PROOF_SCHEMA_VERSION = "baseline-proof-v5-resolved-state"
-RESOLVER_CONTEXT_SCHEMA_VERSION = "resolver-context-v1-canonical"
+# BLOCK_X_SOURCE_TRUTH_V1
+PROOF_SCHEMA_VERSION = "baseline-proof-v6-source-snapshot"
+RESOLVER_CONTEXT_SCHEMA_VERSION = "resolver-context-v2-source-snapshot"
 TRIAL_PROOF_KEY_SCHEMA_VERSION = "trial-proof-key-v1"
 
 _RESOLVER_FILES = (
@@ -726,80 +732,13 @@ def fixed_resolver_input_fingerprint(
     )
 
 
+
 def source_snapshot_fingerprint(project_dir: Path) -> str:
-    """Hash the repository-wide source snapshot relevant to proof reuse."""
-    project_dir = project_dir.resolve()
-    git_root = _git_root_or_none(project_dir)
-    if git_root is None:
-        return _fallback_source_fingerprint(project_dir)
-
-    head = _git_success(
-        _run_git(git_root, ["rev-parse", "HEAD"]),
-        "rev-parse HEAD",
-    ).strip()
-    if not head:
-        raise SourceIdentityUnavailable("SOURCE_IDENTITY_GIT_UNAVAILABLE: empty HEAD")
-
+    """Hash the exact content subject used by authoritative verification."""
     try:
-        relative = project_dir.relative_to(git_root).as_posix() or "."
-    except ValueError as exc:
-        raise SourceIdentityUnavailable(
-            f"SOURCE_IDENTITY_PROJECT_OUTSIDE_GIT_ROOT: {project_dir} vs {git_root}"
-        ) from exc
-
-    pathspec = [
-        ".",
-        ":(exclude).dependency-roadmap/**",
-        ":(glob,exclude)**/.dependency-roadmap/**",
-        # Editor/OS workspace state is intentionally proof-neutral. Desktop's
-        # Baseline source gate applies the same policy; proof identity must not
-        # silently switch from git-clean to git-dirty merely because an IDE
-        # touched workspace.xml during a multi-hour verification run.
-        *git_exclude_pathspecs(),
-    ]
-    status = _git_success(
-        _run_git(
-            git_root,
-            ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", *pathspec],
-        ),
-        "git status",
-    )
-    if not status:
-        return _canonical_hash({
-            "kind": "git-clean",
-            "head": head,
-            "relative": relative,
-        })
-
-    diff = _git_success(
-        _run_git(git_root, ["diff", "--binary", "HEAD", "--", *pathspec]),
-        "git diff",
-    )
-    untracked = _git_success(
-        _run_git(
-            git_root,
-            ["ls-files", "--others", "--exclude-standard", "-z", "--", *pathspec],
-        ),
-        "git ls-files --others",
-    )
-    untracked_hashes: list[tuple[str, str]] = []
-    for raw in untracked.split("\0"):
-        raw = raw.strip()
-        if not raw:
-            continue
-        path = git_root / raw
-        if path.is_file():
-            untracked_hashes.append(
-                (raw.replace("\\", "/"), _hash_file(path))
-            )
-
-    return _canonical_hash({
-        "kind": "git-dirty",
-        "head": head,
-        "relative": relative,
-        "diff": hashlib.sha256(diff.encode("utf-8")).hexdigest(),
-        "untracked": sorted(untracked_hashes),
-    })
+        return captured_source_snapshot_fingerprint(project_dir)
+    except SourceCaptureError as exc:
+        raise SourceIdentityUnavailable(str(exc)) from exc
 
 
 def _resolver_ancestor_files(project_dir: Path) -> list[tuple[str, str]]:
@@ -819,7 +758,10 @@ def _resolver_ancestor_files(project_dir: Path) -> list[tuple[str, str]]:
         for name in _RESOLVER_FILES:
             candidate = directory / name
             if candidate.is_file():
-                label = str(candidate.resolve()).replace("\\", "/")
+                try:
+                    label = "repo:" + candidate.resolve().relative_to(stop).as_posix()
+                except ValueError:
+                    label = str(candidate.resolve()).replace("\\", "/")
                 result.append((label, _hash_file(candidate)))
     return sorted(result)
 
@@ -978,7 +920,10 @@ def _resolver_context_payload(
     Keeping one builder prevents a weaker durable-cache identity from drifting
     away from the real package-manager proof identity again.
     """
-    project_dir = project_dir.resolve()
+    # BLOCK_X_SOURCE_TRUTH_V1: once an epoch is active, resolver identity
+    # is read from the same sealed source bytes that package-manager verification
+    # consumes, not from a live checkout that may change mid-run.
+    project_dir = proof_subject_project_dir(project_dir)
     environment_key = environment_snapshot_fingerprint(environment)
     return {
         "schema": PROOF_SCHEMA_VERSION,
@@ -1193,9 +1138,12 @@ def build_verification_proof_identity(
     project_checks: str,
     commands: Sequence[str],
     environment: Mapping[str, str],
+    source_snapshot_key: str = "",
 ) -> VerificationProofIdentity:
-    project_dir = project_dir.resolve()
-    source_key = source_snapshot_fingerprint(project_dir)
+    logical_project_dir = project_dir.resolve()
+    active = active_source_snapshot(logical_project_dir)
+    project_dir = active.project_path if active is not None else logical_project_dir
+    source_key = str(source_snapshot_key or (active.key if active is not None else source_snapshot_fingerprint(logical_project_dir)))
     assignment_key = _canonical_hash({
         "assignment": sorted((str(k), str(v)) for k, v in assignment.items()),
         "removals": sorted(str(item) for item in remove_packages),

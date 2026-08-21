@@ -98,6 +98,11 @@ from verification_proof import (
     is_fixed_manifest_spec,
     source_snapshot_fingerprint,
 )
+from source_snapshot import (
+    SourceCaptureError,
+    activate_source_snapshot_epoch,
+    source_snapshot_provenance_head,
+)
 from resolved_dependency_state import load_resolved_dependency_state
 from proven_dependency_state import (
     RESOLVER_PROOF_STATUS_NOT_REQUIRED_NO_OP,
@@ -9029,17 +9034,16 @@ def _build_proven_envelope_for_mode(
         _is_fixed_dependency_input(row) for row in rows_by_name.values()
     )
     requires_resolver_proof = requires_execution or requires_fixed_resolver_proof
-    source_head, source_clean, source_dirty_entries = _proof_source_head_clean_and_entries(
-        spec.path,
-        require_git=requires_execution,
-    )
-    if requires_resolver_proof and not source_clean:
-        dirty_summary = "; ".join(source_dirty_entries[:8]) or "<unknown>"
-        raise BaselineConstraintVerificationError(
-            f"PROVEN_DEPENDENCY_SOURCE_DIRTY: {project}/{mode}: resolver ProofEnvelope "
-            "requires the clean source snapshot verified by Baseline; "
-            f"relevantStatus={dirty_summary}"
+    # Dirty is no longer a proof error: the dirty bytes themselves are the
+    # sealed SourceSnapshot subject. sourceHead is capture-time provenance only.
+    try:
+        source_head = source_snapshot_provenance_head(
+            spec.path, require_git=requires_execution
         )
+    except SourceCaptureError as exc:
+        raise BaselineConstraintVerificationError(
+            f"PROVEN_DEPENDENCY_SOURCE_IDENTITY_UNAVAILABLE: {project}/{mode}: {exc}"
+        ) from exc
 
     identity = build_verification_proof_identity(
         spec.path,
@@ -9298,19 +9302,38 @@ def resolve_peer_compatibility_with_verification(
             )
         verification_config_by_project[project] = config
 
-        identity_manager = detect_package_manager(spec.path)
+        # BLOCK_X_SOURCE_TRUTH_V1
+        # One source epoch is captured before any physical compatibility trial.
+        # Every resolver/project experiment in this project run consumes bytes
+        # cloned from this sealed snapshot, never from the changing live checkout.
+        try:
+            source_snapshot = activate_source_snapshot_epoch(
+                spec.path,
+                timeout_seconds=config.snapshot_copy_timeout_seconds,
+                progress=lambda message, project=project: eprint(
+                    f"[info] {project}: {message}"
+                ),
+                progress_interval_seconds=config.progress_interval_seconds,
+                replace=True,
+            )
+        except SourceCaptureError as exc:
+            raise BaselineConstraintVerificationError(
+                f"SOURCE_SNAPSHOT_CAPTURE_FAILED: {project}: {exc}"
+            ) from exc
+
+        identity_manager = detect_package_manager(source_snapshot.project_path)
         identity_executable = resolve_executable(identity_manager)
         project_resolver_context_key = ""
         if identity_executable:
             project_resolver_context_key = build_resolver_context_key(
-                spec.path,
+                source_snapshot.project_path,
                 manager=identity_manager,
                 manager_executable=identity_executable,
                 registry=client.registry,
                 environment=dict(os.environ),
             )
         project_source_snapshot_key = (
-            source_snapshot_fingerprint(spec.path)
+            source_snapshot.key
             if config.project_checks != "off" and config.commands
             else ""
         )

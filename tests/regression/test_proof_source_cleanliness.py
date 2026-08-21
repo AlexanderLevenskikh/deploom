@@ -54,26 +54,46 @@ class ProofSourceCleanlinessRegressionTests(unittest.TestCase):
             self.assertTrue(any("real-source-change.txt" in entry for entry in filtered))
             self.assertFalse(any(".idea" in entry for entry in filtered))
 
-    def test_generator_uses_shared_noise_policy_and_reports_relevant_paths(self) -> None:
+    def test_generator_uses_one_sealed_source_snapshot_epoch(self) -> None:
+        # BLOCK_X_REGRESSION_CONTRACT_V1
         generator = (ROOT / "dependency_live_roadmap_generator.py").read_text(encoding="utf-8")
-        self.assertIn("from workspace_noise import relevant_porcelain_entries", generator)
-        self.assertIn("def _proof_source_head_clean_and_entries(", generator)
-        self.assertIn("def _proof_source_head_and_clean(", generator)
-        self.assertIn("relevant_porcelain_entries(status_result.stdout)", generator)
-        self.assertIn("source_dirty_entries", generator)
-        self.assertIn("relevantStatus=", generator)
+        self.assertIn("from source_snapshot import (", generator)
+        self.assertIn("activate_source_snapshot_epoch", generator)
+        self.assertIn("source_snapshot_provenance_head", generator)
+        self.assertIn("source_snapshot = activate_source_snapshot_epoch(", generator)
+        self.assertIn("project_source_snapshot_key = (", generator)
+        self.assertIn("source_snapshot.key", generator)
 
-    def test_proof_identity_uses_same_git_exclusions(self) -> None:
+        # Dirty state is part of the captured proof subject, not a rejection gate.
+        self.assertNotIn("source_dirty_entries", generator)
+        self.assertNotIn("PROVEN_DEPENDENCY_SOURCE_DIRTY", generator)
+        self.assertIn("SOURCE_SNAPSHOT_CAPTURE_FAILED", generator)
+    def test_proof_identity_uses_captured_source_snapshot_not_git_proxy(self) -> None:
         proof = (ROOT / "verification_proof.py").read_text(encoding="utf-8")
-        self.assertIn("from workspace_noise import git_exclude_pathspecs", proof)
-        self.assertIn("*git_exclude_pathspecs(),", proof)
+        source_snapshot = (ROOT / "source_snapshot.py").read_text(encoding="utf-8")
 
-    def test_source_safety_stop_is_non_retryable(self) -> None:
+        self.assertIn("BLOCK_X_SOURCE_TRUTH_V1", proof)
+        self.assertIn("captured_source_snapshot_fingerprint", proof)
+        self.assertIn("active_source_snapshot", proof)
+        self.assertIn("proof_subject_project_dir", proof)
+        self.assertNotIn("git_exclude_pathspecs", proof)
+
+        # gitignore is not the proof boundary; SourceInputPolicy is explicit.
+        self.assertIn("class SourceInputPolicy", source_snapshot)
+        self.assertIn("DEFAULT_EXCLUDED_DIR_NAMES", source_snapshot)
+        self.assertIn('"node_modules"', source_snapshot)
+        self.assertIn('".idea"', source_snapshot)
+        self.assertIn("build_source_tree_manifest", source_snapshot)
+        self.assertIn("SOURCE_CAPTURE_UNSTABLE", source_snapshot)
+    def test_source_snapshot_identity_failures_remain_explicit(self) -> None:
         main = (ROOT / "desktop" / "electron" / "main.ts").read_text(encoding="utf-8")
-        self.assertIn("PROVEN_DEPENDENCY_SOURCE_DIRTY", main)
+        generator = (ROOT / "dependency_live_roadmap_generator.py").read_text(encoding="utf-8")
+
         self.assertIn("PROVEN_DEPENDENCY_SOURCE_SNAPSHOT_INVALID", main)
         self.assertIn("PROVEN_DEPENDENCY_PROOF_IDENTITY_UNAVAILABLE", main)
-
+        self.assertIn("SOURCE_SNAPSHOT_CAPTURE_FAILED", generator)
+        self.assertIn("PROVEN_DEPENDENCY_SOURCE_IDENTITY_UNAVAILABLE", generator)
+        self.assertNotIn("PROVEN_DEPENDENCY_SOURCE_DIRTY", generator)
 
 if __name__ == "__main__":
     unittest.main()

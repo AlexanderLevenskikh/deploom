@@ -90,7 +90,10 @@ def materialize_private_tree(
     progress_label: str = "workspace materialization",
     progress_interval_seconds: int = 15,
     runner=run_supervised,
+    exclude_dir_names: tuple[str, ...] = (),
+    exclude_file_names: tuple[str, ...] = (),
 ) -> str:
+    # BLOCK_X_SOURCE_TRUTH_V1
     source = source.resolve()
     target = target.resolve()
     if target.exists():
@@ -107,24 +110,29 @@ def materialize_private_tree(
         )
         robocopy = shutil.which("robocopy")
         if robocopy:
+            robocopy_args = [
+                robocopy,
+                str(source),
+                str(target),
+                "/E",
+                "/COPY:DAT",
+                "/DCOPY:DAT",
+                "/R:3",
+                "/W:1",
+                "/NFL",
+                "/NDL",
+                "/NJH",
+                "/NJS",
+                "/NP",
+                "/SL",
+                f"/MT:{_copy_workers(refs_same_volume=refs_same_volume)}",
+            ]
+            if exclude_dir_names:
+                robocopy_args.extend(["/XD", *sorted(set(exclude_dir_names))])
+            if exclude_file_names:
+                robocopy_args.extend(["/XF", *sorted(set(exclude_file_names))])
             result = runner(
-                [
-                    robocopy,
-                    str(source),
-                    str(target),
-                    "/E",
-                    "/COPY:DAT",
-                    "/DCOPY:DAT",
-                    "/R:3",
-                    "/W:1",
-                    "/NFL",
-                    "/NDL",
-                    "/NJH",
-                    "/NJS",
-                    "/NP",
-                    "/SL",
-                    f"/MT:{_copy_workers(refs_same_volume=refs_same_volume)}",
-                ],
+                robocopy_args,
                 source,
                 timeout_seconds=max(1, int(timeout_seconds)),
                 progress=progress,
@@ -147,7 +155,10 @@ def materialize_private_tree(
                 f"exit={result.returncode}: {(result.stdout or '')[-1200:]}"
             )
 
-    if sys.platform.startswith("linux"):
+    # Native whole-tree clones cannot express the explicit Block X
+    # source-input exclusion policy. Use them only for complete trees; filtered
+    # source capture falls back to the proof-safe portable copy below.
+    if sys.platform.startswith("linux") and not exclude_dir_names and not exclude_file_names:
         cp = shutil.which("cp")
         if cp:
             target.mkdir(parents=True, exist_ok=False)
@@ -163,7 +174,7 @@ def materialize_private_tree(
                 return "linux-reflink"
             shutil.rmtree(target, ignore_errors=True)
 
-    if sys.platform == "darwin":
+    if sys.platform == "darwin" and not exclude_dir_names and not exclude_file_names:
         cp = shutil.which("cp")
         if cp:
             target.mkdir(parents=True, exist_ok=False)
@@ -179,7 +190,9 @@ def materialize_private_tree(
                 return "macos-clonefile"
             shutil.rmtree(target, ignore_errors=True)
 
-    shutil.copytree(source, target, symlinks=True)
-    return "portable-deep-copy"
+    ignored = tuple(sorted(set(exclude_dir_names) | set(exclude_file_names)))
+    ignore = shutil.ignore_patterns(*ignored) if ignored else None
+    shutil.copytree(source, target, symlinks=True, ignore=ignore)
+    return "portable-filtered-deep-copy" if ignored else "portable-deep-copy"
 
 # BLOCK_VG_ZERO_CONFIG_TRANSACTIONAL_UI_V1

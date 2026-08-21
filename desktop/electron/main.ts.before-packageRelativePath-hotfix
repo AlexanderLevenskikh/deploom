@@ -1441,6 +1441,7 @@ async function materializeContinuationPrompt(
   // scope branch just before a residual refresh allocates a continuation
   // alias. Prefer whichever tool-owned worktree proves more package targets;
   // otherwise a restart resumes an older alias and silently strands newer work.
+  const { packageRelativePath } = await resolveProjectGitLayout(project)
   const worktreeTargetCounts: Record<string, number> = {}
   for (const branch of plan.branches) {
     for (const candidate of new Set([branch.branch, branch.scopeBranch].filter((value): value is string => Boolean(value)))) {
