@@ -250,7 +250,10 @@ class BlockTFastpathFallbackReentryTests(unittest.TestCase):
     def test_released_failure_branch_no_longer_calls_public_wrapper_with_internal_kwargs(self) -> None:
         source = Path(baseline_verifier.__file__).read_text(encoding="utf-8")
         internal_start = source.index("def verify_assignment(")
-        alias = source.index("_verify_assignment_uncached = verify_assignment", internal_start)
+        # Block Y preserves the released physical implementation behind
+        # an explicit internal alias. Fastpath fallback must still avoid
+        # re-entering the public cache-aware wrapper with internal kwargs.
+        alias = source.index("_verify_assignment_uncached_impl = verify_assignment", internal_start)
         internal = source[internal_start:alias]
         self.assertIn("_retry_assignment_without_prepared_fastpath(", internal)
         self.assertNotIn("return verify_assignment(", internal)

@@ -140,23 +140,27 @@ class VerificationProofIdentityTests(unittest.TestCase):
             second = source_snapshot_fingerprint(app)
             self.assertNotEqual(first, second)
 
-    def test_git_diff_failure_is_fail_closed(self) -> None:
+    def test_source_snapshot_capture_failure_is_fail_closed(self) -> None:
+        # Block X removed Git status/diff as the authoritative source identity.
+        # VerificationProof now adapts the captured-content SourceSnapshot
+        # boundary. Capture uncertainty must still fail closed.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / ".git").mkdir()
-            def fake_git(_cwd, args):
-                if args == ["rev-parse", "--show-toplevel"]:
-                    return subprocess.CompletedProcess(args, 0, stdout=str(root), stderr="")
-                if args == ["rev-parse", "HEAD"]:
-                    return subprocess.CompletedProcess(args, 0, stdout="abc123\n", stderr="")
-                if args and args[0] == "status":
-                    return subprocess.CompletedProcess(args, 0, stdout=" M src/index.ts\0", stderr="")
-                if args and args[0] == "diff":
-                    return subprocess.CompletedProcess(args, 127, stdout="", stderr="simulated timeout")
-                raise AssertionError(args)
-
-            with patch("verification_proof._run_git", side_effect=fake_git):
-                with self.assertRaisesRegex(SourceIdentityUnavailable, "git diff"):
+            (root / "package.json").write_text(
+                '{"name":"source-capture-failure"}\n',
+                encoding="utf-8",
+            )
+            SourceCaptureError = __import__("source_snapshot").SourceCaptureError
+            with patch(
+                "verification_proof.captured_source_snapshot_fingerprint",
+                side_effect=SourceCaptureError(
+                    "SOURCE_FILE_UNREADABLE: simulated capture failure"
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    SourceIdentityUnavailable,
+                    "SOURCE_FILE_UNREADABLE",
+                ):
                     source_snapshot_fingerprint(root)
 
     def test_pass_only_proof_store_round_trip_and_corruption_is_miss(self) -> None:

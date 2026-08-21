@@ -71,6 +71,15 @@ from source_snapshot import (
     SourceSnapshot,
     materialize_source_for_verification,
 )
+from verification_observability import (
+    attempt_scope,
+    current_attempt_id,
+    new_observability_id,
+    pending_stage_finishes,
+    process_resource_snapshot,
+    request_scope,
+    run_summary_payload,
+)
 # BLOCK_V_DURABLE_VERIFICATION_V1
 from block_vex_storage import (
     package_manager_cache_environment,
@@ -1195,13 +1204,6 @@ def verify_assignment(
             payload.update(proof_identity.event_fields())
         emit_verification_event(telemetry_path, name, **payload)
 
-    event(
-        "verify.attempt.start",
-        runProjectChecks=run_project_checks,
-        projectChecks=config.project_checks,
-        commands=list(config.commands),
-    )
-
     def phase_timeout() -> int:
         remaining = int(attempt_deadline - time.monotonic())
         if remaining <= 0:
@@ -1387,11 +1389,29 @@ def verify_assignment(
             "npm_config_ignore_scripts": "true",
         }
         install_env.update(_package_manager_cache_environment(config, manager))
-        resolver_record = (
-            proof_store.lookup_pass("resolver", config.reuse_resolver_proof_key)
-            if config.reuse_resolver_proof_key
-            else None
-        )
+        resolver_reuse_cache_operation_id = ""
+        if config.reuse_resolver_proof_key:
+            resolver_reuse_cache_operation_id = new_observability_id("cache")
+            event(
+                "proof.cache.lookup",
+                proofType="resolver",
+                cacheKey=config.reuse_resolver_proof_key,
+                cacheOperationId=resolver_reuse_cache_operation_id,
+                reuseLookup=True,
+            )
+            resolver_record = proof_store.lookup_pass(
+                "resolver", config.reuse_resolver_proof_key
+            )
+            if resolver_record is None:
+                event(
+                    "proof.cache.miss",
+                    proofType="resolver",
+                    cacheKey=config.reuse_resolver_proof_key,
+                    cacheOperationId=resolver_reuse_cache_operation_id,
+                    reuseLookup=True,
+                )
+        else:
+            resolver_record = None
         resolver_reused = bool(
             resolver_record is not None
             and config.reuse_resolver_proof_key == proof_identity.resolver_input_key
@@ -1411,6 +1431,7 @@ def verify_assignment(
                     "proof.cache.rejected",
                     proofType="resolver",
                     cacheKey=proof_identity.resolver_input_key,
+                    cacheOperationId=resolver_reuse_cache_operation_id,
                     reason="resolved-state-artifact-invalid-or-missing",
                 )
             else:
@@ -1441,6 +1462,7 @@ def verify_assignment(
                 "proof.cache.hit",
                 proofType="resolver",
                 cacheKey=proof_identity.resolver_input_key,
+                cacheOperationId=resolver_reuse_cache_operation_id,
                 reuseMode="restore-exact-resolved-state-then-frozen-lifecycle",
             )
             _emit_progress(
@@ -1587,8 +1609,21 @@ def verify_assignment(
             # Durable filesystem bytes never become authority by themselves.
             # Cross-process reuse is enabled only when the existing exact proof
             # store independently confirms the same PreparationProofKey.
+            preparation_cache_operation_id = new_observability_id("cache")
+            event(
+                "proof.cache.lookup",
+                proofType="preparation",
+                cacheKey=proof_identity.preparation_proof_key,
+                cacheOperationId=preparation_cache_operation_id,
+            )
             preparation_record = proof_store.lookup_pass(
                 "preparation", proof_identity.preparation_proof_key
+            )
+            event(
+                "proof.cache.hit" if preparation_record is not None else "proof.cache.miss",
+                proofType="preparation",
+                cacheKey=proof_identity.preparation_proof_key,
+                cacheOperationId=preparation_cache_operation_id,
             )
             snapshot = (
                 _lookup_prepared_workspace_snapshot(
@@ -1744,6 +1779,12 @@ def verify_assignment(
                     "verify.preparation.snapshot-publish",
                     durationMs=snapshot_duration_ms,
                     preparationProofKey=proof_identity.preparation_proof_key,
+                )
+                event(
+                    "verify.preparation.snapshot-publish.finish",
+                    durationMs=snapshot_duration_ms,
+                    preparationProofKey=proof_identity.preparation_proof_key,
+                    legacyEvent="verify.preparation.snapshot-publish",
                 )
                 _emit_progress(
                     progress,
@@ -2097,7 +2138,6 @@ def verify_assignment(
             )
 
         _emit_progress(progress, f"{progress_label}: completed; elapsed={int(time.monotonic() - attempt_started)}s")
-        event("verify.attempt.finish", outcome="passed")
         return BaselineVerifyResult(
             True, "passed", f"resolver preflight passed for {len(changed)} changed direct package(s)",
             command=" ".join(argv), workspace=str(workspace_project),
@@ -2115,7 +2155,115 @@ def assignment_fingerprint(assignment: Mapping[str, str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-_verify_assignment_uncached = verify_assignment
+_verify_assignment_uncached_impl = verify_assignment
+
+
+def _verify_assignment_uncached(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    *,
+    config: BaselineVerifyConfig,
+    run_project_checks: bool = False,
+    remove_packages: Iterable[str] = (),
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "assignment verification",
+    proof_identity: Optional[VerificationProofIdentity] = None,
+    _allow_prepared_fastpath: bool = True,
+) -> BaselineVerifyResult:
+    # BLOCK_Y_OBSERVABILITY_CONTRACT_V1
+    project_dir = project_dir.resolve()
+    telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
+    attempt_id = new_observability_id("attempt")
+    parent_attempt_id = current_attempt_id()
+    started = time.monotonic()
+    resources_before = process_resource_snapshot()
+    assignment_hash = assignment_fingerprint(assignment)
+
+    with attempt_scope(attempt_id, parent_attempt_id=parent_attempt_id):
+        identity_fields = proof_identity.event_fields() if proof_identity is not None else {}
+        emit_verification_event(
+            telemetry_path,
+            "verify.attempt.start",
+            projectPath=str(project_dir),
+            label=progress_label,
+            assignment=assignment_hash,
+            runProjectChecks=run_project_checks,
+            projectChecks=config.project_checks,
+            commands=list(config.commands),
+            parentAttemptId=parent_attempt_id,
+            **identity_fields,
+        )
+        try:
+            result = _verify_assignment_uncached_impl(
+                project_dir,
+                assignment,
+                config=config,
+                run_project_checks=run_project_checks,
+                remove_packages=remove_packages,
+                progress=progress,
+                progress_label=progress_label,
+                proof_identity=proof_identity,
+                _allow_prepared_fastpath=_allow_prepared_fastpath,
+            )
+        except BaseException as exc:
+            for terminal_event, terminal_fields in pending_stage_finishes(
+                terminal_reason="exception"
+            ):
+                emit_verification_event(
+                    telemetry_path,
+                    terminal_event,
+                    projectPath=str(project_dir),
+                    label=progress_label,
+                    assignment=assignment_hash,
+                    **terminal_fields,
+                )
+            resources_after = process_resource_snapshot()
+            emit_verification_event(
+                telemetry_path,
+                "verify.attempt.finish",
+                projectPath=str(project_dir),
+                label=progress_label,
+                assignment=assignment_hash,
+                outcome="exception",
+                ok=False,
+                durationMs=int((time.monotonic() - started) * 1000),
+                cpuMs=max(0, resources_after.cpu_ms - resources_before.cpu_ms),
+                rssBytes=resources_after.rss_bytes,
+                peakRssBytes=resources_after.peak_rss_bytes,
+                errorType=type(exc).__name__,
+                **identity_fields,
+            )
+            raise
+
+        for terminal_event, terminal_fields in pending_stage_finishes(
+            terminal_reason=result.kind
+        ):
+            emit_verification_event(
+                telemetry_path,
+                terminal_event,
+                projectPath=str(project_dir),
+                label=progress_label,
+                assignment=assignment_hash,
+                **terminal_fields,
+            )
+        resources_after = process_resource_snapshot()
+        emit_verification_event(
+            telemetry_path,
+            "verify.attempt.finish",
+            projectPath=str(project_dir),
+            label=progress_label,
+            assignment=assignment_hash,
+            outcome=result.kind,
+            ok=result.ok,
+            summary=result.summary,
+            durationMs=int((time.monotonic() - started) * 1000),
+            cpuMs=max(0, resources_after.cpu_ms - resources_before.cpu_ms),
+            rssBytes=resources_after.rss_bytes,
+            peakRssBytes=resources_after.peak_rss_bytes,
+            **identity_fields,
+        )
+        return result
+
 
 
 def _retry_assignment_without_prepared_fastpath(
@@ -2204,7 +2352,17 @@ def verify_assignment(
     )
     telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
 
+    cache_operations: Dict[Tuple[str, str], str] = {}
+
     def cache_event(name: str, proof_type: str, key: str, **extra: object) -> None:
+        operation_key = (proof_type, key)
+        if name == "proof.cache.lookup":
+            operation_id = new_observability_id("cache")
+            cache_operations[operation_key] = operation_id
+        else:
+            operation_id = cache_operations.get(operation_key) or new_observability_id("cache")
+            if name in {"proof.cache.hit", "proof.cache.miss", "proof.cache.rejected"}:
+                cache_operations.pop(operation_key, None)
         emit_verification_event(
             telemetry_path,
             name,
@@ -2212,6 +2370,7 @@ def verify_assignment(
             label=progress_label,
             proofType=proof_type,
             cacheKey=key,
+            cacheOperationId=operation_id,
             **identity.event_fields(),
             **extra,
         )
@@ -2325,3 +2484,91 @@ def verify_assignment(
         progress_label=progress_label,
         proof_identity=identity,
     )
+
+# BLOCK_Y_OBSERVABILITY_CONTRACT_V1
+_verify_assignment_cache_aware_impl = verify_assignment
+
+
+def verify_assignment(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    *,
+    config: BaselineVerifyConfig,
+    run_project_checks: bool = False,
+    remove_packages: Iterable[str] = (),
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "assignment verification",
+) -> BaselineVerifyResult:
+    project_dir = project_dir.resolve()
+    telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
+    request_id = new_observability_id("request")
+    started = time.monotonic()
+    resources_before = process_resource_snapshot()
+    assignment_hash = assignment_fingerprint(assignment)
+
+    with request_scope(request_id):
+        emit_verification_event(
+            telemetry_path,
+            "verify.request.start",
+            projectPath=str(project_dir),
+            label=progress_label,
+            assignment=assignment_hash,
+            runProjectChecks=run_project_checks,
+            projectChecks=config.project_checks,
+            commands=list(config.commands),
+        )
+        try:
+            result = _verify_assignment_cache_aware_impl(
+                project_dir,
+                assignment,
+                config=config,
+                run_project_checks=run_project_checks,
+                remove_packages=remove_packages,
+                progress=progress,
+                progress_label=progress_label,
+            )
+        except BaseException as exc:
+            resources_after = process_resource_snapshot()
+            emit_verification_event(
+                telemetry_path,
+                "verify.request.finish",
+                projectPath=str(project_dir),
+                label=progress_label,
+                assignment=assignment_hash,
+                outcome="exception",
+                ok=False,
+                durationMs=int((time.monotonic() - started) * 1000),
+                cpuMs=max(0, resources_after.cpu_ms - resources_before.cpu_ms),
+                rssBytes=resources_after.rss_bytes,
+                peakRssBytes=resources_after.peak_rss_bytes,
+                errorType=type(exc).__name__,
+            )
+            emit_verification_event(
+                telemetry_path,
+                "verification.run.summary",
+                **run_summary_payload(),
+            )
+            raise
+
+        resources_after = process_resource_snapshot()
+        emit_verification_event(
+            telemetry_path,
+            "verify.request.finish",
+            projectPath=str(project_dir),
+            label=progress_label,
+            assignment=assignment_hash,
+            outcome=result.kind,
+            ok=result.ok,
+            summary=result.summary,
+            durationMs=int((time.monotonic() - started) * 1000),
+            cpuMs=max(0, resources_after.cpu_ms - resources_before.cpu_ms),
+            rssBytes=resources_after.rss_bytes,
+            peakRssBytes=resources_after.peak_rss_bytes,
+        )
+        emit_verification_event(
+            telemetry_path,
+            "verification.run.summary",
+            **run_summary_payload(),
+        )
+        return result
+
