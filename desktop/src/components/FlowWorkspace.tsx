@@ -146,10 +146,15 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
     return () => { cancelled = true }
   }, [details.workspace.agent, project.path, onListAgentModels])
 
+  // BLOCK_W_P0_P1_TYPES_NESTED_FIX_V1
   const openBaselineIntentDialog = async (mode: 'prepare' | 'decision', resume: 'auto' | 'continue' | 'restart', decision?: BaselineDecision) => {
-    const loaded = normalizeBaselineIntentPlan(await onGetBaselineIntentPlan(project.name))
-    const plan = mode === 'prepare' ? { ...loaded, intent: freshBaselineIntent() } : loaded
-    setBaselineIntentDialog({ mode, resume, plan, decision })
+    try {
+      const loaded = normalizeBaselineIntentPlan(await onGetBaselineIntentPlan(project.name))
+      const plan = mode === 'prepare' ? { ...loaded, intent: freshBaselineIntent() } : loaded
+      setBaselineIntentDialog({ mode, resume, plan, decision })
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : String(error))
+    }
   }
 
   const baselinePolicyIdentity = (intent: BaselineIntent) =>

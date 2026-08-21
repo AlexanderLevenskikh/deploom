@@ -43,7 +43,7 @@ import { commandEnvironment, decodeProcessOutputChunk, normalizePathForCompariso
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
 import { createHash, randomUUID } from 'node:crypto'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, type Dirent } from 'node:fs'
 import { basename, delimiter, dirname, join, normalize, resolve, isAbsolute, relative, sep } from 'node:path'
 import { createServer as createNetServer } from 'node:net'
 import os from 'node:os'
@@ -440,12 +440,88 @@ function resolveSettingsPath(workspace: WorkspaceRecord): string {
   return resolve(workspace.path, workspace.settingsPath)
 }
 
+// BLOCK_W_P0_P1_TYPES_NESTED_FIX_V1
+const PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH = 5
+const PROJECT_MANIFEST_DISCOVERY_IGNORED_DIRS = new Set([
+  '.git', 'node_modules', '.dependency-roadmap', '.dependency-update-history',
+  '.next', 'dist', 'build', 'coverage', '.turbo', '.cache',
+])
+
+function discoverProjectPackageDirectories(root: string): string[] {
+  const found: string[] = []
+  const walk = (directory: string, depth: number): void => {
+    if (depth > PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH) return
+    if (directory !== root && existsSync(join(directory, 'package.json'))) {
+      found.push(resolve(directory))
+      return
+    }
+    let entries: Dirent[]
+    try {
+      entries = readdirSync(directory, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink() || PROJECT_MANIFEST_DISCOVERY_IGNORED_DIRS.has(entry.name)) continue
+      walk(join(directory, entry.name), depth + 1)
+    }
+  }
+  walk(resolve(root), 0)
+  return [...new Set(found)].sort((left, right) => left.localeCompare(right))
+}
+
+function resolveProjectPackageDirectory(inputPath: string, strict = false): string {
+  const selected = resolve(inputPath)
+  if (!existsSync(selected) || !statSync(selected).isDirectory()) {
+    if (strict) throw new Error(`Папка проекта не найдена: ${selected}`)
+    return selected
+  }
+  if (existsSync(join(selected, 'package.json'))) return selected
+  const candidates = discoverProjectPackageDirectories(selected)
+  if (candidates.length === 1) return candidates[0]
+  if (!strict) return selected
+  if (!candidates.length) {
+    throw new Error(`В выбранной папке ${selected} package.json не найден. Выберите Git-репозиторий с одним npm-проектом или папку конкретного npm-проекта.`)
+  }
+  const preview = candidates.slice(0, 8).map((candidate) => relative(selected, candidate) || '.').join(', ')
+  throw new Error(`Найдено несколько package.json (${preview}${candidates.length > 8 ? `, ... (+${candidates.length - 8})` : ''}). Выберите папку конкретного npm-проекта, чтобы DepLoom не угадывал workspace.`)
+}
+
+async function resolveProjectGitLayout(project: ProjectSpec): Promise<{ gitRoot: string; packageRelativePath: string }> {
+  const packageRoot = resolve(project.path)
+  const probe = await spawnCapture('git', ['-C', packageRoot, 'rev-parse', '--show-toplevel'], packageRoot, 15_000)
+  if (probe.timedOut || probe.code !== 0) {
+    throw new Error(probe.stderr.trim() || `Не удалось определить Git root для ${packageRoot}`)
+  }
+  const gitRoot = resolve(probe.stdout.trim())
+  const relativePath = relative(gitRoot, packageRoot)
+  if (relativePath.startsWith('..') || isAbsolute(relativePath)) {
+    throw new Error(`PROJECT_PACKAGE_OUTSIDE_GIT_ROOT: package=${packageRoot}, gitRoot=${gitRoot}`)
+  }
+  return { gitRoot, packageRelativePath: relativePath === '.' ? '' : relativePath.split(sep).join('/') }
+}
+
+function projectPathInWorktree(worktreeRoot: string, packageRelativePath: string): string {
+  return packageRelativePath ? join(worktreeRoot, ...packageRelativePath.split('/')) : worktreeRoot
+}
+
+function projectTreePath(packageRelativePath: string, fileName: string): string {
+  return packageRelativePath ? `${packageRelativePath}/${fileName}` : fileName
+}
+
 function readProjects(workspace: WorkspaceRecord): ProjectSpec[] {
   const settingsPath = resolveSettingsPath(workspace)
   if (!existsSync(settingsPath)) return []
   try {
-    const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as { projects?: ProjectSpec[] }
-    return Array.isArray(settings.projects) ? settings.projects : []
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as { root?: string; projects?: ProjectSpec[] }
+    if (!Array.isArray(settings.projects)) return []
+    const configuredRoot = typeof settings.root === 'string' && settings.root.trim()
+      ? resolve(settings.root)
+      : workspace.path
+    return settings.projects.map((project) => {
+      const absolute = isAbsolute(project.path) ? resolve(project.path) : resolve(configuredRoot, project.path)
+      return { ...project, path: resolveProjectPackageDirectory(absolute) }
+    })
   } catch {
     return []
   }
@@ -843,8 +919,10 @@ async function readMigrationProgress(workspace: WorkspaceRecord, project: Projec
   const mergedSet = new Set(mergedBranches)
   const integratedBranches = integratedBranchTargets(plan, mergedSet, containment)
   const dirtyChanges = relevantGitStatusLines(statusResult.stdout).length
+  const { packageRelativePath } = await resolveProjectGitLayout(project)
+  const packageJsonTreePath = projectTreePath(packageRelativePath, 'package.json')
   const packageJsonAtRef = async (ref: string): Promise<unknown | undefined> => {
-    const result = await git(['show', `${ref}:package.json`])
+    const result = await git(['show', `${ref}:${packageJsonTreePath}`])
     if (result.timedOut || result.code !== 0) return undefined
     try {
       return JSON.parse(result.stdout) as unknown
@@ -879,14 +957,16 @@ async function readMigrationProgress(workspace: WorkspaceRecord, project: Projec
   const worktreeFacts = await Promise.all(plan.branches.map(async (plannedBranch) => {
     const candidates = await Promise.all([...new Set([plannedBranch.branch, plannedBranch.scopeBranch].filter((value): value is string => Boolean(value)))].map(async (candidate) => {
       const worktreePath = worktreePaths.get(candidate)
-      if (!worktreePath || portablePathKey(worktreePath) === portablePathKey(project.path)) return undefined
+      if (!worktreePath) return undefined
+      const candidateProjectPath = projectPathInWorktree(worktreePath, packageRelativePath)
+      if (portablePathKey(candidateProjectPath) === portablePathKey(project.path)) return undefined
       let satisfied: ReadonlySet<string> | undefined
       try {
-        satisfied = scopeAt(JSON.parse(readFileSync(join(worktreePath, 'package.json'), 'utf8')))
+        satisfied = scopeAt(JSON.parse(readFileSync(join(candidateProjectPath, 'package.json'), 'utf8')))
       } catch {
         trustworthy = false
       }
-      const status = await spawnCapture('git', ['-C', worktreePath, 'status', '--porcelain=v1', '--untracked-files=all'], worktreePath, 15_000)
+      const status = await spawnCapture('git', ['-C', candidateProjectPath, 'status', '--porcelain=v1', '--untracked-files=all'], candidateProjectPath, 15_000)
       if (status.timedOut || status.code !== 0) trustworthy = false
       const dirtyChanges = status.code === 0 ? relevantGitStatusLines(status.stdout).length : 0
       const metPackages = satisfied ? plannedBranch.packages.filter((name) => satisfied.has(name)).length : 0
@@ -1015,11 +1095,12 @@ type MigrationGate = { issues: string[]; feedback: string }
 // agent's checkout.
 async function withMergedCheckout<T>(job: JobRecord, project: ProjectSpec, mergedBranch: string, currentBranch: string, run: (directory: string) => Promise<T>): Promise<T> {
   if (currentBranch === mergedBranch) return run(project.path)
+  const { packageRelativePath } = await resolveProjectGitLayout(project)
   const temporaryTree = join(app.getPath('temp'), `dependency-flow-${job.id}-merged`)
   const added = await spawnCapture('git', ['-C', project.path, 'worktree', 'add', '--detach', temporaryTree, mergedBranch], project.path, 300_000)
   if (added.code !== 0) throw new Error(added.stderr.trim() || `не удалось подготовить проверку ветки ${mergedBranch}`)
   try {
-    return await run(temporaryTree)
+    return await run(projectPathInWorktree(temporaryTree, packageRelativePath))
   } finally {
     await spawnCapture('git', ['-C', project.path, 'worktree', 'remove', '--force', temporaryTree], project.path, 120_000)
   }
@@ -1337,7 +1418,8 @@ async function materializeContinuationPrompt(
   const mergedRef = mergedLocal.code === 0 ? plan.mergedBranch : mergedRemote?.code === 0 ? 'origin/' + plan.mergedBranch : undefined
   if (!mergedRef) return { promptPath, markdown }
 
-  const packageResult = await spawnCapture('git', ['-C', project.path, 'show', mergedRef + ':package.json'], project.path, 15_000)
+  const { packageRelativePath } = await resolveProjectGitLayout(project)
+  const packageResult = await spawnCapture('git', ['-C', project.path, 'show', mergedRef + ':' + projectTreePath(packageRelativePath, 'package.json')], project.path, 15_000)
   if (packageResult.code !== 0) return { promptPath, markdown }
   let satisfied: Set<string> | undefined
   try {
@@ -1359,13 +1441,15 @@ async function materializeContinuationPrompt(
   // scope branch just before a residual refresh allocates a continuation
   // alias. Prefer whichever tool-owned worktree proves more package targets;
   // otherwise a restart resumes an older alias and silently strands newer work.
+  const { packageRelativePath } = await resolveProjectGitLayout(project)
   const worktreeTargetCounts: Record<string, number> = {}
   for (const branch of plan.branches) {
     for (const candidate of new Set([branch.branch, branch.scopeBranch].filter((value): value is string => Boolean(value)))) {
       const worktreePath = await worktreePathForBranch(project.path, candidate)
       if (!worktreePath || !isToolManagedWorktreePath(worktreePath, app.getPath('temp'))) continue
       try {
-        const candidateSatisfied = satisfiedScopePackagesFromPrompt(markdown, project.name, JSON.parse(readFileSync(join(worktreePath, 'package.json'), 'utf8')))
+        const candidateProjectPath = projectPathInWorktree(worktreePath, packageRelativePath)
+        const candidateSatisfied = satisfiedScopePackagesFromPrompt(markdown, project.name, JSON.parse(readFileSync(join(candidateProjectPath, 'package.json'), 'utf8')))
         if (candidateSatisfied) worktreeTargetCounts[candidate] = branch.packages.filter((name) => candidateSatisfied.has(name)).length
       } catch { /* a malformed worker remains untouched and is not adopted */ }
     }
@@ -3540,6 +3624,7 @@ async function prepareParallelGroupWorker(
   plan: MigrationPlan,
   branch: MigrationBranchProgress,
 ): Promise<ParallelGroupWorker | undefined> {
+  const { packageRelativePath } = await resolveProjectGitLayout(project)
   const existing = await worktreePathForBranch(project.path, branch.branch)
   if (existing) {
     // Never commandeer a user's arbitrary worktree. Tool-managed worktrees are
@@ -3548,7 +3633,7 @@ async function prepareParallelGroupWorker(
       send('flow:job-output', { jobId: parent.id, stream: 'system', source: { kind: 'group', id: branch.branch, label: branch.label || branch.branch }, line: `Параллельный worker ${branch.branch} пропущен: ветка уже checkout в пользовательском worktree ${existing}. Она будет обработана последовательно.` })
       return undefined
     }
-    return { branch, worktreePath: existing, project: { ...project, path: existing }, job: parallelWorkerJob(parent, branch) }
+    return { branch, worktreePath: existing, project: { ...project, path: projectPathInWorktree(existing, packageRelativePath) }, job: parallelWorkerJob(parent, branch) }
   }
 
   const root = join(app.getPath('temp'), 'dependency-flow-worktrees', parent.id)
@@ -3567,7 +3652,7 @@ async function prepareParallelGroupWorker(
     send('flow:job-output', { jobId: parent.id, stream: 'system', source: { kind: 'group', id: branch.branch, label: branch.label || branch.branch }, line: `Не удалось создать parallel worktree для ${branch.branch}; без остановки FLOW возвращаю группу в последовательный режим. ${added.stderr.trim().slice(-800)}` })
     return undefined
   }
-  return { branch, worktreePath, project: { ...project, path: worktreePath }, job: parallelWorkerJob(parent, branch) }
+  return { branch, worktreePath, project: { ...project, path: projectPathInWorktree(worktreePath, packageRelativePath) }, job: parallelWorkerJob(parent, branch) }
 }
 
 async function cleanupParallelGroupWorker(parent: JobRecord, rootProject: ProjectSpec, worker: ParallelGroupWorker): Promise<{ clean: boolean; details?: string }> {
@@ -3765,7 +3850,8 @@ async function runMigrationAgentIteration(job: JobRecord): Promise<void> {
         if (!isToolManagedWorktreePath(existingWorktree, app.getPath('temp'))) {
           throw new Error(`MIGRATION_REPLAN_REQUIRED: PARALLEL_USER_WORKTREE_BLOCKED: ${next.branch} уже checkout в пользовательском worktree ${existingWorktree}. DepLoom не будет менять чужой checkout; Supervisor должен временно отложить эту branch/cohort и продолжить зелёных siblings, не показывая пользователю красный stop.`)
         }
-        const worker: ParallelGroupWorker = { branch: next, worktreePath: existingWorktree, project: { ...project, path: existingWorktree }, job: parallelWorkerJob(job, next) }
+        const { packageRelativePath } = await resolveProjectGitLayout(project)
+        const worker: ParallelGroupWorker = { branch: next, worktreePath: existingWorktree, project: { ...project, path: projectPathInWorktree(existingWorktree, packageRelativePath) }, job: parallelWorkerJob(job, next) }
         send('flow:job-output', { jobId: job.id, stream: 'system', line: `Продолжаю ${next.branch} в сохранённом tool-managed worktree ${existingWorktree}; ручное переключение ветки не требуется.` })
         let workerSucceeded = false
         try {
@@ -5172,8 +5258,12 @@ function setupIpc(): void {
   ipcMain.handle('flow:add-project', async (_event, raw: { workspaceId?: string; name: string; path: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }) => {
     const state = loadState()
     const workspace = findWorkspace(state, raw.workspaceId)
-    const projectPath = resolve(raw.path)
-    if (!existsSync(join(projectPath, '.git'))) throw new Error('Папка проекта не является Git-репозиторием.')
+    const selectedPath = resolve(raw.path)
+    const projectPath = resolveProjectPackageDirectory(selectedPath, true)
+    const gitProbe = await spawnCapture('git', ['-C', projectPath, 'rev-parse', '--is-inside-work-tree'], projectPath, 15_000)
+    if (gitProbe.timedOut || gitProbe.code !== 0 || gitProbe.stdout.trim().toLowerCase() !== 'true') {
+      throw new Error('Папка проекта не находится внутри Git-репозитория.')
+    }
     const settingsPath = resolveSettingsPath(workspace)
     const settings = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, 'utf8')) as Record<string, unknown> : { schemaVersion: 1 }
     const projects = Array.isArray(settings.projects) ? settings.projects as ProjectSpec[] : []

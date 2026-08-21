@@ -873,6 +873,68 @@ def normalize_config_path_value(value: Any) -> Optional[str]:
     return text.replace("\\", "/")
 
 
+# BLOCK_W_P0_P1_TYPES_NESTED_FIX_V1
+PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH = 5
+PROJECT_MANIFEST_DISCOVERY_IGNORED_DIRS = frozenset({
+    ".git", "node_modules", ".dependency-roadmap", ".dependency-update-history",
+    ".next", "dist", "build", "coverage", ".turbo", ".cache",
+})
+
+
+def _nested_package_manifest_candidates(root: Path) -> List[Path]:
+    """Find package roots without traversing dependency/build payloads."""
+    root = root.resolve()
+    found: List[Path] = []
+
+    def walk(directory: Path, depth: int) -> None:
+        if depth > PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH:
+            return
+        try:
+            children = sorted(directory.iterdir(), key=lambda item: item.name.lower())
+        except OSError:
+            return
+        if directory != root and (directory / "package.json").is_file():
+            found.append(directory)
+            return
+        for child in children:
+            if not child.is_dir() or child.is_symlink():
+                continue
+            if child.name in PROJECT_MANIFEST_DISCOVERY_IGNORED_DIRS:
+                continue
+            walk(child, depth + 1)
+
+    walk(root, 0)
+    return sorted(set(found), key=lambda item: item.as_posix().lower())
+
+
+def resolve_project_package_path(path: Path) -> Path:
+    """Resolve a repository selection to exactly one npm package root."""
+    resolved = path.expanduser().resolve()
+    if not resolved.exists() or not resolved.is_dir():
+        return resolved
+    if (resolved / "package.json").is_file():
+        return resolved
+    candidates = _nested_package_manifest_candidates(resolved)
+    if len(candidates) == 1:
+        chosen = candidates[0]
+        eprint(
+            f"[info] nested npm project auto-resolved: repository={resolved}, packageRoot={chosen}"
+        )
+        return chosen
+    if len(candidates) > 1:
+        preview = ", ".join(
+            candidate.relative_to(resolved).as_posix() for candidate in candidates[:8]
+        )
+        if len(candidates) > 8:
+            preview += f", ... (+{len(candidates) - 8})"
+        raise ValueError(
+            "PROJECT_PACKAGE_ROOT_AMBIGUOUS: selected directory contains multiple "
+            f"nested package.json files ({preview}). Configure projects[].path to "
+            "the exact npm package directory."
+        )
+    return resolved
+
+
 def parse_projects_file(path: Path, root: Optional[Path]) -> List[ProjectSpec]:
     projects: List[ProjectSpec] = []
     for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -900,7 +962,7 @@ def parse_projects_file(path: Path, root: Optional[Path]) -> List[ProjectSpec]:
         p = Path(normalized_value).expanduser()
         if root and not p.is_absolute():
             p = root / p
-        p = p.resolve()
+        p = resolve_project_package_path(p.resolve())
         if not p.exists():
             eprint(f"[warn] projects-file:{line_no}: path does not exist: {p}")
         project_name = name or p.name
@@ -1143,6 +1205,7 @@ def parse_project_entries(
                     value, name = a, b
             p = resolve_config_path(value, base, effective_root)
             assert p is not None
+            p = resolve_project_package_path(p)
             projects.append(ProjectSpec(name or p.name, p))
             continue
         if isinstance(entry, dict):
@@ -1154,6 +1217,7 @@ def parse_project_entries(
                 continue
             p = resolve_config_path(str(value), base, effective_root)
             assert p is not None
+            p = resolve_project_package_path(p)
             name = entry.get("name") or entry.get("project") or p.name
             git_cfg = entry.get("git") if isinstance(entry.get("git"), dict) else {}
             source_branch = str(entry.get("sourceBranch") or git_cfg.get("sourceBranch") or "")
@@ -2259,15 +2323,72 @@ def registry_tarball_missing_declared_types(data: bytes) -> Optional[str]:
     return f"package.json declares TypeScript types at {', '.join(declared)}, none present in the published tarball"
 
 
+def _collect_runtime_export_paths(node: Any, out: List[str]) -> None:
+    """Collect root runtime entrypoints while ignoring explicit type conditions."""
+    if isinstance(node, str):
+        value = node.strip()
+        if value:
+            out.append(value)
+        return
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if str(key) == "types":
+                continue
+            _collect_runtime_export_paths(value, out)
+        return
+    if isinstance(node, list):
+        for item in node:
+            _collect_runtime_export_paths(item, out)
+
+
+def inferred_type_declaration_paths(package_json: Dict[str, Any]) -> List[str]:
+    """Return declaration paths TypeScript can infer from runtime entrypoints."""
+    runtime_paths: List[str] = []
+    for key in ("main", "module"):
+        value = package_json.get(key)
+        if isinstance(value, str) and value.strip():
+            runtime_paths.append(value.strip())
+
+    exports = package_json.get("exports")
+    root_export: Any = exports
+    if isinstance(exports, dict) and "." in exports:
+        root_export = exports.get(".")
+    if isinstance(root_export, (str, dict, list)):
+        _collect_runtime_export_paths(root_export, runtime_paths)
+
+    candidates: List[str] = ["index.d.ts"]
+    for raw in runtime_paths:
+        normalized = str(raw).strip().split("?", 1)[0].split("#", 1)[0]
+        if not normalized:
+            continue
+        lower = normalized.lower()
+        if lower.endswith(".mjs"):
+            stem = normalized[:-4]
+            candidates.extend([stem + ".d.mts", stem + ".d.ts"])
+        elif lower.endswith(".cjs"):
+            stem = normalized[:-4]
+            candidates.extend([stem + ".d.cts", stem + ".d.ts"])
+        elif lower.endswith(".js"):
+            candidates.append(normalized[:-3] + ".d.ts")
+        elif lower.endswith(".jsx"):
+            candidates.append(normalized[:-4] + ".d.ts")
+        elif not Path(normalized).suffix:
+            candidates.extend([normalized + ".d.ts", normalized.rstrip("/") + "/index.d.ts"])
+
+    return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
 def registry_tarball_provides_own_types(data: bytes) -> bool:
-    """Positive proof that the runtime package really ships its declared types."""
+    """Positive proof that the runtime package ships resolvable declarations."""
     parsed = _registry_tarball_manifest(data)
     if parsed is None:
         return False
     package_json, names, prefix = parsed
     declared = declared_type_declaration_paths(package_json)
-    return bool(declared) and any(_tarball_path_exists(names, prefix, path) for path in declared)
-
+    if declared and any(_tarball_path_exists(names, prefix, path) for path in declared):
+        return True
+    inferred = inferred_type_declaration_paths(package_json)
+    return any(_tarball_path_exists(names, prefix, path) for path in inferred)
 
 def registry_tarball_missing_declared_runtime_entrypoint(data: bytes) -> Optional[str]:
     """Reject obviously broken publishes before package-manager/Executor work.
@@ -5245,7 +5366,7 @@ def plan_executable_actions(
                         action = "remove"
                         note = (
                             f"TYPE_STUB_REMOVE_PROVED: {row.name} removal is coupled to "
-                            f"{runtime_name}@{runtime_version}, whose registry tarball ships its declared TypeScript types"
+                            f"{runtime_name}@{runtime_version}, whose registry tarball ships resolvable TypeScript declarations"
                         )
                         row.compatibility_note = target_reason_join([row.compatibility_note, note])
                         current_provides = client.registry_version_provides_own_types(
@@ -16417,9 +16538,20 @@ def main() -> None:
     apply_supervisor_scope_expansions(rows_by_project)
     enforce_storybook_cohort(rows_by_project, client)
     apply_planner_deferrals(rows_by_project)
-    # Freeze policy intent before compatibility resolution. Registry evidence is
-    # applied first so peer solving never relies on a metadata-only target; the
-    # solver may then choose registry-backed fallbacks/companions.
+    # BLOCK_W_P0_P1_TYPES_NESTED_FIX_V1
+    # Executable-action feasibility is part of planning, not a post-proof rewrite.
+    # A deprecated @types/* target is either already proven removable against
+    # the exact planned runtime target or conservatively deferred before the
+    # expensive resolver/project proof begins.
+    plan_executable_actions(
+        rows_by_project,
+        client,
+        immutable_targets=False,
+    )
+    # Freeze the executable policy intent before compatibility resolution.
+    # Registry evidence is applied first so peer solving never relies on a
+    # metadata-only target; the solver may then choose registry-backed
+    # fallbacks/companions without resurrecting an infeasible type-stub action.
     capture_desired_targets(rows_by_project)
     enrich_registry_target_evidence(rows_by_project, client)
     if residual_targets_by_project:

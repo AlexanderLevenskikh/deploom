@@ -1,0 +1,11 @@
+{
+  "name": "deploom-tiny-types-stub",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "uuid": "11.1.1"
+  },
+  "devDependencies": {
+    "@types/uuid": "9.0.8"
+  }
+}
