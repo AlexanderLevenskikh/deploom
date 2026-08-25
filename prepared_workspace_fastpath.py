@@ -598,15 +598,44 @@ def _copy_local_bin(source: Path, target: Path) -> bool:
         return False
 
 
+def _is_internal_windows_reparse(
+    entry: Path,
+    prepared_workspace_root: Path,
+) -> tuple[bool, Optional[Path]]:
+    if os.name != "nt":
+        return False, None
+    checker = getattr(os.path, "isjunction", None)
+    is_junction = False
+    if callable(checker):
+        try:
+            is_junction = bool(checker(entry))
+        except OSError:
+            is_junction = False
+    if not (is_junction or entry.is_symlink()):
+        return False, None
+    try:
+        target = entry.resolve(strict=True)
+        relative = target.relative_to(prepared_workspace_root.resolve())
+    except (OSError, ValueError):
+        return True, None
+    return True, relative
+
+
 def _populate_node_modules_shell(
     prepared_root: Path,
     clone_root: Path,
+    *,
+    prepared_workspace_root: Path,
+    clone_workspace_root: Path,
 ) -> tuple[bool, list[Path]]:
     clone_root.mkdir(parents=True, exist_ok=True)
     pairs: list[tuple[Path, Path]] = []
     local_cache_names = {".vite", ".vitest", ".cache"}
     try:
-        for entry in sorted(prepared_root.iterdir(), key=lambda item: item.name.lower()):
+        for entry in sorted(
+            prepared_root.iterdir(),
+            key=lambda item: item.name.lower(),
+        ):
             name = entry.name
             destination = clone_root / name
             lowered = name.lower()
@@ -618,10 +647,21 @@ def _populate_node_modules_shell(
                     return False, []
                 continue
             if entry.is_dir():
-                pairs.append((destination, entry.resolve()))
+                is_reparse, internal_relative = _is_internal_windows_reparse(
+                    entry,
+                    prepared_workspace_root,
+                )
+                if is_reparse:
+                    if internal_relative is None:
+                        return False, []
+                    target = clone_workspace_root / internal_relative
+                else:
+                    target = entry.resolve()
+                pairs.append((destination, target))
                 continue
             if entry.is_file():
                 shutil.copy2(entry, destination, follow_symlinks=True)
+
         if not _create_junction_batch(pairs):
             for link, _ in reversed(pairs):
                 _remove_junction(link)
@@ -921,7 +961,12 @@ def try_materialize_guarded_clone(
         for dependency_root in dependency_roots:
             relative = dependency_root.relative_to(prepared_workspace_root)
             clone_root = target / relative
-            ok, created = _populate_node_modules_shell(dependency_root, clone_root)
+            ok, created = _populate_node_modules_shell(
+                dependency_root,
+                clone_root,
+                prepared_workspace_root=prepared_workspace_root,
+                clone_workspace_root=target,
+            )
             if not ok:
                 for existing in reversed(junctions):
                     _remove_junction(existing)

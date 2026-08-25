@@ -136,6 +136,12 @@ from lockfile_consistency import (
 )
 from semantic_version import NpmSpec, Version
 from block_v_predicate_search import prioritize_probe_preference
+from project_topology import (
+    ProjectTopologyError,
+    discover_project_package_directories,
+    resolve_project_topology,
+)
+# BLOCK_Z_PROJECT_TOPOLOGY_V1
 from verification_observability import (
     configure_observability_path,
     emit_observability_event,
@@ -893,30 +899,11 @@ PROJECT_MANIFEST_DISCOVERY_IGNORED_DIRS = frozenset({
 
 
 def _nested_package_manifest_candidates(root: Path) -> List[Path]:
-    """Find package roots without traversing dependency/build payloads."""
-    root = root.resolve()
-    found: List[Path] = []
-
-    def walk(directory: Path, depth: int) -> None:
-        if depth > PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH:
-            return
-        try:
-            children = sorted(directory.iterdir(), key=lambda item: item.name.lower())
-        except OSError:
-            return
-        if directory != root and (directory / "package.json").is_file():
-            found.append(directory)
-            return
-        for child in children:
-            if not child.is_dir() or child.is_symlink():
-                continue
-            if child.name in PROJECT_MANIFEST_DISCOVERY_IGNORED_DIRS:
-                continue
-            walk(child, depth + 1)
-
-    walk(root, 0)
-    return sorted(set(found), key=lambda item: item.as_posix().lower())
-
+    """Canonical Block Z package discovery; Desktop discovery is UX-only."""
+    return list(discover_project_package_directories(
+        root,
+        max_depth=PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH,
+    ))
 
 def resolve_project_package_path(path: Path) -> Path:
     """Resolve a repository selection to exactly one npm package root."""
@@ -1658,33 +1645,86 @@ def resolved_current_version(
     kind: str,
     selected_lockfile: Optional[Path] = None,
 ) -> Tuple[str, str]:
-    """Resolve a direct dependency with the project's own package manager.
+    """Resolve a direct dependency from the selected canonical lockfile.
 
-    Yarn projects read exact versions only from ``yarn.lock``. npm projects
-    read exact versions only from ``package-lock.json``/``npm-shrinkwrap.json``.
-    The generator never creates or reads an npm lockfile for a Yarn project.
-
-    A peer-only declaration is a consumer contract and may legitimately have no
-    local lock entry. In that one case the declared range is shown explicitly
-    as a package.json peer value rather than pretending it was resolved.
+    Identity/discovery is intentionally weaker than package-manager authority:
+    a missing canonical lockfile is represented as a package.json fallback.
+    For npm *workspace* lockfiles, topology is required only when the selected
+    lockfile lives above the target package so the correct workspace record can
+    be addressed.
     """
-    del project_dir
     fallback = strip_spec(spec)
     if selected_lockfile is None:
         return fallback, "package.json; canonical lockfile unavailable"
 
+    selected_lockfile = selected_lockfile.resolve()
+    project_dir = project_dir.resolve()
+
     if selected_lockfile.name == "yarn.lock":
-        version = exact_yarn_lock_version(selected_lockfile, package_name, spec)
+        version = exact_yarn_lock_version(
+            selected_lockfile,
+            package_name,
+            spec,
+        )
         if version:
             return version, "yarn.lock"
-    elif selected_lockfile.name in {"package-lock.json", "npm-shrinkwrap.json"}:
-        version = exact_package_lock_version(selected_lockfile, package_name)
+
+    elif selected_lockfile.name in {
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+    }:
+        package_relative_to_manager = ""
+        if selected_lockfile.parent != project_dir:
+            try:
+                topology = resolve_project_topology(
+                    project_dir,
+                    allow_discovery=False,
+                    require_supported=False,
+                )
+            except ProjectTopologyError as exc:
+                raise ValueError(
+                    f"PROJECT_TOPOLOGY_UNAVAILABLE: {exc}"
+                ) from exc
+
+            try:
+                same_lockfile = topology.lockfile.samefile(
+                    selected_lockfile
+                )
+            except OSError:
+                same_lockfile = (
+                    topology.lockfile.resolve()
+                    == selected_lockfile
+                )
+            if not same_lockfile:
+                raise ValueError(
+                    "PROJECT_TOPOLOGY_LOCKFILE_MISMATCH: "
+                    f"selected={selected_lockfile}; "
+                    f"canonical={topology.lockfile}"
+                )
+            package_relative_to_manager = (
+                topology.package_relative_to_manager.as_posix()
+                if topology.is_workspace_package
+                else ""
+            )
+
+        version = exact_package_lock_version(
+            selected_lockfile,
+            package_name,
+            package_relative=package_relative_to_manager,
+        )
         if version:
             return version, selected_lockfile.name
 
     if kind == "peer":
-        return fallback, "package.json peer declaration; not locally resolved"
-    return fallback, f"package.json fallback; exact entry missing from {selected_lockfile.name}"
+        return (
+            fallback,
+            "package.json peer declaration; not locally resolved",
+        )
+    return (
+        fallback,
+        "package.json fallback; exact entry missing from "
+        f"{selected_lockfile.name}",
+    )
 
 
 class LiveDataClient:
@@ -2133,7 +2173,6 @@ class LiveDataClient:
         result = build_release_intelligence(self, package, meta, current, target)
         self.release_intelligence_cache[cache_key] = result
         return result
-
 
 def repository_url_from_metadata(meta: Dict[str, Any], target: str = "") -> str:
     candidates: List[Any] = []

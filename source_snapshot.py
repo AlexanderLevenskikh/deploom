@@ -31,6 +31,11 @@ from verification_observability import (
     process_resource_snapshot,
     suppress_observability,
 )
+from project_topology import (
+    ProjectTopologyError,
+    semantic_manifest_paths,
+)
+# BLOCK_Z_PROJECT_TOPOLOGY_V1
 
 # BLOCK_Y_FULL_OBSERVABILITY_V1
 
@@ -432,7 +437,16 @@ def _capture_once(
     project_path = (capture_root / project_relative).resolve()
     _validate_git_layout(capture_root)
     _submodule_preflight(capture_root)
-    _local_dependency_preflight(project_path, capture_root)
+    try:
+        topology_manifests = semantic_manifest_paths(project_path)
+    except ProjectTopologyError:
+        # Topology authority will reject unsupported/malformed layouts before
+        # verification. Source capture still checks the selected manifest here
+        # rather than weakening the existing standalone SourceSnapshot API.
+        topology_manifests = ((project_path / "package.json").resolve(),)
+    for manifest_path in topology_manifests:
+        if manifest_path.is_file():
+            _local_dependency_preflight(manifest_path.parent, capture_root)
 
     pre = build_source_tree_manifest(
         capture_root,

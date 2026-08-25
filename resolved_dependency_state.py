@@ -7,6 +7,9 @@ import os
 import subprocess
 from pathlib import Path
 from typing import Mapping, Optional
+from project_topology import ProjectTopologyError, resolve_project_topology
+
+# BLOCK_Z_PROJECT_TOPOLOGY_V1
 
 RESOLVED_STATE_SCHEMA = "resolved-state-v1"
 
@@ -70,19 +73,23 @@ def _lockfile_names(manager: str) -> tuple[str, ...]:
 
 def _find_lockfile(project_dir: Path, manager: str) -> tuple[Path, Path]:
     project_dir = project_dir.resolve()
-    git_root = _git_root_or_project(project_dir)
-    current = project_dir
-    while True:
-        for name in _lockfile_names(manager):
-            candidate = current / name
-            if candidate.is_file():
-                return git_root, candidate.resolve()
-        if current == git_root or current.parent == current:
-            break
-        current = current.parent
-    raise ResolvedDependencyStateError(
-        f"RESOLVED_STATE_LOCKFILE_MISSING: manager={manager}; project={project_dir}"
-    )
+    try:
+        topology = resolve_project_topology(
+            project_dir,
+            allow_discovery=False,
+            require_supported=True,
+        )
+    except ProjectTopologyError as exc:
+        raise ResolvedDependencyStateError(
+            f"RESOLVED_STATE_PROJECT_TOPOLOGY_UNAVAILABLE: {exc}"
+        ) from exc
+    if topology.profile.manager != str(manager).lower():
+        raise ResolvedDependencyStateError(
+            "RESOLVED_STATE_MANAGER_TOPOLOGY_MISMATCH: "
+            f"requested={manager}; topology={topology.profile.manager}"
+        )
+    identity_root = topology.git_root or topology.source_root
+    return identity_root.resolve(), topology.lockfile.resolve()
 
 
 def _state_key(

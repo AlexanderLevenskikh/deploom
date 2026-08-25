@@ -22,6 +22,12 @@ from source_snapshot import (
     proof_subject_project_dir,
     source_snapshot_fingerprint as captured_source_snapshot_fingerprint,
 )
+from project_topology import (
+    ProjectTopologyError,
+    canonical_lockfile,
+    topology_identity_payload,
+)
+# BLOCK_Z_PROJECT_TOPOLOGY_V1
 
 # BLOCK_X_SOURCE_TRUTH_V1
 PROOF_SCHEMA_VERSION = "baseline-proof-v6-source-snapshot"
@@ -366,8 +372,13 @@ def _yarn_lock_fixed_record(
     package_name: str,
     spec: str,
 ) -> Mapping[str, object]:
-    lock = project_dir / "yarn.lock"
-    if not lock.is_file():
+    try:
+        lock = canonical_lockfile(project_dir)
+    except ProjectTopologyError as exc:
+        raise SourceIdentityUnavailable(
+            f"PROJECT_TOPOLOGY_UNAVAILABLE: {exc}"
+        ) from exc
+    if lock.name != "yarn.lock" or not lock.is_file():
         return {}
     try:
         lines = lock.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -406,12 +417,13 @@ def _npm_lock_fixed_record(
     project_dir: Path,
     package_name: str,
 ) -> Mapping[str, object]:
-    lock: Path | None = None
-    for candidate in (project_dir / "npm-shrinkwrap.json", project_dir / "package-lock.json"):
-        if candidate.is_file():
-            lock = candidate
-            break
-    if lock is None:
+    try:
+        lock = canonical_lockfile(project_dir)
+    except ProjectTopologyError as exc:
+        raise SourceIdentityUnavailable(
+            f"PROJECT_TOPOLOGY_UNAVAILABLE: {exc}"
+        ) from exc
+    if lock.name not in {"npm-shrinkwrap.json", "package-lock.json"}:
         return {}
     try:
         payload = json.loads(lock.read_text(encoding="utf-8"))
@@ -926,8 +938,15 @@ def _resolver_context_payload(
     # consumes, not from a live checkout that may change mid-run.
     project_dir = proof_subject_project_dir(project_dir)
     environment_key = environment_snapshot_fingerprint(environment)
+    try:
+        topology_payload = topology_identity_payload(project_dir)
+    except ProjectTopologyError as exc:
+        raise SourceIdentityUnavailable(
+            f"PROJECT_TOPOLOGY_UNAVAILABLE: {exc}"
+        ) from exc
     return {
         "schema": PROOF_SCHEMA_VERSION,
+        "projectTopology": topology_payload,
         "projectResolverFiles": _resolver_ancestor_files(project_dir),
         "userConfigFiles": _user_config_files(environment),
         "effectiveYarnConfig": _effective_yarn_config_identity(

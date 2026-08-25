@@ -71,6 +71,15 @@ from source_snapshot import (
     SourceSnapshot,
     materialize_source_for_verification,
 )
+from package_manager_profile import (
+    PackageManagerProfileError,
+    install_args_for_profile,
+)
+from project_topology import (
+    ProjectTopologyError,
+    resolve_project_topology,
+)
+# BLOCK_Z_PROJECT_TOPOLOGY_V1
 from verification_observability import (
     attempt_scope,
     current_attempt_id,
@@ -434,17 +443,26 @@ def detect_package_manager(project_dir: Path) -> str:
     package_json = project_dir / "package.json"
     if package_json.exists():
         try:
-            package_manager = str(json.loads(package_json.read_text(encoding="utf-8")).get("packageManager") or "")
+            package_manager = str(
+                json.loads(package_json.read_text(encoding="utf-8")).get("packageManager") or ""
+            )
             if package_manager:
                 return package_manager.split("@", 1)[0].strip().lower()
         except (OSError, ValueError, TypeError):
             pass
-    if (project_dir / "yarn.lock").exists():
-        return "yarn"
-    if (project_dir / "pnpm-lock.yaml").exists():
-        return "pnpm"
-    return "npm"
 
+    try:
+        return resolve_project_topology(
+            project_dir,
+            allow_discovery=False,
+            require_supported=False,
+        ).profile.manager
+    except (ProjectTopologyError, PackageManagerProfileError):
+        if (project_dir / "yarn.lock").exists():
+            return "yarn"
+        if (project_dir / "pnpm-lock.yaml").exists():
+            return "pnpm"
+        return "npm"
 
 def install_args(
     manager: str, *, ignore_scripts: bool, frozen: bool = False
@@ -608,6 +626,311 @@ def _run_snapshot_copy(
         progress_label=progress_label,
         progress_interval_seconds=progress_interval_seconds,
     )
+
+
+def _is_windows_junction(path: Path) -> bool:
+    if os.name != "nt":
+        return False
+    checker = getattr(os.path, "isjunction", None)
+    if callable(checker):
+        try:
+            return bool(checker(path))
+        except OSError:
+            return False
+    method = getattr(path, "is_junction", None)
+    if callable(method):
+        try:
+            return bool(method())
+        except OSError:
+            return False
+    return False
+
+
+def _candidate_workspace_junctions(
+    workspace_root: Path,
+    workspace_project: Path,
+) -> Tuple[Path, ...]:
+    """Find only relocation-sensitive ancestor node_modules junctions.
+
+    This is O(project-depth + immediate node_modules entries), not a tree walk.
+    Generic prepared snapshots without junctions remain independent from
+    package-manager topology/lockfile authority.
+    """
+    if os.name != "nt":
+        return ()
+
+    workspace_root = workspace_root.resolve()
+    workspace_project = workspace_project.resolve()
+    try:
+        workspace_project.relative_to(workspace_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            "WORKSPACE_JUNCTION_PROJECT_OUTSIDE_ROOT: "
+            f"project={workspace_project}; root={workspace_root}"
+        ) from exc
+
+    node_modules_roots: list[Path] = []
+    current = workspace_project
+    while True:
+        candidate = current / "node_modules"
+        if candidate.is_dir():
+            node_modules_roots.append(candidate)
+        if current == workspace_root:
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+
+    junctions: list[Path] = []
+    for node_modules in node_modules_roots:
+        try:
+            entries = sorted(
+                node_modules.iterdir(),
+                key=lambda item: item.name.lower(),
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"WORKSPACE_NODE_MODULES_UNREADABLE: {node_modules}: {exc}"
+            ) from exc
+
+        for entry in entries:
+            if _is_windows_junction(entry):
+                junctions.append(entry)
+                continue
+
+            # Scoped workspace packages are one level below @scope.
+            if (
+                entry.name.startswith("@")
+                and entry.is_dir()
+                and not entry.is_symlink()
+                and not _is_windows_junction(entry)
+            ):
+                try:
+                    scoped = sorted(
+                        entry.iterdir(),
+                        key=lambda item: item.name.lower(),
+                    )
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"WORKSPACE_SCOPE_UNREADABLE: {entry}: {exc}"
+                    ) from exc
+                junctions.extend(
+                    item
+                    for item in scoped
+                    if _is_windows_junction(item)
+                )
+
+    unique = {
+        os.path.normcase(str(path.resolve(strict=False))): path
+        for path in junctions
+    }
+    return tuple(unique[key] for key in sorted(unique))
+
+
+def _workspace_junction_rebase_plan(
+    workspace_root: Path,
+    workspace_project: Path,
+) -> Dict[str, str]:
+    if os.name != "nt":
+        return {}
+
+    workspace_root = workspace_root.resolve()
+    workspace_project = workspace_project.resolve()
+
+    candidates = _candidate_workspace_junctions(
+        workspace_root,
+        workspace_project,
+    )
+    if not candidates:
+        # Snapshot substrate is intentionally topology-agnostic unless an
+        # absolute Windows reparse target actually needs rebasing.
+        return {}
+
+    try:
+        topology = resolve_project_topology(
+            workspace_project,
+            allow_discovery=False,
+            require_supported=True,
+        )
+    except ProjectTopologyError as exc:
+        raise RuntimeError(
+            f"WORKSPACE_JUNCTION_TOPOLOGY_UNAVAILABLE: {exc}"
+        ) from exc
+
+    expected_by_name: Dict[str, Path] = {}
+    for manifest_path in topology.workspace_member_manifests:
+        member_root = manifest_path.parent.resolve()
+        if member_root == topology.package_manager_root.resolve():
+            continue
+        try:
+            manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError(
+                f"WORKSPACE_JUNCTION_MANIFEST_UNREADABLE: "
+                f"{manifest_path}: {exc}"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise RuntimeError(
+                f"WORKSPACE_JUNCTION_MANIFEST_INVALID: {manifest_path}"
+            )
+        package_name = str(manifest.get("name") or "").strip()
+        if package_name:
+            expected_by_name[package_name] = member_root
+
+    plan: Dict[str, str] = {}
+    for link in candidates:
+        try:
+            relative_to_node_modules = None
+            cursor = link.parent
+            while True:
+                if cursor.name == "node_modules":
+                    relative_to_node_modules = link.relative_to(cursor)
+                    break
+                if cursor == workspace_root or cursor.parent == cursor:
+                    break
+                cursor = cursor.parent
+            if relative_to_node_modules is None:
+                raise RuntimeError(
+                    f"WORKSPACE_JUNCTION_NODE_MODULES_PARENT_MISSING: {link}"
+                )
+            parts = relative_to_node_modules.parts
+            package_name = (
+                f"{parts[0]}/{parts[1]}"
+                if len(parts) >= 2 and parts[0].startswith("@")
+                else parts[0]
+            )
+        except (ValueError, IndexError) as exc:
+            raise RuntimeError(
+                f"WORKSPACE_JUNCTION_NAME_UNAVAILABLE: {link}: {exc}"
+            ) from exc
+
+        expected_target = expected_by_name.get(package_name)
+        if expected_target is None:
+            raise RuntimeError(
+                "WORKSPACE_JUNCTION_UNDECLARED_REPARSE: "
+                f"{link}; package={package_name!r} is not an owned workspace member"
+            )
+
+        try:
+            observed_target = link.resolve(strict=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"WORKSPACE_JUNCTION_TARGET_UNAVAILABLE: {link}: {exc}"
+            ) from exc
+
+        try:
+            target_matches = observed_target.samefile(expected_target)
+        except OSError:
+            target_matches = observed_target == expected_target
+        if not target_matches:
+            raise RuntimeError(
+                "WORKSPACE_JUNCTION_TARGET_MISMATCH: "
+                f"{link} -> {observed_target}; expected={expected_target}"
+            )
+
+        try:
+            link_relative = link.relative_to(workspace_root).as_posix()
+            target_relative = expected_target.relative_to(
+                workspace_root
+            ).as_posix()
+        except ValueError as exc:
+            raise RuntimeError(
+                "WORKSPACE_JUNCTION_ESCAPE: "
+                f"link={link}; target={expected_target}; root={workspace_root}"
+            ) from exc
+
+        plan[link_relative] = target_relative
+
+    return dict(sorted(plan.items()))
+
+
+def _remove_reparse_or_tree(path: Path) -> None:
+    if not os.path.lexists(path):
+        return
+    if _is_windows_junction(path):
+        os.rmdir(path)
+        return
+    if path.is_symlink():
+        path.unlink()
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+        return
+    path.unlink()
+
+
+def _create_windows_junction(link: Path, target: Path) -> None:
+    comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe")
+    if not comspec:
+        raise RuntimeError(
+            "WORKSPACE_JUNCTION_CREATE_FAILED: cmd.exe unavailable"
+        )
+    link.parent.mkdir(parents=True, exist_ok=True)
+    command = subprocess.list2cmdline(
+        ["mklink", "/J", str(link), str(target)]
+    )
+    result = subprocess.run(
+        [comspec, "/d", "/s", "/c", command],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0 or not _is_windows_junction(link):
+        raise RuntimeError(
+            "WORKSPACE_JUNCTION_CREATE_FAILED: "
+            f"{link} -> {target}; exit={result.returncode}; "
+            f"{(result.stdout or '')[-1000:]}"
+        )
+
+
+def _rebase_workspace_junctions(
+    workspace_root: Path,
+    plan: Mapping[str, str],
+) -> None:
+    if os.name != "nt" or not plan:
+        return
+
+    workspace_root = workspace_root.resolve()
+    for link_relative, target_relative in sorted(plan.items()):
+        link = workspace_root.joinpath(
+            *[part for part in link_relative.split("/") if part]
+        )
+        target = workspace_root.joinpath(
+            *[part for part in target_relative.split("/") if part]
+        )
+        try:
+            link.relative_to(workspace_root)
+            target.relative_to(workspace_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                "WORKSPACE_JUNCTION_REBASE_ESCAPE: "
+                f"link={link}; target={target}"
+            ) from exc
+        if not target.is_dir():
+            raise RuntimeError(
+                "WORKSPACE_JUNCTION_REBASE_TARGET_MISSING: "
+                f"{target}"
+            )
+
+        _remove_reparse_or_tree(link)
+        _create_windows_junction(link, target)
+
+        try:
+            rebound = link.resolve(strict=True)
+            matches = rebound.samefile(target)
+        except OSError:
+            matches = False
+        if not matches:
+            raise RuntimeError(
+                "WORKSPACE_JUNCTION_REBASE_VERIFY_FAILED: "
+                f"{link} -> {target}"
+            )
 
 
 def _copy_tree_snapshot(
@@ -807,6 +1130,10 @@ def _publish_prepared_workspace_snapshot(
     stage_workspace = stage / "workspace"
     relative = workspace_project.resolve().relative_to(workspace_root.resolve())
     storage_mode = "copied-sealed-workspace"
+    junction_rebases = _workspace_junction_rebase_plan(
+        workspace_root,
+        workspace_project,
+    )
     try:
         # On the normal Windows path both directories live under the same temp
         # volume. Renaming the already-prepared tree publishes the immutable
@@ -815,6 +1142,10 @@ def _publish_prepared_workspace_snapshot(
         if os.name == "nt":
             try:
                 os.replace(workspace_root, stage_workspace)
+                _rebase_workspace_junctions(
+                    stage_workspace,
+                    junction_rebases,
+                )
                 moved = True
                 storage_mode = "moved-sealed-workspace"
                 _emit_progress(
@@ -831,6 +1162,10 @@ def _publish_prepared_workspace_snapshot(
                 progress_label=progress_label,
                 timeout_seconds=timeout_seconds,
                 progress_interval_seconds=progress_interval_seconds,
+            )
+            _rebase_workspace_junctions(
+                stage_workspace,
+                junction_rebases,
             )
 
         dependency_integrity: Mapping[str, str] = {}
@@ -921,6 +1256,10 @@ def _materialize_prepared_workspace_snapshot(
         progress=progress,
     ) if os.name == "nt" else None
     try:
+        junction_rebases = _workspace_junction_rebase_plan(
+            snapshot.workspace_root,
+            snapshot.workspace_root / snapshot.project_relative,
+        )
         _copy_tree_snapshot(
             snapshot.workspace_root,
             target,
@@ -928,6 +1267,10 @@ def _materialize_prepared_workspace_snapshot(
             progress_label=progress_label,
             timeout_seconds=timeout_seconds,
             progress_interval_seconds=progress_interval_seconds,
+        )
+        _rebase_workspace_junctions(
+            target,
+            junction_rebases,
         )
     finally:
         if copy_lease is not None:
@@ -991,23 +1334,34 @@ def _materialize_workspace(
     )
 
 
-def _apply_assignment(
+def _validate_assignment_materialization(
     project_dir: Path,
     assignment: Mapping[str, str],
     *,
     remove_packages: Iterable[str] = (),
-) -> List[str]:
+) -> Dict[str, object]:
     package_json = project_dir / "package.json"
     manifest = json.loads(package_json.read_text(encoding="utf-8"))
-    changed: List[str] = []
-    sections = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
+    if not isinstance(manifest, dict):
+        raise ValueError(
+            f"ASSIGNMENT_MANIFEST_INVALID: {package_json}: root must be an object"
+        )
+
+    sections = (
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    )
     removals = {str(name) for name in remove_packages}
+
     for name in sorted(set(assignment) | removals):
         declarations: List[Tuple[str, str]] = []
         for section in sections:
             deps = manifest.get(section)
             if isinstance(deps, dict) and name in deps:
                 declarations.append((section, str(deps[name])))
+
         fixed_declarations = [
             (section, spec)
             for section, spec in declarations
@@ -1018,8 +1372,11 @@ def _apply_assignment(
             for section, spec in declarations
             if not is_fixed_manifest_spec(spec)
         ]
+
         if fixed_declarations:
-            detail = ", ".join(f"{section}={spec}" for section, spec in declarations)
+            detail = ", ".join(
+                f"{section}={spec}" for section, spec in declarations
+            )
             if managed_declarations:
                 raise AssignmentMaterializationError(
                     f"ASSIGNMENT_HETEROGENEOUS_SOURCE_CONFLICT: {name}: "
@@ -1034,13 +1391,40 @@ def _apply_assignment(
                     f"ASSIGNMENT_TARGETS_FIXED_INPUT: {name}: fixed declaration is immutable; {detail}"
                 )
 
+        if name in assignment and name not in removals and not declarations:
+            raise AssignmentMaterializationError(
+                f"ASSIGNMENT_PACKAGE_NOT_DECLARED: {name} is absent from all direct dependency sections"
+            )
+
+    return manifest
+
+
+def _apply_assignment(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    *,
+    remove_packages: Iterable[str] = (),
+) -> List[str]:
+    manifest = _validate_assignment_materialization(
+        project_dir,
+        assignment,
+        remove_packages=remove_packages,
+    )
+    changed: List[str] = []
+    sections = (
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    )
+    removals = {str(name) for name in remove_packages}
+
+    for name in sorted(set(assignment) | removals):
         package_changed = False
-        package_seen = False
         for section in sections:
             deps = manifest.get(section)
             if not isinstance(deps, dict) or name not in deps:
                 continue
-            package_seen = True
             if name in removals:
                 del deps[name]
                 package_changed = True
@@ -1049,16 +1433,14 @@ def _apply_assignment(
             if deps[name] != version:
                 deps[name] = version
                 package_changed = True
-        if name in assignment and name not in removals and not package_seen:
-            raise AssignmentMaterializationError(
-                f"ASSIGNMENT_PACKAGE_NOT_DECLARED: {name} is absent from all direct dependency sections"
-            )
         if package_changed:
             changed.append(name)
-    package_json.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    (project_dir / "package.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     return changed
-
-
 
 OBSERVED_REMOVED = "<removed>"
 OBSERVED_PEER_ONLY = "<peer-only>"
@@ -1192,6 +1574,31 @@ def verify_assignment(
     telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
     assignment_hash = assignment_fingerprint(assignment)
 
+    try:
+        _validate_assignment_materialization(
+            project_dir,
+            assignment,
+            remove_packages=remove_packages,
+        )
+    except AssignmentMaterializationError as exc:
+        return BaselineVerifyResult(False, "unknown", str(exc))
+
+    # Cheap capability/topology preflight before SourceSnapshot copies any large
+    # tree. Authority is recomputed again from the sealed/materialized subject.
+    try:
+        resolve_project_topology(
+            project_dir,
+            allow_discovery=False,
+            require_supported=True,
+        )
+    except ProjectTopologyError as exc:
+        return BaselineVerifyResult(
+            False,
+            "infrastructure",
+            f"PROJECT_TOPOLOGY_UNSUPPORTED: {exc}",
+            workspace=str(project_dir),
+        )
+
     def event(name: str, **fields: object) -> None:
         payload = {
             "projectPath": str(project_dir),
@@ -1243,7 +1650,17 @@ def verify_assignment(
                 progress_label="sealed source snapshot materialization",
                 progress_interval_seconds=config.progress_interval_seconds,
             )
-            changed = _apply_assignment(workspace_project, assignment, remove_packages=remove_packages)
+            changed = _apply_assignment(
+                workspace_project,
+                assignment,
+                remove_packages=remove_packages,
+            )
+            workspace_topology = resolve_project_topology(
+                workspace_project,
+                allow_discovery=False,
+                require_supported=True,
+            )
+            package_manager_project = workspace_topology.package_manager_root
             event(
                 "verify.workspace.finish",
                 durationMs=int((time.monotonic() - workspace_started) * 1000),
@@ -1252,6 +1669,13 @@ def verify_assignment(
                 sourceMaterializationMethod=source_materialization_method,
                 sourceFiles=source_snapshot.file_count,
                 sourceBytes=source_snapshot.byte_count,
+            )
+        except ProjectTopologyError as exc:
+            return BaselineVerifyResult(
+                False,
+                "infrastructure",
+                f"PROJECT_TOPOLOGY_UNSUPPORTED: {exc}",
+                workspace=str(workspace_root),
             )
         except SourceCaptureError as exc:
             return BaselineVerifyResult(
@@ -1265,7 +1689,18 @@ def verify_assignment(
         except Exception as exc:  # filesystem/git setup is infrastructure, never a nogood
             return BaselineVerifyResult(False, "infrastructure", f"workspace preparation failed: {exc}")
 
-        manager = detect_package_manager(workspace_project)
+        manager = workspace_topology.profile.manager
+        event(
+            "project.topology",
+            topologyKey=workspace_topology.key,
+            manager=manager,
+            managerFamily=workspace_topology.profile.family,
+            nodeLinker=workspace_topology.profile.node_linker,
+            packageRelativeToSource=workspace_topology.package_relative_to_source.as_posix() or ".",
+            packageRelativeToManager=workspace_topology.package_relative_to_manager.as_posix() or ".",
+            workspacePackage=workspace_topology.is_workspace_package,
+            canonicalLockfile=workspace_topology.lockfile.name,
+        )
         executable = resolve_executable(manager)
         if not executable:
             return BaselineVerifyResult(
@@ -1380,7 +1815,11 @@ def verify_assignment(
                     resolvedStateKey=proof_identity.resolved_state_key,
                 )
 
-        install = install_args(manager, ignore_scripts=True, frozen=False)
+        install = install_args_for_profile(
+            workspace_topology.profile,
+            ignore_scripts=True,
+            frozen=False,
+        )
         argv, _ = _command_prefix(executable, install)
         install_env = {
             "CI": "1",
@@ -1476,7 +1915,7 @@ def verify_assignment(
             try:
                 result = _run(
                     argv,
-                    workspace_project,
+                    package_manager_project,
                     timeout_seconds=phase_timeout(),
                     env=install_env,
                     base_env=base_env,
@@ -1656,7 +2095,11 @@ def verify_assignment(
                 )
                 observed_versions = dict(snapshot.observed_resolved_versions)
             else:
-                full_install = install_args(manager, ignore_scripts=False, frozen=True)
+                full_install = install_args_for_profile(
+                    workspace_topology.profile,
+                    ignore_scripts=False,
+                    frozen=True,
+                )
                 full_argv, _ = _command_prefix(executable, full_install)
                 lifecycle_env = {
                     "CI": "1",
@@ -1669,7 +2112,7 @@ def verify_assignment(
                 event("verify.preparation.start", command=" ".join(full_argv))
                 try:
                     full_result = _run(
-                        full_argv, workspace_project,
+                        full_argv, package_manager_project,
                         timeout_seconds=phase_timeout(), env=lifecycle_env,
                         base_env=base_env, progress=phase_progress("lifecycle-install"),
                         progress_label="package-manager lifecycle install",
@@ -2311,6 +2754,28 @@ def verify_assignment(
 ) -> BaselineVerifyResult:
     """Cache-aware proof entry point with ResolvedState-bound project proofs."""
     project_dir = project_dir.resolve()
+    try:
+        _validate_assignment_materialization(
+            project_dir,
+            assignment,
+            remove_packages=remove_packages,
+        )
+    except AssignmentMaterializationError as exc:
+        return BaselineVerifyResult(False, "unknown", str(exc))
+
+    try:
+        live_topology = resolve_project_topology(
+            project_dir,
+            allow_discovery=False,
+            require_supported=True,
+        )
+    except ProjectTopologyError as exc:
+        return BaselineVerifyResult(
+            False,
+            "infrastructure",
+            f"PROJECT_TOPOLOGY_UNSUPPORTED: {exc}",
+            workspace=str(project_dir),
+        )
     proof_store = VerificationProofStore(
         Path(config.proof_cache_dir) if config.proof_cache_dir else None
     )
@@ -2325,7 +2790,7 @@ def verify_assignment(
             progress_label=progress_label,
         )
 
-    manager = detect_package_manager(project_dir)
+    manager = live_topology.profile.manager
     executable = resolve_executable(manager)
     if not executable:
         return _verify_assignment_uncached(

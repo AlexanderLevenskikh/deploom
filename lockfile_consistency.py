@@ -751,3 +751,470 @@ def exact_yarn_lock_version(lockfile: Path, package_name: str, spec: str) -> Opt
         if selector in mapping:
             return mapping[selector]
     return None
+
+# BLOCK_Z_PROJECT_TOPOLOGY_V1
+# Topology-aware compatibility layer. Root-project behavior delegates to the
+# released implementation; workspace packages use their owning PM root/lockfile.
+from project_topology import ProjectTopologyError, resolve_project_topology
+
+_select_lockfile_pre_block_z = select_lockfile
+_ensure_lockfile_consistency_pre_block_z = ensure_lockfile_consistency
+_exact_package_lock_version_pre_block_z = exact_package_lock_version
+_lockfile_state_as_dict_pre_block_z = LockfileState.as_dict
+
+
+def _block_z_topology(project: Path, *, require_supported: bool):
+    try:
+        return resolve_project_topology(
+            project,
+            allow_discovery=False,
+            require_supported=require_supported,
+        )
+    except ProjectTopologyError as exc:
+        compatibility_code = exc.code
+
+        if exc.code == "PROJECT_CANONICAL_LOCKFILE_MISSING":
+            compatibility_code = "LOCKFILE_MISSING"
+
+        elif exc.code == "PROJECT_LOCKFILE_AMBIGUOUS":
+            # Preserve the released lockfile-consistency taxonomy. When an
+            # explicit packageManager declaration selects one manager family
+            # and that family's canonical lockfile exists, any lockfile from a
+            # different family is an incidental/conflicting artifact rather
+            # than an unresolved manager choice.
+            try:
+                manifest = read_json(project / "package.json")
+            except Exception:
+                manifest = {}
+
+            declared = str(manifest.get("packageManager") or "").strip()
+            declared_manager = (
+                declared.split("@", 1)[0].strip().lower()
+                if declared
+                else ""
+            )
+            found = present_lockfiles(project)
+            declared_lock_present = (
+                (declared_manager == "yarn" and "yarn" in found)
+                or (
+                    declared_manager == "npm"
+                    and (
+                        "npm" in found
+                        or "npm-shrinkwrap" in found
+                    )
+                )
+                or (
+                    declared_manager == "pnpm"
+                    and "pnpm" in found
+                )
+            )
+            other_family_present = any(
+                (
+                    "npm"
+                    if key in {"npm", "npm-shrinkwrap"}
+                    else key
+                )
+                != declared_manager
+                for key in found
+            )
+
+            compatibility_code = (
+                "LOCKFILE_CONFLICT"
+                if (
+                    declared_manager in {"npm", "yarn", "pnpm"}
+                    and declared_lock_present
+                    and other_family_present
+                )
+                else "LOCKFILE_AMBIGUOUS"
+            )
+
+        raise LockfileConsistencyError(
+            compatibility_code,
+            exc.detail,
+        ) from exc
+
+
+def select_lockfile(
+    project: Path,
+    package_json: Dict[str, Any],
+    *,
+    allow_extra_lockfiles: bool = False,
+) -> Tuple[str, Path, str, List[Path]]:
+    topology = _block_z_topology(project, require_supported=False)
+    if topology.package_root == topology.package_manager_root:
+        return _select_lockfile_pre_block_z(
+            project,
+            package_json,
+            allow_extra_lockfiles=allow_extra_lockfiles,
+        )
+
+    root_manifest = read_json(topology.package_manager_root / "package.json")
+    declared = str(root_manifest.get("packageManager") or "")
+    selected = topology.lockfile
+    found = present_lockfiles(topology.package_manager_root)
+    extras = [
+        path
+        for path in found.values()
+        if path.resolve() != selected.resolve()
+    ]
+    if extras and not allow_extra_lockfiles:
+        names = ", ".join(path.name for path in extras)
+        raise LockfileConsistencyError(
+            "LOCKFILE_CONFLICT",
+            f"workspace package {project} uses {selected} but unrelated "
+            f"package-manager lockfile(s) also exist at "
+            f"{topology.package_manager_root}: {names}",
+        )
+    return topology.profile.manager, selected, declared, extras
+
+
+def _block_z_package_lock_workspace_root(
+    data: Dict[str, Any],
+    package_relative: str,
+) -> Dict[str, Any]:
+    packages = data.get("packages")
+    if not isinstance(packages, dict):
+        return {}
+    key = package_relative.replace("\\", "/").strip("/")
+    entry = packages.get(key)
+    return dict(entry) if isinstance(entry, dict) else {}
+
+
+def _block_z_package_lock_entry_version(
+    data: Dict[str, Any],
+    key: str,
+) -> str:
+    packages = data.get("packages")
+    if not isinstance(packages, dict):
+        return ""
+    entry = packages.get(key)
+    if not isinstance(entry, dict):
+        return ""
+    version = str(entry.get("version") or "").strip()
+    if version:
+        return version
+    if entry.get("link") and entry.get("resolved"):
+        linked = str(entry["resolved"]).replace("\\", "/").strip("/")
+        linked_entry = packages.get(linked)
+        if isinstance(linked_entry, dict):
+            return str(linked_entry.get("version") or "").strip()
+    return ""
+
+
+def _block_z_npm_workspace_version(
+    data: Dict[str, Any],
+    package_name: str,
+    package_relative: str,
+) -> str:
+    relative = package_relative.replace("\\", "/").strip("/")
+    candidates = []
+    if relative:
+        candidates.append(f"{relative}/node_modules/{package_name}")
+    candidates.append(f"node_modules/{package_name}")
+    for key in candidates:
+        value = _block_z_package_lock_entry_version(data, key)
+        if value:
+            return value
+    return ""
+
+
+def _block_z_validate_package_lock(
+    project: Path,
+    package_json: Dict[str, Any],
+    lockfile: Path,
+    *,
+    package_relative: str,
+) -> List[LockfileIssue]:
+    try:
+        data = json.loads(lockfile.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [LockfileIssue("PACKAGE_LOCK_INVALID", detail=str(exc))]
+    if not isinstance(data, dict):
+        return [LockfileIssue("PACKAGE_LOCK_INVALID", detail="expected JSON object")]
+
+    root = _block_z_package_lock_workspace_root(data, package_relative)
+    if not root:
+        return [LockfileIssue(
+            "PACKAGE_LOCK_WORKSPACE_RECORD_MISSING",
+            detail=(
+                f"{lockfile} has no packages[{package_relative!r}] record for "
+                f"workspace package {project}"
+            ),
+        )]
+
+    issues: List[LockfileIssue] = []
+    for section, name, spec in direct_declarations(package_json):
+        if section == "peerDependencies":
+            installed_elsewhere = any(
+                name in (package_json.get(candidate) or {})
+                for candidate in INSTALL_SECTIONS
+            )
+            if not installed_elsewhere:
+                continue
+
+        root_values = (
+            root.get(section)
+            if isinstance(root.get(section), dict)
+            else {}
+        )
+        if str(root_values.get(name, "")) != spec:
+            issues.append(LockfileIssue(
+                "PACKAGE_LOCK_SPEC_MISMATCH",
+                package=name,
+                section=section,
+                requested=spec,
+                resolved=str(root_values.get(name, "")),
+                detail=(
+                    f"workspace record packages[{package_relative!r}] differs "
+                    "from target package.json"
+                ),
+            ))
+
+        resolved = _block_z_npm_workspace_version(
+            data,
+            name,
+            package_relative,
+        )
+        if not resolved:
+            issues.append(LockfileIssue(
+                "PACKAGE_LOCK_ENTRY_MISSING",
+                package=name,
+                section=section,
+                requested=spec,
+                detail="workspace dependency has no effective package-lock entry",
+            ))
+        elif not is_non_registry_spec(spec) and not semver_satisfies(
+            resolved, spec
+        ):
+            issues.append(LockfileIssue(
+                "PACKAGE_LOCK_RESOLVED_OUTSIDE_SPEC",
+                package=name,
+                section=section,
+                requested=spec,
+                resolved=resolved,
+            ))
+    return issues
+
+
+def _block_z_workspace_lock_issues(
+    topology,
+    package_json: Dict[str, Any],
+) -> List[LockfileIssue]:
+    manager = topology.profile.manager
+    if manager == "yarn":
+        return validate_yarn_lock(
+            topology.package_root,
+            package_json,
+            topology.lockfile,
+        )
+    if manager == "npm":
+        return _block_z_validate_package_lock(
+            topology.package_root,
+            package_json,
+            topology.lockfile,
+            package_relative=topology.package_relative_to_manager.as_posix(),
+        )
+    return [LockfileIssue(
+        "LOCKFILE_MANAGER_UNSUPPORTED",
+        detail=topology.profile.family,
+    )]
+
+
+def ensure_lockfile_consistency(
+    project: Path,
+    registry: str,
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    mode: Optional[str] = None,
+    allow_update: bool = True,
+    runner: Optional[Callable[..., subprocess.CompletedProcess[str]]] = None,
+) -> LockfileState:
+    topology = _block_z_topology(project, require_supported=True)
+    cfg = dict(config or {})
+
+    if topology.package_root == topology.package_manager_root:
+        state = _ensure_lockfile_consistency_pre_block_z(
+            project,
+            registry,
+            cfg,
+            mode=mode,
+            allow_update=allow_update,
+            runner=runner,
+        )
+        state.topology = topology  # type: ignore[attr-defined]
+        return state
+
+    effective_mode = str(
+        mode or cfg.get("mode") or "validate"
+    ).strip().lower()
+    if effective_mode not in {"validate", "update", "off"}:
+        raise LockfileConsistencyError(
+            "LOCKFILE_MODE_INVALID", effective_mode
+        )
+
+    package_json = read_json(topology.package_root / "package.json")
+    root_manifest = read_json(
+        topology.package_manager_root / "package.json"
+    )
+    found = present_lockfiles(topology.package_manager_root)
+    extras = [
+        path
+        for path in found.values()
+        if path.resolve() != topology.lockfile.resolve()
+    ]
+    if extras and not bool(cfg.get("allowExtraLockfiles", False)):
+        names = ", ".join(path.name for path in extras)
+        raise LockfileConsistencyError(
+            "LOCKFILE_CONFLICT",
+            f"canonical workspace lockfile={topology.lockfile.name}; "
+            f"unrelated lockfile(s)={names}",
+        )
+
+    state = LockfileState(
+        topology.profile.manager,
+        topology.lockfile,
+        str(root_manifest.get("packageManager") or ""),
+        extras,
+        [],
+        effective_mode,
+    )
+    state.topology = topology  # type: ignore[attr-defined]
+    if topology.profile.manager == "yarn":
+        policy = yarn_deduplication_policy(cfg)
+        state.deduplication_status = (
+            "disabled" if policy == "off" else "not-run"
+        )
+
+    if effective_mode == "off":
+        return state
+
+    enforce_registry_artifacts = bool(
+        cfg.get("enforceRegistryArtifacts", True)
+    )
+    state.issues = _block_z_workspace_lock_issues(
+        topology, package_json
+    )
+    registry_url_issues = (
+        validate_registry_artifact_urls(
+            topology.profile.manager,
+            topology.lockfile,
+            registry,
+        )
+        if enforce_registry_artifacts
+        else []
+    )
+    state.issues.extend(registry_url_issues)
+
+    if not state.issues:
+        return state
+    if effective_mode == "validate":
+        if registry_url_issues:
+            details = " | ".join(
+                issue.render() for issue in registry_url_issues[:12]
+            )
+            raise LockfileConsistencyError(
+                "FOREIGN_REGISTRY_URL", details
+            )
+        return state
+    if not allow_update:
+        raise LockfileConsistencyError(
+            "LOCKFILE_UPDATE_NOT_ALLOWED_ON_SOURCE_CHECKOUT",
+            "the verified workspace lockfile is stale; update/commit it "
+            "separately before authoritative Baseline",
+        )
+
+    update_command, dedupe_command, validation_command = update_lockfile(
+        topology.package_manager_root,
+        root_manifest,
+        topology.profile.manager,
+        topology.lockfile,
+        registry,
+        cfg,
+        runner=runner,
+    )
+    package_json = read_json(topology.package_root / "package.json")
+    state.issues = _block_z_workspace_lock_issues(
+        topology, package_json
+    )
+    if enforce_registry_artifacts:
+        state.issues.extend(validate_registry_artifact_urls(
+            topology.profile.manager,
+            topology.lockfile,
+            registry,
+        ))
+
+    state.updated = True
+    state.deduplicated = (
+        topology.profile.manager == "yarn"
+        and bool(dedupe_command)
+    )
+    if topology.profile.manager == "yarn":
+        policy = yarn_deduplication_policy(cfg)
+        if dedupe_command:
+            state.deduplication_status = "completed"
+        elif policy == "off":
+            state.deduplication_status = "disabled"
+        else:
+            state.deduplication_status = "not-available"
+            state.warnings.append(
+                "Yarn deduplication command was not found; workspace "
+                "lockfile update continued without deduplication"
+            )
+    state.update_command = update_command
+    state.deduplicate_command = dedupe_command
+    state.validation_command = validation_command
+
+    if state.issues:
+        details = " | ".join(
+            issue.render() for issue in state.issues[:12]
+        )
+        if any(
+            issue.code == "FOREIGN_REGISTRY_URL"
+            for issue in state.issues
+        ):
+            raise LockfileConsistencyError(
+                "FOREIGN_REGISTRY_URL", details
+            )
+        raise LockfileConsistencyError(
+            "LOCKFILE_STILL_STALE_AFTER_UPDATE", details
+        )
+    return state
+
+
+def exact_package_lock_version(
+    lockfile: Path,
+    package_name: str,
+    package_relative: str = "",
+) -> Optional[str]:
+    if not package_relative:
+        return _exact_package_lock_version_pre_block_z(
+            lockfile, package_name
+        )
+    try:
+        data = json.loads(lockfile.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = _block_z_npm_workspace_version(
+        data,
+        package_name,
+        package_relative,
+    )
+    return value or None
+
+
+def _block_z_lockfile_state_as_dict(
+    self: LockfileState,
+) -> Dict[str, Any]:
+    payload = _lockfile_state_as_dict_pre_block_z(self)
+    topology = getattr(self, "topology", None)
+    if topology is not None:
+        payload["projectTopology"] = topology.as_dict()
+        payload["packageJsonSha256"] = sha256_file(
+            topology.package_root / "package.json"
+        )
+    return payload
+
+
+LockfileState.as_dict = _block_z_lockfile_state_as_dict
