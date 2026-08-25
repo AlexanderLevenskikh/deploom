@@ -55,7 +55,9 @@ class BlockUTimeToResultTests(unittest.TestCase):
             {"DEPLOOM_NTFS_FASTPATH_MIN_COMMANDS": "not-an-int"},
             clear=False,
         ):
-            self.assertEqual(2, verifier._ntfs_fastpath_min_commands())
+            # Ω removed the O(files) dependency integrity seal. Invalid
+            # overrides therefore fall back to the current one-command default.
+            self.assertEqual(1, verifier._ntfs_fastpath_min_commands())
         with mock.patch.dict(
             os.environ,
             {"DEPLOOM_NTFS_FASTPATH_MIN_COMMANDS": "999"},

@@ -310,6 +310,67 @@ def _dependency_roots(prepared_root: Path) -> list[Path]:
     return [unique[key] for key in sorted(unique)]
 
 
+def guarded_lower_enabled() -> bool:
+    return str(
+        os.environ.get("DEPLOOM_DISABLE_GUARDED_LOWER") or ""
+    ).strip().lower() not in {"1", "true", "yes", "on"}
+
+
+def dependency_root_manifest(
+    prepared_root: Path,
+    *,
+    progress: Optional[ProgressCallback] = None,
+) -> tuple[str, ...]:
+    """Return only relative node_modules roots; never hash dependency payloads."""
+    prepared_root = prepared_root.resolve()
+    operation_id = new_observability_id("dependency-roots")
+    started = time.monotonic()
+    emit_observability_event(
+        "filesystem.dependency-roots.start",
+        operationId=operation_id,
+        schema="verification-substrate-v2",
+    )
+    roots = _dependency_roots(prepared_root)
+    relative: list[str] = []
+    for root in roots:
+        try:
+            item = root.relative_to(prepared_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"DEPENDENCY_ROOT_ESCAPE: {root} outside {prepared_root}"
+            ) from exc
+        relative.append(item.as_posix())
+    result = tuple(sorted(set(relative)))
+    if progress:
+        progress(
+            "Ω dependency lower discovery ready: "
+            f"roots={len(result)}, integrityHashPass=skipped"
+        )
+    emit_observability_event(
+        "filesystem.dependency-roots.finish",
+        operationId=operation_id,
+        schema="verification-substrate-v2",
+        outcome="passed",
+        rootCount=len(result),
+        integrityHashPass=False,
+        durationMs=max(0, int((time.monotonic() - started) * 1000)),
+    )
+    return result
+
+
+def _overlay_copy_workers() -> int:
+    raw = str(os.environ.get("DEPLOOM_OMEGA_OVERLAY_WORKERS") or "").strip()
+    if raw:
+        try:
+            return max(1, min(64, int(raw)))
+        except ValueError:
+            pass
+    logical = max(1, int(os.cpu_count() or 4))
+    # Overlay excludes node_modules; huge /MT values mostly amplify AV/metadata
+    # pressure. Keep enough concurrency to hide latency without 128-thread I/O.
+    return max(8, min(32, logical))
+
+
 def _integrity_key(path: Path, prepared_root: Path) -> str:
     relative = path.relative_to(prepared_root).as_posix()
     return os.path.normcase(relative.replace("/", os.sep)).replace("\\", "/")
@@ -372,6 +433,8 @@ def _seal_dependency_candidate(
         ) from exc
 
 
+# BLOCK_OMEGA_VERIFICATION_SUBSTRATE_V2
+# Legacy diagnostic helper only; production guarded lower does not call it.
 def build_dependency_integrity_manifest(
     prepared_root: Path,
     *,
@@ -474,14 +537,29 @@ def _run_overlay_robocopy(
     if not robocopy:
         return False
     argv = [
-        robocopy, str(source), str(target),
-        "/E", "/COPY:DAT", "/DCOPY:DAT", "/R:1", "/W:1",
-        "/NFL", "/NDL", "/NJH", "/NJS", "/NP", "/SL", "/MT:32",
+        robocopy,
+        str(source),
+        str(target),
+        "/E",
+        "/COPY:DAT",
+        "/DCOPY:DAT",
+        "/R:1",
+        "/W:1",
+        "/NFL",
+        "/NDL",
+        "/NJH",
+        "/NJS",
+        "/NP",
+        "/SL",
+        f"/MT:{_overlay_copy_workers()}",
     ]
     if excluded:
         argv.extend(["/XD", *[str(path) for path in excluded]])
     if progress:
-        progress("NTFS fast clone: overlaying prepared source/config without dependency bytes")
+        progress(
+            "Ω guarded lower: copying sealed source/config/.git upper "
+            "without dependency payload bytes"
+        )
     try:
         result = subprocess.run(
             argv,
@@ -858,14 +936,19 @@ def _classify_integrity_notification(
 
 
 class _DependencyTreeGuard:
+    """Guard a shared dependency lower tree without an O(files) pre-hash.
+
+    The proof rule is stricter and cheaper than the legacy integrity-manifest
+    path: while the exclusive snapshot lease is held, any non-ephemeral
+    filesystem notification in a shared dependency root rejects the fast path.
+    Watcher errors/overflow also reject it. Therefore a byte-for-byte baseline
+    hash of every node_modules file is not needed to accept a *quiet* command.
+    """
+
     def __init__(
         self,
-        prepared_root: Path,
         roots: list[Path],
-        integrity_manifest: Mapping[str, str],
     ) -> None:
-        self.prepared_root = prepared_root.resolve()
-        self.integrity_manifest = dict(integrity_manifest)
         self.watchers = [_DirectoryWatcher(root) for root in roots]
 
     def start(self) -> bool:
@@ -881,29 +964,17 @@ class _DependencyTreeGuard:
     def stop(self) -> GuardResult:
         mutations: list[str] = []
         errors: list[str] = []
-        notification_only: list[str] = []
         for watcher in self.watchers:
             watcher.stop()
             errors.extend(watcher.errors)
-            for action, event in watcher.events:
+            for _action, event in watcher.events:
                 if _is_ephemeral_change(event):
                     continue
-                detail = f"{watcher.root}:{event}"
-                classification = _classify_integrity_notification(
-                    self.prepared_root,
-                    watcher.root,
-                    action,
-                    event,
-                    self.integrity_manifest,
-                )
-                if classification == "mutation":
-                    mutations.append(detail)
-                elif classification == "notification-only":
-                    notification_only.append(detail)
+                mutations.append(f"{watcher.root}:{event}")
         return GuardResult(
             mutations=tuple(sorted(set(mutations))),
             errors=tuple(errors),
-            notification_only=tuple(sorted(set(notification_only))),
+            notification_only=(),
         )
 
 
@@ -913,52 +984,91 @@ def try_materialize_guarded_clone(
     prepared_workspace_root: Path,
     project_relative: Path,
     target: Path,
+    dependency_roots: Optional[tuple[str, ...]] = None,
     dependency_integrity: Optional[Mapping[str, str]] = None,
     progress: Optional[ProgressCallback] = None,
 ) -> Optional[Path]:
-    if os.name != "nt":
+    """Materialize a fresh Windows upper over an exclusively guarded lower.
+
+    `dependency_integrity` is accepted only for compatibility with pre-Ω
+    callers. It is deliberately not consulted: Ω accepts a shared lower only
+    when its watcher observed no meaningful event at all.
+    """
+    del dependency_integrity
+
+    if os.name != "nt" or not guarded_lower_enabled():
         return None
-    source_project = source_project.resolve()
-    source_root = _git_root(source_project)
-    if source_root is None:
-        return None
+
     prepared_workspace_root = prepared_workspace_root.resolve()
     target = target.resolve()
-    dependency_roots = _dependency_roots(prepared_workspace_root)
-    if not dependency_roots or not dependency_integrity:
+
+    if dependency_roots:
+        resolved_roots: list[Path] = []
+        for raw in dependency_roots:
+            relative = Path(str(raw))
+            if relative.is_absolute() or ".." in relative.parts:
+                return None
+            candidate = (prepared_workspace_root / relative).resolve()
+            try:
+                candidate.relative_to(prepared_workspace_root)
+            except ValueError:
+                return None
+            if not candidate.is_dir() or candidate.name != "node_modules":
+                return None
+            resolved_roots.append(candidate)
+        dependency_root_paths = sorted(
+            {os.path.normcase(str(item)): item for item in resolved_roots}.values(),
+            key=lambda item: str(item).lower(),
+        )
+    else:
+        dependency_root_paths = _dependency_roots(prepared_workspace_root)
+
+    if not dependency_root_paths:
         return None
+
+    operation_id = new_observability_id("guarded-lower")
+    started = time.monotonic()
+    emit_observability_event(
+        "filesystem.guarded-lower.start",
+        operationId=operation_id,
+        schema="verification-substrate-v2",
+        dependencyRoots=len(dependency_root_paths),
+        sourceProject=str(source_project.resolve()),
+    )
 
     lease = _try_acquire_snapshot_lease(
         prepared_workspace_root,
         progress=progress,
     )
     if lease is None:
+        emit_observability_event(
+            "filesystem.guarded-lower.finish",
+            operationId=operation_id,
+            schema="verification-substrate-v2",
+            outcome="fallback",
+            reason="snapshot-lease-unavailable",
+            durationMs=max(0, int((time.monotonic() - started) * 1000)),
+        )
         return None
     lease_transferred = False
 
     try:
-        clone = subprocess.run(
-            ["git", "clone", "--quiet", "--shared", "--no-hardlinks", str(source_root), str(target)],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=120,
-            check=False,
-        )
-        if clone.returncode != 0:
-            return None
-
-        excluded = [prepared_workspace_root / ".git", *dependency_roots]
+        # Block X Source Truth already captured the exact .git database and
+        # source/config bytes into the prepared tree. Copy that sealed upper
+        # directly. Never create a --shared Git clone whose alternates point at
+        # a live mutable checkout.
+        excluded = list(dependency_root_paths)
         if not _run_overlay_robocopy(
-            prepared_workspace_root, target, excluded, progress
+            prepared_workspace_root,
+            target,
+            excluded,
+            progress,
         ):
             shutil.rmtree(target, ignore_errors=True)
             return None
 
         junctions: list[Path] = []
-        for dependency_root in dependency_roots:
+        for dependency_root in dependency_root_paths:
             relative = dependency_root.relative_to(prepared_workspace_root)
             clone_root = target / relative
             ok, created = _populate_node_modules_shell(
@@ -974,14 +1084,7 @@ def try_materialize_guarded_clone(
                 return None
             junctions.extend(created)
 
-        # Only the sealed dependency roots are authoritative shared state.
-        # The clone's node_modules shell (.bin/caches/junction entries) is local
-        # execution state and must not itself create false mutation evidence.
-        guard = _DependencyTreeGuard(
-            prepared_workspace_root,
-            dependency_roots,
-            dependency_integrity,
-        )
+        guard = _DependencyTreeGuard(dependency_root_paths)
         if not guard.start():
             for existing in reversed(junctions):
                 _remove_junction(existing)
@@ -1006,17 +1109,37 @@ def try_materialize_guarded_clone(
         with _ACTIVE_LOCK:
             _ACTIVE[_key(target)] = state
         lease_transferred = True
+
         if progress:
             progress(
-                f"NTFS fast clone ready: source/config copied, "
-                f"{len(junctions)} package payload junction(s) mounted under mutation guard"
+                "Ω guarded lower ready: sealed source/config copied privately; "
+                f"dependencyRoots={len(dependency_root_paths)}, "
+                f"packageJunctions={len(junctions)}, integrityHashPass=skipped"
             )
+        emit_observability_event(
+            "filesystem.guarded-lower.finish",
+            operationId=operation_id,
+            schema="verification-substrate-v2",
+            outcome="passed",
+            dependencyRoots=len(dependency_root_paths),
+            packageJunctions=len(junctions),
+            integrityHashPass=False,
+            durationMs=max(0, int((time.monotonic() - started) * 1000)),
+        )
         return project
-    except Exception:
+    except Exception as exc:
         if lease_transferred:
             cleanup_guarded_clone(target)
         else:
             shutil.rmtree(target, ignore_errors=True)
+        emit_observability_event(
+            "filesystem.guarded-lower.finish",
+            operationId=operation_id,
+            schema="verification-substrate-v2",
+            outcome="fallback",
+            reason=type(exc).__name__,
+            durationMs=max(0, int((time.monotonic() - started) * 1000)),
+        )
         return None
     finally:
         if not lease_transferred:

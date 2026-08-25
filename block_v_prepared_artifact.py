@@ -16,13 +16,15 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Sequence
 
 from block_vex_storage import verification_root
 from prepared_workspace_fastpath import try_acquire_snapshot_cleanup_lease
 
 ARTIFACT_INDEX_SCHEMA = 1
 ARTIFACT_AUTHORITY = "PRECONDITION_CACHE"
+
+# BLOCK_OMEGA_VERIFICATION_SUBSTRATE_V2
 _LOCK = threading.RLock()
 _CONFIGURED_ROOT: Optional[Path] = None
 
@@ -275,6 +277,21 @@ def _valid_key(key: str) -> str:
     return normalized
 
 
+def _normalize_dependency_roots(values) -> list[str]:
+    result: list[str] = []
+    for raw in values or ():
+        value = str(raw or "").strip().replace("\\", "/").strip("/")
+        if not value:
+            continue
+        path = Path(value)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("PREPARED_ARTIFACT_DEPENDENCY_ROOT_INVALID")
+        if path.name != "node_modules":
+            raise ValueError("PREPARED_ARTIFACT_DEPENDENCY_ROOT_INVALID")
+        result.append(path.as_posix())
+    return sorted(set(result))
+
+
 def _source_identity(source_project: Path) -> str:
     # The source snapshot itself is already bound by preparationProofKey.  This
     # path hash prevents one index slot from being accidentally presented to a
@@ -300,6 +317,7 @@ def publish_prepared_artifact_record(
     storage_mode: str,
     observed_resolved_versions: Mapping[str, str],
     observed_resolved_hash: str,
+    dependency_roots: Sequence[str] = (),
 ) -> bool:
     """Atomically publish an immutable artifact locator.
 
@@ -329,6 +347,7 @@ def publish_prepared_artifact_record(
             for name, version in observed_resolved_versions.items()
         )),
         "observedResolvedHash": observed_hash,
+        "dependencyRoots": _normalize_dependency_roots(dependency_roots),
         "publishedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -377,6 +396,12 @@ def load_prepared_artifact_record(
     relative_raw = payload.get("projectRelative")
     observed_hash = str(payload.get("observedResolvedHash") or "").lower()
     versions = payload.get("observedResolvedVersions")
+    try:
+        dependency_roots = _normalize_dependency_roots(
+            payload.get("dependencyRoots") or ()
+        )
+    except ValueError:
+        return None
     if not isinstance(workspace_raw, str) or not isinstance(relative_raw, str):
         return None
     if not isinstance(versions, dict) or not all(
@@ -401,6 +426,7 @@ def load_prepared_artifact_record(
         "storageMode": str(payload.get("storageMode") or "durable-prepared-artifact"),
         "observedResolvedVersions": dict(sorted(versions.items())),
         "observedResolvedHash": observed_hash,
+        "dependencyRoots": tuple(dependency_roots),
         "publishedAt": str(payload.get("publishedAt") or ""),
     }
 

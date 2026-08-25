@@ -53,6 +53,7 @@ from resolved_dependency_state import (
 from prepared_workspace_fastpath import (
     acquire_snapshot_copy_lease,
     build_dependency_integrity_manifest,
+    dependency_root_manifest,
     WorkspaceChangeGuard,
     try_acquire_snapshot_cleanup_lease,
     cleanup_guarded_clone,
@@ -61,6 +62,7 @@ from prepared_workspace_fastpath import (
     try_materialize_guarded_clone,
 )
 # BLOCK_U_VERIFICATION_SUBSTRATE_V1
+# BLOCK_OMEGA_VERIFICATION_SUBSTRATE_V2
 from verification_process_supervisor import run_supervised
 from verification_workspace_backend import (
     materialize_private_tree,
@@ -568,6 +570,9 @@ class PreparedWorkspaceSnapshot:
     storage_mode: str
     observed_resolved_versions: Mapping[str, str]
     observed_resolved_hash: str
+    dependency_roots: Tuple[str, ...] = ()
+    # Legacy field retained for old tests/artifacts. Ω does not populate or
+    # consult it on the authoritative production path.
     dependency_integrity: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
 
@@ -999,15 +1004,15 @@ def _prepared_command_fastpath_allowed(
 
 
 def _ntfs_fastpath_min_commands() -> int:
-    # A new one-command targeted proof is cheaper as one proof-safe private
-    # copy than hashing ~100k+ dependency files just to save that one copy.
+    # Ω removed the O(files) dependency hashing tax. Even one project command
+    # can now profit from the guarded lower path.
     raw = str(os.environ.get("DEPLOOM_NTFS_FASTPATH_MIN_COMMANDS") or "").strip()
     if raw:
         try:
             return max(1, min(32, int(raw)))
         except ValueError:
             pass
-    return 2
+    return 1
 
 
 def _prepared_snapshot_fastpath_worth_sealing(
@@ -1049,8 +1054,9 @@ def _lookup_prepared_workspace_snapshot(
         storage_mode=str(record["storageMode"]),
         observed_resolved_versions=dict(record["observedResolvedVersions"]),
         observed_resolved_hash=str(record["observedResolvedHash"]),
-        # Persistent artifacts deliberately do not resurrect the old guarded
-        # junction fast path. Fresh project checks use private clone/copy only.
+        dependency_roots=tuple(
+            str(item) for item in (record.get("dependencyRoots") or ())
+        ),
         dependency_integrity={},
     )
     with _PREPARED_SNAPSHOT_LOCK:
@@ -1168,12 +1174,14 @@ def _publish_prepared_workspace_snapshot(
                 junction_rebases,
             )
 
+        # Ω: discover only dependency-root topology. Do not read/hash every
+        # dependency payload byte merely to enable the guarded lower.
+        dependency_roots: Tuple[str, ...] = ()
         dependency_integrity: Mapping[str, str] = {}
         if os.name == "nt" and seal_dependency_integrity:
-            dependency_integrity = build_dependency_integrity_manifest(
+            dependency_roots = dependency_root_manifest(
                 stage_workspace,
                 progress=progress,
-                progress_interval_seconds=progress_interval_seconds,
             )
 
         snapshot = PreparedWorkspaceSnapshot(
@@ -1186,6 +1194,7 @@ def _publish_prepared_workspace_snapshot(
                 (str(name), str(version)) for name, version in observed_versions.items()
             )),
             observed_resolved_hash=str(observed_hash),
+            dependency_roots=tuple(dependency_roots),
             dependency_integrity=dict(dependency_integrity),
         )
         with _PREPARED_SNAPSHOT_LOCK:
@@ -1206,6 +1215,7 @@ def _publish_prepared_workspace_snapshot(
                 storage_mode=published.storage_mode,
                 observed_resolved_versions=published.observed_resolved_versions,
                 observed_resolved_hash=published.observed_resolved_hash,
+                dependency_roots=published.dependency_roots,
             )
         _enforce_prepared_snapshot_budget(slot)
         return published
@@ -1230,8 +1240,11 @@ def _materialize_prepared_workspace_snapshot(
     # optimization and is retried through proof-safe private copies.
     fastpath_allowed = (
         allow_fastpath
-        and not is_durable_prepared_path(snapshot.workspace_root)
-        and _prepared_snapshot_fastpath_allowed(snapshot.key, snapshot.source_project)
+        and bool(snapshot.dependency_roots)
+        and _prepared_snapshot_fastpath_allowed(
+            snapshot.key,
+            snapshot.source_project,
+        )
     )
     if fastpath_allowed:
         fast = try_materialize_guarded_clone(
@@ -1239,6 +1252,7 @@ def _materialize_prepared_workspace_snapshot(
             prepared_workspace_root=snapshot.workspace_root,
             project_relative=snapshot.project_relative,
             target=target,
+            dependency_roots=snapshot.dependency_roots,
             dependency_integrity=snapshot.dependency_integrity,
             progress=progress,
         )
@@ -2036,13 +2050,14 @@ def verify_assignment(
             )
 
         if run_project_checks and config.project_checks != "off" and config.commands:
-            # The integrity manifest exists solely for the junction-backed clone
-            # optimization. Private full-copy project clones do not consume it.
+            # Ω guarded lower needs only dependency-root topology, not an O(files)
+            # integrity seal. Durable PreparedArtifacts are eligible because the
+            # cross-process snapshot lease serializes every shared consumer.
             preparation_fastpath_enabled = (
                 _allow_prepared_fastpath
-                and prepared_snapshot_storage_root() is None
                 and _prepared_snapshot_fastpath_worth_sealing(
-                    config.commands, project_dir
+                    config.commands,
+                    project_dir,
                 )
             )
             # Durable filesystem bytes never become authority by themselves.
@@ -2286,14 +2301,14 @@ def verify_assignment(
                     try:
                         command_fastpath_allowed = (
                             _allow_prepared_fastpath
-                            and bool(snapshot.dependency_integrity)
+                            and bool(snapshot.dependency_roots)
                             and _prepared_command_fastpath_allowed(
                                 project_dir, command
                             )
                         )
                         if (
                             _allow_prepared_fastpath
-                            and bool(snapshot.dependency_integrity)
+                            and bool(snapshot.dependency_roots)
                             and not command_fastpath_allowed
                         ):
                             _emit_progress(
