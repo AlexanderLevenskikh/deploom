@@ -12,6 +12,9 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import heapq
 import time
+from verification_observability import emit_observability_event
+
+# BLOCK_Y_FULL_OBSERVABILITY_V1
 
 
 Nogood = Dict[str, str]
@@ -135,6 +138,10 @@ def coordinate_global_exact_exclusions(
     exhausted: set[int] = set()
 
     def emit(event: str, **details: object) -> None:
+        emit_observability_event(
+            f"solver.global-exclusion.{event}",
+            **details,
+        )
         if progress is not None:
             progress(event, details)
 
@@ -319,15 +326,19 @@ def parallel_ddmin(
         return len({name for item in candidate for name in item.packages})
 
     def emit(event: str, **details: object) -> None:
-        if progress is None:
-            return
-        progress(event, {
+        payload = {
             "elapsedSeconds": round(time.monotonic() - started, 1),
             "checksStarted": checks,
             "maxChecks": max_checks,
             "currentUnits": len(current),
             **details,
-        })
+        }
+        emit_observability_event(
+            f"localization.ddmin.{event}",
+            **payload,
+        )
+        if progress is not None:
+            progress(event, payload)
 
     def state_payload(reason: str, *, finished: bool = False) -> Dict[str, object]:
         entries = []

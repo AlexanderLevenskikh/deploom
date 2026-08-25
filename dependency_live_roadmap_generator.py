@@ -136,6 +136,12 @@ from lockfile_consistency import (
 )
 from semantic_version import NpmSpec, Version
 from block_v_predicate_search import prioritize_probe_preference
+from verification_observability import (
+    configure_observability_path,
+    emit_observability_event,
+)
+
+# BLOCK_Y_FULL_OBSERVABILITY_V1
 
 NPM_REGISTRY = "https://registry.npmjs.org"
 OSV_QUERY_BATCH = "https://api.osv.dev/v1/querybatch"
@@ -7353,6 +7359,17 @@ def resolve_peer_compatibility(
                     if exact_status == "optimal" and isinstance(exact_report.get("assignment"), dict):
                         component_assignment = dict(exact_report["assignment"])
                         diagnostics.update(status="optimal", backend="z3")
+                        emit_observability_event(
+                            "solver.component.finish",
+                            project=project,
+                            mode=mode,
+                            packageCount=len(component),
+                            changed=int(exact_report.get("changed") or 0),
+                            hardConstraintCount=int(exact_report.get("hardConstraints") or 0),
+                            refinements=int(exact_report.get("refinements") or 0),
+                            durationMs=int(exact_report.get("elapsedMs") or 0),
+                            status=exact_status,
+                        )
                         eprint(
                             f"[info] {project}: exact z3 {mode}; packages={len(component)}, "
                             f"changed={exact_report.get('changed', 0)}, "
@@ -7534,6 +7551,17 @@ def resolve_peer_compatibility(
                 exact_elapsed = sum(int(report.get("elapsedMs") or 0) for report in mode_exact_reports)
                 exact_refinements = sum(int(report.get("refinements") or 0) for report in mode_exact_reports)
                 exact_constraints = sum(int(report.get("hardConstraints") or 0) for report in mode_exact_reports)
+                emit_observability_event(
+                    "solver.mode.summary",
+                    project=project,
+                    mode=mode,
+                    componentsSolved=len(mode_exact_reports),
+                    componentsTotal=len(components),
+                    changed=exact_changed,
+                    hardConstraintCount=exact_constraints,
+                    refinements=exact_refinements,
+                    durationMs=exact_elapsed,
+                )
                 eprint(
                     f"[info] {project}: exact z3 {mode} SUMMARY; components={len(mode_exact_reports)}/{len(components)}, "
                     f"changed={exact_changed}, constraints={exact_constraints}, "
@@ -9294,6 +9322,19 @@ def resolve_peer_compatibility_with_verification(
             registry=client.registry,
             telemetry_path=str(verification_telemetry_path) if verification_telemetry_path is not None else "",
             proof_cache_dir=str(verification_proof_cache_dir) if verification_proof_cache_dir is not None else "",
+        )
+        configure_observability_path(
+            verification_telemetry_path,
+            reset=True,
+            context={"project": project, "projectPath": str(spec.path)},
+        )
+        emit_observability_event(
+            "baseline.run.start",
+            project=project,
+            projectPath=str(spec.path),
+            packageManager=detect_package_manager(spec.path),
+            projectChecks=config.project_checks,
+            commands=list(config.commands),
         )
         if not config.enabled:
             raise BaselineConstraintVerificationError(

@@ -24,6 +24,15 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from verification_workspace_backend import materialize_private_tree
+from verification_observability import (
+    configured_observability_path,
+    emit_observability_event,
+    new_observability_id,
+    process_resource_snapshot,
+    suppress_observability,
+)
+
+# BLOCK_Y_FULL_OBSERVABILITY_V1
 
 # BLOCK_X_SOURCE_TRUTH_V1
 SOURCE_SNAPSHOT_SCHEMA = "source-snapshot-v1-captured-content"
@@ -263,7 +272,7 @@ def _hash_regular_file(path: Path) -> tuple[str, os.stat_result]:
     return digest.hexdigest(), after
 
 
-def build_source_tree_manifest(
+def _build_source_tree_manifest_impl(
     root: Path,
     *,
     policy: SourceInputPolicy = SourceInputPolicy(),
@@ -518,7 +527,7 @@ def _capture_once(
         raise
 
 
-def capture_source_snapshot(
+def _capture_source_snapshot_impl(
     project_dir: Path,
     *,
     policy: SourceInputPolicy = SourceInputPolicy(),
@@ -660,3 +669,160 @@ def _cleanup_all() -> None:
 
 
 atexit.register(_cleanup_all)
+
+def _observability_sink_is_source_safe(
+    root: Path,
+    policy: SourceInputPolicy,
+) -> bool:
+    sink = configured_observability_path()
+    if sink is None:
+        return True
+    root = root.resolve()
+    sink = sink.resolve()
+    try:
+        relative = sink.relative_to(root)
+    except ValueError:
+        return True
+    return _excluded(relative, policy)
+
+
+def build_source_tree_manifest(
+    root: Path,
+    *,
+    policy: SourceInputPolicy = SourceInputPolicy(),
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "source manifest",
+    progress_interval_seconds: int = 15,
+) -> SourceTreeManifest:
+    if not _observability_sink_is_source_safe(root, policy):
+        with suppress_observability():
+            return _build_source_tree_manifest_impl(
+                root,
+                policy=policy,
+                timeout_seconds=timeout_seconds,
+                progress=progress,
+                progress_label=progress_label,
+                progress_interval_seconds=progress_interval_seconds,
+            )
+
+    operation_id = new_observability_id("source-manifest")
+    started = time.monotonic()
+    before = process_resource_snapshot()
+    emit_observability_event(
+        "source.manifest.start",
+        operationId=operation_id,
+        label=progress_label,
+        timeoutSeconds=int(timeout_seconds),
+        policyKey=policy.key,
+    )
+    try:
+        manifest = _build_source_tree_manifest_impl(
+            root,
+            policy=policy,
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+            progress_label=progress_label,
+            progress_interval_seconds=progress_interval_seconds,
+        )
+    except BaseException as exc:
+        after = process_resource_snapshot()
+        emit_observability_event(
+            "source.manifest.finish",
+            operationId=operation_id,
+            label=progress_label,
+            outcome="exception",
+            durationMs=max(0, int((time.monotonic() - started) * 1000)),
+            cpuMs=max(0, after.cpu_ms - before.cpu_ms),
+            rssBytes=after.rss_bytes,
+            peakRssBytes=after.peak_rss_bytes,
+            errorType=type(exc).__name__,
+        )
+        raise
+    after = process_resource_snapshot()
+    emit_observability_event(
+        "source.manifest.finish",
+        operationId=operation_id,
+        label=progress_label,
+        outcome="passed",
+        manifestKey=manifest.key,
+        fileCount=manifest.file_count,
+        directoryCount=manifest.directory_count,
+        byteCount=manifest.byte_count,
+        durationMs=max(0, int((time.monotonic() - started) * 1000)),
+        cpuMs=max(0, after.cpu_ms - before.cpu_ms),
+        rssBytes=after.rss_bytes,
+        peakRssBytes=after.peak_rss_bytes,
+    )
+    return manifest
+
+
+def capture_source_snapshot(
+    project_dir: Path,
+    *,
+    policy: SourceInputPolicy = SourceInputPolicy(),
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+    progress_interval_seconds: int = 15,
+) -> SourceSnapshot:
+    capture_root, _project_relative, _git_head = _subject_layout(project_dir)
+    if not _observability_sink_is_source_safe(capture_root, policy):
+        with suppress_observability():
+            return _capture_source_snapshot_impl(
+                project_dir,
+                policy=policy,
+                timeout_seconds=timeout_seconds,
+                progress=progress,
+                progress_interval_seconds=progress_interval_seconds,
+            )
+
+    operation_id = new_observability_id("source-capture")
+    started = time.monotonic()
+    before = process_resource_snapshot()
+    emit_observability_event(
+        "source.capture.start",
+        operationId=operation_id,
+        timeoutSeconds=int(timeout_seconds),
+        policyKey=policy.key,
+    )
+    try:
+        snapshot = _capture_source_snapshot_impl(
+            project_dir,
+            policy=policy,
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+            progress_interval_seconds=progress_interval_seconds,
+        )
+    except BaseException as exc:
+        after = process_resource_snapshot()
+        emit_observability_event(
+            "source.capture.finish",
+            operationId=operation_id,
+            outcome="exception",
+            durationMs=max(0, int((time.monotonic() - started) * 1000)),
+            cpuMs=max(0, after.cpu_ms - before.cpu_ms),
+            rssBytes=after.rss_bytes,
+            peakRssBytes=after.peak_rss_bytes,
+            errorType=type(exc).__name__,
+        )
+        raise
+    after = process_resource_snapshot()
+    emit_observability_event(
+        "source.capture.finish",
+        operationId=operation_id,
+        outcome="passed",
+        sourceSnapshotKey=snapshot.key,
+        manifestKey=snapshot.manifest_key,
+        policyKey=snapshot.policy_key,
+        fileCount=snapshot.file_count,
+        directoryCount=snapshot.directory_count,
+        byteCount=snapshot.byte_count,
+        materializationMethod=snapshot.materialization_method,
+        gitHead=bool(snapshot.git_head),
+        durationMs=max(0, int((time.monotonic() - started) * 1000)),
+        cpuMs=max(0, after.cpu_ms - before.cpu_ms),
+        rssBytes=after.rss_bytes,
+        peakRssBytes=after.peak_rss_bytes,
+    )
+    return snapshot
+

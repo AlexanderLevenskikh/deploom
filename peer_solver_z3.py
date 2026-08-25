@@ -6,6 +6,13 @@ import time
 from typing import Dict, Tuple
 
 from peer_solver_model import ExactSolveResult, PeerOptimizationModel
+from verification_observability import (
+    emit_observability_event,
+    new_observability_id,
+    process_resource_snapshot,
+)
+
+# BLOCK_Y_FULL_OBSERVABILITY_V1
 
 
 def _objective_bounds_proven(optimize: object, handles: list[object]) -> tuple[bool, str]:
@@ -21,7 +28,7 @@ def _objective_bounds_proven(optimize: object, handles: list[object]) -> tuple[b
     return True, f"objectives={len(handles)} bounds closed"
 
 
-def solve_z3_exact(
+def _solve_z3_exact_impl(
     model: PeerOptimizationModel,
     *,
     timeout_ms: int = 30_000,
@@ -173,3 +180,93 @@ def solve_z3_exact(
             detail=f"Z3 shadow solver failed: {exc}",
             elapsed_ms=int((time.perf_counter() - started) * 1000),
         )
+
+def _safe_model_metric(model: object, name: str, default: object = 0) -> object:
+    try:
+        value = getattr(model, name)
+        return value() if callable(value) else value
+    except Exception:
+        return default
+
+
+def solve_z3_exact(
+    model: PeerOptimizationModel,
+    *,
+    timeout_ms: int = 30_000,
+) -> ExactSolveResult:
+    """Instrumented authoritative Z3 entry point.
+
+    Telemetry is observational only; the wrapped implementation and returned
+    ExactSolveResult are unchanged.
+    """
+    operation_id = new_observability_id("z3")
+    started = time.perf_counter()
+    before = process_resource_snapshot()
+    packages = tuple(getattr(model, "packages", ()) or ())
+    constraints = tuple(getattr(model, "constraints", ()) or ())
+    requirements = tuple(getattr(model, "requirements", ()) or ())
+    candidate_count = sum(len(getattr(package, "domain", ()) or ()) for package in packages)
+    objective_width = int(_safe_model_metric(model, "objective_width", 0) or 0)
+    state_upper_bound = str(_safe_model_metric(model, "state_count_upper_bound", ""))
+
+    emit_observability_event(
+        "solver.z3.start",
+        operationId=operation_id,
+        backend="z3",
+        packageCount=len(packages),
+        candidateCount=candidate_count,
+        hardConstraintCount=len(constraints),
+        requirementCount=len(requirements),
+        objectiveWidth=objective_width,
+        deterministicTieBreakObjectives=len(packages),
+        stateUpperBound=state_upper_bound,
+        timeoutMs=int(timeout_ms),
+    )
+    try:
+        result = _solve_z3_exact_impl(model, timeout_ms=timeout_ms)
+    except BaseException as exc:
+        after = process_resource_snapshot()
+        emit_observability_event(
+            "solver.z3.finish",
+            operationId=operation_id,
+            backend="z3",
+            status="exception",
+            packageCount=len(packages),
+            candidateCount=candidate_count,
+            hardConstraintCount=len(constraints),
+            requirementCount=len(requirements),
+            objectiveWidth=objective_width,
+            deterministicTieBreakObjectives=len(packages),
+            stateUpperBound=state_upper_bound,
+            timeoutMs=int(timeout_ms),
+            durationMs=max(0, int((time.perf_counter() - started) * 1000)),
+            cpuMs=max(0, after.cpu_ms - before.cpu_ms),
+            rssBytes=after.rss_bytes,
+            peakRssBytes=after.peak_rss_bytes,
+            errorType=type(exc).__name__,
+        )
+        raise
+
+    after = process_resource_snapshot()
+    emit_observability_event(
+        "solver.z3.finish",
+        operationId=operation_id,
+        backend="z3",
+        status=str(result.status),
+        packageCount=len(packages),
+        candidateCount=candidate_count,
+        hardConstraintCount=len(constraints),
+        requirementCount=len(requirements),
+        objectiveWidth=objective_width,
+        deterministicTieBreakObjectives=len(packages),
+        stateUpperBound=state_upper_bound,
+        timeoutMs=int(timeout_ms),
+        solverElapsedMs=int(result.elapsed_ms),
+        assignmentCount=len(result.assignment or {}),
+        durationMs=max(0, int((time.perf_counter() - started) * 1000)),
+        cpuMs=max(0, after.cpu_ms - before.cpu_ms),
+        rssBytes=after.rss_bytes,
+        peakRssBytes=after.peak_rss_bytes,
+    )
+    return result
+

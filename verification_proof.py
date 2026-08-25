@@ -15,10 +15,7 @@ from urllib.parse import unquote, urlparse
 
 from semantic_version import NpmSpec
 from block_vex_storage import semantic_verification_environment
-from verification_observability import (
-    decorate_verification_event,
-    record_verification_event,
-)
+from verification_observability import emit_observability_event
 from source_snapshot import (
     SourceCaptureError,
     active_source_snapshot,
@@ -1370,24 +1367,5 @@ def _telemetry_lock(path: Path) -> threading.Lock:
 
 def emit_verification_event(path: Path | None, event: str, **fields: object) -> None:
     """Best-effort JSONL telemetry. It is observability, never proof authority."""
-    if path is None:
-        return
-    decorated = decorate_verification_event(event, fields)
-    payload = {
-        "schemaVersion": 1,
-        "event": event,
-        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "pid": os.getpid(),
-        **decorated,
-    }
-    record_verification_event(event, payload)
-    try:
-        path = path.resolve()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-        with _telemetry_lock(path):
-            with path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(line)
-                handle.flush()
-    except OSError:
-        return
+    emit_observability_event(event, path=path, **fields)
+

@@ -5,11 +5,19 @@ import ctypes
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
 from verification_process_supervisor import run_supervised
 from block_vex_storage import windows_filesystem
+from verification_observability import (
+    emit_observability_event,
+    new_observability_id,
+    process_resource_snapshot,
+)
+
+# BLOCK_Y_FULL_OBSERVABILITY_V1
 
 # BLOCK_VEX_VERIFICATION_SUBSTRATE_V1
 
@@ -81,7 +89,7 @@ def workspace_backend_summary(root: Optional[Path] = None) -> str:
     return "portable-private-copy"
 
 
-def materialize_private_tree(
+def _materialize_private_tree_impl(
     source: Path,
     target: Path,
     *,
@@ -196,3 +204,98 @@ def materialize_private_tree(
     return "portable-filtered-deep-copy" if ignored else "portable-deep-copy"
 
 # BLOCK_VG_ZERO_CONFIG_TRANSACTIONAL_UI_V1
+
+def materialize_private_tree(
+    source: Path,
+    target: Path,
+    *,
+    timeout_seconds: int,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "workspace materialization",
+    progress_interval_seconds: int = 15,
+    runner=run_supervised,
+    exclude_dir_names: tuple[str, ...] = (),
+    exclude_file_names: tuple[str, ...] = (),
+) -> str:
+    """Instrumented private materialization without an extra filesystem walk."""
+    operation_id = new_observability_id("materialize")
+    started = time.monotonic()
+    before = process_resource_snapshot()
+    source_path = source.resolve()
+    target_path = target.resolve()
+    source_fs = windows_filesystem(source_path) if os.name == "nt" else sys.platform
+    target_fs = (
+        windows_filesystem(target_path.parent)
+        if os.name == "nt"
+        else sys.platform
+    )
+    refs_same_volume = (
+        os.name == "nt"
+        and source_fs == "refs"
+        and target_fs == "refs"
+        and _same_windows_volume(source_path, target_path)
+    )
+    workers = _copy_workers(refs_same_volume=bool(refs_same_volume))
+
+    emit_observability_event(
+        "filesystem.materialize.start",
+        operationId=operation_id,
+        label=progress_label,
+        platform=sys.platform,
+        sourceFilesystem=source_fs,
+        targetFilesystem=target_fs,
+        configuredWorkers=workers,
+        excludeDirCount=len(exclude_dir_names),
+        excludeFileCount=len(exclude_file_names),
+        timeoutSeconds=int(timeout_seconds),
+    )
+    try:
+        method = _materialize_private_tree_impl(
+            source,
+            target,
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+            progress_label=progress_label,
+            progress_interval_seconds=progress_interval_seconds,
+            runner=runner,
+            exclude_dir_names=exclude_dir_names,
+            exclude_file_names=exclude_file_names,
+        )
+    except BaseException as exc:
+        after = process_resource_snapshot()
+        emit_observability_event(
+            "filesystem.materialize.finish",
+            operationId=operation_id,
+            label=progress_label,
+            outcome="exception",
+            method="",
+            platform=sys.platform,
+            sourceFilesystem=source_fs,
+            targetFilesystem=target_fs,
+            configuredWorkers=workers,
+            durationMs=max(0, int((time.monotonic() - started) * 1000)),
+            cpuMs=max(0, after.cpu_ms - before.cpu_ms),
+            rssBytes=after.rss_bytes,
+            peakRssBytes=after.peak_rss_bytes,
+            errorType=type(exc).__name__,
+        )
+        raise
+
+    after = process_resource_snapshot()
+    emit_observability_event(
+        "filesystem.materialize.finish",
+        operationId=operation_id,
+        label=progress_label,
+        outcome="passed",
+        method=method,
+        platform=sys.platform,
+        sourceFilesystem=source_fs,
+        targetFilesystem=target_fs,
+        configuredWorkers=workers,
+        durationMs=max(0, int((time.monotonic() - started) * 1000)),
+        cpuMs=max(0, after.cpu_ms - before.cpu_ms),
+        rssBytes=after.rss_bytes,
+        peakRssBytes=after.peak_rss_bytes,
+    )
+    return method
+

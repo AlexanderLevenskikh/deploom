@@ -13,6 +13,12 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Mapping, Optional
+from verification_observability import (
+    emit_observability_event,
+    new_observability_id,
+)
+
+# BLOCK_Y_FULL_OBSERVABILITY_V1
 
 ProgressCallback = Callable[[str], None]
 
@@ -380,6 +386,13 @@ def build_dependency_integrity_manifest(
     """
     prepared_root = prepared_root.resolve()
     started = time.monotonic()
+    integrity_operation_id = new_observability_id("integrity")
+    emit_observability_event(
+        "filesystem.integrity.start",
+        operationId=integrity_operation_id,
+        label="sealed dependency integrity manifest",
+        preparedRootName=prepared_root.name,
+    )
     interval = max(1, int(progress_interval_seconds or 15))
     next_progress = started + interval
     candidates: list[Path] = []
@@ -437,6 +450,17 @@ def build_dependency_integrity_manifest(
             f"files={files}, bytes={total_bytes}, workers={workers}, "
             f"elapsed={int(time.monotonic() - started)}s"
         )
+    emit_observability_event(
+        "filesystem.integrity.finish",
+        operationId=integrity_operation_id,
+        label="sealed dependency integrity manifest",
+        outcome="passed",
+        candidateFiles=len(candidates),
+        fileCount=files,
+        byteCount=total_bytes,
+        workers=workers,
+        durationMs=max(0, int((time.monotonic() - started) * 1000)),
+    )
     return canonical
 
 

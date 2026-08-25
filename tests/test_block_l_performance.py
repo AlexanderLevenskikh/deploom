@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import baseline_constraint_verifier as verifier
+import block_vex_storage
 import dependency_live_roadmap_generator as roadmap
 
 
@@ -58,16 +59,43 @@ class BlockLPerformanceTests(unittest.TestCase):
 
     def test_package_manager_cache_is_isolated_without_offline_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config = verifier.BaselineVerifyConfig(proof_cache_dir=str(Path(tmp) / "baseline-proofs"))
-            yarn = verifier._package_manager_cache_environment(config, "yarn")
-            npm = verifier._package_manager_cache_environment(config, "npm")
-            # Yarn Classic intentionally keeps its native warm user cache.
-            # Cache location is not proof authority; the fresh isolated install is.
-            self.assertEqual({}, yarn)
-            self.assertIn("npm_config_cache", npm)
-            rendered = " ".join([*npm.keys(), *npm.values()]).lower()
-            self.assertNotIn("offline", rendered)
-            self.assertNotIn("prefer-offline", rendered)
+            root = Path(tmp)
+            config = verifier.BaselineVerifyConfig(
+                proof_cache_dir=str(root / "baseline-proofs")
+            )
+
+            ordinary = block_vex_storage.VerificationStorageProfile(
+                root=root / "ordinary",
+                filesystem="ntfs",
+            )
+            with mock.patch.object(
+                block_vex_storage,
+                "verification_storage_profile",
+                return_value=ordinary,
+            ):
+                yarn = verifier._package_manager_cache_environment(config, "yarn")
+                npm = verifier._package_manager_cache_environment(config, "npm")
+                self.assertEqual({}, yarn)
+                self.assertIn("npm_config_cache", npm)
+                rendered = " ".join([*npm.keys(), *npm.values()]).lower()
+                self.assertNotIn("offline", rendered)
+                self.assertNotIn("prefer-offline", rendered)
+
+            optimized = block_vex_storage.VerificationStorageProfile(
+                root=root / "refs",
+                filesystem="refs",
+                refs_same_volume_capable=True,
+            )
+            with mock.patch.object(
+                block_vex_storage,
+                "verification_storage_profile",
+                return_value=optimized,
+            ):
+                yarn = verifier._package_manager_cache_environment(config, "yarn")
+                self.assertIn("YARN_CACHE_FOLDER", yarn)
+                rendered = " ".join([*yarn.keys(), *yarn.values()]).lower()
+                self.assertNotIn("offline", rendered)
+                self.assertNotIn("prefer-offline", rendered)
 
     def test_registry_prefetch_reduces_in_sorted_order(self) -> None:
         main = SimpleNamespace(

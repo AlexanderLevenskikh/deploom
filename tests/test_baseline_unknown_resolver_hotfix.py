@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,18 +11,50 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import baseline_constraint_verifier as verifier
+import block_vex_storage
 import dependency_live_roadmap_generator as roadmap
 
 
 class BaselineUnknownResolverHotfixTests(unittest.TestCase):
-    def test_yarn_uses_native_cache_but_npm_keeps_deploom_cache(self) -> None:
+    def test_yarn_cache_policy_is_storage_profile_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
             config = verifier.BaselineVerifyConfig(
-                proof_cache_dir=str(Path(tmp) / "baseline-proofs")
+                proof_cache_dir=str(root / "baseline-proofs")
             )
-            self.assertEqual({}, verifier._package_manager_cache_environment(config, "yarn"))
-            npm = verifier._package_manager_cache_environment(config, "npm")
-            self.assertIn("npm_config_cache", npm)
+
+            ordinary = block_vex_storage.VerificationStorageProfile(
+                root=root / "ordinary",
+                filesystem="ntfs",
+            )
+            with mock.patch.object(
+                block_vex_storage,
+                "verification_storage_profile",
+                return_value=ordinary,
+            ):
+                self.assertEqual(
+                    {},
+                    verifier._package_manager_cache_environment(config, "yarn"),
+                )
+                npm = verifier._package_manager_cache_environment(config, "npm")
+                self.assertIn("npm_config_cache", npm)
+
+            optimized = block_vex_storage.VerificationStorageProfile(
+                root=root / "refs",
+                filesystem="refs",
+                refs_same_volume_capable=True,
+            )
+            with mock.patch.object(
+                block_vex_storage,
+                "verification_storage_profile",
+                return_value=optimized,
+            ):
+                yarn = verifier._package_manager_cache_environment(config, "yarn")
+                self.assertIn("YARN_CACHE_FOLDER", yarn)
+                self.assertIn(
+                    "package-manager-artifacts",
+                    yarn["YARN_CACHE_FOLDER"].replace("\\", "/"),
+                )
 
     def test_known_yarn_network_and_auth_failures_are_infrastructure(self) -> None:
         cases = (
