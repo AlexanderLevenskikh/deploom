@@ -93,7 +93,11 @@ class ProjectIsolationRegressionTests(unittest.TestCase):
         flow = (ROOT / "desktop" / "src" / "components" / "FlowWorkspace.tsx").read_text(encoding="utf-8")
         self.assertIn("cleanupSupersededMigrationAfterBaseline", main)
         self.assertIn("baselineStartCommands(input, project)", main)
-        self.assertIn("BASELINE_SOURCE_DIRTY", main)
+        self.assertIn("SOURCE_SNAPSHOT_BASELINE_LIVE_CHECKOUT", main)
+        self.assertNotIn("BASELINE_SOURCE_DIRTY", main)
+        baseline_guard = main.split("async function baselineStartCommands", 1)[1].split("async function cleanAgentStartCommands", 1)[0]
+        self.assertNotIn("'status'", baseline_guard)
+        self.assertNotIn("'switch'", baseline_guard)
         self.assertIn("if (job.action === 'baseline' && job.projectName)", main)
         self.assertIn("forgetProjectPromptState(job.workspace, project.name, oldPromptPath)", main)
         self.assertIn("const freshBaseline = job.action === 'baseline' && status === 'passed'", main)

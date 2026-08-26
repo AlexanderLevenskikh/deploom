@@ -35,12 +35,13 @@ from project_topology import (
     ProjectTopologyError,
     semantic_manifest_paths,
 )
+from substrate_identity import tool_build_id
 # BLOCK_Z_PROJECT_TOPOLOGY_V1
 
 # BLOCK_Y_FULL_OBSERVABILITY_V1
 
 # BLOCK_X_SOURCE_TRUTH_V1
-SOURCE_SNAPSHOT_SCHEMA = "source-snapshot-v1-captured-content"
+SOURCE_SNAPSHOT_SCHEMA = "source-snapshot-v2-tool-build-content"
 SOURCE_INPUT_POLICY_SCHEMA = "source-input-policy-v1-explicit"
 SOURCE_CAPTURE_RETRIES = 3
 
@@ -174,27 +175,145 @@ def _subject_layout(project_dir: Path, *, require_git: bool = False) -> tuple[Pa
     return project_dir, Path("."), ""
 
 
-def _validate_git_layout(capture_root: Path) -> None:
-    marker = capture_root / ".git"
-    if not marker.is_file():
-        return
+def _iter_source_files_without_links(
+    root: Path,
+    *,
+    policy: SourceInputPolicy = SourceInputPolicy(),
+) -> Iterable[Path]:
+    """Walk policy coverage without following symlinks or reparse directories."""
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise SourceCaptureError(
+                f"SOURCE_DIRECTORY_UNREADABLE: {directory}: {exc}"
+            ) from exc
+        for item in entries:
+            path = Path(item.path)
+            try:
+                relative = path.relative_to(root)
+            except ValueError as exc:
+                raise SourceCaptureError(
+                    f"SOURCE_ENTRY_OUTSIDE_ROOT: {path}"
+                ) from exc
+            if _excluded(relative, policy):
+                continue
+            try:
+                if item.is_symlink():
+                    continue
+                if item.is_dir(follow_symlinks=False):
+                    is_junction = getattr(path, "is_junction", None)
+                    if callable(is_junction) and is_junction():
+                        continue
+                    pending.append(path)
+                elif item.is_file(follow_symlinks=False):
+                    yield path
+            except OSError as exc:
+                raise SourceCaptureError(
+                    f"SOURCE_ENTRY_UNREADABLE: {path}: {exc}"
+                ) from exc
+
+
+def _read_git_indirection(path: Path, *, prefix: str = "") -> str:
     try:
-        text = marker.read_text(encoding="utf-8", errors="replace").strip()
-    except OSError as exc:
-        raise SourceCaptureError(f"SOURCE_GIT_MARKER_UNREADABLE: {marker}: {exc}") from exc
-    if not text.lower().startswith("gitdir:"):
-        raise SourceCaptureError(f"SOURCE_GIT_MARKER_INVALID: {marker}")
-    target = Path(text.split(":", 1)[1].strip())
-    if not target.is_absolute():
-        target = marker.parent / target
-    if not _within(target, capture_root):
-        # A linked worktree's .git file points at the parent repository's
-        # common object database. Copying only the worktree would create a
-        # source snapshot that looks self-contained but is not.
+        text = path.read_text(encoding="utf-8", errors="strict").strip()
+    except (OSError, UnicodeError) as exc:
         raise SourceCaptureError(
-            "SOURCE_GIT_LINKED_WORKTREE_UNSUPPORTED: root .git points outside "
-            f"captured tree: {target.resolve(strict=False)}"
+            f"SOURCE_GIT_INDIRECTION_UNREADABLE: {path}: {exc}"
+        ) from exc
+    if prefix and not text.lower().startswith(prefix.lower()):
+        raise SourceCaptureError(f"SOURCE_GIT_MARKER_INVALID: {path}")
+    return text.split(":", 1)[1].strip() if prefix else text
+
+
+def _require_sealed_relative_git_target(
+    *,
+    capture_root: Path,
+    marker: Path,
+    raw_target: str,
+    relative_base: Path,
+    kind: str,
+) -> None:
+    target = Path(raw_target).expanduser()
+    if target.is_absolute():
+        raise SourceCaptureError(
+            f"SOURCE_GIT_ABSOLUTE_INDIRECTION_UNSUPPORTED: {kind}: "
+            f"{marker} -> {raw_target}"
         )
+    resolved = (relative_base / target).resolve(strict=False)
+    if not _within(resolved, capture_root):
+        raise SourceCaptureError(
+            f"SOURCE_GIT_EXTERNAL_INDIRECTION_UNSUPPORTED: {kind}: "
+            f"{marker} -> {raw_target}"
+        )
+
+
+def _validate_git_layout(
+    capture_root: Path,
+    *,
+    policy: SourceInputPolicy = SourceInputPolicy(),
+) -> None:
+    """Reject every Git metadata edge that would escape a sealed copy.
+
+    Root and nested repositories are covered. Absolute indirections are
+    rejected even when they currently resolve inside the live checkout because
+    the absolute text would still point back to that mutable checkout after
+    materialization.
+    """
+    capture_root = capture_root.resolve()
+    for path in _iter_source_files_without_links(capture_root, policy=policy):
+        if path.name == ".git":
+            target = _read_git_indirection(path, prefix="gitdir:")
+            _require_sealed_relative_git_target(
+                capture_root=capture_root,
+                marker=path,
+                raw_target=target,
+                relative_base=path.parent,
+                kind="gitdir",
+            )
+            continue
+
+        if (
+            path.name == "commondir"
+            and ".git" in path.relative_to(capture_root).parts
+        ):
+            target = _read_git_indirection(path)
+            _require_sealed_relative_git_target(
+                capture_root=capture_root,
+                marker=path,
+                raw_target=target,
+                relative_base=path.parent,
+                kind="commondir",
+            )
+            continue
+
+        if (
+            path.name == "alternates"
+            and path.parent.name == "info"
+            and path.parent.parent.name == "objects"
+        ):
+            try:
+                lines = path.read_text(
+                    encoding="utf-8", errors="strict"
+                ).splitlines()
+            except (OSError, UnicodeError) as exc:
+                raise SourceCaptureError(
+                    f"SOURCE_GIT_ALTERNATES_UNREADABLE: {path}: {exc}"
+                ) from exc
+            object_database = path.parent.parent
+            for line in lines:
+                target = line.strip()
+                if not target or target.startswith("#"):
+                    continue
+                _require_sealed_relative_git_target(
+                    capture_root=capture_root,
+                    marker=path,
+                    raw_target=target,
+                    relative_base=object_database,
+                    kind="objects/info/alternates",
+                )
 
 
 def _submodule_preflight(capture_root: Path) -> None:
@@ -402,6 +521,7 @@ def _build_source_tree_manifest_impl(
     entries.sort(key=lambda entry: str(entry["path"]))
     key = _canonical_hash({
         "schema": SOURCE_SNAPSHOT_SCHEMA,
+        "toolBuildId": tool_build_id(),
         "policyKey": policy.key,
         "entries": entries,
     }, length=64)
@@ -494,6 +614,7 @@ def _capture_once(
 
         key = _canonical_hash({
             "schema": SOURCE_SNAPSHOT_SCHEMA,
+            "toolBuildId": tool_build_id(),
             "policyKey": policy.key,
             "manifestKey": captured.key,
             "projectRelative": project_relative.as_posix() or ".",
@@ -504,6 +625,7 @@ def _capture_once(
                 "schemaVersion": 1,
                 "type": "deploom-source-snapshot",
                 "sourceSnapshotKey": key,
+                "toolBuildId": tool_build_id(),
                 "manifestKey": captured.key,
                 "policyKey": policy.key,
                 "projectRelative": project_relative.as_posix() or ".",
@@ -615,6 +737,7 @@ def source_snapshot_fingerprint(project_dir: Path) -> str:
     manifest = build_source_tree_manifest(root)
     return _canonical_hash({
         "schema": SOURCE_SNAPSHOT_SCHEMA,
+        "toolBuildId": tool_build_id(),
         "policyKey": SourceInputPolicy().key,
         "manifestKey": manifest.key,
         "projectRelative": relative.as_posix() or ".",
@@ -839,4 +962,195 @@ def capture_source_snapshot(
         peakRssBytes=after.peak_rss_bytes,
     )
     return snapshot
+def open_source_snapshot(
+    container: Path,
+    *,
+    expected_key: str = "",
+    timeout_seconds: int = 1800,
+) -> SourceSnapshot:
+    """Open and strongly validate a durable SourceSnapshot container."""
+    container = container.expanduser().resolve()
+    manifest_path = container / "manifest.json"
+    root = container / "tree"
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        raise SourceCaptureError(
+            f"SOURCE_SNAPSHOT_MANIFEST_INVALID: {manifest_path}: {exc}"
+        ) from exc
+    if (
+        not isinstance(raw, dict)
+        or int(raw.get("schemaVersion", 0) or 0) != 1
+        or raw.get("type") != "deploom-source-snapshot"
+    ):
+        raise SourceCaptureError("SOURCE_SNAPSHOT_MANIFEST_SCHEMA_INVALID")
+    if not root.is_dir():
+        raise SourceCaptureError(f"SOURCE_SNAPSHOT_TREE_MISSING: {root}")
 
+    key = str(raw.get("sourceSnapshotKey") or "")
+    manifest_key = str(raw.get("manifestKey") or "")
+    policy_key = str(raw.get("policyKey") or "")
+    current_build_id = tool_build_id()
+    if raw.get("toolBuildId") != current_build_id:
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_TOOL_BUILD_MISMATCH: "
+            f"expected={current_build_id}; observed={raw.get('toolBuildId')}"
+        )
+    if expected_key and key != expected_key:
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_KEY_MISMATCH: "
+            f"expected={expected_key}; observed={key}"
+        )
+    policy = SourceInputPolicy()
+    if policy_key != policy.key:
+        raise SourceCaptureError(
+            f"SOURCE_SNAPSHOT_POLICY_UNSUPPORTED: {policy_key}"
+        )
+
+    relative_text = str(raw.get("projectRelative") or ".")
+    relative = Path(relative_text)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise SourceCaptureError(
+            f"SOURCE_SNAPSHOT_PROJECT_RELATIVE_INVALID: {relative_text}"
+        )
+    project_path = (root / relative).resolve()
+    if not _within(project_path, root) or not project_path.is_dir():
+        raise SourceCaptureError(
+            f"SOURCE_SNAPSHOT_PROJECT_MISSING: {relative_text}"
+        )
+
+    _validate_git_layout(root, policy=policy)
+    observed = build_source_tree_manifest(
+        root,
+        policy=policy,
+        timeout_seconds=timeout_seconds,
+        progress_label="durable source snapshot validation",
+    )
+    if observed.key != manifest_key:
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_CONTENT_MISMATCH: "
+            f"expected={manifest_key}; observed={observed.key}"
+        )
+    recomputed_key = _canonical_hash({
+        "schema": SOURCE_SNAPSHOT_SCHEMA,
+        "toolBuildId": current_build_id,
+        "policyKey": policy_key,
+        "manifestKey": observed.key,
+        "projectRelative": relative.as_posix() or ".",
+    }, length=32)
+    if recomputed_key != key:
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_IDENTITY_MISMATCH: "
+            f"expected={key}; observed={recomputed_key}"
+        )
+
+    return SourceSnapshot(
+        original_project_path=project_path,
+        capture_root=root,
+        project_relative=relative,
+        container=container,
+        root=root,
+        project_path=project_path,
+        key=key,
+        manifest_key=observed.key,
+        policy_key=policy_key,
+        file_count=observed.file_count,
+        directory_count=observed.directory_count,
+        byte_count=observed.byte_count,
+        materialization_method=str(raw.get("materializationMethod") or "durable"),
+        git_head=str(raw.get("gitHead") or ""),
+        git_root=str(root) if raw.get("gitHead") else "",
+        created_at=float(raw.get("createdAt") or manifest_path.stat().st_mtime),
+    )
+
+
+def persist_source_snapshot(
+    snapshot: SourceSnapshot,
+    destination: Path,
+    *,
+    timeout_seconds: int = 1800,
+) -> SourceSnapshot:
+    """Atomically publish an active snapshot as durable evidence."""
+    destination = destination.expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise SourceCaptureError(
+            f"SOURCE_SNAPSHOT_DESTINATION_EXISTS: {destination}"
+        )
+    stage = Path(tempfile.mkdtemp(
+        prefix=f".{destination.name}.tmp-",
+        dir=str(destination.parent),
+    ))
+    try:
+        shutil.copytree(
+            snapshot.container,
+            stage,
+            dirs_exist_ok=True,
+            symlinks=True,
+        )
+        open_source_snapshot(
+            stage,
+            expected_key=snapshot.key,
+            timeout_seconds=timeout_seconds,
+        )
+        os.replace(stage, destination)
+        return open_source_snapshot(
+            destination,
+            expected_key=snapshot.key,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def capture_durable_source_snapshot(
+    project_dir: Path,
+    destination: Path,
+    *,
+    timeout_seconds: int = 1800,
+) -> SourceSnapshot:
+    snapshot = capture_source_snapshot(
+        project_dir,
+        timeout_seconds=timeout_seconds,
+    )
+    return persist_source_snapshot(
+        snapshot,
+        destination,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="DepLoom sealed SourceSnapshot")
+    parser.add_argument("--capture-durable", metavar="PROJECT")
+    parser.add_argument("--destination")
+    parser.add_argument("--timeout-seconds", type=int, default=1800)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    if not args.capture_durable:
+        parser.error("--capture-durable is required")
+    if not args.destination:
+        parser.error("--destination is required")
+    snapshot = capture_durable_source_snapshot(
+        Path(args.capture_durable),
+        Path(args.destination),
+        timeout_seconds=args.timeout_seconds,
+    )
+    result = {
+        "sourceSnapshotLocator": str(snapshot.container),
+        "sourceSnapshotKey": snapshot.key,
+        "toolBuildId": tool_build_id(),
+        "projectRelative": snapshot.project_relative.as_posix() or ".",
+        "manifestKey": snapshot.manifest_key,
+        "fileCount": snapshot.file_count,
+        "byteCount": snapshot.byte_count,
+    }
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

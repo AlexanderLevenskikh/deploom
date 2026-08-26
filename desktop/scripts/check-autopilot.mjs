@@ -67,7 +67,7 @@ mustContain(main, 'needsGoalSeekingSupervisor', 'empty fresh plan falls back to 
 mustContain(main, 'Пустой scope не будет отправлен Executor', 'fallback seed is explicitly separated from executor scope')
 mustContain(main, 'AGENT_BRANCH_SCOPE_VIOLATION', 'wrong-branch agent sessions are routed to Supervisor reconciliation')
 mustContain(main, "if (input.action === 'baseline') clearPlannerDeferrals(workspace, project.name)", 'temporary planner deferrals reset on fresh baseline')
-mustContain(main, 'baselineStartCommands(input, project)', 'fresh baseline is captured from a clean source checkout')
+mustContain(main, 'SOURCE_SNAPSHOT_BASELINE_LIVE_CHECKOUT', 'fresh baseline seals the live checkout without a clean-Git precondition')
 mustContain(main, 'cleanupSupersededMigrationAfterBaseline', 'successful baseline closes the previous execution epoch')
 mustContain(main, 'forgetProjectPromptState(job.workspace, project.name, oldPromptPath)', 'old immutable prompt cannot survive a fresh baseline')
 mustContain(workspace, "planning: t('flow.runtime.planning')", 'planner is not rendered as a per-branch worker')

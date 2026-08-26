@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -70,6 +72,122 @@ class BlockOmegaGuardedLowerPhysicalAcceptance(unittest.TestCase):
             self.assertEqual((), result.errors)
             self.assertEqual((), result.mutations)
             cleanup_guarded_clone(target)
+
+    def _junction(self, link: Path, target: Path) -> None:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        comspec = os.environ.get("COMSPEC") or "cmd.exe"
+        result = subprocess.run(
+            [comspec, "/d", "/s", "/c", subprocess.list2cmdline(
+                ["mklink", "/J", str(link), str(target)]
+            )],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(0, result.returncode, result.stdout)
+
+    @staticmethod
+    def _sha(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def test_scoped_workspace_alias_rebases_into_private_upper(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            prepared = self._prepared_tree(root)
+            workspace = prepared / "packages" / "ui"
+            workspace.mkdir(parents=True)
+            source = workspace / "index.js"
+            source.write_text("module.exports = 'sealed';\n", encoding="utf-8")
+            self._junction(prepared / "node_modules" / "@acme" / "ui", workspace)
+
+            before = self._sha(source)
+            target = root / "clone"
+            project = try_materialize_guarded_clone(
+                source_project=prepared,
+                prepared_workspace_root=prepared,
+                project_relative=Path("."),
+                target=target,
+                dependency_roots=dependency_root_manifest(prepared),
+            )
+            self.assertIsNotNone(project)
+            assert project is not None
+            scoped_shell = project / "node_modules" / "@acme"
+            alias = scoped_shell / "ui"
+            self.assertFalse(scoped_shell.samefile(prepared / "node_modules" / "@acme"))
+            self.assertTrue(alias.samefile(project / "packages" / "ui"))
+
+            (alias / "index.js").write_text("module.exports = 'private';\n", encoding="utf-8")
+            self.assertEqual(before, self._sha(source))
+            result = stop_guarded_clone(target)
+            self.assertFalse(result.errors, result.errors)
+            self.assertFalse(result.mutations, result.mutations)
+            cleanup_guarded_clone(target)
+
+    def test_nested_and_sibling_workspace_links_rebase_privately(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            prepared = self._prepared_tree(root)
+            for name in ("a", "b"):
+                package = prepared / "packages" / name
+                package.mkdir(parents=True)
+                (package / "index.js").write_text(name, encoding="utf-8")
+            self._junction(prepared / "node_modules" / "a", prepared / "packages" / "a")
+            self._junction(
+                prepared / "packages" / "a" / "node_modules" / "@scope" / "b",
+                prepared / "packages" / "b",
+            )
+            target = root / "clone"
+            project = try_materialize_guarded_clone(
+                source_project=prepared,
+                prepared_workspace_root=prepared,
+                project_relative=Path("."),
+                target=target,
+                dependency_roots=dependency_root_manifest(prepared),
+            )
+            self.assertIsNotNone(project)
+            assert project is not None
+            self.assertTrue((project / "node_modules" / "a").samefile(project / "packages" / "a"))
+            self.assertTrue(
+                (project / "packages" / "a" / "node_modules" / "@scope" / "b").samefile(
+                    project / "packages" / "b"
+                )
+            )
+            cleanup_guarded_clone(target)
+
+    def test_external_and_cycle_junctions_reject_guarded_optimization(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            outside = root / "outside"
+            outside.mkdir()
+            prepared = self._prepared_tree(root)
+            self._junction(prepared / "node_modules" / "external", outside)
+            target = root / "external-clone"
+            self.assertIsNone(try_materialize_guarded_clone(
+                source_project=prepared,
+                prepared_workspace_root=prepared,
+                project_relative=Path("."),
+                target=target,
+                dependency_roots=dependency_root_manifest(prepared),
+            ))
+            self.assertFalse(target.exists())
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            prepared = self._prepared_tree(root)
+            self._junction(prepared / "cycle", prepared)
+            target = root / "cycle-clone"
+            self.assertIsNone(try_materialize_guarded_clone(
+                source_project=prepared,
+                prepared_workspace_root=prepared,
+                project_relative=Path("."),
+                target=target,
+                dependency_roots=dependency_root_manifest(prepared),
+            ))
+            self.assertFalse(target.exists())
 
     def test_dependency_write_is_detected_without_pre_hash(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

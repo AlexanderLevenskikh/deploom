@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlparse
 from semantic_version import NpmSpec
 from block_vex_storage import semantic_verification_environment
 from verification_observability import emit_observability_event
+from substrate_identity import tool_build_id
 from source_snapshot import (
     SourceCaptureError,
     active_source_snapshot,
@@ -30,9 +31,9 @@ from project_topology import (
 # BLOCK_Z_PROJECT_TOPOLOGY_V1
 
 # BLOCK_X_SOURCE_TRUTH_V1
-PROOF_SCHEMA_VERSION = "baseline-proof-v6-source-snapshot"
-RESOLVER_CONTEXT_SCHEMA_VERSION = "resolver-context-v2-source-snapshot"
-TRIAL_PROOF_KEY_SCHEMA_VERSION = "trial-proof-key-v1"
+PROOF_SCHEMA_VERSION = "baseline-proof-v7-tool-build"
+RESOLVER_CONTEXT_SCHEMA_VERSION = "resolver-context-v3-tool-build"
+TRIAL_PROOF_KEY_SCHEMA_VERSION = "trial-proof-key-v2-tool-build"
 
 _RESOLVER_FILES = (
     "package.json",
@@ -99,7 +100,11 @@ def environment_snapshot_fingerprint(environment: Mapping[str, str]) -> str:
         (str(key), hashlib.sha256(str(value).encode("utf-8")).hexdigest())
         for key, value in sorted(semantic.items())
     ]
-    return _canonical_hash({"schema": PROOF_SCHEMA_VERSION, "environment": payload})
+    return _canonical_hash({
+        "schema": PROOF_SCHEMA_VERSION,
+        "toolBuildId": tool_build_id(),
+        "environment": payload,
+    })
 
 
 def _run_git(project_dir: Path, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -646,6 +651,7 @@ def remote_fixed_resolver_input_fingerprint(
     return _canonical_hash(
         {
             "schema": PROOF_SCHEMA_VERSION,
+            "toolBuildId": tool_build_id(),
             "remoteFixedResolverInputs": remote,
             "remoteFixedResolverControlInputs": controls,
         },
@@ -738,6 +744,7 @@ def fixed_resolver_input_fingerprint(
     return _canonical_hash(
         {
             "schema": PROOF_SCHEMA_VERSION,
+            "toolBuildId": tool_build_id(),
             "fixedResolverInputs": fixed,
             "fixedResolverControlInputs": fixed_controls,
         },
@@ -946,6 +953,7 @@ def _resolver_context_payload(
         ) from exc
     return {
         "schema": PROOF_SCHEMA_VERSION,
+        "toolBuildId": tool_build_id(),
         "projectTopology": topology_payload,
         "projectResolverFiles": _resolver_ancestor_files(project_dir),
         "userConfigFiles": _user_config_files(environment),
@@ -1000,6 +1008,7 @@ def build_resolver_trial_key(
     return _canonical_hash(
         {
             "schema": TRIAL_PROOF_KEY_SCHEMA_VERSION,
+            "toolBuildId": tool_build_id(),
             "kind": "resolver-trial",
             "resolverContextKey": context_key,
             "assignment": sorted((str(k), str(v)) for k, v in assignment.items()),
@@ -1029,6 +1038,7 @@ def build_project_trial_key(
     return _canonical_hash(
         {
             "schema": TRIAL_PROOF_KEY_SCHEMA_VERSION,
+            "toolBuildId": tool_build_id(),
             "kind": "project-trial",
             "resolverTrialKey": resolver_key,
             "resolvedStateKey": state_key,
@@ -1053,6 +1063,8 @@ def _proof_record_identity_valid(
     identity: Mapping[str, str],
 ) -> bool:
     if identity.get("proofSchema") != PROOF_SCHEMA_VERSION:
+        return False
+    if identity.get("toolBuildId") != tool_build_id():
         return False
     key_field = {
         "resolver": "resolverInputKey",
@@ -1122,6 +1134,7 @@ def _proof_record_metadata_valid(
 @dataclasses.dataclass(frozen=True)
 class VerificationProofIdentity:
     schema_version: str
+    tool_build_id: str
     assignment_key: str
     environment_key: str
     source_snapshot_key: str
@@ -1135,6 +1148,7 @@ class VerificationProofIdentity:
     def event_fields(self) -> dict[str, str]:
         return {
             "proofSchema": self.schema_version,
+            "toolBuildId": self.tool_build_id,
             "assignmentKey": self.assignment_key,
             "environmentKey": self.environment_key,
             "sourceSnapshotKey": self.source_snapshot_key,
@@ -1188,6 +1202,7 @@ def build_verification_proof_identity(
 
     preparation_key = _canonical_hash({
         "schema": PROOF_SCHEMA_VERSION,
+        "toolBuildId": tool_build_id(),
         "resolverInputKey": resolver_key,
         "resolvedStateKey": "",
         "sourceSnapshotKey": source_key,
@@ -1195,6 +1210,7 @@ def build_verification_proof_identity(
     })
     project_key = _canonical_hash({
         "schema": PROOF_SCHEMA_VERSION,
+        "toolBuildId": tool_build_id(),
         "preparationProofKey": preparation_key,
         "sourceSnapshotKey": source_key,
         "projectChecks": project_checks,
@@ -1202,11 +1218,13 @@ def build_verification_proof_identity(
     })
     localization_key = _canonical_hash({
         "schema": PROOF_SCHEMA_VERSION,
+        "toolBuildId": tool_build_id(),
         "projectProofKey": project_key,
         "algorithm": "same-origin-localization-v1",
     })
     return VerificationProofIdentity(
         schema_version=PROOF_SCHEMA_VERSION,
+        tool_build_id=tool_build_id(),
         assignment_key=assignment_key,
         environment_key=environment_key,
         source_snapshot_key=source_key,
@@ -1234,6 +1252,7 @@ def bind_resolved_state_identity(
         raise ValueError("RESOLVED_STATE_KEY_INVALID")
     preparation_key = _canonical_hash({
         "schema": PROOF_SCHEMA_VERSION,
+        "toolBuildId": tool_build_id(),
         "resolverInputKey": identity.resolver_input_key,
         "resolvedStateKey": resolved_state_key,
         "sourceSnapshotKey": identity.source_snapshot_key,
@@ -1241,6 +1260,7 @@ def bind_resolved_state_identity(
     })
     project_key = _canonical_hash({
         "schema": PROOF_SCHEMA_VERSION,
+        "toolBuildId": tool_build_id(),
         "preparationProofKey": preparation_key,
         "sourceSnapshotKey": identity.source_snapshot_key,
         "projectChecks": project_checks,
@@ -1248,6 +1268,7 @@ def bind_resolved_state_identity(
     })
     localization_key = _canonical_hash({
         "schema": PROOF_SCHEMA_VERSION,
+        "toolBuildId": tool_build_id(),
         "projectProofKey": project_key,
         "algorithm": "same-origin-localization-v1",
     })
@@ -1300,6 +1321,8 @@ class VerificationProofStore:
             return None
         if payload.get("proofSchema") != PROOF_SCHEMA_VERSION:
             return None
+        if payload.get("toolBuildId") != tool_build_id():
+            return None
         if payload.get("proofType") != proof_type or payload.get("key") != key:
             return None
         if payload.get("outcome") != "passed":
@@ -1346,6 +1369,7 @@ class VerificationProofStore:
         payload = {
             "schemaVersion": 1,
             "proofSchema": PROOF_SCHEMA_VERSION,
+            "toolBuildId": tool_build_id(),
             "proofType": proof_type,
             "key": key,
             "outcome": "passed",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -56,6 +57,47 @@ class PreparedArtifactTests(unittest.TestCase):
         other.mkdir()
         self.assertIsNone(store.load_prepared_artifact_record(self.key, other))
 
+    def test_same_size_restored_mtime_tampering_invalidates_cross_process_hit(self):
+        self.assertTrue(store.publish_prepared_artifact_record(
+            key=self.key, workspace_root=self.stage, project_relative=Path("project"),
+            source_project=self.source, storage_mode="test",
+            observed_resolved_versions={}, observed_resolved_hash="e" * 64,
+        ))
+        subject = self.stage / "project" / "package.json"
+        before = subject.stat()
+        subject.write_text("[]", encoding="utf-8")
+        os.utime(subject, ns=(before.st_atime_ns, before.st_mtime_ns))
+        store._clear_artifact_integrity_validation_cache_for_tests()
+
+        self.assertIsNone(store.load_prepared_artifact_record(self.key, self.source))
+        record_path = store.configured_prepared_artifact_root() / "index" / f"{self.key}.json"
+        self.assertFalse(record_path.exists())
+
+    def test_tool_build_change_invalidates_durable_record(self):
+        from unittest.mock import patch
+
+        self.assertTrue(store.publish_prepared_artifact_record(
+            key=self.key, workspace_root=self.stage, project_relative=Path("project"),
+            source_project=self.source, storage_mode="test",
+            observed_resolved_versions={}, observed_resolved_hash="f" * 64,
+        ))
+        store._clear_artifact_integrity_validation_cache_for_tests()
+        with patch.object(store, "tool_build_id", return_value="0" * 64):
+            self.assertIsNone(store.load_prepared_artifact_record(self.key, self.source))
+
+    def test_legacy_record_schema_is_a_safe_miss(self):
+        self.assertTrue(store.publish_prepared_artifact_record(
+            key=self.key, workspace_root=self.stage, project_relative=Path("project"),
+            source_project=self.source, storage_mode="test",
+            observed_resolved_versions={}, observed_resolved_hash="1" * 64,
+        ))
+        record_path = store.configured_prepared_artifact_root() / "index" / f"{self.key}.json"
+        payload = json.loads(record_path.read_text(encoding="utf-8"))
+        payload["schemaVersion"] = 1
+        record_path.write_text(json.dumps(payload), encoding="utf-8")
+        store._clear_artifact_integrity_validation_cache_for_tests()
+        self.assertIsNone(store.load_prepared_artifact_record(self.key, self.source))
+
     def test_record_is_not_authority(self):
         store.publish_prepared_artifact_record(
             key=self.key, workspace_root=self.stage, project_relative=Path("project"),
@@ -63,7 +105,11 @@ class PreparedArtifactTests(unittest.TestCase):
             observed_resolved_versions={}, observed_resolved_hash="d" * 64,
         )
         index = store.configured_prepared_artifact_root() / "index" / f"{self.key}.json"
-        self.assertIn('"authority": "PRECONDITION_CACHE"', index.read_text(encoding="utf-8"))
+        payload = json.loads(index.read_text(encoding="utf-8"))
+        self.assertEqual("PRECONDITION_CACHE", payload["authority"])
+        self.assertEqual(2, payload["schemaVersion"])
+        self.assertEqual(64, len(payload["artifactContentKey"]))
+        self.assertEqual(64, len(payload["toolBuildId"]))
 
 
 if __name__ == "__main__":

@@ -81,6 +81,11 @@ from project_topology import (
     ProjectTopologyError,
     resolve_project_topology,
 )
+from reparse_materialization import (
+    ReparseLink,
+    ReparseMaterializationError,
+    inventory_reparse_plan,
+)
 # BLOCK_Z_PROJECT_TOPOLOGY_V1
 from verification_observability import (
     attempt_scope,
@@ -732,25 +737,7 @@ def _candidate_workspace_junctions(
     return tuple(unique[key] for key in sorted(unique))
 
 
-def _workspace_junction_rebase_plan(
-    workspace_root: Path,
-    workspace_project: Path,
-) -> Dict[str, str]:
-    if os.name != "nt":
-        return {}
-
-    workspace_root = workspace_root.resolve()
-    workspace_project = workspace_project.resolve()
-
-    candidates = _candidate_workspace_junctions(
-        workspace_root,
-        workspace_project,
-    )
-    if not candidates:
-        # Snapshot substrate is intentionally topology-agnostic unless an
-        # absolute Windows reparse target actually needs rebasing.
-        return {}
-
+def _workspace_package_targets(workspace_project: Path) -> Dict[str, Path]:
     try:
         topology = resolve_project_topology(
             workspace_project,
@@ -762,19 +749,16 @@ def _workspace_junction_rebase_plan(
             f"WORKSPACE_JUNCTION_TOPOLOGY_UNAVAILABLE: {exc}"
         ) from exc
 
-    expected_by_name: Dict[str, Path] = {}
+    targets: Dict[str, Path] = {}
     for manifest_path in topology.workspace_member_manifests:
         member_root = manifest_path.parent.resolve()
         if member_root == topology.package_manager_root.resolve():
             continue
         try:
-            manifest = json.loads(
-                manifest_path.read_text(encoding="utf-8")
-            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError) as exc:
             raise RuntimeError(
-                f"WORKSPACE_JUNCTION_MANIFEST_UNREADABLE: "
-                f"{manifest_path}: {exc}"
+                f"WORKSPACE_JUNCTION_MANIFEST_UNREADABLE: {manifest_path}: {exc}"
             ) from exc
         if not isinstance(manifest, dict):
             raise RuntimeError(
@@ -782,73 +766,50 @@ def _workspace_junction_rebase_plan(
             )
         package_name = str(manifest.get("name") or "").strip()
         if package_name:
-            expected_by_name[package_name] = member_root
+            targets[package_name] = member_root
+    return targets
 
-    plan: Dict[str, str] = {}
-    for link in candidates:
-        try:
-            relative_to_node_modules = None
-            cursor = link.parent
-            while True:
-                if cursor.name == "node_modules":
-                    relative_to_node_modules = link.relative_to(cursor)
-                    break
-                if cursor == workspace_root or cursor.parent == cursor:
-                    break
-                cursor = cursor.parent
-            if relative_to_node_modules is None:
-                raise RuntimeError(
-                    f"WORKSPACE_JUNCTION_NODE_MODULES_PARENT_MISSING: {link}"
-                )
-            parts = relative_to_node_modules.parts
-            package_name = (
-                f"{parts[0]}/{parts[1]}"
-                if len(parts) >= 2 and parts[0].startswith("@")
-                else parts[0]
-            )
-        except (ValueError, IndexError) as exc:
-            raise RuntimeError(
-                f"WORKSPACE_JUNCTION_NAME_UNAVAILABLE: {link}: {exc}"
-            ) from exc
 
-        expected_target = expected_by_name.get(package_name)
-        if expected_target is None:
-            raise RuntimeError(
-                "WORKSPACE_JUNCTION_UNDECLARED_REPARSE: "
-                f"{link}; package={package_name!r} is not an owned workspace member"
-            )
+def _canonical_workspace_reparse_plan(
+    workspace_root: Path,
+    workspace_project: Path,
+) -> tuple[ReparseLink, ...]:
+    if os.name != "nt":
+        return ()
+    workspace_root = workspace_root.resolve()
+    workspace_project = workspace_project.resolve()
+    try:
+        workspace_project.relative_to(workspace_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            "WORKSPACE_JUNCTION_PROJECT_OUTSIDE_ROOT: "
+            f"project={workspace_project}; root={workspace_root}"
+        ) from exc
+    try:
+        preliminary = inventory_reparse_plan(workspace_root)
+        if not preliminary:
+            return ()
+        if not any(item.package_name for item in preliminary):
+            return preliminary
+        return inventory_reparse_plan(
+            workspace_root,
+            workspace_package_targets=_workspace_package_targets(workspace_project),
+        )
+    except ReparseMaterializationError as exc:
+        raise RuntimeError(f"WORKSPACE_REPARSE_PLAN_REJECTED: {exc}") from exc
 
-        try:
-            observed_target = link.resolve(strict=True)
-        except OSError as exc:
-            raise RuntimeError(
-                f"WORKSPACE_JUNCTION_TARGET_UNAVAILABLE: {link}: {exc}"
-            ) from exc
 
-        try:
-            target_matches = observed_target.samefile(expected_target)
-        except OSError:
-            target_matches = observed_target == expected_target
-        if not target_matches:
-            raise RuntimeError(
-                "WORKSPACE_JUNCTION_TARGET_MISMATCH: "
-                f"{link} -> {observed_target}; expected={expected_target}"
-            )
-
-        try:
-            link_relative = link.relative_to(workspace_root).as_posix()
-            target_relative = expected_target.relative_to(
-                workspace_root
-            ).as_posix()
-        except ValueError as exc:
-            raise RuntimeError(
-                "WORKSPACE_JUNCTION_ESCAPE: "
-                f"link={link}; target={expected_target}; root={workspace_root}"
-            ) from exc
-
-        plan[link_relative] = target_relative
-
-    return dict(sorted(plan.items()))
+def _workspace_junction_rebase_plan(
+    workspace_root: Path,
+    workspace_project: Path,
+) -> Dict[str, str]:
+    return {
+        item.link_relative: item.target_relative
+        for item in _canonical_workspace_reparse_plan(
+            workspace_root,
+            workspace_project,
+        )
+    }
 
 
 def _remove_reparse_or_tree(path: Path) -> None:
@@ -946,6 +907,7 @@ def _copy_tree_snapshot(
     progress_label: str = "prepared snapshot copy",
     timeout_seconds: int = 1800,
     progress_interval_seconds: int = 15,
+    reparse_plan: Optional[tuple[ReparseLink, ...]] = None,
 ) -> None:
     """Materialize a proof-safe private tree through the platform backend."""
     mode = materialize_private_tree(
@@ -958,6 +920,7 @@ def _copy_tree_snapshot(
         # Preserve the verifier-level heartbeat/timeout hook. WorkspaceBackend
         # still owns platform selection; the caller owns command supervision.
         runner=_run_snapshot_copy,
+        reparse_plan=reparse_plan,
     )
     _emit_progress(
         progress,
@@ -1136,10 +1099,14 @@ def _publish_prepared_workspace_snapshot(
     stage_workspace = stage / "workspace"
     relative = workspace_project.resolve().relative_to(workspace_root.resolve())
     storage_mode = "copied-sealed-workspace"
-    junction_rebases = _workspace_junction_rebase_plan(
+    canonical_reparse_plan = _canonical_workspace_reparse_plan(
         workspace_root,
         workspace_project,
     )
+    junction_rebases = {
+        item.link_relative: item.target_relative
+        for item in canonical_reparse_plan
+    }
     try:
         # On the normal Windows path both directories live under the same temp
         # volume. Renaming the already-prepared tree publishes the immutable
@@ -1168,6 +1135,7 @@ def _publish_prepared_workspace_snapshot(
                 progress_label=progress_label,
                 timeout_seconds=timeout_seconds,
                 progress_interval_seconds=progress_interval_seconds,
+                reparse_plan=canonical_reparse_plan,
             )
             _rebase_workspace_junctions(
                 stage_workspace,
@@ -1270,10 +1238,14 @@ def _materialize_prepared_workspace_snapshot(
         progress=progress,
     ) if os.name == "nt" else None
     try:
-        junction_rebases = _workspace_junction_rebase_plan(
+        canonical_reparse_plan = _canonical_workspace_reparse_plan(
             snapshot.workspace_root,
             snapshot.workspace_root / snapshot.project_relative,
         )
+        junction_rebases = {
+            item.link_relative: item.target_relative
+            for item in canonical_reparse_plan
+        }
         _copy_tree_snapshot(
             snapshot.workspace_root,
             target,
@@ -1281,6 +1253,7 @@ def _materialize_prepared_workspace_snapshot(
             progress_label=progress_label,
             timeout_seconds=timeout_seconds,
             progress_interval_seconds=progress_interval_seconds,
+            reparse_plan=canonical_reparse_plan,
         )
         _rebase_workspace_junctions(
             target,

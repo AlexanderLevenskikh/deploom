@@ -213,7 +213,7 @@ class BlockYFullObservabilityTests(unittest.TestCase):
         import verification_proof
 
         self.assertEqual(
-            "baseline-proof-v6-source-snapshot",
+            "baseline-proof-v7-tool-build",
             verification_proof.PROOF_SCHEMA_VERSION,
         )
 

@@ -10,23 +10,31 @@ from baseline_constraint_verifier import BaselineProjectFailure, BaselineVerifyC
 from dependency_compatibility_evidence import (
     CompatibilityEvidence,
     CompatibilityEvidenceAction,
+    CompatibilityEvidenceError,
+    _materialize_evidence_ref,
     load_compatibility_evidence,
     localize_compatibility_evidence,
 )
+from source_snapshot import capture_durable_source_snapshot
+from substrate_identity import tool_build_id
 
 
 STRUCTURAL = "config/plugins.ts:1:1 - error TS2307: Cannot find module '@demo/plugin' or its corresponding type declarations. There are types at x, but this result could not be resolved under your current 'moduleResolution' setting. Consider updating to 'node16', 'nodenext', or 'bundler'."
 
 
 class CompatibilityEvidenceTests(unittest.TestCase):
-    def test_loads_v1_evidence(self) -> None:
+    def test_loads_v2_sealed_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "evidence.json"
             path.write_text(json.dumps({
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "project": "Demo",
                 "projectPath": temp,
                 "branchRef": "CD-1-cohort-demo",
+                "sourceSnapshotLocator": str(Path(temp) / "snapshot"),
+                "sourceSnapshotKey": "sealed-key",
+                "toolBuildId": tool_build_id(),
+                "projectRelative": ".",
                 "targetMode": "yellow",
                 "commands": ["yarn lint:types"],
                 "actions": [
@@ -36,6 +44,68 @@ class CompatibilityEvidenceTests(unittest.TestCase):
             evidence = load_compatibility_evidence(path)
             self.assertEqual(evidence.project, "Demo")
             self.assertEqual(evidence.actions[0].current, "1.0.0")
+
+
+    def test_v1_branch_reconstruction_evidence_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "evidence.json"
+            path.write_text(json.dumps({
+                "schemaVersion": 1,
+                "project": "Demo",
+                "projectPath": temp,
+                "branchRef": "branch",
+                "targetMode": "yellow",
+                "commands": ["npm test"],
+                "actions": [
+                    {"package": "a", "current": "1", "target": "2", "action": "update"},
+                ],
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(
+                CompatibilityEvidenceError,
+                "schemaVersion must be 2",
+            ):
+                load_compatibility_evidence(path)
+
+    def test_materialization_uses_sealed_snapshot_not_mutated_live_repo(self) -> None:
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as state:
+            root = Path(temp)
+            subprocess.run(["git", "-C", str(root), "init", "-b", "master"], check=True, stdout=subprocess.PIPE)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "evidence@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "Evidence"], check=True)
+            (root / "package.json").write_text('{"name":"demo","private":true}', encoding="utf-8")
+            subject = root / "subject.txt"
+            subject.write_text("sealed-post-executor", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-m", "initial"], check=True, stdout=subprocess.PIPE)
+
+            durable = capture_durable_source_snapshot(
+                root,
+                Path(state) / "evidence.source-snapshot",
+                timeout_seconds=60,
+            )
+            subject.write_text("mutated-live-checkout", encoding="utf-8")
+            evidence = CompatibilityEvidence(
+                project="Demo",
+                project_path=root,
+                branch_ref="master",
+                target_mode="yellow",
+                commands=("npm test",),
+                actions=(CompatibilityEvidenceAction("a", "1", "2"),),
+                source_snapshot_locator=durable.container,
+                source_snapshot_key=durable.key,
+                project_relative=durable.project_relative,
+            )
+            materialized_root, project = _materialize_evidence_ref(evidence)
+            try:
+                self.assertEqual(
+                    "sealed-post-executor",
+                    (project / "subject.txt").read_text(encoding="utf-8"),
+                )
+            finally:
+                import shutil
+                shutil.rmtree(materialized_root, ignore_errors=True)
 
     def test_candidate_vs_control_localizes_target_nogood(self) -> None:
         evidence = CompatibilityEvidence(
@@ -122,10 +192,14 @@ class CompatibilityEvidenceTests(unittest.TestCase):
             )
             path = Path(temp) / "evidence.json"
             path.write_text(json.dumps({
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "project": "Demo",
                 "projectPath": temp,
                 "branchRef": "CD-1-cohort-demo",
+                "sourceSnapshotLocator": str(Path(temp) / "snapshot"),
+                "sourceSnapshotKey": "sealed-key",
+                "toolBuildId": tool_build_id(),
+                "projectRelative": ".",
                 "targetMode": "yellow",
                 "commands": ["yarn lint:types"],
                 "actions": [

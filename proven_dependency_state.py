@@ -7,8 +7,10 @@ import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from substrate_identity import tool_build_id
+
 PROVEN_DEPENDENCY_STATE_SCHEMA_VERSION = 1
-PROVEN_DEPENDENCY_ENVELOPE_SCHEMA_VERSION = 4
+PROVEN_DEPENDENCY_ENVELOPE_SCHEMA_VERSION = 5
 RESOLVER_PROOF_STATUS_PASSED = "passed"
 RESOLVER_PROOF_STATUS_NOT_REQUIRED_NO_OP = "not-required-no-op"
 RESOLVER_PROOF_STATUSES = frozenset({
@@ -81,6 +83,7 @@ def build_proven_dependency_envelope(
     payload: dict[str, Any] = {
         "schemaVersion": PROVEN_DEPENDENCY_ENVELOPE_SCHEMA_VERSION,
         "proofSchema": str(proof_schema),
+        "toolBuildId": tool_build_id(),
         "project": str(project),
         "mode": str(mode),
         "sourceHead": str(source_head),
@@ -113,6 +116,8 @@ def validate_proven_dependency_envelope(
 ) -> tuple[bool, str]:
     if int(envelope.get("schemaVersion", 0) or 0) != PROVEN_DEPENDENCY_ENVELOPE_SCHEMA_VERSION:
         return False, "unsupported envelope schema"
+    if envelope.get("toolBuildId") != tool_build_id():
+        return False, "toolBuildId missing or stale"
     expected = str(envelope.get("envelopeKey") or "")
     if not expected:
         return False, "envelope key missing"

@@ -209,8 +209,9 @@ export function scopeTargetsFromPrompt(markdown: string, projectName: string): R
 }
 
 export type ProvenDependencyEnvelope = {
-  schemaVersion: 4
+  schemaVersion: 5
   proofSchema: string
+  toolBuildId: string
   envelopeKey: string
   project: string
   mode: string
@@ -267,7 +268,8 @@ export function validateScopeProofEnvelope(
   const manifest = migrationScopeManifestFromPrompt(markdown)
   const envelope = proofEnvelopeFromPrompt(markdown, projectName)
   if (!manifest || !envelope) return { ok: false, reason: 'proof envelope missing' }
-  if (envelope.schemaVersion !== 4 || envelope.project !== projectName) return { ok: false, reason: 'proof envelope project/schema mismatch' }
+  if (envelope.schemaVersion !== 5 || envelope.project !== projectName) return { ok: false, reason: 'proof envelope project/schema mismatch' }
+  if (!/^[0-9a-f]{64}$/i.test(envelope.toolBuildId || '')) return { ok: false, reason: 'proof envelope tool build identity missing' }
   if (typeof manifest.targetMode !== 'string' || envelope.mode !== manifest.targetMode) return { ok: false, reason: 'proof envelope target mode mismatch' }
   if (!envelope.envelopeKey || proofEnvelopeContentKey(envelope) !== envelope.envelopeKey) return { ok: false, reason: 'proof envelope content hash mismatch' }
   if (!envelope.sourceHead || !envelope.sourceSnapshotKey || !envelope.assignmentKey || !envelope.resolverInputKey) return { ok: false, reason: 'proof envelope identity incomplete' }

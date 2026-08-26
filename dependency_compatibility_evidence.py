@@ -12,13 +12,18 @@ from __future__ import annotations
 import inspect
 import json
 import shutil
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from proven_dependency_state import validate_proven_dependency_envelope
+from source_snapshot import (
+    SourceCaptureError,
+    open_source_snapshot,
+)
+from verification_workspace_backend import materialize_private_tree
+from substrate_identity import tool_build_id
 
 from baseline_constraint_verifier import (
     BaselineVerifyConfig,
@@ -49,6 +54,10 @@ class CompatibilityEvidence:
     materialization_proof: str = ""
     proof_envelope_key: str = ""
     exact_assignment: Tuple[Tuple[str, str], ...] = ()
+    source_snapshot_locator: Path = Path()
+    source_snapshot_key: str = ""
+    tool_build_id: str = ""
+    project_relative: Path = Path(".")
 
 
 class CompatibilityEvidenceError(RuntimeError):
@@ -60,11 +69,17 @@ def load_compatibility_evidence(path: Path) -> CompatibilityEvidence:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError) as exc:
         raise CompatibilityEvidenceError(f"invalid compatibility evidence file: {exc}") from exc
-    if not isinstance(raw, dict) or int(raw.get("schemaVersion", 0) or 0) != 1:
-        raise CompatibilityEvidenceError("compatibility evidence schemaVersion must be 1")
+    if not isinstance(raw, dict) or int(raw.get("schemaVersion", 0) or 0) != 2:
+        raise CompatibilityEvidenceError("compatibility evidence schemaVersion must be 2")
     project = str(raw.get("project") or "").strip()
-    project_path = Path(str(raw.get("projectPath") or "")).expanduser()
+    project_path_text = str(raw.get("projectPath") or "").strip()
+    project_path = Path(project_path_text).expanduser()
     branch_ref = str(raw.get("branchRef") or "").strip()
+    snapshot_locator_text = str(raw.get("sourceSnapshotLocator") or "").strip()
+    snapshot_key = str(raw.get("sourceSnapshotKey") or "").strip()
+    evidence_build_id = str(raw.get("toolBuildId") or "").strip()
+    project_relative_text = str(raw.get("projectRelative") or ".").strip()
+    project_relative = Path(project_relative_text)
     target_mode = str(raw.get("targetMode") or "default").strip().lower()
     if target_mode not in {"yellow", "green", "default"}:
         raise CompatibilityEvidenceError(f"unsupported targetMode {target_mode!r}")
@@ -82,8 +97,16 @@ def load_compatibility_evidence(path: Path) -> CompatibilityEvidence:
             action = str(item.get("action") or "update").strip().lower()
             if package and current and target and action == "update":
                 actions.append(CompatibilityEvidenceAction(package, current, target, action))
-    if not project or not project_path or not branch_ref:
-        raise CompatibilityEvidenceError("evidence requires project, projectPath and branchRef")
+    if not project or not project_path_text or not branch_ref:
+        raise CompatibilityEvidenceError("evidence requires project, projectPath and branchRef provenance")
+    if not snapshot_locator_text or not snapshot_key:
+        raise CompatibilityEvidenceError(
+            "evidence requires sourceSnapshotLocator and sourceSnapshotKey"
+        )
+    if evidence_build_id != tool_build_id():
+        raise CompatibilityEvidenceError("evidence toolBuildId is missing or stale")
+    if project_relative.is_absolute() or ".." in project_relative.parts:
+        raise CompatibilityEvidenceError("evidence projectRelative must stay inside the snapshot")
     if not commands:
         raise CompatibilityEvidenceError("evidence requires at least one deterministic verification command")
     if not actions:
@@ -121,46 +144,53 @@ def load_compatibility_evidence(path: Path) -> CompatibilityEvidence:
         materialization_proof=str(raw.get("materializationProof") or ""),
         proof_envelope_key=proof_envelope_key,
         exact_assignment=exact_assignment,
+        source_snapshot_locator=Path(snapshot_locator_text).expanduser().resolve(),
+        source_snapshot_key=snapshot_key,
+        tool_build_id=evidence_build_id,
+        project_relative=project_relative,
     )
-
-
-def _git_root_and_relative(project_path: Path) -> Tuple[Path, Path]:
-    probe = subprocess.run(
-        ["git", "-C", str(project_path), "rev-parse", "--show-toplevel"],
-        text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        timeout=30, check=False,
-    )
-    if probe.returncode != 0 or not probe.stdout.strip():
-        raise CompatibilityEvidenceError(f"projectPath is not inside a readable Git repository: {project_path}")
-    root = Path(probe.stdout.strip()).resolve()
-    try:
-        relative = project_path.resolve().relative_to(root)
-    except ValueError as exc:
-        raise CompatibilityEvidenceError(f"projectPath {project_path} is outside Git root {root}") from exc
-    return root, relative
 
 
 def _materialize_evidence_ref(evidence: CompatibilityEvidence) -> Tuple[Path, Path]:
-    root, relative = _git_root_and_relative(evidence.project_path)
-    temp = Path(tempfile.mkdtemp(prefix="dependency-flow-evidence-ref-"))
+    """Materialize only the sealed post-Executor filesystem subject."""
+    try:
+        snapshot = open_source_snapshot(
+            evidence.source_snapshot_locator,
+            expected_key=evidence.source_snapshot_key,
+        )
+    except SourceCaptureError as exc:
+        raise CompatibilityEvidenceError(
+            f"sealed compatibility SourceSnapshot is invalid: {exc}"
+        ) from exc
+    if snapshot.project_relative != evidence.project_relative:
+        raise CompatibilityEvidenceError(
+            "compatibility evidence projectRelative does not match SourceSnapshot"
+        )
+
+    temp = Path(tempfile.mkdtemp(prefix="dependency-flow-evidence-snapshot-"))
     clone = temp / "repo"
-    result = subprocess.run(
-        ["git", "clone", "--quiet", "--shared", "--no-hardlinks", str(root), str(clone)],
-        text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        timeout=120, check=False,
-    )
-    if result.returncode != 0:
+    try:
+        materialize_private_tree(
+            snapshot.root,
+            clone,
+            timeout_seconds=1800,
+            progress_label="compatibility evidence SourceSnapshot materialization",
+        )
+        project = (clone / snapshot.project_relative).resolve()
+        try:
+            project.relative_to(clone.resolve())
+        except ValueError as exc:
+            raise CompatibilityEvidenceError(
+                "materialized compatibility project escaped its SourceSnapshot"
+            ) from exc
+        if not project.is_dir():
+            raise CompatibilityEvidenceError(
+                f"materialized compatibility project is missing: {project}"
+            )
+        return temp, project
+    except Exception:
         shutil.rmtree(temp, ignore_errors=True)
-        raise CompatibilityEvidenceError(f"failed to clone evidence repository: {result.stdout.strip()}")
-    checkout = subprocess.run(
-        ["git", "-C", str(clone), "checkout", "--quiet", evidence.branch_ref],
-        text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        timeout=60, check=False,
-    )
-    if checkout.returncode != 0:
-        shutil.rmtree(temp, ignore_errors=True)
-        raise CompatibilityEvidenceError(f"cannot checkout evidence branch {evidence.branch_ref!r}: {checkout.stdout.strip()}")
-    return temp, clone / relative
+        raise
 
 
 def _structural(result: BaselineVerifyResult) -> set[str]:

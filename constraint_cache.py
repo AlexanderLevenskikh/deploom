@@ -27,6 +27,7 @@ from verification_proof import (
     PROOF_SCHEMA_VERSION,
     build_resolver_context_key,
 )
+from substrate_identity import tool_build_id
 
 from typing import (
     Dict,
@@ -37,8 +38,8 @@ from typing import (
     Tuple,
 )
 
-CACHE_SCHEMA_VERSION = 2
-CONSTRAINT_ENTRY_SCHEMA = "verified-resolver-nogood-v2"
+CACHE_SCHEMA_VERSION = 3
+CONSTRAINT_ENTRY_SCHEMA = "verified-resolver-nogood-v3-tool-build"
 SOLVER_SCHEMA_VERSION = "peer-ir-v3-fixed-source-identity"
 _CACHE_WRITE_THREAD_LOCK = threading.RLock()
 _WINDOWS_PERMISSION_GRACE_SECONDS = 0.25
@@ -309,6 +310,7 @@ class LearnedConstraintProof:
         payload = {
             "entrySchema": CONSTRAINT_ENTRY_SCHEMA,
             "proofSchema": PROOF_SCHEMA_VERSION,
+            "toolBuildId": tool_build_id(),
             "solverSchema": str(self.solver_schema),
             "projectPath": self.project_path,
             "resolverContextKey": context_key,
@@ -441,6 +443,7 @@ def _constraint_entry_key(payload: Mapping[str, object]) -> str:
     canonical = {
         "entrySchema": str(payload.get("entrySchema") or ""),
         "proofSchema": str(payload.get("proofSchema") or ""),
+        "toolBuildId": str(payload.get("toolBuildId") or ""),
         "solverSchema": str(payload.get("solverSchema") or ""),
         "projectPath": str(payload.get("projectPath") or ""),
         "resolverContextKey": str(payload.get("resolverContextKey") or "").lower(),
@@ -461,6 +464,7 @@ def _empty_cache() -> Dict[str, object]:
     return {
         "schemaVersion": CACHE_SCHEMA_VERSION,
         "proofSchema": PROOF_SCHEMA_VERSION,
+        "toolBuildId": tool_build_id(),
         "entrySchema": CONSTRAINT_ENTRY_SCHEMA,
         "entries": [],
     }
@@ -477,6 +481,8 @@ def _validated_constraint_entry(raw: object) -> Optional[Dict[str, object]]:
     if raw.get("entrySchema") != CONSTRAINT_ENTRY_SCHEMA:
         return None
     if raw.get("proofSchema") != PROOF_SCHEMA_VERSION:
+        return None
+    if raw.get("toolBuildId") != tool_build_id():
         return None
     if raw.get("solverSchema") != SOLVER_SCHEMA_VERSION:
         return None
@@ -507,6 +513,7 @@ def _validated_constraint_entry(raw: object) -> Optional[Dict[str, object]]:
     authority_payload = {
         "entrySchema": CONSTRAINT_ENTRY_SCHEMA,
         "proofSchema": PROOF_SCHEMA_VERSION,
+        "toolBuildId": tool_build_id(),
         "solverSchema": SOLVER_SCHEMA_VERSION,
         "projectPath": project_path,
         "resolverContextKey": context_key,
@@ -539,6 +546,7 @@ def _read_cache(path: Optional[Path]) -> Dict[str, object]:
         not isinstance(value, dict)
         or value.get("schemaVersion") != CACHE_SCHEMA_VERSION
         or value.get("proofSchema") != PROOF_SCHEMA_VERSION
+        or value.get("toolBuildId") != tool_build_id()
         or value.get("entrySchema") != CONSTRAINT_ENTRY_SCHEMA
     ):
         return _empty_cache()
@@ -568,6 +576,8 @@ def load_verified_nogoods(
         if raw.get("entrySchema") != CONSTRAINT_ENTRY_SCHEMA:
             continue
         if raw.get("proofSchema") != PROOF_SCHEMA_VERSION:
+            continue
+        if raw.get("toolBuildId") != tool_build_id():
             continue
         if raw.get("solverSchema") != SOLVER_SCHEMA_VERSION:
             continue
@@ -599,6 +609,7 @@ def load_verified_nogoods(
         authority_payload = {
             "entrySchema": raw.get("entrySchema"),
             "proofSchema": raw.get("proofSchema"),
+            "toolBuildId": raw.get("toolBuildId"),
             "solverSchema": raw.get("solverSchema"),
             "projectPath": raw.get("projectPath"),
             "resolverContextKey": raw.get("resolverContextKey"),
@@ -671,6 +682,7 @@ def persist_verified_nogood(
             payload = {
                 "schemaVersion": CACHE_SCHEMA_VERSION,
                 "proofSchema": PROOF_SCHEMA_VERSION,
+                "toolBuildId": tool_build_id(),
                 "entrySchema": CONSTRAINT_ENTRY_SCHEMA,
                 "entries": entries,
             }

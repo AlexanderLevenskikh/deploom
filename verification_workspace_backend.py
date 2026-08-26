@@ -9,6 +9,13 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from io_governor import io_slot
+from reparse_materialization import (
+    ReparseLink,
+    inventory_reparse_plan,
+    recreate_reparse_plan,
+)
+
 from verification_process_supervisor import run_supervised
 from block_vex_storage import windows_filesystem
 from verification_observability import (
@@ -100,6 +107,7 @@ def _materialize_private_tree_impl(
     runner=run_supervised,
     exclude_dir_names: tuple[str, ...] = (),
     exclude_file_names: tuple[str, ...] = (),
+    reparse_plan: Optional[tuple[ReparseLink, ...]] = None,
 ) -> str:
     # BLOCK_X_SOURCE_TRUTH_V1
     source = source.resolve()
@@ -107,6 +115,15 @@ def _materialize_private_tree_impl(
     if target.exists():
         raise RuntimeError(f"WORKSPACE_TARGET_EXISTS: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
+    canonical_plan = (
+        tuple(reparse_plan)
+        if reparse_plan is not None
+        else inventory_reparse_plan(
+            source,
+            excluded_dir_names=exclude_dir_names,
+            excluded_file_names=exclude_file_names,
+        )
+    )
 
     if os.name == "nt":
         source_fs = windows_filesystem(source)
@@ -133,6 +150,7 @@ def _materialize_private_tree_impl(
                 "/NJS",
                 "/NP",
                 "/SL",
+                "/XJ",
                 f"/MT:{_copy_workers(refs_same_volume=refs_same_volume)}",
             ]
             if exclude_dir_names:
@@ -152,6 +170,7 @@ def _materialize_private_tree_impl(
                 progress_interval_seconds=progress_interval_seconds,
             )
             if result.returncode < 8:
+                recreate_reparse_plan(source, target, canonical_plan)
                 if refs_same_volume:
                     return "windows-refs-same-volume-native-copy-eligible"
                 if target_fs == "refs":
@@ -201,6 +220,7 @@ def _materialize_private_tree_impl(
     ignored = tuple(sorted(set(exclude_dir_names) | set(exclude_file_names)))
     ignore = shutil.ignore_patterns(*ignored) if ignored else None
     shutil.copytree(source, target, symlinks=True, ignore=ignore)
+    recreate_reparse_plan(source, target, canonical_plan)
     return "portable-filtered-deep-copy" if ignored else "portable-deep-copy"
 
 # BLOCK_VG_ZERO_CONFIG_TRANSACTIONAL_UI_V1
@@ -216,8 +236,9 @@ def materialize_private_tree(
     runner=run_supervised,
     exclude_dir_names: tuple[str, ...] = (),
     exclude_file_names: tuple[str, ...] = (),
+    reparse_plan: Optional[tuple[ReparseLink, ...]] = None,
 ) -> str:
-    """Instrumented private materialization without an extra filesystem walk."""
+    """Instrumented private materialization without following reparse points."""
     operation_id = new_observability_id("materialize")
     started = time.monotonic()
     before = process_resource_snapshot()
@@ -260,6 +281,7 @@ def materialize_private_tree(
             runner=runner,
             exclude_dir_names=exclude_dir_names,
             exclude_file_names=exclude_file_names,
+            reparse_plan=reparse_plan,
         )
     except BaseException as exc:
         after = process_resource_snapshot()

@@ -178,6 +178,55 @@ class BlockXSourceTruthTests(unittest.TestCase):
             with self.assertRaisesRegex(source_snapshot.SourceCaptureError, "SOURCE_SYMLINK_ESCAPE"):
                 source_snapshot.activate_source_snapshot_epoch(project, replace=True)
 
+    def test_absolute_nested_gitdir_and_external_alternates_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as outside_tmp:
+            root = Path(tmp)
+            project = self._repo(root)
+            nested = project / "nested"
+            nested.mkdir()
+            (nested / ".git").write_text(
+                f"gitdir: {root / '.git'}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                source_snapshot.SourceCaptureError,
+                "SOURCE_GIT_ABSOLUTE_INDIRECTION_UNSUPPORTED",
+            ):
+                source_snapshot.capture_source_snapshot(project, timeout_seconds=60)
+
+            (nested / ".git").unlink()
+            alternates = root / ".git" / "objects" / "info" / "alternates"
+            alternates.parent.mkdir(parents=True, exist_ok=True)
+            alternates.write_text(str(Path(outside_tmp).resolve()), encoding="utf-8")
+            with self.assertRaisesRegex(
+                source_snapshot.SourceCaptureError,
+                "SOURCE_GIT_ABSOLUTE_INDIRECTION_UNSUPPORTED",
+            ):
+                source_snapshot.capture_source_snapshot(project, timeout_seconds=60)
+
+    def test_durable_snapshot_detects_same_size_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as state:
+            root = Path(tmp)
+            project = self._repo(root)
+            durable = source_snapshot.capture_durable_source_snapshot(
+                project,
+                Path(state) / "durable",
+                timeout_seconds=60,
+            )
+            sealed_file = durable.project_path / "src.txt"
+            before = sealed_file.stat()
+            sealed_file.write_text("tampered!", encoding="utf-8")
+            os.utime(sealed_file, ns=(before.st_atime_ns, before.st_mtime_ns))
+            with self.assertRaisesRegex(
+                source_snapshot.SourceCaptureError,
+                "SOURCE_SNAPSHOT_CONTENT_MISMATCH",
+            ):
+                source_snapshot.open_source_snapshot(
+                    durable.container,
+                    expected_key=durable.key,
+                    timeout_seconds=60,
+                )
+
     def test_capture_instability_retries_and_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

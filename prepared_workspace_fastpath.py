@@ -13,6 +13,12 @@ import threading
 import time
 from pathlib import Path
 from typing import Callable, Mapping, Optional
+from io_governor import io_slot
+from reparse_materialization import (
+    ReparseLink,
+    ReparseMaterializationError,
+    inventory_reparse_plan,
+)
 from verification_observability import (
     emit_observability_event,
     new_observability_id,
@@ -551,6 +557,7 @@ def _run_overlay_robocopy(
         "/NJS",
         "/NP",
         "/SL",
+        "/XJ",
         f"/MT:{_overlay_copy_workers()}",
     ]
     if excluded:
@@ -705,41 +712,72 @@ def _populate_node_modules_shell(
     *,
     prepared_workspace_root: Path,
     clone_workspace_root: Path,
+    reparse_plan: tuple[ReparseLink, ...],
 ) -> tuple[bool, list[Path]]:
+    """Build a private node_modules shell from one canonical reparse plan.
+
+    Scope directories are always private shells. Each package child is handled
+    independently, so an owned workspace link can never carry a scope-level
+    junction back into the PreparedArtifact.
+    """
     clone_root.mkdir(parents=True, exist_ok=True)
     pairs: list[tuple[Path, Path]] = []
     local_cache_names = {".vite", ".vitest", ".cache"}
-    try:
-        for entry in sorted(
-            prepared_root.iterdir(),
-            key=lambda item: item.name.lower(),
-        ):
-            name = entry.name
-            destination = clone_root / name
-            lowered = name.lower()
-            if lowered in local_cache_names:
-                destination.mkdir(parents=True, exist_ok=True)
-                continue
-            if lowered == ".bin" and entry.is_dir():
-                if not _copy_local_bin(entry, destination):
-                    return False, []
-                continue
-            if entry.is_dir():
-                is_reparse, internal_relative = _is_internal_windows_reparse(
-                    entry,
-                    prepared_workspace_root,
-                )
-                if is_reparse:
-                    if internal_relative is None:
-                        return False, []
-                    target = clone_workspace_root / internal_relative
-                else:
-                    target = entry.resolve()
-                pairs.append((destination, target))
-                continue
-            if entry.is_file():
-                shutil.copy2(entry, destination, follow_symlinks=True)
+    plan_by_link = {item.link_relative: item for item in reparse_plan}
 
+    def planned_target(entry: Path) -> Optional[Path]:
+        try:
+            relative = entry.relative_to(prepared_workspace_root).as_posix()
+        except ValueError:
+            return None
+        item = plan_by_link.get(relative)
+        if item is None:
+            return None
+        return clone_workspace_root.joinpath(*Path(item.target_relative).parts)
+
+    def add_entry(entry: Path, destination: Path, *, scope_level: bool) -> bool:
+        lowered = entry.name.lower()
+        if lowered in local_cache_names:
+            destination.mkdir(parents=True, exist_ok=True)
+            return True
+        if lowered == ".bin" and entry.is_dir():
+            return _copy_local_bin(entry, destination)
+
+        is_reparse, _legacy_relative = _is_internal_windows_reparse(
+            entry, prepared_workspace_root
+        )
+        if is_reparse:
+            target = planned_target(entry)
+            if target is None:
+                return False
+            # A scope directory itself is authority-ambiguous. Only individual
+            # package children may be workspace links.
+            if entry.name.startswith("@") and not scope_level:
+                return False
+            pairs.append((destination, target))
+            return True
+
+        if entry.is_dir():
+            if not scope_level and entry.name.startswith("@"):
+                destination.mkdir(parents=True, exist_ok=True)
+                try:
+                    children = sorted(entry.iterdir(), key=lambda item: item.name.lower())
+                except OSError:
+                    return False
+                return all(
+                    add_entry(child, destination / child.name, scope_level=True)
+                    for child in children
+                )
+            pairs.append((destination, entry.resolve()))
+            return True
+        if entry.is_file():
+            shutil.copy2(entry, destination, follow_symlinks=True)
+        return True
+
+    try:
+        entries = sorted(prepared_root.iterdir(), key=lambda item: item.name.lower())
+        if not all(add_entry(entry, clone_root / entry.name, scope_level=False) for entry in entries):
+            return False, []
         if not _create_junction_batch(pairs):
             for link, _ in reversed(pairs):
                 _remove_junction(link)
@@ -1026,6 +1064,11 @@ def try_materialize_guarded_clone(
     if not dependency_root_paths:
         return None
 
+    try:
+        canonical_reparse_plan = inventory_reparse_plan(prepared_workspace_root)
+    except ReparseMaterializationError:
+        return None
+
     operation_id = new_observability_id("guarded-lower")
     started = time.monotonic()
     emit_observability_event(
@@ -1076,6 +1119,7 @@ def try_materialize_guarded_clone(
                 clone_root,
                 prepared_workspace_root=prepared_workspace_root,
                 clone_workspace_root=target,
+                reparse_plan=canonical_reparse_plan,
             )
             if not ok:
                 for existing in reversed(junctions):

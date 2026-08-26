@@ -18,15 +18,23 @@ import time
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+from artifact_integrity import (
+    ArtifactIntegrityError,
+    build_artifact_tree_integrity,
+)
 from block_vex_storage import verification_root
 from prepared_workspace_fastpath import try_acquire_snapshot_cleanup_lease
+from substrate_identity import tool_build_id
+from verification_observability import emit_observability_event
 
-ARTIFACT_INDEX_SCHEMA = 1
+ARTIFACT_INDEX_SCHEMA = 2
 ARTIFACT_AUTHORITY = "PRECONDITION_CACHE"
 
 # BLOCK_OMEGA_VERIFICATION_SUBSTRATE_V2
 _LOCK = threading.RLock()
 _CONFIGURED_ROOT: Optional[Path] = None
+_INTEGRITY_VALIDATION_LOCK = threading.RLock()
+_VALIDATED_CONTENT: set[tuple[str, str, str]] = set()
 
 # BLOCK_V_PREPARED_ARTIFACT_ASYNC_GC_V2
 # PreparedArtifact is a performance cache. Heavy physical deletion must never
@@ -334,10 +342,26 @@ def publish_prepared_artifact_record(
     observed_hash = str(observed_resolved_hash or "").lower()
     if len(observed_hash) != 64 or any(ch not in "0123456789abcdef" for ch in observed_hash):
         return False
+    try:
+        integrity = build_artifact_tree_integrity(workspace_root)
+    except ArtifactIntegrityError as exc:
+        emit_observability_event(
+            "prepared-artifact.integrity",
+            outcome="publish-rejected",
+            artifactKey=str(key),
+            errorType=type(exc).__name__,
+        )
+        return False
     payload = {
         "schemaVersion": ARTIFACT_INDEX_SCHEMA,
         "authority": ARTIFACT_AUTHORITY,
         "key": _valid_key(key),
+        "toolBuildId": integrity.tool_build_id,
+        "artifactContentKey": integrity.key,
+        "artifactFileCount": integrity.file_count,
+        "artifactDirectoryCount": integrity.directory_count,
+        "artifactByteCount": integrity.byte_count,
+        "artifactReparseCount": integrity.reparse_count,
         "sourceProjectIdentity": _source_identity(source_project),
         "workspaceRoot": str(workspace_root),
         "projectRelative": project_relative.as_posix(),
@@ -362,6 +386,22 @@ def publish_prepared_artifact_record(
             except OSError:
                 pass
         os.replace(temp, path)
+        slot = (
+            os.path.normcase(str(workspace_root)),
+            _valid_key(key),
+            integrity.key,
+        )
+        with _INTEGRITY_VALIDATION_LOCK:
+            _VALIDATED_CONTENT.add(slot)
+        emit_observability_event(
+            "prepared-artifact.integrity",
+            outcome="published",
+            artifactKey=_valid_key(key),
+            artifactContentKey=integrity.key,
+            fileCount=integrity.file_count,
+            byteCount=integrity.byte_count,
+            toolBuildId=integrity.tool_build_id,
+        )
         return True
     except OSError:
         try:
@@ -390,6 +430,17 @@ def load_prepared_artifact_record(
         return None
     if payload.get("key") != _valid_key(key):
         return None
+    current_build_id = tool_build_id()
+    content_key = str(payload.get("artifactContentKey") or "").lower()
+    if payload.get("toolBuildId") != current_build_id:
+        invalidate_prepared_artifact_record(key, remove_tree=False)
+        return None
+    if (
+        len(content_key) != 64
+        or any(ch not in "0123456789abcdef" for ch in content_key)
+    ):
+        invalidate_prepared_artifact_record(key, remove_tree=False)
+        return None
     if payload.get("sourceProjectIdentity") != _source_identity(source_project):
         return None
     workspace_raw = payload.get("workspaceRoot")
@@ -411,19 +462,69 @@ def load_prepared_artifact_record(
         return None
     if len(observed_hash) != 64 or any(ch not in "0123456789abcdef" for ch in observed_hash):
         return None
-    workspace = Path(workspace_raw)
+    relative = Path(relative_raw)
+    if relative.is_absolute() or ".." in relative.parts:
+        invalidate_prepared_artifact_record(key, remove_tree=False)
+        return None
+    workspace = Path(workspace_raw).resolve()
     if not workspace.is_dir() or not is_durable_prepared_path(workspace):
         invalidate_prepared_artifact_record(key)
         return None
-    project = workspace / Path(relative_raw)
+    validation_slot = (
+        os.path.normcase(str(workspace)),
+        _valid_key(key),
+        content_key,
+    )
+    with _INTEGRITY_VALIDATION_LOCK:
+        already_validated = validation_slot in _VALIDATED_CONTENT
+    if not already_validated:
+        try:
+            observed_integrity = build_artifact_tree_integrity(workspace)
+        except ArtifactIntegrityError as exc:
+            emit_observability_event(
+                "prepared-artifact.integrity",
+                outcome="validation-error",
+                artifactKey=_valid_key(key),
+                errorType=type(exc).__name__,
+            )
+            invalidate_prepared_artifact_record(key, remove_tree=False)
+            return None
+        if (
+            observed_integrity.key != content_key
+            or observed_integrity.tool_build_id != current_build_id
+        ):
+            emit_observability_event(
+                "prepared-artifact.integrity",
+                outcome="mismatch",
+                artifactKey=_valid_key(key),
+                expectedContentKey=content_key,
+                observedContentKey=observed_integrity.key,
+                toolBuildId=current_build_id,
+            )
+            invalidate_prepared_artifact_record(key, remove_tree=False)
+            return None
+        with _INTEGRITY_VALIDATION_LOCK:
+            _VALIDATED_CONTENT.add(validation_slot)
+        emit_observability_event(
+            "prepared-artifact.integrity",
+            outcome="validated",
+            artifactKey=_valid_key(key),
+            artifactContentKey=content_key,
+            fileCount=observed_integrity.file_count,
+            byteCount=observed_integrity.byte_count,
+            toolBuildId=current_build_id,
+        )
+    project = workspace / relative
     if not project.is_dir():
         invalidate_prepared_artifact_record(key)
         return None
     return {
         "key": _valid_key(key),
         "workspaceRoot": workspace,
-        "projectRelative": Path(relative_raw),
+        "projectRelative": relative,
         "storageMode": str(payload.get("storageMode") or "durable-prepared-artifact"),
+        "toolBuildId": current_build_id,
+        "artifactContentKey": content_key,
         "observedResolvedVersions": dict(sorted(versions.items())),
         "observedResolvedHash": observed_hash,
         "dependencyRoots": tuple(dependency_roots),
@@ -432,7 +533,12 @@ def load_prepared_artifact_record(
 
 
 def invalidate_prepared_artifact_record(key: str, *, remove_tree: bool = False) -> bool:
-    path = _record_path(key)
+    normalized_key = _valid_key(key)
+    with _INTEGRITY_VALIDATION_LOCK:
+        _VALIDATED_CONTENT.difference_update(list(
+            item for item in _VALIDATED_CONTENT if item[1] == normalized_key
+        ))
+    path = _record_path(normalized_key)
     if path is None:
         return False
 
@@ -484,6 +590,11 @@ def invalidate_prepared_artifact_record(key: str, *, remove_tree: bool = False) 
     finally:
         if lease is not None:
             lease.close()
+
+
+def _clear_artifact_integrity_validation_cache_for_tests() -> None:
+    with _INTEGRITY_VALIDATION_LOCK:
+        _VALIDATED_CONTENT.clear()
 
 
 def prune_prepared_artifact_store(

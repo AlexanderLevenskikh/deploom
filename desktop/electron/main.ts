@@ -38,7 +38,7 @@ import { forgetScopedPromptPath, rememberScopedPromptPath, roadmapContainsProjec
 import { scopeExpansionCoverage, shouldUseSupervisorSeed, targetClosureFromRoadmap, targetClosureFromRoadmapWithTargets, targetClosureMessage, type ClosureTarget, type TargetClosure } from './target-closure.js'
 import { summarizeUpdaterError } from './updater-error.js'
 import { flowNotificationContent, type FlowNotificationEvent } from './notifications.js'
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveSpawnInvocation } from './process-launcher.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
@@ -1906,7 +1906,11 @@ function emptyHooksPath(): string {
 // never a release branch, never anything outside the plan -- and only ever
 // issued for branches confirmed to exist locally, so a missing branch never
 // turns into a failed `git branch -D`.
-async function migrationBranchCleanupCommands(project: ProjectSpec, plan: MigrationPlan | undefined): Promise<CommandSpec[]> {
+async function migrationBranchCleanupCommands(
+  project: ProjectSpec,
+  plan: MigrationPlan | undefined,
+  preserveCurrentCheckout = false,
+): Promise<CommandSpec[]> {
   // Even without a readable old prompt, stale DepLoom worktrees are
   // still ours and can safely be removed. Branch deletion remains scoped to
   // the exact saved plan when one exists.
@@ -1929,6 +1933,13 @@ async function migrationBranchCleanupCommands(project: ProjectSpec, plan: Migrat
     throw new Error(`MIGRATION_RESTART_USER_WORKTREE_BLOCKED: ветка предыдущей попытки используется внешним worktree. DepLoom не удаляет пользовательские worktree автоматически: ${details}`)
   }
 
+  const current = preserveCurrentCheckout
+    ? await spawnCapture('git', ['-C', project.path, 'branch', '--show-current'], project.path, 15_000)
+    : undefined
+  if (current && current.code !== 0) {
+    throw new Error(current.stderr.trim() || 'Не удалось определить текущую ветку перед очисткой старого Baseline epoch.')
+  }
+  const preservedBranch = current?.stdout.trim() || ''
   const existing = await Promise.all(candidates.map(async (branch) => {
     const result = await spawnCapture('git', ['-C', project.path, 'show-ref', '--verify', '--quiet', `refs/heads/${branch}`], project.path)
     return result.code === 0 ? branch : undefined
@@ -1963,12 +1974,14 @@ async function migrationBranchCleanupCommands(project: ProjectSpec, plan: Migrat
       cwd: project.path,
       args: ['-c', hooksArg, '-C', project.path, 'update-ref', backupRef, `refs/heads/${branch}`],
     })
-    commands.push({
-      label: `Удаление ветки ${branch} из предыдущей попытки`,
-      command: 'git',
-      cwd: project.path,
-      args: ['-c', hooksArg, '-C', project.path, 'branch', '-D', branch],
-    })
+    if (branch !== preservedBranch) {
+      commands.push({
+        label: `Удаление ветки ${branch} из предыдущей попытки`,
+        command: 'git',
+        cwd: project.path,
+        args: ['-c', hooksArg, '-C', project.path, 'branch', '-D', branch],
+      })
+    }
   }
   return commands
 }
@@ -2066,19 +2079,10 @@ async function cleanupSupersededMigrationAfterBaseline(job: JobRecord, project: 
     try { oldPlan = migrationPlanFromPrompt(readFileSync(oldPromptPath, 'utf8'), project.name) } catch { oldPlan = undefined }
   }
 
-  const sourceBranch = project.git?.sourceBranch || 'master'
-  const switchResult = await executeCommand(job, {
-    label: `Возврат на ${sourceBranch} после нового Baseline`,
-    command: 'git',
-    cwd: project.path,
-    args: ['-c', `core.hooksPath=${emptyHooksPath()}`, '-C', project.path, 'switch', sourceBranch],
-    captureAgentSession: false,
-  })
-  if (switchResult.code !== 0) {
-    throw new Error(`BASELINE_EXECUTION_RESET_FAILED: новый Baseline построен, но не удалось безопасно вернуться на ${sourceBranch} перед очисткой старой миграции. ${switchResult.stderr.trim()}`)
-  }
-
-  for (const spec of await migrationBranchCleanupCommands(project, oldPlan)) {
+  // SourceSnapshot captured the live checkout bytes (dirty, untracked,
+  // ignored, or detached). Cleanup must preserve that exact checkout instead
+  // of switching branches after the proof subject has been chosen.
+  for (const spec of await migrationBranchCleanupCommands(project, oldPlan, true)) {
     const result = await executeCommand(job, { ...spec, captureAgentSession: false })
     if (result.code !== 0) {
       throw new Error(`BASELINE_EXECUTION_RESET_FAILED: ${spec.label}: exit ${result.code}.${result.stderr.trim() ? `\n\n${result.stderr.trim()}` : ''}`)
@@ -2192,6 +2196,52 @@ function compatibilityEvidencePath(workspace: WorkspaceRecord, projectName: stri
   return join(workspace.path, '.dependency-roadmap', 'state', 'compatibility-evidence', safe(projectName), `${new Date().toISOString().replace(/[:.]/g, '-')}-${safe(branchName)}.json`)
 }
 
+function captureCompatibilitySourceSnapshot(
+  projectPath: string,
+  destination: string,
+): { sourceSnapshotLocator: string; sourceSnapshotKey: string; toolBuildId: string; projectRelative: string } {
+  const pythonPath = join(bundledToolDir(), 'vendor')
+  const env = commandEnvironment({
+    ...process.env,
+    FORCE_COLOR: '0',
+    PYTHONUNBUFFERED: '1',
+    PYTHONPATH: [pythonPath, process.env.PYTHONPATH].filter(Boolean).join(delimiter),
+  })
+  const invocation = resolveSpawnInvocation('python', [
+    join(bundledToolDir(), 'source_snapshot.py'),
+    '--capture-durable', projectPath,
+    '--destination', destination,
+    '--timeout-seconds', '1800',
+    '--json',
+  ], { env })
+  const result = spawnSync(invocation.command, invocation.args, {
+    cwd: projectPath,
+    shell: false,
+    windowsHide: true,
+    windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+    env,
+    encoding: 'utf8',
+    timeout: 1_800_000,
+    maxBuffer: 16 * 1024 * 1024,
+  })
+  if (result.error || result.status !== 0) {
+    const detail = String(result.stderr ?? '') + '\n' + String(result.stdout ?? '')
+    const fallback = result.error?.message || detail.trim() || `exit ${result.status}`
+    throw new Error(`DEPENDENCY_COMPATIBILITY_SOURCE_SNAPSHOT_FAILED: ${fallback}`)
+  }
+  const line = String(result.stdout ?? '').trim().split(/\r?\n/).at(-1)
+  try {
+    const parsed = JSON.parse(line || '') as Record<string, unknown>
+    const locator = String(parsed.sourceSnapshotLocator ?? '')
+    const key = String(parsed.sourceSnapshotKey ?? '')
+    const toolBuildId = String(parsed.toolBuildId ?? '')
+    const projectRelative = String(parsed.projectRelative ?? '.')
+    if (!locator || !key || !/^[0-9a-f]{64}$/i.test(toolBuildId)) throw new Error('capture returned no locator/key/toolBuildId')
+    return { sourceSnapshotLocator: locator, sourceSnapshotKey: key, toolBuildId, projectRelative }
+  } catch (error) {
+    throw new Error(`DEPENDENCY_COMPATIBILITY_SOURCE_SNAPSHOT_INVALID: ${String(error)}`)
+  }
+}
 function writeDependencyCompatibilityEvidence(input: {
   workspace: WorkspaceRecord
   project: ProjectSpec
@@ -2225,11 +2275,20 @@ function writeDependencyCompatibilityEvidence(input: {
   }
   const path = compatibilityEvidencePath(input.workspace, input.project.name, input.branch)
   mkdirSync(dirname(path), { recursive: true })
+  const snapshotDestination = path.replace(/\.json$/i, '.source-snapshot')
+  const snapshot = captureCompatibilitySourceSnapshot(
+    input.project.path,
+    snapshotDestination,
+  )
   const payload = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     project: input.project.name,
     projectPath: input.canonicalProjectPath,
     branchRef: input.branch,
+    sourceSnapshotLocator: snapshot.sourceSnapshotLocator,
+    sourceSnapshotKey: snapshot.sourceSnapshotKey,
+    toolBuildId: snapshot.toolBuildId,
+    projectRelative: snapshot.projectRelative,
     targetMode: input.targetMode,
     commands: [...input.commands],
     actions,
@@ -2239,11 +2298,15 @@ function writeDependencyCompatibilityEvidence(input: {
     createdAt: new Date().toISOString(),
   }
   const temporary = `${path}.tmp`
-  writeFileSync(temporary, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
-  renameSync(temporary, path)
-  return path
+  try {
+    writeFileSync(temporary, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+    renameSync(temporary, path)
+    return path
+  } catch (error) {
+    try { rmSync(snapshot.sourceSnapshotLocator, { recursive: true, force: true }) } catch { /* best effort */ }
+    throw error
+  }
 }
-
 function compatibilityEvidencePathFromFailure(failure: string): string | undefined {
   const match = /DEPENDENCY_COMPATIBILITY_EVIDENCE:[^\n]*evidenceFile=([^;\s]+)/.exec(failure)
   if (!match) return undefined
@@ -2721,23 +2784,11 @@ async function batchExecutionState(job: JobRecord, project: ProjectSpec, branchN
 
 async function baselineStartCommands(input: ActionInput, project: ProjectSpec): Promise<CommandSpec[]> {
   if (input.action !== 'baseline') return []
-  const status = await spawnCapture('git', ['-C', project.path, 'status', '--porcelain=v1', '--untracked-files=all'], project.path, 15_000)
-  if (status.code !== 0) throw new Error(status.stderr.trim() || 'Не удалось проверить Git перед новым Baseline.')
-  const dirty = relevantGitStatus(status.stdout)
-  if (dirty) {
-    throw new Error(`BASELINE_SOURCE_DIRTY: новый Baseline должен сниматься с чистого source checkout. Текущие изменения сохранены без автоматического stash: ${dirty.split('\n').slice(0, 8).join('; ')}`)
-  }
-  const sourceBranch = project.git?.sourceBranch || 'master'
-  const current = await spawnCapture('git', ['-C', project.path, 'branch', '--show-current'], project.path, 15_000)
-  if (current.code !== 0) throw new Error(current.stderr.trim() || 'Не удалось определить текущую ветку перед новым Baseline.')
-  if (current.stdout.trim() === sourceBranch) return []
-  return [{
-    label: `Переход на ${sourceBranch} перед новым Baseline`,
-    command: 'git',
-    cwd: project.path,
-    args: ['-c', `core.hooksPath=${emptyHooksPath()}`, '-C', project.path, 'switch', sourceBranch],
-    captureAgentSession: false,
-  }]
+  void project
+  // SOURCE_SNAPSHOT_BASELINE_LIVE_CHECKOUT: Git is provenance, not source
+  // authority. The generator seals the current filesystem subject, including
+  // dirty, untracked and ignored bytes, without stash or branch switching.
+  return []
 }
 
 async function cleanAgentStartCommands(input: ActionInput, workspace: WorkspaceRecord, project: ProjectSpec): Promise<CommandSpec[]> {
