@@ -4,7 +4,7 @@ Implementation status: **complete; authoritative final Windows gate pending**.
 
 This file is a resumable engineering checkpoint only. It is not runtime/proof authority.
 
-## Workstream 1 — reparse-safe materialization
+## Workstream 1 вЂ” reparse-safe materialization
 
 Status: completed.
 
@@ -16,9 +16,9 @@ Status: completed.
 
 Codex focused validation before handoff:
 
-- `python -m unittest tests.test_prepared_workspace_fastpath tests.test_block_z_project_topology tests.test_snapshot_copy_progress_hotfix tests.acceptance.test_block_z_workspace_physical tests.acceptance.test_block_omega_guarded_lower_physical` — PASS.
+- `python -m unittest tests.test_prepared_workspace_fastpath tests.test_block_z_project_topology tests.test_snapshot_copy_progress_hotfix tests.acceptance.test_block_z_workspace_physical tests.acceptance.test_block_omega_guarded_lower_physical` вЂ” PASS.
 
-## Workstream 2 — sealed SourceSnapshot evidence and live-checkout baseline
+## Workstream 2 вЂ” sealed SourceSnapshot evidence and live-checkout baseline
 
 Status: completed.
 
@@ -30,10 +30,10 @@ Status: completed.
 
 Codex focused validation before handoff:
 
-- Source Truth/evidence/project-isolation tests — PASS, with platform capability skips only.
-- Electron TypeScript noEmit/migration/autopilot contracts — PASS.
+- Source Truth/evidence/project-isolation tests вЂ” PASS, with platform capability skips only.
+- Electron TypeScript noEmit/migration/autopilot contracts вЂ” PASS.
 
-## Workstream 3 — durable integrity and tool build identity
+## Workstream 3 вЂ” durable integrity and tool build identity
 
 Status: completed.
 
@@ -45,9 +45,9 @@ Status: completed.
 
 Codex focused validation before handoff:
 
-- PreparedArtifact/GC, proof/cache/proven-state, SourceSnapshot/evidence/artifact gates — PASS.
+- PreparedArtifact/GC, proof/cache/proven-state, SourceSnapshot/evidence/artifact gates вЂ” PASS.
 
-## Workstream 4 — context-safe learned constraints
+## Workstream 4 вЂ” context-safe learned constraints
 
 Status: completed.
 
@@ -62,7 +62,7 @@ Safety invariant:
 
 `FAIL(A1,B2,C1)` may exclude that exact certified assignment; it may not silently become universal `NOT(A1 AND B2)`.
 
-## Workstream 5 — descendant supervision and bounded subprocess output
+## Workstream 5 вЂ” descendant supervision and bounded subprocess output
 
 Status: completed.
 
@@ -77,7 +77,7 @@ Focused validation:
 
 - `tests.test_sigma_process_supervision` is included in the aggregate focused gate below.
 
-## Workstream 6 — physical acceptance and CI gate
+## Workstream 6 вЂ” physical acceptance and CI gate
 
 Status: completed.
 
@@ -88,10 +88,10 @@ Status: completed.
 
 Local Linux acceptance on 2026-08-27:
 
-- `python run_tool_tests.py --suite acceptance` — **12 tests, PASS, 7 platform skips**.
+- `python run_tool_tests.py --suite acceptance` вЂ” **12 tests, PASS, 7 platform skips**.
 - The skips are Windows-only physical cases and are intentionally NOT counted as Windows PASS.
 
-## Workstream 7 — SourceSnapshot / I/O performance closure
+## Workstream 7 вЂ” SourceSnapshot / I/O performance closure
 
 Status: completed.
 
@@ -105,9 +105,9 @@ Status: completed.
 
 Remaining performance evidence requirement:
 
-- Measure a fresh production-like `partner-form` run after the authoritative Windows gate. No production wall-clock improvement is claimed from the Linux fixture alone.
+- Measure a fresh production-like `representative production-like project` run after the authoritative Windows gate. No production wall-clock improvement is claimed from the Linux fixture alone.
 
-## Workstream 8 — release hardening and real-run repair
+## Workstream 8 вЂ” release hardening and real-run repair
 
 Status: completed.
 
@@ -118,7 +118,7 @@ Status: completed.
 - README now states the actual authoritative package-manager matrix: npm + Yarn Classic supported; Yarn Berry/PnP/pnpm typed unsupported/fail-closed.
 - Added `tests/regression/test_package_manager_support_matrix.py`.
 
-### Real `partner-form` bug discovered during Sigma
+### Real `representative production-like project` bug discovered during Sigma
 
 Fixed `PREPARED_SNAPSHOT_CLONE_FAILED ... WORKSPACE_TARGET_EXISTS: .../project-check-transaction`.
 
@@ -137,16 +137,16 @@ Fix:
 
 Regression coverage is in `tests.test_sigma_process_supervision`.
 
-## Workstream 9 — final gate and repair loop
+## Workstream 9 вЂ” final gate and repair loop
 
 Status: implementation-complete; Windows authority pending.
 
 Validation performed in the available Linux environment:
 
-1. `python -m compileall -q .` — PASS.
-2. Aggregate Sigma/source/substrate focused gate — **152 tests PASS, 12 platform skips**.
-3. `python run_tool_tests.py --suite acceptance` — **12 tests PASS, 7 Windows-only skips**.
-4. `python -m unittest tests.regression.test_package_manager_support_matrix` — **2 tests PASS**.
+1. `python -m compileall -q .` вЂ” PASS.
+2. Aggregate Sigma/source/substrate focused gate вЂ” **152 tests PASS, 12 platform skips**.
+3. `python run_tool_tests.py --suite acceptance` вЂ” **12 tests PASS, 7 Windows-only skips**.
+4. `python -m unittest tests.regression.test_package_manager_support_matrix` вЂ” **2 tests PASS**.
 5. Broad 484-test non-curated run reached only expected environment-dependent failures:
    - exact-solver tests fail because this environment has no `z3-solver` and internet is disabled;
    - one CLI physical fixture fails because Yarn is not installed here.
@@ -179,9 +179,9 @@ If Yarn Classic is not globally available for physical acceptance:
 npm install --global yarn@1.22.22
 ```
 
-Block Sigma may be marked **DONE** only after this Windows gate is green. A fresh `partner-form` production-like run is the recommended final performance/operational acceptance, not an inner test-loop requirement.
+Block Sigma may be marked **DONE** only after this Windows gate is green. A fresh `representative production-like project` production-like run is the recommended final performance/operational acceptance, not an inner test-loop requirement.
 
-## Final Windows repair loop — deferred cleanup telemetry
+## Final Windows repair loop вЂ” deferred cleanup telemetry
 
 Status: completed; authoritative Windows rerun pending.
 
@@ -190,7 +190,7 @@ Status: completed; authoritative Windows rerun pending.
 - Added a platform-neutral regression that forces deferred cleanup and exercises the real telemetry writer.
 - The external Block Sigma Windows gate was hardened separately to fail immediately on any non-zero native process exit code.
 
-## Final Windows repair loop — Yarn scoped-workspace fixture escaping
+## Final Windows repair loop вЂ” Yarn scoped-workspace fixture escaping
 
 Status: completed; authoritative Windows rerun pending.
 
