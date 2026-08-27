@@ -366,12 +366,13 @@ class BlockTProofEnvelopeTests(unittest.TestCase):
 
 
 class BlockTDesktopHandoffTests(unittest.TestCase):
-    def test_desktop_proof_envelope_and_materialization_are_schema_v4(self) -> None:
+    def test_desktop_proof_envelope_v5_and_materialization_v4(self) -> None:
         root = Path(__file__).resolve().parents[1]
         migration = (root / "desktop" / "electron" / "migration-progress.ts").read_text(encoding="utf-8")
         materialization = (root / "desktop" / "electron" / "materialization-proof.ts").read_text(encoding="utf-8")
         main = (root / "desktop" / "electron" / "main.ts").read_text(encoding="utf-8")
-        self.assertIn("schemaVersion: 4", migration)
+        self.assertIn("schemaVersion: 5", migration)
+        self.assertIn("toolBuildId: string", migration)
         self.assertIn("fixedResolverInputsKey: string", migration)
         self.assertIn("proof envelope fixed source identity missing", migration)
         self.assertIn("schemaVersion: 4", materialization)

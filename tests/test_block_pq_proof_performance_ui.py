@@ -79,7 +79,9 @@ class BlockPQContracts(unittest.TestCase):
         self.assertIn("trial_fingerprint = assignment_fingerprint(trial)", source)
         self.assertIn('"constraint-minimization-proof-reused"', source)
         self.assertIn("required_predicate in {", source)
-        self.assertIn("for generalized in new_constraints", source)
+        self.assertIn("diagnostic_constraints: List[Dict[str, str]]", source)
+        self.assertIn('clauseScope="context-diagnostic"', source)
+        self.assertIn("global_exact_exclusions[project][mode].append(exact_nogood)", source)
 
     def test_resolver_purpose_summary_supports_before_after_comparison(self) -> None:
         events = [

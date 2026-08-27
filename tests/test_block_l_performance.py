@@ -130,13 +130,15 @@ class BlockLPerformanceTests(unittest.TestCase):
         # Project checks reuse one fully-private trial only when a whole-workspace
         # watcher proves that the previous command produced no filesystem events.
         # Any event or watcher uncertainty discards the trial before the next check.
-        self.assertIn('else temp_root / "project-check-transaction"', source)
+        self.assertIn("_fresh_project_check_root(", source)
+        self.assertIn('stem = f"project-check-{int(command_index):03d}"', source)
         self.assertIn("for command_index, command in enumerate(config.commands, start=1):", source)
         self.assertIn('clone_isolation = "reused-private-trial"', source)
         self.assertIn("WorkspaceChangeGuard(command_root)", source)
         self.assertIn("verify.project-check.trial-reuse-ready", source)
         self.assertIn("verify.project-check.trial-reuse-rejected", source)
-        self.assertIn("shutil.rmtree(command_root, ignore_errors=True)", source)
+        self.assertIn("_cleanup_trial_root(", source)
+        self.assertIn("verify.workspace.cleanup-deferred", source)
 
         # The production path still has proof-preserving isolation backends:
         # guarded NTFS zero-copy fast path plus safe full-copy fallback.

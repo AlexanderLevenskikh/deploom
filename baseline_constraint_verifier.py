@@ -537,8 +537,23 @@ def _run(
     progress_label: str = "command",
     progress_interval_seconds: int = 15,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a verifier child through the cross-platform Block U supervisor."""
-    return run_supervised(
+    """Run a verifier child with bounded output and full-stream infra detection."""
+    infra_seen = False
+    rolling = ""
+
+    def observe_output(chunk: str) -> None:
+        nonlocal infra_seen, rolling
+        if infra_seen:
+            return
+        # Pattern boundaries may cross reader chunks. A small rolling prefix is
+        # enough for the finite infrastructure regex while avoiding full output
+        # retention in RAM.
+        candidate = rolling + str(chunk)
+        if INFRA_PATTERNS.search(candidate):
+            infra_seen = True
+        rolling = candidate[-4096:]
+
+    completed = run_supervised(
         argv,
         cwd,
         timeout_seconds=timeout_seconds,
@@ -547,22 +562,44 @@ def _run(
         progress=progress,
         progress_label=progress_label,
         progress_interval_seconds=progress_interval_seconds,
+        output_observer=observe_output,
     )
+    setattr(completed, "deploom_infra_detected", bool(infra_seen))
+    return completed
 
 
-def clean_ephemeral_verification_caches(project_dir: Path) -> Tuple[str, ...]:
+def clean_ephemeral_verification_caches(
+    project_dir: Path,
+    dependency_roots: Iterable[str] = (),
+) -> Tuple[str, ...]:
+    """Remove only known cache directories below canonical dependency roots."""
+    root = project_dir.resolve()
+    normalized_roots = [
+        str(value).replace("\\", "/").strip("/")
+        for value in dependency_roots
+        if str(value).strip()
+    ]
+    if not normalized_roots:
+        # Backward-compatible standalone behaviour. Production PreparedSnapshot
+        # callers pass the canonical dependency roots explicitly.
+        normalized_roots = ["node_modules", "src/node_modules"]
     removed: List[str] = []
-    for relative in EPHEMERAL_VERIFICATION_CACHE_PATHS:
-        target = project_dir.joinpath(*relative.split("/"))
-        if not target.exists():
+    for dependency_root in sorted(set(normalized_roots)):
+        relative_root = Path(*dependency_root.split("/"))
+        if relative_root.is_absolute() or ".." in relative_root.parts:
             continue
-        try:
-            shutil.rmtree(target, ignore_errors=False)
-            removed.append(relative)
-        except OSError:
-            # A cache cleanup failure is handled by the following deterministic
-            # command; do not silently mutate source/config to work around it.
-            pass
+        for cache_name in (".vite", ".vitest", ".cache"):
+            relative = (relative_root / cache_name).as_posix()
+            target = root / relative_root / cache_name
+            if not target.exists():
+                continue
+            try:
+                shutil.rmtree(target, ignore_errors=False)
+                removed.append(relative)
+            except OSError:
+                # Cache cleanup is performance hygiene; the following command
+                # remains authoritative and mutation guards stay fail-closed.
+                pass
     return tuple(removed)
 
 
@@ -1440,16 +1477,40 @@ DIRECT_DEPENDENCY_SECTIONS = (
 )
 
 
-def _installed_package_json_path(project_dir: Path, package_name: str) -> Optional[Path]:
+def _installed_package_json_path(
+    project_dir: Path,
+    package_name: str,
+    *,
+    package_manager_root: Optional[Path] = None,
+) -> Optional[Path]:
+    """Resolve hoisted packages without escaping the authoritative trial root."""
     parts = package_name.split("/") if package_name.startswith("@") else [package_name]
     cursor = project_dir.resolve()
+    boundary = (package_manager_root or project_dir).resolve()
+    try:
+        cursor.relative_to(boundary)
+    except ValueError:
+        raise ObservedResolutionError(
+            f"OBSERVED_RESOLVED_ASSIGNMENT_BOUNDARY_INVALID: project={cursor}, managerRoot={boundary}"
+        )
     while True:
         candidate = cursor.joinpath("node_modules", *parts, "package.json")
         if candidate.is_file():
+            try:
+                candidate.resolve().relative_to(boundary)
+            except ValueError:
+                raise ObservedResolutionError(
+                    f"OBSERVED_RESOLVED_ASSIGNMENT_ESCAPE: {package_name}: {candidate}"
+                )
             return candidate
-        if cursor.parent == cursor:
+        if cursor == boundary:
             return None
-        cursor = cursor.parent
+        parent = cursor.parent
+        try:
+            parent.relative_to(boundary)
+        except ValueError:
+            return None
+        cursor = parent
 
 
 def observed_resolved_assignment(
@@ -1457,6 +1518,7 @@ def observed_resolved_assignment(
     assignment: Mapping[str, str],
     *,
     remove_packages: Iterable[str] = (),
+    package_manager_root: Optional[Path] = None,
 ) -> Dict[str, str]:
     """Observe the full direct assignment actually installed by the package manager."""
     try:
@@ -1488,7 +1550,9 @@ def observed_resolved_assignment(
             observed[name] = OBSERVED_PEER_ONLY
             continue
 
-        package_json = _installed_package_json_path(project_dir, name)
+        package_json = _installed_package_json_path(
+            project_dir, name, package_manager_root=package_manager_root
+        )
         optional_only = (
             "optionalDependencies" in declared_sections
             and set(declared_sections).issubset(
@@ -1539,6 +1603,54 @@ def _classify_install_failure(output: str) -> str:
     # deterministic non-zero exit without being dependency constraints.
     return "unknown"
 
+
+
+def _cleanup_trial_root(
+    path: Path,
+    *,
+    event: Optional[Callable[..., None]] = None,
+    command: str = "",
+    attempts: int = 5,
+) -> bool:
+    """Best-effort bounded cleanup; stale Windows handles never poison next trial."""
+    if not path.exists():
+        return True
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        try:
+            shutil.rmtree(path, ignore_errors=False)
+        except OSError:
+            if attempt < attempts:
+                time.sleep(min(0.5, 0.05 * (2 ** (attempt - 1))))
+                continue
+        if not path.exists():
+            return True
+    if event is not None:
+        event(
+            "verify.workspace.cleanup-deferred",
+            command=command,
+            cleanupPath=str(path),
+            attempts=int(attempts),
+        )
+    return False
+
+
+def _fresh_project_check_root(
+    temp_root: Path,
+    command_index: int,
+    *,
+    event: Optional[Callable[..., None]] = None,
+    command: str = "",
+) -> Path:
+    """Allocate a never-merge target even when Windows defers prior cleanup."""
+    stem = f"project-check-{int(command_index):03d}"
+    for suffix in range(0, 1000):
+        name = stem if suffix == 0 else f"{stem}-{suffix:03d}"
+        candidate = temp_root / name
+        if candidate.exists():
+            _cleanup_trial_root(candidate, event=event, command=command)
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"PROJECT_CHECK_NAMESPACE_EXHAUSTED: {temp_root / stem}")
 
 def verify_assignment(
     project_dir: Path,
@@ -1648,6 +1760,7 @@ def verify_assignment(
                 require_supported=True,
             )
             package_manager_project = workspace_topology.package_manager_root
+            package_manager_relative_to_workspace = package_manager_project.relative_to(workspace_root)
             event(
                 "verify.workspace.finish",
                 durationMs=int((time.monotonic() - workspace_started) * 1000),
@@ -1916,7 +2029,15 @@ def verify_assignment(
                 return BaselineVerifyResult(False, "infrastructure", f"package-manager launch failed: {exc}", command=" ".join(argv))
 
             output = result.stdout or ""
-            kind = "passed" if result.returncode == 0 else _classify_install_failure(output)
+            kind = (
+                "passed"
+                if result.returncode == 0
+                else (
+                    "infrastructure"
+                    if bool(getattr(result, "deploom_infra_detected", False))
+                    else _classify_install_failure(output)
+                )
+            )
             event(
                 "verify.resolver.finish",
                 durationMs=int((time.monotonic() - resolver_started) * 1000),
@@ -1973,6 +2094,7 @@ def verify_assignment(
                     workspace_project,
                     assignment,
                     remove_packages=remove_packages,
+                    package_manager_root=package_manager_project,
                 )
                 observed_hash = observed_resolved_hash(observed_versions)
             except ObservedResolutionError as exc:
@@ -2108,7 +2230,15 @@ def verify_assignment(
                     )
                 except (OSError, subprocess.TimeoutExpired) as exc:
                     return BaselineVerifyResult(False, "infrastructure", f"project-preflight install failed: {exc}", command=" ".join(full_argv))
-                preparation_classified = "passed" if full_result.returncode == 0 else _classify_install_failure(full_result.stdout or "")
+                preparation_classified = (
+                    "passed"
+                    if full_result.returncode == 0
+                    else (
+                        "infrastructure"
+                        if bool(getattr(full_result, "deploom_infra_detected", False))
+                        else _classify_install_failure(full_result.stdout or "")
+                    )
+                )
                 event(
                     "verify.preparation.finish",
                     durationMs=int((time.monotonic() - preparation_started) * 1000),
@@ -2145,6 +2275,7 @@ def verify_assignment(
                 try:
                     lifecycle_observed = observed_resolved_assignment(
                         workspace_project, assignment, remove_packages=remove_packages,
+                        package_manager_root=package_manager_project,
                     )
                     lifecycle_observed_hash = observed_resolved_hash(lifecycle_observed)
                 except ObservedResolutionError as exc:
@@ -2240,7 +2371,9 @@ def verify_assignment(
                 command_root = (
                     reusable_private_root
                     if reusing_private_trial and reusable_private_root is not None
-                    else temp_root / "project-check-transaction"
+                    else _fresh_project_check_root(
+                        temp_root, command_index, event=event, command=command
+                    )
                 )
                 clone_started = time.monotonic()
                 clone_timeout = snapshot_copy_timeout()
@@ -2265,7 +2398,9 @@ def verify_assignment(
                     )
                 else:
                     if command_root.exists():
-                        shutil.rmtree(command_root, ignore_errors=True)
+                        command_root = _fresh_project_check_root(
+                            temp_root, command_index, event=event, command=command
+                        )
                     _emit_progress(
                         progress,
                         f"{progress_label}: project clone {command_index}/{len(config.commands)} started; "
@@ -2326,7 +2461,7 @@ def verify_assignment(
                 workspace_guard: Optional[WorkspaceChangeGuard] = None
                 workspace_guard_started = False
                 try:
-                    removed_caches = clean_ephemeral_verification_caches(command_project)
+                    removed_caches = clean_ephemeral_verification_caches(command_project, snapshot.dependency_roots)
                     if removed_caches:
                         _emit_progress(progress, f"{progress_label}: normalized transient caches before {command}: {', '.join(removed_caches)}")
 
@@ -2352,7 +2487,7 @@ def verify_assignment(
                     if os.name == "nt":
                         shell_argv: Sequence[str] = [os.environ.get("COMSPEC") or "cmd.exe", "/d", "/s", "/c", command]
                     else:
-                        shell_argv = ["/bin/sh", "-lc", command]
+                        shell_argv = ["/bin/sh", "-c", command]
                     try:
                         check_result = _run(
                             shell_argv,
@@ -2437,7 +2572,7 @@ def verify_assignment(
                     # Allowed root cache writes are cache-only. Remove them
                     # from the sealed dependency base before any later check.
                     prepared_project = snapshot.workspace_root / snapshot.project_relative
-                    normalized_shared = clean_ephemeral_verification_caches(prepared_project)
+                    normalized_shared = clean_ephemeral_verification_caches(prepared_project, snapshot.dependency_roots)
                     if normalized_shared:
                         event(
                             "verify.project-check.shared-cache-normalized",
@@ -2463,6 +2598,7 @@ def verify_assignment(
                     try:
                         check_observed = observed_resolved_assignment(
                             command_project, assignment, remove_packages=remove_packages,
+                            package_manager_root=(command_root / package_manager_relative_to_workspace),
                         )
                         check_observed_hash = observed_resolved_hash(check_observed)
                     except ObservedResolutionError as exc:
@@ -2484,12 +2620,19 @@ def verify_assignment(
                         exitCode=check_result.returncode,
                         outcome="passed" if check_result.returncode == 0 else "failed",
                         isolation=clone_isolation,
+                        capturedBytes=int(getattr(check_result, "captured_bytes", 0) or 0),
+                        droppedBytes=int(getattr(check_result, "dropped_bytes", 0) or 0),
+                        outputTruncated=bool(getattr(check_result, "output_truncated", False)),
+                        supervisionQuality=str(getattr(getattr(check_result, "supervision", None), "quality", "")),
+                        descendantsKilled=int(getattr(getattr(check_result, "supervision", None), "descendants_terminated", 0) or 0),
+                        descendantsRemaining=int(getattr(getattr(check_result, "supervision", None), "descendants_remaining", 0) or 0),
+                        quiescenceMs=int(getattr(getattr(check_result, "supervision", None), "quiescence_ms", 0) or 0),
                     )
                     if check_result.returncode == 0:
                         _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} PASS: {command}")
                         continue
                     tail = "\n".join((check_result.stdout or "").splitlines()[-80:])
-                    if INFRA_PATTERNS.search(tail):
+                    if bool(getattr(check_result, "deploom_infra_detected", False)) or INFRA_PATTERNS.search(check_result.stdout or ""):
                         return BaselineVerifyResult(False, "infrastructure", f"project preflight infrastructure failure: {command}", command=command, output=tail, workspace=str(command_project))
                     project_failures.append(BaselineProjectFailure(command, check_result.returncode, tail))
                     _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} RED exit={check_result.returncode}: {command}")
@@ -2498,7 +2641,7 @@ def verify_assignment(
 
                     if clone_isolation == "ntfs-junction-guarded":
                         cleanup_guarded_clone(command_root)
-                        shutil.rmtree(command_root, ignore_errors=True)
+                        _cleanup_trial_root(command_root, event=event, command=command)
                         reusable_private_root = None
                         reusable_private_project = None
                     elif (
@@ -2508,6 +2651,10 @@ def verify_assignment(
                         and not workspace_changes.changes
                         and command_root.is_dir()
                         and command_project.is_dir()
+                        and (
+                            getattr(check_result, "supervision", None) is None
+                            or str(getattr(check_result.supervision, "quality", "")) == "guaranteed-tree"
+                        )
                     ):
                         reusable_private_root = command_root
                         reusable_private_project = command_project
@@ -2543,7 +2690,7 @@ def verify_assignment(
                             )
                         reusable_private_root = None
                         reusable_private_project = None
-                        shutil.rmtree(command_root, ignore_errors=True)
+                        _cleanup_trial_root(command_root, event=event, command=command)
 
             if project_failures:
                 summary_commands = ", ".join(item.command for item in project_failures)

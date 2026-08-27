@@ -162,25 +162,42 @@ def build_artifact_tree_integrity(
             workers = min(8, max(2, os.cpu_count() or 2))
     workers = max(1, min(32, int(workers)))
     byte_count = 0
+    # Bound in-flight futures. A durable artifact may contain hundreds of
+    # thousands of files; allocating one Future per path defeats the I/O
+    # governor by creating avoidable RAM and scheduler pressure.
+    queue_limit = max(workers, workers * 3)
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=workers,
         thread_name_prefix="deploom-artifact-hash",
     ) as executor:
-        futures = {
-            executor.submit(_hash_file, path): (path, relative)
-            for path, relative in files
-        }
-        for future in concurrent.futures.as_completed(futures):
-            path, relative = futures[future]
-            digest, size, executable = future.result()
-            byte_count += size
-            entries.append({
-                "path": relative,
-                "kind": "file",
-                "size": size,
-                "sha256": digest,
-                "executable": executable,
-            })
+        pending: dict[concurrent.futures.Future[tuple[str, int, bool]], tuple[Path, str]] = {}
+        iterator = iter(files)
+
+        def submit_until_full() -> None:
+            while len(pending) < queue_limit:
+                try:
+                    path, relative = next(iterator)
+                except StopIteration:
+                    break
+                pending[executor.submit(_hash_file, path)] = (path, relative)
+
+        submit_until_full()
+        while pending:
+            done, _ = concurrent.futures.wait(
+                tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for future in done:
+                _path, relative = pending.pop(future)
+                digest, size, executable = future.result()
+                byte_count += size
+                entries.append({
+                    "path": relative,
+                    "kind": "file",
+                    "size": size,
+                    "sha256": digest,
+                    "executable": executable,
+                })
+            submit_until_full()
 
     for directory, stamp in directories:
         if _directory_stamp(directory) != stamp:

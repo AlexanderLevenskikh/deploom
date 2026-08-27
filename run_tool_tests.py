@@ -31,17 +31,20 @@ def load_files(files: list[Path]) -> unittest.TestSuite:
 def files_for(suite_name: str) -> list[Path]:
     unit = sorted((ROOT / "tests").glob("test_*.py"))
     regression = sorted((ROOT / "tests" / "regression").glob("test_*.py"))
+    acceptance = sorted((ROOT / "tests" / "acceptance").glob("test_*.py"))
     if suite_name == "unit":
         return unit
     if suite_name == "regression":
         return regression
-    return unit + regression
+    if suite_name == "acceptance":
+        return acceptance
+    return unit + regression + acceptance
 
 
 def main() -> int:
     configure_utf8_stdio()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--suite", choices=("unit", "regression", "all"), default="unit")
+    parser.add_argument("--suite", choices=("unit", "regression", "acceptance", "all"), default="unit")
     parser.add_argument("--list", action="store_true", help="List exact test files without running")
     args = parser.parse_args()
     files = files_for(args.suite)

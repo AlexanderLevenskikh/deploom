@@ -67,12 +67,13 @@ def _copy_workers(*, refs_same_volume: bool = False) -> int:
         except ValueError:
             pass
 
-    # node_modules copies are dominated by per-file metadata/filter latency.
-    # Scale with the machine instead of pinning every user to the old 8/24
-    # defaults; robocopy supports /MT up to 128.
+    # Block Sigma coordinates heavy copies process-wide. Per-copy Robocopy
+    # parallelism therefore stays deliberately conservative; otherwise several
+    # verification trials can still create hundreds of filesystem workers on
+    # one SSD even though each individual copy looks reasonable.
     logical = max(1, int(os.cpu_count() or 4))
-    adaptive = max(16, min(128, logical * 4))
-    return max(32, adaptive) if refs_same_volume else adaptive
+    adaptive = max(4, min(16, max(4, logical // 2)))
+    return adaptive
 
 
 def workspace_backend_summary(root: Optional[Path] = None) -> str:
@@ -271,18 +272,19 @@ def materialize_private_tree(
         timeoutSeconds=int(timeout_seconds),
     )
     try:
-        method = _materialize_private_tree_impl(
-            source,
-            target,
-            timeout_seconds=timeout_seconds,
-            progress=progress,
-            progress_label=progress_label,
-            progress_interval_seconds=progress_interval_seconds,
-            runner=runner,
-            exclude_dir_names=exclude_dir_names,
-            exclude_file_names=exclude_file_names,
-            reparse_plan=reparse_plan,
-        )
+        with io_slot("copy", label=progress_label) as io_state:
+            method = _materialize_private_tree_impl(
+                source,
+                target,
+                timeout_seconds=timeout_seconds,
+                progress=progress,
+                progress_label=progress_label,
+                progress_interval_seconds=progress_interval_seconds,
+                runner=runner,
+                exclude_dir_names=exclude_dir_names,
+                exclude_file_names=exclude_file_names,
+                reparse_plan=reparse_plan,
+            )
     except BaseException as exc:
         after = process_resource_snapshot()
         emit_observability_event(
@@ -314,6 +316,8 @@ def materialize_private_tree(
         sourceFilesystem=source_fs,
         targetFilesystem=target_fs,
         configuredWorkers=workers,
+        ioGovernorSlots=int(io_state.get("slots", 0)),
+        ioGovernorWaitMs=int(io_state.get("waitMs", 0)),
         durationMs=max(0, int((time.monotonic() - started) * 1000)),
         cpuMs=max(0, after.cpu_ms - before.cpu_ms),
         rssBytes=after.rss_bytes,

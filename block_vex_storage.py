@@ -32,6 +32,13 @@ _PROOF_NEUTRAL_ENV = frozenset({
     "DEPLOOM_VEX_REFS_COPY_WORKERS",
     "DEPLOOM_DISABLE_GUARDED_LOWER",
     "DEPLOOM_OMEGA_OVERLAY_WORKERS",
+    # Block Sigma global I/O governor / bounded hashing controls. These only
+    # change scheduling cost and must never invalidate or distinguish proof.
+    "DEPLOOM_IO_COPY_SLOTS",
+    "DEPLOOM_IO_HASH_SLOTS",
+    "DEPLOOM_IO_PM_SLOTS",
+    "DEPLOOM_SOURCE_HASH_WORKERS",
+    "DEPLOOM_ARTIFACT_HASH_WORKERS",
 })
 
 

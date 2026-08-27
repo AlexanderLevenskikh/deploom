@@ -15,11 +15,11 @@ class BlockVGZeroConfigTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"DEPLOOM_WORKSPACE_COPY_WORKERS": "128"}, clear=False):
             self.assertEqual(backend._copy_workers(refs_same_volume=False), 128)
 
-    def test_copy_worker_default_scales_with_machine(self):
+    def test_copy_worker_default_is_conservative_under_global_io_governor(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             backend.os, "cpu_count", return_value=16
         ):
-            self.assertEqual(backend._copy_workers(refs_same_volume=False), 64)
+            self.assertEqual(backend._copy_workers(refs_same_volume=False), 8)
 
     def test_zero_config_storage_is_proof_neutral(self):
         env = {

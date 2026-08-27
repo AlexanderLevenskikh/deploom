@@ -224,3 +224,31 @@ class BlockOmegaGuardedLowerPhysicalAcceptance(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SigmaWindowsDescendantAcceptance(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows Job Object physical acceptance")
+    def test_success_parent_cannot_leave_late_writing_descendant(self) -> None:
+        import sys
+        import time
+        from verification_process_supervisor import run_supervised
+
+        with tempfile.TemporaryDirectory(prefix="deploom-sigma-descendant-") as temporary:
+            marker = Path(temporary) / "late.txt"
+            child = (
+                "import time; time.sleep(0.7); "
+                f"open({str(marker)!r}, 'w', encoding='utf-8').write('late')"
+            )
+            parent = (
+                "import subprocess,sys; "
+                f"subprocess.Popen([sys.executable, '-c', {child!r}])"
+            )
+            completed = run_supervised(
+                [sys.executable, "-c", parent],
+                Path(temporary),
+                timeout_seconds=10,
+            )
+            self.assertEqual("guaranteed-tree", completed.supervision.quality)
+            self.assertEqual(0, completed.supervision.descendants_remaining)
+            time.sleep(1.0)
+            self.assertFalse(marker.exists())

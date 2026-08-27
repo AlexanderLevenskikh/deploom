@@ -220,18 +220,13 @@ class AdaptiveGraphGeneralizationTests(unittest.TestCase):
             source,
         )
         self.assertIn("if certified and stable_predicate:", source)
-        self.assertIn(
-            "for generalized in new_constraints:",
-            source,
-        )
-        self.assertIn(
-            "learned[project][mode].append(generalized)",
-            source,
-        )
-        self.assertNotIn(
-            "learned[project][mode].append(graph_generalization",
-            source,
-        )
+        # Block Sigma keeps a minimized graph shape diagnostic-only. Solver
+        # authority is the freshly confirmed full exact assignment, so omitted
+        # context dimensions can never be generalized away implicitly.
+        self.assertIn("diagnostic_constraints: List[Dict[str, str]]", source)
+        self.assertIn('clauseScope="context-diagnostic"', source)
+        self.assertIn("global_exact_exclusions[project][mode].append(exact_nogood)", source)
+        self.assertNotIn("learned[project][mode].append(generalized)", source)
         certification_index = source.index("if certified and stable_predicate:")
         family_split_index = source.index(
             "predicate_families = _adaptive_predicate_families(",
@@ -242,7 +237,7 @@ class AdaptiveGraphGeneralizationTests(unittest.TestCase):
             family_split_index,
         )
         authority_loop_index = source.index(
-            "for generalized in new_constraints:",
+            "global_exact_exclusions[project][mode].append(exact_nogood)",
             family_results_index,
         )
         self.assertLess(certification_index, family_split_index)
@@ -670,19 +665,19 @@ class ProofPreservingNogoodMinimizationTests(unittest.TestCase):
             "minimization = _proof_preserving_minimize_nogood("
         )
         family_authority_loop_index = source.index(
-            "for generalized in new_constraints:",
+            "global_exact_exclusions[project][mode].append(exact_nogood)",
             graph_minimization_index,
         )
-        family_authority_index = source.index(
-            "learned[project][mode].append(generalized)",
-            family_authority_loop_index,
-        )
         self.assertLess(graph_minimization_index, family_authority_loop_index)
-        self.assertLess(family_authority_loop_index, family_authority_index)
-        self.assertLess(
-            source.index("localized_minimization = _proof_preserving_minimize_nogood("),
-            source.index("learned[project][mode].append(nogood)"),
+        localized_minimization_index = source.index(
+            "localized_minimization = _proof_preserving_minimize_nogood("
         )
+        localized_exact_authority_index = source.index(
+            "global_exact_exclusions[project][mode].append(dict(exact_nogood))",
+            localized_minimization_index,
+        )
+        self.assertLess(localized_minimization_index, localized_exact_authority_index)
+        self.assertNotIn("learned[project][mode].append(nogood)", source)
 
     def test_convergence_has_typed_plateau_and_hard_safety_terminal_codes(self) -> None:
         source = inspect.getsource(
@@ -817,18 +812,18 @@ class CrossIterationConflictHistoryTests(unittest.TestCase):
             "minimization = _proof_preserving_minimize_nogood(",
             certification_index,
         )
-        authority_loop_index = source.index(
-            "for generalized in new_constraints:",
+        diagnostic_index = source.index(
+            "diagnostic_constraints: List[Dict[str, str]]",
             minimization_index,
         )
         authority_index = source.index(
-            "learned[project][mode].append(generalized)",
-            authority_loop_index,
+            "global_exact_exclusions[project][mode].append(exact_nogood)",
+            diagnostic_index,
         )
         self.assertLess(consensus_index, certification_index)
         self.assertLess(certification_index, minimization_index)
-        self.assertLess(minimization_index, authority_loop_index)
-        self.assertLess(authority_loop_index, authority_index)
+        self.assertLess(minimization_index, diagnostic_index)
+        self.assertLess(diagnostic_index, authority_index)
         helper = inspect.getsource(
             roadmap._cross_iteration_consensus_proposal
         )

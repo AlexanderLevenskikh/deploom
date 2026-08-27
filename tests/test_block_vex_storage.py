@@ -16,6 +16,11 @@ class VexStorageTests(unittest.TestCase):
             "DEPLOOM_VERIFICATION_ROOT": "D:/fast",
             "DEPLOOM_BASELINE_RESUME": "restart",
             "DEPLOOM_PREDICATE_PROBE_BUDGET": "3",
+            "DEPLOOM_IO_COPY_SLOTS": "2",
+            "DEPLOOM_IO_HASH_SLOTS": "2",
+            "DEPLOOM_IO_PM_SLOTS": "1",
+            "DEPLOOM_SOURCE_HASH_WORKERS": "4",
+            "DEPLOOM_ARTIFACT_HASH_WORKERS": "4",
             "MY_PROJECT_FLAG": "keep",
         }
         result = storage.semantic_verification_environment(env)
@@ -25,6 +30,11 @@ class VexStorageTests(unittest.TestCase):
         self.assertNotIn("DEPLOOM_VERIFICATION_ROOT", result)
         self.assertNotIn("DEPLOOM_BASELINE_RESUME", result)
         self.assertNotIn("DEPLOOM_PREDICATE_PROBE_BUDGET", result)
+        self.assertNotIn("DEPLOOM_IO_COPY_SLOTS", result)
+        self.assertNotIn("DEPLOOM_IO_HASH_SLOTS", result)
+        self.assertNotIn("DEPLOOM_IO_PM_SLOTS", result)
+        self.assertNotIn("DEPLOOM_SOURCE_HASH_WORKERS", result)
+        self.assertNotIn("DEPLOOM_ARTIFACT_HASH_WORKERS", result)
 
     def test_explicit_root_is_created(self):
         with tempfile.TemporaryDirectory() as temp:

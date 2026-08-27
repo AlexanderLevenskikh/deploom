@@ -177,6 +177,79 @@ console.log('BLOCK_Z_WORKSPACE_CHECK_PASS');
             self.assertEqual("npm", event["managerFamily"])
             self.assertEqual("packages/app", event["packageRelativeToManager"])
 
+    @unittest.skipUnless(os.name == "nt", "Windows scoped Yarn Classic workspace acceptance")
+    def test_real_yarn1_scoped_workspace_link_is_rebased_into_private_clone(self) -> None:
+        yarn = _command("yarn")
+        git = _command("git")
+        node = _command("node")
+        if not yarn or not git or not node:
+            self.skipTest("Yarn Classic/git/node required")
+        version = _run([yarn, "--version"], Path.cwd())
+        if version.returncode != 0 or not version.stdout.strip().startswith("1."):
+            self.skipTest(f"Yarn Classic 1.x required; observed={version.stdout.strip()!r}")
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "repo"
+            app = root / "packages" / "app"
+            app.mkdir(parents=True)
+            _write_json(root / "package.json", {
+                "name": "block-z-yarn-root",
+                "private": True,
+                "packageManager": "yarn@1.22.22",
+                "workspaces": ["packages/*"],
+            })
+            _write_json(app / "package.json", {
+                "name": "@block-z/app",
+                "version": "1.0.0",
+            })
+            topology_script = app / "check-topology.js"
+            topology_script.write_text(
+                """
+const fs = require('fs');
+const path = require('path');
+const cwd = fs.realpathSync.native(process.cwd()).replace(/\\\\/g, '/').toLowerCase();
+const root = path.resolve(process.cwd(), '../..');
+if (!fs.existsSync(path.join(root, 'yarn.lock'))) process.exit(41);
+const link = path.join(root, 'node_modules', '@block-z', 'app');
+if (!fs.existsSync(link)) { console.error('scoped workspace link missing: ' + link); process.exit(42); }
+const linked = fs.realpathSync.native(link).replace(/\\\\/g, '/').toLowerCase();
+if (linked !== cwd) { console.error('scoped workspace escaped private clone: ' + linked + ' != ' + cwd); process.exit(43); }
+console.log('BLOCK_Z_YARN_SCOPED_WORKSPACE_PASS');
+""".lstrip(),
+                encoding="utf-8",
+            )
+            syntax = _run([node, "--check", str(topology_script)], app)
+            self.assertEqual(0, syntax.returncode, syntax.stdout)
+
+            self.assertEqual(0, _run([git, "init", "-q"], root).returncode)
+            self.assertEqual(0, _run([git, "config", "user.email", "z@example.invalid"], root).returncode)
+            self.assertEqual(0, _run([git, "config", "user.name", "Block Z"], root).returncode)
+            install = _run([yarn, "install", "--ignore-scripts", "--non-interactive"], root)
+            self.assertEqual(0, install.returncode, install.stdout)
+            self.assertTrue((root / "yarn.lock").is_file())
+            self.assertEqual(0, _run([git, "add", "."], root).returncode)
+            self.assertEqual(0, _run([git, "commit", "-q", "-m", "fixture"], root).returncode)
+
+            topology = resolve_project_topology(app, require_supported=True)
+            self.assertEqual("yarn-classic", topology.profile.family)
+            self.assertEqual(Path("packages/app"), topology.package_relative_to_manager)
+
+            config = BaselineVerifyConfig(
+                enabled=True,
+                parallelism=1,
+                timeout_seconds=120,
+                attempt_timeout_seconds=300,
+                localization_timeout_seconds=300,
+                progress_interval_seconds=5,
+                snapshot_copy_timeout_seconds=120,
+                project_checks="strict",
+                commands=("node check-topology.js",),
+                proof_cache_dir=str(root.parent / "proof-cache-yarn"),
+            )
+            result = verify_assignment(app, {}, config=config, run_project_checks=True)
+            self.assertTrue(result.ok, result.summary + "\n" + result.output)
+            self.assertEqual("passed", result.kind)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Persistent, environment-scoped package-manager incompatibility proofs.
+"""Persistent, environment-scoped exact package-manager incompatibility proofs.
 
-Only reproducible dependency-resolution failures belong here.  Entries are
+Only reproducible dependency-resolution failures belong here. Minimized clauses are diagnostic; durable Solver authority is exact-assignment scoped.  Entries are
 scoped by a conservative resolver-environment fingerprint so a clause learned
 under one manifest/lock/config/runtime context cannot silently become authority
 in another.
@@ -38,9 +38,9 @@ from typing import (
     Tuple,
 )
 
-CACHE_SCHEMA_VERSION = 3
-CONSTRAINT_ENTRY_SCHEMA = "verified-resolver-nogood-v3-tool-build"
-SOLVER_SCHEMA_VERSION = "peer-ir-v3-fixed-source-identity"
+CACHE_SCHEMA_VERSION = 4
+CONSTRAINT_ENTRY_SCHEMA = "verified-resolver-exact-assignment-v4-context-safe"
+SOLVER_SCHEMA_VERSION = "peer-ir-v4-context-safe-exact-exclusion"
 _CACHE_WRITE_THREAD_LOCK = threading.RLock()
 _WINDOWS_PERMISSION_GRACE_SECONDS = 0.25
 _ENV_FILES = (
@@ -294,6 +294,9 @@ class LearnedConstraintProof:
     verified_count: int = 2
     created_at: str = ""
     solver_schema: str = SOLVER_SCHEMA_VERSION
+    # Block Sigma: durable authority is exact-assignment scoped. A minimized
+    # subset may remain diagnostic, but can never be silently universalized.
+    scope: str = "exact-assignment"
 
     def normalized_literals(self) -> Dict[str, str]:
         return {str(name): str(version) for name, version in sorted(self.literals.items())}
@@ -314,6 +317,8 @@ class LearnedConstraintProof:
             "solverSchema": str(self.solver_schema),
             "projectPath": self.project_path,
             "resolverContextKey": context_key,
+            "scope": str(self.scope),
+            "assignmentWidth": len(literals),
             "literals": literals,
             "failureSignature": self.failure_signature,
             "source": self.source,
@@ -447,6 +452,8 @@ def _constraint_entry_key(payload: Mapping[str, object]) -> str:
         "solverSchema": str(payload.get("solverSchema") or ""),
         "projectPath": str(payload.get("projectPath") or ""),
         "resolverContextKey": str(payload.get("resolverContextKey") or "").lower(),
+        "scope": str(payload.get("scope") or ""),
+        "assignmentWidth": int(payload.get("assignmentWidth") or 0),
         "literals": dict(sorted(
             (str(k), str(v))
             for k, v in dict(payload.get("literals") or {}).items()
@@ -490,6 +497,13 @@ def _validated_constraint_entry(raw: object) -> Optional[Dict[str, object]]:
     context_key = str(raw.get("resolverContextKey") or "").lower()
     failure_signature = str(raw.get("failureSignature") or "")
     source = str(raw.get("source") or "")
+    scope = str(raw.get("scope") or "")
+    try:
+        assignment_width = int(raw.get("assignmentWidth") or 0)
+    except (TypeError, ValueError):
+        return None
+    if scope != "exact-assignment":
+        return None
     if not project_path or not _valid_context_key(context_key):
         return None
     if not failure_signature or source != "package-manager-resolver":
@@ -510,6 +524,8 @@ def _validated_constraint_entry(raw: object) -> Optional[Dict[str, object]]:
     }
     if len(literals) != len(literals_raw) or not literals:
         return None
+    if assignment_width != len(literals):
+        return None
     authority_payload = {
         "entrySchema": CONSTRAINT_ENTRY_SCHEMA,
         "proofSchema": PROOF_SCHEMA_VERSION,
@@ -517,6 +533,8 @@ def _validated_constraint_entry(raw: object) -> Optional[Dict[str, object]]:
         "solverSchema": SOLVER_SCHEMA_VERSION,
         "projectPath": project_path,
         "resolverContextKey": context_key,
+        "scope": scope,
+        "assignmentWidth": assignment_width,
         "literals": literals,
         "failureSignature": failure_signature,
         "source": source,
@@ -613,6 +631,8 @@ def load_verified_nogoods(
             "solverSchema": raw.get("solverSchema"),
             "projectPath": raw.get("projectPath"),
             "resolverContextKey": raw.get("resolverContextKey"),
+            "scope": raw.get("scope"),
+            "assignmentWidth": raw.get("assignmentWidth"),
             "literals": literals,
             "failureSignature": failure_signature,
             "source": raw.get("source"),
@@ -633,7 +653,7 @@ def persist_verified_nogood(
     *,
     max_entries: int = 1000,
 ) -> bool:
-    """Atomically persist one proven clause after full authority validation."""
+    """Atomically persist one exact failing assignment after full authority validation."""
     if path is None or proof.verified_count < 2 or not proof.failure_signature or not proof.literals:
         return False
     # Fail closed before touching the existing cache. A short/display hash or

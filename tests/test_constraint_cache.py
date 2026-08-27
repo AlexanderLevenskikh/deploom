@@ -186,8 +186,8 @@ class ConstraintCacheTests(unittest.TestCase):
             captured = []
 
             def fake_resolve(rows_by_project, client, **kwargs):
-                learned = kwargs.get("learned_nogoods_by_project_mode") or {}
-                captured.append(learned)
+                exact = kwargs.get("global_exact_exclusions_by_project_mode") or {}
+                captured.append(exact)
                 modes = kwargs.get("modes", ("default",))
                 result = {"Demo": {}}
                 for mode in modes:

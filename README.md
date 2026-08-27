@@ -95,7 +95,17 @@ python -m pip install -r requirements-solver.txt
 }
 ```
 
-Реальный npm/Yarn/pnpm resolver остаётся proof-oracle. Воспроизводимые dependency-resolution nogoods сохраняются в environment-scoped cache; project/build/infra/unknown failures в persistent cache не попадают.
+Авторитетный Baseline resolver/proof-oracle сейчас поддерживает **npm** и **Yarn Classic 1.x**. Yarn Berry 2/3/4 (как PnP, так и `node-modules`) и pnpm распознаются, но для authoritative Baseline намеренно завершаются typed fail-closed (`PACKAGE_MANAGER_YARN_BERRY_UNSUPPORTED` / `PACKAGE_MANAGER_PNPM_UNSUPPORTED`): это infrastructure/UNKNOWN-equivalent capability boundary, из которого никогда не учится dependency nogood. Ручной vulnerability audit остаётся отдельным workflow и может использовать npm/pnpm независимо от этой Baseline support matrix. В persistent cache сохраняются только воспроизведённые exact-assignment dependency exclusions; project/build/infra/unknown failures туда не попадают.
+
+### Package-manager support matrix
+
+| Package manager | Baseline authority | Behaviour |
+| --- | --- | --- |
+| npm | **Supported** | real package-manager verification |
+| Yarn Classic 1.x | **Supported** | real Yarn 1 verification |
+| Yarn Berry 2/3/4 + `node-modules` | **Typed unsupported** | fail closed, no nogood |
+| Yarn Berry 2/3/4 + PnP | **Typed unsupported** | fail closed, no nogood |
+| pnpm | **Typed unsupported** | fail closed, no nogood |
 
 Долгие deterministic verification/localization фазы имеют heartbeat и hard watchdog. По умолчанию один subprocess ограничен 600 секундами, целая isolated assignment verification — 3600 секундами, localization cycle — 7200 секундами, heartbeat приходит каждые 15 секунд. Последняя фаза также сохраняется в `.dependency-roadmap/state/baseline-verification-progress.json`. Auto-discovery в adaptive mode запускает lint/type/style/script checks, затем build и `test:unit`/`test`; обычные source-migration ошибки остаются Executor work и не становятся solver constraints.
 
@@ -452,11 +462,13 @@ Desktop state-коммит сначала обновляет уже отслеж
 
 ## Current checkout и lockfile одного package manager
 
-`package.json` хранит direct declarations/ranges. Exact current versions берутся из lockfile того же package manager:
+`package.json` хранит direct declarations/ranges. Exact current versions для анализа могут читаться из canonical lockfile того же package manager:
 
 - Yarn → `yarn.lock`;
 - npm → `package-lock.json`/`npm-shrinkwrap.json`;
 - pnpm → `pnpm-lock.yaml`.
+
+Чтение/распознавание lockfile не означает authoritative Baseline support: на release boundary real solve-and-verify сейчас доказан только для npm и Yarn Classic 1.x; Berry и pnpm fail closed согласно matrix выше.
 
 `--capture-baseline` validates and records the fetched source branch. Every ordinary run analyzes the current checkout, refreshes a stale **canonical project lockfile** by default and optionally deduplicates Yarn when tooling exists. Mixed root lockfiles are rejected.
 

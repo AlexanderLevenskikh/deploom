@@ -9560,11 +9560,12 @@ def resolve_peer_compatibility_with_verification(
                 )
                 if cached_nogoods:
                     for cached_mode in modes:
-                        for nogood in cached_nogoods:
-                            if nogood not in learned[project][cached_mode]:
-                                learned[project][cached_mode].append(dict(nogood))
+                        for exact_assignment in cached_nogoods:
+                            if exact_assignment not in global_exact_exclusions[project][cached_mode]:
+                                global_exact_exclusions[project][cached_mode].append(dict(exact_assignment))
                     eprint(
-                        f"[info] {project}: loaded {len(cached_nogoods)} persistent verified resolver constraint(s); "
+                        f"[info] {project}: loaded {len(cached_nogoods)} persistent exact resolver exclusion(s); "
+                        f"scope=exact-assignment, universal=false, "
                         f"resolverContext={project_resolver_context_key[:12]}"
                     )
 
@@ -9648,9 +9649,11 @@ def resolve_peer_compatibility_with_verification(
                     restored_learned, restored_exclusions, restored_failed,
                     restored_iteration, restored_liveness,
                 ) = restore_run_state(recovery_plan.state)
-                for clause in restored_learned:
-                    if clause not in learned[project][mode]:
-                        learned[project][mode].append(clause)
+                if restored_learned:
+                    eprint(
+                        f"[warn] {project}: discarded {len(restored_learned)} legacy/context-unsafe "
+                        f"recovery learned clause(s); Block Sigma requires exact-assignment authority"
+                    )
                 for clause in restored_exclusions:
                     if clause not in global_exact_exclusions[project][mode]:
                         global_exact_exclusions[project][mode].append(clause)
@@ -11213,95 +11216,86 @@ def resolve_peer_compatibility_with_verification(
                                     authority=EVIDENCE_CONFIRMED_CONSTRAINT,
                                 )
 
-                            new_constraints: List[Dict[str, str]] = []
-                            new_family_results: List[Tuple[str, Dict[str, str], NogoodMinimizationResult]] = []
+                            diagnostic_constraints: List[Dict[str, str]] = []
+                            diagnostic_family_results: List[Tuple[str, Dict[str, str], NogoodMinimizationResult]] = []
                             for family_result in family_results:
                                 _predicate, generalized, _minimization = family_result
-                                if generalized in learned[project][mode] or generalized in new_constraints:
+                                if generalized in diagnostic_constraints:
                                     continue
-                                new_constraints.append(generalized)
-                                new_family_results.append(family_result)
-                            if not new_constraints:
-                                raise BaselineConstraintVerificationError(
-                                    f"BASELINE_CONSTRAINT_LOOP_STUCK: {project}/{mode}: all freshly "
-                                    "certified predicate-family constraints were already learned"
+                                diagnostic_constraints.append(generalized)
+                                diagnostic_family_results.append(family_result)
+                            if not diagnostic_constraints:
+                                liveness.record_diagnostic()
+                                progress_reporter.emit(
+                                    project, mode, "generalization-not-certified",
+                                    iteration=iteration, assignment=fingerprint,
+                                    authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                    reason="no-new-diagnostic-shape",
+                                )
+                            else:
+                                # Block Sigma: fresh minimization proves the failure
+                                # only under the assignment used for that trial. It
+                                # does NOT prove that omitted dimensions are
+                                # irrelevant. Keep the minimized shape as diagnostic
+                                # navigation and block only the fully confirmed exact
+                                # assignment in Solver authority.
+                                strongest_family = min(
+                                    diagnostic_family_results,
+                                    key=lambda item: (len(item[1]), assignment_fingerprint(item[1]), item[0]),
+                                )
+                                strongest = strongest_family[1]
+                                strongest_minimization = strongest_family[2]
+                                candidate_fingerprint = assignment_fingerprint(strongest)
+                                diagnostic_fingerprints = [
+                                    assignment_fingerprint(item) for item in diagnostic_constraints
+                                ]
+                                eprint(
+                                    f"[warn] {project}: graph-guided predicate family reproduced; "
+                                    f"diagnosticLiterals={[len(item) for item in diagnostic_constraints]}, "
+                                    f"scope=context-diagnostic, universal=false; exact assignment remains authority"
+                                )
+                                progress_reporter.emit(
+                                    project, mode, "generalization-certified-diagnostic",
+                                    iteration=iteration, assignment=fingerprint,
+                                    candidate=candidate_fingerprint,
+                                    originalCandidate=original_candidate_fingerprint,
+                                    originalLiterals=len(certified_candidate), literals=len(strongest),
+                                    minimizationChecks=sum(item[2].checks for item in family_results),
+                                    shrinkHistory=list(strongest_minimization.shrink_history),
+                                    diagnosticCandidates=diagnostic_fingerprints,
+                                    predicateFamilies=list(predicate_families),
+                                    contextRadius=(proposal.context_radius if proposal is not None else 1),
+                                    repeatCount=(proposal.repeat_count if proposal is not None else 1),
+                                    literalBudget=(proposal.literal_budget if proposal is not None else len(strongest)),
+                                    boundedSlice=(proposal.bounded_slice if proposal is not None else False),
+                                    seedSource=(proposal.seed_source if proposal is not None else "legacy"),
+                                    authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                    clauseScope="context-diagnostic",
+                                    universal=False,
+                                    predicate=stable_predicate,
                                 )
 
-                            for generalized in new_constraints:
-                                learned[project][mode].append(generalized)
-                            liveness.observe_learned_constraints(len(learned[project][mode]))
+                            if exact_nogood not in global_exact_exclusions[project][mode]:
+                                global_exact_exclusions[project][mode].append(exact_nogood)
+                                extension_granted = liveness.record_exact_exclusion()
+                            else:
+                                extension_granted = False
                             localization_checkpoint_store.clear(project, mode)
-
-                            learned_fingerprints = [assignment_fingerprint(item) for item in new_constraints]
-                            strongest_family = min(
-                                new_family_results,
-                                key=lambda item: (len(item[1]), assignment_fingerprint(item[1]), item[0]),
-                            )
-                            strongest = strongest_family[1]
-                            strongest_minimization = strongest_family[2]
-                            candidate_fingerprint = assignment_fingerprint(strongest)
-                            if _baseline_interactive() and iteration >= decision_prompt_not_before:
-                                decision_focus = _baseline_human_decision_focus(
-                                    learned[project][mode], baseline_current_versions,
-                                    min_confirmed=BASELINE_INTERACTIVE_UNARY_THRESHOLD,
-                                )
-                                if decision_focus is not None:
-                                    checkpoint_baseline_run(
-                                        "human-decision-required",
-                                        completed_iteration=iteration,
-                                        last_assignment=fingerprint,
-                                        last_predicate=strongest_family[0],
-                                        status="decision-required",
-                                    )
-                                    decision_payload = {
-                                        "schemaVersion": 1,
-                                        "reason": "repeated-package-conflict",
-                                        "project": project,
-                                        "mode": mode,
-                                        "iteration": iteration,
-                                        "hardIterations": liveness.hard_iterations,
-                                        "learnedConstraints": len(learned[project][mode]),
-                                        "predicate": strongest_family[0],
-                                        **decision_focus,
-                                    }
-                                    progress_reporter.emit(
-                                        project, mode, "human-decision-required",
-                                        iteration=iteration,
-                                        stopCode="BASELINE_HUMAN_DECISION_REQUIRED",
-                                        terminalStatus="HUMAN_DECISION_REQUIRED",
-                                        **{key: value for key, value in decision_payload.items() if key not in {"project", "mode", "iteration", "schemaVersion"}},
-                                    )
-                                    _raise_baseline_human_decision(decision_payload)
-                            eprint(
-                                f"[warn] {project}: graph-guided constraint family certified; "
-                                f"learned={len(new_constraints)}, "
-                                f"literals={[len(item) for item in new_constraints]}, "
-                                f"authority={EVIDENCE_CONFIRMED_CONSTRAINT}; re-solving"
-                            )
                             checkpoint_baseline_run(
-                                "generalization-certified",
+                                "exact-assignment-blocked",
                                 completed_iteration=iteration,
                                 last_assignment=fingerprint,
                                 last_predicate=stable_predicate,
                             )
                             progress_reporter.emit(
-                                project, mode, "generalization-certified",
+                                project, mode, "exact-assignment-blocked",
                                 iteration=iteration, assignment=fingerprint,
-                                candidate=candidate_fingerprint,
-                                originalCandidate=original_candidate_fingerprint,
-                                originalLiterals=len(certified_candidate), literals=len(strongest),
-                                minimizationChecks=sum(item[2].checks for item in family_results),
-                                shrinkHistory=list(strongest_minimization.shrink_history),
-                                learnedCandidates=learned_fingerprints,
-                                learnedThisIteration=len(new_constraints),
-                                predicateFamilies=list(predicate_families),
-                                contextRadius=(proposal.context_radius if proposal is not None else 1),
-                                repeatCount=(proposal.repeat_count if proposal is not None else 1),
-                                literalBudget=(proposal.literal_budget if proposal is not None else len(strongest)),
-                                boundedSlice=(proposal.bounded_slice if proposal is not None else False),
-                                seedSource=(proposal.seed_source if proposal is not None else "legacy"),
+                                literals=len(exact_nogood), origin=result.kind,
                                 authority=EVIDENCE_CONFIRMED_CONSTRAINT,
-                                predicate=stable_predicate,
+                                clauseScope="exact-assignment",
+                                universal=False,
+                                topologyMerged=False,
+                                extensionGranted=extension_granted,
                                 **liveness.snapshot(learned_constraints=len(learned[project][mode])),
                             )
                             continue
@@ -11812,22 +11806,23 @@ def resolve_peer_compatibility_with_verification(
                     authority=EVIDENCE_CONFIRMED_CONSTRAINT,
                 )
 
-                if nogood in learned[project][mode]:
-                    raise BaselineConstraintVerificationError(
-                        f"BASELINE_CONSTRAINT_LOOP_STUCK: {project}/{mode}: verification repeated already learned assignment "
-                        f"{assignment_fingerprint(nogood)}; {result.summary}"
-                    )
-                learned[project][mode].append(nogood)
-                liveness.observe_learned_constraints(len(learned[project][mode]))
-                # Keep the finished localization checkpoint through project
-                # reproductions; clear only after the clause becomes solver authority.
+                # The minimized clause is useful diagnostic evidence, but its
+                # omitted variables were not proven irrelevant. Block Sigma
+                # therefore keeps Solver authority exact-assignment scoped.
+                detail = ", ".join(
+                    f"{name}@{version}" for name, version in sorted(nogood.items())
+                )
+                exact_added = exact_nogood not in global_exact_exclusions[project][mode]
+                if exact_added:
+                    global_exact_exclusions[project][mode].append(dict(exact_nogood))
+                    extension_granted = liveness.record_exact_exclusion()
+                else:
+                    extension_granted = False
                 localization_checkpoint_store.clear(project, mode)
-                detail = ", ".join(f"{name}@{version}" for name, version in sorted(nogood.items()))
 
-                # Persist only package-manager dependency failures that reproduce
-                # in fresh workspaces under the same resolver environment.
-                # Project/build failures and unknown/infra failures never become
-                # durable version authority.
+                # Persist only exact package-manager dependency failures that
+                # reproduce under the same resolver context. A minimized subset
+                # is never durable/universal authority.
                 if (
                     result.kind == "dependency"
                     and backend_options["persistentLearning"]
@@ -11841,7 +11836,7 @@ def resolve_peer_compatibility_with_verification(
                         if not persistent_control_ok:
                             eprint(
                                 f"[warn] {project}: current resolver control is not green; "
-                                "learned constraint remains session-local and will not be persisted"
+                                "exact exclusion remains session-local and will not be persisted"
                             )
 
                     if persistent_control_ok:
@@ -11849,57 +11844,70 @@ def resolve_peer_compatibility_with_verification(
                         reproducible = True
                         for _proof_index in range(backend_options["learningReproductions"]):
                             proof_result = verify_assignment(
-                                spec.path, nogood, config=config, run_project_checks=False
+                                spec.path, exact_nogood, config=config, run_project_checks=False
                             )
                             if proof_result.ok or proof_result.kind != "dependency":
                                 reproducible = False
                                 break
-                            signatures.append(
-                                dependency_failure_signature(
-                                    summary=proof_result.summary,
-                                    output=proof_result.output,
-                                )
+                            signature = matching_dependency_failure_signature(
+                                expected_summary=result.summary,
+                                expected_output=result.output,
+                                observed_summary=proof_result.summary,
+                                observed_output=proof_result.output,
                             )
+                            if not signature:
+                                reproducible = False
+                                break
+                            signatures.append(signature)
                         if reproducible and signatures and len(set(signatures)) == 1:
                             persisted = persist_verified_nogood(
                                 spec.constraint_cache_path,
                                 LearnedConstraintProof(
                                     project_path=str(spec.path.resolve()),
                                     environment_fingerprint=project_resolver_context_key,
-                                    literals=dict(nogood),
+                                    literals=dict(exact_nogood),
                                     failure_signature=signatures[0],
                                     verified_count=len(signatures),
+                                    scope="exact-assignment",
                                 ),
                             )
                             eprint(
-                                f"[info] {project}: persistent resolver constraint "
+                                f"[info] {project}: persistent exact resolver exclusion "
                                 f"{'stored' if persisted else 'already known'}; "
-                                f"proofs={len(signatures)}, resolverContext={project_resolver_context_key[:12]}"
+                                f"proofs={len(signatures)}, universal=false, "
+                                f"resolverContext={project_resolver_context_key[:12]}"
                             )
                         else:
                             eprint(
-                                f"[warn] {project}: resolver constraint was not reproducible with a stable signature; "
-                                "kept session-local only"
+                                f"[warn] {project}: exact resolver exclusion did not reproduce "
+                                "with a stable predicate; kept session-local only"
                             )
 
                 eprint(
-                    f"[info] {project}: learned constraint {mode} #{len(learned[project][mode])}: "
-                    f"NOT({detail}); verification checks localized in parallel"
+                    f"[info] {project}: localized diagnostic constraint {mode}: NOT({detail}); "
+                    f"scope=context-diagnostic, universal=false; "
+                    f"blockedExact={fingerprint}"
                 )
                 checkpoint_baseline_run(
-                    "constraint-learned",
+                    "exact-assignment-blocked",
                     completed_iteration=iteration,
                     last_assignment=fingerprint,
                     last_predicate=localized_minimization.predicate,
                 )
                 progress_reporter.emit(
-                    project,
-                    mode,
-                    "constraint-learned",
-                    iteration=iteration,
-                    assignment=fingerprint,
-                    constraintNumber=len(learned[project][mode]),
-                    literals=dict(nogood),
+                    project, mode, "constraint-localized-diagnostic",
+                    iteration=iteration, assignment=fingerprint,
+                    diagnosticLiterals=dict(nogood),
+                    clauseScope="context-diagnostic", universal=False,
+                    authority=EVIDENCE_DIAGNOSTIC_HINT,
+                )
+                progress_reporter.emit(
+                    project, mode, "exact-assignment-blocked",
+                    iteration=iteration, assignment=fingerprint,
+                    literals=len(exact_nogood), origin=result.kind,
+                    authority=EVIDENCE_CONFIRMED_CONSTRAINT,
+                    clauseScope="exact-assignment", universal=False,
+                    topologyMerged=False, extensionGranted=extension_granted,
                     **liveness.snapshot(learned_constraints=len(learned[project][mode])),
                 )
                 if fingerprint == last_fingerprint and len(learned[project][mode]) > 1:

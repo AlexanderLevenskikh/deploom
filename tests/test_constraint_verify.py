@@ -330,6 +330,33 @@ class ConstraintVerifyTests(unittest.TestCase):
         self.assertIn((1, ((("b", "2"),),)), calls)
 
 
+    def test_context_sensitive_failure_does_not_forbid_same_pair_in_other_context(self) -> None:
+        # Failure was proven only for A1+B2+C1. The exact coordinator may move
+        # C while preserving the same A/B pair; a universal NOT(A1 & B2) would
+        # incorrectly make this valid assignment unreachable.
+        initial = (
+            RankedComponentAlternative({"a": "1"}, (10,)),
+            RankedComponentAlternative({"b": "2"}, (10,)),
+            RankedComponentAlternative({"c": "1"}, (10,)),
+        )
+        alternatives = {
+            0: [RankedComponentAlternative({"a": "2"}, (1,))],
+            1: [RankedComponentAlternative({"b": "1"}, (1,))],
+            2: [RankedComponentAlternative({"c": "2"}, (9,))],
+        }
+
+        def next_alt(index, existing):
+            rank = len(existing) - 1
+            values = alternatives[index]
+            return values[rank] if rank < len(values) else None
+
+        assignment, _ = coordinate_global_exact_exclusions(
+            initial,
+            [{"a": "1", "b": "2", "c": "1"}],
+            next_alt,
+        )
+        self.assertEqual({"a": "1", "b": "2", "c": "2"}, assignment)
+
 
 class FixedNonRegistryInputTests(unittest.TestCase):
     class _Client:
@@ -521,7 +548,7 @@ class FixedNonRegistryInputTests(unittest.TestCase):
 
     def test_constraint_cache_schema_invalidates_pre_h_solver_learning(self) -> None:
         self.assertEqual(
-            "peer-ir-v3-fixed-source-identity",
+            "peer-ir-v4-context-safe-exact-exclusion",
             constraint_cache.SOLVER_SCHEMA_VERSION,
         )
 

@@ -10,6 +10,7 @@ exclusion says otherwise.
 from __future__ import annotations
 
 import atexit
+import concurrent.futures
 import dataclasses
 import hashlib
 import json
@@ -24,6 +25,8 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from verification_workspace_backend import materialize_private_tree
+from io_governor import io_slot
+from reparse_materialization import ReparseMaterializationError
 from verification_observability import (
     configured_observability_path,
     emit_observability_event,
@@ -377,23 +380,62 @@ def _excluded(relative: Path, policy: SourceInputPolicy) -> bool:
     return relative.name in policy.excluded_file_names
 
 
-def _hash_regular_file(path: Path) -> tuple[str, os.stat_result]:
+def _hash_regular_file(
+    path: Path,
+    *,
+    suppress_worker_observability: bool = False,
+) -> tuple[str, os.stat_result]:
     try:
         before = path.stat(follow_symlinks=False)
         digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
+        def hash_stream() -> None:
+            with io_slot("hash", label="source-manifest"):
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+        if suppress_worker_observability:
+            # ContextVars do not automatically propagate into ThreadPoolExecutor
+            # workers. Re-establish suppression in the worker so an in-source
+            # telemetry sink cannot mutate the Source Truth while it is hashed.
+            with suppress_observability():
+                hash_stream()
+        else:
+            hash_stream()
         after = path.stat(follow_symlinks=False)
     except OSError as exc:
         raise SourceCaptureError(f"SOURCE_FILE_UNREADABLE: {path}: {exc}") from exc
     if (
         before.st_size != after.st_size
         or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_mode != after.st_mode
+        or int(getattr(before, "st_nlink", 1) or 1) != int(getattr(after, "st_nlink", 1) or 1)
         or getattr(before, "st_ino", 0) != getattr(after, "st_ino", 0)
     ):
         raise SourceCaptureError(f"SOURCE_CAPTURE_UNSTABLE: file changed while hashing: {path}")
     return digest.hexdigest(), after
+
+
+def _source_hash_workers() -> int:
+    raw = str(os.environ.get("DEPLOOM_SOURCE_HASH_WORKERS") or "").strip()
+    if raw:
+        try:
+            return max(1, min(32, int(raw)))
+        except ValueError:
+            pass
+    logical = max(1, int(os.cpu_count() or 4))
+    return max(2, min(8, logical // 2 or 1))
+
+
+def _directory_stability_stamp(path: Path) -> tuple[int, int, int]:
+    try:
+        value = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise SourceCaptureError(f"SOURCE_DIRECTORY_UNREADABLE: {path}: {exc}") from exc
+    return (
+        int(value.st_mtime_ns),
+        int(value.st_size),
+        int(getattr(value, "st_ino", 0)),
+    )
 
 
 def _build_source_tree_manifest_impl(
@@ -404,7 +446,14 @@ def _build_source_tree_manifest_impl(
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "source manifest",
     progress_interval_seconds: int = 15,
+    suppress_worker_observability: bool = False,
 ) -> SourceTreeManifest:
+    """Build a deterministic manifest with bounded parallel file hashing.
+
+    Only a small multiple of worker futures may exist at once; million-file
+    repositories therefore do not allocate a future per file. Directory stamps
+    are rechecked after hashing so add/remove/rename races fail closed.
+    """
     root = root.resolve()
     deadline = time.monotonic() + max(1, int(timeout_seconds))
     next_progress = time.monotonic() + max(1, int(progress_interval_seconds))
@@ -412,6 +461,10 @@ def _build_source_tree_manifest_impl(
     files = 0
     directories = 0
     byte_count = 0
+    workers = _source_hash_workers()
+    max_pending = max(workers, workers * 3)
+    directory_stamps: list[tuple[Path, tuple[int, int, int]]] = []
+    pending: dict[concurrent.futures.Future[tuple[str, os.stat_result]], tuple[Path, str]] = {}
 
     def tick() -> None:
         nonlocal next_progress
@@ -422,102 +475,133 @@ def _build_source_tree_manifest_impl(
             )
         if progress is not None and now >= next_progress:
             progress(
-                f"{progress_label}: files={files}, dirs={directories}, bytes={byte_count}"
+                f"{progress_label}: files={files}, dirs={directories}, bytes={byte_count}, workers={workers}"
             )
             next_progress = now + max(1, int(progress_interval_seconds))
 
-    def walk(directory: Path, relative_dir: Path) -> None:
-        nonlocal files, directories, byte_count
+    def accept_future(future: concurrent.futures.Future[tuple[str, os.stat_result]]) -> None:
+        nonlocal files, byte_count
+        path, relative_text = pending.pop(future)
+        digest, stable = future.result()
+        files += 1
+        byte_count += int(stable.st_size)
+        entries.append({
+            "path": relative_text,
+            "kind": "file",
+            "size": int(stable.st_size),
+            "sha256": digest,
+            "executable": bool(stable.st_mode & 0o111),
+        })
         tick()
-        try:
-            scanned = sorted(os.scandir(directory), key=lambda entry: entry.name)
-        except OSError as exc:
-            raise SourceCaptureError(f"SOURCE_DIRECTORY_UNREADABLE: {directory}: {exc}") from exc
-        for item in scanned:
-            relative = relative_dir / item.name
-            if _excluded(relative, policy):
-                continue
-            path = Path(item.path)
+
+    def drain_one() -> None:
+        if not pending:
+            return
+        done, _ = concurrent.futures.wait(
+            tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED
+        )
+        for future in done:
+            accept_future(future)
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="deploom-source-hash",
+    ) as executor:
+        def walk(directory: Path, relative_dir: Path) -> None:
+            nonlocal directories
             tick()
+            directory_stamps.append((directory, _directory_stability_stamp(directory)))
             try:
-                st = item.stat(follow_symlinks=False)
+                scanned = sorted(os.scandir(directory), key=lambda entry: entry.name)
             except OSError as exc:
-                raise SourceCaptureError(f"SOURCE_ENTRY_UNREADABLE: {path}: {exc}") from exc
-
-            is_junction = getattr(path, "is_junction", None)
-            if callable(is_junction):
+                raise SourceCaptureError(f"SOURCE_DIRECTORY_UNREADABLE: {directory}: {exc}") from exc
+            for item in scanned:
+                relative = relative_dir / item.name
+                if _excluded(relative, policy):
+                    continue
+                path = Path(item.path)
+                tick()
                 try:
-                    if is_junction():
+                    st = item.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise SourceCaptureError(f"SOURCE_ENTRY_UNREADABLE: {path}: {exc}") from exc
+
+                is_junction = getattr(path, "is_junction", None)
+                if callable(is_junction):
+                    try:
+                        if is_junction():
+                            raise SourceCaptureError(
+                                f"SOURCE_UNSUPPORTED_REPARSE_POINT: junction: {path}"
+                            )
+                    except OSError as exc:
                         raise SourceCaptureError(
-                            f"SOURCE_UNSUPPORTED_REPARSE_POINT: junction: {path}"
+                            f"SOURCE_ENTRY_UNREADABLE: junction probe {path}: {exc}"
+                        ) from exc
+
+                if stat.S_ISLNK(st.st_mode):
+                    try:
+                        target_text = os.readlink(path)
+                    except OSError as exc:
+                        raise SourceCaptureError(f"SOURCE_SYMLINK_UNREADABLE: {path}: {exc}") from exc
+                    target = Path(target_text)
+                    if not target.is_absolute():
+                        target = path.parent / target
+                    if not _within(target, root):
+                        raise SourceCaptureError(
+                            f"SOURCE_SYMLINK_ESCAPE: {relative.as_posix()} -> {target_text}"
                         )
-                except OSError as exc:
-                    raise SourceCaptureError(
-                        f"SOURCE_ENTRY_UNREADABLE: junction probe {path}: {exc}"
-                    ) from exc
+                    try:
+                        target_relative = target.resolve(strict=False).relative_to(root)
+                    except ValueError:
+                        target_relative = Path(".")
+                    if _excluded(target_relative, policy):
+                        raise SourceCaptureError(
+                            f"SOURCE_SYMLINK_TARGET_EXCLUDED: {relative.as_posix()} -> {target_text}"
+                        )
+                    entries.append({
+                        "path": relative.as_posix(),
+                        "kind": "symlink",
+                        "target": target_text.replace("\\", "/"),
+                    })
+                    continue
 
-            if stat.S_ISLNK(st.st_mode):
-                try:
-                    target_text = os.readlink(path)
-                except OSError as exc:
-                    raise SourceCaptureError(f"SOURCE_SYMLINK_UNREADABLE: {path}: {exc}") from exc
-                target = Path(target_text)
-                if not target.is_absolute():
-                    target = path.parent / target
-                if not _within(target, root):
-                    raise SourceCaptureError(
-                        f"SOURCE_SYMLINK_ESCAPE: {relative.as_posix()} -> {target_text}"
-                    )
-                try:
-                    target_relative = target.resolve(strict=False).relative_to(root)
-                except ValueError:
-                    target_relative = Path(".")
-                if _excluded(target_relative, policy):
-                    raise SourceCaptureError(
-                        f"SOURCE_SYMLINK_TARGET_EXCLUDED: {relative.as_posix()} -> {target_text}"
-                    )
-                entries.append({
-                    "path": relative.as_posix(),
-                    "kind": "symlink",
-                    "target": target_text.replace("\\", "/"),
-                })
-                continue
+                if stat.S_ISDIR(st.st_mode):
+                    directories += 1
+                    entries.append({"path": relative.as_posix(), "kind": "directory"})
+                    walk(path, relative)
+                    continue
 
-            if stat.S_ISDIR(st.st_mode):
-                directories += 1
-                entries.append({"path": relative.as_posix(), "kind": "directory"})
-                walk(path, relative)
-                continue
+                if stat.S_ISREG(st.st_mode):
+                    if int(getattr(st, "st_nlink", 1) or 1) > 1 and not (
+                        relative.parts and relative.parts[0] == ".git"
+                    ):
+                        raise SourceCaptureError(
+                            f"SOURCE_HARDLINK_UNSUPPORTED: {relative.as_posix()} nlink={st.st_nlink}"
+                        )
+                    future = executor.submit(
+                    _hash_regular_file,
+                    path,
+                    suppress_worker_observability=suppress_worker_observability,
+                )
+                    pending[future] = (path, relative.as_posix())
+                    if len(pending) >= max_pending:
+                        drain_one()
+                    continue
 
-            if stat.S_ISREG(st.st_mode):
-                # Portable copy backends do not promise to preserve source
-                # hardlink aliasing. Outside .git that aliasing can be a
-                # semantic build input, so X.1 refuses rather than silently
-                # proving a tree with different mutation semantics.
-                if int(getattr(st, "st_nlink", 1) or 1) > 1 and not (
-                    relative.parts and relative.parts[0] == ".git"
-                ):
-                    raise SourceCaptureError(
-                        f"SOURCE_HARDLINK_UNSUPPORTED: {relative.as_posix()} nlink={st.st_nlink}"
-                    )
-                digest, stable = _hash_regular_file(path)
-                files += 1
-                byte_count += int(stable.st_size)
-                entries.append({
-                    "path": relative.as_posix(),
-                    "kind": "file",
-                    "size": int(stable.st_size),
-                    "sha256": digest,
-                    # Executability can change build behaviour on POSIX.
-                    "executable": bool(stable.st_mode & 0o111),
-                })
-                continue
+                raise SourceCaptureError(
+                    f"SOURCE_SPECIAL_FILE_UNSUPPORTED: {relative.as_posix()} mode={oct(st.st_mode)}"
+                )
 
+        walk(root, Path("."))
+        while pending:
+            drain_one()
+
+    for directory, stamp in directory_stamps:
+        if _directory_stability_stamp(directory) != stamp:
             raise SourceCaptureError(
-                f"SOURCE_SPECIAL_FILE_UNSUPPORTED: {relative.as_posix()} mode={oct(st.st_mode)}"
+                f"SOURCE_CAPTURE_UNSTABLE: directory changed while hashing: {directory}"
             )
 
-    walk(root, Path("."))
     entries.sort(key=lambda entry: str(entry["path"]))
     key = _canonical_hash({
         "schema": SOURCE_SNAPSHOT_SCHEMA,
@@ -526,7 +610,9 @@ def _build_source_tree_manifest_impl(
         "entries": entries,
     }, length=64)
     if progress is not None:
-        progress(f"{progress_label}: ready; files={files}, dirs={directories}, bytes={byte_count}")
+        progress(
+            f"{progress_label}: ready; files={files}, dirs={directories}, bytes={byte_count}, workers={workers}"
+        )
     return SourceTreeManifest(
         key=key,
         entries=tuple(entries),
@@ -568,29 +654,26 @@ def _capture_once(
         if manifest_path.is_file():
             _local_dependency_preflight(manifest_path.parent, capture_root)
 
-    pre = build_source_tree_manifest(
-        capture_root,
-        policy=policy,
-        timeout_seconds=_remaining(deadline),
-        progress=progress,
-        progress_label="source capture pre-manifest",
-        progress_interval_seconds=progress_interval_seconds,
-    )
-
     container = Path(tempfile.mkdtemp(prefix="dependency-flow-source-snapshot-"))
     _ALL_CONTAINERS.add(container)
     snapshot_root = container / "tree"
     try:
-        method = materialize_private_tree(
-            capture_root,
-            snapshot_root,
-            timeout_seconds=_remaining(deadline),
-            progress=progress,
-            progress_label="source capture materialization",
-            progress_interval_seconds=progress_interval_seconds,
-            exclude_dir_names=policy.excluded_dir_names,
-            exclude_file_names=policy.excluded_file_names,
-        )
+        try:
+            method = materialize_private_tree(
+                capture_root,
+                snapshot_root,
+                timeout_seconds=_remaining(deadline),
+                progress=progress,
+                progress_label="source capture materialization",
+                progress_interval_seconds=progress_interval_seconds,
+                exclude_dir_names=policy.excluded_dir_names,
+                exclude_file_names=policy.excluded_file_names,
+            )
+        except ReparseMaterializationError as exc:
+            detail = str(exc)
+            if os.name != "nt" and "REPARSE_EXTERNAL_TARGET_UNSUPPORTED" in detail:
+                raise SourceCaptureError(f"SOURCE_SYMLINK_ESCAPE: {detail}") from exc
+            raise SourceCaptureError(f"SOURCE_REPARSE_LAYOUT_UNSUPPORTED: {detail}") from exc
         captured = build_source_tree_manifest(
             snapshot_root,
             policy=policy,
@@ -598,18 +681,20 @@ def _capture_once(
             progress=progress,
             progress_label="source capture sealed-manifest",
             progress_interval_seconds=progress_interval_seconds,
+            pass_role="sealed-snapshot",
         )
         post = build_source_tree_manifest(
             capture_root,
             policy=policy,
             timeout_seconds=_remaining(deadline),
             progress=progress,
-            progress_label="source capture post-manifest",
+            progress_label="source capture live-final-manifest",
             progress_interval_seconds=progress_interval_seconds,
+            pass_role="live-final",
         )
-        if pre.key != post.key or captured.key != post.key:
+        if captured.key != post.key:
             raise SourceCaptureError(
-                "SOURCE_CAPTURE_UNSTABLE: pre/captured/post content manifests differ"
+                "SOURCE_CAPTURE_UNSTABLE: sealed/live-final content manifests differ"
             )
 
         key = _canonical_hash({
@@ -831,6 +916,7 @@ def build_source_tree_manifest(
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "source manifest",
     progress_interval_seconds: int = 15,
+    pass_role: str = "",
 ) -> SourceTreeManifest:
     if not _observability_sink_is_source_safe(root, policy):
         with suppress_observability():
@@ -841,6 +927,7 @@ def build_source_tree_manifest(
                 progress=progress,
                 progress_label=progress_label,
                 progress_interval_seconds=progress_interval_seconds,
+                suppress_worker_observability=True,
             )
 
     operation_id = new_observability_id("source-manifest")
@@ -850,6 +937,8 @@ def build_source_tree_manifest(
         "source.manifest.start",
         operationId=operation_id,
         label=progress_label,
+        passRole=str(pass_role or progress_label),
+        workers=_source_hash_workers(),
         timeoutSeconds=int(timeout_seconds),
         policyKey=policy.key,
     )
@@ -868,6 +957,8 @@ def build_source_tree_manifest(
             "source.manifest.finish",
             operationId=operation_id,
             label=progress_label,
+            passRole=str(pass_role or progress_label),
+            workers=_source_hash_workers(),
             outcome="exception",
             durationMs=max(0, int((time.monotonic() - started) * 1000)),
             cpuMs=max(0, after.cpu_ms - before.cpu_ms),
@@ -881,6 +972,8 @@ def build_source_tree_manifest(
         "source.manifest.finish",
         operationId=operation_id,
         label=progress_label,
+        passRole=str(pass_role or progress_label),
+        workers=_source_hash_workers(),
         outcome="passed",
         manifestKey=manifest.key,
         fileCount=manifest.file_count,
