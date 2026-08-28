@@ -9,6 +9,7 @@ import time
 import unittest
 from pathlib import Path
 
+import baseline_constraint_verifier as verifier
 import block_v_prepared_artifact as artifact_store
 import source_snapshot
 import substrate_identity
@@ -29,6 +30,7 @@ LOCAL_TEMP = None
 class BlockLambdaReleaseClosureTests(unittest.TestCase):
     def tearDown(self) -> None:
         source_snapshot.clear_source_snapshot_epochs()
+        verifier._cleanup_prepared_snapshot_root()
 
     def test_active_source_snapshot_rejects_same_size_mutation_and_stale_locator(self) -> None:
         with tempfile.TemporaryDirectory(dir=LOCAL_TEMP) as raw:
@@ -159,6 +161,47 @@ class BlockLambdaReleaseClosureTests(unittest.TestCase):
             temporary.cleanup()
 
 
+    def test_outer_prepared_snapshot_cache_cannot_bypass_durable_invalidation(self) -> None:
+        temporary, old, source, workspace = self._artifact()
+        try:
+            key = "9" * 32
+            self.assertTrue(artifact_store.publish_prepared_artifact_record(
+                key=key, workspace_root=workspace, project_relative=Path("project"),
+                source_project=source, storage_mode="test",
+                observed_resolved_versions={}, observed_resolved_hash="8" * 64,
+            ))
+            first = verifier._lookup_prepared_workspace_snapshot(key, source)
+            self.assertIsNotNone(first)
+            index = artifact_store.configured_prepared_artifact_root() / "index" / f"{key}.json"
+            index.unlink()
+            self.assertIsNone(verifier._lookup_prepared_workspace_snapshot(key, source))
+            slot = verifier._prepared_snapshot_slot(key, source)
+            with verifier._PREPARED_SNAPSHOT_LOCK:
+                self.assertNotIn(slot, verifier._PREPARED_SNAPSHOTS)
+        finally:
+            self._restore_root(old)
+            temporary.cleanup()
+
+    def test_private_snapshot_is_not_published_or_reused(self) -> None:
+        temporary, old, source, workspace = self._artifact()
+        try:
+            key = "7" * 32
+            snapshot = verifier._publish_prepared_workspace_snapshot(
+                workspace.parent,
+                workspace / "project",
+                key=key,
+                observed_versions={},
+                observed_hash="6" * 64,
+                source_project=source,
+                shared_reuse_allowed=False,
+                publication_root=Path(temporary.name) / "private",
+            )
+            self.assertTrue(snapshot.workspace_root.is_dir())
+            self.assertIsNone(verifier._lookup_prepared_workspace_snapshot(key, source))
+        finally:
+            self._restore_root(old)
+            temporary.cleanup()
+
     def test_cross_process_artifact_invalidation_is_observed(self) -> None:
         temporary, old, source, workspace = self._artifact()
         try:
@@ -242,6 +285,30 @@ error demo@1.2.3: The engine "node" is incompatible with this module. Expected v
         self.assertFalse(project_proof_cache_reusable(("npm test",)))
         self.assertFalse(project_proof_cache_reusable(("python verify.py",)))
         self.assertTrue(project_proof_cache_reusable(()))
+
+    def test_durable_publication_requires_guaranteed_closed_process_tree(self) -> None:
+        from types import SimpleNamespace
+        guaranteed = SimpleNamespace(
+            supervision=SimpleNamespace(quality="guaranteed-tree", descendants_remaining=0)
+        )
+        best_effort = SimpleNamespace(
+            supervision=SimpleNamespace(quality="best-effort", descendants_remaining=0)
+        )
+        remaining = SimpleNamespace(
+            supervision=SimpleNamespace(quality="guaranteed-tree", descendants_remaining=1)
+        )
+        self.assertTrue(verifier._durable_proof_publication_allowed(guaranteed))
+        self.assertFalse(verifier._durable_proof_publication_allowed(best_effort))
+        self.assertFalse(verifier._durable_proof_publication_allowed(remaining))
+        self.assertFalse(verifier._durable_proof_publication_allowed(SimpleNamespace()))
+
+    def test_tool_build_covers_semantic_environment_module(self) -> None:
+        covered = {
+            name
+            for names in substrate_identity._COMPONENT_FILES.values()
+            for name in names
+        }
+        self.assertIn("block_vex_storage.py", covered)
 
     def test_tool_build_component_digest_changes_identity(self) -> None:
         from unittest import mock

@@ -6401,16 +6401,15 @@ def _peer_solver_backend_options(raw: Optional[Dict[str, Any]]) -> Dict[str, Any
     ).strip().lower()
     if requested_authoritative in {"", "legacy", "heuristic"}:
         requested_authoritative = "custom"
-    reference_only = as_bool(config.get("referenceOnly"), False)
     authority_override = ""
-    if requested_authoritative == "custom" and not reference_only:
-        # Production dependency decisions are exact-Z3 only. Keep the custom
-        # solver available for explicit micrograph/reference tests, but never
-        # let a legacy workspace setting silently restore heuristic authority.
+    if requested_authoritative == "custom":
+        # Configuration can never make the heuristic solver authoritative.
+        # Reference tests call the internal solver directly or monkeypatch this
+        # normalization boundary; workspace settings always remain exact-Z3.
         authoritative = "z3"
         authority_override = "custom->z3"
-    elif requested_authoritative in {"custom", "z3"}:
-        authoritative = requested_authoritative
+    elif requested_authoritative == "z3":
+        authoritative = "z3"
     else:
         authoritative = "invalid"
 
@@ -6428,7 +6427,6 @@ def _peer_solver_backend_options(raw: Optional[Dict[str, Any]]) -> Dict[str, Any
     return {
         "authoritative": authoritative,
         "authorityOverride": authority_override,
-        "referenceOnly": bool(reference_only),
         "shadow": shadow,
         "timeoutMs": max(100, min(timeout_ms, 600_000)),
         "maxRefinements": max(0, min(max_refinements, 512)),
@@ -7334,12 +7332,12 @@ def resolve_peer_compatibility(
             authoritative_backend = backend_options["authoritative"]
             if authoritative_backend == "invalid":
                 raise BaselineConstraintVerificationError(
-                    f"EXACT_SOLVER_CONFIG_INVALID: {project}/{mode}: solverBackend must be z3; custom is reference-only"
+                    f"EXACT_SOLVER_CONFIG_INVALID: {project}/{mode}: solverBackend must be z3; heuristic backends are never authoritative"
                 )
             if backend_options.get("authorityOverride"):
                 eprint(
                     f"[warn] {project}: legacy solverBackend=custom ignored for production authority; "
-                    "exact Z3 remains authoritative. Use referenceOnly=true only in tests/reference tooling."
+                    "exact Z3 remains authoritative."
                 )
             shadow_active = authoritative_backend == "custom" and backend_options["shadow"] != "off"
             mode_shadow_reports: List[Dict[str, Any]] = []

@@ -43,7 +43,7 @@
 - Project-derived solver nogoods require two fresh reproductions with a stable structural signature before they can influence the exact assignment; inconclusive/flaky failures are never learned.
 - Deterministic group verification removes stale generated Vite/Vitest caches before gates, eliminating LLM repair cycles whose only effective action was deleting `.vite`/`.vitest`.
 - Live base-branch gate evidence is shared across parallel groups and the full gate set is probed once per FLOW job instead of reinstalling/probing the same baseline independently for every group.
-- Legacy `solverBackend=custom` workspace settings can no longer restore heuristic production authority: production forces exact Z3; custom search remains available only with explicit `referenceOnly=true` for tests/reference tooling.
+- Legacy `solverBackend=custom` workspace settings can no longer restore heuristic production authority: production always forces exact Z3, and the undocumented `referenceOnly` configuration escape is ignored.
 - Persistent resolver proof fingerprints now include the effective Node and package-manager executable/version in addition to manifests, lockfiles, registry and platform.
 
 ## 0.1.125 — Interaction IR and platform-correct Z3 packaging

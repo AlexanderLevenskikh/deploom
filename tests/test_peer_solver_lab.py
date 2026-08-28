@@ -283,14 +283,23 @@ class PeerSolverLabTests(unittest.TestCase):
         roadmap.capture_desired_targets(by_project)
         roadmap.enrich_registry_target_evidence(by_project, client)
         statuses = {}
-        with mock.patch.object(roadmap, "PEER_SOLVER_LARGE_MAX_VISITS", 1):
+        original_backend_options = roadmap._peer_solver_backend_options
+
+        def reference_backend_options(raw):
+            options = original_backend_options(raw)
+            options.update(authoritative="custom", authorityOverride="")
+            return options
+
+        with mock.patch.object(roadmap, "PEER_SOLVER_LARGE_MAX_VISITS", 1), mock.patch.object(
+            roadmap, "_peer_solver_backend_options", side_effect=reference_backend_options
+        ):
             roadmap.resolve_peer_compatibility(
                 by_project,
                 client,
                 modes=("default",),
                 solver_statuses_out=statuses,
                 shadow_solver_config_by_project={
-                    "Demo": {"solverBackend": "custom", "shadowSolver": "off", "referenceOnly": True}
+                    "Demo": {"solverBackend": "custom", "shadowSolver": "off"}
                 },
             )
 

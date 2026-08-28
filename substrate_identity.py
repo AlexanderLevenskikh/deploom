@@ -12,6 +12,9 @@ from typing import Mapping
 TOOL_BUILD_ID_SCHEMA = "deploom-tool-build-v1"
 
 _COMPONENT_FILES: Mapping[str, tuple[str, ...]] = {
+    "environment": (
+        "block_vex_storage.py",
+    ),
     "source": (
         "source_snapshot.py",
         "project_topology.py",

@@ -573,6 +573,18 @@ def _run(
     return completed
 
 
+def _durable_proof_publication_allowed(
+    completed: subprocess.CompletedProcess[str],
+) -> bool:
+    """Require a closed, guaranteed process tree before publishing reusable proof."""
+    supervision = getattr(completed, "supervision", None)
+    return bool(
+        supervision is not None
+        and str(getattr(supervision, "quality", "")) == "guaranteed-tree"
+        and int(getattr(supervision, "descendants_remaining", 0) or 0) == 0
+    )
+
+
 def clean_ephemeral_verification_caches(
     project_dir: Path,
     dependency_roots: Iterable[str] = (),
@@ -1037,13 +1049,12 @@ def _lookup_prepared_workspace_snapshot(
     key: str, source_project: Path
 ) -> Optional[PreparedWorkspaceSnapshot]:
     slot = _prepared_snapshot_slot(key, source_project)
+    # A process-local object is never sufficient authority. Another process may
+    # have invalidated the durable index or changed/quarantined its tree since
+    # the previous lookup. Drop the LRU entry first and force the durable loader
+    # to re-read the record, re-hash the complete tree, and verify continuity.
     with _PREPARED_SNAPSHOT_LOCK:
-        snapshot = _PREPARED_SNAPSHOTS.pop(slot, None)
-        if snapshot is not None and snapshot.workspace_root.is_dir():
-            # Dict insertion order becomes a tiny LRU. Snapshot eviction never
-            # weakens proof; it only forces rematerialization on a future miss.
-            _PREPARED_SNAPSHOTS[slot] = snapshot
-            return snapshot
+        _PREPARED_SNAPSHOTS.pop(slot, None)
 
     # Cross-process Block V lookup. The locator itself is PRECONDITION_CACHE
     # only; the caller separately requires an exact PreparationProof HIT before
@@ -1126,17 +1137,24 @@ def _publish_prepared_workspace_snapshot(
     observed_hash: str,
     source_project: Path,
     seal_dependency_integrity: bool = True,
+    shared_reuse_allowed: bool = True,
+    publication_root: Optional[Path] = None,
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "prepared snapshot publish copy",
     timeout_seconds: int = 1800,
     progress_interval_seconds: int = 15,
 ) -> PreparedWorkspaceSnapshot:
     slot = _prepared_snapshot_slot(key, source_project)
-    existing = _lookup_prepared_workspace_snapshot(key, source_project)
-    if existing is not None:
-        return existing
-
-    root = _prepared_snapshot_root()
+    if shared_reuse_allowed:
+        existing = _lookup_prepared_workspace_snapshot(key, source_project)
+        if existing is not None:
+            return existing
+        root = _prepared_snapshot_root()
+    else:
+        if publication_root is None:
+            raise ValueError("PRIVATE_PREPARED_SNAPSHOT_ROOT_REQUIRED")
+        root = publication_root.resolve()
+        root.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f"{key[:12]}-", dir=root))
     stage_workspace = stage / "workspace"
     relative = workspace_project.resolve().relative_to(workspace_root.resolve())
@@ -1207,17 +1225,23 @@ def _publish_prepared_workspace_snapshot(
             dependency_roots=tuple(dependency_roots),
             dependency_integrity=dict(dependency_integrity),
         )
-        with _PREPARED_SNAPSHOT_LOCK:
-            raced = _PREPARED_SNAPSHOTS.get(slot)
-            if raced is None:
-                _PREPARED_SNAPSHOTS[slot] = snapshot
-                published = snapshot
-            else:
-                published = raced
-        if raced is not None:
-            shutil.rmtree(stage, ignore_errors=True)
-        if is_durable_prepared_path(published.workspace_root):
-            publish_prepared_artifact_record(
+        raced: Optional[PreparedWorkspaceSnapshot] = None
+        if shared_reuse_allowed:
+            with _PREPARED_SNAPSHOT_LOCK:
+                raced = _PREPARED_SNAPSHOTS.get(slot)
+                if raced is None:
+                    _PREPARED_SNAPSHOTS[slot] = snapshot
+                    published = snapshot
+                else:
+                    published = raced
+            if raced is not None:
+                shutil.rmtree(stage, ignore_errors=True)
+        else:
+            published = snapshot
+
+        durable_published = False
+        if shared_reuse_allowed and is_durable_prepared_path(published.workspace_root):
+            durable_published = publish_prepared_artifact_record(
                 key=published.key,
                 workspace_root=published.workspace_root,
                 project_relative=published.project_relative,
@@ -1227,7 +1251,12 @@ def _publish_prepared_workspace_snapshot(
                 observed_resolved_hash=published.observed_resolved_hash,
                 dependency_roots=published.dependency_roots,
             )
-        _enforce_prepared_snapshot_budget(slot)
+        if shared_reuse_allowed and not durable_published:
+            with _PREPARED_SNAPSHOT_LOCK:
+                if _PREPARED_SNAPSHOTS.get(slot) is published:
+                    _PREPARED_SNAPSHOTS.pop(slot, None)
+        if shared_reuse_allowed:
+            _enforce_prepared_snapshot_budget(slot)
         return published
     except Exception:
         shutil.rmtree(stage, ignore_errors=True)
@@ -2001,6 +2030,7 @@ def verify_assignment(
         )
         observed_versions: Dict[str, str] = {}
         observed_hash = ""
+        resolver_publication_allowed = False
 
         if resolver_reused and resolver_record is not None:
             resolved_state = load_resolved_dependency_state(
@@ -2072,6 +2102,7 @@ def verify_assignment(
             except OSError as exc:
                 return BaselineVerifyResult(False, "infrastructure", f"package-manager launch failed: {exc}", command=" ".join(argv))
 
+            resolver_publication_allowed = _durable_proof_publication_allowed(result)
             output = result.stdout or ""
             kind = (
                 "passed"
@@ -2176,13 +2207,21 @@ def verify_assignment(
                 project_checks=config.project_checks if run_project_checks else "off",
                 commands=config.commands if run_project_checks else (),
             )
-            publish_pass(
-                "resolver",
-                proof_identity.resolver_input_key,
-                observed_versions,
-                observed_hash,
-                extra_metadata=resolved_state_metadata(resolved_state),
-            )
+            if resolver_publication_allowed:
+                publish_pass(
+                    "resolver",
+                    proof_identity.resolver_input_key,
+                    observed_versions,
+                    observed_hash,
+                    extra_metadata=resolved_state_metadata(resolved_state),
+                )
+            else:
+                event(
+                    "proof.cache.publish-skipped",
+                    proofType="resolver",
+                    cacheKey=proof_identity.resolver_input_key,
+                    reason="process-tree-supervision-not-guaranteed",
+                )
             event(
                 "verify.resolved-state.captured",
                 resolvedStateKey=resolved_state.key,
@@ -2283,6 +2322,7 @@ def verify_assignment(
                     )
                 except (OSError, subprocess.TimeoutExpired) as exc:
                     return BaselineVerifyResult(False, "infrastructure", f"project-preflight install failed: {exc}", command=" ".join(full_argv))
+                preparation_publication_allowed = _durable_proof_publication_allowed(full_result)
                 preparation_classified = (
                     "passed"
                     if full_result.returncode == 0
@@ -2352,13 +2392,21 @@ def verify_assignment(
                         f"RESOLVED_STATE_PREPARATION_DRIFT: {exc}",
                         workspace=str(workspace_project),
                     )
-                publish_pass(
-                    "preparation",
-                    proof_identity.preparation_proof_key,
-                    observed_versions,
-                    observed_hash,
-                    extra_metadata=resolved_state_metadata(resolved_state),
-                )
+                if preparation_publication_allowed:
+                    publish_pass(
+                        "preparation",
+                        proof_identity.preparation_proof_key,
+                        observed_versions,
+                        observed_hash,
+                        extra_metadata=resolved_state_metadata(resolved_state),
+                    )
+                else:
+                    event(
+                        "proof.cache.publish-skipped",
+                        proofType="preparation",
+                        cacheKey=proof_identity.preparation_proof_key,
+                        reason="process-tree-supervision-not-guaranteed",
+                    )
 
                 normalized = clean_ephemeral_verification_caches(workspace_project)
                 if normalized:
@@ -2382,6 +2430,12 @@ def verify_assignment(
                         observed_hash=observed_hash,
                         source_project=project_dir,
                         seal_dependency_integrity=preparation_fastpath_enabled,
+                        shared_reuse_allowed=preparation_publication_allowed,
+                        publication_root=(
+                            None
+                            if preparation_publication_allowed
+                            else temp_root / "private-prepared-snapshots"
+                        ),
                         progress=progress,
                         progress_label=f"{progress_label}: snapshot-publish",
                         timeout_seconds=snapshot_timeout,
@@ -2411,6 +2465,7 @@ def verify_assignment(
                 return BaselineVerifyResult(False, "infrastructure", "PREPARED_SNAPSHOT_UNAVAILABLE: project checks require a sealed preparation tree")
 
             project_failures: List[BaselineProjectFailure] = []
+            project_publication_allowed = True
             reusable_private_root: Optional[Path] = None
             reusable_private_project: Optional[Path] = None
 
@@ -2551,6 +2606,10 @@ def verify_assignment(
                             progress=phase_progress(f"project-check:{command}"),
                             progress_label=command,
                             progress_interval_seconds=config.progress_interval_seconds,
+                        )
+                        project_publication_allowed = bool(
+                            project_publication_allowed
+                            and _durable_proof_publication_allowed(check_result)
                         )
                     except (OSError, subprocess.TimeoutExpired) as exc:
                         emit_observability_event(
@@ -2782,10 +2841,18 @@ def verify_assignment(
                 )
 
             assert resolved_state is not None
-            publish_pass(
-                "project", proof_identity.project_proof_key, observed_versions, observed_hash,
-                extra_metadata=resolved_state_metadata(resolved_state),
-            )
+            if project_publication_allowed:
+                publish_pass(
+                    "project", proof_identity.project_proof_key, observed_versions, observed_hash,
+                    extra_metadata=resolved_state_metadata(resolved_state),
+                )
+            else:
+                event(
+                    "proof.cache.publish-skipped",
+                    proofType="project",
+                    cacheKey=proof_identity.project_proof_key,
+                    reason="process-tree-supervision-not-guaranteed",
+                )
 
         _emit_progress(progress, f"{progress_label}: completed; elapsed={int(time.monotonic() - attempt_started)}s")
         return BaselineVerifyResult(

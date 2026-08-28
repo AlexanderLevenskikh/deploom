@@ -17,7 +17,9 @@ class PeerSolverModelTests(unittest.TestCase):
         reference = roadmap._peer_solver_backend_options({"solverBackend": "custom", "referenceOnly": True})
         self.assertEqual("z3", production["authoritative"])
         self.assertEqual("custom->z3", production["authorityOverride"])
-        self.assertEqual("custom", reference["authoritative"])
+        self.assertEqual("z3", reference["authoritative"])
+        self.assertEqual("custom->z3", reference["authorityOverride"])
+        self.assertNotIn("referenceOnly", reference)
 
     def make_client(self) -> roadmap.LiveDataClient:
         return roadmap.LiveDataClient(self.REGISTRY, timeout=1, batch_size=10, sleep_sec=0)
@@ -247,7 +249,7 @@ class PeerSolverModelTests(unittest.TestCase):
         self.assertIn("CONSTRAINT_LITERAL_OUTSIDE_DOMAIN: a@2", result.detail)
 
 
-    def test_shadow_result_is_non_authoritative_even_when_it_is_better(self):
+    def test_reference_only_flag_cannot_demote_exact_authority(self):
         client = self.make_client()
         self.add_package(client, "a", {"1.0.0": {}, "2.0.0": {}})
         row = self.row("a")
@@ -289,11 +291,8 @@ class PeerSolverModelTests(unittest.TestCase):
                 shadow_reports_out=reports,
             )
 
-        self.assertEqual("1.0.0", assignments["Demo"]["default"]["a"])
-        report = reports["Demo"]["default"][0]
-        self.assertEqual("better", report["objectiveRelation"])
-        self.assertEqual("2.0.0", report["assignment"]["a"])
-        self.assertFalse(report["sameAssignment"])
+        self.assertEqual("2.0.0", assignments["Demo"]["default"]["a"])
+        self.assertEqual({}, reports)
 
     def test_authoritative_z3_bypasses_legacy_and_uses_exact_assignment(self):
         client = self.make_client()
@@ -355,7 +354,7 @@ class PeerSolverModelTests(unittest.TestCase):
         self.assertIn("EXACT_SOLVER_UNKNOWN", str(error))
         self.assertIn("unfinished exact proof is not a dependency decision", str(error))
 
-    def test_shadow_z3_runs_before_legacy_search(self):
+    def test_reference_only_flag_cannot_enable_legacy_authority(self):
         client = self.make_client()
         self.add_package(client, "a", {"1.0.0": {}, "2.0.0": {}})
         row = self.row("a")
@@ -389,8 +388,7 @@ class PeerSolverModelTests(unittest.TestCase):
                 shadow_solver_config_by_project={"Demo": {"solverBackend": "custom", "shadowSolver": "z3", "referenceOnly": True}},
             )
 
-        self.assertGreaterEqual(len(order), 2)
-        self.assertEqual(["z3", "legacy"], order[:2])
+        self.assertEqual(["z3"], order)
 
 
 if __name__ == "__main__":
