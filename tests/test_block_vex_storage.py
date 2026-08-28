@@ -21,6 +21,12 @@ class VexStorageTests(unittest.TestCase):
             "DEPLOOM_IO_PM_SLOTS": "1",
             "DEPLOOM_SOURCE_HASH_WORKERS": "4",
             "DEPLOOM_ARTIFACT_HASH_WORKERS": "4",
+            "DEPLOOM_INTEGRITY_HASH_WORKERS": "4",
+            "DEPLOOM_BASELINE_INTENT_JSON": '{"schemaVersion":1}',
+            "DEPLOOM_BASELINE_EXTRA_ITERATIONS": "2",
+            "DEPLOOM_BASELINE_DECISION_GRANT_ITERATIONS": "1",
+            "DEPLOOM_BASELINE_INTERACTIVE": "1",
+            "DEPLOOM_RUN_ID": "run-1",
             "MY_PROJECT_FLAG": "keep",
         }
         result = storage.semantic_verification_environment(env)
@@ -35,6 +41,12 @@ class VexStorageTests(unittest.TestCase):
         self.assertNotIn("DEPLOOM_IO_PM_SLOTS", result)
         self.assertNotIn("DEPLOOM_SOURCE_HASH_WORKERS", result)
         self.assertNotIn("DEPLOOM_ARTIFACT_HASH_WORKERS", result)
+        self.assertNotIn("DEPLOOM_INTEGRITY_HASH_WORKERS", result)
+        self.assertNotIn("DEPLOOM_BASELINE_INTENT_JSON", result)
+        self.assertNotIn("DEPLOOM_BASELINE_EXTRA_ITERATIONS", result)
+        self.assertNotIn("DEPLOOM_BASELINE_DECISION_GRANT_ITERATIONS", result)
+        self.assertNotIn("DEPLOOM_BASELINE_INTERACTIVE", result)
+        self.assertNotIn("DEPLOOM_RUN_ID", result)
 
     def test_explicit_root_is_created(self):
         with tempfile.TemporaryDirectory() as temp:

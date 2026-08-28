@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from verification_workspace_backend import materialize_private_tree
+from prepared_workspace_fastpath import _DirectoryWatcher
 from io_governor import io_slot
 from reparse_materialization import ReparseMaterializationError
 from verification_observability import (
@@ -118,7 +119,30 @@ class SourceSnapshot:
 
 _ACTIVE: dict[str, SourceSnapshot] = {}
 _ALL_CONTAINERS: set[Path] = set()
+_ACTIVE_WATCHERS: dict[str, tuple[SourceSnapshot, _DirectoryWatcher]] = {}
 _LOCK = threading.RLock()
+
+
+def _watcher_is_clean(watcher: _DirectoryWatcher) -> bool:
+    thread = watcher._thread
+    return bool(
+        thread is not None
+        and thread.is_alive()
+        and not watcher.events
+        and not watcher.errors
+    )
+
+
+def _retire_snapshot_watcher(snapshot: SourceSnapshot) -> None:
+    key = _active_key(snapshot.original_project_path)
+    with _LOCK:
+        entry = _ACTIVE_WATCHERS.get(key)
+        watcher = None
+        if entry is not None and entry[0] is snapshot:
+            _ACTIVE_WATCHERS.pop(key, None)
+            watcher = entry[1]
+    if watcher is not None:
+        watcher.stop()
 
 
 def _canonical_hash(value: object, *, length: int = 64) -> str:
@@ -800,6 +824,9 @@ def activate_source_snapshot_epoch(
             return existing
         if existing is not None:
             _ACTIVE.pop(key, None)
+            watcher_entry = _ACTIVE_WATCHERS.pop(key, None)
+            if watcher_entry is not None:
+                watcher_entry[1].stop()
             shutil.rmtree(existing.container, ignore_errors=True)
             _ALL_CONTAINERS.discard(existing.container)
         snapshot = capture_source_snapshot(
@@ -824,8 +851,55 @@ def validate_source_snapshot(
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "active SourceSnapshot validation",
 ) -> SourceSnapshot:
-    """Prove that a snapshot locator still contains the bytes bound to its key."""
+    """Prove snapshot bytes once, then keep that proof live with a watcher."""
     started = time.monotonic()
+    active_key = _active_key(snapshot.original_project_path)
+    with _LOCK:
+        watcher_entry = _ACTIVE_WATCHERS.get(active_key)
+        watcher = (
+            watcher_entry[1]
+            if watcher_entry is not None and watcher_entry[0] is snapshot
+            else None
+        )
+        is_active = _ACTIVE.get(active_key) is snapshot
+
+    if watcher is not None:
+        if (
+            snapshot.root.is_dir()
+            and snapshot.project_path.is_dir()
+            and _watcher_is_clean(watcher)
+        ):
+            emit_observability_event(
+                "source.snapshot.validation",
+                snapshotKey=snapshot.key, outcome="watcher-memo-hit",
+                generation=str(snapshot.created_at),
+                validationMs=max(0, int((time.monotonic() - started) * 1000)),
+            )
+            return snapshot
+        with _LOCK:
+            if _ACTIVE.get(active_key) is snapshot:
+                _ACTIVE.pop(active_key, None)
+        _retire_snapshot_watcher(snapshot)
+        emit_observability_event(
+            "source.snapshot.validation",
+            snapshotKey=snapshot.key, outcome="watcher-invalidated",
+            generation=str(snapshot.created_at),
+            validationMs=max(0, int((time.monotonic() - started) * 1000)),
+            watcherEvents=len(watcher.events),
+            watcherErrors=list(watcher.errors),
+        )
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_CONTENT_MISMATCH: active snapshot watcher observed "
+            "a mutation or lost integrity coverage"
+        )
+
+    candidate_watcher: Optional[_DirectoryWatcher] = None
+    if os.name == "nt" and is_active and snapshot.root.is_dir():
+        candidate_watcher = _DirectoryWatcher(snapshot.root)
+        if not candidate_watcher.start():
+            candidate_watcher.stop()
+            candidate_watcher = None
+
     try:
         observed = build_source_tree_manifest(
             snapshot.root,
@@ -836,9 +910,11 @@ def validate_source_snapshot(
             pass_role="active-validation",
         )
     except SourceCaptureError:
+        if candidate_watcher is not None:
+            candidate_watcher.stop()
         with _LOCK:
-            if _ACTIVE.get(_active_key(snapshot.original_project_path)) is snapshot:
-                _ACTIVE.pop(_active_key(snapshot.original_project_path), None)
+            if _ACTIVE.get(active_key) is snapshot:
+                _ACTIVE.pop(active_key, None)
         emit_observability_event(
             "source.snapshot.validation",
             snapshotKey=snapshot.key, outcome="error",
@@ -847,9 +923,11 @@ def validate_source_snapshot(
         )
         raise
     if observed.key != snapshot.manifest_key:
+        if candidate_watcher is not None:
+            candidate_watcher.stop()
         with _LOCK:
-            if _ACTIVE.get(_active_key(snapshot.original_project_path)) is snapshot:
-                _ACTIVE.pop(_active_key(snapshot.original_project_path), None)
+            if _ACTIVE.get(active_key) is snapshot:
+                _ACTIVE.pop(active_key, None)
         emit_observability_event(
             "source.snapshot.validation",
             snapshotKey=snapshot.key, outcome="content-mismatch",
@@ -861,6 +939,21 @@ def validate_source_snapshot(
             "SOURCE_SNAPSHOT_CONTENT_MISMATCH: "
             f"expected={snapshot.manifest_key}; observed={observed.key}"
         )
+    if candidate_watcher is not None and not _watcher_is_clean(candidate_watcher):
+        candidate_watcher.stop()
+        with _LOCK:
+            if _ACTIVE.get(active_key) is snapshot:
+                _ACTIVE.pop(active_key, None)
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_CONTENT_MISMATCH: snapshot changed during validation"
+        )
+    if candidate_watcher is not None:
+        with _LOCK:
+            if _ACTIVE.get(active_key) is snapshot:
+                _ACTIVE_WATCHERS[active_key] = (snapshot, candidate_watcher)
+                candidate_watcher = None
+        if candidate_watcher is not None:
+            candidate_watcher.stop()
     emit_observability_event(
         "source.snapshot.validation",
         snapshotKey=snapshot.key, outcome="passed",
@@ -957,7 +1050,11 @@ def materialize_source_for_verification(
 def clear_source_snapshot_epochs() -> None:
     with _LOCK:
         snapshots = list(_ACTIVE.values())
+        watchers = [entry[1] for entry in _ACTIVE_WATCHERS.values()]
         _ACTIVE.clear()
+        _ACTIVE_WATCHERS.clear()
+    for watcher in watchers:
+        watcher.stop()
     for snapshot in snapshots:
         shutil.rmtree(snapshot.container, ignore_errors=True)
         _ALL_CONTAINERS.discard(snapshot.container)
@@ -966,8 +1063,12 @@ def clear_source_snapshot_epochs() -> None:
 def _cleanup_all() -> None:
     with _LOCK:
         _ACTIVE.clear()
+        watchers = [entry[1] for entry in _ACTIVE_WATCHERS.values()]
+        _ACTIVE_WATCHERS.clear()
         containers = list(_ALL_CONTAINERS)
         _ALL_CONTAINERS.clear()
+    for watcher in watchers:
+        watcher.stop()
     for container in containers:
         shutil.rmtree(container, ignore_errors=True)
 

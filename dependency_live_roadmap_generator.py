@@ -51,6 +51,7 @@ import datetime as dt
 import hashlib
 import heapq
 import io
+import itertools
 import json
 import os
 import re
@@ -8582,6 +8583,49 @@ def _partition_names(names: Sequence[str], parts: int) -> List[Tuple[str, ...]]:
     return chunks
 
 
+UNIVERSAL_CLAUSE_MAX_EXTENSIONS = 4
+
+
+def _bounded_universal_clause_extensions(
+    clause: Mapping[str, str],
+    exact_assignment: Mapping[str, str],
+    domains: Mapping[str, Sequence[str]],
+    *,
+    max_extensions: int = UNIVERSAL_CLAUSE_MAX_EXTENSIONS,
+) -> Optional[Tuple[Dict[str, str], ...]]:
+    """Enumerate the finite domain needed to prove omitted literals irrelevant."""
+    normalized_exact = {
+        str(name): str(version) for name, version in sorted(exact_assignment.items())
+    }
+    normalized_clause = {
+        str(name): str(version) for name, version in sorted(clause.items())
+    }
+    if (
+        not normalized_clause
+        or len(normalized_clause) >= len(normalized_exact)
+        or any(normalized_exact.get(name) != version for name, version in normalized_clause.items())
+    ):
+        return None
+    omitted = tuple(name for name in normalized_exact if name not in normalized_clause)
+    values_by_name: list[Tuple[str, ...]] = []
+    total = 1
+    for name in omitted:
+        values = tuple(dict.fromkeys(str(value) for value in domains.get(name, ()) if str(value)))
+        if not values or normalized_exact[name] not in values:
+            return None
+        total *= len(values)
+        if total > max(1, int(max_extensions)):
+            return None
+        values_by_name.append(values)
+    return tuple(
+        {
+            **normalized_clause,
+            **dict(zip(omitted, combination)),
+        }
+        for combination in itertools.product(*values_by_name)
+    )
+
+
 def _proof_preserving_minimize_nogood(
     nogood: Mapping[str, str],
     certify: Callable[[Dict[str, str], int], str],
@@ -9086,6 +9130,9 @@ def _build_proven_envelope_for_mode(
     removals: Set[str],
     config: BaselineVerifyConfig,
     client: LiveDataClient,
+    *,
+    same_run_resolver_evidence: Optional[BaselineVerifyResult] = None,
+    same_run_project_evidence: Optional[BaselineVerifyResult] = None,
 ) -> Dict[str, Any]:
     manager = detect_package_manager(spec.path)
     executable = resolve_executable(manager)
@@ -9151,6 +9198,44 @@ def _build_proven_envelope_for_mode(
             "content-addressed post-resolve lockfile artifact"
         )
     resolver_pass = resolver_record is not None and resolved_state is not None
+    observed_resolved_hash = (
+        str(resolver_record.metadata.get("observedResolvedHash") or "")
+        if resolver_record is not None
+        else ""
+    )
+
+    # Same-run verification evidence is authoritative even when best-effort
+    # process supervision correctly forbids publishing a cross-run proof.
+    # Re-open its content-addressed state and bind it to the freshly rebuilt
+    # exact identity before admitting it to the envelope.
+    if (
+        not resolver_pass
+        and same_run_resolver_evidence is not None
+        and same_run_resolver_evidence.ok
+    ):
+        transient_metadata = {
+            "resolvedStateKey": same_run_resolver_evidence.resolved_state_key,
+            "resolvedStateResolverInputKey": identity.resolver_input_key,
+            "resolvedPackageManager": manager,
+            "resolvedLockfilePath": same_run_resolver_evidence.resolved_lockfile_path,
+            "resolvedLockfileHash": same_run_resolver_evidence.resolved_lockfile_hash,
+            "resolvedStateArtifact": same_run_resolver_evidence.resolved_state_artifact,
+            "resolvedStateObservedHash": same_run_resolver_evidence.observed_resolved_hash,
+        }
+        transient_state = load_resolved_dependency_state(
+            transient_metadata,
+            proof_cache_dir=proof_store.root,
+        )
+        if (
+            transient_state is not None
+            and transient_state.resolver_input_key == identity.resolver_input_key
+            and transient_state.observed_resolved_hash
+            == same_run_resolver_evidence.observed_resolved_hash
+        ):
+            resolved_state = transient_state
+            observed_resolved_hash = same_run_resolver_evidence.observed_resolved_hash
+            resolver_pass = True
+
     if resolved_state is not None:
         identity = bind_resolved_state_identity(
             identity,
@@ -9158,11 +9243,6 @@ def _build_proven_envelope_for_mode(
             project_checks=config.project_checks,
             commands=config.commands,
         )
-    observed_resolved_hash = (
-        str(resolver_record.metadata.get("observedResolvedHash") or "")
-        if resolver_record is not None
-        else ""
-    )
     if requires_resolver_proof and (
         len(observed_resolved_hash) != 64
         or any(ch not in "0123456789abcdef" for ch in observed_resolved_hash.lower())
@@ -9171,11 +9251,24 @@ def _build_proven_envelope_for_mode(
             f"PROVEN_DEPENDENCY_OBSERVED_PROOF_MISSING: {spec.name}/{mode}: "
             "ResolverProof does not carry the full installed direct-tree hash"
         )
+    transient_project_matches = bool(
+        same_run_project_evidence is not None
+        and same_run_project_evidence.resolved_state_key
+        and resolved_state is not None
+        and same_run_project_evidence.resolved_state_key == resolved_state.key
+        and same_run_project_evidence.observed_resolved_hash == observed_resolved_hash
+    )
+    transient_preparation_pass = bool(
+        transient_project_matches
+        and same_run_project_evidence.kind != "preparation"
+    )
     preparation_pass = (
         proof_store.lookup_pass("preparation", identity.preparation_proof_key) is not None
+        or transient_preparation_pass
     )
     project_pass = (
         proof_store.lookup_pass("project", identity.project_proof_key) is not None
+        or bool(transient_project_matches and same_run_project_evidence.ok)
     )
 
     if requires_resolver_proof and not resolver_pass:
@@ -9318,6 +9411,8 @@ def resolve_peer_compatibility_with_verification(
     graph_generalization_seed_packages: Dict[str, Tuple[str, ...]] = {}
     graph_generalization_history_by_family: Dict[str, List[Tuple[str, ...]]] = {}
     final_assignments: Dict[str, Dict[str, Dict[str, str]]] = {}
+    successful_resolver_evidence: Dict[Tuple[str, str], BaselineVerifyResult] = {}
+    successful_project_evidence: Dict[Tuple[str, str], BaselineVerifyResult] = {}
     resolver_cache: Dict[str, BaselineVerifyResult] = {}
     # Project cache keys include the resulting ResolvedStateKey, source snapshot,
     # command set and check policy. Display fingerprints never participate.
@@ -9925,6 +10020,7 @@ def resolve_peer_compatibility_with_verification(
                                 f"BASELINE_NOOP_RESOLVER_INVALID: {project}/{mode}: "
                                 f"fixed-input resolver state is not installable: {noop_result.summary}"
                             )
+                        successful_resolver_evidence[(project, mode)] = noop_result
                     if unknown_budget_names:
                         eprint(
                             f"[warn] {project}: Baseline verify {mode}: solver UNKNOWN_BUDGET for "
@@ -10204,6 +10300,9 @@ def resolve_peer_compatibility_with_verification(
                                 f"project migration is expected: {project_result.summary}"
                             )
                     if result.ok:
+                        successful_resolver_evidence[(project, mode)] = result
+                        if config.project_checks != "off" and config.commands:
+                            successful_project_evidence[(project, mode)] = project_result
                         final_assignments.setdefault(project, {})[mode] = assignment
                         if unknown_budget_names:
                             eprint(
@@ -11877,9 +11976,45 @@ def resolve_peer_compatibility_with_verification(
                     authority=EVIDENCE_CONFIRMED_CONSTRAINT,
                 )
 
-                # The minimized clause is useful diagnostic evidence, but its
-                # omitted variables were not proven irrelevant. Block Sigma
-                # therefore keeps Solver authority exact-assignment scoped.
+                # Promote a minimized clause only after exhaustively proving the
+                # same predicate for every omitted-variable value in the current
+                # finite solver domain. This authority is session-local because
+                # registry domains may expand between runs.
+                universal_domains = {
+                    name: _candidate_domain(rows_by_name[name], mode, client)
+                    for name in exact_nogood
+                    if name in rows_by_name
+                }
+                universal_extensions = _bounded_universal_clause_extensions(
+                    nogood,
+                    exact_nogood,
+                    universal_domains,
+                )
+                universal = bool(universal_extensions)
+                if universal_extensions:
+                    for universal_index, extension in enumerate(
+                        universal_extensions, start=1
+                    ):
+                        predicate = certify_localized_minimization(
+                            extension,
+                            localized_minimization.checks + universal_index,
+                        )
+                        if predicate != localized_minimization.predicate:
+                            universal = False
+                            break
+                if universal and nogood not in learned[project][mode]:
+                    learned[project][mode].append(dict(nogood))
+                    liveness.record_certified_constraint()
+                    progress_reporter.emit(
+                        project, mode, "constraint-generalized-certified",
+                        iteration=iteration, assignment=fingerprint,
+                        literals=len(nogood),
+                        extensions=len(universal_extensions or ()),
+                        clauseScope="finite-domain-universal",
+                        universal=True,
+                        authority=EVIDENCE_CONFIRMED_CONSTRAINT,
+                    )
+
                 detail = ", ".join(
                     f"{name}@{version}" for name, version in sorted(nogood.items())
                 )
@@ -11955,9 +12090,10 @@ def resolve_peer_compatibility_with_verification(
                             )
 
                 eprint(
-                    f"[info] {project}: localized diagnostic constraint {mode}: NOT({detail}); "
-                    f"scope=context-diagnostic, universal=false; "
-                    f"blockedExact={fingerprint}"
+                    f"[info] {project}: localized {'certified' if universal else 'diagnostic'} "
+                    f"constraint {mode}: NOT({detail}); "
+                    f"scope={'finite-domain-universal' if universal else 'context-diagnostic'}, "
+                    f"universal={str(universal).lower()}; blockedExact={fingerprint}"
                 )
                 checkpoint_baseline_run(
                     "exact-assignment-blocked",
@@ -11969,8 +12105,15 @@ def resolve_peer_compatibility_with_verification(
                     project, mode, "constraint-localized-diagnostic",
                     iteration=iteration, assignment=fingerprint,
                     diagnosticLiterals=dict(nogood),
-                    clauseScope="context-diagnostic", universal=False,
-                    authority=EVIDENCE_DIAGNOSTIC_HINT,
+                    clauseScope=(
+                        "finite-domain-universal" if universal else "context-diagnostic"
+                    ),
+                    universal=universal,
+                    authority=(
+                        EVIDENCE_CONFIRMED_CONSTRAINT
+                        if universal
+                        else EVIDENCE_DIAGNOSTIC_HINT
+                    ),
                 )
                 progress_reporter.emit(
                     project, mode, "exact-assignment-blocked",
@@ -12141,6 +12284,8 @@ def resolve_peer_compatibility_with_verification(
                     set(removals),
                     config,
                     client,
+                    same_run_resolver_evidence=successful_resolver_evidence.get((project, mode)),
+                    same_run_project_evidence=successful_project_evidence.get((project, mode)),
                 )
                 proof_envelopes_out.setdefault(project, {})[mode] = envelope
 

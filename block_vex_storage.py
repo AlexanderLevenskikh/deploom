@@ -39,6 +39,14 @@ _PROOF_NEUTRAL_ENV = frozenset({
     "DEPLOOM_IO_PM_SLOTS",
     "DEPLOOM_SOURCE_HASH_WORKERS",
     "DEPLOOM_ARTIFACT_HASH_WORKERS",
+    "DEPLOOM_INTEGRITY_HASH_WORKERS",
+    # Orchestrator inputs are consumed before verification subprocesses start.
+    # They alter search/recovery/telemetry, never package-manager semantics.
+    "DEPLOOM_BASELINE_INTENT_JSON",
+    "DEPLOOM_BASELINE_EXTRA_ITERATIONS",
+    "DEPLOOM_BASELINE_DECISION_GRANT_ITERATIONS",
+    "DEPLOOM_BASELINE_INTERACTIVE",
+    "DEPLOOM_RUN_ID",
 })
 
 

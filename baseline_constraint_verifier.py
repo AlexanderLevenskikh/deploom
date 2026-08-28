@@ -209,7 +209,9 @@ class BaselineVerifyResult:
     observed_resolved_versions: Mapping[str, str] = dataclasses.field(default_factory=dict)
     observed_resolved_hash: str = ""
     resolved_state_key: str = ""
+    resolved_lockfile_path: str = ""
     resolved_lockfile_hash: str = ""
+    resolved_state_artifact: str = ""
 
     @property
     def hard_failure(self) -> bool:
@@ -2347,7 +2349,9 @@ def verify_assignment(
                         observed_resolved_versions=observed_versions,
                         observed_resolved_hash=observed_hash,
                         resolved_state_key=resolved_state.key if resolved_state is not None else "",
+                        resolved_lockfile_path=resolved_state.lockfile_path if resolved_state is not None else "",
                         resolved_lockfile_hash=resolved_state.lockfile_hash if resolved_state is not None else "",
+                        resolved_state_artifact=resolved_state.artifact_relative_path if resolved_state is not None else "",
                     )
                     if preparation_classified in {"infrastructure", "dependency"}:
                         return BaselineVerifyResult(
@@ -2837,7 +2841,9 @@ def verify_assignment(
                     observed_resolved_versions=observed_versions,
                     observed_resolved_hash=observed_hash,
                     resolved_state_key=resolved_state.key if resolved_state is not None else "",
+                    resolved_lockfile_path=resolved_state.lockfile_path if resolved_state is not None else "",
                     resolved_lockfile_hash=resolved_state.lockfile_hash if resolved_state is not None else "",
+                    resolved_state_artifact=resolved_state.artifact_relative_path if resolved_state is not None else "",
                 )
 
             assert resolved_state is not None
@@ -2861,7 +2867,9 @@ def verify_assignment(
             observed_resolved_versions=observed_versions,
             observed_resolved_hash=observed_hash,
             resolved_state_key=resolved_state.key if resolved_state is not None else "",
+            resolved_lockfile_path=resolved_state.lockfile_path if resolved_state is not None else "",
             resolved_lockfile_hash=resolved_state.lockfile_hash if resolved_state is not None else "",
+            resolved_state_artifact=resolved_state.artifact_relative_path if resolved_state is not None else "",
         )
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
@@ -3180,7 +3188,9 @@ def verify_assignment(
                     project_record.metadata.get("observedResolvedHash") or ""
                 ),
                 resolved_state_key=resolved_state.key,
+                resolved_lockfile_path=resolved_state.lockfile_path,
                 resolved_lockfile_hash=resolved_state.lockfile_hash,
+                resolved_state_artifact=resolved_state.artifact_relative_path,
             )
         cache_event("proof.cache.miss", "project", identity.project_proof_key)
 
@@ -3205,7 +3215,9 @@ def verify_assignment(
                 resolver_record.metadata.get("observedResolvedHash") or ""
             ),
             resolved_state_key=resolved_state.key,
+            resolved_lockfile_path=resolved_state.lockfile_path,
             resolved_lockfile_hash=resolved_state.lockfile_hash,
+            resolved_state_artifact=resolved_state.artifact_relative_path,
         )
 
     effective_config = (

@@ -30,6 +30,7 @@ LOCAL_TEMP = None
 class BlockLambdaReleaseClosureTests(unittest.TestCase):
     def tearDown(self) -> None:
         source_snapshot.clear_source_snapshot_epochs()
+        artifact_store._clear_artifact_integrity_validation_cache_for_tests()
         verifier._cleanup_prepared_snapshot_root()
 
     def test_active_source_snapshot_rejects_same_size_mutation_and_stale_locator(self) -> None:
@@ -53,6 +54,80 @@ class BlockLambdaReleaseClosureTests(unittest.TestCase):
                 source_snapshot.source_snapshot_fingerprint(project)
             self.assertIsNone(source_snapshot.active_source_snapshot(project))
 
+
+    @unittest.skipUnless(os.name == "nt", "Windows watcher memoization")
+    def test_active_source_snapshot_rehash_is_amortized_and_mutation_fails_closed(self) -> None:
+        from unittest import mock
+        with tempfile.TemporaryDirectory(dir=LOCAL_TEMP) as raw:
+            project = Path(raw) / "project"
+            project.mkdir()
+            (project / "package.json").write_text('{"name":"demo"}', encoding="utf-8")
+            (project / "subject.txt").write_text("aaaa", encoding="utf-8")
+            subprocess.run(["git", "-C", str(project), "init", "-b", "master"], check=True, stdout=subprocess.PIPE)
+            subprocess.run(["git", "-C", str(project), "config", "user.email", "lambda@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(project), "config", "user.name", "Lambda Test"], check=True)
+            subprocess.run(["git", "-C", str(project), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(project), "commit", "-m", "fixture"], check=True, stdout=subprocess.PIPE)
+            snapshot = source_snapshot.activate_source_snapshot_epoch(project, replace=True)
+            source_snapshot.validate_source_snapshot(snapshot)
+            with mock.patch.object(
+                source_snapshot,
+                "build_source_tree_manifest",
+                wraps=source_snapshot.build_source_tree_manifest,
+            ) as manifest:
+                source_snapshot.validate_source_snapshot(snapshot)
+                manifest.assert_not_called()
+            (snapshot.project_path / "subject.txt").write_text("bbbb", encoding="utf-8")
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                entry = source_snapshot._ACTIVE_WATCHERS.get(
+                    source_snapshot._active_key(project)
+                )
+                if entry is not None and entry[1].events:
+                    break
+                time.sleep(0.02)
+            with self.assertRaisesRegex(
+                source_snapshot.SourceCaptureError,
+                "SOURCE_SNAPSHOT_CONTENT_MISMATCH",
+            ):
+                source_snapshot.validate_source_snapshot(snapshot)
+
+    @unittest.skipUnless(os.name == "nt", "Windows watcher memoization")
+    def test_prepared_artifact_whole_tree_hash_is_amortized(self) -> None:
+        from unittest import mock
+        temporary, old, source, workspace = self._artifact()
+        try:
+            key = "4" * 32
+            self.assertTrue(artifact_store.publish_prepared_artifact_record(
+                key=key, workspace_root=workspace, project_relative=Path("project"),
+                source_project=source, storage_mode="test",
+                observed_resolved_versions={}, observed_resolved_hash="5" * 64,
+            ))
+            self.assertIsNotNone(artifact_store.load_prepared_artifact_record(key, source))
+            with mock.patch.object(
+                artifact_store,
+                "build_artifact_tree_integrity",
+                wraps=artifact_store.build_artifact_tree_integrity,
+            ) as integrity:
+                self.assertIsNotNone(
+                    artifact_store.load_prepared_artifact_record(key, source)
+                )
+                integrity.assert_not_called()
+            (workspace / "project" / "package.json").write_text("[]", encoding="utf-8")
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if any(
+                    watcher.events
+                    for watcher in artifact_store._VALIDATION_WATCHERS.values()
+                ):
+                    break
+                time.sleep(0.02)
+            self.assertIsNone(
+                artifact_store.load_prepared_artifact_record(key, source)
+            )
+        finally:
+            self._restore_root(old)
+            temporary.cleanup()
 
     def test_materialization_rejects_snapshot_mutation_after_prevalidation(self) -> None:
         with tempfile.TemporaryDirectory(dir=LOCAL_TEMP) as raw:

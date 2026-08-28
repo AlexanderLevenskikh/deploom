@@ -139,6 +139,33 @@ class PeerSolverLabTests(unittest.TestCase):
         self.assertIsNotNone(best, "current assignment should always keep the synthetic graph satisfiable")
         return best
 
+    def test_bounded_universal_clause_extensions_cover_the_omitted_domain(self):
+        extensions = roadmap._bounded_universal_clause_extensions(
+            {"a": "2"},
+            {"a": "2", "b": "1"},
+            {"a": ("1", "2"), "b": ("1", "2")},
+        )
+        self.assertEqual(
+            (
+                {"a": "2", "b": "1"},
+                {"a": "2", "b": "2"},
+            ),
+            extensions,
+        )
+
+    def test_bounded_universal_clause_extensions_fail_closed_on_budget_or_domain_gap(self):
+        self.assertIsNone(roadmap._bounded_universal_clause_extensions(
+            {"a": "2"},
+            {"a": "2", "b": "1", "c": "1"},
+            {"b": ("1", "2", "3"), "c": ("1", "2")},
+            max_extensions=4,
+        ))
+        self.assertIsNone(roadmap._bounded_universal_clause_extensions(
+            {"a": "2"},
+            {"a": "2", "b": "1"},
+            {"b": ("2", "3")},
+        ))
+
     def test_large_solver_trivial_independent_packages_finish_immediately(self):
         client = self.make_client()
         rows = []

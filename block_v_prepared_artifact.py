@@ -23,7 +23,7 @@ from artifact_integrity import (
     build_artifact_tree_integrity,
 )
 from block_vex_storage import verification_root
-from prepared_workspace_fastpath import try_acquire_snapshot_cleanup_lease
+from prepared_workspace_fastpath import _DirectoryWatcher, try_acquire_snapshot_cleanup_lease
 from substrate_identity import tool_build_id
 from verification_observability import emit_observability_event
 
@@ -35,6 +35,30 @@ _LOCK = threading.RLock()
 _CONFIGURED_ROOT: Optional[Path] = None
 _INTEGRITY_VALIDATION_LOCK = threading.RLock()
 _VALIDATED_CONTENT: set[tuple[str, str, str]] = set()
+_VALIDATION_WATCHERS: dict[tuple[str, str, str], _DirectoryWatcher] = {}
+
+
+def _retire_validation_watchers(*, key: Optional[str] = None) -> None:
+    with _INTEGRITY_VALIDATION_LOCK:
+        slots = [
+            slot for slot in _VALIDATION_WATCHERS
+            if key is None or slot[1] == key
+        ]
+        watchers = [_VALIDATION_WATCHERS.pop(slot) for slot in slots]
+        for slot in slots:
+            _VALIDATED_CONTENT.discard(slot)
+    for watcher in watchers:
+        watcher.stop()
+
+
+def _watcher_is_clean(watcher: _DirectoryWatcher) -> bool:
+    thread = watcher._thread
+    return bool(
+        thread is not None
+        and thread.is_alive()
+        and not watcher.events
+        and not watcher.errors
+    )
 
 # BLOCK_V_PREPARED_ARTIFACT_ASYNC_GC_V2
 # PreparedArtifact is a performance cache. Heavy physical deletion must never
@@ -461,29 +485,69 @@ def load_prepared_artifact_record(
         return None
     validation_slot = (os.path.normcase(str(workspace)), _valid_key(key), content_key)
     with _INTEGRITY_VALIDATION_LOCK:
+        watcher = _VALIDATION_WATCHERS.get(validation_slot)
         memory_hit = validation_slot in _VALIDATED_CONTENT
-    try:
-        observed_integrity = build_artifact_tree_integrity(workspace)
-    except ArtifactIntegrityError as exc:
-        emit_observability_event(
-            "prepared-artifact.integrity", outcome="validation-error",
-            artifactKey=_valid_key(key), errorType=type(exc).__name__,
-        )
-        invalidate_prepared_artifact_record(key, remove_tree=False)
-        return None
-    if observed_integrity.key != content_key or observed_integrity.tool_build_id != current_build_id:
-        emit_observability_event(
-            "prepared-artifact.integrity", outcome="mismatch",
-            artifactKey=_valid_key(key), expectedContentKey=content_key,
-            observedContentKey=observed_integrity.key, toolBuildId=current_build_id,
-        )
-        invalidate_prepared_artifact_record(key, remove_tree=False)
-        return None
+
+    validation_mode = "full-hash"
+    candidate_watcher: Optional[_DirectoryWatcher] = None
+    if watcher is not None:
+        if not _watcher_is_clean(watcher):
+            emit_observability_event(
+                "prepared-artifact.integrity", outcome="watcher-invalidated",
+                artifactKey=_valid_key(key),
+                watcherErrors=list(watcher.errors),
+                watcherEvents=len(watcher.events),
+            )
+            invalidate_prepared_artifact_record(key, remove_tree=False)
+            return None
+        validation_mode = "watcher-memo"
+    elif os.name == "nt":
+        candidate_watcher = _DirectoryWatcher(workspace)
+        if not candidate_watcher.start():
+            candidate_watcher.stop()
+            candidate_watcher = None
+
+    if validation_mode == "full-hash":
+        try:
+            observed_integrity = build_artifact_tree_integrity(workspace)
+        except ArtifactIntegrityError as exc:
+            if candidate_watcher is not None:
+                candidate_watcher.stop()
+            emit_observability_event(
+                "prepared-artifact.integrity", outcome="validation-error",
+                artifactKey=_valid_key(key), errorType=type(exc).__name__,
+            )
+            invalidate_prepared_artifact_record(key, remove_tree=False)
+            return None
+        if (
+            observed_integrity.key != content_key
+            or observed_integrity.tool_build_id != current_build_id
+        ):
+            if candidate_watcher is not None:
+                candidate_watcher.stop()
+            emit_observability_event(
+                "prepared-artifact.integrity", outcome="mismatch",
+                artifactKey=_valid_key(key), expectedContentKey=content_key,
+                observedContentKey=observed_integrity.key, toolBuildId=current_build_id,
+            )
+            invalidate_prepared_artifact_record(key, remove_tree=False)
+            return None
+        if candidate_watcher is not None and not _watcher_is_clean(candidate_watcher):
+            candidate_watcher.stop()
+            emit_observability_event(
+                "prepared-artifact.integrity", outcome="watcher-invalidated-during-hash",
+                artifactKey=_valid_key(key),
+            )
+            invalidate_prepared_artifact_record(key, remove_tree=False)
+            return None
+
     try:
         durable_record_unchanged = path.is_file() and path.read_text(encoding="utf-8") == record_text
     except OSError:
         durable_record_unchanged = False
     if not durable_record_unchanged:
+        if candidate_watcher is not None:
+            candidate_watcher.stop()
         emit_observability_event(
             "prepared-artifact.cache", memoryHit=memory_hit,
             durableRecordPresent=path.is_file(), generationMatch=False,
@@ -492,10 +556,13 @@ def load_prepared_artifact_record(
         return None
     with _INTEGRITY_VALIDATION_LOCK:
         _VALIDATED_CONTENT.add(validation_slot)
+        if candidate_watcher is not None:
+            _VALIDATION_WATCHERS[validation_slot] = candidate_watcher
     emit_observability_event(
         "prepared-artifact.cache", memoryHit=memory_hit,
         durableRecordPresent=True, generationMatch=True,
         contentKeyMatch=True, invalidationReason="",
+        validationMode=validation_mode,
     )
     project = workspace / relative
     if not project.is_dir():
@@ -514,10 +581,11 @@ def load_prepared_artifact_record(
 
 def invalidate_prepared_artifact_record(key: str, *, remove_tree: bool = False) -> bool:
     normalized_key = _valid_key(key)
+    _retire_validation_watchers(key=normalized_key)
     with _INTEGRITY_VALIDATION_LOCK:
-        _VALIDATED_CONTENT.difference_update(list(
+        _VALIDATED_CONTENT.difference_update([
             item for item in _VALIDATED_CONTENT if item[1] == normalized_key
-        ))
+        ])
     path = _record_path(normalized_key)
     if path is None:
         return False
@@ -573,6 +641,7 @@ def invalidate_prepared_artifact_record(key: str, *, remove_tree: bool = False) 
 
 
 def _clear_artifact_integrity_validation_cache_for_tests() -> None:
+    _retire_validation_watchers()
     with _INTEGRITY_VALIDATION_LOCK:
         _VALIDATED_CONTENT.clear()
 
