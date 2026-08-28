@@ -77,6 +77,7 @@ class PreparedArtifactContinuityPhysical(unittest.TestCase):
     def _load(self):
         return artifact_store.load_prepared_artifact_record(KEY, self.source)
 
+    @unittest.skipUnless(os.name == "nt", "the watcher memo fast path is Windows-only")
     def test_cold_then_hot_hit_without_rehashing(self) -> None:
         self._publish()
         self.assertIsNotNone(self._load())

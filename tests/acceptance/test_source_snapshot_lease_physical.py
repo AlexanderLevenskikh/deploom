@@ -145,8 +145,8 @@ class SourceSnapshotLeasePhysicalAcceptance(unittest.TestCase):
                 validate_source_snapshot(snapshot)
 
     def test_hardlink_alias_cannot_rewrite_sealed_bytes(self) -> None:
-        """P0-A(B): sealed trees are write-protected, and protection lives on
-        the file object, so it is enforced through every alias."""
+        """P0-A(B): protection applies through aliases, and a real mutation
+        through an external alias must invalidate the sealed snapshot."""
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             project = _project(root)
@@ -158,12 +158,42 @@ class SourceSnapshotLeasePhysicalAcceptance(unittest.TestCase):
                 os.link(victim, alias)
             except OSError:
                 self.skipTest("hardlinks unavailable in this environment")
+
             with self.assertRaises(OSError):
                 with open(alias, "w", encoding="utf-8") as handle:
                     handle.write("EVIL\n")
             self.assertEqual(victim.read_text(encoding="utf-8"), original)
-            self.assertIs(validate_source_snapshot(snapshot), snapshot)
 
+            # Creating an alias outside the watched tree is not a content
+            # notification. This test pins the seal guarantee only: ordinary
+            # writes through every alias remain blocked and bytes stay intact.
+            # Link-topology detection belongs to the authoritative-path test
+            # below, where it is exercised explicitly on every platform.
+
+    def test_authoritative_validation_rejects_hardlink_topology(self) -> None:
+        """The full manifest path must reject an external alias even when no
+        content write occurred and therefore no watcher event exists."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            project = _project(root)
+            snapshot = self._snapshot(project)
+            victim = next(snapshot.root.rglob("index.js"))
+            alias = root / "alias.js"
+            try:
+                os.link(victim, alias)
+            except OSError:
+                self.skipTest("hardlinks unavailable in this environment")
+
+            # Force the platform-independent authoritative path. Creating a
+            # link outside the watched tree is not itself a content event.
+            source_snapshot._retire_snapshot_watcher(snapshot)
+            with self.assertRaisesRegex(
+                SourceCaptureError,
+                "SOURCE_(?:SNAPSHOT_LINK_TOPOLOGY_VIOLATION|HARDLINK_UNSUPPORTED)",
+            ):
+                validate_source_snapshot(snapshot)
+
+    @unittest.skipUnless(os.name == "nt", "the watcher memo fast path is Windows-only")
     def test_hot_validation_does_not_traverse_the_whole_tree(self) -> None:
         """A proof-grade lease on an unchanged tree must stay O(1)."""
         with tempfile.TemporaryDirectory() as raw:
