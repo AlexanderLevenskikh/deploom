@@ -57,6 +57,7 @@ from prepared_workspace_fastpath import (
     WorkspaceChangeGuard,
     try_acquire_snapshot_cleanup_lease,
     cleanup_guarded_clone,
+    guarded_clone_authorized_roots,
     guarded_clone_is_active,
     stop_guarded_clone,
     try_materialize_guarded_clone,
@@ -1513,13 +1514,33 @@ DIRECT_DEPENDENCY_SECTIONS = (
 )
 
 
+def _within_any_root(path: Path, roots: Iterable[Path]) -> bool:
+    """True when `path` resolves inside one of `roots` (case-insensitive on NT)."""
+    normalized = os.path.normcase(str(path))
+    for root in roots:
+        root_text = os.path.normcase(str(root))
+        if normalized == root_text or normalized.startswith(
+            root_text.rstrip(os.sep) + os.sep
+        ):
+            return True
+    return False
+
+
 def _installed_package_json_path(
     project_dir: Path,
     package_name: str,
     *,
     package_manager_root: Optional[Path] = None,
+    authorized_roots: Iterable[Path] = (),
 ) -> Optional[Path]:
-    """Resolve hoisted packages without escaping the authoritative trial root."""
+    """Resolve hoisted packages without escaping the authoritative read set.
+
+    The authoritative read set is the trial root plus any sealed lower root
+    that the Ω guarded-lower plan deliberately mapped into this workspace by
+    junction. Those sealed roots are proof-authoritative but by construction
+    live outside the trial root, so resolving through such a junction is not
+    an escape. Anything resolving outside the whole set still is.
+    """
     parts = package_name.split("/") if package_name.startswith("@") else [package_name]
     cursor = project_dir.resolve()
     boundary = (package_manager_root or project_dir).resolve()
@@ -1529,14 +1550,16 @@ def _installed_package_json_path(
         raise ObservedResolutionError(
             f"OBSERVED_RESOLVED_ASSIGNMENT_BOUNDARY_INVALID: project={cursor}, managerRoot={boundary}"
         )
+    authorized = [boundary, *(Path(item).resolve() for item in authorized_roots)]
     while True:
         candidate = cursor.joinpath("node_modules", *parts, "package.json")
         if candidate.is_file():
-            try:
-                candidate.resolve().relative_to(boundary)
-            except ValueError:
+            resolved = candidate.resolve()
+            if not _within_any_root(resolved, authorized):
                 raise ObservedResolutionError(
-                    f"OBSERVED_RESOLVED_ASSIGNMENT_ESCAPE: {package_name}: {candidate}"
+                    f"OBSERVED_RESOLVED_ASSIGNMENT_ESCAPE: {package_name}: {candidate} "
+                    f"-> {resolved} is outside the authoritative read set "
+                    f"({', '.join(str(item) for item in authorized)})"
                 )
             return candidate
         if cursor == boundary:
@@ -1555,6 +1578,7 @@ def observed_resolved_assignment(
     *,
     remove_packages: Iterable[str] = (),
     package_manager_root: Optional[Path] = None,
+    authorized_roots: Iterable[Path] = (),
 ) -> Dict[str, str]:
     """Observe the full direct assignment actually installed by the package manager."""
     try:
@@ -1587,7 +1611,10 @@ def observed_resolved_assignment(
             continue
 
         package_json = _installed_package_json_path(
-            project_dir, name, package_manager_root=package_manager_root
+            project_dir,
+            name,
+            package_manager_root=package_manager_root,
+            authorized_roots=authorized_roots,
         )
         optional_only = (
             "optionalDependencies" in declared_sections
@@ -2588,6 +2615,94 @@ def verify_assignment(
                                 "current check remains proof-safe, but this trial will not be reused",
                             )
 
+                    # MANDATORY PRE-CHECK (Ω guarded lower).
+                    # The sealed lower is reached through junctions and is
+                    # reused across checks, so a stale package map, a poisoned
+                    # junction target, or a PreparedArtifact built for another
+                    # assignment is only observable here -- before the project
+                    # process ever sees a tree that never matched the proof.
+                    # Substrate drift is never dependency evidence: it must not
+                    # reach the Solver and must not launch the command.
+                    precheck_failure = ""
+                    try:
+                        precheck_observed = observed_resolved_assignment(
+                            command_project,
+                            assignment,
+                            remove_packages=remove_packages,
+                            package_manager_root=(command_root / package_manager_relative_to_workspace),
+                            authorized_roots=guarded_clone_authorized_roots(command_root),
+                        )
+                        if observed_resolved_hash(precheck_observed) != observed_hash:
+                            drifted = sorted(
+                                name
+                                for name, version in precheck_observed.items()
+                                if str(assignment.get(name, version)) != version
+                            )
+                            precheck_failure = (
+                                "observed direct dependency tree differs from the proven "
+                                f"lifecycle assignment; packages={drifted or '<hash-only>'}"
+                            )
+                    except ObservedResolutionError as exc:
+                        precheck_failure = str(exc)
+
+                    if precheck_failure:
+                        emit_observability_event(
+                            "verify.project-check.precheck-failed",
+                            phase="guarded-lower-precheck",
+                            command=command,
+                            isolation=clone_isolation,
+                            authoritativeSource="substrate",
+                            kind="infrastructure",
+                            rebuildAttempted=bool(_allow_prepared_fastpath),
+                            detail=precheck_failure,
+                        )
+                        event(
+                            "verify.project-check.precheck-failed",
+                            command=command,
+                            check=command_index,
+                            checks=len(config.commands),
+                            isolation=clone_isolation,
+                            detail=precheck_failure,
+                        )
+                        if clone_isolation == "ntfs-junction-guarded":
+                            cleanup_guarded_clone(command_root)
+                        _disable_prepared_command_fastpath(project_dir, command)
+                        _disable_prepared_snapshot_fastpath(
+                            proof_identity.preparation_proof_key, project_dir
+                        )
+                        _evict_prepared_workspace_snapshot(
+                            proof_identity.preparation_proof_key, project_dir
+                        )
+                        if _allow_prepared_fastpath:
+                            # One controlled rebuild through the fully
+                            # authoritative full-copy path, same proof identity.
+                            _emit_progress(
+                                progress,
+                                f"{progress_label}: guarded-lower precheck rejected {command} "
+                                f"({precheck_failure}); discarding the suspect materialization "
+                                "and rebuilding through the authoritative path",
+                            )
+                            return _retry_assignment_without_prepared_fastpath(
+                                project_dir,
+                                assignment,
+                                config=config,
+                                run_project_checks=run_project_checks,
+                                remove_packages=remove_packages,
+                                progress=progress,
+                                progress_label=progress_label,
+                                proof_identity=proof_identity,
+                            )
+                        # Clean rebuild already happened and still mismatches:
+                        # deterministic substrate invariant failure. Fail closed,
+                        # never as project incompatibility, never as UNKNOWN.
+                        return BaselineVerifyResult(
+                            False,
+                            "infrastructure",
+                            f"SUBSTRATE_ASSIGNMENT_DRIFT: {command}: {precheck_failure}",
+                            command=command,
+                            workspace=str(command_project),
+                        )
+
                     _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} started: {command}")
                     check_started = time.monotonic()
                     event(
@@ -2726,6 +2841,7 @@ def verify_assignment(
                         check_observed = observed_resolved_assignment(
                             command_project, assignment, remove_packages=remove_packages,
                             package_manager_root=(command_root / package_manager_relative_to_workspace),
+                            authorized_roots=guarded_clone_authorized_roots(command_root),
                         )
                         check_observed_hash = observed_resolved_hash(check_observed)
                     except ObservedResolutionError as exc:

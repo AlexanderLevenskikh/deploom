@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -53,8 +54,12 @@ def main() -> int:
 
         if not args.skip_lockfile:
             run([
-                "npm", "install", "--package-lock-only", "--ignore-scripts",
-                "--no-audit", "--no-fund",
+                "npm.cmd" if os.name == "nt" else "npm",
+                "install",
+                "--package-lock-only",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
             ], pkg)
 
         run(["git", "init", "-b", "master"], target)

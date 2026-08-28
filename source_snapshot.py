@@ -119,8 +119,38 @@ class SourceSnapshot:
 
 _ACTIVE: dict[str, SourceSnapshot] = {}
 _ALL_CONTAINERS: set[Path] = set()
-_ACTIVE_WATCHERS: dict[str, tuple[SourceSnapshot, _DirectoryWatcher]] = {}
+# (snapshot, watcher, sealed directory-object identity at arm time)
+_ACTIVE_WATCHERS: dict[
+    str, tuple[SourceSnapshot, _DirectoryWatcher, Optional[object]]
+] = {}
 _LOCK = threading.RLock()
+
+
+def _tree_object_identity(path: Path) -> Optional[tuple[int, int]]:
+    """Filesystem object identity of a directory, not just its pathname.
+
+    A watched directory can be renamed away and a different directory put back
+    at the same textual path. The watcher holds a handle to the ORIGINAL object
+    and reports nothing, while `is_dir()` on the path still succeeds. Only the
+    (device, file-id) pair distinguishes the two objects.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    if not stat.st_ino:
+        return None
+    return (stat.st_dev, stat.st_ino)
+
+
+def _snapshot_object_identity(
+    snapshot: SourceSnapshot,
+) -> Optional[tuple[Optional[tuple[int, int]], Optional[tuple[int, int]]]]:
+    root = _tree_object_identity(snapshot.root)
+    project = _tree_object_identity(snapshot.project_path)
+    if root is None or project is None:
+        return None
+    return (root, project)
 
 
 def _watcher_is_clean(watcher: _DirectoryWatcher) -> bool:
@@ -856,19 +886,41 @@ def validate_source_snapshot(
     active_key = _active_key(snapshot.original_project_path)
     with _LOCK:
         watcher_entry = _ACTIVE_WATCHERS.get(active_key)
-        watcher = (
-            watcher_entry[1]
-            if watcher_entry is not None and watcher_entry[0] is snapshot
-            else None
+        usable_entry = (
+            watcher_entry is not None and watcher_entry[0] is snapshot
         )
+        watcher = watcher_entry[1] if usable_entry else None
+        sealed_identity = watcher_entry[2] if usable_entry else None
         is_active = _ACTIVE.get(active_key) is snapshot
+    watcher_events = list(watcher.events) if watcher is not None else []
+    watcher_errors = list(watcher.errors) if watcher is not None else []
 
+    fallback_reason = ""
     if watcher is not None:
-        if (
-            snapshot.root.is_dir()
-            and snapshot.project_path.is_dir()
-            and _watcher_is_clean(watcher)
-        ):
+        # A memo hit is only sound while the watched path still resolves to the
+        # SAME directory object that was sealed. Path identity is not object
+        # identity: a directory swap leaves `is_dir()` true and the watcher --
+        # which holds a handle to the original object -- permanently silent.
+        current_identity = _snapshot_object_identity(snapshot)
+        identity_stable = (
+            sealed_identity is not None
+            and current_identity is not None
+            and current_identity == sealed_identity
+        )
+        if not snapshot.root.is_dir() or not snapshot.project_path.is_dir():
+            fallback_reason = "root-missing"
+        elif not identity_stable:
+            fallback_reason = "directory-identity-changed"
+        elif watcher.errors:
+            fallback_reason = "watcher-failure"
+        elif not (watcher._thread is not None and watcher._thread.is_alive()):
+            fallback_reason = "watcher-thread-dead"
+        elif watcher.events:
+            # Could be a real mutation or an attribute-only touch. The watcher
+            # cannot tell us which, so it does not get to decide the verdict.
+            fallback_reason = "watcher-event-observed"
+
+        if not fallback_reason:
             emit_observability_event(
                 "source.snapshot.validation",
                 snapshotKey=snapshot.key, outcome="watcher-memo-hit",
@@ -876,21 +928,19 @@ def validate_source_snapshot(
                 validationMs=max(0, int((time.monotonic() - started) * 1000)),
             )
             return snapshot
-        with _LOCK:
-            if _ACTIVE.get(active_key) is snapshot:
-                _ACTIVE.pop(active_key, None)
+
+        # Watcher uncertainty is NEVER a content mismatch and NEVER a pass.
+        # Retire the memo and let authoritative full validation decide. The
+        # snapshot stays registered so a benign event can revalidate cleanly.
         _retire_snapshot_watcher(snapshot)
+        watcher = None
         emit_observability_event(
             "source.snapshot.validation",
-            snapshotKey=snapshot.key, outcome="watcher-invalidated",
+            snapshotKey=snapshot.key, outcome="watcher-fallback",
+            reason=fallback_reason,
             generation=str(snapshot.created_at),
-            validationMs=max(0, int((time.monotonic() - started) * 1000)),
-            watcherEvents=len(watcher.events),
-            watcherErrors=list(watcher.errors),
-        )
-        raise SourceCaptureError(
-            "SOURCE_SNAPSHOT_CONTENT_MISMATCH: active snapshot watcher observed "
-            "a mutation or lost integrity coverage"
+            watcherEvents=len(watcher_events),
+            watcherErrors=list(watcher_errors),
         )
 
     candidate_watcher: Optional[_DirectoryWatcher] = None
@@ -950,7 +1000,11 @@ def validate_source_snapshot(
     if candidate_watcher is not None:
         with _LOCK:
             if _ACTIVE.get(active_key) is snapshot:
-                _ACTIVE_WATCHERS[active_key] = (snapshot, candidate_watcher)
+                _ACTIVE_WATCHERS[active_key] = (
+                    snapshot,
+                    candidate_watcher,
+                    _snapshot_object_identity(snapshot),
+                )
                 candidate_watcher = None
         if candidate_watcher is not None:
             candidate_watcher.stop()

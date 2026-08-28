@@ -21,6 +21,7 @@ from source_snapshot import (
     SourceCaptureError,
     active_source_snapshot,
     proof_subject_project_dir,
+    validate_source_snapshot,
     source_snapshot_fingerprint as captured_source_snapshot_fingerprint,
 )
 from project_topology import (
@@ -1176,6 +1177,13 @@ def build_verification_proof_identity(
 ) -> VerificationProofIdentity:
     logical_project_dir = project_dir.resolve()
     active = active_source_snapshot(logical_project_dir)
+    # An authority-bearing identity may never stamp a bare `active.key`. The
+    # registry entry alone proves only that a snapshot was once captured, not
+    # that the tree still holds those bytes. Take the key from a VALIDATED
+    # snapshot, and resolve the registry lookup from the ORIGINAL logical path
+    # before any rebind, so a rebind cannot route around this validation.
+    if active is not None and not source_snapshot_key:
+        active = validate_source_snapshot(active)
     project_dir = active.project_path if active is not None else logical_project_dir
     source_key = str(source_snapshot_key or (active.key if active is not None else source_snapshot_fingerprint(logical_project_dir)))
     assignment_key = _canonical_hash({

@@ -268,6 +268,11 @@ class _GuardedClone:
     junctions: list[Path]
     guard: "_DependencyTreeGuard"
     lease: "_SnapshotLease"
+    # Sealed lower roots this clone deliberately mapped in by junction. These
+    # are proof-authoritative read sources even though they live outside the
+    # trial root, so observed-assignment checks must accept them explicitly
+    # instead of treating every junction traversal as a boundary escape.
+    authorized_lower_roots: tuple[Path, ...] = ()
     stopped: Optional[GuardResult] = None
 
 
@@ -1178,6 +1183,7 @@ def try_materialize_guarded_clone(
             junctions=junctions,
             guard=guard,
             lease=lease,
+            authorized_lower_roots=tuple(dependency_root_paths),
         )
         with _ACTIVE_LOCK:
             _ACTIVE[_key(target)] = state
@@ -1222,6 +1228,23 @@ def try_materialize_guarded_clone(
 def guarded_clone_is_active(target: Path) -> bool:
     with _ACTIVE_LOCK:
         return _key(target) in _ACTIVE
+
+
+def guarded_clone_authorized_roots(target: Path) -> tuple[Path, ...]:
+    """Sealed lower roots the Ω plan deliberately mapped into `target`.
+
+    A guarded clone reads its dependency tree through junctions that point at
+    the sealed PreparedArtifact lower, which by construction lives outside the
+    trial root. Those targets are authoritative, so an authority-bearing reader
+    needs to know which outside roots were intentionally mapped. Any resolved
+    path landing outside both the trial root and this set is still a genuine
+    escape.
+    """
+    with _ACTIVE_LOCK:
+        state = _ACTIVE.get(_key(target))
+    if state is None:
+        return ()
+    return tuple(state.authorized_lower_roots)
 
 
 def stop_guarded_clone(target: Path) -> GuardResult:
