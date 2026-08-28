@@ -88,6 +88,7 @@ from reparse_materialization import (
 )
 # BLOCK_Z_PROJECT_TOPOLOGY_V1
 from verification_observability import (
+    emit_observability_event,
     attempt_scope,
     current_attempt_id,
     new_observability_id,
@@ -169,6 +170,10 @@ class BaselineVerifyConfig:
             commands=commands,
         )
 
+
+def project_proof_cache_reusable(commands: Sequence[str]) -> bool:
+    """Policy: arbitrary shell-command PASS has no durable external-tool closure."""
+    return not any(str(command).strip() for command in commands)
 
 def _as_int(value: object, default: int) -> int:
     try:
@@ -1605,6 +1610,44 @@ def _classify_install_failure(output: str) -> str:
 
 
 
+def reap_orphan_verification_trials(
+    parent: Optional[Path], *, max_age_seconds: int = 24 * 60 * 60,
+    max_candidates: int = 4,
+) -> Tuple[int, int]:
+    """Bounded cleanup for old tool-owned trial namespaces only."""
+    if parent is None or not parent.is_dir():
+        return 0, 0
+    cutoff = time.time() - max(3600, int(max_age_seconds))
+    candidates = 0
+    reclaimed = 0
+    try:
+        entries = sorted(parent.iterdir(), key=lambda item: item.stat().st_mtime)
+    except OSError:
+        return 0, 0
+    for item in entries:
+        if candidates >= max(1, int(max_candidates)):
+            break
+        if not item.is_dir() or not item.name.startswith("dependency-flow-baseline-verify-"):
+            continue
+        try:
+            if item.stat().st_mtime > cutoff:
+                continue
+        except OSError:
+            continue
+        candidates += 1
+        trash = parent / f".deploom-trial-trash-{item.name}-{os.getpid()}-{time.time_ns()}"
+        try:
+            os.replace(item, trash)
+            shutil.rmtree(trash, ignore_errors=False)
+            reclaimed += 1
+        except OSError:
+            continue
+    emit_observability_event(
+        "trial.reaper", candidates=candidates, reclaimed=reclaimed,
+        failures=max(0, candidates - reclaimed),
+    )
+    return candidates, reclaimed
+
 def _cleanup_trial_root(
     path: Path,
     *,
@@ -1732,6 +1775,7 @@ def verify_assignment(
     _emit_progress(progress, f"{progress_label}: verification substrate: {workspace_backend_summary(prepared_snapshot_storage_root())}")
     _emit_progress(progress, f"{progress_label}: verification storage: {storage_summary()}")
     trial_parent = verification_trial_parent(config.proof_cache_dir or None)
+    reap_orphan_verification_trials(trial_parent)
     temp_root = Path(tempfile.mkdtemp(
         prefix="dependency-flow-baseline-verify-",
         dir=str(trial_parent) if trial_parent is not None else None,
@@ -2038,6 +2082,15 @@ def verify_assignment(
                     else _classify_install_failure(output)
                 )
             )
+            if kind != "passed":
+                emit_observability_event(
+                    "verify.failure-classification",
+                    phase="resolver",
+                    authoritativeSource=(
+                        "substrate" if kind == "infrastructure" else "dep-parser"
+                    ),
+                    kind=kind,
+                )
             event(
                 "verify.resolver.finish",
                 durationMs=int((time.monotonic() - resolver_started) * 1000),
@@ -2460,6 +2513,7 @@ def verify_assignment(
 
                 workspace_guard: Optional[WorkspaceChangeGuard] = None
                 workspace_guard_started = False
+                check_result: Optional[subprocess.CompletedProcess[str]] = None
                 try:
                     removed_caches = clean_ephemeral_verification_caches(command_project, snapshot.dependency_roots)
                     if removed_caches:
@@ -2499,6 +2553,16 @@ def verify_assignment(
                             progress_interval_seconds=config.progress_interval_seconds,
                         )
                     except (OSError, subprocess.TimeoutExpired) as exc:
+                        emit_observability_event(
+                            "verify.failure-classification",
+                            phase="project-check",
+                            authoritativeSource=(
+                                "supervisor"
+                                if isinstance(exc, subprocess.TimeoutExpired)
+                                else "substrate"
+                            ),
+                            kind="infrastructure",
+                        )
                         if clone_isolation == "ntfs-junction-guarded":
                             cleanup_guarded_clone(command_root)
                             _evict_prepared_workspace_snapshot(
@@ -2632,8 +2696,15 @@ def verify_assignment(
                         _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} PASS: {command}")
                         continue
                     tail = "\n".join((check_result.stdout or "").splitlines()[-80:])
-                    if bool(getattr(check_result, "deploom_infra_detected", False)) or INFRA_PATTERNS.search(check_result.stdout or ""):
-                        return BaselineVerifyResult(False, "infrastructure", f"project preflight infrastructure failure: {command}", command=command, output=tail, workspace=str(command_project))
+                    # Arbitrary project output is not infrastructure authority.
+                    # Launch, timeout, watcher and supervision failures are already
+                    # represented by typed exceptions above.
+                    emit_observability_event(
+                        "verify.failure-classification",
+                        phase="project-check",
+                        authoritativeSource="project-rc",
+                        kind="project",
+                    )
                     project_failures.append(BaselineProjectFailure(command, check_result.returncode, tail))
                     _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} RED exit={check_result.returncode}: {command}")
                 finally:
@@ -2651,6 +2722,7 @@ def verify_assignment(
                         and not workspace_changes.changes
                         and command_root.is_dir()
                         and command_project.is_dir()
+                        and check_result is not None
                         and (
                             getattr(check_result, "supervision", None) is None
                             or str(getattr(check_result.supervision, "quality", "")) == "guaranteed-tree"
@@ -3012,7 +3084,10 @@ def verify_assignment(
     else:
         cache_event("proof.cache.miss", "resolver", identity.resolver_input_key)
 
-    if wants_project_proof and resolver_hit:
+    # Arbitrary shell commands may invoke undeclared external runtimes. Their
+    # PASS is not durable-reusable until a declared tool closure exists.
+    project_cache_reusable = wants_project_proof and project_proof_cache_reusable(config.commands)
+    if project_cache_reusable and resolver_hit:
         cache_event("proof.cache.lookup", "project", identity.project_proof_key)
         project_record = proof_store.lookup_pass("project", identity.project_proof_key)
         if project_record is not None:

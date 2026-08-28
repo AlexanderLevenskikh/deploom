@@ -22,8 +22,10 @@ class SigmaProcessSupervisionTests(unittest.TestCase):
         )
         self.assertEqual(0, result.returncode)
         self.assertEqual(0, result.supervision.descendants_remaining)
-        if os.name == "nt" or sys.platform.startswith("linux"):
+        if os.name == "nt":
             self.assertEqual("guaranteed-tree", result.supervision.quality)
+        elif sys.platform.startswith("linux"):
+            self.assertEqual("best-effort", result.supervision.quality)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux subreaper physical check")
     def test_detached_descendant_cannot_write_after_parent_success(self) -> None:
@@ -43,10 +45,26 @@ class SigmaProcessSupervisionTests(unittest.TestCase):
                 Path.cwd(),
                 timeout_seconds=10,
             )
-            self.assertEqual("guaranteed-tree", result.supervision.quality)
+            self.assertEqual("best-effort", result.supervision.quality)
             self.assertGreaterEqual(result.supervision.descendants_terminated, 1)
             time.sleep(0.8)
             self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux token scrub capability check")
+    def test_scrubbed_supervision_token_never_reports_guaranteed_tree(self) -> None:
+        child = "import time; time.sleep(0.2)"
+        parent = (
+            "import os,subprocess,sys; "
+            f"subprocess.Popen([sys.executable, '-c', {child!r}], "
+            "start_new_session=True, env={'PATH': os.environ.get('PATH', '')})"
+        )
+        result = run_supervised(
+            [sys.executable, "-c", parent],
+            Path.cwd(),
+            timeout_seconds=10,
+        )
+        self.assertEqual(0, result.returncode)
+        self.assertEqual("best-effort", result.supervision.quality)
 
     def test_output_is_bounded_but_full_stream_infra_match_survives(self) -> None:
         script = (

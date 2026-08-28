@@ -188,7 +188,8 @@ def _iter_source_files_without_links(
     while pending:
         directory = pending.pop()
         try:
-            entries = list(os.scandir(directory))
+            with os.scandir(directory) as iterator:
+                entries = list(iterator)
         except OSError as exc:
             raise SourceCaptureError(
                 f"SOURCE_DIRECTORY_UNREADABLE: {directory}: {exc}"
@@ -512,7 +513,8 @@ def _build_source_tree_manifest_impl(
             tick()
             directory_stamps.append((directory, _directory_stability_stamp(directory)))
             try:
-                scanned = sorted(os.scandir(directory), key=lambda entry: entry.name)
+                with os.scandir(directory) as iterator:
+                    scanned = sorted(iterator, key=lambda entry: entry.name)
             except OSError as exc:
                 raise SourceCaptureError(f"SOURCE_DIRECTORY_UNREADABLE: {directory}: {exc}") from exc
             for item in scanned:
@@ -655,6 +657,12 @@ def _capture_once(
             _local_dependency_preflight(manifest_path.parent, capture_root)
 
     container = Path(tempfile.mkdtemp(prefix="dependency-flow-source-snapshot-"))
+    if _within(container, capture_root):
+        shutil.rmtree(container, ignore_errors=True)
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_TEMP_INSIDE_SUBJECT: "
+            f"container={container}; captureRoot={capture_root}"
+        )
     _ALL_CONTAINERS.add(container)
     snapshot_root = container / "tree"
     try:
@@ -809,15 +817,69 @@ def active_source_snapshot(project_dir: Path) -> Optional[SourceSnapshot]:
         return _ACTIVE.get(_active_key(project_dir))
 
 
+def validate_source_snapshot(
+    snapshot: SourceSnapshot,
+    *,
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "active SourceSnapshot validation",
+) -> SourceSnapshot:
+    """Prove that a snapshot locator still contains the bytes bound to its key."""
+    started = time.monotonic()
+    try:
+        observed = build_source_tree_manifest(
+            snapshot.root,
+            policy=SourceInputPolicy(),
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+            progress_label=progress_label,
+            pass_role="active-validation",
+        )
+    except SourceCaptureError:
+        with _LOCK:
+            if _ACTIVE.get(_active_key(snapshot.original_project_path)) is snapshot:
+                _ACTIVE.pop(_active_key(snapshot.original_project_path), None)
+        emit_observability_event(
+            "source.snapshot.validation",
+            snapshotKey=snapshot.key, outcome="error",
+            generation=str(snapshot.created_at),
+            validationMs=max(0, int((time.monotonic() - started) * 1000)),
+        )
+        raise
+    if observed.key != snapshot.manifest_key:
+        with _LOCK:
+            if _ACTIVE.get(_active_key(snapshot.original_project_path)) is snapshot:
+                _ACTIVE.pop(_active_key(snapshot.original_project_path), None)
+        emit_observability_event(
+            "source.snapshot.validation",
+            snapshotKey=snapshot.key, outcome="content-mismatch",
+            generation=str(snapshot.created_at),
+            validationMs=max(0, int((time.monotonic() - started) * 1000)),
+            files=observed.file_count, bytes=observed.byte_count,
+        )
+        raise SourceCaptureError(
+            "SOURCE_SNAPSHOT_CONTENT_MISMATCH: "
+            f"expected={snapshot.manifest_key}; observed={observed.key}"
+        )
+    emit_observability_event(
+        "source.snapshot.validation",
+        snapshotKey=snapshot.key, outcome="passed",
+        generation=str(snapshot.created_at),
+        validationMs=max(0, int((time.monotonic() - started) * 1000)),
+        files=observed.file_count, bytes=observed.byte_count,
+    )
+    return snapshot
+
+
 def proof_subject_project_dir(project_dir: Path) -> Path:
     snapshot = active_source_snapshot(project_dir)
-    return snapshot.project_path if snapshot is not None else project_dir.expanduser().resolve()
+    return validate_source_snapshot(snapshot).project_path if snapshot is not None else project_dir.expanduser().resolve()
 
 
 def source_snapshot_fingerprint(project_dir: Path) -> str:
     snapshot = active_source_snapshot(project_dir)
     if snapshot is not None:
-        return snapshot.key
+        return validate_source_snapshot(snapshot).key
     root, relative, _head = _subject_layout(project_dir)
     manifest = build_source_tree_manifest(root)
     return _canonical_hash({
@@ -856,6 +918,12 @@ def materialize_source_for_verification(
             progress=progress,
             progress_interval_seconds=progress_interval_seconds,
         )
+    validate_source_snapshot(
+        snapshot,
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+        progress_label=f"{progress_label} pre-consumption validation",
+    )
     method = materialize_private_tree(
         snapshot.root,
         target,
@@ -864,6 +932,20 @@ def materialize_source_for_verification(
         progress_label=progress_label,
         progress_interval_seconds=progress_interval_seconds,
     )
+    observed = build_source_tree_manifest(
+        target,
+        policy=SourceInputPolicy(),
+        timeout_seconds=timeout_seconds,
+        progress=progress,
+        progress_label=f"{progress_label} post-copy validation",
+        pass_role="materialized-validation",
+    )
+    if observed.key != snapshot.manifest_key:
+        shutil.rmtree(target, ignore_errors=True)
+        raise SourceCaptureError(
+            "SOURCE_MATERIALIZED_CONTENT_MISMATCH: "
+            f"expected={snapshot.manifest_key}; observed={observed.key}"
+        )
     project = (target / snapshot.project_relative).resolve()
     if not project.is_dir():
         raise SourceCaptureError(
@@ -1164,6 +1246,7 @@ def persist_source_snapshot(
     timeout_seconds: int = 1800,
 ) -> SourceSnapshot:
     """Atomically publish an active snapshot as durable evidence."""
+    validate_source_snapshot(snapshot, timeout_seconds=timeout_seconds)
     destination = destination.expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():

@@ -18,6 +18,8 @@ import uuid
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
+from verification_observability import emit_observability_event
+
 ProgressCallback = Callable[[str], None]
 OutputObserver = Callable[[str], None]
 
@@ -35,6 +37,7 @@ class SupervisionMetadata:
     captured_bytes: int = 0
     dropped_bytes: int = 0
     output_truncated: bool = False
+    attach_before_execution: bool = False
 
 
 class _BoundedOutput:
@@ -320,6 +323,21 @@ def _kill_posix_process_group(pgid: int) -> int:
         return 0
 
 
+def _resume_windows_process(process: subprocess.Popen[str]) -> None:
+    """Resume a CREATE_SUSPENDED process only after Job Object association."""
+    try:
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        ntdll.NtResumeProcess.argtypes = [ctypes.c_void_p]
+        ntdll.NtResumeProcess.restype = ctypes.c_long
+        status = int(ntdll.NtResumeProcess(ctypes.c_void_p(int(process._handle))))
+    except Exception as exc:
+        raise ProcessSupervisionError(f"PROCESS_SUPERVISION_RESUME_FAILED: {exc}") from exc
+    if status != 0:
+        raise ProcessSupervisionError(
+            f"PROCESS_SUPERVISION_RESUME_FAILED: NTSTATUS=0x{status & 0xffffffff:08x}"
+        )
+
+
 def _quiesce_owned_tree(
     process: subprocess.Popen[str],
     *,
@@ -395,7 +413,9 @@ def _quiesce_owned_tree(
                 + ",".join(str(pid) for pid in remaining_pids[:16])
             )
         quiescence_ms = int((time.monotonic() - started) * 1000)
-        return "guaranteed-tree", terminated, 0, quiescence_ms
+        # /proc environment tokens are observable aids, not complete descendant
+        # authority: descendants can scrub the token or become unreadable.
+        return "best-effort", terminated, 0, quiescence_ms
 
     # macOS/other POSIX: a fresh session gives strong process-group ownership,
     # but a child can deliberately detach with setsid().  Verification remains
@@ -480,7 +500,10 @@ def run_supervised(
     if os.name != "nt":
         popen_kwargs["start_new_session"] = True
     elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-        popen_kwargs["creationflags"] = int(subprocess.CREATE_NEW_PROCESS_GROUP)
+        popen_kwargs["creationflags"] = (
+            int(subprocess.CREATE_NEW_PROCESS_GROUP)
+            | int(getattr(subprocess, "CREATE_SUSPENDED", 0x00000004))
+        )
 
     process: subprocess.Popen[str] = subprocess.Popen(list(argv), **popen_kwargs)
     # A handful of historical unit tests use minimal Popen doubles. Keep that
@@ -511,7 +534,13 @@ def run_supervised(
                 "PROCESS_SUPERVISION_UNAVAILABLE: Windows Job Object attach failed"
                 + (f" ({job.error})" if job.error else "")
             )
-        _emit(progress, f"{progress_label}: process supervisor=windows-job-object; pid={process.pid}")
+        try:
+            _resume_windows_process(process)
+        except ProcessSupervisionError:
+            job.terminate(exit_code=1)
+            job.close()
+            raise
+        _emit(progress, f"{progress_label}: process supervisor=windows-job-object; attachBeforeExecution=true; pid={process.pid}")
     elif _LINUX_SUBREAPER:
         _emit(progress, f"{progress_label}: process supervisor=linux-subreaper-session; pid={process.pid}")
     else:
@@ -605,6 +634,14 @@ def run_supervised(
             captured_bytes=captured_bytes,
             dropped_bytes=dropped_bytes,
             output_truncated=truncated,
+            attach_before_execution=(os.name == "nt"),
+        )
+        emit_observability_event(
+            "process.supervision",
+            quality=metadata.quality,
+            attachBeforeExecution=metadata.attach_before_execution,
+            descendantsKilled=metadata.descendants_terminated,
+            descendantsRemaining=metadata.descendants_remaining,
         )
         if timed_out:
             exc = subprocess.TimeoutExpired(list(argv), timeout_seconds, output=output)

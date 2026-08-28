@@ -71,6 +71,7 @@ jobs:
           python -m unittest tests.test_resolved_dependency_state
           python -m unittest tests.test_verification_proof
           python -m unittest tests.test_sigma_process_supervision
+          python -m unittest tests.test_block_lambda_release_closure
           python run_tool_tests.py --suite acceptance
       - name: Install desktop dependencies
         working-directory: desktop

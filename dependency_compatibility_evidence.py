@@ -56,6 +56,7 @@ class CompatibilityEvidence:
     exact_assignment: Tuple[Tuple[str, str], ...] = ()
     source_snapshot_locator: Path = Path()
     source_snapshot_key: str = ""
+    envelope_source_snapshot_key: str = ""
     tool_build_id: str = ""
     project_relative: Path = Path(".")
 
@@ -63,6 +64,15 @@ class CompatibilityEvidence:
 class CompatibilityEvidenceError(RuntimeError):
     pass
 
+
+def external_evidence_identity_matches(
+    evidence: CompatibilityEvidence, baseline_source_snapshot_key: str,
+) -> bool:
+    return bool(
+        evidence.source_snapshot_key
+        and evidence.source_snapshot_key == evidence.envelope_source_snapshot_key
+        and evidence.source_snapshot_key == str(baseline_source_snapshot_key or "")
+    )
 
 def load_compatibility_evidence(path: Path) -> CompatibilityEvidence:
     try:
@@ -113,6 +123,7 @@ def load_compatibility_evidence(path: Path) -> CompatibilityEvidence:
         raise CompatibilityEvidenceError("evidence contains no update actions that can be localized")
 
     proof_envelope_key = ""
+    envelope_source_snapshot_key = ""
     exact_assignment: Tuple[Tuple[str, str], ...] = ()
     proof_envelope = raw.get("proofEnvelope")
     if proof_envelope is not None:
@@ -129,6 +140,7 @@ def load_compatibility_evidence(path: Path) -> CompatibilityEvidence:
         if not isinstance(assignment_raw, dict):
             raise CompatibilityEvidenceError("proofEnvelope exactDirectAssignment missing")
         proof_envelope_key = str(proof_envelope.get("envelopeKey") or "")
+        envelope_source_snapshot_key = str(proof_envelope.get("sourceSnapshotKey") or "")
         exact_assignment = tuple(
             sorted((str(name), str(version)) for name, version in assignment_raw.items())
         )
@@ -146,6 +158,7 @@ def load_compatibility_evidence(path: Path) -> CompatibilityEvidence:
         exact_assignment=exact_assignment,
         source_snapshot_locator=Path(snapshot_locator_text).expanduser().resolve(),
         source_snapshot_key=snapshot_key,
+        envelope_source_snapshot_key=envelope_source_snapshot_key,
         tool_build_id=evidence_build_id,
         project_relative=project_relative,
     )

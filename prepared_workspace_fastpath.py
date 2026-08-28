@@ -800,22 +800,23 @@ class _DirectoryWatcher:
     FILE_ACTION_MODIFIED = 0x00000003
     FILE_ACTION_RENAMED_OLD_NAME = 0x00000004
     FILE_ACTION_RENAMED_NEW_NAME = 0x00000005
-
     FILE_LIST_DIRECTORY = 0x0001
     FILE_SHARE_READ = 0x00000001
     FILE_SHARE_WRITE = 0x00000002
     FILE_SHARE_DELETE = 0x00000004
     OPEN_EXISTING = 3
     FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
-    FILTER = (
-        0x00000001  # FILE_NOTIFY_CHANGE_FILE_NAME
-        | 0x00000002  # DIR_NAME
-        | 0x00000004  # ATTRIBUTES
-        | 0x00000008  # SIZE
-        | 0x00000010  # LAST_WRITE
-        | 0x00000040  # CREATION
-    )
+    FILE_FLAG_OVERLAPPED = 0x40000000
+    FILTER = 0x00000001 | 0x00000002 | 0x00000004 | 0x00000008 | 0x00000010 | 0x00000040
+    ERROR_IO_PENDING = 997
     ERROR_OPERATION_ABORTED = 995
+
+    class _OVERLAPPED(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_size_t), ("InternalHigh", ctypes.c_size_t),
+            ("Offset", ctypes.c_ulong), ("OffsetHigh", ctypes.c_ulong),
+            ("hEvent", ctypes.c_void_p),
+        ]
 
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
@@ -823,26 +824,57 @@ class _DirectoryWatcher:
         self.errors: list[str] = []
         self._stop = threading.Event()
         self._handle = None
+        self._event_handle = None
+        self._overlapped: Optional[_DirectoryWatcher._OVERLAPPED] = None
+        self._buffer = ctypes.create_string_buffer(64 * 1024)
         self._thread: Optional[threading.Thread] = None
+        self.armed_ms = 0
+
+    @staticmethod
+    def _kernel32():
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.ReadDirectoryChangesW.argtypes = [
+            wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, wintypes.BOOL,
+            wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID, wintypes.LPVOID,
+        ]
+        kernel32.ReadDirectoryChangesW.restype = wintypes.BOOL
+        return kernel32
+
+    def _issue(self) -> bool:
+        assert self._overlapped is not None
+        kernel32 = self._kernel32()
+        kernel32.ResetEvent(self._event_handle)
+        ok = kernel32.ReadDirectoryChangesW(
+            self._handle, ctypes.byref(self._buffer), len(self._buffer), True,
+            self.FILTER, None, ctypes.byref(self._overlapped), None,
+        )
+        if ok:
+            return True
+        error = ctypes.get_last_error()
+        if error == self.ERROR_IO_PENDING:
+            return True
+        self.errors.append(f"ReadDirectoryChangesW arm failed for {self.root}: {error}")
+        return False
 
     def start(self) -> bool:
         if os.name != "nt":
             return False
         from ctypes import wintypes
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        started = time.monotonic()
+        kernel32 = self._kernel32()
         kernel32.CreateFileW.argtypes = [
             wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
             wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
         ]
         kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateEventW.restype = wintypes.HANDLE
         handle = kernel32.CreateFileW(
-            str(self.root),
-            self.FILE_LIST_DIRECTORY,
+            str(self.root), self.FILE_LIST_DIRECTORY,
             self.FILE_SHARE_READ | self.FILE_SHARE_WRITE | self.FILE_SHARE_DELETE,
-            None,
-            self.OPEN_EXISTING,
-            self.FILE_FLAG_BACKUP_SEMANTICS,
-            None,
+            None, self.OPEN_EXISTING,
+            self.FILE_FLAG_BACKUP_SEMANTICS | self.FILE_FLAG_OVERLAPPED, None,
         )
         invalid = ctypes.c_void_p(-1).value
         handle_value = ctypes.cast(handle, ctypes.c_void_p).value if handle else None
@@ -850,95 +882,92 @@ class _DirectoryWatcher:
             self.errors.append(f"CreateFileW failed for {self.root}: {ctypes.get_last_error()}")
             return False
         self._handle = handle
+        self._event_handle = kernel32.CreateEventW(None, True, False, None)
+        if not self._event_handle:
+            self.errors.append(f"CreateEventW failed for {self.root}: {ctypes.get_last_error()}")
+            kernel32.CloseHandle(self._handle)
+            self._handle = None
+            return False
+        self._overlapped = self._OVERLAPPED()
+        self._overlapped.hEvent = ctypes.cast(self._event_handle, ctypes.c_void_p).value
+        if not self._issue():
+            kernel32.CloseHandle(self._event_handle)
+            kernel32.CloseHandle(self._handle)
+            self._event_handle = None
+            self._handle = None
+            return False
+        self.armed_ms = max(0, int((time.monotonic() - started) * 1000))
+        emit_observability_event(
+            "filesystem.watcher.armed", root=str(self.root), armedMs=self.armed_ms,
+            backend="ReadDirectoryChangesW-overlapped", outcome="passed",
+        )
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         return True
 
+    def _consume(self, size: int) -> None:
+        if size == 0:
+            self.errors.append(f"ReadDirectoryChangesW buffer overflow for {self.root}")
+            return
+        raw = self._buffer.raw
+        offset = 0
+        while offset + 12 <= size:
+            next_offset = int.from_bytes(raw[offset:offset + 4], "little")
+            action = int.from_bytes(raw[offset + 4:offset + 8], "little")
+            name_len = int.from_bytes(raw[offset + 8:offset + 12], "little")
+            end = offset + 12 + name_len
+            if end > size:
+                self.errors.append(f"ReadDirectoryChangesW malformed buffer for {self.root}")
+                return
+            name = raw[offset + 12:end].decode("utf-16-le", errors="replace")
+            if name:
+                self.events.append((action, name.replace("\\", "/")))
+            if next_offset == 0:
+                break
+            offset += next_offset
+
     def _run(self) -> None:
         from ctypes import wintypes
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.ReadDirectoryChangesW.argtypes = [
-            wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, wintypes.BOOL,
-            wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID, wintypes.LPVOID,
-        ]
-        kernel32.ReadDirectoryChangesW.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        buffer = ctypes.create_string_buffer(64 * 1024)
-        returned = ctypes.c_ulong(0)
+        kernel32 = self._kernel32()
+        kernel32.GetOverlappedResult.argtypes = [wintypes.HANDLE, ctypes.POINTER(self._OVERLAPPED), ctypes.POINTER(wintypes.DWORD), wintypes.BOOL]
+        kernel32.GetOverlappedResult.restype = wintypes.BOOL
+        returned = wintypes.DWORD(0)
         try:
             while not self._stop.is_set():
-                ok = kernel32.ReadDirectoryChangesW(
-                    self._handle,
-                    ctypes.byref(buffer),
-                    len(buffer),
-                    True,
-                    self.FILTER,
-                    ctypes.byref(returned),
-                    None,
-                    None,
+                ok = kernel32.GetOverlappedResult(
+                    self._handle, ctypes.byref(self._overlapped), ctypes.byref(returned), True
                 )
                 if not ok:
                     error = ctypes.get_last_error()
                     if self._stop.is_set() and error == self.ERROR_OPERATION_ABORTED:
                         break
-                    self.errors.append(
-                        f"ReadDirectoryChangesW failed for {self.root}: {error}"
-                    )
+                    self.errors.append(f"GetOverlappedResult failed for {self.root}: {error}")
                     break
-                size = int(returned.value)
-                if size == 0:
-                    self.errors.append(
-                        f"ReadDirectoryChangesW buffer overflow for {self.root}"
-                    )
+                self._consume(int(returned.value))
+                if self.errors or self._stop.is_set() or not self._issue():
                     break
-                offset = 0
-                while offset + 12 <= size:
-                    raw = buffer.raw
-                    next_offset = int.from_bytes(raw[offset:offset + 4], "little")
-                    action = int.from_bytes(raw[offset + 4:offset + 8], "little")
-                    name_len = int.from_bytes(raw[offset + 8:offset + 12], "little")
-                    end = offset + 12 + name_len
-                    if end > size:
-                        self.errors.append(
-                            f"ReadDirectoryChangesW malformed buffer for {self.root}"
-                        )
-                        break
-                    name = raw[offset + 12:end].decode("utf-16-le", errors="replace")
-                    if name:
-                        self.events.append((action, name.replace("\\", "/")))
-                    if next_offset == 0:
-                        break
-                    offset += next_offset
         finally:
-            if self._handle not in (None, 0):
-                try:
-                    kernel32.CloseHandle(self._handle)
-                except Exception:
-                    pass
+            if self._event_handle:
+                kernel32.CloseHandle(self._event_handle)
+                self._event_handle = None
+            if self._handle:
+                kernel32.CloseHandle(self._handle)
                 self._handle = None
 
     def stop(self) -> None:
         if self._thread is None:
             return
-        # Give the synchronous watcher one scheduling slice to consume the
-        # final filesystem notification before cancelling an idle read.
-        import time
         time.sleep(0.05)
         self._stop.set()
-        if self._handle not in (None, 0):
+        if self._handle and self._overlapped is not None:
             try:
-                from ctypes import wintypes
-                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-                kernel32.CancelIoEx.argtypes = [wintypes.HANDLE, wintypes.LPVOID]
-                kernel32.CancelIoEx.restype = wintypes.BOOL
-                kernel32.CancelIoEx(self._handle, None)
+                kernel32 = self._kernel32()
+                kernel32.CancelIoEx(self._handle, ctypes.byref(self._overlapped))
             except Exception as exc:
                 self.errors.append(f"CancelIoEx failed for {self.root}: {exc}")
         self._thread.join(timeout=5)
         if self._thread.is_alive():
             self.errors.append(f"dependency watcher did not stop for {self.root}")
-
 
 
 def _classify_integrity_notification(

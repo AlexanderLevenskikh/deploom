@@ -292,6 +292,63 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
             self.assertEqual(["npm run types", "npm run styles"], [item.command for item in result.project_failures])
             self.assertIn("esm-cjs:stylelint-selector-tag-no-without-class", structural_project_failure_signatures(result))
 
+
+    def test_project_output_tokens_are_not_infrastructure_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(
+                json.dumps({"packageManager": "npm@11.0.0", "dependencies": {"demo": "1.0.0"}}),
+                encoding="utf-8",
+            )
+            (root / "package-lock.json").write_text(
+                json.dumps({"lockfileVersion": 3, "packages": {}}), encoding="utf-8"
+            )
+            tokens = ("ENOENT assertion text", "EACCES expected diagnostic", "HTTP 503 fixture")
+            runs = [
+                CompletedProcess(["npm", "install"], 0, stdout="resolver ok"),
+                CompletedProcess(["npm", "install"], 0, stdout="lifecycle ok"),
+                *[
+                    CompletedProcess(["npm", "run", f"check-{index}"], 1, stdout=token)
+                    for index, token in enumerate(tokens, start=1)
+                ],
+            ]
+            commands = tuple(f"npm run check-{index}" for index in range(1, 4))
+            with patch("baseline_constraint_verifier.resolve_executable", return_value="npm"), \
+                    patch("baseline_constraint_verifier._run", side_effect=runs):
+                result = verify_assignment(
+                    root, {"demo": "2.0.0"},
+                    config=BaselineVerifyConfig(project_checks="diagnostic", commands=commands),
+                    run_project_checks=True,
+                )
+            self.assertEqual("project", result.kind)
+            self.assertEqual(list(commands), [item.command for item in result.project_failures])
+
+    def test_project_launch_oserror_is_typed_without_secondary_unboundlocal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(
+                json.dumps({"packageManager": "npm@11.0.0", "dependencies": {"demo": "1.0.0"}}),
+                encoding="utf-8",
+            )
+            (root / "package-lock.json").write_text(
+                json.dumps({"lockfileVersion": 3, "packages": {}}), encoding="utf-8"
+            )
+            runs = [
+                CompletedProcess(["npm", "install"], 0, stdout="resolver ok"),
+                CompletedProcess(["npm", "install"], 0, stdout="lifecycle ok"),
+                OSError("synthetic launch failure"),
+            ]
+            with patch("baseline_constraint_verifier.resolve_executable", return_value="npm"), \
+                    patch("baseline_constraint_verifier._run", side_effect=runs):
+                result = verify_assignment(
+                    root, {"demo": "2.0.0"},
+                    config=BaselineVerifyConfig(
+                        project_checks="diagnostic", commands=("npm run check",)
+                    ),
+                    run_project_checks=True,
+                )
+            self.assertEqual("infrastructure", result.kind)
+            self.assertIn("project check launch failed", result.summary)
     def test_module_resolution_structural_signature_is_independent_from_unrelated_baseline_type_error(self) -> None:
         candidate = BaselineVerifyResult(
             False, "project", "project preflight failed: yarn lint:types", command="yarn lint:types",

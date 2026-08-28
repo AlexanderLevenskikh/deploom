@@ -62,6 +62,8 @@ def _hash_file(path: Path) -> tuple[str, int, bool]:
         before.st_size == after.st_size,
         before.st_mtime_ns == after.st_mtime_ns,
         getattr(before, "st_ino", 0) == getattr(after, "st_ino", 0),
+        int(getattr(before, "st_nlink", 1) or 1) == 1,
+        int(getattr(after, "st_nlink", 1) or 1) == 1,
     )
     if not all(stable_fields):
         raise ArtifactIntegrityError(
@@ -146,6 +148,12 @@ def build_artifact_tree_integrity(
                 entries.append({"path": relative_text, "kind": "directory"})
                 pending.append((path, relative))
             elif stat.S_ISREG(mode):
+                links = int(getattr(item.stat(follow_symlinks=False), "st_nlink", 1) or 1)
+                if links > 1:
+                    raise ArtifactIntegrityError(
+                        "PREPARED_ARTIFACT_HARDLINK_UNSUPPORTED: "
+                        f"{relative_text}; nlink={links}"
+                    )
                 files.append((path, relative_text))
             else:
                 raise ArtifactIntegrityError(

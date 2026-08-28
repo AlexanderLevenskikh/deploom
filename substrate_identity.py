@@ -23,6 +23,13 @@ _COMPONENT_FILES: Mapping[str, tuple[str, ...]] = {
         "baseline_constraint_verifier.py",
         "constraint_cache.py",
         "project_topology.py",
+        "package_manager_profile.py",
+        "lockfile_consistency.py",
+        "resolved_dependency_state.py",
+        "proven_dependency_state.py",
+        "peer_solver_model.py",
+        "peer_solver_transition.py",
+        "peer_solver_z3.py",
     ),
     "preparation": (
         "baseline_constraint_verifier.py",
@@ -91,12 +98,8 @@ def tool_build_components() -> dict[str, str]:
 
 @functools.lru_cache(maxsize=1)
 def tool_build_id() -> str:
-    override = str(os.environ.get("DEPLOOM_TOOL_BUILD_ID") or "").strip().lower()
-    if (
-        len(override) == 64
-        and all(character in "0123456789abcdef" for character in override)
-    ):
-        return override
+    # Production proof identity is always computed from semantic code. An
+    # environment variable must never make changed code look like an old build.
     return _canonical_hash({
         "schema": TOOL_BUILD_ID_SCHEMA,
         "components": tool_build_components(),

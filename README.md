@@ -486,3 +486,16 @@ Defaults require no `lockfileSync` block:
 ```
 
 `--post-update` remains a compatibility alias. Use `--lockfile-mode validate` in a final staged-tree gate when mutation must be forbidden.
+
+
+## Release-proof verification boundaries (Block Lambda)
+
+DepLoom revalidates active SourceSnapshot bytes before every authority-bearing consumption and fails closed when a sealed locator changes. PreparedArtifact memory state is never stronger than its durable index and freshly validated content; regular-file hardlinks are unsupported because an external writable alias cannot be proven safe.
+
+Windows proof-grade reuse requires an OVERLAPPED filesystem watcher armed before command execution and CREATE_SUSPENDED Job Object association before user code runs. Linux subreaper/token supervision is intentionally reported as best-effort because descendants may scrub environment tokens or become unobservable; shared/reuse-sensitive publication therefore remains disabled there.
+
+Project command output is project evidence, not DepLoom infrastructure authority. Infrastructure classification comes from typed launch, timeout, registry, watcher, artifact, storage, and supervision failures. Diagnostic localization and minimization never create solver authority or cancel an already certified exact-assignment exclusion.
+
+Durable ProjectProof reuse for arbitrary shell commands is disabled until the command's external tool closure is explicitly declared and identity-bound. Production toolBuildId is computed from proof-semantic code and cannot be replaced by DEPLOOM_TOOL_BUILD_ID.
+
+Release publication is gated on exact-release-SHA Windows physical acceptance. npm and Yarn Classic remain the supported package managers; Yarn Berry and pnpm remain typed unsupported. Windows NTFS is the proof-grade physical substrate. ReFS has no independent Lambda acceptance claim. macOS and Linux do not claim proof-grade descendant-tree supervision.

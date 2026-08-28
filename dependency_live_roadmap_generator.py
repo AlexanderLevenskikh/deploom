@@ -125,7 +125,8 @@ from dependency_interaction import (
     DIRECT_SHADOWING, PEER_REQUIREMENT, InteractionEdge, edge_index, graph_from_edges,
 )
 from dependency_compatibility_evidence import (
-    CompatibilityEvidence, CompatibilityEvidenceError, load_compatibility_evidence, localize_compatibility_evidence,
+    CompatibilityEvidence, CompatibilityEvidenceError, external_evidence_identity_matches,
+    load_compatibility_evidence, localize_compatibility_evidence,
 )
 from lockfile_consistency import (
     LockfileConsistencyError,
@@ -9420,6 +9421,31 @@ def resolve_peer_compatibility_with_verification(
 
         external_evidence = (external_evidence_by_project or {}).get(project)
         if external_evidence is not None:
+            identity_matched = external_evidence_identity_matches(
+                external_evidence, source_snapshot.key
+            )
+            emit_observability_event(
+                "external-evidence.identity",
+                envelopeSnapshotKey=external_evidence.envelope_source_snapshot_key,
+                evidenceSnapshotKey=external_evidence.source_snapshot_key,
+                baselineSnapshotKey=source_snapshot.key,
+                matched=identity_matched,
+            )
+            if not identity_matched:
+                progress_reporter.emit(
+                    project, external_evidence.target_mode,
+                    "external-evidence-identity-mismatch",
+                    envelopeSnapshotKey=external_evidence.envelope_source_snapshot_key,
+                    evidenceSnapshotKey=external_evidence.source_snapshot_key,
+                    baselineSnapshotKey=source_snapshot.key,
+                    authority=EVIDENCE_DIAGNOSTIC_HINT,
+                )
+                eprint(
+                    f"[warn] {project}: post-Executor evidence SourceSnapshot identity "
+                    "does not match the current Baseline; evidence preserved as diagnostic-only"
+                )
+                external_evidence = None
+        if external_evidence is not None:
             try:
                 progress_reporter.emit(project, external_evidence.target_mode, "external-evidence-localization-started", maxChecks=config.max_delta_checks, parallelism=config.parallelism)
                 evidence_nogood, evidence_signatures = localize_compatibility_evidence(
@@ -10840,9 +10866,21 @@ def resolve_peer_compatibility_with_verification(
                                 adaptive_project=adaptive_project_predicate,
                             )
                             if not predicate_families:
-                                raise BaselineConstraintVerificationError(
-                                    f"BASELINE_CONSTRAINT_MINIMIZATION_INCONCLUSIVE: "
-                                    f"{project}/{mode}: certified graph candidate has no stable predicate"
+                                emit_observability_event(
+                                    "verify.diagnostic",
+                                    authorityProduced=False,
+                                    outcome="predicate-unavailable",
+                                    abortAllowed=False,
+                                )
+                                progress_reporter.emit(
+                                    project, mode, "verify-diagnostic-inconclusive",
+                                    iteration=iteration, assignment=fingerprint,
+                                    authorityProduced=False, outcome="predicate-unavailable",
+                                    abortAllowed=False,
+                                )
+                                eprint(
+                                    f"[warn] {project}: graph diagnostic has no stable predicate; "
+                                    "keeping the certified exact exclusion and continuing"
                                 )
 
                             minimization_budget = _nogood_minimization_check_budget(
@@ -11008,11 +11046,19 @@ def resolve_peer_compatibility_with_verification(
                                     ),
                                 )
                                 if trial_result.kind in {"infrastructure", "unknown"}:
-                                    raise BaselineConstraintVerificationError(
-                                        f"BASELINE_CONSTRAINT_MINIMIZATION_INCONCLUSIVE: "
-                                        f"{project}/{mode}: fresh minimization proof {minimization_check} "
-                                        f"is {trial_result.kind}: {trial_result.summary}"
+                                    emit_observability_event(
+                                        "verify.diagnostic",
+                                        authorityProduced=False,
+                                        outcome=trial_result.kind,
+                                        abortAllowed=False,
                                     )
+                                    progress_reporter.emit(
+                                        project, mode, "verify-diagnostic-inconclusive",
+                                        iteration=iteration, assignment=fingerprint,
+                                        authorityProduced=False, outcome=trial_result.kind,
+                                        abortAllowed=False,
+                                    )
+                                    return ""
 
                                 trial_predicate = ""
                                 if result.kind == "dependency":
@@ -11181,11 +11227,20 @@ def resolve_peer_compatibility_with_verification(
                                     initial_predicate=required_predicate,
                                 )
                                 if not minimization.predicate:
-                                    raise BaselineConstraintVerificationError(
-                                        f"BASELINE_CONSTRAINT_MINIMIZATION_INCONCLUSIVE: "
-                                        f"{project}/{mode}: certified graph candidate lost "
-                                        f"predicate family {required_predicate!r} during minimization"
+                                    emit_observability_event(
+                                        "verify.diagnostic",
+                                        authorityProduced=False,
+                                        outcome="predicate-family-lost",
+                                        abortAllowed=False,
                                     )
+                                    progress_reporter.emit(
+                                        project, mode, "verify-diagnostic-inconclusive",
+                                        iteration=iteration, assignment=fingerprint,
+                                        authorityProduced=False,
+                                        outcome="predicate-family-lost",
+                                        abortAllowed=False,
+                                    )
+                                    continue
                                 generalized = dict(minimization.minimized)
                                 generalized_fingerprint = assignment_fingerprint(generalized)
                                 family_results.append((required_predicate, generalized, minimization))
@@ -11713,12 +11768,19 @@ def resolve_peer_compatibility_with_verification(
                             ),
                         )
                         if trial_result.kind in {"infrastructure", "unknown"}:
-                            raise BaselineConstraintVerificationError(
-                                f"BASELINE_CONSTRAINT_MINIMIZATION_INCONCLUSIVE: "
-                                f"{project}/{mode}: localized minimization proof "
-                                f"{minimization_check} is {trial_result.kind}: "
-                                f"{trial_result.summary}"
+                            emit_observability_event(
+                                "verify.diagnostic",
+                                authorityProduced=False,
+                                outcome=trial_result.kind,
+                                abortAllowed=False,
                             )
+                            progress_reporter.emit(
+                                project, mode, "verify-diagnostic-inconclusive",
+                                iteration=iteration, assignment=fingerprint,
+                                authorityProduced=False, outcome=trial_result.kind,
+                                abortAllowed=False,
+                            )
+                            return ""
 
                         trial_predicate = ""
                         if result.kind == "dependency":
@@ -11778,11 +11840,22 @@ def resolve_peer_compatibility_with_verification(
                     initial_predicate="",
                 )
                 if not localized_minimization.predicate:
-                    raise BaselineConstraintVerificationError(
-                        f"BASELINE_CONSTRAINT_MINIMIZATION_INCONCLUSIVE: "
-                        f"{project}/{mode}: localized solver clause "
-                        f"{localized_original_fingerprint} did not reproduce "
-                        "its authoritative predicate at literal granularity"
+                    emit_observability_event(
+                        "verify.diagnostic",
+                        authorityProduced=False,
+                        outcome="predicate-unavailable",
+                        abortAllowed=False,
+                    )
+                    progress_reporter.emit(
+                        project, mode, "verify-diagnostic-inconclusive",
+                        iteration=iteration, assignment=fingerprint,
+                        authorityProduced=False, outcome="predicate-unavailable",
+                        abortAllowed=False,
+                    )
+                    localized_minimization = dataclasses.replace(
+                        localized_minimization,
+                        minimized=dict(exact_nogood),
+                        predicate="diagnostic-inconclusive-exact-only",
                     )
                 nogood = dict(localized_minimization.minimized)
                 progress_reporter.emit(

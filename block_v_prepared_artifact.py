@@ -419,26 +419,20 @@ def load_prepared_artifact_record(
     if path is None or not path.is_file():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        record_text = path.read_text(encoding="utf-8")
+        payload = json.loads(record_text)
     except (OSError, ValueError, TypeError):
         return None
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or payload.get("schemaVersion") != ARTIFACT_INDEX_SCHEMA:
         return None
-    if payload.get("schemaVersion") != ARTIFACT_INDEX_SCHEMA:
-        return None
-    if payload.get("authority") != ARTIFACT_AUTHORITY:
-        return None
-    if payload.get("key") != _valid_key(key):
+    if payload.get("authority") != ARTIFACT_AUTHORITY or payload.get("key") != _valid_key(key):
         return None
     current_build_id = tool_build_id()
     content_key = str(payload.get("artifactContentKey") or "").lower()
     if payload.get("toolBuildId") != current_build_id:
         invalidate_prepared_artifact_record(key, remove_tree=False)
         return None
-    if (
-        len(content_key) != 64
-        or any(ch not in "0123456789abcdef" for ch in content_key)
-    ):
+    if len(content_key) != 64 or any(ch not in "0123456789abcdef" for ch in content_key):
         invalidate_prepared_artifact_record(key, remove_tree=False)
         return None
     if payload.get("sourceProjectIdentity") != _source_identity(source_project):
@@ -448,17 +442,12 @@ def load_prepared_artifact_record(
     observed_hash = str(payload.get("observedResolvedHash") or "").lower()
     versions = payload.get("observedResolvedVersions")
     try:
-        dependency_roots = _normalize_dependency_roots(
-            payload.get("dependencyRoots") or ()
-        )
+        dependency_roots = _normalize_dependency_roots(payload.get("dependencyRoots") or ())
     except ValueError:
         return None
     if not isinstance(workspace_raw, str) or not isinstance(relative_raw, str):
         return None
-    if not isinstance(versions, dict) or not all(
-        isinstance(name, str) and isinstance(version, str)
-        for name, version in versions.items()
-    ):
+    if not isinstance(versions, dict) or not all(isinstance(name, str) and isinstance(version, str) for name, version in versions.items()):
         return None
     if len(observed_hash) != 64 or any(ch not in "0123456789abcdef" for ch in observed_hash):
         return None
@@ -470,67 +459,58 @@ def load_prepared_artifact_record(
     if not workspace.is_dir() or not is_durable_prepared_path(workspace):
         invalidate_prepared_artifact_record(key)
         return None
-    validation_slot = (
-        os.path.normcase(str(workspace)),
-        _valid_key(key),
-        content_key,
-    )
+    validation_slot = (os.path.normcase(str(workspace)), _valid_key(key), content_key)
     with _INTEGRITY_VALIDATION_LOCK:
-        already_validated = validation_slot in _VALIDATED_CONTENT
-    if not already_validated:
-        try:
-            observed_integrity = build_artifact_tree_integrity(workspace)
-        except ArtifactIntegrityError as exc:
-            emit_observability_event(
-                "prepared-artifact.integrity",
-                outcome="validation-error",
-                artifactKey=_valid_key(key),
-                errorType=type(exc).__name__,
-            )
-            invalidate_prepared_artifact_record(key, remove_tree=False)
-            return None
-        if (
-            observed_integrity.key != content_key
-            or observed_integrity.tool_build_id != current_build_id
-        ):
-            emit_observability_event(
-                "prepared-artifact.integrity",
-                outcome="mismatch",
-                artifactKey=_valid_key(key),
-                expectedContentKey=content_key,
-                observedContentKey=observed_integrity.key,
-                toolBuildId=current_build_id,
-            )
-            invalidate_prepared_artifact_record(key, remove_tree=False)
-            return None
-        with _INTEGRITY_VALIDATION_LOCK:
-            _VALIDATED_CONTENT.add(validation_slot)
+        memory_hit = validation_slot in _VALIDATED_CONTENT
+    try:
+        observed_integrity = build_artifact_tree_integrity(workspace)
+    except ArtifactIntegrityError as exc:
         emit_observability_event(
-            "prepared-artifact.integrity",
-            outcome="validated",
-            artifactKey=_valid_key(key),
-            artifactContentKey=content_key,
-            fileCount=observed_integrity.file_count,
-            byteCount=observed_integrity.byte_count,
-            toolBuildId=current_build_id,
+            "prepared-artifact.integrity", outcome="validation-error",
+            artifactKey=_valid_key(key), errorType=type(exc).__name__,
         )
+        invalidate_prepared_artifact_record(key, remove_tree=False)
+        return None
+    if observed_integrity.key != content_key or observed_integrity.tool_build_id != current_build_id:
+        emit_observability_event(
+            "prepared-artifact.integrity", outcome="mismatch",
+            artifactKey=_valid_key(key), expectedContentKey=content_key,
+            observedContentKey=observed_integrity.key, toolBuildId=current_build_id,
+        )
+        invalidate_prepared_artifact_record(key, remove_tree=False)
+        return None
+    try:
+        durable_record_unchanged = path.is_file() and path.read_text(encoding="utf-8") == record_text
+    except OSError:
+        durable_record_unchanged = False
+    if not durable_record_unchanged:
+        emit_observability_event(
+            "prepared-artifact.cache", memoryHit=memory_hit,
+            durableRecordPresent=path.is_file(), generationMatch=False,
+            contentKeyMatch=True, invalidationReason="durable-record-changed",
+        )
+        return None
+    with _INTEGRITY_VALIDATION_LOCK:
+        _VALIDATED_CONTENT.add(validation_slot)
+    emit_observability_event(
+        "prepared-artifact.cache", memoryHit=memory_hit,
+        durableRecordPresent=True, generationMatch=True,
+        contentKeyMatch=True, invalidationReason="",
+    )
     project = workspace / relative
     if not project.is_dir():
         invalidate_prepared_artifact_record(key)
         return None
     return {
-        "key": _valid_key(key),
-        "workspaceRoot": workspace,
+        "key": _valid_key(key), "workspaceRoot": workspace,
         "projectRelative": relative,
         "storageMode": str(payload.get("storageMode") or "durable-prepared-artifact"),
-        "toolBuildId": current_build_id,
-        "artifactContentKey": content_key,
+        "toolBuildId": current_build_id, "artifactContentKey": content_key,
         "observedResolvedVersions": dict(sorted(versions.items())),
         "observedResolvedHash": observed_hash,
         "dependencyRoots": tuple(dependency_roots),
         "publishedAt": str(payload.get("publishedAt") or ""),
     }
-
 
 def invalidate_prepared_artifact_record(key: str, *, remove_tree: bool = False) -> bool:
     normalized_key = _valid_key(key)

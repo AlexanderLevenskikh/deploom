@@ -120,6 +120,10 @@ def resolver_environment_fingerprint(
 
 
 _FAILURE_PATH = re.compile(r"dependency-flow-baseline-verify-[^\\/\s]+", re.IGNORECASE)
+_FAILURE_ABSOLUTE_TRIAL_PATH = re.compile(r"(?:[a-z]:)?[^\s\"']*[\\/]dependency-flow-baseline-verify-[^\s\"']+", re.IGNORECASE)
+_FAILURE_ISO_TIMESTAMP = re.compile(r"\b\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}:\d{2}(?:\.\d+)?z?\b", re.IGNORECASE)
+_FAILURE_NPM_LOG = re.compile(r"(?:[a-z]:)?[^\s\"']*[\\/]_logs[\\/][^\s\"']+\.log", re.IGNORECASE)
+_FAILURE_PID = re.compile(r"\bpid[=: ]+\d+\b", re.IGNORECASE)
 _WHITESPACE = re.compile(r"\s+")
 
 
@@ -130,7 +134,11 @@ def dependency_failure_signature(*, summary: str, output: str) -> str:
     the fallback whenever no narrow structured resolver predicate is available.
     """
     text = f"{summary}\n{output}".strip().lower()
+    text = _FAILURE_ABSOLUTE_TRIAL_PATH.sub("<workspace>", text)
     text = _FAILURE_PATH.sub("<workspace>", text)
+    text = _FAILURE_NPM_LOG.sub("<npm-log>", text)
+    text = _FAILURE_ISO_TIMESTAMP.sub("<timestamp>", text)
+    text = _FAILURE_PID.sub("pid=<pid>", text)
     text = _WHITESPACE.sub(" ", text)
     return _sha256_bytes(text.encode("utf-8"))[:24]
 
@@ -157,6 +165,14 @@ _YARN1_MISSING_VERSION = re.compile(
 )
 _YARN_BERRY_NO_CANDIDATES = re.compile(
     r"\bYN0082\b(?P<body>[^\r\n]*)",
+    re.IGNORECASE,
+)
+_YARN1_REQUIRED_PACKAGE = re.compile(
+    r"couldn't find package\s+[\"'](?P<spec>[^\"']+)[\"']\s+required by\s+[\"'](?P<consumer>[^\"']+)[\"']",
+    re.IGNORECASE,
+)
+_YARN1_ENGINE_INCOMPATIBLE = re.compile(
+    r"the engine\s+[\"'](?P<engine>[^\"']+)[\"']\s+is incompatible with this module(?:\. expected version\s+[\"'](?P<expected>[^\"']+)[\"'])?",
     re.IGNORECASE,
 )
 
@@ -218,6 +234,18 @@ def dependency_failure_predicates(*, summary: str, output: str) -> Tuple[str, ..
         requested = _normalize_resolver_predicate_atom(match.group("range"))
         if package and requested:
             facts.append(f"missing-version:{package}@{requested}")
+
+    for match in _YARN1_REQUIRED_PACKAGE.finditer(text):
+        spec = _normalize_resolver_predicate_atom(match.group("spec"))
+        consumer = _normalize_resolver_predicate_atom(match.group("consumer"))
+        if spec and consumer:
+            facts.append(f"yarn1-required-package:spec={spec};consumer={consumer}")
+
+    for match in _YARN1_ENGINE_INCOMPATIBLE.finditer(text):
+        engine = _normalize_resolver_predicate_atom(match.group("engine"))
+        expected = _normalize_resolver_predicate_atom(match.group("expected") or "unspecified")
+        if engine:
+            facts.append(f"yarn1-engine-incompatible:engine={engine};expected={expected}")
 
     # YN0082 is a fatal Yarn Berry no-candidates resolver code. Preserve the
     # normalized exact body rather than reducing it to a generic code.
