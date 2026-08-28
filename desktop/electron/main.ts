@@ -401,7 +401,14 @@ function baselineRecoveryInfo(workspace: WorkspaceRecord, projectName: string | 
   try { const payload = JSON.parse(readFileSync(path, 'utf8')) as { entries?: Record<string, unknown> }; const entries = payload.entries && typeof payload.entries === 'object' ? payload.entries : {}; const candidates = (['yellow', 'green'] as const).flatMap((mode) => { const entry = entries[baselineRecoverySlot(projectName, mode)]; return entry && typeof entry === 'object' ? [{ mode, entry: entry as Record<string, unknown> }] : [] })
     if (!candidates.length) return { available: false, reason: 'checkpoint-missing' }
     const chosen = candidates.map((item) => ({ ...item, updatedAtMs: Date.parse(String(item.entry.updatedAt || '')) || 0 })).sort((left, right) => right.updatedAtMs - left.updatedAtMs)[0]; const entry = chosen.entry; const state = entry.state && typeof entry.state === 'object' ? entry.state as Record<string, unknown> : {}; const iteration = Number(state.iteration); const generation = Number(entry.generation); const learned = Array.isArray(state.learnedConstraints) ? state.learnedConstraints.length : undefined; const exact = Array.isArray(state.globalExactExclusions) ? state.globalExactExclusions.length : undefined
-    return { available: true, mode: chosen.mode, status: typeof entry.status === 'string' ? entry.status : undefined, phase: typeof entry.phase === 'string' ? entry.phase : undefined, updatedAt: typeof entry.updatedAt === 'string' ? entry.updatedAt : undefined, ...(Number.isFinite(generation) ? { generation } : {}), ...(Number.isFinite(iteration) ? { iteration } : {}), lastAssignment: typeof state.lastAssignment === 'string' ? state.lastAssignment : undefined, lastPredicate: typeof state.lastPredicate === 'string' ? state.lastPredicate : undefined, ...(learned !== undefined ? { learnedConstraints: learned } : {}), ...(exact !== undefined ? { exactExclusions: exact } : {}) }
+    const status = typeof entry.status === 'string' ? entry.status : undefined
+    // Python RecoveryStore deliberately marks completed/passed checkpoints as
+    // non-resumable (reason=already-complete). Desktop previously treated the
+    // mere presence of such an entry as "Continue available", which could turn
+    // a post-processing failure after a successful Baseline into a bogus
+    // BASELINE_RECOVERY_CONTINUE_UNAVAILABLE loop.
+    const resumable = status !== 'completed' && status !== 'passed'
+    return { available: resumable, mode: chosen.mode, status, phase: typeof entry.phase === 'string' ? entry.phase : undefined, updatedAt: typeof entry.updatedAt === 'string' ? entry.updatedAt : undefined, ...(Number.isFinite(generation) ? { generation } : {}), ...(Number.isFinite(iteration) ? { iteration } : {}), lastAssignment: typeof state.lastAssignment === 'string' ? state.lastAssignment : undefined, lastPredicate: typeof state.lastPredicate === 'string' ? state.lastPredicate : undefined, ...(learned !== undefined ? { learnedConstraints: learned } : {}), ...(exact !== undefined ? { exactExclusions: exact } : {}), ...(!resumable ? { reason: 'already-complete' } : {}) }
   } catch (error) { return { available: false, reason: error instanceof Error ? error.message : String(error) } }
 }
 function emptyState(): DesktopState {
@@ -565,13 +572,22 @@ function projectArtifactCachePath(workspace: WorkspaceRecord, projectName: strin
   return join(projectArtifactCacheDir(workspace, projectName), kind === 'json' ? 'dependency-roadmap.json' : 'local-dependency-roadmap.html')
 }
 
-function snapshotProjectArtifacts(workspace: WorkspaceRecord, projectName: string): boolean {
-  const sourceRoadmap = artifactPath(workspace, 'jsonOut', '.dependency-roadmap/artifacts/dependency-roadmap.json')
+function baselineProjectOutputDir(workspace: WorkspaceRecord, projectName: string): string {
+  const stem = projectName.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'project'
+  return join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-project-output', stem)
+}
+
+function snapshotProjectArtifacts(
+  workspace: WorkspaceRecord,
+  projectName: string,
+  source?: { roadmap: string; dashboard?: string },
+): boolean {
+  const sourceRoadmap = source?.roadmap ?? artifactPath(workspace, 'jsonOut', '.dependency-roadmap/artifacts/dependency-roadmap.json')
   if (!roadmapFileContainsProject(sourceRoadmap, projectName)) return false
   const directory = projectArtifactCacheDir(workspace, projectName)
   mkdirSync(directory, { recursive: true })
   copyFileSync(sourceRoadmap, projectArtifactCachePath(workspace, projectName, 'json'))
-  const sourceDashboard = artifactPath(workspace, 'htmlOut', '.dependency-roadmap/artifacts/local-dependency-roadmap.html')
+  const sourceDashboard = source?.dashboard ?? artifactPath(workspace, 'htmlOut', '.dependency-roadmap/artifacts/local-dependency-roadmap.html')
   if (existsSync(sourceDashboard)) copyFileSync(sourceDashboard, projectArtifactCachePath(workspace, projectName, 'html'))
   return true
 }
@@ -1781,8 +1797,7 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
       // dependency-roadmap.{md,json,html} publication. Baseline evidence and
       // verification caches stay on their normal exact/project identities; only
       // human-facing generator outputs are redirected to a project-private sink.
-      const baselineProjectStem = project.name.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'project'
-      const baselineProjectOutput = join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-project-output', baselineProjectStem)
+      const baselineProjectOutput = baselineProjectOutputDir(workspace, project.name)
       mkdirSync(baselineProjectOutput, { recursive: true })
       const baselineOutputArgs = [
         '--out', join(baselineProjectOutput, 'dependency-roadmap.md'),
@@ -4931,6 +4946,19 @@ function commandAttemptsForAction(action: FlowAction): number {
   return ['preflight', 'baseline', 'generate', 'generate-all', 'audit', 'commit-state', 'push-workspace'].includes(action) ? 3 : 1
 }
 
+function commandSpecForRetry(job: JobRecord, spec: CommandSpec): CommandSpec {
+  if (job.action !== 'baseline') return spec
+  // An explicit Start-over is a one-shot user decision. Replaying
+  // DEPLOOM_BASELINE_RESUME=restart on transient attempt 2/3 would delete the
+  // checkpoint produced by attempt 1 and make every retry start from zero.
+  // `auto` resumes an exact compatible checkpoint when one exists, and safely
+  // starts fresh when the first attempt died before any checkpoint was written.
+  return {
+    ...spec,
+    env: { ...spec.env, DEPLOOM_BASELINE_RESUME: 'auto' },
+  }
+}
+
 function deterministicWatchdogFailure(result: { code: number; stderr: string; stdout: string }): boolean {
   if (result.code === 124) return true
   const text = `${result.stderr}\n${result.stdout}`
@@ -5130,9 +5158,10 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
       let attemptsPerformed = 1
       let result = await executeCommand(job, spec)
       for (let attempt = 2; result.code !== 0 && !nonRetryableDeterministicFailure(result) && attempt <= maxCommandAttempts; attempt += 1) {
-        send('flow:job-output', { jobId: job.id, stream: 'system', line: `${spec.label}: transient retry ${attempt}/${maxCommandAttempts}; предыдущий exit=${result.code}.` })
+        const retrySpec = commandSpecForRetry(job, spec)
+        send('flow:job-output', { jobId: job.id, stream: 'system', line: `${spec.label}: transient retry ${attempt}/${maxCommandAttempts}; предыдущий exit=${result.code}.${job.action === 'baseline' ? ' Повтор использует safe resume=auto; explicit restart повторно не применяется.' : ''}` })
         attemptsPerformed = attempt
-        result = await executeCommand(job, spec)
+        result = await executeCommand(job, retrySpec)
       }
       if (result.code !== 0 && deterministicWatchdogFailure(result)) {
         send('flow:job-output', {
@@ -5155,9 +5184,22 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
     // another `--only-project` run is allowed to replace the configured files.
     // This is the persistence boundary that makes project switching truly
     // isolated rather than merely filtering renderer state.
-    if ((job.action === 'baseline' || job.action === 'generate') && job.projectName) {
+    if (job.action === 'baseline' && job.projectName) {
+      // Baseline intentionally writes into a project-private output directory
+      // so concurrent project Baselines cannot race on shared jsonOut/htmlOut.
+      // Snapshot exactly those files; reading the shared configured roadmap
+      // here used to turn a successful Baseline into a false failure whenever
+      // that shared file happened to contain another project.
+      const baselineOutput = baselineProjectOutputDir(job.workspace, job.projectName)
+      if (!snapshotProjectArtifacts(job.workspace, job.projectName, {
+        roadmap: join(baselineOutput, 'dependency-roadmap.json'),
+        dashboard: join(baselineOutput, 'dependency-roadmap.html'),
+      })) {
+        throw new Error(`PROJECT_ARTIFACT_SNAPSHOT_FAILED: private Baseline roadmap для ${job.projectName} не содержит этот проект.`)
+      }
+    } else if (job.action === 'generate' && job.projectName) {
       if (!snapshotProjectArtifacts(job.workspace, job.projectName)) {
-        throw new Error(`PROJECT_ARTIFACT_SNAPSHOT_FAILED: roadmap для ${job.projectName} не содержит этот проект после ${job.action}.`)
+        throw new Error(`PROJECT_ARTIFACT_SNAPSHOT_FAILED: roadmap для ${job.projectName} не содержит этот проект после generate.`)
       }
     } else if (job.action === 'generate-all') {
       for (const project of readProjects(job.workspace)) snapshotProjectArtifacts(job.workspace, project.name)
@@ -5511,7 +5553,7 @@ function setupIpc(): void {
     // reconsiders every package from scratch instead of inheriting an old
     // "temporarily unreachable" decision forever. A migration-only restart
     // intentionally keeps the current plan; rebuilding it is the baseline's job.
-    if (input.action === 'baseline') clearPlannerDeferrals(workspace, project.name)
+    if (input.action === 'baseline' && input.baselineResume !== 'continue') clearPlannerDeferrals(workspace, project.name)
 
     let bestEffortReleaseReason: string | undefined
     let bestEffortCurrentLevel: string | undefined

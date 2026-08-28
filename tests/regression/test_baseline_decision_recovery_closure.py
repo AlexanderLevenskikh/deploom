@@ -38,5 +38,28 @@ class BaselineDecisionRecoveryClosureTests(unittest.TestCase):
         self.assertIn('"required": baseline_required', generator)
 
 
+    def test_baseline_snapshots_its_project_private_output(self) -> None:
+        main = (ROOT / "desktop" / "electron" / "main.ts").read_text(encoding="utf-8")
+        self.assertIn("function baselineProjectOutputDir", main)
+        self.assertIn("const baselineOutput = baselineProjectOutputDir(job.workspace, job.projectName)", main)
+        self.assertIn("roadmap: join(baselineOutput, 'dependency-roadmap.json')", main)
+        self.assertIn("dashboard: join(baselineOutput, 'dependency-roadmap.html')", main)
+
+    def test_transient_baseline_retry_never_replays_explicit_restart(self) -> None:
+        main = (ROOT / "desktop" / "electron" / "main.ts").read_text(encoding="utf-8")
+        self.assertIn("function commandSpecForRetry", main)
+        self.assertIn("DEPLOOM_BASELINE_RESUME: 'auto'", main)
+        self.assertIn("result = await executeCommand(job, retrySpec)", main)
+
+    def test_completed_checkpoint_is_not_advertised_as_continue(self) -> None:
+        main = (ROOT / "desktop" / "electron" / "main.ts").read_text(encoding="utf-8")
+        self.assertIn("const resumable = status !== 'completed' && status !== 'passed'", main)
+        self.assertIn("reason: 'already-complete'", main)
+
+    def test_continue_does_not_clear_planner_epoch_before_recovery(self) -> None:
+        main = (ROOT / "desktop" / "electron" / "main.ts").read_text(encoding="utf-8")
+        self.assertIn("input.action === 'baseline' && input.baselineResume !== 'continue'", main)
+
+
 if __name__ == "__main__":
     unittest.main()
