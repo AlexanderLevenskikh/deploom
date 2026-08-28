@@ -21,11 +21,15 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from verification_workspace_backend import materialize_private_tree
-from prepared_workspace_fastpath import _DirectoryWatcher
+from prepared_workspace_fastpath import (
+    _DirectoryWatcher,
+    apply_tree_write_protection,
+)
 from io_governor import io_slot
 from reparse_materialization import ReparseMaterializationError
 from verification_observability import (
@@ -153,6 +157,74 @@ def _snapshot_object_identity(
     return (root, project)
 
 
+_DRAIN_MARKER_DIR = ".dependency-roadmap"
+
+
+def _content_relevant_events(
+    events: "list[tuple[int, str]]",
+) -> "list[tuple[int, str]]":
+    """Drop notifications for paths the sealed manifest does not measure.
+
+    An excluded path cannot change the content key by definition, so a write
+    there is not evidence of content mutation.
+    """
+    relevant: list[tuple[int, str]] = []
+    for action, relative in events:
+        parts = [part for part in relative.replace("\\", "/").split("/") if part]
+        if any(part in DEFAULT_EXCLUDED_DIR_NAMES for part in parts):
+            continue
+        if parts and parts[-1] in DEFAULT_EXCLUDED_FILE_NAMES:
+            continue
+        relevant.append((action, relative))
+    return relevant
+
+
+def _drain_watcher(
+    watcher: _DirectoryWatcher,
+    root: Path,
+    *,
+    timeout_seconds: float = 2.0,
+) -> bool:
+    """Prove every change that completed before this boundary was delivered.
+
+    ReadDirectoryChangesW reports changes for one tree in order. Writing a
+    sentinel inside the watched subtree and then waiting for that sentinel's
+    OWN notification therefore proves that every earlier change has already
+    been observed. Without this barrier a mutation that completed moments
+    before consumption could still be in flight, and the memo would report a
+    clean tree that is in fact already stale.
+
+    The sentinel lives under an excluded directory, so it can never alter the
+    sealed content key. Returns False when delivery could not be confirmed --
+    the caller must then fall back to authoritative validation rather than
+    treating silence as proof.
+    """
+    marker_directory = root / _DRAIN_MARKER_DIR
+    token = f".drain-{uuid.uuid4().hex}"
+    marker = marker_directory / token
+    try:
+        marker_directory.mkdir(parents=True, exist_ok=True)
+        marker.write_text("drain", encoding="utf-8")
+    except OSError:
+        return False
+    deadline = time.monotonic() + max(0.05, float(timeout_seconds))
+    delivered = False
+    try:
+        while time.monotonic() < deadline:
+            if any(token in relative for _action, relative in list(watcher.events)):
+                delivered = True
+                break
+            if watcher.errors:
+                break
+            time.sleep(0.005)
+    finally:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+    return delivered
+
+
 def _watcher_is_clean(watcher: _DirectoryWatcher) -> bool:
     thread = watcher._thread
     return bool(
@@ -173,6 +245,29 @@ def _retire_snapshot_watcher(snapshot: SourceSnapshot) -> None:
             watcher = entry[1]
     if watcher is not None:
         watcher.stop()
+
+
+def _apply_tree_write_protection(root: Path, *, readonly: bool) -> int:
+    """Seal or release a private source tree.
+
+    Delegates to the shared reparse-safe implementation: a naive walk would
+    follow junctions out of this tree and unprotect whatever they point at.
+    """
+    return apply_tree_write_protection(root, readonly=readonly)
+
+
+def _force_rmtree(path: Path) -> None:
+    """Remove a private tree that may be write-protected.
+
+    A sealed tree is read-only, and `shutil.rmtree(ignore_errors=True)` would
+    silently fail to remove it on Windows -- turning every sealed container
+    into a permanent orphan.
+    """
+    try:
+        _apply_tree_write_protection(path, readonly=False)
+    except OSError:
+        pass
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _canonical_hash(value: object, *, length: int = 64) -> str:
@@ -502,6 +597,7 @@ def _build_source_tree_manifest_impl(
     progress_label: str = "source manifest",
     progress_interval_seconds: int = 15,
     suppress_worker_observability: bool = False,
+    require_exclusive_links: bool = False,
 ) -> SourceTreeManifest:
     """Build a deterministic manifest with bounded parallel file hashing.
 
@@ -538,6 +634,16 @@ def _build_source_tree_manifest_impl(
         nonlocal files, byte_count
         path, relative_text = pending.pop(future)
         digest, stable = future.result()
+        if require_exclusive_links and int(getattr(stable, "st_nlink", 1) or 1) > 1:
+            # A sealed tree is a fresh private copy, so every file must have
+            # exactly one directory entry. A second link is an alias through
+            # which bytes can be rewritten WITHOUT any watcher notification
+            # inside the watched subtree.
+            raise SourceCaptureError(
+                "SOURCE_SNAPSHOT_LINK_TOPOLOGY_VIOLATION: "
+                f"{relative_text}: sealed file has {int(stable.st_nlink)} links; "
+                "an external alias can mutate sealed bytes unobserved"
+            )
         files += 1
         byte_count += int(stable.st_size)
         entries.append({
@@ -710,9 +816,12 @@ def _capture_once(
         if manifest_path.is_file():
             _local_dependency_preflight(manifest_path.parent, capture_root)
 
-    container = Path(tempfile.mkdtemp(prefix="dependency-flow-source-snapshot-"))
+    _reap_once()
+    container = Path(
+        tempfile.mkdtemp(prefix=SOURCE_SNAPSHOT_CONTAINER_PREFIX)
+    )
     if _within(container, capture_root):
-        shutil.rmtree(container, ignore_errors=True)
+        _force_rmtree(container)
         raise SourceCaptureError(
             "SOURCE_SNAPSHOT_TEMP_INSIDE_SUBJECT: "
             f"container={container}; captureRoot={capture_root}"
@@ -736,6 +845,9 @@ def _capture_once(
             if os.name != "nt" and "REPARSE_EXTERNAL_TARGET_UNSUPPORTED" in detail:
                 raise SourceCaptureError(f"SOURCE_SYMLINK_ESCAPE: {detail}") from exc
             raise SourceCaptureError(f"SOURCE_REPARSE_LAYOUT_UNSUPPORTED: {detail}") from exc
+        # Seal BEFORE hashing so the sealed manifest measures bytes that are
+        # already write-protected against every alias to the same file object.
+        _apply_tree_write_protection(snapshot_root, readonly=True)
         captured = build_source_tree_manifest(
             snapshot_root,
             policy=policy,
@@ -805,7 +917,7 @@ def _capture_once(
             created_at=time.time(),
         )
     except Exception:
-        shutil.rmtree(container, ignore_errors=True)
+        _force_rmtree(container)
         _ALL_CONTAINERS.discard(container)
         raise
 
@@ -857,7 +969,7 @@ def activate_source_snapshot_epoch(
             watcher_entry = _ACTIVE_WATCHERS.pop(key, None)
             if watcher_entry is not None:
                 watcher_entry[1].stop()
-            shutil.rmtree(existing.container, ignore_errors=True)
+            _force_rmtree(existing.container)
             _ALL_CONTAINERS.discard(existing.container)
         snapshot = capture_source_snapshot(
             project_dir,
@@ -892,7 +1004,15 @@ def validate_source_snapshot(
         watcher = watcher_entry[1] if usable_entry else None
         sealed_identity = watcher_entry[2] if usable_entry else None
         is_active = _ACTIVE.get(active_key) is snapshot
-    watcher_events = list(watcher.events) if watcher is not None else []
+    # Drain BEFORE reading events: a mutation that completed just before this
+    # boundary may still be in flight, and silence would otherwise be misread
+    # as proof of an unchanged tree.
+    drain_confirmed = True
+    if watcher is not None:
+        drain_confirmed = _drain_watcher(watcher, snapshot.root)
+    watcher_events = (
+        _content_relevant_events(list(watcher.events)) if watcher is not None else []
+    )
     watcher_errors = list(watcher.errors) if watcher is not None else []
 
     fallback_reason = ""
@@ -915,7 +1035,10 @@ def validate_source_snapshot(
             fallback_reason = "watcher-failure"
         elif not (watcher._thread is not None and watcher._thread.is_alive()):
             fallback_reason = "watcher-thread-dead"
-        elif watcher.events:
+        elif not drain_confirmed:
+            # Delivery could not be proven, so watcher silence proves nothing.
+            fallback_reason = "watcher-drain-unconfirmed"
+        elif watcher_events:
             # Could be a real mutation or an attribute-only touch. The watcher
             # cannot tell us which, so it does not get to decide the verdict.
             fallback_reason = "watcher-event-observed"
@@ -1088,11 +1211,14 @@ def materialize_source_for_verification(
         pass_role="materialized-validation",
     )
     if observed.key != snapshot.manifest_key:
-        shutil.rmtree(target, ignore_errors=True)
+        _force_rmtree(target)
         raise SourceCaptureError(
             "SOURCE_MATERIALIZED_CONTENT_MISMATCH: "
             f"expected={snapshot.manifest_key}; observed={observed.key}"
         )
+    # The sealed lower is immutable, but this materialized copy is a working
+    # tree: the package manager must be able to write into it.
+    _apply_tree_write_protection(target, readonly=False)
     project = (target / snapshot.project_relative).resolve()
     if not project.is_dir():
         raise SourceCaptureError(
@@ -1110,8 +1236,90 @@ def clear_source_snapshot_epochs() -> None:
     for watcher in watchers:
         watcher.stop()
     for snapshot in snapshots:
-        shutil.rmtree(snapshot.container, ignore_errors=True)
+        _force_rmtree(snapshot.container)
         _ALL_CONTAINERS.discard(snapshot.container)
+
+
+SOURCE_SNAPSHOT_CONTAINER_PREFIX = "dependency-flow-source-snapshot-"
+_REAP_MAX_AGE_SECONDS = 6 * 3600
+_REAP_MAX_CONTAINERS = 8
+_REAP_DONE = threading.Event()
+
+
+def reap_orphaned_source_snapshots(
+    *,
+    max_age_seconds: int = _REAP_MAX_AGE_SECONDS,
+    max_containers: int = _REAP_MAX_CONTAINERS,
+) -> dict[str, int]:
+    """Remove source snapshot containers abandoned by a crashed/killed run.
+
+    `_cleanup_all` only runs at a clean exit, so a crash, a kill or a watchdog
+    stop leaves the whole sealed tree behind forever. This reaper is bounded on
+    purpose: it does a little work per process rather than an unbounded sweep.
+
+    Liveness is decided by the rename itself. Windows refuses to rename a
+    directory that another process still has open, so a successful atomic
+    rename into a trash name is the proof that nothing is using the container.
+    A container this process owns is never considered. Failing to reap is
+    telemetry, never corruption -- the tree is simply left for a later run.
+    """
+    reaped = skipped = failed = 0
+    base = Path(tempfile.gettempdir())
+    now = time.time()
+    with _LOCK:
+        owned = {os.path.normcase(str(item)) for item in _ALL_CONTAINERS}
+    try:
+        candidates = sorted(base.glob(SOURCE_SNAPSHOT_CONTAINER_PREFIX + "*"))
+    except OSError:
+        candidates = []
+    for container in candidates:
+        if reaped >= max_containers:
+            break
+        if os.path.normcase(str(container)) in owned or not container.is_dir():
+            skipped += 1
+            continue
+        try:
+            age = now - container.stat().st_mtime
+        except OSError:
+            skipped += 1
+            continue
+        if age < max_age_seconds:
+            skipped += 1
+            continue
+        trash = container.with_name(f"{container.name}.reap-{os.getpid()}")
+        try:
+            os.rename(container, trash)
+        except OSError:
+            # Still open somewhere: treat as live and leave it alone.
+            skipped += 1
+            continue
+        try:
+            # Sealed trees are write-protected, so a plain rmtree would fail
+            # and silently turn every orphan into a permanent one.
+            _force_rmtree(trash)
+            reaped += 1
+        except Exception:
+            failed += 1
+    if reaped or failed:
+        emit_observability_event(
+            "source.snapshot.reap",
+            reaped=reaped,
+            skipped=skipped,
+            failed=failed,
+            maxAgeSeconds=int(max_age_seconds),
+        )
+    return {"reaped": reaped, "skipped": skipped, "failed": failed}
+
+
+def _reap_once() -> None:
+    """Bounded, best-effort, at most once per process."""
+    if _REAP_DONE.is_set():
+        return
+    _REAP_DONE.set()
+    try:
+        reap_orphaned_source_snapshots()
+    except Exception:
+        pass
 
 
 def _cleanup_all() -> None:
@@ -1124,7 +1332,7 @@ def _cleanup_all() -> None:
     for watcher in watchers:
         watcher.stop()
     for container in containers:
-        shutil.rmtree(container, ignore_errors=True)
+        _force_rmtree(container)
 
 
 atexit.register(_cleanup_all)
@@ -1145,6 +1353,13 @@ def _observability_sink_is_source_safe(
     return _excluded(relative, policy)
 
 
+_EXCLUSIVE_LINK_PASS_ROLES = frozenset({
+    "sealed-snapshot",
+    "active-validation",
+    "materialized-validation",
+})
+
+
 def build_source_tree_manifest(
     root: Path,
     *,
@@ -1155,6 +1370,7 @@ def build_source_tree_manifest(
     progress_interval_seconds: int = 15,
     pass_role: str = "",
 ) -> SourceTreeManifest:
+    exclusive_links = str(pass_role) in _EXCLUSIVE_LINK_PASS_ROLES
     if not _observability_sink_is_source_safe(root, policy):
         with suppress_observability():
             return _build_source_tree_manifest_impl(
@@ -1165,6 +1381,7 @@ def build_source_tree_manifest(
                 progress_label=progress_label,
                 progress_interval_seconds=progress_interval_seconds,
                 suppress_worker_observability=True,
+                require_exclusive_links=exclusive_links,
             )
 
     operation_id = new_observability_id("source-manifest")
@@ -1187,6 +1404,7 @@ def build_source_tree_manifest(
             progress=progress,
             progress_label=progress_label,
             progress_interval_seconds=progress_interval_seconds,
+            require_exclusive_links=exclusive_links,
         )
     except BaseException as exc:
         after = process_resource_snapshot()

@@ -9,6 +9,8 @@ These tests count actual calls rather than asserting a branch exists.
 """
 from __future__ import annotations
 
+import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -73,6 +75,9 @@ class ProofIdentityRequiresValidatedSource(unittest.TestCase):
         )
         # Mutate the sealed tree behind the registry entry.
         victim = next(snapshot.root.rglob("index.js"))
+        # Model an adversary who first clears the sealed tree's write
+        # protection. Detection must not depend on that protection holding.
+        os.chmod(victim, os.stat(victim).st_mode | stat.S_IWRITE)
         victim.write_text("export const x = 666;\n", encoding="utf-8")
         with self.assertRaises(source_snapshot.SourceCaptureError):
             _identity(self.project)

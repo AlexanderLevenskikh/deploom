@@ -16,14 +16,19 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from artifact_integrity import (
     ArtifactIntegrityError,
     build_artifact_tree_integrity,
 )
 from block_vex_storage import verification_root
-from prepared_workspace_fastpath import _DirectoryWatcher, try_acquire_snapshot_cleanup_lease
+from prepared_workspace_fastpath import (
+    _DirectoryWatcher,
+    drain_watcher,
+    tree_object_identity,
+    try_acquire_snapshot_cleanup_lease,
+)
 from substrate_identity import tool_build_id
 from verification_observability import emit_observability_event
 
@@ -35,7 +40,10 @@ _LOCK = threading.RLock()
 _CONFIGURED_ROOT: Optional[Path] = None
 _INTEGRITY_VALIDATION_LOCK = threading.RLock()
 _VALIDATED_CONTENT: set[tuple[str, str, str]] = set()
-_VALIDATION_WATCHERS: dict[tuple[str, str, str], _DirectoryWatcher] = {}
+# slot -> (watcher, sealed directory-object identity at arm time)
+_VALIDATION_WATCHERS: dict[
+    tuple[str, str, str], tuple[_DirectoryWatcher, Optional[tuple[int, int]]]
+] = {}
 
 
 def _retire_validation_watchers(*, key: Optional[str] = None) -> None:
@@ -44,11 +52,19 @@ def _retire_validation_watchers(*, key: Optional[str] = None) -> None:
             slot for slot in _VALIDATION_WATCHERS
             if key is None or slot[1] == key
         ]
-        watchers = [_VALIDATION_WATCHERS.pop(slot) for slot in slots]
+        watchers = [_VALIDATION_WATCHERS.pop(slot)[0] for slot in slots]
         for slot in slots:
             _VALIDATED_CONTENT.discard(slot)
     for watcher in watchers:
         watcher.stop()
+
+
+def _retire_validation_slot(slot: tuple[str, str, str]) -> None:
+    with _INTEGRITY_VALIDATION_LOCK:
+        entry = _VALIDATION_WATCHERS.pop(slot, None)
+        _VALIDATED_CONTENT.discard(slot)
+    if entry is not None:
+        entry[0].stop()
 
 
 def _watcher_is_clean(watcher: _DirectoryWatcher) -> bool:
@@ -350,6 +366,8 @@ def publish_prepared_artifact_record(
     observed_resolved_versions: Mapping[str, str],
     observed_resolved_hash: str,
     dependency_roots: Sequence[str] = (),
+    progress: Optional[Callable[[str], None]] = None,
+    progress_interval_seconds: int = 15,
 ) -> bool:
     """Atomically publish an immutable artifact locator.
 
@@ -367,7 +385,12 @@ def publish_prepared_artifact_record(
     if len(observed_hash) != 64 or any(ch not in "0123456789abcdef" for ch in observed_hash):
         return False
     try:
-        integrity = build_artifact_tree_integrity(workspace_root)
+        integrity = build_artifact_tree_integrity(
+            workspace_root,
+            progress=progress,
+            progress_label="snapshot-publish: durable-record integrity seal",
+            progress_interval_seconds=progress_interval_seconds,
+        )
     except ArtifactIntegrityError as exc:
         emit_observability_event(
             "prepared-artifact.integrity",
@@ -485,22 +508,56 @@ def load_prepared_artifact_record(
         return None
     validation_slot = (os.path.normcase(str(workspace)), _valid_key(key), content_key)
     with _INTEGRITY_VALIDATION_LOCK:
-        watcher = _VALIDATION_WATCHERS.get(validation_slot)
+        watcher_entry = _VALIDATION_WATCHERS.get(validation_slot)
         memory_hit = validation_slot in _VALIDATED_CONTENT
+    watcher = watcher_entry[0] if watcher_entry is not None else None
+    sealed_identity = watcher_entry[1] if watcher_entry is not None else None
 
     validation_mode = "full-hash"
     candidate_watcher: Optional[_DirectoryWatcher] = None
     if watcher is not None:
-        if not _watcher_is_clean(watcher):
+        # A memo HIT must mean the SAME sealed bytes, the SAME directory object
+        # and proven notification delivery -- not merely "the watcher has not
+        # spoken". Anything short of that falls back to authoritative hashing;
+        # watcher uncertainty is never a HIT and never a reason to destroy a
+        # durable record.
+        current_identity = tree_object_identity(workspace)
+        delivered, drain_token = drain_watcher(watcher, workspace)
+        pending_events = [
+            item for item in list(watcher.events) if drain_token not in item[1]
+        ]
+        thread = watcher._thread
+        fallback_reason = ""
+        if sealed_identity is None or current_identity is None:
+            fallback_reason = "object-identity-unavailable"
+        elif current_identity != sealed_identity:
+            fallback_reason = "directory-identity-changed"
+        elif watcher.errors:
+            fallback_reason = "watcher-failure"
+        elif thread is None or not thread.is_alive():
+            fallback_reason = "watcher-thread-dead"
+        elif not delivered:
+            fallback_reason = "watcher-drain-unconfirmed"
+        elif pending_events:
+            fallback_reason = "watcher-event-observed"
+
+        if fallback_reason:
             emit_observability_event(
-                "prepared-artifact.integrity", outcome="watcher-invalidated",
+                "prepared-artifact.integrity", outcome="watcher-fallback",
+                reason=fallback_reason,
                 artifactKey=_valid_key(key),
                 watcherErrors=list(watcher.errors),
-                watcherEvents=len(watcher.events),
+                watcherEvents=len(pending_events),
             )
-            invalidate_prepared_artifact_record(key, remove_tree=False)
-            return None
-        validation_mode = "watcher-memo"
+            _retire_validation_slot(validation_slot)
+            watcher = None
+            if os.name == "nt":
+                candidate_watcher = _DirectoryWatcher(workspace)
+                if not candidate_watcher.start():
+                    candidate_watcher.stop()
+                    candidate_watcher = None
+        else:
+            validation_mode = "watcher-memo"
     elif os.name == "nt":
         candidate_watcher = _DirectoryWatcher(workspace)
         if not candidate_watcher.start():
@@ -557,7 +614,10 @@ def load_prepared_artifact_record(
     with _INTEGRITY_VALIDATION_LOCK:
         _VALIDATED_CONTENT.add(validation_slot)
         if candidate_watcher is not None:
-            _VALIDATION_WATCHERS[validation_slot] = candidate_watcher
+            _VALIDATION_WATCHERS[validation_slot] = (
+                candidate_watcher,
+                tree_object_identity(workspace),
+            )
     emit_observability_event(
         "prepared-artifact.cache", memoryHit=memory_hit,
         durableRecordPresent=True, generationMatch=True,

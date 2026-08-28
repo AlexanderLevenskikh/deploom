@@ -34,6 +34,17 @@ def init_repo(root: Path) -> None:
     git(root, "config", "user.name", "Block X")
 
 
+
+def _defeat_write_protection(path):
+    """Model an adversary strong enough to clear the sealed tree's write
+    protection before tampering. Detection must not depend on that protection."""
+    import os
+    import stat as _stat
+    try:
+        os.chmod(path, os.stat(path).st_mode | _stat.S_IWRITE)
+    except OSError:
+        pass
+
 class BlockXSourceTruthTests(unittest.TestCase):
     def tearDown(self) -> None:
         source_snapshot.clear_source_snapshot_epochs()
@@ -215,6 +226,7 @@ class BlockXSourceTruthTests(unittest.TestCase):
             )
             sealed_file = durable.project_path / "src.txt"
             before = sealed_file.stat()
+            _defeat_write_protection(sealed_file)
             sealed_file.write_text("tampered!", encoding="utf-8")
             os.utime(sealed_file, ns=(before.st_atime_ns, before.st_mtime_ns))
             with self.assertRaisesRegex(

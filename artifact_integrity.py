@@ -9,7 +9,10 @@ import json
 import os
 import stat
 from pathlib import Path
-from typing import Optional
+import time
+from typing import Callable, Optional
+
+ProgressCallback = Callable[[str], None]
 
 from io_governor import io_slot
 from reparse_materialization import (
@@ -94,7 +97,32 @@ def build_artifact_tree_integrity(
     root: Path,
     *,
     max_workers: Optional[int] = None,
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "prepared artifact integrity",
+    progress_interval_seconds: int = 15,
 ) -> ArtifactTreeIntegrity:
+    """Whole-tree content seal.
+
+    This is an O(files) pass over a durable artifact that can hold hundreds of
+    thousands of entries, so it MUST report progress: a silent multi-minute
+    stage is indistinguishable from a hang to anything watching it.
+    """
+    started = time.monotonic()
+    next_progress = started + max(1, int(progress_interval_seconds))
+
+    def heartbeat(subphase: str, done: int, total: Optional[int] = None) -> None:
+        nonlocal next_progress
+        if progress is None:
+            return
+        now = time.monotonic()
+        if now < next_progress:
+            return
+        next_progress = now + max(1, int(progress_interval_seconds))
+        scope = f"{done}/{total}" if total else str(done)
+        progress(
+            f"{progress_label}: {subphase} {scope}; "
+            f"elapsed={int(now - started)}s"
+        )
     root = root.resolve()
     if not root.is_dir():
         raise ArtifactIntegrityError(
@@ -124,6 +152,7 @@ def build_artifact_tree_integrity(
             raise ArtifactIntegrityError(
                 f"PREPARED_ARTIFACT_DIRECTORY_UNREADABLE: {directory}: {exc}"
             ) from exc
+        heartbeat("scanning", len(files))
         for item in scanned:
             path = Path(item.path)
             relative = relative_directory / item.name
@@ -198,6 +227,7 @@ def build_artifact_tree_integrity(
                 _path, relative = pending.pop(future)
                 digest, size, executable = future.result()
                 byte_count += size
+                heartbeat("hashing", len(entries), len(files))
                 entries.append({
                     "path": relative,
                     "kind": "file",
@@ -207,6 +237,7 @@ def build_artifact_tree_integrity(
                 })
             submit_until_full()
 
+    heartbeat("verifying directory stamps", len(directories), len(directories))
     for directory, stamp in directories:
         if _directory_stamp(directory) != stamp:
             raise ArtifactIntegrityError(

@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 from io_governor import io_slot
@@ -792,6 +793,127 @@ def _populate_node_modules_shell(
         for link, _ in reversed(pairs):
             _remove_junction(link)
         return False, []
+
+
+EPHEMERAL_CACHE_DIR_NAMES = frozenset({".vite", ".vitest", ".cache"})
+
+
+def apply_tree_write_protection(
+    root: Path,
+    *,
+    readonly: bool,
+    skip_dir_names: "frozenset[str]" = frozenset(),
+) -> int:
+    """Seal (or release) every regular file in a private tree.
+
+    Write protection lives on the file OBJECT, not on the directory entry, so
+    it is enforced through every hardlink alias to that object. That is what
+    makes it a sound defence against alias mutation: an attacker who links a
+    sealed file into an unwatched directory still cannot write through the
+    alias. Cost is O(files) once at seal time and zero on every later hit.
+
+    Reparse points are NEVER traversed. `os.walk` follows NTFS junctions and
+    `os.path.islink` is False for them, so a naive walk over a guarded clone
+    would reach straight through its package junctions and unprotect the
+    sealed lower they point at -- silently destroying the protection it was
+    supposed to preserve.
+
+    Threat boundary: the owner of a file may clear its write protection. This
+    stops accidental and tool-driven mutation, and it stops alias writes by any
+    principal that cannot rewrite the sealed file's own attributes. It is not a
+    defence against a principal who owns the tree and deliberately unprotects
+    it, so content detection must never depend on it.
+    """
+    touched = 0
+    for current, directories, names in os.walk(root):
+        directories[:] = [
+            name
+            for name in directories
+            if name not in skip_dir_names
+            and not _is_reparse_directory(Path(current) / name)
+        ]
+        for name in names:
+            path = Path(current) / name
+            try:
+                mode = os.stat(path, follow_symlinks=False).st_mode
+                os.chmod(
+                    path,
+                    (mode & ~0o222) if readonly else (mode | stat.S_IWRITE),
+                )
+                touched += 1
+            except OSError:
+                continue
+    return touched
+
+
+def _is_reparse_directory(path: Path) -> bool:
+    try:
+        if path.is_junction():
+            return True
+    except (OSError, AttributeError):
+        pass
+    try:
+        return bool(
+            os.stat(path, follow_symlinks=False).st_file_attributes
+            & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        )
+    except (OSError, AttributeError):
+        return os.path.islink(path)
+
+
+def tree_object_identity(path: Path) -> Optional[tuple[int, int]]:
+    """Filesystem object identity of a directory, not just its pathname.
+
+    A watched directory can be renamed away and a different directory put back
+    at the same textual path. The watcher keeps a handle to the ORIGINAL object
+    and stays silent, while `is_dir()` on the path still succeeds. Only the
+    (device, file-id) pair distinguishes the two objects.
+    """
+    try:
+        stat_result = os.stat(path)
+    except OSError:
+        return None
+    if not stat_result.st_ino:
+        return None
+    return (stat_result.st_dev, stat_result.st_ino)
+
+
+def drain_watcher(
+    watcher: "_DirectoryWatcher",
+    root: Path,
+    *,
+    timeout_seconds: float = 2.0,
+) -> tuple[bool, str]:
+    """Prove every change completed before this boundary has been delivered.
+
+    ReadDirectoryChangesW reports changes for one tree in order, so writing a
+    sentinel inside the watched subtree and waiting for that sentinel's OWN
+    notification proves every earlier change was already observed. Returns
+    (delivered, token); the caller must ignore events carrying `token` and must
+    treat delivered=False as "unknown", never as proof of an unchanged tree.
+    """
+    token = f".deploom-drain-{uuid.uuid4().hex}"
+    marker = root / token
+    try:
+        marker.write_text("drain", encoding="utf-8")
+    except OSError:
+        return False, token
+    deadline = time.monotonic() + max(0.05, float(timeout_seconds))
+    delivered = False
+    try:
+        while time.monotonic() < deadline:
+            if any(token in relative for _action, relative in list(watcher.events)):
+                delivered = True
+                break
+            if watcher.errors:
+                break
+            time.sleep(0.005)
+    finally:
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+    return delivered, token
 
 
 def _is_ephemeral_change(relative: str) -> bool:

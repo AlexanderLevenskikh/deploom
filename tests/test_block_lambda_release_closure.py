@@ -27,6 +27,17 @@ ROOT = Path(__file__).resolve().parents[1]
 LOCAL_TEMP = None
 
 
+
+def _defeat_write_protection(path):
+    """Model an adversary strong enough to clear the sealed tree's write
+    protection before tampering. Detection must not depend on that protection."""
+    import os
+    import stat as _stat
+    try:
+        os.chmod(path, os.stat(path).st_mode | _stat.S_IWRITE)
+    except OSError:
+        pass
+
 class BlockLambdaReleaseClosureTests(unittest.TestCase):
     def tearDown(self) -> None:
         source_snapshot.clear_source_snapshot_epochs()
@@ -48,6 +59,7 @@ class BlockLambdaReleaseClosureTests(unittest.TestCase):
             snapshot = source_snapshot.activate_source_snapshot_epoch(project, replace=True)
             before = subject.stat()
             sealed = snapshot.project_path / "subject.txt"
+            _defeat_write_protection(sealed)
             sealed.write_text("bbbb", encoding="utf-8")
             os.utime(sealed, ns=(before.st_atime_ns, before.st_mtime_ns))
             with self.assertRaisesRegex(source_snapshot.SourceCaptureError, "SOURCE_SNAPSHOT_CONTENT_MISMATCH"):
@@ -77,6 +89,7 @@ class BlockLambdaReleaseClosureTests(unittest.TestCase):
             ) as manifest:
                 source_snapshot.validate_source_snapshot(snapshot)
                 manifest.assert_not_called()
+            _defeat_write_protection((snapshot.project_path / "subject.txt"))
             (snapshot.project_path / "subject.txt").write_text("bbbb", encoding="utf-8")
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
@@ -118,7 +131,7 @@ class BlockLambdaReleaseClosureTests(unittest.TestCase):
             while time.monotonic() < deadline:
                 if any(
                     watcher.events
-                    for watcher in artifact_store._VALIDATION_WATCHERS.values()
+                    for watcher, _identity in artifact_store._VALIDATION_WATCHERS.values()
                 ):
                     break
                 time.sleep(0.02)
@@ -143,6 +156,7 @@ class BlockLambdaReleaseClosureTests(unittest.TestCase):
             snapshot = source_snapshot.activate_source_snapshot_epoch(project, replace=True)
             target = Path(raw) / "materialized"
             def mutate_then_materialize(_source, destination, **_kwargs):
+                _defeat_write_protection((snapshot.project_path / "subject.txt"))
                 (snapshot.project_path / "subject.txt").write_text("bbbb", encoding="utf-8")
                 destination.mkdir()
                 (destination / "subject.txt").write_text("bbbb", encoding="utf-8")

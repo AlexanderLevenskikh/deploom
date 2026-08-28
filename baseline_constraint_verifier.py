@@ -15,6 +15,7 @@ are fed back into planning before any Executor branch is created.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -1131,6 +1132,46 @@ def _enforce_prepared_snapshot_budget(protected_slot: Tuple[str, str]) -> None:
         _retire_prepared_workspace_snapshot(victim)
 
 
+@contextlib.contextmanager
+def _publish_stage(
+    name: str,
+    *,
+    operation_id: str,
+    progress: Optional[ProgressCallback],
+    progress_label: str,
+    totals: Optional[Mapping[str, object]] = None,
+):
+    """Time one snapshot-publish substage and make it externally visible.
+
+    "zero-copy promotion complete" used to be followed by many minutes of
+    unrelated synchronous work with no output at all. Every substage now
+    reports its own start/finish with a duration, so a slow stage is
+    attributable instead of being an unexplained silence.
+    """
+    started = time.monotonic()
+    emit_observability_event(
+        "snapshot-publish.stage.start",
+        operationId=operation_id,
+        stage=name,
+        **{str(k): v for k, v in (totals or {}).items()},
+    )
+    _emit_progress(progress, f"{progress_label}: {name} started")
+    try:
+        yield
+    finally:
+        duration_ms = max(0, int((time.monotonic() - started) * 1000))
+        emit_observability_event(
+            "snapshot-publish.stage.finish",
+            operationId=operation_id,
+            stage=name,
+            durationMs=duration_ms,
+        )
+        _emit_progress(
+            progress,
+            f"{progress_label}: {name} complete in {duration_ms // 1000}s",
+        )
+
+
 def _publish_prepared_workspace_snapshot(
     workspace_root: Path,
     workspace_project: Path,
@@ -1162,10 +1203,18 @@ def _publish_prepared_workspace_snapshot(
     stage_workspace = stage / "workspace"
     relative = workspace_project.resolve().relative_to(workspace_root.resolve())
     storage_mode = "copied-sealed-workspace"
-    canonical_reparse_plan = _canonical_workspace_reparse_plan(
-        workspace_root,
-        workspace_project,
-    )
+    publish_operation_id = new_observability_id("snapshot-publish")
+    publish_started = time.monotonic()
+    with _publish_stage(
+        "prepare:reparse-plan",
+        operation_id=publish_operation_id,
+        progress=progress,
+        progress_label=progress_label,
+    ):
+        canonical_reparse_plan = _canonical_workspace_reparse_plan(
+            workspace_root,
+            workspace_project,
+        )
     junction_rebases = {
         item.link_relative: item.target_relative
         for item in canonical_reparse_plan
@@ -1177,11 +1226,24 @@ def _publish_prepared_workspace_snapshot(
         moved = False
         if os.name == "nt":
             try:
-                os.replace(workspace_root, stage_workspace)
-                _rebase_workspace_junctions(
-                    stage_workspace,
-                    junction_rebases,
-                )
+                with _publish_stage(
+                    "promotion",
+                    operation_id=publish_operation_id,
+                    progress=progress,
+                    progress_label=progress_label,
+                ):
+                    os.replace(workspace_root, stage_workspace)
+                with _publish_stage(
+                    "tree-index:junction-rebase",
+                    operation_id=publish_operation_id,
+                    progress=progress,
+                    progress_label=progress_label,
+                    totals={"junctions": len(junction_rebases)},
+                ):
+                    _rebase_workspace_junctions(
+                        stage_workspace,
+                        junction_rebases,
+                    )
                 moved = True
                 storage_mode = "moved-sealed-workspace"
                 _emit_progress(
@@ -1210,10 +1272,16 @@ def _publish_prepared_workspace_snapshot(
         dependency_roots: Tuple[str, ...] = ()
         dependency_integrity: Mapping[str, str] = {}
         if os.name == "nt" and seal_dependency_integrity:
-            dependency_roots = dependency_root_manifest(
-                stage_workspace,
+            with _publish_stage(
+                "dependency-lower-discovery",
+                operation_id=publish_operation_id,
                 progress=progress,
-            )
+                progress_label=progress_label,
+            ):
+                dependency_roots = dependency_root_manifest(
+                    stage_workspace,
+                    progress=progress,
+                )
 
         snapshot = PreparedWorkspaceSnapshot(
             key=str(key),
@@ -1244,22 +1312,46 @@ def _publish_prepared_workspace_snapshot(
 
         durable_published = False
         if shared_reuse_allowed and is_durable_prepared_path(published.workspace_root):
-            durable_published = publish_prepared_artifact_record(
-                key=published.key,
-                workspace_root=published.workspace_root,
-                project_relative=published.project_relative,
-                source_project=published.source_project,
-                storage_mode=published.storage_mode,
-                observed_resolved_versions=published.observed_resolved_versions,
-                observed_resolved_hash=published.observed_resolved_hash,
-                dependency_roots=published.dependency_roots,
-            )
+            # This performs a FULL whole-tree content hash of the durable
+            # artifact. It is the dominant cost of snapshot publish and used to
+            # run silently right after "zero-copy promotion complete".
+            with _publish_stage(
+                "durable-record:integrity-seal",
+                operation_id=publish_operation_id,
+                progress=progress,
+                progress_label=progress_label,
+            ):
+                durable_published = publish_prepared_artifact_record(
+                    key=published.key,
+                    workspace_root=published.workspace_root,
+                    project_relative=published.project_relative,
+                    source_project=published.source_project,
+                    storage_mode=published.storage_mode,
+                    observed_resolved_versions=published.observed_resolved_versions,
+                    observed_resolved_hash=published.observed_resolved_hash,
+                    dependency_roots=published.dependency_roots,
+                    progress=progress,
+                    progress_interval_seconds=progress_interval_seconds,
+                )
         if shared_reuse_allowed and not durable_published:
             with _PREPARED_SNAPSHOT_LOCK:
                 if _PREPARED_SNAPSHOTS.get(slot) is published:
                     _PREPARED_SNAPSHOTS.pop(slot, None)
         if shared_reuse_allowed:
-            _enforce_prepared_snapshot_budget(slot)
+            with _publish_stage(
+                "finalize:budget",
+                operation_id=publish_operation_id,
+                progress=progress,
+                progress_label=progress_label,
+            ):
+                _enforce_prepared_snapshot_budget(slot)
+        emit_observability_event(
+            "snapshot-publish.finish",
+            operationId=publish_operation_id,
+            storageMode=storage_mode,
+            durablePublished=bool(durable_published),
+            totalMs=max(0, int((time.monotonic() - publish_started) * 1000)),
+        )
         return published
     except Exception:
         shutil.rmtree(stage, ignore_errors=True)

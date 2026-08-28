@@ -17,12 +17,23 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import source_snapshot
 from source_snapshot import (
     SourceCaptureError,
     validate_source_snapshot,
 )
+
+
+def _defeat_write_protection(path: Path) -> None:
+    """Model an adversary who first clears the sealed tree's write protection.
+    Content detection must not depend on that protection holding."""
+    import stat as _stat
+    try:
+        os.chmod(path, os.stat(path).st_mode | _stat.S_IWRITE)
+    except OSError:
+        pass
 
 
 def _project(root: Path) -> Path:
@@ -59,6 +70,7 @@ class SourceSnapshotLeasePhysicalAcceptance(unittest.TestCase):
             snapshot = self._snapshot(project)
             target = snapshot.root
             victim = next(target.rglob("index.js"))
+            _defeat_write_protection(victim)
             victim.write_text("export const sealed = 999;\n", encoding="utf-8")
             with self.assertRaises(SourceCaptureError):
                 validate_source_snapshot(snapshot)
@@ -117,6 +129,62 @@ class SourceSnapshotLeasePhysicalAcceptance(unittest.TestCase):
             self.assertTrue(watched.is_dir(), "attack precondition: path still valid")
             with self.assertRaises(SourceCaptureError):
                 validate_source_snapshot(snapshot)
+
+
+    def test_mutation_consumed_before_notification_must_not_pass(self) -> None:
+        """P0-A(C): consume immediately after mutating, with no wait for the
+        watcher event. Silence must not be read as proof of an unchanged tree."""
+        with tempfile.TemporaryDirectory() as raw:
+            project = _project(Path(raw))
+            snapshot = self._snapshot(project)
+            victim = next(snapshot.root.rglob("index.js"))
+            _defeat_write_protection(victim)
+            victim.write_text("export const sealed = 666;\n", encoding="utf-8")
+            # Deliberately no sleep and no event wait.
+            with self.assertRaises(SourceCaptureError):
+                validate_source_snapshot(snapshot)
+
+    def test_hardlink_alias_cannot_rewrite_sealed_bytes(self) -> None:
+        """P0-A(B): sealed trees are write-protected, and protection lives on
+        the file object, so it is enforced through every alias."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            project = _project(root)
+            snapshot = self._snapshot(project)
+            victim = next(snapshot.root.rglob("index.js"))
+            original = victim.read_text(encoding="utf-8")
+            alias = root / "alias.js"
+            try:
+                os.link(victim, alias)
+            except OSError:
+                self.skipTest("hardlinks unavailable in this environment")
+            with self.assertRaises(OSError):
+                with open(alias, "w", encoding="utf-8") as handle:
+                    handle.write("EVIL\n")
+            self.assertEqual(victim.read_text(encoding="utf-8"), original)
+            self.assertIs(validate_source_snapshot(snapshot), snapshot)
+
+    def test_hot_validation_does_not_traverse_the_whole_tree(self) -> None:
+        """A proof-grade lease on an unchanged tree must stay O(1)."""
+        with tempfile.TemporaryDirectory() as raw:
+            project = _project(Path(raw))
+            for index in range(200):
+                (project / f"file{index}.js").write_text(
+                    f"export const n{index} = {index};\n", encoding="utf-8"
+                )
+            snapshot = self._snapshot(project)
+            calls: list[str] = []
+            real = source_snapshot.build_source_tree_manifest
+
+            def counting(root, **kwargs):
+                calls.append(str(kwargs.get("pass_role") or ""))
+                return real(root, **kwargs)
+
+            with patch.object(source_snapshot, "build_source_tree_manifest", counting):
+                self.assertIs(validate_source_snapshot(snapshot), snapshot)
+            self.assertEqual(
+                calls, [], "hot lease performed a whole-tree content traversal"
+            )
 
 
 if __name__ == "__main__":

@@ -70,6 +70,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 import requests
 from dateutil.relativedelta import relativedelta
 
+from deploom_failure import build_failure, write_diagnostic_artifact
 from cli_io import configure_utf8_stdio
 from dependency_audit_branch import AuditBranchError, recover_orphaned_managed_workspace
 from git_hook_policy import GitHookPolicyError, run_git
@@ -1326,6 +1327,72 @@ def _dirty_checkout_details(project: ProjectSpec) -> str:
     return preview
 
 
+def _verify_local_only_source(project: ProjectSpec, branch: str) -> Dict[str, Any]:
+    """Provenance for a repository that has no configured remotes at all.
+
+    A purely local repository has no upstream to diverge from, so the fetch /
+    fast-forward contract is meaningless there -- but the invariants that
+    actually protect the proof still apply and are enforced here: the checkout
+    must be clean, the analyzed branch must be explicit, and an exact source
+    commit is recorded. Nothing is reset, stashed or discarded.
+
+    Source Truth remains the sealed captured bytes; Git is a provenance and
+    input mechanism only, so a local-only origin is a legitimate input, not a
+    reason to refuse to build a Baseline.
+    """
+    current = _git_command(
+        project, ["symbolic-ref", "--quiet", "--short", "HEAD"], check=False
+    ).stdout.strip()
+    if not current:
+        raise SourceCheckoutGuardError(
+            "SOURCE_CHECKOUT_DETACHED",
+            project,
+            "repository has no configured remote and HEAD is detached; "
+            "check out a branch before capturing a baseline",
+        )
+    if current != branch:
+        local_exists = _git_command(
+            project, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            check=False,
+        ).returncode == 0
+        if not local_exists:
+            raise SourceCheckoutGuardError(
+                "SOURCE_BRANCH_NOT_FOUND",
+                project,
+                f"local branch {branch!r} does not exist and there is no remote "
+                f"to fetch it from; current branch is {current!r}",
+            )
+        checkout = _git_command(project, ["checkout", branch], check=False)
+        if checkout.returncode != 0:
+            message = (checkout.stderr or checkout.stdout or "git checkout failed").strip()
+            raise SourceCheckoutGuardError(
+                "SOURCE_CHECKOUT_FAILED",
+                project,
+                f"cannot switch to {branch}: {message[-1000:]}",
+            )
+
+    dirty_after = _dirty_checkout_details(project)
+    if dirty_after:
+        raise SourceCheckoutGuardError(
+            "SOURCE_CHECKOUT_DIRTY_AFTER_SYNC",
+            project,
+            f"checkout became dirty during synchronization: {dirty_after}",
+        )
+
+    source_commit = _git_value(project, ["rev-parse", "HEAD"])
+    metadata = {
+        "verified": True,
+        "remote": "",
+        "sourceBranch": branch,
+        "sourceCommit": source_commit,
+        "remoteCommit": "",
+        "localOnly": True,
+        "verifiedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    project.source_checkout = metadata
+    return metadata
+
+
 def ensure_source_checkout(project: ProjectSpec, *, allow_checkpoint_resume: bool = False) -> Dict[str, Any]:
     """Move a clean checkout to the exact fetched source branch commit.
 
@@ -1361,19 +1428,39 @@ def ensure_source_checkout(project: ProjectSpec, *, allow_checkpoint_resume: boo
 
     branch = project.source_branch.strip()
     remote = project.git_remote.strip() or "origin"
+
+    configured_remotes = [
+        line.strip()
+        for line in (_git_command(project, ["remote"], check=False).stdout or "").splitlines()
+        if line.strip()
+    ]
+    # No remotes at all is a legitimate local repository -- Desktop itself now
+    # creates workspaces with a plain `git init`. A configured remote that is
+    # MISSING is a different thing: that stays fail-closed below.
+    local_only = not configured_remotes
+
     if not branch:
-        raise SourceCheckoutGuardError(
-            "SOURCE_BRANCH_NOT_CONFIGURED",
-            project,
-            "configure projects[].git.sourceBranch or disable the guard explicitly",
-        )
+        if local_only:
+            branch = _git_command(
+                project, ["branch", "--show-current"], check=False
+            ).stdout.strip()
+        if not branch:
+            raise SourceCheckoutGuardError(
+                "SOURCE_BRANCH_NOT_CONFIGURED",
+                project,
+                "configure projects[].git.sourceBranch or disable the guard explicitly",
+            )
+
+    if local_only:
+        return _verify_local_only_source(project, branch)
 
     remote_check = _git_command(project, ["remote", "get-url", remote], check=False)
     if remote_check.returncode != 0:
         raise SourceCheckoutGuardError(
             "SOURCE_REMOTE_NOT_FOUND",
             project,
-            f"remote {remote!r} is not configured",
+            f"remote {remote!r} is not configured; available remotes: "
+            f"{', '.join(sorted(configured_remotes))}",
         )
 
     remote_ref = f"refs/remotes/{remote}/{branch}"
@@ -5795,6 +5882,57 @@ def _bounded_candidate_versions(
     return [version for version in ordered if version in selected]
 
 
+def _clause_domain_fingerprint(
+    clause: Mapping[str, str],
+    rows_by_name: Mapping[str, DependencyRow],
+    mode: str,
+    client: LiveDataClient,
+) -> str:
+    """Fingerprint the finite domains a generalized clause was certified over.
+
+    Bounded universal certification proves a predicate for every omitted-variable
+    value in the CURRENT finite domain. That proof says nothing about values the
+    domain did not contain. If a domain is later reloaded, refreshed or grown --
+    a registry refetch, an intent change, a replan -- the clause is no longer
+    certified for the domain it is now being applied to, so it must not silently
+    remain authoritative.
+    """
+    payload = []
+    for name in sorted(clause):
+        row = rows_by_name.get(name)
+        domain = _candidate_domain(row, mode, client) if row is not None else []
+        payload.append({"package": str(name), "domain": sorted(str(v) for v in domain)})
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _drop_uncertified_generalized_clauses(
+    clauses: List[Dict[str, str]],
+    fingerprints: Dict[str, str],
+    rows_by_name: Mapping[str, DependencyRow],
+    mode: str,
+    client: LiveDataClient,
+) -> List[Dict[str, str]]:
+    """Remove certified clauses whose candidate domains no longer match.
+
+    Returns the dropped clauses. UNKNOWN never confirms a universal clause, so
+    a clause whose domain moved is demoted rather than re-assumed.
+    """
+    dropped: List[Dict[str, str]] = []
+    for clause in list(clauses):
+        key = assignment_fingerprint(clause)
+        certified = fingerprints.get(key)
+        if certified is None:
+            continue
+        current = _clause_domain_fingerprint(clause, rows_by_name, mode, client)
+        if current != certified:
+            clauses.remove(clause)
+            fingerprints.pop(key, None)
+            dropped.append(clause)
+    return dropped
+
+
 def _candidate_domain(row: DependencyRow, mode: str, client: LiveDataClient) -> List[str]:
     """Build the complete deterministic registry domain without display groups.
 
@@ -9888,8 +10026,34 @@ def resolve_peer_compatibility_with_verification(
             # This is a SAFE cursor: no current subprocess is represented as done.
             # If the process dies later, this completed-iteration state is retried fresh.
             checkpoint_baseline_run("ready", completed_iteration=iteration)
+            certified_clause_domains: Dict[str, str] = {}
             while iteration < liveness.allowed_iterations:
                 iteration += 1
+                revoked_clauses = _drop_uncertified_generalized_clauses(
+                    learned[project][mode],
+                    certified_clause_domains,
+                    rows_by_name,
+                    mode,
+                    client,
+                )
+                for revoked in revoked_clauses:
+                    eprint(
+                        f"[warn] {project}: generalized constraint revoked because its "
+                        f"candidate domain changed: NOT("
+                        + ", ".join(
+                            f"{name}@{version}"
+                            for name, version in sorted(revoked.items())
+                        )
+                        + "); it must be re-certified before it is authoritative again"
+                    )
+                    progress_reporter.emit(
+                        project, mode, "constraint-generalization-revoked",
+                        iteration=iteration,
+                        literals=dict(revoked),
+                        clauseScope="context-diagnostic",
+                        universal=False,
+                        reason="candidate-domain-changed",
+                    )
                 progress_reporter.emit(
                     project,
                     mode,
@@ -12004,6 +12168,11 @@ def resolve_peer_compatibility_with_verification(
                             break
                 if universal and nogood not in learned[project][mode]:
                     learned[project][mode].append(dict(nogood))
+                    # Bind the certificate to the exact domains it was proven
+                    # over, so a later domain change can revoke it.
+                    certified_clause_domains[assignment_fingerprint(nogood)] = (
+                        _clause_domain_fingerprint(nogood, rows_by_name, mode, client)
+                    )
                     liveness.record_certified_constraint()
                     progress_reporter.emit(
                         project, mode, "constraint-generalized-certified",
@@ -16740,9 +16909,14 @@ def main() -> None:
             except SourceCheckoutGuardError as exc:
                 eprint(f"[error] {exc}")
                 raise SystemExit(2) from None
+            origin_label = (
+                f"{metadata['remote']}/{metadata['sourceBranch']}"
+                if metadata.get("remote")
+                else f"local {metadata['sourceBranch']} (no remote configured)"
+            )
             eprint(
                 f"[info] source checkout verified: {project.name} "
-                f"{metadata['remote']}/{metadata['sourceBranch']}@{metadata['sourceCommit'][:12]}"
+                f"{origin_label}@{metadata['sourceCommit'][:12]}"
             )
 
         baseline_mode = str(project.lockfile_sync_config.get("baselineMode") or project.lockfile_sync_config.get("mode") or "validate").strip().lower()
@@ -17022,13 +17196,50 @@ def main() -> None:
     eprint(f"[info] history store: events={events_log}, runs={runs_dir}, index={index_file}")
 
 
+def _report_domain_failure(exc: BaseException, *, expected: bool) -> int:
+    """Present an expected failure as a result, not as a crash.
+
+    The traceback still exists -- it goes to a diagnostic artifact. What the
+    user sees first is what stopped, where, and what happens next.
+    """
+    failure = build_failure(exc, expected=expected)
+    artifact = write_diagnostic_artifact(exc, failure)
+    if artifact:
+        failure = dataclasses.replace(failure, diagnostic_artifact=artifact)
+    try:
+        emit_observability_event(
+            "baseline.failure",
+            **{
+                key: value
+                for key, value in failure.to_envelope().items()
+                if isinstance(value, (str, int, float, bool))
+            },
+        )
+    except Exception:
+        pass
+    eprint(json.dumps(failure.to_envelope(), ensure_ascii=False))
+    eprint("")
+    eprint(failure.human_summary())
+    return 3 if expected else 4
+
+
 if __name__ == "__main__":
     try:
         main()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        eprint("Baseline interrupted by user.")
+        raise SystemExit(130)
     except BaselineConstraintVerificationError as exc:
         message = str(exc)
         if message.startswith(BASELINE_DECISION_MARKER):
             # Expected product control-flow boundary, not a crash.
             eprint(message)
             raise SystemExit(3)
-        raise
+        # Every other verification failure is still an EXPECTED domain outcome.
+        # It must stop the run with a structured, readable result instead of a
+        # raw traceback -- that was the primary user-facing defect.
+        raise SystemExit(_report_domain_failure(exc, expected=True))
+    except Exception as exc:  # genuine tool defect
+        raise SystemExit(_report_domain_failure(exc, expected=False))
