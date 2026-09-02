@@ -20,7 +20,7 @@ class SyntheticBaselineScenarioTests(unittest.TestCase):
         result = SCENARIOS["exact-exclusion-followup"]()
         self.assertTrue(result["extensionGranted"])
         self.assertEqual(1, result["allowedIterationsBefore"])
-        self.assertEqual(2, result["allowedIterationsAfter"])
+        self.assertEqual(1, result["allowedIterationsAfter"])
         self.assertNotEqual(result["firstAssignment"], result["secondAssignment"])
         self.assertEqual("SAT_PROVEN", result["terminalStatus"])
 

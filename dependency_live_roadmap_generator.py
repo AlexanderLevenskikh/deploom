@@ -70,6 +70,15 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 import requests
 from dateutil.relativedelta import relativedelta
 
+from block_psi_anytime import (
+    AutomaticBudgetPolicy,
+    BaselineAnytimeState,
+    BaselineCompletionStatus,
+    BaselineSearchMode,
+    BestVerifiedIncumbent,
+    ContinuationReason,
+)
+
 from deploom_failure import build_failure, write_diagnostic_artifact
 from cli_io import configure_utf8_stdio
 from dependency_audit_branch import AuditBranchError, recover_orphaned_managed_workspace
@@ -229,6 +238,19 @@ def _baseline_decision_grant_iterations() -> int:
 
 def _baseline_interactive() -> bool:
     return str(os.environ.get("DEPLOOM_BASELINE_INTERACTIVE") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _baseline_search_mode() -> BaselineSearchMode:
+    raw = str(os.environ.get("DEPLOOM_BASELINE_SEARCH_MODE") or "AUTO").strip().upper()
+    try:
+        return BaselineSearchMode(raw)
+    except ValueError:
+        return BaselineSearchMode.AUTO
+
+
+def _baseline_automatic_budget_seconds() -> int:
+    raw = _baseline_env_nonnegative_int("DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS")
+    return raw or 30 * 60
 
 
 def _baseline_human_decision_focus(
@@ -8950,6 +8972,8 @@ class BaselineLivenessBudget:
         self.exact_since_learning = 0
         self.generalization_attempts = 0
         self.diagnostics = 0
+        self.exhaustive_authorized = False
+        self.anytime: Optional[BaselineAnytimeState] = None
 
     @property
     def hard_iterations(self) -> int:
@@ -8957,10 +8981,11 @@ class BaselineLivenessBudget:
 
     @property
     def allowed_iterations(self) -> int:
-        return min(
-            self.hard_iterations,
-            self.base_iterations + self.certified_extensions + self.user_extensions,
-        )
+        # Certified authority permits offering more search; it never silently
+        # consumes expensive iterations in the interactive default.
+        if self.exhaustive_authorized:
+            return self.hard_iterations
+        return min(self.hard_iterations, self.base_iterations + self.user_extensions)
 
     def grant_user_extensions(self, count: int) -> int:
         requested = max(0, int(count))
@@ -9002,9 +9027,9 @@ class BaselineLivenessBudget:
     def record_diagnostic(self) -> None:
         self.diagnostics += 1
 
-    def snapshot(self, *, learned_constraints: int) -> Dict[str, int]:
+    def snapshot(self, *, learned_constraints: int) -> Dict[str, object]:
         self.observe_learned_constraints(learned_constraints)
-        return {
+        snapshot: Dict[str, object] = {
             "baseIterations": self.base_iterations,
             "allowedIterations": self.allowed_iterations,
             "hardIterations": self.hard_iterations,
@@ -9019,7 +9044,11 @@ class BaselineLivenessBudget:
             "exactSinceLearning": self.exact_since_learning,
             "generalizationAttempts": self.generalization_attempts,
             "diagnostics": self.diagnostics,
+            "certifiedContinuationAvailable": self.certified_extensions > 0,
         }
+        if self.anytime is not None:
+            snapshot.update(self.anytime.snapshot())
+        return snapshot
 
 
 class BaselineProgressReporter:
@@ -9948,6 +9977,15 @@ def resolve_peer_compatibility_with_verification(
                 max_learning_extensions=config.max_iterations,
                 starting_learned_constraints=len(learned[project][mode]),
             )
+            anytime = BaselineAnytimeState(
+                policy=AutomaticBudgetPolicy(
+                    wall_clock_seconds=_baseline_automatic_budget_seconds(),
+                    max_expensive_attempts=max(1, config.max_iterations),
+                ),
+                search_mode=_baseline_search_mode(),
+            )
+            liveness.anytime = anytime
+            liveness.exhaustive_authorized = anytime.exhaustive_authorized
             user_extra_iterations = _baseline_extra_iterations()
             liveness.max_learning_extensions = max(
                 liveness.max_learning_extensions,
@@ -9955,17 +9993,17 @@ def resolve_peer_compatibility_with_verification(
             )
             if restored_liveness:
                 restore_liveness_budget(liveness, restored_liveness)
+                anytime.restore(restored_liveness)
+                liveness.exhaustive_authorized = anytime.exhaustive_authorized
             try:
                 restored_user_extensions = max(0, int(restored_liveness.get("userExtensions") or 0))
             except (TypeError, ValueError):
                 restored_user_extensions = 0
-            consumed_user_extensions = max(
-                0,
-                restored_iteration - liveness.base_iterations - liveness.certified_extensions,
-            )
+            # Recovery never converts previously consumed certified credit into
+            # user consent. Only an explicit persisted user extension is restored.
             liveness.user_extensions = min(
                 liveness.max_learning_extensions,
-                max(restored_user_extensions, consumed_user_extensions),
+                restored_user_extensions,
             )
             decision_grant_iterations = _baseline_decision_grant_iterations()
             granted_user_iterations = liveness.grant_user_extensions(decision_grant_iterations)
@@ -9993,6 +10031,41 @@ def resolve_peer_compatibility_with_verification(
             last_fingerprint = ""
             confirmed_failed_assignments: Set[str] = set(restored_failed)
             iteration = restored_iteration
+            desired_assignment: Dict[str, str] = dict(anytime.desired_assignment)
+            desired_identity = anytime.desired_identity
+            candidate_started = time.monotonic()
+
+            def record_verified_incumbent(
+                verified_assignment: Mapping[str, str],
+                identity: str,
+                evidence: str,
+            ) -> BaselineCompletionStatus:
+                deferred = tuple(sorted(
+                    name for name, version in desired_assignment.items()
+                    if verified_assignment.get(name) != version
+                ))
+                total = max(1, len(desired_assignment))
+                matched = total - len(deferred)
+                incumbent = BestVerifiedIncumbent(
+                    assignment=dict(verified_assignment),
+                    assignment_identity=identity,
+                    changed_dependency_count=len(_changed_assignment(dict(verified_assignment), rows_by_name)),
+                    policy_score=matched / total,
+                    yellow_coverage=matched / total,
+                    distance_from_desired=len(deferred),
+                    deferred_targets=deferred,
+                    verification_evidence=evidence,
+                    verified_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                    run_identity=recovery_identity,
+                    objective_rank=(len(deferred), -matched, len(verified_assignment)),
+                )
+                anytime.observe_candidate(
+                    duration_seconds=time.monotonic() - candidate_started,
+                    passed=True,
+                    learned_constraints=len(learned[project][mode]),
+                )
+                anytime.update_incumbent(incumbent)
+                return anytime.completion_status(desired_identity) or BaselineCompletionStatus.VERIFIED_GOOD_ENOUGH
 
             def checkpoint_baseline_run(
                 phase: str,
@@ -10027,8 +10100,12 @@ def resolve_peer_compatibility_with_verification(
             # If the process dies later, this completed-iteration state is retried fresh.
             checkpoint_baseline_run("ready", completed_iteration=iteration)
             certified_clause_domains: Dict[str, str] = {}
-            while iteration < liveness.allowed_iterations:
+            while (
+                iteration < liveness.allowed_iterations
+                and anytime.automatic_continuation_reason() is None
+            ):
                 iteration += 1
+                candidate_started = time.monotonic()
                 revoked_clauses = _drop_uncertified_generalized_clauses(
                     learned[project][mode],
                     certified_clause_domains,
@@ -10132,6 +10209,11 @@ def resolve_peer_compatibility_with_verification(
                 verification_assignment = _verification_assignment(assignment, rows_by_name)
                 removals = _types_stub_removals_for_assignment(rows_by_name, assignment, mode, client)
                 fingerprint = assignment_fingerprint(verification_assignment)
+                if not desired_identity:
+                    desired_assignment = dict(verification_assignment)
+                    desired_identity = fingerprint
+                    anytime.desired_assignment = dict(desired_assignment)
+                    anytime.desired_identity = desired_identity
                 if fingerprint in confirmed_failed_assignments:
                     raise BaselineConstraintVerificationError(
                         f"BASELINE_SOLVER_REPEATED_FAILED_ASSIGNMENT: {project}/{mode}: "
@@ -10192,6 +10274,10 @@ def resolve_peer_compatibility_with_verification(
                         )
                     else:
                         eprint(f"[info] {project}: Baseline verify {mode}: no target changes to materialize")
+                    completion_status = record_verified_incumbent(
+                        verification_assignment, fingerprint,
+                        getattr(noop_result, "resolved_state_key", "") if fixed_input_names else fingerprint,
+                    )
                     final_assignments.setdefault(project, {})[mode] = assignment
                     checkpoint_baseline_run(
                         "mode-passed-no-changes", completed_iteration=iteration,
@@ -10209,6 +10295,7 @@ def resolve_peer_compatibility_with_verification(
                             else BaselineTerminalStatus.SAT_PROVEN.value
                         ),
                         fixedResolverProofRequired=bool(fixed_input_names),
+                        completionStatus=completion_status.value,
                         **liveness.snapshot(learned_constraints=len(learned[project][mode])),
                     )
                     break
@@ -10467,6 +10554,10 @@ def resolve_peer_compatibility_with_verification(
                         successful_resolver_evidence[(project, mode)] = result
                         if config.project_checks != "off" and config.commands:
                             successful_project_evidence[(project, mode)] = project_result
+                        completion_status = record_verified_incumbent(
+                            verification_assignment, fingerprint,
+                            getattr(result, "resolved_state_key", "") or fingerprint,
+                        )
                         final_assignments.setdefault(project, {})[mode] = assignment
                         if unknown_budget_names:
                             eprint(
@@ -10499,7 +10590,8 @@ def resolve_peer_compatibility_with_verification(
                                 if unknown_budget_names or sat_unproven_names
                                 else BaselineTerminalStatus.SAT_PROVEN.value
                             ),
-                            **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                            completionStatus=completion_status.value,
+                                **liveness.snapshot(learned_constraints=len(learned[project][mode])),
                         )
                         break
 
@@ -10564,6 +10656,7 @@ def resolve_peer_compatibility_with_verification(
                             f"{confirmation.kind}: {confirmation.summary}; no solver constraint was learned"
                         )
 
+                    observed_signature = ""
                     if result.kind == "dependency":
                         observed_signature = (
                             matching_dependency_failure_signature(
@@ -10610,6 +10703,34 @@ def resolve_peer_compatibility_with_verification(
                             "no solver constraint was learned"
                         )
                     confirmed_failed_assignments.add(fingerprint)
+                    failure_predicate = (
+                        "|".join(sorted(expected_structural))
+                        if expected_structural else (observed_signature or expected_signature)
+                    )
+                    stagnated = anytime.observe_candidate(
+                        duration_seconds=time.monotonic() - candidate_started,
+                        passed=False,
+                        predicate=failure_predicate,
+                        learned_constraints=len(learned[project][mode]),
+                    )
+                    if stagnated:
+                        implicated = predicate_package(failure_predicate)
+                        if implicated and implicated in baseline_current_versions:
+                            predicate_diagnostic_preferences.setdefault(project, {}).setdefault(mode, {})[
+                                implicated
+                            ] = baseline_current_versions[implicated]
+                        progress_reporter.emit(
+                            project, mode, "search-stagnation",
+                            event="BASELINE_SEARCH_STAGNATION",
+                            repeatedPredicate=failure_predicate,
+                            rejectedAssignments=anytime.rejected_assignments,
+                            learnedConstraintsDelta=0,
+                            incumbentDelta=0,
+                            strategyBefore="exact-neighbor-refinement",
+                            strategyAfter=anytime.search_strategy,
+                            targetedPackages=[implicated] if implicated else [],
+                            relaxationReason="repeated-predicate-no-authoritative-learning",
+                        )
 
                     # BLOCK_VF_ACTIVE_PREDICATE_EXECUTION_V1
                     # Exact confirmation above is the authority boundary. Point
@@ -11144,8 +11265,9 @@ def resolve_peer_compatibility_with_verification(
                                     "keeping the certified exact exclusion and continuing"
                                 )
 
-                            minimization_budget = _nogood_minimization_check_budget(
-                                len(certified_candidate)
+                            minimization_budget = min(
+                                _nogood_minimization_check_budget(len(certified_candidate)),
+                                anytime.policy.pre_incumbent_minimization_probes,
                             )
                             # Reuse is restricted to an identical exact trial
                             # inside this invocation. Every cache entry below was
@@ -11964,8 +12086,9 @@ def resolve_peer_compatibility_with_verification(
                     localized_original
                 )
                 localized_proof_count = 2 if learn_project_failure else 1
-                localized_minimization_budget = _nogood_minimization_check_budget(
-                    len(localized_original)
+                localized_minimization_budget = min(
+                    _nogood_minimization_check_budget(len(localized_original)),
+                    anytime.policy.pre_incumbent_minimization_probes,
                 )
 
                 def certify_localized_minimization(
@@ -12301,30 +12424,35 @@ def resolve_peer_compatibility_with_verification(
                     learned_constraints=len(learned[project][mode])
                 )
                 hard_exhausted = iteration >= summary["hardIterations"]
-                if hard_exhausted and _baseline_interactive():
+                continuation_reason = anytime.automatic_continuation_reason(
+                    base_iteration_limit_hit=iteration >= liveness.allowed_iterations,
+                ) or ContinuationReason.BASE_ITERATION_LIMIT
+                anytime.continuation_reason = continuation_reason
+                if _baseline_interactive() and not anytime.exhaustive_authorized:
                     decision_focus = _baseline_human_decision_focus(
                         learned[project][mode], baseline_current_versions,
                         min_confirmed=1,
                     ) or {}
+                    decision_payload = anytime.continuation_payload(
+                        project=project, mode=mode, iteration=iteration,
+                        reason=continuation_reason,
+                    )
+                    decision_payload.update({
+                        "hardIterations": summary["hardIterations"],
+                        "learnedConstraints": summary["learnedConstraints"],
+                        **decision_focus,
+                    })
                     checkpoint_baseline_run(
                         "human-decision-required",
                         completed_iteration=iteration,
                         last_assignment=last_fingerprint,
+                        last_predicate=anytime.repeated_predicate,
                         status="decision-required",
                     )
-                    decision_payload = {
-                        "schemaVersion": 1,
-                        "reason": "budget-exhausted",
-                        "project": project,
-                        "mode": mode,
-                        "iteration": iteration,
-                        "hardIterations": summary["hardIterations"],
-                        "learnedConstraints": summary["learnedConstraints"],
-                        **decision_focus,
-                    }
                     progress_reporter.emit(
-                        project, mode, "human-decision-required",
+                        project, mode, "continuation-required",
                         iteration=iteration,
+                        event="BASELINE_CONTINUATION_REQUIRED",
                         stopCode="BASELINE_HUMAN_DECISION_REQUIRED",
                         terminalStatus="HUMAN_DECISION_REQUIRED",
                         **{key: value for key, value in decision_payload.items() if key not in {"project", "mode", "iteration", "schemaVersion"}},

@@ -3,10 +3,11 @@ export type FlowAction = 'preflight' | 'sync-tool' | 'baseline' | 'generate' | '
 export type TargetLevel = 'yellow' | 'green'
 export type ThemePreference = 'system' | 'light' | 'dark'
 export type BaselinePackagePolicy = 'auto' | 'keep-current' | 'required'
-export type BaselineIntent = { schemaVersion: 1; policies: Record<string, BaselinePackagePolicy>; extraIterations?: number; decisionGrantIterations?: number }
+export type BaselineSearchMode = 'AUTO' | 'BOUNDED_IMPROVEMENT' | 'EXHAUSTIVE'
+export type BaselineIntent = { schemaVersion: 1; policies: Record<string, BaselinePackagePolicy>; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode }
 export type BaselineIntentCandidate = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string }
 export type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent }
-export type BaselineDecision = { schemaVersion: 1; reason: 'repeated-package-conflict' | 'budget-exhausted' | 'policy-unsat'; project: string; mode: string; iteration?: number; hardIterations?: number; learnedConstraints?: number; package?: string; currentVersion?: string; failedVersions?: string[]; predicate?: string }
+export type BaselineDecision = { schemaVersion: 1 | 2; event?: 'BASELINE_CONTINUATION_REQUIRED'; reason: 'repeated-package-conflict' | 'budget-exhausted' | 'policy-unsat' | 'AUTOMATIC_BUDGET_EXHAUSTED' | 'STAGNATION' | 'BASE_ITERATION_LIMIT' | 'EXPENSIVE_DIAGNOSTIC'; project: string; mode: string; iteration?: number; hardIterations?: number; learnedConstraints?: number; package?: string; currentVersion?: string; failedVersions?: string[]; predicate?: string; repeatedPredicate?: string; elapsedSeconds?: number; rejectedAssignments?: number; observedCandidateDurationSeconds?: number; continuationCostClass?: 'minutes' | 'hours'; recommendedAction?: string; availableActions?: string[]; bestIncumbent?: { changed_dependency_count?: number; policy_score?: number; deferred_targets?: string[]; objective_rank?: number[] } }
 
 export type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
 export type BaselineRecoveryInfo = { available: boolean; mode?: 'yellow' | 'green'; status?: string; phase?: string; updatedAt?: string; generation?: number; iteration?: number; lastAssignment?: string; lastPredicate?: string; learnedConstraints?: number; exactExclusions?: number; reason?: string }

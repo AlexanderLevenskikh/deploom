@@ -60,7 +60,8 @@ protocol.registerSchemesAsPrivileged([
 type AgentProvider = 'codex' | 'opencode' | 'claude'
 type ThemePreference = 'system' | 'light' | 'dark'
 type BaselinePackagePolicy = 'auto' | 'keep-current' | 'required'
-type BaselineIntent = { schemaVersion: 1; policies: Record<string, BaselinePackagePolicy>; extraIterations?: number; decisionGrantIterations?: number }
+type BaselineSearchMode = 'AUTO' | 'BOUNDED_IMPROVEMENT' | 'EXHAUSTIVE'
+type BaselineIntent = { schemaVersion: 1; policies: Record<string, BaselinePackagePolicy>; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode }
 type BaselineIntentCandidate = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string }
 type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent }
 type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
@@ -294,6 +295,7 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
     policies,
     extraIterations: Math.max(0, Math.floor(Number(raw.extraIterations ?? 0) || 0)),
     decisionGrantIterations: Math.max(0, Math.floor(Number(raw.decisionGrantIterations ?? 0) || 0)),
+    searchMode: raw.searchMode === 'EXHAUSTIVE' || raw.searchMode === 'BOUNDED_IMPROVEMENT' ? raw.searchMode : 'AUTO',
   }
 }
 
@@ -311,7 +313,7 @@ function saveBaselineIntent(workspace: WorkspaceRecord, projectName: string, int
   const normalized = normalizeBaselineIntent(intent)
   // decisionGrantIterations is invocation-local; persisting it would silently
   // grant a new tranche after an unrelated crash/restart.
-  atomicWriteJsonSync(baselineIntentPath(workspace, projectName), { ...normalized, decisionGrantIterations: 0 })
+  atomicWriteJsonSync(baselineIntentPath(workspace, projectName), { ...normalized, decisionGrantIterations: 0, searchMode: 'AUTO' })
 }
 
 function projectInstalledVersion(projectPath: string, packageName: string): string | undefined {
@@ -1814,10 +1816,13 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
         args: [...commonGeneratorArgs, ...baselineOutputArgs, '--capture-baseline', '--baseline-label', input.label?.trim() || `dependency-flow-${new Date().toISOString().slice(0, 10)}`],
         env: {
           DEPLOOM_BASELINE_RESUME: input.baselineResume === 'restart' ? 'restart' : input.baselineResume === 'continue' ? 'continue' : 'auto',
+          DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE: input.baselineResume === 'continue' ? '1' : '0',
           DEPLOOM_BASELINE_INTENT_JSON: JSON.stringify({ schemaVersion: 1, policies: effectiveIntent.policies }),
           DEPLOOM_BASELINE_INTERACTIVE: '1',
           DEPLOOM_BASELINE_EXTRA_ITERATIONS: String(effectiveIntent.extraIterations ?? 0),
           DEPLOOM_BASELINE_DECISION_GRANT_ITERATIONS: String(explicitIntent?.decisionGrantIterations ?? 0),
+          DEPLOOM_BASELINE_SEARCH_MODE: explicitIntent?.searchMode ?? 'AUTO',
+          DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS: '1800',
         },
         stallWarningMs: 2 * 60_000,
         stallAbortMs: 15 * 60_000,
@@ -2844,6 +2849,93 @@ async function cleanAgentStartCommands(input: ActionInput, workspace: WorkspaceR
   return commands
 }
 
+async function ensureMigrationBaseBranch(
+  job: JobRecord,
+  project: ProjectSpec,
+  plan: MigrationPlan,
+  savedPromptMarkdown: string,
+): Promise<void> {
+  const baseBranch = String(plan.baseBranch || '').trim()
+  if (!baseBranch) throw new Error('MIGRATION_BASE_REF_MISSING: Branch plan has no baseBranch.')
+
+  const local = await spawnCapture(
+    'git',
+    ['-C', project.path, 'show-ref', '--verify', '--quiet', `refs/heads/${baseBranch}`],
+    project.path,
+    15_000,
+  )
+  if (local.code === 0) return
+
+  // If the configured base exists remotely, materialize exactly that ref
+  // locally. This preserves an explicitly maintained base branch instead of
+  // silently rebasing it onto another checkout.
+  const remoteRef = `origin/${baseBranch}`
+  const remote = await spawnCapture(
+    'git',
+    ['-C', project.path, 'show-ref', '--verify', '--quiet', `refs/remotes/${remoteRef}`],
+    project.path,
+    15_000,
+  )
+  if (remote.code === 0) {
+    const created = await executeCommand(job, {
+      label: `Восстановление локальной base-ветки ${baseBranch} из ${remoteRef}`,
+      command: 'git',
+      cwd: project.path,
+      args: ['-c', `core.hooksPath=${emptyHooksPath()}`, '-C', project.path, 'branch', '--no-track', baseBranch, remoteRef],
+      captureAgentSession: false,
+    })
+    if (created.code !== 0) {
+      throw new Error(`MIGRATION_BASE_REF_CREATE_FAILED: ${baseBranch} <- ${remoteRef}: ${created.stderr.trim()}`)
+    }
+    send('flow:job-output', {
+      jobId: job.id,
+      stream: 'system',
+      line: `Base ref ${baseBranch} отсутствовал локально; восстановлен из существующего ${remoteRef}.`,
+    })
+    return
+  }
+
+  // Default `libs`/custom prefixes are allowed to be logical branch names,
+  // not pre-existing refs. Bind a newly created base to the exact provenance
+  // commit carried by the reviewed ProofEnvelope, never to an arbitrary live
+  // HEAD/source branch that may have moved since Baseline.
+  const proof = validateScopeProofEnvelope(savedPromptMarkdown, project.name)
+  const sourceHead = proof.ok ? String(proof.envelope?.sourceHead || '').trim() : ''
+  if (!sourceHead) {
+    throw new Error(
+      `MIGRATION_BASE_REF_MISSING: ${baseBranch} does not exist locally or as ${remoteRef}; ` +
+      `the current reviewed prompt cannot provide a proven sourceHead (${proof.reason}).`,
+    )
+  }
+  const sourceCommit = await spawnCapture(
+    'git',
+    ['-C', project.path, 'rev-parse', '--verify', `${sourceHead}^{commit}`],
+    project.path,
+    15_000,
+  )
+  if (sourceCommit.code !== 0) {
+    throw new Error(
+      `MIGRATION_BASE_SOURCE_COMMIT_MISSING: ${baseBranch} requires proven sourceHead ${sourceHead}, ` +
+      `but that commit is not available in the local repository.`,
+    )
+  }
+  const created = await executeCommand(job, {
+    label: `Создание base-ветки ${baseBranch} от proven source ${sourceHead.slice(0, 12)}`,
+    command: 'git',
+    cwd: project.path,
+    args: ['-c', `core.hooksPath=${emptyHooksPath()}`, '-C', project.path, 'branch', baseBranch, sourceHead],
+    captureAgentSession: false,
+  })
+  if (created.code !== 0) {
+    throw new Error(`MIGRATION_BASE_REF_CREATE_FAILED: ${baseBranch} <- ${sourceHead}: ${created.stderr.trim()}`)
+  }
+  send('flow:job-output', {
+    jobId: job.id,
+    stream: 'system',
+    line: `Base ref ${baseBranch} ещё не существовал. Создал его детерминированно от proven sourceHead ${sourceHead.slice(0, 12)}; текущий HEAD для выбора базы не использовался.`,
+  })
+}
+
 // The orchestrator, not the agent, owns branch creation and merge under the
 // per-branch-group loop -- this is the same `-c core.hooksPath=` bypass
 // cleanAgentStartCommands already uses for its own lifecycle git calls, not a
@@ -3854,6 +3946,7 @@ async function runMigrationAgentIteration(job: JobRecord): Promise<void> {
   }
   const initialPlan = migrationPlanFromPrompt(savedPromptMarkdown, project.name)
   if (!initialPlan) throw new Error('не удалось прочитать Branch plan из сохранённого prompt')
+  await ensureMigrationBaseBranch(job, project, initialPlan, savedPromptMarkdown)
 
   for (;;) {
     const progress = await readMigrationProgress(job.workspace, project)
@@ -4955,7 +5048,11 @@ function commandSpecForRetry(job: JobRecord, spec: CommandSpec): CommandSpec {
   // starts fresh when the first attempt died before any checkpoint was written.
   return {
     ...spec,
-    env: { ...spec.env, DEPLOOM_BASELINE_RESUME: 'auto' },
+    env: {
+      ...spec.env,
+      DEPLOOM_BASELINE_RESUME: 'auto',
+      DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE: '1',
+    },
   }
 }
 

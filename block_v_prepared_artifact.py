@@ -29,6 +29,7 @@ from prepared_workspace_fastpath import (
     tree_object_identity,
     try_acquire_snapshot_cleanup_lease,
 )
+from reparse_materialization import ReparseLink
 from substrate_identity import tool_build_id
 from verification_observability import emit_observability_event
 
@@ -366,6 +367,7 @@ def publish_prepared_artifact_record(
     observed_resolved_versions: Mapping[str, str],
     observed_resolved_hash: str,
     dependency_roots: Sequence[str] = (),
+    reparse_plan: Optional[Sequence[ReparseLink]] = None,
     progress: Optional[Callable[[str], None]] = None,
     progress_interval_seconds: int = 15,
 ) -> bool:
@@ -390,6 +392,7 @@ def publish_prepared_artifact_record(
             progress=progress,
             progress_label="snapshot-publish: durable-record integrity seal",
             progress_interval_seconds=progress_interval_seconds,
+            reparse_plan=reparse_plan,
         )
     except ArtifactIntegrityError as exc:
         emit_observability_event(

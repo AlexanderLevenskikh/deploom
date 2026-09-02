@@ -51,11 +51,12 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     [plan.intent.policies, policies],
   )
 
-  const buildIntent = (extra = 0, grant = 0, nextPolicies = policies): BaselineIntent => ({
+  const buildIntent = (extra = 0, grant = 0, nextPolicies = policies, searchMode: BaselineIntent['searchMode'] = 'AUTO'): BaselineIntent => ({
     schemaVersion: 1,
     policies: Object.fromEntries(Object.entries(nextPolicies).filter(([, value]) => value !== 'auto')),
     extraIterations: Math.max(0, Number(plan.intent.extraIterations ?? 0) + extra),
     decisionGrantIterations: grant,
+    searchMode,
   })
 
   const submit = async (intent: BaselineIntent) => {
@@ -76,13 +77,14 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     setPolicies((current) => ({ ...current, [name]: policy }))
   }
 
-  const continueSearch = () => void submit(buildIntent(DECISION_TRANCHE, DECISION_TRANCHE))
-  const applyAndContinue = () => void submit(buildIntent(mode === 'decision' ? DECISION_TRANCHE : 0, mode === 'decision' ? DECISION_TRANCHE : 0))
+  const continueSearch = () => void submit(buildIntent(DECISION_TRANCHE, DECISION_TRANCHE, policies, 'BOUNDED_IMPROVEMENT'))
+  const continueExhaustive = () => void submit(buildIntent(DECISION_TRANCHE * 8, DECISION_TRANCHE * 8, policies, 'EXHAUSTIVE'))
+  const applyAndContinue = () => void submit(buildIntent(mode === 'decision' ? DECISION_TRANCHE : 0, mode === 'decision' ? DECISION_TRANCHE : 0, policies, mode === 'decision' ? 'BOUNDED_IMPROVEMENT' : 'AUTO'))
   const keepFocusAndContinue = () => {
     if (!decision?.package) return
     const next = { ...policies, [decision.package]: 'keep-current' as const }
     setPolicies(next)
-    void submit(buildIntent(DECISION_TRANCHE, DECISION_TRANCHE, next))
+    void submit(buildIntent(DECISION_TRANCHE, DECISION_TRANCHE, next, 'BOUNDED_IMPROVEMENT'))
   }
 
   const kindOptions = [
@@ -110,13 +112,14 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
 
         {mode === 'decision' && decision ? (
           <div className="baseline-decision-summary">
-            <strong>{decision.reason === 'budget-exhausted'
+            <strong>{decision.reason === 'budget-exhausted' || decision.reason === 'AUTOMATIC_BUDGET_EXHAUSTED' || decision.reason === 'BASE_ITERATION_LIMIT'
               ? text('Исчерпан автоматический search budget', 'Automatic search budget exhausted')
               : decision.reason === 'policy-unsat'
                 ? text('Для выбранной политики нет совместимого assignment', 'No compatible assignment exists under the selected policy')
                 : text('Повторяющийся конфликт', 'Repeated compatibility conflict')}</strong>
             <span>{decision.package ? `${decision.package}${decision.currentVersion ? ` · current ${decision.currentVersion}` : ''}` : text('Можно изменить состав Baseline или продолжить поиск.', 'You can change Baseline scope or continue searching.')}</span>
-            {decision.predicate ? <code>{decision.predicate}</code> : null}
+            {decision.predicate || decision.repeatedPredicate ? <code>{decision.predicate || decision.repeatedPredicate}</code> : null}
+            {decision.continuationCostClass === 'hours' ? <small>{text('Продолжение может занять часы', 'Continuation may take hours')}</small> : null}
             {decision.failedVersions?.length ? <small>{text('Подтверждённо не подошли', 'Confirmed incompatible')}: {decision.failedVersions.join(', ')}</small> : null}
             <small>{text(`Итерация ${decision.iteration ?? '—'} · learned constraints ${decision.learnedConstraints ?? '—'}`, `Iteration ${decision.iteration ?? '—'} · learned constraints ${decision.learnedConstraints ?? '—'}`)}</small>
           </div>
@@ -166,6 +169,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
           <span className="baseline-intent-apply-hint">{dirty ? text('Есть неприменённые изменения', 'There are unapplied changes') : text('Состав готов', 'Scope is ready')}</span>
           <button type="button" className="button secondary" disabled={busy} onClick={requestCancel}>{mode === 'decision' ? text('Оставить на паузе', 'Keep paused') : text('Отмена', 'Cancel')}</button>
           {mode === 'decision' ? <button type="button" className="button secondary" disabled={busy} onClick={continueSearch}>{text(`Продолжить поиск (+${DECISION_TRANCHE})`, `Continue search (+${DECISION_TRANCHE})`)}</button> : null}
+          {mode === 'decision' ? <button type="button" className="button secondary" disabled={busy} onClick={continueExhaustive}>{text('Исчерпывающий поиск', 'Continue exhaustive')}</button> : null}
           {mode === 'decision' && decision?.package ? <button type="button" className="button secondary" disabled={busy} onClick={keepFocusAndContinue}>{text(`Исключить ${decision.package} и продолжить`, `Exclude ${decision.package} and continue`)}</button> : null}
           <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{mode === 'decision' ? text('Применить и продолжить', 'Apply and continue') : text('Подтвердить и запустить Baseline', 'Confirm and start Baseline')}</button>
         </footer>

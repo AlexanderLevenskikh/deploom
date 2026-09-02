@@ -849,10 +849,44 @@ def _canonical_workspace_reparse_plan(
             return ()
         if not any(item.package_name for item in preliminary):
             return preliminary
-        return inventory_reparse_plan(
-            workspace_root,
-            workspace_package_targets=_workspace_package_targets(workspace_project),
-        )
+
+        # The first inventory already proved that every reparse target is
+        # internal and cycle-free. Older code walked the complete prepared
+        # workspace a second time only to attach workspace-package authority.
+        # Validate that authority against the already captured relative targets
+        # instead: same correctness, no second O(tree) traversal.
+        workspace_targets = _workspace_package_targets(workspace_project)
+        validated: list[ReparseLink] = []
+        for item in preliminary:
+            if not item.package_name:
+                validated.append(item)
+                continue
+            expected = workspace_targets.get(item.package_name)
+            if expected is None:
+                raise ReparseMaterializationError(
+                    "REPARSE_UNDECLARED_WORKSPACE_LINK: "
+                    f"{item.link_relative}; package={item.package_name}"
+                )
+            target_path = workspace_root.joinpath(*Path(item.target_relative).parts)
+            try:
+                resolved_target = target_path.resolve(strict=True)
+                resolved_target.relative_to(workspace_root)
+                matches = resolved_target.samefile(expected)
+            except (OSError, ValueError, RuntimeError):
+                matches = False
+            if not matches:
+                raise ReparseMaterializationError(
+                    "REPARSE_WORKSPACE_TARGET_MISMATCH: "
+                    f"{item.link_relative} -> {target_path}; expected={expected}"
+                )
+            validated.append(ReparseLink(
+                item.link_relative,
+                item.target_relative,
+                item.link_kind,
+                "workspace-private-upper",
+                item.package_name,
+            ))
+        return tuple(validated)
     except ReparseMaterializationError as exc:
         raise RuntimeError(f"WORKSPACE_REPARSE_PLAN_REJECTED: {exc}") from exc
 
@@ -1330,6 +1364,7 @@ def _publish_prepared_workspace_snapshot(
                     observed_resolved_versions=published.observed_resolved_versions,
                     observed_resolved_hash=published.observed_resolved_hash,
                     dependency_roots=published.dependency_roots,
+                    reparse_plan=canonical_reparse_plan,
                     progress=progress,
                     progress_interval_seconds=progress_interval_seconds,
                 )
@@ -2122,32 +2157,46 @@ def verify_assignment(
             "npm_config_ignore_scripts": "true",
         }
         install_env.update(_package_manager_cache_environment(config, manager))
+        # Recovery may reuse a durable ResolverProof only when the Desktop
+        # explicitly marks this command as a Continue/transient-retry replay.
+        # A normal fresh Baseline still performs fresh resolver work unless its
+        # caller supplies the legacy exact reuse key. The stored ResolvedState
+        # is content-addressed and validated again before the HIT is accepted.
+        recovery_reuse = str(
+            os.environ.get("DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        resolver_reuse_key = (
+            config.reuse_resolver_proof_key
+            or (proof_identity.resolver_input_key if recovery_reuse else "")
+        )
         resolver_reuse_cache_operation_id = ""
-        if config.reuse_resolver_proof_key:
+        if resolver_reuse_key:
             resolver_reuse_cache_operation_id = new_observability_id("cache")
             event(
                 "proof.cache.lookup",
                 proofType="resolver",
-                cacheKey=config.reuse_resolver_proof_key,
+                cacheKey=resolver_reuse_key,
                 cacheOperationId=resolver_reuse_cache_operation_id,
                 reuseLookup=True,
+                recoveryReuse=recovery_reuse,
             )
             resolver_record = proof_store.lookup_pass(
-                "resolver", config.reuse_resolver_proof_key
+                "resolver", resolver_reuse_key
             )
             if resolver_record is None:
                 event(
                     "proof.cache.miss",
                     proofType="resolver",
-                    cacheKey=config.reuse_resolver_proof_key,
+                    cacheKey=resolver_reuse_key,
                     cacheOperationId=resolver_reuse_cache_operation_id,
                     reuseLookup=True,
+                    recoveryReuse=recovery_reuse,
                 )
         else:
             resolver_record = None
         resolver_reused = bool(
             resolver_record is not None
-            and config.reuse_resolver_proof_key == proof_identity.resolver_input_key
+            and resolver_reuse_key == proof_identity.resolver_input_key
         )
         observed_versions: Dict[str, str] = {}
         observed_hash = ""
@@ -2418,6 +2467,11 @@ def verify_assignment(
                 )
                 observed_versions = dict(snapshot.observed_resolved_versions)
             else:
+                if preparation_record is not None:
+                    _emit_progress(
+                        progress,
+                        f"{progress_label}: PreparationProof HIT but its durable PreparedArtifact is unavailable or failed continuity validation; replaying frozen lifecycle instead of trusting recovery metadata",
+                    )
                 full_install = install_args_for_profile(
                     workspace_topology.profile,
                     ignore_scripts=False,

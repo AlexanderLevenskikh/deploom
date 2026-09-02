@@ -10,14 +10,16 @@ import os
 import stat
 from pathlib import Path
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 ProgressCallback = Callable[[str], None]
 
 from io_governor import io_slot
 from reparse_materialization import (
+    ReparseLink,
     ReparseMaterializationError,
     inventory_reparse_plan,
+    is_windows_junction,
 )
 from substrate_identity import tool_build_id
 
@@ -100,6 +102,7 @@ def build_artifact_tree_integrity(
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "prepared artifact integrity",
     progress_interval_seconds: int = 15,
+    reparse_plan: Optional[Sequence[ReparseLink]] = None,
 ) -> ArtifactTreeIntegrity:
     """Whole-tree content seal.
 
@@ -128,20 +131,27 @@ def build_artifact_tree_integrity(
         raise ArtifactIntegrityError(
             f"PREPARED_ARTIFACT_TREE_MISSING: {root}"
         )
-    try:
-        reparse_plan = inventory_reparse_plan(root)
-    except ReparseMaterializationError as exc:
-        raise ArtifactIntegrityError(
-            f"PREPARED_ARTIFACT_REPARSE_INVALID: {exc}"
-        ) from exc
+    if reparse_plan is None:
+        try:
+            canonical_reparse_plan = inventory_reparse_plan(root)
+        except ReparseMaterializationError as exc:
+            raise ArtifactIntegrityError(
+                f"PREPARED_ARTIFACT_REPARSE_INVALID: {exc}"
+            ) from exc
+    else:
+        canonical_reparse_plan = tuple(reparse_plan)
     reparse_by_path = {
         item.link_relative: item
-        for item in reparse_plan
+        for item in canonical_reparse_plan
     }
+    if len(reparse_by_path) != len(canonical_reparse_plan):
+        raise ArtifactIntegrityError("PREPARED_ARTIFACT_REPARSE_PLAN_DUPLICATE")
 
     entries: list[dict[str, object]] = []
     files: list[tuple[Path, str]] = []
     directories: list[tuple[Path, tuple[int, int, int]]] = []
+    seen_reparse: set[str] = set()
+    scanned_entries = 0
     pending = [(root, Path("."))]
     while pending:
         directory, relative_directory = pending.pop()
@@ -152,13 +162,73 @@ def build_artifact_tree_integrity(
             raise ArtifactIntegrityError(
                 f"PREPARED_ARTIFACT_DIRECTORY_UNREADABLE: {directory}: {exc}"
             ) from exc
-        heartbeat("scanning", len(files))
         for item in scanned:
+            scanned_entries += 1
+            heartbeat("scanning", scanned_entries)
             path = Path(item.path)
             relative = relative_directory / item.name
             relative_text = relative.as_posix()
             planned = reparse_by_path.get(relative_text)
+            try:
+                metadata = item.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise ArtifactIntegrityError(
+                    f"PREPARED_ARTIFACT_ENTRY_UNREADABLE: {path}: {exc}"
+                ) from exc
+            mode = metadata.st_mode
+            reparse_attribute = int(
+                getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0
+            )
+            is_reparse_entry = bool(
+                stat.S_ISLNK(mode)
+                or (
+                    reparse_attribute
+                    and int(getattr(metadata, "st_file_attributes", 0) or 0)
+                    & reparse_attribute
+                )
+            )
+
             if planned is not None:
+                planned_is_reparse = bool(
+                    is_reparse_entry
+                    or path.is_symlink()
+                    or (os.name == "nt" and is_windows_junction(path))
+                )
+                if not planned_is_reparse:
+                    raise ArtifactIntegrityError(
+                        "PREPARED_ARTIFACT_REPARSE_DRIFT: "
+                        f"{relative_text} is no longer a reparse entry"
+                    )
+                try:
+                    actual_target = path.resolve(strict=True)
+                    expected_target = root.joinpath(
+                        *Path(planned.target_relative).parts
+                    ).resolve(strict=True)
+                    actual_target.relative_to(root)
+                    expected_target.relative_to(root)
+                    matches = actual_target.samefile(expected_target)
+                except (OSError, ValueError, RuntimeError):
+                    matches = False
+                if not matches:
+                    raise ArtifactIntegrityError(
+                        "PREPARED_ARTIFACT_REPARSE_DRIFT: "
+                        f"{relative_text} target changed"
+                    )
+                actual_kind = (
+                    "junction"
+                    if is_windows_junction(path)
+                    else (
+                        "symlink-directory"
+                        if actual_target.is_dir()
+                        else "symlink-file"
+                    )
+                )
+                if actual_kind != planned.link_kind:
+                    raise ArtifactIntegrityError(
+                        "PREPARED_ARTIFACT_REPARSE_DRIFT: "
+                        f"{relative_text} kind={actual_kind}, expected={planned.link_kind}"
+                    )
+                seen_reparse.add(relative_text)
                 entries.append({
                     "path": relative_text,
                     "kind": planned.link_kind,
@@ -167,17 +237,28 @@ def build_artifact_tree_integrity(
                     "package": planned.package_name,
                 })
                 continue
-            try:
-                mode = item.stat(follow_symlinks=False).st_mode
-            except OSError as exc:
+
+            # A new link/junction appearing after the canonical plan was built
+            # must never be silently traversed. Reusing the plan is an
+            # optimization only; this scan still detects topology drift.
+            if (
+                is_reparse_entry
+                or path.is_symlink()
+                or (
+                    os.name == "nt"
+                    and stat.S_ISDIR(mode)
+                    and is_windows_junction(path)
+                )
+            ):
                 raise ArtifactIntegrityError(
-                    f"PREPARED_ARTIFACT_ENTRY_UNREADABLE: {path}: {exc}"
-                ) from exc
+                    "PREPARED_ARTIFACT_REPARSE_DRIFT: "
+                    f"unplanned reparse entry {relative_text}"
+                )
             if stat.S_ISDIR(mode):
                 entries.append({"path": relative_text, "kind": "directory"})
                 pending.append((path, relative))
             elif stat.S_ISREG(mode):
-                links = int(getattr(item.stat(follow_symlinks=False), "st_nlink", 1) or 1)
+                links = int(getattr(metadata, "st_nlink", 1) or 1)
                 if links > 1:
                     raise ArtifactIntegrityError(
                         "PREPARED_ARTIFACT_HARDLINK_UNSUPPORTED: "
@@ -190,6 +271,13 @@ def build_artifact_tree_integrity(
                     f"{relative_text}; mode={oct(mode)}"
                 )
 
+    missing_reparse = sorted(set(reparse_by_path) - seen_reparse)
+    if missing_reparse:
+        raise ArtifactIntegrityError(
+            "PREPARED_ARTIFACT_REPARSE_DRIFT: planned entries disappeared: "
+            + ", ".join(missing_reparse[:8])
+        )
+
     workers = max_workers
     if workers is None:
         raw = str(os.environ.get("DEPLOOM_ARTIFACT_HASH_WORKERS") or "").strip()
@@ -199,6 +287,7 @@ def build_artifact_tree_integrity(
             workers = min(8, max(2, os.cpu_count() or 2))
     workers = max(1, min(32, int(workers)))
     byte_count = 0
+    hashed_files = 0
     # Bound in-flight futures. A durable artifact may contain hundreds of
     # thousands of files; allocating one Future per path defeats the I/O
     # governor by creating avoidable RAM and scheduler pressure.
@@ -227,7 +316,8 @@ def build_artifact_tree_integrity(
                 _path, relative = pending.pop(future)
                 digest, size, executable = future.result()
                 byte_count += size
-                heartbeat("hashing", len(entries), len(files))
+                hashed_files += 1
+                heartbeat("hashing", hashed_files, len(files))
                 entries.append({
                     "path": relative,
                     "kind": "file",
@@ -256,6 +346,6 @@ def build_artifact_tree_integrity(
         file_count=len(files),
         directory_count=len(directories),
         byte_count=byte_count,
-        reparse_count=len(reparse_plan),
+        reparse_count=len(canonical_reparse_plan),
         tool_build_id=build_id,
     )

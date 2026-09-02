@@ -51,9 +51,9 @@ class BlockVHBaselineIntentTests(unittest.TestCase):
     def test_user_continuation_credit_is_not_mislabeled_as_proof_credit(self):
         budget = gen.BaselineLivenessBudget(base_iterations=8, max_learning_extensions=16)
         budget.certified_extensions = 8
-        self.assertEqual(16, budget.allowed_iterations)
+        self.assertEqual(8, budget.allowed_iterations)
         self.assertEqual(8, budget.grant_user_extensions(8))
-        self.assertEqual(24, budget.allowed_iterations)
+        self.assertEqual(16, budget.allowed_iterations)
         snapshot = budget.snapshot(learned_constraints=0)
         self.assertEqual(8, snapshot["certifiedExtensions"])
         self.assertEqual(8, snapshot["userExtensions"])

@@ -3,7 +3,7 @@ import type { BaselineDecision, BaselineIntent, BaselineIntentPlan } from '../ty
 export const BASELINE_DECISION_MARKER = 'DEPLOOM_BASELINE_DECISION_V1 '
 
 export function freshBaselineIntent(): BaselineIntent {
-  return { schemaVersion: 1, policies: {}, extraIterations: 0, decisionGrantIterations: 0 }
+  return { schemaVersion: 1, policies: {}, extraIterations: 0, decisionGrantIterations: 0, searchMode: 'AUTO' }
 }
 
 export function parseBaselineDecision(message: string | undefined): BaselineDecision | undefined {
@@ -19,7 +19,7 @@ export function parseBaselineDecision(message: string | undefined): BaselineDeci
   if (end < 0) return undefined
   try {
     const parsed = JSON.parse(line.slice(0, end + 1)) as BaselineDecision
-    if (parsed.schemaVersion !== 1 || !parsed.reason) return undefined
+    if ((parsed.schemaVersion !== 1 && parsed.schemaVersion !== 2) || !parsed.reason) return undefined
     return parsed
   } catch {
     return undefined
@@ -34,6 +34,7 @@ export function normalizeBaselineIntentPlan(plan: BaselineIntentPlan): BaselineI
       policies: { ...(plan.intent?.policies ?? {}) },
       extraIterations: Math.max(0, Number(plan.intent?.extraIterations ?? 0) || 0),
       decisionGrantIterations: 0,
+      searchMode: plan.intent?.searchMode ?? 'AUTO',
     },
   }
 }

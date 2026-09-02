@@ -545,14 +545,14 @@ class BaselineLivenessBudgetTests(unittest.TestCase):
         # formula just like a learned generalized clause, so it must buy the
         # follow-up solve that can actually consume that new fact.
         self.assertTrue(budget.record_exact_exclusion())
-        self.assertEqual(9, budget.allowed_iterations)
+        self.assertEqual(8, budget.allowed_iterations)
         self.assertEqual(1, budget.exact_extension_credits)
         self.assertEqual(1, budget.certified_extensions)
         self.assertEqual(1, budget.exact_since_learning)
 
         # Fresh generalized authority uses the same bounded extension pool.
         budget.observe_learned_constraints(4)
-        self.assertEqual(10, budget.allowed_iterations)
+        self.assertEqual(8, budget.allowed_iterations)
         self.assertEqual(2, budget.certified_extensions)
         self.assertEqual(1, budget.learned_extensions)
         self.assertEqual(0, budget.exact_since_learning)
@@ -568,7 +568,7 @@ class BaselineLivenessBudgetTests(unittest.TestCase):
             budget.observe_learned_constraints(learned)
 
         snapshot = budget.snapshot(learned_constraints=24)
-        self.assertEqual(16, budget.allowed_iterations)
+        self.assertEqual(8, budget.allowed_iterations)
         self.assertEqual(16, snapshot["hardIterations"])
         self.assertEqual(8, snapshot["certifiedExtensions"])
         self.assertEqual(24, snapshot["learnedConstraints"])
