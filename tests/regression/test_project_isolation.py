@@ -44,11 +44,15 @@ class ProjectIsolationRegressionTests(unittest.TestCase):
         self.assertIn("setContextError(failedWorkspaceId, failedProjectName", finish_block)
         self.assertNotIn("autopilotRef.current?.", finish_block)
 
-    def test_preflight_and_baseline_can_run_for_another_project_without_unlocking_mutating_jobs(self) -> None:
+    def test_project_background_actions_can_overlap_across_projects_while_workspace_globals_stay_locked(self) -> None:
         main = (ROOT / "desktop" / "electron" / "main.ts").read_text(encoding="utf-8")
 
         self.assertIn(
-            "const PROJECT_PARALLEL_ACTIONS = new Set<FlowAction>(['preflight', 'baseline'])",
+            "const PROJECT_BACKGROUND_ACTIONS = new Set<FlowAction>(['preflight', 'baseline'])",
+            main,
+        )
+        self.assertIn(
+            "const WORKSPACE_GLOBAL_ACTIONS = new Set<FlowAction>(['sync-tool', 'generate-all', 'commit-state', 'push-workspace'])",
             main,
         )
         self.assertIn(
@@ -56,7 +60,11 @@ class ProjectIsolationRegressionTests(unittest.TestCase):
             main,
         )
         self.assertIn(
-            "return !(PROJECT_PARALLEL_ACTIONS.has(action) && PROJECT_PARALLEL_ACTIONS.has(existing.action))",
+            "if (WORKSPACE_GLOBAL_ACTIONS.has(action) || WORKSPACE_GLOBAL_ACTIONS.has(existing.action)) return true",
+            main,
+        )
+        self.assertIn(
+            "if (PROJECT_BACKGROUND_ACTIONS.has(action) || PROJECT_BACKGROUND_ACTIONS.has(existing.action)) return false",
             main,
         )
         self.assertIn(
