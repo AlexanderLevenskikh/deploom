@@ -258,7 +258,18 @@ def build_artifact_tree_integrity(
                 entries.append({"path": relative_text, "kind": "directory"})
                 pending.append((path, relative))
             elif stat.S_ISREG(mode):
-                links = int(getattr(metadata, "st_nlink", 1) or 1)
+                raw_links = int(getattr(metadata, "st_nlink", 0) or 0)
+                if raw_links < 1:
+                    try:
+                        raw_links = int(
+                            getattr(path.stat(follow_symlinks=False), "st_nlink", 1)
+                            or 1
+                        )
+                    except OSError as exc:
+                        raise ArtifactIntegrityError(
+                            f"PREPARED_ARTIFACT_ENTRY_UNREADABLE: {path}: {exc}"
+                        ) from exc
+                links = max(1, raw_links)
                 if links > 1:
                     raise ArtifactIntegrityError(
                         "PREPARED_ARTIFACT_HARDLINK_UNSUPPORTED: "

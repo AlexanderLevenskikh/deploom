@@ -13,6 +13,7 @@ import datetime as dt
 import json
 import os
 import shutil
+import stat
 import threading
 import time
 from pathlib import Path
@@ -76,6 +77,57 @@ def _watcher_is_clean(watcher: _DirectoryWatcher) -> bool:
         and not watcher.events
         and not watcher.errors
     )
+
+
+def _dependency_link_topology_issue(
+    workspace: Path,
+    dependency_roots: Sequence[str],
+) -> Optional[str]:
+    """Return why dependency bytes cannot use the watcher-only memo.
+
+    ReadDirectoryChangesW observes names below ``workspace``. Creating or
+    writing an NTFS hardlink through a name outside that tree need not produce
+    an in-tree notification, but it does raise the sealed file object's link
+    count. A metadata-only topology pass closes that blind spot without
+    rehashing package payloads on every hot lookup.
+    """
+    pending = [
+        workspace.joinpath(*Path(relative).parts)
+        for relative in dependency_roots
+    ]
+    reparse_attribute = int(
+        getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0
+    )
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = list(iterator)
+        except OSError:
+            return "link-topology-unavailable"
+        for item in entries:
+            path = Path(item.path)
+            try:
+                # CPython may leave DirEntry.stat().st_nlink as zero on
+                # Windows even though os.stat() has the real NTFS count.
+                metadata = path.stat(follow_symlinks=False)
+            except OSError:
+                return "link-topology-unavailable"
+            if (
+                reparse_attribute
+                and int(getattr(metadata, "st_file_attributes", 0) or 0)
+                & reparse_attribute
+            ):
+                continue
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append(path)
+            elif (
+                stat.S_ISREG(metadata.st_mode)
+                and int(getattr(metadata, "st_nlink", 1) or 1) != 1
+            ):
+                return "external-hardlink-observed"
+    return None
+
 
 # BLOCK_V_PREPARED_ARTIFACT_ASYNC_GC_V2
 # PreparedArtifact is a performance cache. Heavy physical deletion must never
@@ -543,6 +595,10 @@ def load_prepared_artifact_record(
             fallback_reason = "watcher-drain-unconfirmed"
         elif pending_events:
             fallback_reason = "watcher-event-observed"
+        else:
+            fallback_reason = _dependency_link_topology_issue(
+                workspace, dependency_roots
+            ) or ""
 
         if fallback_reason:
             emit_observability_event(
