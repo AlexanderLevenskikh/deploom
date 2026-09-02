@@ -649,6 +649,48 @@ _PREPARED_FASTPATH_DISABLED: set[Tuple[str, str]] = set()
 # Process-local optimization state only. It is never proof/Solver authority.
 _PREPARED_FASTPATH_COMMAND_DISABLED: set[Tuple[str, str]] = set()
 
+# BLOCK_X_SAME_RUN_REUSE_V1
+# Coordination may serialize equivalent requests but never grants reuse. After
+# waiting, callers re-enter exact proof lookup and watcher-backed validation.
+_PREPARATION_COORDINATION_LOCK = threading.Lock()
+_PREPARATION_COORDINATION: Dict[Tuple[object, ...], threading.Lock] = {}
+_PREPARED_SNAPSHOT_PRODUCERS: Dict[Tuple[str, str], str] = {}
+
+
+def _preparation_coordination_key(
+    project_dir: Path,
+    assignment: Mapping[str, str],
+    remove_packages: Iterable[str],
+    config: "BaselineVerifyConfig",
+) -> Tuple[object, ...]:
+    return (
+        os.path.normcase(str(project_dir.resolve())),
+        tuple(sorted((str(name), str(version)) for name, version in assignment.items())),
+        tuple(sorted(str(item) for item in remove_packages)),
+        str(config.registry or "").rstrip("/"),
+        tuple(sorted(semantic_verification_environment(os.environ).items())),
+    )
+
+
+@contextlib.contextmanager
+def _coalesce_same_run_preparation(key: Tuple[object, ...]):
+    with _PREPARATION_COORDINATION_LOCK:
+        lock = _PREPARATION_COORDINATION.setdefault(key, threading.Lock())
+    waited = lock.locked()
+    lock.acquire()
+    try:
+        yield waited
+    finally:
+        lock.release()
+
+
+def reset_same_run_verification_reuse() -> None:
+    """Start a new Baseline run without restoring process-local trust."""
+    with _PREPARATION_COORDINATION_LOCK:
+        _PREPARATION_COORDINATION.clear()
+    with _PREPARED_SNAPSHOT_LOCK:
+        _PREPARED_SNAPSHOT_PRODUCERS.clear()
+
 
 def _cleanup_prepared_snapshot_root() -> None:
     global _PREPARED_SNAPSHOT_ROOT
@@ -661,6 +703,9 @@ def _cleanup_prepared_snapshot_root() -> None:
     _PREPARED_SNAPSHOTS.clear()
     _PREPARED_FASTPATH_DISABLED.clear()
     _PREPARED_FASTPATH_COMMAND_DISABLED.clear()
+    _PREPARED_SNAPSHOT_PRODUCERS.clear()
+    with _PREPARATION_COORDINATION_LOCK:
+        _PREPARATION_COORDINATION.clear()
 
 
 atexit.register(_cleanup_prepared_snapshot_root)
@@ -1148,6 +1193,13 @@ def _evict_prepared_workspace_snapshot(key: str, source_project: Path) -> None:
     # Remove the durable locator only. Another process may still be reading the
     # immutable tree; lazy garbage collection is safer than deleting it here.
     invalidate_prepared_artifact_record(key, remove_tree=False)
+    with _PREPARED_SNAPSHOT_LOCK:
+        _PREPARED_SNAPSHOT_PRODUCERS.pop(slot, None)
+    emit_observability_event(
+        "same-run.prepared-artifact.invalidated",
+        identity=key,
+        sourceProject=str(source_project.resolve()),
+    )
 
 
 def _enforce_prepared_snapshot_budget(protected_slot: Tuple[str, str]) -> None:
@@ -2456,17 +2508,45 @@ def verify_assignment(
                 snapshot = None
 
             if snapshot is not None:
+                producer = _PREPARED_SNAPSHOT_PRODUCERS.get(
+                    _prepared_snapshot_slot(
+                        proof_identity.preparation_proof_key, project_dir
+                    )
+                )
                 event(
                     "verify.preparation.snapshot-hit",
                     preparationProofKey=proof_identity.preparation_proof_key,
                     observedResolvedHash=observed_hash,
                 )
+                if producer is not None:
+                    event(
+                        "same-run.prepared-artifact.hit",
+                        marker="SAME_RUN_PREPARED_ARTIFACT_HIT",
+                        identity=proof_identity.preparation_proof_key,
+                        consumer=progress_label,
+                        originalProducer=producer,
+                        lifecycleInstallAvoided=True,
+                        integritySealAvoided=True,
+                    )
                 _emit_progress(
                     progress,
                     f"{progress_label}: lifecycle preparation snapshot HIT; fresh project-check clones will be materialized from the sealed tree",
                 )
                 observed_versions = dict(snapshot.observed_resolved_versions)
             else:
+                invalidated_producer = _PREPARED_SNAPSHOT_PRODUCERS.pop(
+                    _prepared_snapshot_slot(
+                        proof_identity.preparation_proof_key, project_dir
+                    ),
+                    None,
+                )
+                if invalidated_producer is not None:
+                    event(
+                        "same-run.prepared-artifact.invalidated",
+                        identity=proof_identity.preparation_proof_key,
+                        reason="continuity-validation-miss",
+                        originalProducer=invalidated_producer,
+                    )
                 if preparation_record is not None:
                     _emit_progress(
                         progress,
@@ -2487,6 +2567,11 @@ def verify_assignment(
                 lifecycle_env.update(_package_manager_cache_environment(config, manager))
                 preparation_started = time.monotonic()
                 event("verify.preparation.start", command=" ".join(full_argv))
+                event(
+                    "same-run.prepared-artifact.build",
+                    identity=proof_identity.preparation_proof_key,
+                    consumer=progress_label,
+                )
                 try:
                     full_result = _run(
                         full_argv, package_manager_project,
@@ -2637,6 +2722,12 @@ def verify_assignment(
                     f"{progress_label}: snapshot publish PASS; elapsed={snapshot_duration_ms // 1000}s; mode={snapshot.storage_mode}",
                 )
                 workspace_project = snapshot.workspace_root / snapshot.project_relative
+                if preparation_publication_allowed:
+                    _PREPARED_SNAPSHOT_PRODUCERS[
+                        _prepared_snapshot_slot(
+                            proof_identity.preparation_proof_key, project_dir
+                        )
+                    ] = progress_label
 
             if snapshot is None:
                 return BaselineVerifyResult(False, "infrastructure", "PREPARED_SNAPSHOT_UNAVAILABLE: project checks require a sealed preparation tree")
@@ -3516,6 +3607,7 @@ def verify_assignment(
     progress_label: str = "assignment verification",
 ) -> BaselineVerifyResult:
     project_dir = project_dir.resolve()
+    remove_packages = tuple(str(item) for item in remove_packages)
     telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
     request_id = new_observability_id("request")
     started = time.monotonic()
@@ -3534,15 +3626,37 @@ def verify_assignment(
             commands=list(config.commands),
         )
         try:
-            result = _verify_assignment_cache_aware_impl(
-                project_dir,
-                assignment,
-                config=config,
-                run_project_checks=run_project_checks,
-                remove_packages=remove_packages,
-                progress=progress,
-                progress_label=progress_label,
-            )
+            if run_project_checks and config.project_checks != "off" and config.commands:
+                coordination_key = _preparation_coordination_key(
+                    project_dir, assignment, remove_packages, config
+                )
+                with _coalesce_same_run_preparation(coordination_key) as waited:
+                    if waited:
+                        emit_verification_event(
+                            telemetry_path,
+                            "same-run.prepared-artifact.coalesced",
+                            identity=assignment_hash,
+                            consumer=progress_label,
+                        )
+                    result = _verify_assignment_cache_aware_impl(
+                        project_dir,
+                        assignment,
+                        config=config,
+                        run_project_checks=run_project_checks,
+                        remove_packages=remove_packages,
+                        progress=progress,
+                        progress_label=progress_label,
+                    )
+            else:
+                result = _verify_assignment_cache_aware_impl(
+                    project_dir,
+                    assignment,
+                    config=config,
+                    run_project_checks=run_project_checks,
+                    remove_packages=remove_packages,
+                    progress=progress,
+                    progress_label=progress_label,
+                )
         except BaseException as exc:
             resources_after = process_resource_snapshot()
             emit_verification_event(

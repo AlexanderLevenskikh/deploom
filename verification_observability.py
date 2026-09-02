@@ -77,6 +77,17 @@ def _new_metrics() -> dict[str, object]:
         "sourceBytesObservedMax": 0,
         "orphanStageFinishes": 0,
         "materializationMethods": {},
+        "preparedArtifactBuilds": 0,
+        "sameRunPreparedArtifactHits": 0,
+        "lifecycleInstallsAvoided": 0,
+        "integritySealsAvoided": 0,
+        "controlProofHits": 0,
+        "projectObservationHits": 0,
+        "independentReproductions": 0,
+        "artifactInvalidations": 0,
+        "preparationRequestsCoalesced": 0,
+        "totalArtifactPrepareMs": 0,
+        "totalProjectTrialMs": 0,
     }
 
 
@@ -494,6 +505,28 @@ def record_verification_event(event: str, payload: Mapping[str, object]) -> None
         if event == "filesystem.materialize.finish":
             method = str(payload.get("method") or "unknown")
             _bump_dict("materializationMethods", method)
+
+        if event == "same-run.prepared-artifact.build":
+            _METRICS["preparedArtifactBuilds"] = int(_METRICS["preparedArtifactBuilds"]) + 1
+        elif event == "same-run.prepared-artifact.hit":
+            _METRICS["sameRunPreparedArtifactHits"] = int(_METRICS["sameRunPreparedArtifactHits"]) + 1
+            _METRICS["lifecycleInstallsAvoided"] = int(_METRICS["lifecycleInstallsAvoided"]) + 1
+            _METRICS["integritySealsAvoided"] = int(_METRICS["integritySealsAvoided"]) + 1
+        elif event == "same-run.prepared-artifact.coalesced":
+            _METRICS["preparationRequestsCoalesced"] = int(_METRICS["preparationRequestsCoalesced"]) + 1
+        elif event == "same-run.control-proof.hit":
+            _METRICS["controlProofHits"] = int(_METRICS["controlProofHits"]) + 1
+        elif event == "same-run.project-observation.hit":
+            _METRICS["projectObservationHits"] = int(_METRICS["projectObservationHits"]) + 1
+        elif event == "same-run.independent-reproduction":
+            _METRICS["independentReproductions"] = int(_METRICS["independentReproductions"]) + 1
+        elif event == "same-run.prepared-artifact.invalidated":
+            _METRICS["artifactInvalidations"] = int(_METRICS["artifactInvalidations"]) + 1
+
+        if event == "verify.preparation.finish":
+            _METRICS["totalArtifactPrepareMs"] = int(_METRICS["totalArtifactPrepareMs"]) + _int_field(payload, ("durationMs",))
+        elif event == "verify.project-check.finish":
+            _METRICS["totalProjectTrialMs"] = int(_METRICS["totalProjectTrialMs"]) + _int_field(payload, ("durationMs",))
 
         if str(payload.get("stagePairing") or "") == "orphan-finish":
             _METRICS["orphanStageFinishes"] = int(_METRICS["orphanStageFinishes"]) + 1

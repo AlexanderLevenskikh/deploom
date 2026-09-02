@@ -97,7 +97,8 @@ from constraint_verify import (
 from baseline_constraint_verifier import (
     BaselineVerifyConfig, BaselineVerifyResult, assignment_fingerprint,
     detect_package_manager, discover_baseline_project_checks, resolve_executable,
-    structural_project_failure_signatures, verify_assignment,
+    reset_same_run_verification_reuse, structural_project_failure_signatures,
+    verify_assignment,
 )
 from verification_proof import (
     VerificationProofStore,
@@ -9523,6 +9524,7 @@ def resolve_peer_compatibility_with_verification(
     diagnostic by default because source repair belongs to Executor; strict mode
     can explicitly promote them to learned constraints.
     """
+    reset_same_run_verification_reuse()
     progress_reporter = BaselineProgressReporter(progress_path)
     localization_checkpoint_store = BaselineLocalizationCheckpointStore(progress_path)
     # BLOCK_V_BASELINE_RECOVERY_V1
@@ -9584,6 +9586,14 @@ def resolve_peer_compatibility_with_verification(
     # Project cache keys include the resulting ResolvedStateKey, source snapshot,
     # command set and check policy. Display fingerprints never participate.
     project_preflight_cache: Dict[str, BaselineVerifyResult] = {}
+    # Exact authoritative physical observations, grouped by ProjectTrialKey.
+    # Multiple entries mean independent fresh project executions; re-reading an
+    # entry never manufactures another proof.
+    project_observation_cache: Dict[str, List[BaselineVerifyResult]] = {}
+    # Exact PASS-only control observations. The request key binds the validated
+    # SourceSnapshot, resolver environment, command and verification semantics;
+    # the value additionally carries the authoritative ResolvedStateKey.
+    control_proof_cache: Dict[Tuple[str, str, str, str], BaselineVerifyResult] = {}
     verification_config_by_project: Dict[str, BaselineVerifyConfig] = {}
 
     for project, rows in rows_by_project.items():
@@ -9803,14 +9813,33 @@ def resolve_peer_compatibility_with_verification(
                 # verify_assignment already owns the strong Resolver/ProjectProof
                 # cache and binds project reuse to an exact ResolvedStateKey.
                 control_config = dataclasses.replace(config, project_checks="diagnostic", commands=(command,))
-                control = verify_assignment(
-                    spec.path, {}, config=control_config, run_project_checks=True, remove_packages=(),
-                    progress=lambda message, command=command: (
-                        progress_reporter.emit(project, "control", "adaptive-control", command=command, message=message),
-                        eprint(f"[info] {project}: Baseline control {command}: {message}"),
-                    ),
-                    progress_label=f"Baseline control {command}",
+                control_request_key = (
+                    project_source_snapshot_key,
+                    project_resolver_context_key,
+                    command,
+                    "diagnostic:single-command:v1",
                 )
+                control = control_proof_cache.get(control_request_key)
+                if control is not None:
+                    emit_observability_event(
+                        "same-run.control-proof.hit",
+                        marker="CONTROL_PROOF_HIT",
+                        command=command,
+                        sourceSnapshotKey=project_source_snapshot_key,
+                        resolvedStateKey=control.resolved_state_key,
+                    )
+                    eprint(f"[info] {project}: CONTROL_PROOF_HIT command={command}")
+                else:
+                    control = verify_assignment(
+                        spec.path, {}, config=control_config, run_project_checks=True, remove_packages=(),
+                        progress=lambda message, command=command: (
+                            progress_reporter.emit(project, "control", "adaptive-control", command=command, message=message),
+                            eprint(f"[info] {project}: Baseline control {command}: {message}"),
+                        ),
+                        progress_label=f"Baseline control {command}",
+                    )
+                    if control.ok and control.resolved_state_key:
+                        control_proof_cache[control_request_key] = control
                 if control.kind in {"infrastructure", "unknown"}:
                     raise BaselineConstraintVerificationError(
                         f"BASELINE_VERIFY_INCONCLUSIVE_CONTROL: {project}: adaptive structural comparison "
@@ -10445,6 +10474,21 @@ def resolve_peer_compatibility_with_verification(
                                     f"adaptive screen {fingerprint}"
                                 ),
                             )
+                            if (
+                                screen_result.kind not in {"infrastructure", "unknown"}
+                                and resolver_trial_key
+                                and screen_result.resolved_state_key
+                            ):
+                                screen_observation_key = build_project_trial_key(
+                                    resolver_trial_key=resolver_trial_key,
+                                    resolved_state_key=screen_result.resolved_state_key,
+                                    source_snapshot_key=project_source_snapshot_key,
+                                    project_checks=screen_config.project_checks,
+                                    commands=screen_config.commands,
+                                )
+                                project_observation_cache.setdefault(
+                                    screen_observation_key, []
+                                ).append(screen_result)
                             if screen_result.kind == "infrastructure":
                                 raise BaselineConstraintVerificationError(
                                     f"BASELINE_VERIFY_INFRA_ERROR: "
@@ -10515,6 +10559,9 @@ def resolve_peer_compatibility_with_verification(
                                     commands=config.commands,
                                 )
                                 project_preflight_cache[exact_project_key] = project_result
+                                project_observation_cache.setdefault(
+                                    exact_project_key, []
+                                ).append(project_result)
                         else:
                             eprint(
                                 f"[info] {project}: Baseline project preflight reused exact ProjectTrialKey "
@@ -10638,18 +10685,64 @@ def resolve_peer_compatibility_with_verification(
                         iteration=iteration, assignment=fingerprint,
                         literals=len(exact_nogood), origin=result.kind,
                     )
-                    confirmation = verify_assignment(
-                        spec.path, verification_assignment, config=confirmation_config,
-                        run_project_checks=confirmation_project_checks, remove_packages=removals,
-                        progress=lambda message: (
-                            progress_reporter.emit(
-                                project, mode, "exact-assignment-confirmation-running",
-                                iteration=iteration, assignment=fingerprint, message=message,
+                    confirmation_key = ""
+                    existing_confirmations: List[BaselineVerifyResult] = []
+                    if (
+                        confirmation_project_checks
+                        and resolver_trial_key
+                        and result.resolved_state_key
+                    ):
+                        confirmation_key = build_project_trial_key(
+                            resolver_trial_key=resolver_trial_key,
+                            resolved_state_key=result.resolved_state_key,
+                            source_snapshot_key=project_source_snapshot_key,
+                            project_checks=confirmation_config.project_checks,
+                            commands=confirmation_config.commands,
+                        )
+                        existing_confirmations = list(
+                            project_observation_cache.get(confirmation_key, ())
+                        )
+                    required_confirmations = 2 if confirmation_project_checks else 1
+                    if len(existing_confirmations) >= required_confirmations:
+                        confirmation = existing_confirmations[required_confirmations - 1]
+                        emit_observability_event(
+                            "same-run.project-observation.hit",
+                            marker="PROJECT_OBSERVATION_HIT",
+                            projectTrialKey=confirmation_key,
+                            authority="CONFIRMED",
+                            observations=len(existing_confirmations),
+                        )
+                        eprint(
+                            f"[info] {project}: PROJECT_OBSERVATION_HIT "
+                            f"projectTrialKey={confirmation_key[:12]} authority=CONFIRMED"
+                        )
+                    else:
+                        if confirmation_project_checks:
+                            emit_observability_event(
+                                "same-run.independent-reproduction",
+                                projectTrialKey=confirmation_key,
+                                ordinal=len(existing_confirmations) + 1,
+                                required=required_confirmations,
+                            )
+                        confirmation = verify_assignment(
+                            spec.path, verification_assignment, config=confirmation_config,
+                            run_project_checks=confirmation_project_checks, remove_packages=removals,
+                            progress=lambda message: (
+                                progress_reporter.emit(
+                                    project, mode, "exact-assignment-confirmation-running",
+                                    iteration=iteration, assignment=fingerprint, message=message,
+                                ),
+                                eprint(f"[info] {project}: Baseline exact confirmation {mode}: {message}"),
                             ),
-                            eprint(f"[info] {project}: Baseline exact confirmation {mode}: {message}"),
-                        ),
-                        progress_label=f"Baseline exact confirmation {mode} {fingerprint}",
-                    )
+                            progress_label=f"Baseline exact confirmation {mode} {fingerprint}",
+                        )
+                        if (
+                            confirmation_key
+                            and confirmation.kind not in {"infrastructure", "unknown"}
+                        ):
+                            project_observation_cache.setdefault(
+                                confirmation_key, []
+                            ).append(confirmation)
                     if confirmation.kind in {"infrastructure", "unknown"}:
                         raise BaselineConstraintVerificationError(
                             f"BASELINE_VERIFY_INCONCLUSIVE_CONFIRMATION: {project}/{mode}: "
