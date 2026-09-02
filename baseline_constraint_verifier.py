@@ -1491,6 +1491,17 @@ def _materialize_prepared_workspace_snapshot(
         progress=progress,
     ) if os.name == "nt" else None
     try:
+        # A durable PreparedArtifact record can be retired by background GC
+        # after lookup but before this consumer obtains the reader lease. Once
+        # the lease is held cleanup cannot remove the tree, so re-check the
+        # published root here and fail with a precise substrate error instead
+        # of handing a stale path to robocopy. The caller performs one bounded
+        # exact-identity rebuild; this is never dependency evidence.
+        if not snapshot.workspace_root.is_dir():
+            raise RuntimeError(
+                "PREPARED_SNAPSHOT_RETIRED_DURING_CLONE: "
+                f"{snapshot.workspace_root}"
+            )
         canonical_reparse_plan = _canonical_workspace_reparse_plan(
             snapshot.workspace_root,
             snapshot.workspace_root / snapshot.project_relative,
@@ -2810,7 +2821,49 @@ def verify_assignment(
                             progress_interval_seconds=config.progress_interval_seconds,
                         )
                     except Exception as exc:
-                        return BaselineVerifyResult(False, "infrastructure", f"PREPARED_SNAPSHOT_CLONE_FAILED: {command}: {exc}", command=command)
+                        clone_failure = f"PREPARED_SNAPSHOT_CLONE_FAILED: {command}: {exc}"
+                        emit_observability_event(
+                            "verify.project-check.clone-failed",
+                            command=command,
+                            check=command_index,
+                            checks=len(config.commands),
+                            preparationProofKey=proof_identity.preparation_proof_key,
+                            authoritativeSource="substrate",
+                            kind="infrastructure",
+                            rebuildAttempted=bool(_allow_prepared_fastpath),
+                            detail=str(exc),
+                        )
+                        # A clone failure is substrate uncertainty, not
+                        # incompatibility. Drop only the suspect locator and
+                        # retry this *same exact assignment* once through the
+                        # existing authoritative no-fastpath rebuild path.
+                        _evict_prepared_workspace_snapshot(
+                            proof_identity.preparation_proof_key,
+                            project_dir,
+                        )
+                        if _allow_prepared_fastpath:
+                            _emit_progress(
+                                progress,
+                                f"{progress_label}: {clone_failure}; invalidating the stale "
+                                "prepared artifact and rebuilding this exact assignment once "
+                                "through the authoritative full-copy path",
+                            )
+                            return _retry_assignment_without_prepared_fastpath(
+                                project_dir,
+                                assignment,
+                                config=config,
+                                run_project_checks=run_project_checks,
+                                remove_packages=remove_packages,
+                                progress=progress,
+                                progress_label=progress_label,
+                                proof_identity=proof_identity,
+                            )
+                        return BaselineVerifyResult(
+                            False,
+                            "infrastructure",
+                            clone_failure,
+                            command=command,
+                        )
                     clone_isolation = (
                         "ntfs-junction-guarded"
                         if guarded_clone_is_active(command_root)

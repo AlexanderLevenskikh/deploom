@@ -30,15 +30,19 @@ class DesktopReleaseAndProjectConcurrencyRegression(unittest.TestCase):
     def test_baseline_is_project_scoped_but_shared_mutators_stay_workspace_scoped(self):
         text = (ROOT / "desktop/electron/main.ts").read_text(encoding="utf-8")
         for sentinel in (
-            "PROJECT_PARALLEL_ACTIONS",
+            "PROJECT_BACKGROUND_ACTIONS",
+            "WORKSPACE_GLOBAL_ACTIONS",
             "'preflight', 'baseline'",
+            "'sync-tool', 'generate-all', 'commit-state', 'push-workspace'",
             "projectRunConflicts",
             "baseline-project-output",
             "'--no-history-snapshot'",
         ):
             self.assertIn(sentinel, text)
         self.assertIn("existing.projectName === project.name", text)
-        self.assertIn("PROJECT_PARALLEL_ACTIONS.has(existing.action)", text)
+        self.assertIn("WORKSPACE_GLOBAL_ACTIONS.has(existing.action)", text)
+        self.assertIn("PROJECT_BACKGROUND_ACTIONS.has(existing.action)", text)
+        self.assertIn("projectRunConflicts(existing, workspace, project, 'recover')", text)
 
 
 if __name__ == "__main__":

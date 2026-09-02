@@ -258,16 +258,22 @@ type JobRecord = {
 type UpdateStatus = { state: 'idle' | 'checking' | 'available' | 'downloading' | 'current' | 'ready' | 'error'; version?: string; percent?: number; message?: string; authRequired?: boolean }
 
 const jobs = new Map<string, JobRecord>()
-const PROJECT_PARALLEL_ACTIONS = new Set<FlowAction>(['preflight', 'baseline'])
+const PROJECT_BACKGROUND_ACTIONS = new Set<FlowAction>(['preflight', 'baseline'])
+const WORKSPACE_GLOBAL_ACTIONS = new Set<FlowAction>(['sync-tool', 'generate-all', 'commit-state', 'push-workspace'])
 
 function projectRunConflicts(existing: JobRecord, workspace: WorkspaceRecord, project: ProjectSpec, action: FlowAction): boolean {
   if (existing.workspace.id !== workspace.id) return false
   if (existing.projectName === project.name) return true
 
-  // Baseline/preflight operate on one project and may run side by side across
-  // different projects. Other FLOW actions can publish/mutate shared workspace
-  // state and therefore retain the workspace-wide exclusion.
-  return !(PROJECT_PARALLEL_ACTIONS.has(action) && PROJECT_PARALLEL_ACTIONS.has(existing.action))
+  // Truly workspace-global operations still serialize against every project.
+  // Baseline/preflight are project-private (Baseline writes to its private
+  // baseline-project-output sink), so on a different project they may overlap
+  // with another project-scoped FLOW stage. Keep two non-background mutating
+  // stages serialized for now: this fixes the broad Baseline lock without
+  // opening unrelated cross-project mutation races.
+  if (WORKSPACE_GLOBAL_ACTIONS.has(action) || WORKSPACE_GLOBAL_ACTIONS.has(existing.action)) return true
+  if (PROJECT_BACKGROUND_ACTIONS.has(action) || PROJECT_BACKGROUND_ACTIONS.has(existing.action)) return false
+  return true
 }
 
 let mainWindow: BrowserWindow | null = null
@@ -5760,8 +5766,13 @@ function setupIpc(): void {
     const state = loadState()
     const workspace = findWorkspace(state, raw.workspaceId)
     const project = findProject(workspace, raw.projectName)
-    const runningJob = [...jobs.values()].find((existing) => existing.workspace.id === workspace.id)
-    if (runningJob) throw new Error(`Для этого workspace уже выполняется «${runningJob.action}».`)
+    const runningJob = [...jobs.values()].find((existing) =>
+      projectRunConflicts(existing, workspace, project, 'recover')
+    )
+    if (runningJob) {
+      const scope = runningJob.projectName === project.name ? `проекта ${project.name}` : 'workspace'
+      throw new Error(`Для ${scope} уже выполняется «${runningJob.action}».`)
+    }
     const issue = await inferredRecoveryIssue(workspace, project)
     if (!issue) throw new Error('Нет сохранённой recoverable-ошибки или подготовленной dirty release-ветки.')
     if (issue.kind === 'hard') throw new Error(`${issue.code}: это safety hard-stop; пользовательский prompt не может его обойти.`)
