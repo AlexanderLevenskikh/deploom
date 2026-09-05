@@ -24,11 +24,12 @@ for (const sentinel of [
 ]) if (!flow.includes(sentinel)) throw new Error(`Baseline intent FLOW contract missing: ${sentinel}`)
 
 for (const sentinel of [
-  'Продолжить поиск (+',
+  'Отложить когорту (',
+  'Готов ждать: исчерпывающий поиск в фоне',
   'baseline-policy-toggle',
   "setPolicy(item.name, 'keep-current')",
   "setPolicy(item.name, 'required')",
-  'Подтвердить и запустить Baseline',
+  'Запустить быстрый Baseline',
 ]) if (!dialog.includes(sentinel)) throw new Error(`Baseline intent dialog contract missing: ${sentinel}`)
 
 for (const sentinel of [
@@ -56,6 +57,8 @@ for (const sentinel of [
   'USER_BASELINE_REQUIRED_UPDATE',
   'USER_BASELINE_KEEP_CURRENT',
   '_apply_baseline_intent_scope',
+  'infer_baseline_cohort',
+  'cohort-deferral-suggested',
   'excluded from this Baseline update/health scope by USER_POLICY',
 ]) if (!generator.includes(sentinel)) throw new Error(`Baseline intent solver/verifier contract missing: ${sentinel}`)
 

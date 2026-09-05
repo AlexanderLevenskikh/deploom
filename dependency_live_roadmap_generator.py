@@ -78,6 +78,7 @@ from block_psi_anytime import (
     BestVerifiedIncumbent,
     ContinuationReason,
 )
+from baseline_cohort_inference import infer_baseline_cohort
 
 from deploom_failure import build_failure, write_diagnostic_artifact
 from cli_io import configure_utf8_stdio
@@ -201,7 +202,7 @@ def _baseline_intent_payload() -> Dict[str, Any]:
             normalized = str(policy or "").strip().lower()
             if normalized in {"keep-current", "required"}:
                 policies[str(name)] = normalized
-    execution_mode = str(parsed.get("executionMode") or "AUTOPILOT").strip().upper() if isinstance(parsed, dict) else "AUTOPILOT"
+    execution_mode = str(parsed.get("executionMode") or "FAST").strip().upper() if isinstance(parsed, dict) else "FAST"
     if execution_mode not in BASELINE_EXECUTION_MODES:
         execution_mode = "AUTOPILOT"
     _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": policies, "executionMode": execution_mode}
@@ -256,7 +257,7 @@ def _baseline_search_mode() -> BaselineSearchMode:
 def _baseline_execution_mode() -> str:
     raw = str(os.environ.get("DEPLOOM_BASELINE_EXECUTION_MODE") or "").strip().upper()
     if not raw:
-        raw = str(_baseline_intent_payload().get("executionMode") or "AUTOPILOT").strip().upper()
+        raw = str(_baseline_intent_payload().get("executionMode") or "FAST").strip().upper()
     return raw if raw in BASELINE_EXECUTION_MODES else "AUTOPILOT"
 
 
@@ -283,7 +284,7 @@ def _baseline_preseal_screening_enabled(*, has_incumbent: bool) -> bool:
 
 def _baseline_automatic_budget_seconds() -> int:
     raw = _baseline_env_nonnegative_int("DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS")
-    return raw or 30 * 60
+    return raw or 15 * 60
 
 
 def _baseline_human_decision_focus(
@@ -12602,11 +12603,45 @@ def resolve_peer_compatibility_with_verification(
                         project=project, mode=mode, iteration=iteration,
                         reason=continuation_reason,
                     )
+                    cohort_suggestion = infer_baseline_cohort(
+                        predicate=anytime.repeated_predicate,
+                        direct_packages=rows_by_name.keys(),
+                        policy_by_package={
+                            name: _baseline_intent_policy(name)
+                            for name in rows_by_name
+                        },
+                        repeated_count=anytime.repeated_predicate_count,
+                    )
                     decision_payload.update({
                         "hardIterations": summary["hardIterations"],
                         "learnedConstraints": summary["learnedConstraints"],
                         **decision_focus,
                     })
+                    if cohort_suggestion is not None:
+                        decision_payload["suggestedCohort"] = cohort_suggestion.to_json()
+                        decision_payload["recommendedAction"] = (
+                            "REVIEW_COHORT_REQUIREMENTS"
+                            if cohort_suggestion.required_packages
+                            else "DEFER_COHORT_AND_CONTINUE"
+                        )
+                        decision_payload["availableActions"] = [
+                            "DEFER_COHORT_AND_CONTINUE",
+                            "CONTINUE_EXHAUSTIVE_BACKGROUND",
+                            "STOP_SAVE_PROGRESS",
+                        ]
+                        progress_reporter.emit(
+                            project,
+                            mode,
+                            "cohort-deferral-suggested",
+                            iteration=iteration,
+                            predicate=anytime.repeated_predicate,
+                            cohortId=cohort_suggestion.cohort_id,
+                            cohortLabel=cohort_suggestion.label,
+                            packages=list(cohort_suggestion.packages),
+                            requiredPackages=list(cohort_suggestion.required_packages),
+                            confidence=cohort_suggestion.confidence,
+                            authority=cohort_suggestion.authority,
+                        )
                     checkpoint_baseline_run(
                         "human-decision-required",
                         completed_iteration=iteration,

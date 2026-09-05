@@ -3,7 +3,7 @@ import type { BaselineDecision, BaselineIntent, BaselineIntentPlan } from '../ty
 export const BASELINE_DECISION_MARKER = 'DEPLOOM_BASELINE_DECISION_V1 '
 
 export function freshBaselineIntent(): BaselineIntent {
-  return { schemaVersion: 1, policies: {}, extraIterations: 0, decisionGrantIterations: 0, searchMode: 'AUTO', executionMode: 'AUTOPILOT' }
+  return { schemaVersion: 1, policies: {}, extraIterations: 0, decisionGrantIterations: 0, searchMode: 'AUTO', executionMode: 'FAST' }
 }
 
 export function parseBaselineDecision(message: string | undefined): BaselineDecision | undefined {
@@ -35,7 +35,7 @@ export function normalizeBaselineIntentPlan(plan: BaselineIntentPlan): BaselineI
       extraIterations: Math.max(0, Number(plan.intent?.extraIterations ?? 0) || 0),
       decisionGrantIterations: 0,
       searchMode: plan.intent?.searchMode ?? 'AUTO',
-      executionMode: plan.intent?.executionMode ?? 'AUTOPILOT',
+      executionMode: plan.intent?.executionMode === 'BACKGROUND' ? 'BACKGROUND' : 'FAST',
     },
   }
 }

@@ -304,7 +304,7 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
     extraIterations: Math.max(0, Math.floor(Number(raw.extraIterations ?? 0) || 0)),
     decisionGrantIterations: Math.max(0, Math.floor(Number(raw.decisionGrantIterations ?? 0) || 0)),
     searchMode: raw.searchMode === 'EXHAUSTIVE' || raw.searchMode === 'BOUNDED_IMPROVEMENT' ? raw.searchMode : 'AUTO',
-    executionMode: raw.executionMode === 'FAST' || raw.executionMode === 'BACKGROUND' ? raw.executionMode : 'AUTOPILOT',
+    executionMode: raw.executionMode === 'BACKGROUND' ? 'BACKGROUND' : 'FAST',
   }
 }
 
@@ -1803,7 +1803,7 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
       const explicitIntent = input.baselineIntent ? normalizeBaselineIntent(input.baselineIntent) : undefined
       const effectiveIntent = explicitIntent ?? persistedIntent
       if (explicitIntent) saveBaselineIntent(workspace, project.name, explicitIntent)
-      const executionMode: BaselineExecutionMode = effectiveIntent.executionMode ?? 'AUTOPILOT'
+      const executionMode: BaselineExecutionMode = effectiveIntent.executionMode === 'BACKGROUND' ? 'BACKGROUND' : 'FAST'
       const automaticBudgetSeconds = executionMode === 'FAST' ? 15 * 60 : executionMode === 'BACKGROUND' ? 2 * 60 * 60 : 30 * 60
       const maxExpensiveAttempts = executionMode === 'FAST' ? 2 : executionMode === 'BACKGROUND' ? 8 : 4
 

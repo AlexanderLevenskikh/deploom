@@ -613,3 +613,28 @@ textarea::placeholder {
 .button.secondary,
 .dialog,
 .setup-panel { background-color: var(--surface-raised); }
+
+/* BLOCK_PHI_ITERATIVE_COHORT_UI_V1 */
+.baseline-fast-flow,
+.baseline-cohort-suggestion {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border-color, rgba(127,127,127,.28));
+  border-radius: 10px;
+  background: var(--surface-2, rgba(127,127,127,.06));
+}
+.baseline-fast-flow > div { display: grid; gap: 5px; }
+.baseline-fast-flow span,
+.baseline-cohort-suggestion span { font-size: 12px; line-height: 1.45; opacity: .9; }
+.baseline-advanced-flow,
+.baseline-technical-details,
+.baseline-advanced-actions { font-size: 12px; }
+.baseline-advanced-flow summary,
+.baseline-technical-details summary,
+.baseline-advanced-actions summary { cursor: pointer; opacity: .78; }
+.baseline-cohort-suggestion { border-color: rgba(86,156,214,.55); }
+.baseline-cohort-packages { display: flex; flex-wrap: wrap; gap: 6px; }
+.baseline-cohort-packages code { padding: 3px 6px; border-radius: 6px; background: rgba(127,127,127,.12); }
+.baseline-technical-details { display: grid; gap: 5px; }
+.baseline-advanced-actions[open] { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }

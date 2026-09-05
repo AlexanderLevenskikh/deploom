@@ -27,15 +27,13 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
   const [query, setQuery] = useState('')
   const [kind, setKind] = useState<'all' | 'runtime' | 'dev' | 'peer'>('all')
   const [policies, setPolicies] = useState<Record<string, BaselinePackagePolicy>>({ ...plan.intent.policies })
-  const [executionMode, setExecutionMode] = useState<BaselineExecutionMode>(plan.intent.executionMode ?? 'AUTOPILOT')
-  const [fastAutoExcluded, setFastAutoExcluded] = useState<string[]>([])
+  const [executionMode, setExecutionMode] = useState<BaselineExecutionMode>(plan.intent.executionMode === 'BACKGROUND' ? 'BACKGROUND' : 'FAST')
   const [busy, setBusy] = useState(false)
   const deferredQuery = useDeferredValue(query)
 
   useEffect(() => {
     setPolicies({ ...plan.intent.policies })
-    setExecutionMode(plan.intent.executionMode ?? 'AUTOPILOT')
-    setFastAutoExcluded([])
+    setExecutionMode(plan.intent.executionMode === 'BACKGROUND' ? 'BACKGROUND' : 'FAST')
   }, [plan])
 
   const visible = useMemo(() => {
@@ -54,7 +52,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
 
   const dirty = useMemo(
     () => policyFingerprint(policies) !== policyFingerprint(plan.intent.policies)
-      || executionMode !== (plan.intent.executionMode ?? 'AUTOPILOT'),
+      || executionMode !== (plan.intent.executionMode === 'BACKGROUND' ? 'BACKGROUND' : 'FAST'),
     [executionMode, plan.intent.executionMode, plan.intent.policies, policies],
   )
 
@@ -86,24 +84,20 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
   }
 
   const chooseExecutionMode = (nextMode: BaselineExecutionMode) => {
-    if (nextMode === executionMode) return
-    if (nextMode === 'FAST') {
-      const autoDev = plan.candidates.filter((item) => item.kind === 'dev' && (policies[item.name] ?? 'auto') === 'auto').map((item) => item.name)
-      if (autoDev.length) setPolicies((current) => ({ ...current, ...Object.fromEntries(autoDev.map((name) => [name, 'keep-current' as const])) }))
-      setFastAutoExcluded(autoDev)
-    } else if (executionMode === 'FAST' && fastAutoExcluded.length) {
-      setPolicies((current) => {
-        const next = { ...current }
-        for (const name of fastAutoExcluded) if (next[name] === 'keep-current') delete next[name]
-        return next
-      })
-      setFastAutoExcluded([])
-    }
-    setExecutionMode(nextMode)
+    setExecutionMode(nextMode === 'BACKGROUND' ? 'BACKGROUND' : 'FAST')
   }
 
-  const continueSearch = () => void submit(buildIntent(DECISION_TRANCHE, DECISION_TRANCHE, policies, 'BOUNDED_IMPROVEMENT'))
-  const continueInBackground = () => void submit(buildIntent(DECISION_TRANCHE * 4, DECISION_TRANCHE * 4, policies, 'BOUNDED_IMPROVEMENT', 'BACKGROUND'))
+  const suggestedCohort = decision?.suggestedCohort
+  const deferSuggestedCohort = () => {
+    if (!suggestedCohort?.packages?.length) return
+    const next = { ...policies }
+    for (const name of suggestedCohort.packages) {
+      if (next[name] !== 'required') next[name] = 'keep-current'
+    }
+    setPolicies(next)
+    void submit(buildIntent(DECISION_TRANCHE, DECISION_TRANCHE, next, 'BOUNDED_IMPROVEMENT', 'FAST'))
+  }
+
   const continueExhaustive = () => void submit(buildIntent(DECISION_TRANCHE * 8, DECISION_TRANCHE * 8, policies, 'EXHAUSTIVE', 'BACKGROUND'))
   const applyAndContinue = () => void submit(buildIntent(mode === 'decision' ? DECISION_TRANCHE : 0, mode === 'decision' ? DECISION_TRANCHE : 0, policies, mode === 'decision' ? 'BOUNDED_IMPROVEMENT' : 'AUTO'))
   const keepFocusAndContinue = () => {
@@ -136,35 +130,72 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
           <button type="button" className="icon-button" aria-label={text('Закрыть без применения', 'Close without applying')} onClick={requestCancel}><X size={17} /></button>
         </header>
 
-        <div className="baseline-intent-stats">
-          <button type="button" className={executionMode === 'FAST' ? 'button primary' : 'button secondary'} disabled={busy} onClick={() => chooseExecutionMode('FAST')}>{text('⚡ Быстро · ~15 мин', '⚡ Fast · ~15 min')}</button>
-          <button type="button" className={executionMode === 'AUTOPILOT' ? 'button primary' : 'button secondary'} disabled={busy} onClick={() => chooseExecutionMode('AUTOPILOT')}>{text('▶ Автопилот · ~30 мин', '▶ Autopilot · ~30 min')}</button>
-          <button type="button" className={executionMode === 'BACKGROUND' ? 'button primary' : 'button secondary'} disabled={busy} onClick={() => chooseExecutionMode('BACKGROUND')}>{text('☾ В фоне · до 2 ч', '☾ Background · up to 2h')}</button>
-        </div>
-        <div className="baseline-intent-scope-note">
-          {executionMode === 'FAST' ? text('Fast: AUTO DEV-пакеты оставлены текущими по явной USER_POLICY. Можно вернуть любой пакет в AUTO/Обязательно ниже.', 'Fast: AUTO dev packages are kept current by explicit USER_POLICY. You can put any package back into AUTO/Required below.') : executionMode === 'BACKGROUND' ? text('Background: более глубокий поиск с пониженной I/O-конкуренцией. Другие проекты остаются доступны; конфликтующие действия этого проекта защищены.', 'Background: deeper search with reduced I/O concurrency. Other projects remain available; conflicting actions on this project stay protected.') : text('Autopilot: полный выбранный scope, ранний high-signal screening и bounded search до первого полезного verified результата.', 'Autopilot: full selected scope, early high-signal screening and bounded search toward the first useful verified result.')}
+        <div className="baseline-fast-flow">
+          <div>
+            <strong>{executionMode === 'BACKGROUND' ? text('☾ Глубокий поиск', '☾ Deep search') : text('⚡ Быстрый Baseline', '⚡ Fast Baseline')}</strong>
+            <span>{executionMode === 'BACKGROUND'
+              ? text('DepLoom будет дольше исследовать проблемные комбинации. Это дополнительный режим для случаев, когда вы готовы ждать.', 'DepLoom will spend longer exploring difficult combinations. This is an optional mode for when you are willing to wait.')
+              : text('Основной Flow: сначала получить рабочий verified результат. Если совместимость локально мешает, DepLoom предложит временно отложить только связанную когорту — без массового исключения DEV-пакетов.', 'Main flow: get a working verified result first. If compatibility is locally blocked, DepLoom will suggest deferring only the related cohort instead of excluding all dev packages.')}</span>
+          </div>
+          <details className="baseline-advanced-flow">
+            <summary>{text('Дополнительно', 'Advanced')}</summary>
+            {executionMode === 'BACKGROUND'
+              ? <button type="button" className="button secondary" disabled={busy} onClick={() => chooseExecutionMode('FAST')}>{text('Вернуться к быстрому Flow', 'Return to Fast flow')}</button>
+              : <button type="button" className="button secondary" disabled={busy} onClick={() => chooseExecutionMode('BACKGROUND')}>{text('Готов ждать: искать глубже в фоне', 'I can wait: search deeper in background')}</button>}
+          </details>
         </div>
 
         {mode === 'decision' && decision ? (
-          <div className="baseline-decision-summary">
-            <strong>{decision.reason === 'budget-exhausted' || decision.reason === 'AUTOMATIC_BUDGET_EXHAUSTED' || decision.reason === 'BASE_ITERATION_LIMIT'
-              ? text('Исчерпан автоматический search budget', 'Automatic search budget exhausted')
-              : decision.reason === 'policy-unsat'
-                ? text('Для выбранной политики нет совместимого assignment', 'No compatible assignment exists under the selected policy')
-                : text('Повторяющийся конфликт', 'Repeated compatibility conflict')}</strong>
-            <span>{decision.package ? `${decision.package}${decision.currentVersion ? ` · current ${decision.currentVersion}` : ''}` : text('Можно изменить состав Baseline или продолжить поиск.', 'You can change Baseline scope or continue searching.')}</span>
-            {decision.predicate || decision.repeatedPredicate ? <code>{decision.predicate || decision.repeatedPredicate}</code> : null}
-            {decision.continuationCostClass === 'hours' ? <small>{text('Продолжение может занять часы', 'Continuation may take hours')}</small> : null}
-            {decision.failedVersions?.length ? <small>{text('Подтверждённо не подошли', 'Confirmed incompatible')}: {decision.failedVersions.join(', ')}</small> : null}
-            <small>{text(`Итерация ${decision.iteration ?? '—'} · learned constraints ${decision.learnedConstraints ?? '—'}`, `Iteration ${decision.iteration ?? '—'} · learned constraints ${decision.learnedConstraints ?? '—'}`)}</small>
-          </div>
+          <>
+            {suggestedCohort?.packages?.length ? (
+              <div className="baseline-cohort-suggestion">
+                <strong>{text(`Рекомендуем временно отложить ${suggestedCohort.label}`, `Temporarily defer ${suggestedCohort.label}`)}</strong>
+                <span>{text(
+                  'Конфликт выглядит локальным для связанной compatibility-когорты. Быстрее получить рабочий Baseline для остальных зависимостей, а к этой группе вернуться отдельным проходом. Это эвристика навигации, не proof.',
+                  'The conflict looks local to a related compatibility cohort. It is faster to get a working Baseline for the remaining dependencies and revisit this group in a separate pass. This is a navigation heuristic, not proof.',
+                )}</span>
+                <div className="baseline-cohort-packages">
+                  {suggestedCohort.packages.map((name) => <code key={name}>{name}</code>)}
+                </div>
+                {suggestedCohort.requiredPackages?.length ? (
+                  <small>{text(
+                    `Не будут автоматически исключены обязательные: ${suggestedCohort.requiredPackages.join(', ')}`,
+                    `Required packages will not be automatically deferred: ${suggestedCohort.requiredPackages.join(', ')}`,
+                  )}</small>
+                ) : null}
+                <button type="button" className="button primary" disabled={busy} onClick={deferSuggestedCohort}>
+                  {text(`Отложить когорту (${suggestedCohort.packages.length}) и продолжить`, `Defer cohort (${suggestedCohort.packages.length}) and continue`)}
+                </button>
+                <details className="baseline-technical-details">
+                  <summary>{text('Почему DepLoom это предлагает', 'Why DepLoom suggests this')}</summary>
+                  <small>{text('Confidence', 'Confidence')}: {Math.round(suggestedCohort.confidence * 100)}% · {suggestedCohort.authority}</small>
+                  <code>{suggestedCohort.predicate}</code>
+                </details>
+              </div>
+            ) : null}
+
+            <div className="baseline-decision-summary">
+              <strong>{decision.reason === 'budget-exhausted' || decision.reason === 'AUTOMATIC_BUDGET_EXHAUSTED' || decision.reason === 'BASE_ITERATION_LIMIT'
+                ? text('Быстрый поиск дошёл до границы бюджета', 'Fast search reached its budget boundary')
+                : decision.reason === 'policy-unsat'
+                  ? text('Для выбранной политики нет совместимого assignment', 'No compatible assignment exists under the selected policy')
+                  : text('Повторяется одна и та же compatibility-проблема', 'The same compatibility problem keeps repeating')}</strong>
+              <span>{suggestedCohort
+                ? text('Основной рекомендуемый шаг показан выше. Подтверждённые constraints сохранены.', 'The recommended next step is shown above. Confirmed constraints are preserved.')
+                : decision.package
+                  ? `${decision.package}${decision.currentVersion ? ` · current ${decision.currentVersion}` : ''}`
+                  : text('DepLoom не смог уверенно вывести когорту. Можно изменить состав вручную или выбрать глубокий поиск.', 'DepLoom could not infer a confident cohort. You can edit the scope manually or choose deep search.')}</span>
+              {!suggestedCohort && (decision.predicate || decision.repeatedPredicate) ? <code>{decision.predicate || decision.repeatedPredicate}</code> : null}
+              {decision.failedVersions?.length ? <small>{text('Подтверждённо не подошли', 'Confirmed incompatible')}: {decision.failedVersions.join(', ')}</small> : null}
+              <small>{text(`Итерация ${decision.iteration ?? '—'} · learned constraints ${decision.learnedConstraints ?? '—'}`, `Iteration ${decision.iteration ?? '—'} · learned constraints ${decision.learnedConstraints ?? '—'}`)}</small>
+            </div>
+          </>
         ) : null}
 
         <div className="baseline-intent-toolbar">
           <label><Search size={14} /><input autoFocus spellCheck={false} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={text('Найти зависимость', 'Find dependency')} /></label>
           <QuickSelect value={kind} options={kindOptions} onChange={(value) => setKind(value as typeof kind)} ariaLabel={text('Фильтр типа зависимости', 'Dependency type filter')} />
           <button type="button" className="button secondary" disabled={busy} onClick={() => setPolicies({})}>{text('Все → AUTO', 'All → AUTO')}</button>
-          <button type="button" className="button secondary" disabled={busy} onClick={() => setPolicies((current) => ({ ...current, ...Object.fromEntries(plan.candidates.filter((item) => item.kind === 'dev').map((item) => [item.name, 'keep-current' as const] as const)) }))}>{text('DEV → исключить', 'DEV → exclude')}</button>
         </div>
 
         <div className="baseline-intent-stats">
@@ -203,11 +234,30 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
         <footer className="baseline-intent-actions">
           <span className="baseline-intent-apply-hint">{dirty ? text('Есть неприменённые изменения', 'There are unapplied changes') : text('Состав готов', 'Scope is ready')}</span>
           <button type="button" className="button secondary" disabled={busy} onClick={requestCancel}>{mode === 'decision' ? text('Оставить на паузе', 'Keep paused') : text('Отмена', 'Cancel')}</button>
-          {mode === 'decision' ? <button type="button" className="button secondary" disabled={busy} onClick={continueSearch}>{text(`Продолжить поиск (+${DECISION_TRANCHE})`, `Continue search (+${DECISION_TRANCHE})`)}</button> : null}
-          {mode === 'decision' ? <button type="button" className="button secondary" disabled={busy} onClick={continueInBackground}>{text('Продолжить в фоне', 'Continue in background')}</button> : null}
-          {mode === 'decision' ? <button type="button" className="button secondary" disabled={busy} onClick={continueExhaustive}>{text('Исчерпывающий поиск в фоне', 'Continue exhaustive in background')}</button> : null}
-          {mode === 'decision' && decision?.package ? <button type="button" className="button secondary" disabled={busy} onClick={keepFocusAndContinue}>{text(`Исключить ${decision.package} и продолжить`, `Exclude ${decision.package} and continue`)}</button> : null}
-          <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{mode === 'decision' ? text('Применить и продолжить', 'Apply and continue') : text('Подтвердить и запустить Baseline', 'Confirm and start Baseline')}</button>
+
+          {mode === 'prepare' ? (
+            <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>
+              {executionMode === 'BACKGROUND' ? text('Запустить глубокий поиск', 'Start deep search') : text('Запустить быстрый Baseline', 'Start Fast Baseline')}
+            </button>
+          ) : null}
+
+          {mode === 'decision' && !suggestedCohort?.packages?.length && decision?.package ? (
+            <button type="button" className="button primary" disabled={busy} onClick={keepFocusAndContinue}>
+              {text(`Пока оставить ${decision.package} текущим`, `Keep ${decision.package} current for now`)}
+            </button>
+          ) : null}
+
+          {mode === 'decision' && !suggestedCohort?.packages?.length && !decision?.package ? (
+            <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{text('Применить состав и продолжить', 'Apply scope and continue')}</button>
+          ) : null}
+
+          {mode === 'decision' ? (
+            <details className="baseline-advanced-actions">
+              <summary>{text('Другие варианты', 'Other options')}</summary>
+              <button type="button" className="button secondary" disabled={busy} onClick={applyAndContinue}>{text('Применить ручные изменения', 'Apply manual scope changes')}</button>
+              <button type="button" className="button secondary" disabled={busy} onClick={continueExhaustive}>{text('Готов ждать: исчерпывающий поиск в фоне', 'I can wait: exhaustive search in background')}</button>
+            </details>
+          ) : null}
         </footer>
       </section>
     </div>
