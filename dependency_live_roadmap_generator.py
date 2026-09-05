@@ -182,6 +182,55 @@ _BASELINE_INTENT_CACHE_RAW = "<unset>"
 _BASELINE_INTENT_CACHE: Dict[str, Any] = {"schemaVersion": 1, "policies": {}}
 
 
+def _normalize_baseline_deferred_cohorts(value: object) -> List[Dict[str, object]]:
+    result: List[Dict[str, object]] = []
+    if not isinstance(value, list):
+        return result
+    for raw in value[:24]:
+        if not isinstance(raw, dict):
+            continue
+        cohort_id = str(raw.get("id") or "").strip()[:120]
+        label = str(raw.get("label") or cohort_id).strip()[:240]
+        packages = sorted({str(name).strip() for name in (raw.get("packages") or []) if str(name).strip()})[:64]
+        if not cohort_id or not packages:
+            continue
+        try:
+            confidence = max(0.0, min(1.0, float(raw.get("confidence") or 0)))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        result.append({
+            "id": cohort_id,
+            "label": label,
+            "packages": packages,
+            "predicate": str(raw.get("predicate") or "")[:1000],
+            "confidence": confidence,
+            "authority": "DIAGNOSTIC_HINT",
+            "deferredAt": str(raw.get("deferredAt") or "")[:80],
+            "decisionId": str(raw.get("decisionId") or "")[:120],
+            "boundaryPackages": sorted({str(name).strip() for name in (raw.get("boundaryPackages") or []) if str(name).strip()})[:32],
+            "warningPackages": sorted({str(name).strip() for name in (raw.get("warningPackages") or []) if str(name).strip()})[:32],
+        })
+    return result
+
+
+def _normalize_baseline_cohort_action(value: object) -> Dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    kind = str(value.get("kind") or "").strip().upper()
+    if kind not in {"DEFER", "REACTIVATE"}:
+        return {}
+    packages = sorted({str(name).strip() for name in (value.get("packages") or []) if str(name).strip()})[:64]
+    return {
+        "kind": kind,
+        "cohortId": str(value.get("cohortId") or "")[:120],
+        "label": str(value.get("label") or "")[:240],
+        "packages": packages,
+        "predicate": str(value.get("predicate") or "")[:1000],
+        "decisionId": str(value.get("decisionId") or "")[:120],
+        "confidence": value.get("confidence"),
+    }
+
+
 def _baseline_intent_payload() -> Dict[str, Any]:
     global _BASELINE_INTENT_CACHE_RAW, _BASELINE_INTENT_CACHE
     raw = str(os.environ.get("DEPLOOM_BASELINE_INTENT_JSON") or "").strip()
@@ -189,12 +238,12 @@ def _baseline_intent_payload() -> Dict[str, Any]:
         return _BASELINE_INTENT_CACHE
     _BASELINE_INTENT_CACHE_RAW = raw
     if not raw:
-        _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": {}}
+        _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": {}, "executionMode": "FAST", "deferredCohorts": [], "cohortAction": {}}
         return _BASELINE_INTENT_CACHE
     try:
         parsed = json.loads(raw)
     except (TypeError, ValueError):
-        _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": {}}
+        _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": {}, "executionMode": "FAST", "deferredCohorts": [], "cohortAction": {}}
         return _BASELINE_INTENT_CACHE
     policies: Dict[str, str] = {}
     if isinstance(parsed, dict) and isinstance(parsed.get("policies"), dict):
@@ -204,9 +253,24 @@ def _baseline_intent_payload() -> Dict[str, Any]:
                 policies[str(name)] = normalized
     execution_mode = str(parsed.get("executionMode") or "FAST").strip().upper() if isinstance(parsed, dict) else "FAST"
     if execution_mode not in BASELINE_EXECUTION_MODES:
-        execution_mode = "AUTOPILOT"
-    _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": policies, "executionMode": execution_mode}
+        execution_mode = "FAST"
+    _BASELINE_INTENT_CACHE = {
+        "schemaVersion": 1,
+        "policies": policies,
+        "executionMode": execution_mode,
+        "deferredCohorts": _normalize_baseline_deferred_cohorts(parsed.get("deferredCohorts") if isinstance(parsed, dict) else None),
+        "cohortAction": _normalize_baseline_cohort_action(parsed.get("cohortAction") if isinstance(parsed, dict) else None),
+    }
     return _BASELINE_INTENT_CACHE
+
+
+def _baseline_deferred_cohorts() -> List[Dict[str, object]]:
+    return [dict(item) for item in (_baseline_intent_payload().get("deferredCohorts") or []) if isinstance(item, dict)]
+
+
+def _baseline_cohort_action() -> Dict[str, object]:
+    value = _baseline_intent_payload().get("cohortAction")
+    return dict(value) if isinstance(value, dict) else {}
 
 
 def _baseline_intent_policy(package: str) -> str:
@@ -258,7 +322,7 @@ def _baseline_execution_mode() -> str:
     raw = str(os.environ.get("DEPLOOM_BASELINE_EXECUTION_MODE") or "").strip().upper()
     if not raw:
         raw = str(_baseline_intent_payload().get("executionMode") or "FAST").strip().upper()
-    return raw if raw in BASELINE_EXECUTION_MODES else "AUTOPILOT"
+    return raw if raw in BASELINE_EXECUTION_MODES else "FAST"
 
 
 def _baseline_max_expensive_attempts(default: int) -> int:
@@ -319,6 +383,95 @@ def _baseline_human_decision_focus(
         "failedVersions": versions,
         "confirmedVersions": count,
     }
+
+
+def _baseline_cohort_navigation_context(
+    rows_by_name: Mapping[str, DependencyRow],
+    assignment: Mapping[str, str],
+    client: LiveDataClient,
+) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
+    """Build proof-neutral interaction/reverse-consumer navigation evidence.
+
+    Only already-loaded registry metadata and existing transition-cohort labels
+    participate. Missing metadata lowers navigation confidence and never becomes
+    dependency incompatibility or Solver authority.
+    """
+    direct = set(rows_by_name)
+    graph: Dict[str, Set[str]] = {name: set() for name in direct}
+    consumers: Dict[str, Set[str]] = defaultdict(set)
+    transition_groups: Dict[str, Set[str]] = defaultdict(set)
+
+    for name, row in rows_by_name.items():
+        if row.compatibility_cohort:
+            transition_groups[str(row.compatibility_cohort)].add(name)
+        meta = getattr(client, "npm_cache", {}).get(name)
+        if not isinstance(meta, dict):
+            continue
+        metadata_versions = meta.get("versions")
+        if not isinstance(metadata_versions, dict):
+            continue
+        versions = {str(row.current_version or "")}
+        target = str(assignment.get(name) or "")
+        if target:
+            versions.add(target)
+        for version in sorted(value for value in versions if value):
+            record = metadata_versions.get(version)
+            if not isinstance(record, dict):
+                continue
+            for section in ("dependencies", "peerDependencies", "optionalDependencies"):
+                declarations = record.get(section)
+                if not isinstance(declarations, dict):
+                    continue
+                for raw_dependency in declarations:
+                    dependency_name = str(raw_dependency)
+                    if not dependency_name:
+                        continue
+                    consumers[dependency_name.lower()].add(name)
+                    if dependency_name in direct and dependency_name != name:
+                        graph[name].add(dependency_name)
+                        graph[dependency_name].add(name)
+
+    for members in transition_groups.values():
+        ordered = sorted(members)
+        for index, left in enumerate(ordered):
+            for right in ordered[index + 1:]:
+                graph[left].add(right)
+                graph[right].add(left)
+    return graph, consumers
+
+
+def _baseline_cohort_package_priority(row: DependencyRow) -> str:
+    if _baseline_intent_policy(row.name) == "required":
+        return "required"
+    counts = parse_vuln_counts(row.current_vulns)
+    if counts.get("C", 0) > 0:
+        return "critical"
+    if counts.get("H", 0) > 0:
+        return "high"
+    return "runtime" if row.kind == "runtime" else "dev"
+
+
+def _baseline_cohort_suggestion(
+    *,
+    predicate: str,
+    decision_focus: Mapping[str, object],
+    rows_by_name: Mapping[str, DependencyRow],
+    assignment: Mapping[str, str],
+    client: LiveDataClient,
+    repeated_count: int,
+) -> Optional[object]:
+    graph, consumers = _baseline_cohort_navigation_context(rows_by_name, assignment, client)
+    return infer_baseline_cohort(
+        predicate=predicate,
+        direct_packages=rows_by_name.keys(),
+        focus_package=str(decision_focus.get("package") or ""),
+        subject_consumers=consumers,
+        interaction_graph=graph,
+        policy_by_package={name: _baseline_intent_policy(name) for name in rows_by_name},
+        package_priority={name: _baseline_cohort_package_priority(row) for name, row in rows_by_name.items()},
+        previous_deferred=_baseline_deferred_cohorts(),
+        repeated_count=repeated_count,
+    )
 
 
 def _raise_baseline_human_decision(payload: Mapping[str, object]) -> None:
@@ -9953,6 +10106,34 @@ def resolve_peer_compatibility_with_verification(
                 f"[info] {project}: user Baseline intent applied; keepCurrent={baseline_keep_current}, "
                 f"required={baseline_required}; authority=USER_POLICY"
             )
+        active_deferred_cohorts = _baseline_deferred_cohorts()
+        cohort_action = _baseline_cohort_action()
+        if active_deferred_cohorts:
+            emit_observability_event(
+                "baseline.cohort.active-scope",
+                project=project,
+                cohortCount=len(active_deferred_cohorts),
+                cohorts=[{
+                    "id": item.get("id"),
+                    "packages": item.get("packages"),
+                    "predicate": item.get("predicate"),
+                    "confidence": item.get("confidence"),
+                } for item in active_deferred_cohorts],
+                authority="USER_POLICY",
+            )
+        if cohort_action:
+            emit_observability_event(
+                "baseline.cohort.user-action",
+                project=project,
+                action=str(cohort_action.get("kind") or ""),
+                cohortId=str(cohort_action.get("cohortId") or ""),
+                label=str(cohort_action.get("label") or ""),
+                packages=list(cohort_action.get("packages") or []),
+                predicate=str(cohort_action.get("predicate") or ""),
+                decisionId=str(cohort_action.get("decisionId") or ""),
+                confidence=cohort_action.get("confidence"),
+                authority="USER_POLICY",
+            )
 
         for mode in modes:
             recovery_identity = baseline_run_identity(
@@ -10107,7 +10288,8 @@ def resolve_peer_compatibility_with_verification(
             iteration = restored_iteration
             desired_assignment: Dict[str, str] = dict(anytime.desired_assignment)
             desired_identity = anytime.desired_identity
-            candidate_started = time.monotonic()
+            mode_started = time.monotonic()
+            candidate_started = mode_started
 
             def record_verified_incumbent(
                 verified_assignment: Mapping[str, str],
@@ -10141,7 +10323,24 @@ def resolve_peer_compatibility_with_verification(
                 anytime.update_incumbent(incumbent)
                 completion = anytime.completion_status(desired_identity) or BaselineCompletionStatus.VERIFIED_GOOD_ENOUGH
                 if baseline_keep_current and completion == BaselineCompletionStatus.VERIFIED_TARGET_COMPLETE:
-                    return BaselineCompletionStatus.VERIFIED_PARTIAL_SCOPE
+                    completion = BaselineCompletionStatus.VERIFIED_PARTIAL_SCOPE
+                emit_observability_event(
+                    "baseline.cohort.incumbent",
+                    project=project,
+                    mode=mode,
+                    iteration=iteration,
+                    executionMode=_baseline_execution_mode(),
+                    completionStatus=completion.value,
+                    changedDependencyCount=incumbent.changed_dependency_count,
+                    policyScore=incumbent.policy_score,
+                    yellowCoverage=incumbent.yellow_coverage,
+                    deferredTargets=list(incumbent.deferred_targets),
+                    activeDeferredCohorts=[str(item.get("id") or "") for item in active_deferred_cohorts],
+                    cohortAction=str(cohort_action.get("kind") or ""),
+                    cohortId=str(cohort_action.get("cohortId") or ""),
+                    timeToFirstVerifiedUsableResultMs=max(0, int((time.monotonic() - mode_started) * 1000)),
+                    authority="PHYSICAL_VERIFICATION",
+                )
                 return completion
 
             def checkpoint_baseline_run(
@@ -12603,45 +12802,58 @@ def resolve_peer_compatibility_with_verification(
                         project=project, mode=mode, iteration=iteration,
                         reason=continuation_reason,
                     )
-                    cohort_suggestion = infer_baseline_cohort(
-                        predicate=anytime.repeated_predicate,
-                        direct_packages=rows_by_name.keys(),
-                        policy_by_package={
-                            name: _baseline_intent_policy(name)
-                            for name in rows_by_name
-                        },
-                        repeated_count=anytime.repeated_predicate_count,
-                    )
                     decision_payload.update({
                         "hardIterations": summary["hardIterations"],
                         "learnedConstraints": summary["learnedConstraints"],
                         **decision_focus,
                     })
+                    cohort_predicate = str(anytime.repeated_predicate or "")
+                    cohort_suggestion = _baseline_cohort_suggestion(
+                        predicate=cohort_predicate,
+                        decision_focus=decision_focus,
+                        rows_by_name=rows_by_name,
+                        assignment=desired_assignment or baseline_current_versions,
+                        client=client,
+                        repeated_count=anytime.repeated_predicate_count,
+                    )
                     if cohort_suggestion is not None:
-                        decision_payload["suggestedCohort"] = cohort_suggestion.to_json()
-                        decision_payload["recommendedAction"] = (
-                            "REVIEW_COHORT_REQUIREMENTS"
-                            if cohort_suggestion.required_packages
-                            else "DEFER_COHORT_AND_CONTINUE"
-                        )
+                        cohort_payload = cohort_suggestion.to_json()
+                        decision_payload["suggestedCohort"] = cohort_payload
+                        decision_payload["recommendedAction"] = "DEFER_COHORT_AND_CONTINUE"
                         decision_payload["availableActions"] = [
                             "DEFER_COHORT_AND_CONTINUE",
                             "CONTINUE_EXHAUSTIVE_BACKGROUND",
                             "STOP_SAVE_PROGRESS",
                         ]
-                        progress_reporter.emit(
-                            project,
-                            mode,
-                            "cohort-deferral-suggested",
+                        emit_observability_event(
+                            "baseline.cohort.suggested",
+                            project=project,
+                            mode=mode,
                             iteration=iteration,
-                            predicate=anytime.repeated_predicate,
                             cohortId=cohort_suggestion.cohort_id,
-                            cohortLabel=cohort_suggestion.label,
+                            label=cohort_suggestion.label,
                             packages=list(cohort_suggestion.packages),
-                            requiredPackages=list(cohort_suggestion.required_packages),
+                            blockedPackages=list(cohort_suggestion.blocked_packages),
+                            warningPackages=list(cohort_suggestion.warning_packages),
+                            boundaryPackages=list(cohort_suggestion.boundary_packages),
+                            predicate=cohort_suggestion.predicate,
                             confidence=cohort_suggestion.confidence,
+                            decisionId=cohort_suggestion.decision_id,
+                            expandedFrom=cohort_suggestion.expanded_from,
                             authority=cohort_suggestion.authority,
                         )
+                        if cohort_suggestion.expanded_from:
+                            emit_observability_event(
+                                "baseline.cohort.expanded",
+                                project=project,
+                                mode=mode,
+                                cohortId=cohort_suggestion.cohort_id,
+                                expandedFrom=cohort_suggestion.expanded_from,
+                                packages=list(cohort_suggestion.packages),
+                                boundaryPackages=list(cohort_suggestion.boundary_packages),
+                                predicate=cohort_suggestion.predicate,
+                                authority=cohort_suggestion.authority,
+                            )
                     checkpoint_baseline_run(
                         "human-decision-required",
                         completed_iteration=iteration,

@@ -63,7 +63,9 @@ type ThemePreference = 'system' | 'light' | 'dark'
 type BaselinePackagePolicy = 'auto' | 'keep-current' | 'required'
 type BaselineSearchMode = 'AUTO' | 'BOUNDED_IMPROVEMENT' | 'EXHAUSTIVE'
 type BaselineExecutionMode = 'FAST' | 'AUTOPILOT' | 'BACKGROUND'
-type BaselineIntent = { schemaVersion: 1; policies: Record<string, BaselinePackagePolicy>; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode }
+type BaselineDeferredCohort = { id: string; label: string; packages: string[]; predicate?: string; confidence?: number; authority: 'DIAGNOSTIC_HINT'; deferredAt?: string; decisionId?: string; boundaryPackages?: string[]; warningPackages?: string[] }
+type BaselineCohortAction = { kind: 'DEFER' | 'REACTIVATE'; cohortId: string; label: string; packages: string[]; predicate?: string; confidence?: number; decisionId?: string }
+type BaselineIntent = { schemaVersion: 1; policies: Record<string, BaselinePackagePolicy>; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction }
 type BaselineIntentCandidate = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string }
 type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent }
 type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
@@ -298,6 +300,41 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
   for (const [name, policy] of Object.entries(rawPolicies)) {
     if (policy === 'keep-current' || policy === 'required') policies[name] = policy
   }
+  const deferredCohorts: BaselineDeferredCohort[] = Array.isArray(raw.deferredCohorts)
+    ? raw.deferredCohorts.slice(0, 24).flatMap((value) => {
+      if (!value || typeof value !== 'object') return []
+      const item = value as Record<string, unknown>
+      const id = String(item.id ?? '').trim().slice(0, 120)
+      const packages = Array.isArray(item.packages) ? [...new Set(item.packages.map((name) => String(name).trim()).filter(Boolean))].sort().slice(0, 64) : []
+      if (!id || !packages.length) return []
+      return [{
+        id,
+        label: String(item.label ?? id).trim().slice(0, 240),
+        packages,
+        predicate: String(item.predicate ?? '').slice(0, 1000),
+        confidence: Math.max(0, Math.min(1, Number(item.confidence ?? 0) || 0)),
+        authority: 'DIAGNOSTIC_HINT' as const,
+        deferredAt: String(item.deferredAt ?? '').slice(0, 80),
+        decisionId: String(item.decisionId ?? '').slice(0, 120),
+        boundaryPackages: Array.isArray(item.boundaryPackages) ? item.boundaryPackages.map((name) => String(name)).filter(Boolean).slice(0, 32) : [],
+        warningPackages: Array.isArray(item.warningPackages) ? item.warningPackages.map((name) => String(name)).filter(Boolean).slice(0, 32) : [],
+      }]
+    })
+    : []
+  let cohortAction: BaselineCohortAction | undefined
+  if (raw.cohortAction && typeof raw.cohortAction === 'object') {
+    const action = raw.cohortAction as Record<string, unknown>
+    const kind = action.kind === 'DEFER' || action.kind === 'REACTIVATE' ? action.kind : undefined
+    if (kind) cohortAction = {
+      kind,
+      cohortId: String(action.cohortId ?? '').slice(0, 120),
+      label: String(action.label ?? '').slice(0, 240),
+      packages: Array.isArray(action.packages) ? [...new Set(action.packages.map((name) => String(name)).filter(Boolean))].sort().slice(0, 64) : [],
+      predicate: String(action.predicate ?? '').slice(0, 1000),
+      confidence: Math.max(0, Math.min(1, Number(action.confidence ?? 0) || 0)),
+      decisionId: String(action.decisionId ?? '').slice(0, 120),
+    }
+  }
   return {
     schemaVersion: 1,
     policies,
@@ -305,6 +342,8 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
     decisionGrantIterations: Math.max(0, Math.floor(Number(raw.decisionGrantIterations ?? 0) || 0)),
     searchMode: raw.searchMode === 'EXHAUSTIVE' || raw.searchMode === 'BOUNDED_IMPROVEMENT' ? raw.searchMode : 'AUTO',
     executionMode: raw.executionMode === 'BACKGROUND' ? 'BACKGROUND' : 'FAST',
+    deferredCohorts,
+    ...(cohortAction ? { cohortAction } : {}),
   }
 }
 
@@ -322,7 +361,9 @@ function saveBaselineIntent(workspace: WorkspaceRecord, projectName: string, int
   const normalized = normalizeBaselineIntent(intent)
   // decisionGrantIterations is invocation-local; persisting it would silently
   // grant a new tranche after an unrelated crash/restart.
-  atomicWriteJsonSync(baselineIntentPath(workspace, projectName), { ...normalized, decisionGrantIterations: 0, searchMode: 'AUTO' })
+  const durable = { ...normalized }
+  delete durable.cohortAction
+  atomicWriteJsonSync(baselineIntentPath(workspace, projectName), { ...durable, decisionGrantIterations: 0, searchMode: 'AUTO' })
 }
 
 function projectInstalledVersion(projectPath: string, packageName: string): string | undefined {
