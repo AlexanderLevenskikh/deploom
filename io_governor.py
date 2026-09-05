@@ -29,6 +29,8 @@ class _Pool:
     semaphore: threading.BoundedSemaphore
     lock: threading.Lock
     active: int = 0
+    completed: int = 0
+    total_wait_ms: int = 0
 
 
 _POOLS_LOCK = threading.Lock()
@@ -52,22 +54,23 @@ def io_slot(kind: str, *, label: str = "") -> Iterator[dict[str, int]]:
     if kind not in {"copy", "hash", "pm"}:
         raise ValueError(f"IO_GOVERNOR_KIND_INVALID: {kind}")
     pool = _pool(kind)
-    operation_id = new_observability_id("io-governor")
+    operation_id = "" if kind == "hash" else new_observability_id("io-governor")
     started = time.monotonic()
     pool.semaphore.acquire()
     wait_ms = max(0, int((time.monotonic() - started) * 1000))
     with pool.lock:
         pool.active += 1
         active = pool.active
-    emit_observability_event(
-        "filesystem.io-governor.acquired",
-        operationId=operation_id,
-        ioKind=kind,
-        label=label,
-        ioGovernorSlots=pool.slots,
-        ioGovernorActiveSlots=active,
-        ioGovernorWaitMs=wait_ms,
-    )
+    if kind != "hash":
+        emit_observability_event(
+            "filesystem.io-governor.acquired",
+            operationId=operation_id,
+            ioKind=kind,
+            label=label,
+            ioGovernorSlots=pool.slots,
+            ioGovernorActiveSlots=active,
+            ioGovernorWaitMs=wait_ms,
+        )
     try:
         yield {"slots": pool.slots, "active": active, "waitMs": wait_ms}
     finally:
@@ -75,15 +78,29 @@ def io_slot(kind: str, *, label: str = "") -> Iterator[dict[str, int]]:
             pool.active -= 1
             remaining = pool.active
         pool.semaphore.release()
-        emit_observability_event(
-            "filesystem.io-governor.released",
-            operationId=operation_id,
-            ioKind=kind,
-            label=label,
-            ioGovernorSlots=pool.slots,
-            ioGovernorActiveSlots=remaining,
-            ioGovernorWaitMs=wait_ms,
-        )
+        if kind == "hash":
+            # A 150k-file seal used to synchronously append 300k JSON records.
+            # Aggregate resource telemetry without changing semaphore authority.
+            with pool.lock:
+                pool.completed += 1
+                pool.total_wait_ms += wait_ms
+                completed, total_wait = pool.completed, pool.total_wait_ms
+            if completed % 256 == 0:
+                emit_observability_event(
+                    "filesystem.io-governor.summary", ioKind=kind,
+                    ioGovernorSlots=pool.slots, completedOperations=completed,
+                    totalWaitMs=total_wait, aggregation="cumulative-per-process-pool",
+                )
+        else:
+            emit_observability_event(
+                "filesystem.io-governor.released",
+                operationId=operation_id,
+                ioKind=kind,
+                label=label,
+                ioGovernorSlots=pool.slots,
+                ioGovernorActiveSlots=remaining,
+                ioGovernorWaitMs=wait_ms,
+            )
 
 
 def reset_io_governor_for_tests() -> None:

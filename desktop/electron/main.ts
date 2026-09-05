@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
 import updaterPackage from 'electron-updater'
+import { isDeterministicToolFailure } from './baseline-retry.js'
 const { autoUpdater } = updaterPackage
 import { buildClaudeAgentArgs, buildClaudeResumeArgs, buildCodexAgentArgs, buildCodexResumeArgs, buildOpenCodeAgentArgs, buildOpenCodeResumeArgs, parseOpencodeModelsOutput } from './agent-command.js'
 import { agentBatchCompletionFingerprint, agentScopeFingerprint, extractAgentSessionId, resumableAgentSessionId } from './agent-session.js'
@@ -5069,12 +5070,7 @@ function deterministicWatchdogFailure(result: { code: number; stderr: string; st
 }
 
 function deterministicPythonProgrammingFailure(result: { code: number; stderr: string; stdout: string }): boolean {
-  // An unhandled interpreter/programming error in the bundled generator cannot
-  // become healthy by rerunning the exact same installed code. Keep transient
-  // network/registry failures retryable; only classify explicit Python tracebacks
-  // ending in structural programming/import exceptions here.
-  const text = result.stderr.trim()
-  return /Traceback \(most recent call last\):/i.test(text) && /(?:NameError|UnboundLocalError|SyntaxError|IndentationError|ModuleNotFoundError|ImportError):[^\r\n]*\s*$/i.test(text)
+  return isDeterministicToolFailure(result)
 }
 
 function baselineHumanDecisionRequired(result: { code: number; stderr: string; stdout: string }): boolean {

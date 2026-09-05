@@ -1129,7 +1129,8 @@ def _prepared_snapshot_fastpath_worth_sealing(
 
 
 def _lookup_prepared_workspace_snapshot(
-    key: str, source_project: Path
+    key: str, source_project: Path,
+    *, progress: Optional[ProgressCallback] = None,
 ) -> Optional[PreparedWorkspaceSnapshot]:
     slot = _prepared_snapshot_slot(key, source_project)
     # A process-local object is never sufficient authority. Another process may
@@ -1142,7 +1143,9 @@ def _lookup_prepared_workspace_snapshot(
     # Cross-process Block V lookup. The locator itself is PRECONDITION_CACHE
     # only; the caller separately requires an exact PreparationProof HIT before
     # allowing this tree to skip lifecycle preparation.
-    record = load_prepared_artifact_record(key, source_project)
+    _emit_progress(progress, "prepared artifact continuity validation started")
+    record = load_prepared_artifact_record(key, source_project, progress=progress)
+    _emit_progress(progress, "prepared artifact continuity validation " + ("HIT" if record else "MISS"))
     if record is None:
         return None
     snapshot = PreparedWorkspaceSnapshot(
@@ -1276,7 +1279,7 @@ def _publish_prepared_workspace_snapshot(
 ) -> PreparedWorkspaceSnapshot:
     slot = _prepared_snapshot_slot(key, source_project)
     if shared_reuse_allowed:
-        existing = _lookup_prepared_workspace_snapshot(key, source_project)
+        existing = _lookup_prepared_workspace_snapshot(key, source_project, progress=progress)
         if existing is not None:
             return existing
         root = _prepared_snapshot_root()
@@ -2501,7 +2504,7 @@ def verify_assignment(
             )
             snapshot = (
                 _lookup_prepared_workspace_snapshot(
-                    proof_identity.preparation_proof_key, project_dir
+                    proof_identity.preparation_proof_key, project_dir, progress=progress
                 )
                 if preparation_record is not None
                 else None

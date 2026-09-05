@@ -9060,7 +9060,15 @@ class BaselineProgressReporter:
         self._lock = threading.Lock()
         self._terminal = False
 
-    def emit(self, project: str, mode: str, phase: str, **details: object) -> None:
+    def emit(
+        self, project: str, mode: str, phase: str, /,
+        *, details: Optional[Mapping[str, object]] = None, **fields: object,
+    ) -> None:
+        # Nested telemetry crosses one explicit mapping boundary. Wrapper fields
+        # deterministically win; positional envelope fields cannot be overwritten.
+        normalized = _normalize_baseline_progress_details({**(details or {}), **fields})
+        for reserved in ("project", "mode", "schemaVersion", "type", "updatedAt"):
+            normalized.pop(reserved, None)
         with self._lock:
             if phase in {"solve-and-verify-started", "external-evidence-localization-started"}:
                 self._terminal = False
@@ -9077,7 +9085,7 @@ class BaselineProgressReporter:
                 "mode": mode,
                 "phase": phase,
                 "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
-                **details,
+                **normalized,
             }
 
             # Versioned machine channel for Desktop. The persisted latest-state
@@ -9722,7 +9730,7 @@ def resolve_peer_compatibility_with_verification(
                     external_evidence, base_config=config,
                     parallelism=config.parallelism, max_checks=config.max_delta_checks,
                     progress=lambda event, details: (
-                        progress_reporter.emit(project, external_evidence.target_mode, f"external-evidence-{event}", **details),
+                        progress_reporter.emit(project, external_evidence.target_mode, f"external-evidence-{event}", details=details),
                         eprint(f"[info] {project}: post-Executor evidence {event}; " + ", ".join(f"{key}={value}" for key, value in details.items()))
                     ),
                 )
@@ -10055,7 +10063,7 @@ def resolve_peer_compatibility_with_verification(
                 localizationHardTimeoutSeconds=config.localization_timeout_seconds,
                 solverManagedInputs=solver_managed_inputs,
                 fixedInputs=len(fixed_input_names),
-                **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
             )
             last_fingerprint = ""
             confirmed_failed_assignments: Set[str] = set(restored_failed)
@@ -10165,7 +10173,7 @@ def resolve_peer_compatibility_with_verification(
                     mode,
                     "iteration-started",
                     iteration=iteration,
-                    **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                    details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
                 )
                 solver_statuses: Dict[str, Dict[str, Dict[str, str]]] = {}
                 try:
@@ -10223,7 +10231,7 @@ def resolve_peer_compatibility_with_verification(
                             terminalStatus=exc.terminal_status,
                             terminalSource=exc.terminal_source,
                             stopCode=exc.stop_code,
-                            **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                            details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
                         )
                     raise
                 assignment = candidate_map[project][mode]
@@ -10325,7 +10333,7 @@ def resolve_peer_compatibility_with_verification(
                         ),
                         fixedResolverProofRequired=bool(fixed_input_names),
                         completionStatus=completion_status.value,
-                        **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                        details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
                     )
                     break
 
@@ -10638,7 +10646,7 @@ def resolve_peer_compatibility_with_verification(
                                 else BaselineTerminalStatus.SAT_PROVEN.value
                             ),
                             completionStatus=completion_status.value,
-                                **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                                details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
                         )
                         break
 
@@ -11134,7 +11142,7 @@ def resolve_peer_compatibility_with_verification(
                                     exactAssignmentAuthority=EVIDENCE_CONFIRMED_CONSTRAINT,
                                     probeAuthority=EVIDENCE_DIAGNOSTIC_HINT,
                                     topologyMerged=False,
-                                    **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                                    details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
                                 )
                                 predicate_search_steered = True
                                 break
@@ -11827,7 +11835,7 @@ def resolve_peer_compatibility_with_verification(
                                 universal=False,
                                 topologyMerged=False,
                                 extensionGranted=extension_granted,
-                                **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                                details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
                             )
                             continue
 
@@ -11892,7 +11900,7 @@ def resolve_peer_compatibility_with_verification(
                         authority=EVIDENCE_CONFIRMED_CONSTRAINT,
                         topologyMerged=False,
                         extensionGranted=extension_granted,
-                        **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                        details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
                     )
                     continue
 
@@ -11924,7 +11932,7 @@ def resolve_peer_compatibility_with_verification(
 
                 def localization_progress(event: str, details: Dict[str, object]) -> None:
                     safe_details = _normalize_baseline_progress_details(details)
-                    progress_reporter.emit(project, mode, f"localization-{event}", iteration=iteration, assignment=fingerprint, **safe_details)
+                    progress_reporter.emit(project, mode, f"localization-{event}", iteration=iteration, assignment=fingerprint, details=safe_details)
                     if event in {"start", "resume", "wave-start", "heartbeat", "check-finish", "confirmation-start", "confirmation-heartbeat", "confirmation-finish", "shrink", "timeout", "checkpoint-error", "finish"}:
                         detail_text = ", ".join(f"{key}={value}" for key, value in safe_details.items())
                         level = "warn" if event == "timeout" else "info"
@@ -12507,7 +12515,7 @@ def resolve_peer_compatibility_with_verification(
                     authority=EVIDENCE_CONFIRMED_CONSTRAINT,
                     clauseScope="exact-assignment", universal=False,
                     topologyMerged=False, extensionGranted=extension_granted,
-                    **liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                    details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
                 )
                 if fingerprint == last_fingerprint and len(learned[project][mode]) > 1:
                     eprint(f"[warn] {project}: solver repeated assignment {fingerprint}; learned constraint should force next repair")
@@ -12548,7 +12556,7 @@ def resolve_peer_compatibility_with_verification(
                         event="BASELINE_CONTINUATION_REQUIRED",
                         stopCode="BASELINE_HUMAN_DECISION_REQUIRED",
                         terminalStatus="HUMAN_DECISION_REQUIRED",
-                        **{key: value for key, value in decision_payload.items() if key not in {"project", "mode", "iteration", "schemaVersion"}},
+                        details={key: value for key, value in decision_payload.items() if key not in {"project", "mode", "iteration", "schemaVersion"}},
                     )
                     _raise_baseline_human_decision(decision_payload)
                 terminal_status = (
@@ -12579,7 +12587,7 @@ def resolve_peer_compatibility_with_verification(
                     uniqueConfirmedFailedAssignments=len(
                         confirmed_failed_assignments
                     ),
-                    **summary,
+                    details=summary,
                 )
                 raise _baseline_terminal_error(
                     terminal_status,

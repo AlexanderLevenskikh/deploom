@@ -46,6 +46,8 @@ _VALIDATED_CONTENT: set[tuple[str, str, str]] = set()
 _VALIDATION_WATCHERS: dict[
     tuple[str, str, str], tuple[_DirectoryWatcher, Optional[tuple[int, int]]]
 ] = {}
+# Only exact sentinels created by this process may be ignored by its watcher.
+_VALIDATION_DRAIN_TOKENS: dict[tuple[str, str, str], set[str]] = {}
 
 
 def _retire_validation_watchers(*, key: Optional[str] = None) -> None:
@@ -57,6 +59,7 @@ def _retire_validation_watchers(*, key: Optional[str] = None) -> None:
         watchers = [_VALIDATION_WATCHERS.pop(slot)[0] for slot in slots]
         for slot in slots:
             _VALIDATED_CONTENT.discard(slot)
+            _VALIDATION_DRAIN_TOKENS.pop(slot, None)
     for watcher in watchers:
         watcher.stop()
 
@@ -65,6 +68,7 @@ def _retire_validation_slot(slot: tuple[str, str, str]) -> None:
     with _INTEGRITY_VALIDATION_LOCK:
         entry = _VALIDATION_WATCHERS.pop(slot, None)
         _VALIDATED_CONTENT.discard(slot)
+        _VALIDATION_DRAIN_TOKENS.pop(slot, None)
     if entry is not None:
         entry[0].stop()
 
@@ -82,6 +86,7 @@ def _watcher_is_clean(watcher: _DirectoryWatcher) -> bool:
 def _dependency_link_topology_issue(
     workspace: Path,
     dependency_roots: Sequence[str],
+    progress: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
     """Return why dependency bytes cannot use the watcher-only memo.
 
@@ -98,7 +103,12 @@ def _dependency_link_topology_issue(
     reparse_attribute = int(
         getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0
     )
+    scanned = 0
+    heartbeat_at = time.monotonic() + 15
     while pending:
+        if progress and time.monotonic() >= heartbeat_at:
+            progress(f"prepared artifact continuity: checked {scanned} entries")
+            heartbeat_at = time.monotonic() + 15
         directory = pending.pop()
         try:
             with os.scandir(directory) as iterator:
@@ -106,6 +116,7 @@ def _dependency_link_topology_issue(
         except OSError:
             return "link-topology-unavailable"
         for item in entries:
+            scanned += 1
             path = Path(item.path)
             try:
                 # CPython may leave DirEntry.stat().st_nlink as zero on
@@ -451,8 +462,10 @@ def publish_prepared_artifact_record(
             "prepared-artifact.integrity",
             outcome="publish-rejected",
             artifactKey=str(key),
-            errorType=type(exc).__name__,
+            errorType=type(exc).__name__, error=str(exc),
         )
+        if progress:
+            progress(f"snapshot-publish: durable record rejected: {exc}")
         return False
     payload = {
         "schemaVersion": ARTIFACT_INDEX_SCHEMA,
@@ -516,6 +529,8 @@ def publish_prepared_artifact_record(
 def load_prepared_artifact_record(
     key: str,
     source_project: Path,
+    *,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> Optional[dict[str, object]]:
     path = _record_path(key)
     if path is None or not path.is_file():
@@ -578,8 +593,12 @@ def load_prepared_artifact_record(
         # durable record.
         current_identity = tree_object_identity(workspace)
         delivered, drain_token = drain_watcher(watcher, workspace)
+        with _INTEGRITY_VALIDATION_LOCK:
+            owned_tokens = _VALIDATION_DRAIN_TOKENS.setdefault(validation_slot, set())
+            owned_tokens.add(drain_token)
+            owned_tokens = frozenset(owned_tokens)
         pending_events = [
-            item for item in list(watcher.events) if drain_token not in item[1]
+            item for item in list(watcher.events) if item[1] not in owned_tokens
         ]
         thread = watcher._thread
         fallback_reason = ""
@@ -595,9 +614,15 @@ def load_prepared_artifact_record(
             fallback_reason = "watcher-drain-unconfirmed"
         elif pending_events:
             fallback_reason = "watcher-event-observed"
+        elif len(owned_tokens) > 256:
+            fallback_reason = "drain-history-limit"
+        elif any(os.path.lexists(workspace / token) for token in owned_tokens):
+            # A sentinel must have been removed. Recreating an old sentinel name
+            # cannot smuggle a new persistent file into the sealed tree.
+            fallback_reason = "drain-sentinel-still-present"
         else:
             fallback_reason = _dependency_link_topology_issue(
-                workspace, dependency_roots
+                workspace, dependency_roots, progress=progress
             ) or ""
 
         if fallback_reason:
@@ -625,13 +650,18 @@ def load_prepared_artifact_record(
 
     if validation_mode == "full-hash":
         try:
-            observed_integrity = build_artifact_tree_integrity(workspace)
+            if progress:
+                progress("prepared artifact continuity: full integrity validation started")
+            observed_integrity = build_artifact_tree_integrity(
+                workspace, progress=progress,
+                progress_label="prepared artifact continuity",
+            )
         except ArtifactIntegrityError as exc:
             if candidate_watcher is not None:
                 candidate_watcher.stop()
             emit_observability_event(
                 "prepared-artifact.integrity", outcome="validation-error",
-                artifactKey=_valid_key(key), errorType=type(exc).__name__,
+                artifactKey=_valid_key(key), errorType=type(exc).__name__, error=str(exc),
             )
             invalidate_prepared_artifact_record(key, remove_tree=False)
             return None

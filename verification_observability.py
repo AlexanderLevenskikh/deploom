@@ -20,6 +20,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Mapping, Optional
 
+from bounded_telemetry import append_bounded_telemetry
+
 # BLOCK_Y_OBSERVABILITY_CONTRACT_V1
 # BLOCK_Y_FULL_OBSERVABILITY_V1
 OBSERVABILITY_SCHEMA = "verification-observability-v2-performance"
@@ -583,9 +585,7 @@ def emit_observability_event(
             + "\n"
         )
         with _write_lock(sink):
-            with sink.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(line)
-                handle.flush()
+            append_bounded_telemetry(sink, line)
     except OSError:
         return
 
