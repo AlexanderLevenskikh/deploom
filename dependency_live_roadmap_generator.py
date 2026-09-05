@@ -10911,7 +10911,12 @@ def resolve_peer_compatibility_with_verification(
                     if result.kind == "project" and config.project_checks == "adaptive":
                         targeted_commands = _targeted_adaptive_confirmation_commands(result, config)
                         if targeted_commands != config.commands:
-                            confirmation_config = dataclasses.replace(config, commands=targeted_commands)
+                            # Preserve the Fast/pre-incumbent publication policy already derived above.
+                            # Rebuilding from the original config here used to restore durable publication
+                            # and force a whole-tree integrity seal for an assignment being confirmed as FAIL.
+                            confirmation_config = dataclasses.replace(
+                                confirmation_config, commands=targeted_commands,
+                            )
                             eprint(
                                 f"[info] {project}: exact confirmation narrowed project checks "
                                 f"from {len(config.commands)} to {len(targeted_commands)} responsible command(s): "
