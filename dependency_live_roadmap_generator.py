@@ -175,6 +175,7 @@ REGISTRY_METADATA_MAX_ATTEMPTS = 3
 # BLOCK_VH_BASELINE_INTENT_HUMAN_LOOP_V1
 BASELINE_DECISION_MARKER = "DEPLOOM_BASELINE_DECISION_V1 "
 BASELINE_INTENT_POLICIES = frozenset({"auto", "keep-current", "required"})
+BASELINE_EXECUTION_MODES = frozenset({"FAST", "AUTOPILOT", "BACKGROUND"})
 BASELINE_INTERACTIVE_UNARY_THRESHOLD = 3
 _BASELINE_INTENT_CACHE_RAW = "<unset>"
 _BASELINE_INTENT_CACHE: Dict[str, Any] = {"schemaVersion": 1, "policies": {}}
@@ -200,7 +201,10 @@ def _baseline_intent_payload() -> Dict[str, Any]:
             normalized = str(policy or "").strip().lower()
             if normalized in {"keep-current", "required"}:
                 policies[str(name)] = normalized
-    _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": policies}
+    execution_mode = str(parsed.get("executionMode") or "AUTOPILOT").strip().upper() if isinstance(parsed, dict) else "AUTOPILOT"
+    if execution_mode not in BASELINE_EXECUTION_MODES:
+        execution_mode = "AUTOPILOT"
+    _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": policies, "executionMode": execution_mode}
     return _BASELINE_INTENT_CACHE
 
 
@@ -247,6 +251,34 @@ def _baseline_search_mode() -> BaselineSearchMode:
         return BaselineSearchMode(raw)
     except ValueError:
         return BaselineSearchMode.AUTO
+
+
+def _baseline_execution_mode() -> str:
+    raw = str(os.environ.get("DEPLOOM_BASELINE_EXECUTION_MODE") or "").strip().upper()
+    if not raw:
+        raw = str(_baseline_intent_payload().get("executionMode") or "AUTOPILOT").strip().upper()
+    return raw if raw in BASELINE_EXECUTION_MODES else "AUTOPILOT"
+
+
+def _baseline_max_expensive_attempts(default: int) -> int:
+    raw = _baseline_env_nonnegative_int("DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS")
+    if raw:
+        return max(1, raw)
+    mode = _baseline_execution_mode()
+    if mode == "FAST":
+        return 2
+    if mode == "AUTOPILOT":
+        return min(max(1, int(default)), 4)
+    return max(1, int(default))
+
+
+def _baseline_deep_search_allowed(*, has_incumbent: bool, search_mode: Optional[BaselineSearchMode] = None) -> bool:
+    effective = search_mode or _baseline_search_mode()
+    return bool(has_incumbent or _baseline_execution_mode() == "BACKGROUND" or effective == BaselineSearchMode.EXHAUSTIVE)
+
+
+def _baseline_preseal_screening_enabled(*, has_incumbent: bool) -> bool:
+    return bool(not has_incumbent and _baseline_execution_mode() in {"FAST", "AUTOPILOT"} and _baseline_search_mode() != BaselineSearchMode.EXHAUSTIVE)
 
 
 def _baseline_automatic_budget_seconds() -> int:
@@ -9820,7 +9852,10 @@ def resolve_peer_compatibility_with_verification(
                 # Do not maintain an alternate project/command-only authority cache.
                 # verify_assignment already owns the strong Resolver/ProjectProof
                 # cache and binds project reuse to an exact ResolvedStateKey.
-                control_config = dataclasses.replace(config, project_checks="diagnostic", commands=(command,))
+                control_config = dataclasses.replace(
+                    config, project_checks="diagnostic", commands=(command,),
+                    publish_durable_prepared_artifact=not _baseline_preseal_screening_enabled(has_incumbent=anytime.incumbent is not None),
+                )
                 control_request_key = (
                     project_source_snapshot_key,
                     project_resolver_context_key,
@@ -10017,7 +10052,7 @@ def resolve_peer_compatibility_with_verification(
             anytime = BaselineAnytimeState(
                 policy=AutomaticBudgetPolicy(
                     wall_clock_seconds=_baseline_automatic_budget_seconds(),
-                    max_expensive_attempts=max(1, config.max_iterations),
+                    max_expensive_attempts=_baseline_max_expensive_attempts(config.max_iterations),
                 ),
                 search_mode=_baseline_search_mode(),
             )
@@ -10049,7 +10084,8 @@ def resolve_peer_compatibility_with_verification(
                 f"[info] {project}: Baseline solve-and-verify {mode} started; "
                 f"maxIterations={config.max_iterations}, hardIterations={liveness.hard_iterations}, "
                 f"learningExtensionLimit={liveness.max_learning_extensions}, parallelism={config.parallelism}, "
-                f"solverManagedInputs={solver_managed_inputs}, fixedInputs={len(fixed_input_names)}"
+                f"solverManagedInputs={solver_managed_inputs}, fixedInputs={len(fixed_input_names)}, "
+                f"executionMode={_baseline_execution_mode()}"
             )
             progress_reporter.emit(
                 project,
@@ -10102,7 +10138,10 @@ def resolve_peer_compatibility_with_verification(
                     learned_constraints=len(learned[project][mode]),
                 )
                 anytime.update_incumbent(incumbent)
-                return anytime.completion_status(desired_identity) or BaselineCompletionStatus.VERIFIED_GOOD_ENOUGH
+                completion = anytime.completion_status(desired_identity) or BaselineCompletionStatus.VERIFIED_GOOD_ENOUGH
+                if baseline_keep_current and completion == BaselineCompletionStatus.VERIFIED_TARGET_COMPLETE:
+                    return BaselineCompletionStatus.VERIFIED_PARTIAL_SCOPE
+                return completion
 
             def checkpoint_baseline_run(
                 phase: str,
@@ -10449,9 +10488,14 @@ def resolve_peer_compatibility_with_verification(
                             and len(config.commands) > 1
                         ):
                             screen_command = config.commands[0]
+                            screen_preseal = _baseline_preseal_screening_enabled(has_incumbent=anytime.incumbent is not None)
                             screen_config = dataclasses.replace(
-                                config, commands=(screen_command,)
+                                config, commands=(screen_command,),
+                                publish_durable_prepared_artifact=not screen_preseal,
                             )
+                            if screen_preseal:
+                                progress_reporter.emit(project, mode, "adaptive-screen-preseal", iteration=iteration, assignment=fingerprint, command=screen_command, executionMode=_baseline_execution_mode(), durablePublicationDeferred=True, authority="PROJECT_CHECK")
+                                eprint(f"[info] {project}: Baseline {_baseline_execution_mode().lower()} pre-seal screen; command={screen_command}; durable publication deferred")
                             progress_reporter.emit(
                                 project, mode, "adaptive-screen-started",
                                 iteration=iteration,
@@ -10661,7 +10705,9 @@ def resolve_peer_compatibility_with_verification(
                         )
 
                     confirmation_project_checks = result.kind in {"preparation", "project"}
-                    confirmation_config = config
+                    confirmation_config = dataclasses.replace(
+                        config, publish_durable_prepared_artifact=not _baseline_preseal_screening_enabled(has_incumbent=anytime.incumbent is not None),
+                    )
                     if result.kind == "project" and config.project_checks == "adaptive":
                         targeted_commands = _targeted_adaptive_confirmation_commands(result, config)
                         if targeted_commands != config.commands:
@@ -11151,18 +11197,36 @@ def resolve_peer_compatibility_with_verification(
                         continue
 
                     generalized_nogood: Optional[Dict[str, str]] = None
-                    proposal = _adaptive_graph_guided_generalization_proposal(
-                        rows_by_name,
-                        assignment,
-                        mode,
-                        client,
-                        learned[project][mode],
-                        result,
-                        project_key=project,
-                        repeat_tracker=graph_generalization_repeats,
-                        failed_candidates=graph_generalization_failed_candidates,
-                        seed_packages_by_family=graph_generalization_seed_packages,
+                    deep_search_allowed = _baseline_deep_search_allowed(
+                        has_incumbent=anytime.incumbent is not None,
+                        search_mode=anytime.search_mode,
                     )
+                    if deep_search_allowed:
+                        proposal = _adaptive_graph_guided_generalization_proposal(
+                            rows_by_name,
+                            assignment,
+                            mode,
+                            client,
+                            learned[project][mode],
+                            result,
+                            project_key=project,
+                            repeat_tracker=graph_generalization_repeats,
+                            failed_candidates=graph_generalization_failed_candidates,
+                            seed_packages_by_family=graph_generalization_seed_packages,
+                        )
+                    else:
+                        proposal = None
+                        progress_reporter.emit(
+                            project, mode, "pre-incumbent-deep-search-deferred",
+                            iteration=iteration, assignment=fingerprint,
+                            predicate=failure_predicate, executionMode=_baseline_execution_mode(),
+                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                            reason="time-to-first-verified-usable-result",
+                        )
+                        eprint(
+                            f"[info] {project}: {_baseline_execution_mode()} defers graph certification/minimization "
+                            "before first verified incumbent; exact confirmed assignment exclusion remains authority"
+                        )
                     if proposal is not None:
                         proposal = _cross_iteration_consensus_proposal(
                             proposal,

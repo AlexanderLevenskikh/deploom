@@ -1,7 +1,7 @@
 import { AlertTriangle, Search, ShieldCheck, X } from 'lucide-react'
 import { useDeferredValue, useEffect, useMemo, useState } from 'react'
 import { useLanguage } from '../i18n'
-import type { BaselineDecision, BaselineIntent, BaselineIntentPlan, BaselinePackagePolicy } from '../types'
+import type { BaselineDecision, BaselineExecutionMode, BaselineIntent, BaselineIntentPlan, BaselinePackagePolicy } from '../types'
 import { QuickSelect } from './QuickSelect'
 
 type Props = {
@@ -27,10 +27,16 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
   const [query, setQuery] = useState('')
   const [kind, setKind] = useState<'all' | 'runtime' | 'dev' | 'peer'>('all')
   const [policies, setPolicies] = useState<Record<string, BaselinePackagePolicy>>({ ...plan.intent.policies })
+  const [executionMode, setExecutionMode] = useState<BaselineExecutionMode>(plan.intent.executionMode ?? 'AUTOPILOT')
+  const [fastAutoExcluded, setFastAutoExcluded] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const deferredQuery = useDeferredValue(query)
 
-  useEffect(() => setPolicies({ ...plan.intent.policies }), [plan])
+  useEffect(() => {
+    setPolicies({ ...plan.intent.policies })
+    setExecutionMode(plan.intent.executionMode ?? 'AUTOPILOT')
+    setFastAutoExcluded([])
+  }, [plan])
 
   const visible = useMemo(() => {
     const needle = deferredQuery.trim().toLowerCase()
@@ -47,16 +53,18 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
   }, [plan.candidates, policies])
 
   const dirty = useMemo(
-    () => policyFingerprint(policies) !== policyFingerprint(plan.intent.policies),
-    [plan.intent.policies, policies],
+    () => policyFingerprint(policies) !== policyFingerprint(plan.intent.policies)
+      || executionMode !== (plan.intent.executionMode ?? 'AUTOPILOT'),
+    [executionMode, plan.intent.executionMode, plan.intent.policies, policies],
   )
 
-  const buildIntent = (extra = 0, grant = 0, nextPolicies = policies, searchMode: BaselineIntent['searchMode'] = 'AUTO'): BaselineIntent => ({
+  const buildIntent = (extra = 0, grant = 0, nextPolicies = policies, searchMode: BaselineIntent['searchMode'] = 'AUTO', nextExecutionMode: BaselineExecutionMode = executionMode): BaselineIntent => ({
     schemaVersion: 1,
     policies: Object.fromEntries(Object.entries(nextPolicies).filter(([, value]) => value !== 'auto')),
     extraIterations: Math.max(0, Number(plan.intent.extraIterations ?? 0) + extra),
     decisionGrantIterations: grant,
     searchMode,
+    executionMode: nextExecutionMode,
   })
 
   const submit = async (intent: BaselineIntent) => {
@@ -77,8 +85,26 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     setPolicies((current) => ({ ...current, [name]: policy }))
   }
 
+  const chooseExecutionMode = (nextMode: BaselineExecutionMode) => {
+    if (nextMode === executionMode) return
+    if (nextMode === 'FAST') {
+      const autoDev = plan.candidates.filter((item) => item.kind === 'dev' && (policies[item.name] ?? 'auto') === 'auto').map((item) => item.name)
+      if (autoDev.length) setPolicies((current) => ({ ...current, ...Object.fromEntries(autoDev.map((name) => [name, 'keep-current' as const])) }))
+      setFastAutoExcluded(autoDev)
+    } else if (executionMode === 'FAST' && fastAutoExcluded.length) {
+      setPolicies((current) => {
+        const next = { ...current }
+        for (const name of fastAutoExcluded) if (next[name] === 'keep-current') delete next[name]
+        return next
+      })
+      setFastAutoExcluded([])
+    }
+    setExecutionMode(nextMode)
+  }
+
   const continueSearch = () => void submit(buildIntent(DECISION_TRANCHE, DECISION_TRANCHE, policies, 'BOUNDED_IMPROVEMENT'))
-  const continueExhaustive = () => void submit(buildIntent(DECISION_TRANCHE * 8, DECISION_TRANCHE * 8, policies, 'EXHAUSTIVE'))
+  const continueInBackground = () => void submit(buildIntent(DECISION_TRANCHE * 4, DECISION_TRANCHE * 4, policies, 'BOUNDED_IMPROVEMENT', 'BACKGROUND'))
+  const continueExhaustive = () => void submit(buildIntent(DECISION_TRANCHE * 8, DECISION_TRANCHE * 8, policies, 'EXHAUSTIVE', 'BACKGROUND'))
   const applyAndContinue = () => void submit(buildIntent(mode === 'decision' ? DECISION_TRANCHE : 0, mode === 'decision' ? DECISION_TRANCHE : 0, policies, mode === 'decision' ? 'BOUNDED_IMPROVEMENT' : 'AUTO'))
   const keepFocusAndContinue = () => {
     if (!decision?.package) return
@@ -109,6 +135,15 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
           </div>
           <button type="button" className="icon-button" aria-label={text('Закрыть без применения', 'Close without applying')} onClick={requestCancel}><X size={17} /></button>
         </header>
+
+        <div className="baseline-intent-stats">
+          <button type="button" className={executionMode === 'FAST' ? 'button primary' : 'button secondary'} disabled={busy} onClick={() => chooseExecutionMode('FAST')}>{text('⚡ Быстро · ~15 мин', '⚡ Fast · ~15 min')}</button>
+          <button type="button" className={executionMode === 'AUTOPILOT' ? 'button primary' : 'button secondary'} disabled={busy} onClick={() => chooseExecutionMode('AUTOPILOT')}>{text('▶ Автопилот · ~30 мин', '▶ Autopilot · ~30 min')}</button>
+          <button type="button" className={executionMode === 'BACKGROUND' ? 'button primary' : 'button secondary'} disabled={busy} onClick={() => chooseExecutionMode('BACKGROUND')}>{text('☾ В фоне · до 2 ч', '☾ Background · up to 2h')}</button>
+        </div>
+        <div className="baseline-intent-scope-note">
+          {executionMode === 'FAST' ? text('Fast: AUTO DEV-пакеты оставлены текущими по явной USER_POLICY. Можно вернуть любой пакет в AUTO/Обязательно ниже.', 'Fast: AUTO dev packages are kept current by explicit USER_POLICY. You can put any package back into AUTO/Required below.') : executionMode === 'BACKGROUND' ? text('Background: более глубокий поиск с пониженной I/O-конкуренцией. Другие проекты остаются доступны; конфликтующие действия этого проекта защищены.', 'Background: deeper search with reduced I/O concurrency. Other projects remain available; conflicting actions on this project stay protected.') : text('Autopilot: полный выбранный scope, ранний high-signal screening и bounded search до первого полезного verified результата.', 'Autopilot: full selected scope, early high-signal screening and bounded search toward the first useful verified result.')}
+        </div>
 
         {mode === 'decision' && decision ? (
           <div className="baseline-decision-summary">
@@ -169,7 +204,8 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
           <span className="baseline-intent-apply-hint">{dirty ? text('Есть неприменённые изменения', 'There are unapplied changes') : text('Состав готов', 'Scope is ready')}</span>
           <button type="button" className="button secondary" disabled={busy} onClick={requestCancel}>{mode === 'decision' ? text('Оставить на паузе', 'Keep paused') : text('Отмена', 'Cancel')}</button>
           {mode === 'decision' ? <button type="button" className="button secondary" disabled={busy} onClick={continueSearch}>{text(`Продолжить поиск (+${DECISION_TRANCHE})`, `Continue search (+${DECISION_TRANCHE})`)}</button> : null}
-          {mode === 'decision' ? <button type="button" className="button secondary" disabled={busy} onClick={continueExhaustive}>{text('Исчерпывающий поиск', 'Continue exhaustive')}</button> : null}
+          {mode === 'decision' ? <button type="button" className="button secondary" disabled={busy} onClick={continueInBackground}>{text('Продолжить в фоне', 'Continue in background')}</button> : null}
+          {mode === 'decision' ? <button type="button" className="button secondary" disabled={busy} onClick={continueExhaustive}>{text('Исчерпывающий поиск в фоне', 'Continue exhaustive in background')}</button> : null}
           {mode === 'decision' && decision?.package ? <button type="button" className="button secondary" disabled={busy} onClick={keepFocusAndContinue}>{text(`Исключить ${decision.package} и продолжить`, `Exclude ${decision.package} and continue`)}</button> : null}
           <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{mode === 'decision' ? text('Применить и продолжить', 'Apply and continue') : text('Подтвердить и запустить Baseline', 'Confirm and start Baseline')}</button>
         </footer>

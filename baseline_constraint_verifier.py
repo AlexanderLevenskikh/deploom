@@ -109,6 +109,9 @@ from block_v_prepared_artifact import (
     configure_prepared_artifact_store,
     invalidate_prepared_artifact_record,
     is_durable_prepared_path,
+    pin_prepared_artifact_record,
+    unpin_prepared_artifact_record,
+    clear_prepared_artifact_pins,
     load_prepared_artifact_record,
     prepared_snapshot_storage_root,
     publish_prepared_artifact_record,
@@ -125,6 +128,10 @@ class BaselineVerifyConfig:
     attempt_timeout_seconds: int = 3600
     localization_timeout_seconds: int = 7200
     progress_interval_seconds: int = 15
+    # Performance policy only. False keeps authoritative lifecycle/project checks
+    # but keeps the PreparedSnapshot request-private, so a failing early screen
+    # does not pay the full durable integrity seal.
+    publish_durable_prepared_artifact: bool = True
     snapshot_copy_timeout_seconds: int = 1800
     project_checks: str = "adaptive"  # off | diagnostic | adaptive | strict
     commands: Tuple[str, ...] = ()
@@ -686,6 +693,7 @@ def _coalesce_same_run_preparation(key: Tuple[object, ...]):
 
 def reset_same_run_verification_reuse() -> None:
     """Start a new Baseline run without restoring process-local trust."""
+    clear_prepared_artifact_pins()
     with _PREPARATION_COORDINATION_LOCK:
         _PREPARATION_COORDINATION.clear()
     with _PREPARED_SNAPSHOT_LOCK:
@@ -704,6 +712,7 @@ def _cleanup_prepared_snapshot_root() -> None:
     _PREPARED_FASTPATH_DISABLED.clear()
     _PREPARED_FASTPATH_COMMAND_DISABLED.clear()
     _PREPARED_SNAPSHOT_PRODUCERS.clear()
+    clear_prepared_artifact_pins()
     with _PREPARATION_COORDINATION_LOCK:
         _PREPARATION_COORDINATION.clear()
 
@@ -1187,6 +1196,7 @@ def _retire_prepared_workspace_snapshot(snapshot: PreparedWorkspaceSnapshot) -> 
 
 def _evict_prepared_workspace_snapshot(key: str, source_project: Path) -> None:
     slot = _prepared_snapshot_slot(key, source_project)
+    unpin_prepared_artifact_record(key)
     with _PREPARED_SNAPSHOT_LOCK:
         snapshot = _PREPARED_SNAPSHOTS.pop(slot, None)
     durable = bool(snapshot is not None and is_durable_prepared_path(snapshot.workspace_root))
@@ -2533,6 +2543,7 @@ def verify_assignment(
                     observedResolvedHash=observed_hash,
                 )
                 if producer is not None:
+                    pin_prepared_artifact_record(proof_identity.preparation_proof_key)
                     event(
                         "same-run.prepared-artifact.hit",
                         marker="SAME_RUN_PREPARED_ARTIFACT_HIT",
@@ -2698,6 +2709,9 @@ def verify_assignment(
                     progress,
                     f"{progress_label}: snapshot publish started; hardTimeout={snapshot_timeout}s",
                 )
+                durable_snapshot_requested = bool(
+                    preparation_publication_allowed and config.publish_durable_prepared_artifact
+                )
                 try:
                     snapshot = _publish_prepared_workspace_snapshot(
                         workspace_root, workspace_project,
@@ -2706,10 +2720,10 @@ def verify_assignment(
                         observed_hash=observed_hash,
                         source_project=project_dir,
                         seal_dependency_integrity=preparation_fastpath_enabled,
-                        shared_reuse_allowed=preparation_publication_allowed,
+                        shared_reuse_allowed=durable_snapshot_requested,
                         publication_root=(
                             None
-                            if preparation_publication_allowed
+                            if durable_snapshot_requested
                             else temp_root / "private-prepared-snapshots"
                         ),
                         progress=progress,
@@ -2736,12 +2750,13 @@ def verify_assignment(
                     f"{progress_label}: snapshot publish PASS; elapsed={snapshot_duration_ms // 1000}s; mode={snapshot.storage_mode}",
                 )
                 workspace_project = snapshot.workspace_root / snapshot.project_relative
-                if preparation_publication_allowed:
+                if durable_snapshot_requested:
                     _PREPARED_SNAPSHOT_PRODUCERS[
                         _prepared_snapshot_slot(
                             proof_identity.preparation_proof_key, project_dir
                         )
                     ] = progress_label
+                    pin_prepared_artifact_record(proof_identity.preparation_proof_key)
 
             if snapshot is None:
                 return BaselineVerifyResult(False, "infrastructure", "PREPARED_SNAPSHOT_UNAVAILABLE: project checks require a sealed preparation tree")

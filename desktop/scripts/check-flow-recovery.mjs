@@ -82,14 +82,18 @@ if (parsedRecovery?.status !== "migration-repair-required") throw new Error("Rel
 if (!releasePrompt.includes("Human prose in chat is diagnostic only")) throw new Error("Release recovery must not use Markdown text as its primary control channel");
 
 const mainSource = readFileSync(new URL("../electron/main.ts", import.meta.url), "utf8");
+const retrySource = readFileSync(new URL("../electron/baseline-retry.ts", import.meta.url), "utf8");
 for (const retryContract of [
+  "import { isDeterministicToolFailure } from './baseline-retry.js'",
   "function nonRetryableDeterministicFailure",
   "function deterministicPythonProgrammingFailure",
   "BASELINE_VERIFY_INCONCLUSIVE_PROJECT_ERROR",
   "!nonRetryableDeterministicFailure(result)",
-  "NameError|UnboundLocalError",
 ]) {
-  if (!mainSource.includes(retryContract)) throw new Error(`Deterministic Baseline retry contract missing: ${retryContract}`);
+  if (!mainSource.includes(retryContract)) throw new Error(`Deterministic Baseline retry integration missing: ${retryContract}`);
+}
+for (const retryContract of ["DEPLOOM_FAILURE_V2", "TOOL_INTERNAL_ERROR", "NameError|UnboundLocalError"]) {
+  if (!retrySource.includes(retryContract)) throw new Error(`Deterministic Baseline retry classifier missing: ${retryContract}`);
 }
 
 for (const required of [

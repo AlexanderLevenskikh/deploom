@@ -150,6 +150,76 @@ _DEFAULT_GC_INITIAL_DELAY_SECONDS = 30.0
 _DEFAULT_GC_PAUSE_SECONDS = 5.0
 
 
+# BLOCK_PHI_SAME_RUN_ARTIFACT_RETENTION_V1
+# Cross-process pin markers are performance state only. They keep background LRU
+# maintenance from retiring an artifact between proof 1/2 and proof 2/2. They do
+# not bypass content continuity validation and stale crash pins expire.
+_PIN_MAX_AGE_SECONDS = 6 * 60 * 60
+
+
+def _pin_root(root: Optional[Path] = None) -> Optional[Path]:
+    target = root or configured_prepared_artifact_root()
+    if target is None:
+        return None
+    path = target / "pins"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def pin_prepared_artifact_record(key: str) -> bool:
+    root = _pin_root()
+    if root is None:
+        return False
+    path = root / f"{_valid_key(key)}.{os.getpid()}.pin"
+    try:
+        path.write_text(str(time.time()), encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def unpin_prepared_artifact_record(key: str) -> None:
+    root = _pin_root()
+    if root is None:
+        return
+    try:
+        (root / f"{_valid_key(key)}.{os.getpid()}.pin").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def clear_prepared_artifact_pins() -> None:
+    root = _pin_root()
+    if root is None:
+        return
+    for path in root.glob(f"*.{os.getpid()}.pin"):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _artifact_key_pinned(key: str, *, now: Optional[float] = None) -> bool:
+    root = _pin_root()
+    if root is None:
+        return False
+    current = time.time() if now is None else float(now)
+    pinned = False
+    for path in root.glob(f"{_valid_key(key)}.*.pin"):
+        try:
+            age = max(0.0, current - path.stat().st_mtime)
+        except OSError:
+            continue
+        if age <= _PIN_MAX_AGE_SECONDS:
+            pinned = True
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return pinned
+
+
 def configure_prepared_artifact_store(proof_cache_dir: str | Path | None) -> Optional[Path]:
     """Configure durable PreparedArtifact storage."""
     global _CONFIGURED_ROOT
@@ -821,6 +891,9 @@ def prune_prepared_artifact_store(
 
     removed = 0
     for record in records[limit:]:
+        if _artifact_key_pinned(record.stem):
+            emit_observability_event("prepared-artifact.gc-skip", artifactKey=record.stem, reason="active-same-run-pin")
+            continue
         if invalidate_prepared_artifact_record(record.stem, remove_tree=True):
             removed += 1
             if removal_limit is not None and removed >= removal_limit:

@@ -62,7 +62,8 @@ type AgentProvider = 'codex' | 'opencode' | 'claude'
 type ThemePreference = 'system' | 'light' | 'dark'
 type BaselinePackagePolicy = 'auto' | 'keep-current' | 'required'
 type BaselineSearchMode = 'AUTO' | 'BOUNDED_IMPROVEMENT' | 'EXHAUSTIVE'
-type BaselineIntent = { schemaVersion: 1; policies: Record<string, BaselinePackagePolicy>; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode }
+type BaselineExecutionMode = 'FAST' | 'AUTOPILOT' | 'BACKGROUND'
+type BaselineIntent = { schemaVersion: 1; policies: Record<string, BaselinePackagePolicy>; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode }
 type BaselineIntentCandidate = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string }
 type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent }
 type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
@@ -303,6 +304,7 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
     extraIterations: Math.max(0, Math.floor(Number(raw.extraIterations ?? 0) || 0)),
     decisionGrantIterations: Math.max(0, Math.floor(Number(raw.decisionGrantIterations ?? 0) || 0)),
     searchMode: raw.searchMode === 'EXHAUSTIVE' || raw.searchMode === 'BOUNDED_IMPROVEMENT' ? raw.searchMode : 'AUTO',
+    executionMode: raw.executionMode === 'FAST' || raw.executionMode === 'BACKGROUND' ? raw.executionMode : 'AUTOPILOT',
   }
 }
 
@@ -1801,6 +1803,9 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
       const explicitIntent = input.baselineIntent ? normalizeBaselineIntent(input.baselineIntent) : undefined
       const effectiveIntent = explicitIntent ?? persistedIntent
       if (explicitIntent) saveBaselineIntent(workspace, project.name, explicitIntent)
+      const executionMode: BaselineExecutionMode = effectiveIntent.executionMode ?? 'AUTOPILOT'
+      const automaticBudgetSeconds = executionMode === 'FAST' ? 15 * 60 : executionMode === 'BACKGROUND' ? 2 * 60 * 60 : 30 * 60
+      const maxExpensiveAttempts = executionMode === 'FAST' ? 2 : executionMode === 'BACKGROUND' ? 8 : 4
 
       // Concurrent project Baselines must not race on the workspace's shared
       // dependency-roadmap.{md,json,html} publication. Baseline evidence and
@@ -1824,12 +1829,15 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
         env: {
           DEPLOOM_BASELINE_RESUME: input.baselineResume === 'restart' ? 'restart' : input.baselineResume === 'continue' ? 'continue' : 'auto',
           DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE: input.baselineResume === 'continue' ? '1' : '0',
-          DEPLOOM_BASELINE_INTENT_JSON: JSON.stringify({ schemaVersion: 1, policies: effectiveIntent.policies }),
+          DEPLOOM_BASELINE_INTENT_JSON: JSON.stringify({ schemaVersion: 1, policies: effectiveIntent.policies, executionMode }),
           DEPLOOM_BASELINE_INTERACTIVE: '1',
+          DEPLOOM_BASELINE_EXECUTION_MODE: executionMode,
           DEPLOOM_BASELINE_EXTRA_ITERATIONS: String(effectiveIntent.extraIterations ?? 0),
           DEPLOOM_BASELINE_DECISION_GRANT_ITERATIONS: String(explicitIntent?.decisionGrantIterations ?? 0),
           DEPLOOM_BASELINE_SEARCH_MODE: explicitIntent?.searchMode ?? 'AUTO',
-          DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS: '1800',
+          DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS: String(automaticBudgetSeconds),
+          DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS: String(maxExpensiveAttempts),
+          ...(executionMode === 'BACKGROUND' ? { DEPLOOM_IO_COPY_SLOTS: '1', DEPLOOM_IO_HASH_SLOTS: '1', DEPLOOM_IO_PM_SLOTS: '1' } : {}),
         },
         stallWarningMs: 2 * 60_000,
         stallAbortMs: 15 * 60_000,
