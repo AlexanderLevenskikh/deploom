@@ -56,6 +56,7 @@
         "check:baseline-intent": "node scripts/check-baseline-intent.mjs",
         "check:baseline-retry": "node scripts/check-baseline-retry.mjs",
         "check:interaction-contracts": "node scripts/check-interaction-contracts.mjs",
+        "check:dependency-graph": "node scripts/check-dependency-graph.mjs",
         "check:ui-lifecycle": "node scripts/check-ui-lifecycle.mjs"
     },
     "dependencies": {
