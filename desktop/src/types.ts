@@ -13,6 +13,10 @@ export type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent
 export type BaselineCohortSuggestion = { id: string; label: string; predicate: string; subjects: string[]; packages: string[]; blockedPackages: string[]; warningPackages: string[]; boundaryPackages: string[]; confidence: number; reasons: string[]; decisionId: string; expandedFrom?: string; authority: 'DIAGNOSTIC_HINT' }
 export type BaselineDecision = { schemaVersion: 1 | 2; event?: 'BASELINE_CONTINUATION_REQUIRED'; reason: 'repeated-package-conflict' | 'budget-exhausted' | 'policy-unsat' | 'AUTOMATIC_BUDGET_EXHAUSTED' | 'STAGNATION' | 'BASE_ITERATION_LIMIT' | 'EXPENSIVE_DIAGNOSTIC'; project: string; mode: string; iteration?: number; hardIterations?: number; learnedConstraints?: number; package?: string; currentVersion?: string; failedVersions?: string[]; predicate?: string; repeatedPredicate?: string; elapsedSeconds?: number; rejectedAssignments?: number; observedCandidateDurationSeconds?: number; continuationCostClass?: 'minutes' | 'hours'; recommendedAction?: string; availableActions?: string[]; suggestedCohort?: BaselineCohortSuggestion; bestIncumbent?: { changed_dependency_count?: number; policy_score?: number; deferred_targets?: string[]; objective_rank?: number[] } }
 
+export type DependencyGraphPackage = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string; installedVersion?: string; policy: BaselinePackagePolicy; manifestObserved: boolean }
+export type DependencyGraphObservedEdge = { source: string; target: string; kind: 'dependency' | 'peer' | 'optional'; authority: 'OBSERVED_LOCAL_MANIFEST' }
+export type DependencyGraphSnapshot = { schemaVersion: 1; project: string; capturedAt: string; packages: DependencyGraphPackage[]; edges: DependencyGraphObservedEdge[]; intent: Pick<BaselineIntent, 'policies' | 'deferredCohorts'>; manifestCoverage: { observed: number; total: number; missing: string[] }; authorityBoundary: { packageList: 'PROJECT_MANIFEST'; relations: 'OBSERVED_LOCAL_MANIFEST'; cohorts: 'DIAGNOSTIC_HINT_OR_USER_POLICY'; proofAuthority: false } }
+
 export type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
 export type BaselineRecoveryInfo = { available: boolean; mode?: 'yellow' | 'green'; status?: string; phase?: string; updatedAt?: string; generation?: number; iteration?: number; lastAssignment?: string; lastPredicate?: string; learnedConstraints?: number; exactExclusions?: number; reason?: string }
 
@@ -226,6 +230,7 @@ export type DependencyFlowApi = {
   updateProjectBranches: (input: { workspaceId?: string; projectName: string; branchBase?: string; push?: boolean }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   refreshWorkspace: () => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   getBaselineIntentPlan: (input: { workspaceId?: string; projectName: string }) => Promise<BaselineIntentPlan>
+  getDependencyGraphSnapshot: (input: { workspaceId?: string; projectName: string }) => Promise<DependencyGraphSnapshot>
   runAction: (input: ActionInput) => Promise<{ jobId: string; preview: string[] }>
   cancelJob: (jobId: string) => Promise<boolean>
   pauseJob: (jobId: string) => Promise<boolean>

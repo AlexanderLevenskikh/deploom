@@ -1,9 +1,10 @@
-import { Bell, Boxes, Download, ExternalLink, GitFork, Pause, Play, Settings, Workflow } from 'lucide-react'
+import { Bell, Boxes, Download, ExternalLink, GitFork, Network, Pause, Play, Settings, Workflow } from 'lucide-react'
 import { useState } from 'react'
 import './App.css'
 import { AddProjectDialog } from './components/AddProjectDialog'
 import { WorkspaceDialog } from './components/WorkspaceDialog'
 import { DashboardWorkspace } from './components/DashboardWorkspace'
+import { DependencyGraphWorkspace } from './components/DependencyGraphWorkspace'
 import { FlowWorkspace } from './components/FlowWorkspace'
 import { MonitoringPanel } from './components/MonitoringPanel'
 import { ProjectRail } from './components/ProjectRail'
@@ -12,7 +13,7 @@ import { SetupScreen } from './components/SetupScreen'
 import { useDependencyFlow } from './hooks/useDependencyFlow'
 import { useLanguage } from './i18n'
 
-type WorkspaceTab = 'flow' | 'dashboard'
+type WorkspaceTab = 'flow' | 'graph' | 'dashboard'
 
 function App() {
   const flow = useDependencyFlow()
@@ -78,9 +79,10 @@ function App() {
         <main className="main-workspace">
           <div className="workspace-titlebar">
             <div><Boxes size={19} /><h1>{project?.name || t('app.noProject')}</h1></div>
-            <div className="tab-switch" role="tablist"><button role="tab" aria-selected={tab === 'flow'} className={tab === 'flow' ? 'active' : ''} onClick={() => setTab('flow')}>FLOW</button><button role="tab" aria-selected={tab === 'dashboard'} className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button></div>
+            <div className="tab-switch" role="tablist"><button role="tab" aria-selected={tab === 'flow'} className={tab === 'flow' ? 'active' : ''} onClick={() => setTab('flow')}>FLOW</button><button role="tab" aria-selected={tab === 'graph'} className={tab === 'graph' ? 'active' : ''} onClick={() => setTab('graph')}><Network size={14} />Graph</button><button role="tab" aria-selected={tab === 'dashboard'} className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button></div>
           </div>
           {tab === 'flow' && project ? <FlowWorkspace details={details} project={project} activeAction={flow.activeWorkspaceId === details.workspace.id && flow.activeProjectName === project.name ? flow.activeAction : undefined} autopilotActive={flow.autopilotActive && flow.autopilotProjectName === project.name} baselineDecision={flow.baselineDecision} onClearBaselineDecision={flow.clearBaselineDecision} onGetBaselineIntentPlan={flow.getBaselineIntentPlan} onRun={flow.runAction} onSendAgentNote={flow.sendAgentNote} onStartAutopilot={flow.startAutopilot} onStopAutopilot={flow.stopAutopilot} onRecoverWithAgent={flow.recoverWithAgent} onOpenDashboard={openDashboard} onOpenPath={flow.openPath} onChoosePrompt={flow.choosePrompt} onUpdateWorkspace={flow.updateWorkspace} onUpdateProjectBranches={flow.updateProjectBranches} onListAgentModels={flow.listAgentModels} /> : null}
+          {tab === 'graph' && project ? <DependencyGraphWorkspace details={details} project={project} baselineDecision={flow.baselineDecision} onGetSnapshot={flow.getDependencyGraphSnapshot} onOpenFlow={() => setTab('flow')} /> : null}
           {tab === 'dashboard' ? <DashboardWorkspace details={details} onRefresh={flow.refresh} onOpenExternal={() => flow.openPath(details.dashboardPath)} /> : null}
         </main>
 

@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, nativeTheme, net, Notification, pr
 import updaterPackage from 'electron-updater'
 import { isDeterministicToolFailure } from './baseline-retry.js'
 import { BASELINE_DECISION_MARKER, extractBaselineDecisionEnvelope } from './migration-baseline-decision.js'
+import { buildDependencyGraphSnapshot } from './dependency-graph.js'
 const { autoUpdater } = updaterPackage
 import { buildClaudeAgentArgs, buildClaudeResumeArgs, buildCodexAgentArgs, buildCodexResumeArgs, buildOpenCodeAgentArgs, buildOpenCodeResumeArgs, parseOpencodeModelsOutput } from './agent-command.js'
 import { agentBatchCompletionFingerprint, agentScopeFingerprint, extractAgentSessionId, resumableAgentSessionId } from './agent-session.js'
@@ -397,6 +398,10 @@ function baselineIntentPlan(workspace: WorkspaceRecord, project: ProjectSpec): B
   add('devDependencies', 'dev')
   add('peerDependencies', 'peer')
   return { candidates: [...result.values()].sort((a, b) => a.name.localeCompare(b.name)), intent: loadBaselineIntent(workspace, project.name) }
+}
+
+function dependencyGraphSnapshot(workspace: WorkspaceRecord, project: ProjectSpec) {
+  return buildDependencyGraphSnapshot(project.path, project.name, baselineIntentPlan(workspace, project))
 }
 
 type JsonReplacer = (this: unknown, key: string, value: unknown) => unknown
@@ -5703,6 +5708,13 @@ function setupIpc(): void {
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
     return baselineIntentPlan(workspace, project)
+  })
+
+  ipcMain.handle('flow:dependency-graph-snapshot', async (_event, input: { workspaceId?: string; projectName: string }) => {
+    const state = loadState()
+    const workspace = findWorkspace(state, input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    return dependencyGraphSnapshot(workspace, project)
   })
 
   ipcMain.handle('flow:run-action', async (_event, input: ActionInput) => {
