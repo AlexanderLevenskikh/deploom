@@ -1,4 +1,5 @@
 import { classifyFlowRecovery } from "../dist-electron/flow-recovery.js";
+import { BASELINE_DECISION_MARKER, containsBaselineDecisionEnvelope, extractBaselineDecisionEnvelope } from "../dist-electron/migration-baseline-decision.js";
 import { buildReleaseRecoveryPrompt, readReleaseRecoveryResult } from "../dist-electron/release-recovery.js";
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -56,11 +57,21 @@ const cases = [
   ["PLANNER_SCOPE_VIOLATION: planner touched refs", "agent", "agent"],
   ["GROUP_ALIAS_PLAN_MISSING: stale continuation alias", "agent", "agent"],
   ["RECOVERY_INPUT_MISSING: prompt not found", "agent", "agent"],
+  ["MIGRATION_BASELINE_DECISION_REQUIRED: DEPLOOM_BASELINE_DECISION_V1 {\"schemaVersion\":2}", "agent", "agent"],
 ];
 for (const [message, action, expected] of cases) {
   const actual = classifyFlowRecovery(message, action);
   if (actual.kind !== expected) throw new Error(`${message}: expected ${expected}, got ${JSON.stringify(actual)}`);
 }
+
+const decisionPayload = `${BASELINE_DECISION_MARKER}${JSON.stringify({ schemaVersion: 2, event: "BASELINE_CONTINUATION_REQUIRED", reason: "AUTOMATIC_BUDGET_EXHAUSTED", suggestedCohort: { id: "vite-build", packages: ["vite"] } })}`;
+const extractedFromStdout = extractBaselineDecisionEnvelope(`[info] before\n[error] ${decisionPayload}\n`, "");
+if (extractedFromStdout !== decisionPayload) throw new Error("Nested Baseline decision must survive stdout wrappers");
+const extractedFromStderr = extractBaselineDecisionEnvelope("", `trace\n${decisionPayload}\n`);
+if (extractedFromStderr !== decisionPayload) throw new Error("Nested Baseline decision must survive stderr wrappers");
+if (!containsBaselineDecisionEnvelope(`MIGRATION_BASELINE_DECISION_REQUIRED: ${decisionPayload}`)) throw new Error("Wrapped migration decision must remain detectable");
+if (extractBaselineDecisionEnvelope(`${BASELINE_DECISION_MARKER}{broken`, "")) throw new Error("Malformed Baseline decision must not become a control signal");
+if (extractBaselineDecisionEnvelope(`${BASELINE_DECISION_MARKER}${JSON.stringify({ schemaVersion: 2, reason: "old" })}\n${decisionPayload}`, "") !== decisionPayload) throw new Error("Latest valid Baseline decision must win");
 const releasePrompt = buildReleaseRecoveryPrompt({
   projectName: "Demo",
   projectPath: "C:/repo",
@@ -97,6 +108,11 @@ for (const retryContract of ["DEPLOOM_FAILURE_V2", "TOOL_INTERNAL_ERROR", "NameE
 }
 
 for (const required of [
+  "extractBaselineDecisionEnvelope(generated.stdout, generated.stderr)",
+  "MIGRATION_BASELINE_DECISION_REQUIRED",
+  "message.includes(BASELINE_DECISION_MARKER)",
+  "const baselineDecisionRequired = errorMessage.includes(BASELINE_DECISION_MARKER)",
+  "Fast Baseline внутри residual replan дошёл до decision boundary",
   "handoffPreparedReleaseToMigrationRepair",
   "RELEASE_TO_MIGRATION_HANDOFF_UNSAFE",
   "git', args: ['-C', project.path, 'reset', '--hard', 'HEAD']",

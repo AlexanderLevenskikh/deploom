@@ -1,6 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
 import updaterPackage from 'electron-updater'
 import { isDeterministicToolFailure } from './baseline-retry.js'
+import { BASELINE_DECISION_MARKER, extractBaselineDecisionEnvelope } from './migration-baseline-decision.js'
 const { autoUpdater } = updaterPackage
 import { buildClaudeAgentArgs, buildClaudeResumeArgs, buildCodexAgentArgs, buildCodexResumeArgs, buildOpenCodeAgentArgs, buildOpenCodeResumeArgs, parseOpencodeModelsOutput } from './agent-command.js'
 import { agentBatchCompletionFingerprint, agentScopeFingerprint, extractAgentSessionId, resumableAgentSessionId } from './agent-session.js'
@@ -4604,6 +4605,11 @@ Do not repeat the previous classification. Check whether any subset of the curre
   if (compatibilityEvidence && !existsSync(compatibilityEvidence)) {
     throw new Error(`PLANNER_REGENERATION_FAILED: dependency compatibility evidence file disappeared before deterministic re-solve: ${compatibilityEvidence}`)
   }
+  send('flow:job-output', {
+    jobId: job.id,
+    stream: 'system',
+    line: 'Фаза FLOW: детерминированный пересчёт остаточного плана. Agent execution приостановлен; сейчас работают generator / Solver / Verifier.',
+  })
   let generated: { code: number; stderr: string; stdout: string }
   try {
     generated = await executeCommand(job, {
@@ -4621,7 +4627,16 @@ Do not repeat the previous classification. Check whether any subset of the curre
   } finally {
     try { unlinkSync(residualStabilityPath) } catch { /* best-effort temp cleanup */ }
   }
-  if (generated.code !== 0) throw new Error(`PLANNER_REGENERATION_FAILED: ${generated.stderr.trim()}`)
+  const nestedBaselineDecision = extractBaselineDecisionEnvelope(generated.stdout, generated.stderr)
+  if (generated.code !== 0 && nestedBaselineDecision) {
+    send('flow:job-output', {
+      jobId: job.id,
+      stream: 'system',
+      line: 'Fast Baseline внутри residual replan дошёл до decision boundary. Не классифицирую это как infrastructure/planner failure и не перезапускаю Agent: FLOW приостанавливается для выбора dependency group.',
+    })
+    throw new Error(`MIGRATION_BASELINE_DECISION_REQUIRED: ${nestedBaselineDecision}`)
+  }
+  if (generated.code !== 0) throw new Error(`PLANNER_REGENERATION_FAILED: ${generated.stderr.trim() || generated.stdout.trim()}`)
   send('flow:job-output', {
     jobId: job.id,
     stream: 'system',
@@ -5051,6 +5066,14 @@ async function runAutonomousMigrationStage(job: JobRecord): Promise<void> {
       return
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+      if (message.includes(BASELINE_DECISION_MARKER)) {
+        send('flow:job-output', {
+          jobId: job.id,
+          stream: 'system',
+          line: 'Migration orchestration получила Baseline continuation decision. Infrastructure retry / Agent retry запрещены; возвращаю decision в UI.',
+        })
+        throw error instanceof Error ? error : new Error(message)
+      }
       const classified = classifyFlowRecovery(message, 'agent')
 
       if (classified.kind === 'infrastructure') {
@@ -5397,9 +5420,19 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
       }
     }
     if (!recovered) {
-      const baselineDecisionRequired = job.action === 'baseline' && errorMessage.includes('DEPLOOM_BASELINE_DECISION_V1 ')
+      const baselineDecisionRequired = errorMessage.includes(BASELINE_DECISION_MARKER)
       if (baselineDecisionRequired) {
         updateTeamState(job, 'paused')
+        job.recoveryIssue = undefined
+        send('flow:job-output', {
+          jobId: job.id,
+          stream: 'system',
+          workspaceId: job.workspace.id,
+          projectName: job.projectName,
+          line: job.action === 'agent'
+            ? 'Миграция приостановлена на безопасной decision boundary: выберите предложенную dependency group / измените scope / запустите глубокий поиск.'
+            : 'Baseline приостановлен на безопасной decision boundary.',
+        })
       } else {
         updateTeamState(job, 'failed')
         job.recoveryIssue = await persistRecoveryIssue(job, errorMessage)
