@@ -58,8 +58,10 @@ class BaselineDecisionRecoveryClosureTests(unittest.TestCase):
 
     def test_continue_does_not_clear_planner_epoch_before_recovery(self) -> None:
         main = (ROOT / "desktop" / "electron" / "main.ts").read_text(encoding="utf-8")
-        self.assertIn("input.action === 'baseline' && input.baselineResume !== 'continue'", main)
-
+        self.assertIn(
+            "input.action === 'baseline' && requestedBaselineProofMode !== 'DRAFT' && input.baselineResume !== 'continue'",
+            main,
+        )
 
 if __name__ == "__main__":
     unittest.main()
