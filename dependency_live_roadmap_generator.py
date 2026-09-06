@@ -115,7 +115,9 @@ from source_snapshot import (
     SourceCaptureError,
     activate_source_snapshot_epoch,
     active_source_snapshot,
+    source_snapshot_live_source_continuity,
     source_snapshot_provenance_head,
+    validate_source_snapshot,
 )
 from resolved_dependency_state import load_resolved_dependency_state
 from proven_dependency_state import (
@@ -9904,13 +9906,36 @@ def resolve_peer_compatibility_with_verification(
         existing_hot_head = str(
             getattr(existing_hot_snapshot, "git_head", "") or ""
         )
-        hot_epoch_reusable = bool(
+        hot_epoch_identity_match = bool(
             hot_worker_continuation
             and existing_hot_snapshot is not None
             and bool((spec.source_checkout or {}).get("verified"))
             and expected_source_head
             and existing_hot_head == expected_source_head
         )
+        hot_epoch_reusable = False
+        if hot_epoch_identity_match and existing_hot_snapshot is not None:
+            try:
+                validate_source_snapshot(
+                    existing_hot_snapshot,
+                    timeout_seconds=config.hard_timeout_seconds,
+                    progress=lambda message: eprint(f"[info] {project}: {message}"),
+                    progress_label="hot SourceSnapshot private continuity",
+                )
+                hot_epoch_reusable = source_snapshot_live_source_continuity(
+                    existing_hot_snapshot,
+                    timeout_seconds=config.hard_timeout_seconds,
+                    progress=lambda message: eprint(f"[info] {project}: {message}"),
+                )
+            except SourceCaptureError as exc:
+                emit_observability_event(
+                    "baseline.worker.hot-epoch-continuity-uncertain",
+                    project=project,
+                    sourceHead=expected_source_head,
+                    error=f"{type(exc).__name__}: {exc}",
+                    authority="SOURCE_TRUTH_GUARD",
+                )
+                hot_epoch_reusable = False
         if hot_worker_continuation and not hot_epoch_reusable:
             reset_same_run_verification_reuse()
             reset_physical_experiment_registry()

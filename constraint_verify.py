@@ -535,7 +535,7 @@ def parallel_ddmin(
         except Exception:
             for future in future_map:
                 future.cancel()
-            pool.shutdown(wait=False, cancel_futures=True)
+            pool.shutdown(wait=True, cancel_futures=True)
             raise
         else:
             pool.shutdown(wait=True)
@@ -601,7 +601,7 @@ def parallel_ddmin(
                 confirmed = bool(future.result())
             except Exception:
                 future.cancel()
-                pool.shutdown(wait=False, cancel_futures=True)
+                pool.shutdown(wait=True, cancel_futures=True)
                 raise
             else:
                 pool.shutdown(wait=True)

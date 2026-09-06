@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { delimiter, dirname, join } from 'node:path'
-import { commandEnvironment, decodeProcessOutputChunk, processTreeDetached, resolveSpawnInvocation } from './process-launcher.js'
+import { commandEnvironment, processTreeDetached, resolveSpawnInvocation } from './process-launcher.js'
 
 export type BaselineWorkerResult = {
   code: number
@@ -38,6 +38,8 @@ export class BaselineWorkerPool {
     const env = commandEnvironment({
       ...process.env,
       PYTHONUNBUFFERED: '1',
+      PYTHONUTF8: '1',
+      PYTHONIOENCODING: 'utf-8',
       PYTHONPATH: [vendor, process.env.PYTHONPATH].filter(Boolean).join(delimiter),
       FORCE_COLOR: '0',
     })
@@ -54,6 +56,9 @@ export class BaselineWorkerPool {
       windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       env,
     })
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+
     const record: WorkerRecord = {
       child,
       carry: '',
@@ -93,15 +98,14 @@ export class BaselineWorkerPool {
     child.on('close', code => {
       failPending(`BASELINE_WORKER_EXITED: code=${code ?? -1}`)
     })
-    child.stderr.on('data', chunk => {
-      const text = decodeProcessOutputChunk(chunk as Buffer)
+    child.stderr.on('data', (text: string) => {
       if (!text) return
       for (const request of record.pending.values()) {
         request.onOutput('stderr', text)
       }
     })
-    child.stdout.on('data', chunk => {
-      record.carry += decodeProcessOutputChunk(chunk as Buffer)
+    child.stdout.on('data', (text: string) => {
+      record.carry += text
       while (true) {
         const newline = record.carry.indexOf('\n')
         if (newline < 0) break
@@ -131,13 +135,26 @@ export class BaselineWorkerPool {
           const code = Number.isFinite(Number(message?.code))
             ? Number(message.code)
             : 4
+          const reusable = message?.reusable !== false
           request.settled = true
           request.resolve({
             code,
             ...(message?.error ? { error: String(message.error) } : {}),
           })
           record.pending.delete(id)
-          scheduleIdle()
+          if (reusable) {
+            scheduleIdle()
+          } else {
+            record.alive = false
+            if (record.idleTimer) clearTimeout(record.idleTimer)
+            if (this.records.get(key) === record) this.records.delete(key)
+            for (const pending of record.pending.values()) {
+              if (!pending.settled) {
+                pending.settled = true
+                pending.reject(new Error('BASELINE_WORKER_RETIRED_AFTER_UNSAFE_REQUEST'))
+              }
+            }
+          }
         }
       }
     })

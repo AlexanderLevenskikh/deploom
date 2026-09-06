@@ -128,6 +128,15 @@ _ALL_CONTAINERS: set[Path] = set()
 _ACTIVE_WATCHERS: dict[
     str, tuple[SourceSnapshot, _DirectoryWatcher, Optional[object]]
 ] = {}
+_LIVE_SOURCE_WATCHERS: dict[
+    str,
+    tuple[
+        SourceSnapshot,
+        _DirectoryWatcher,
+        Optional[tuple[int, int]],
+        Optional[tuple[int, int]],
+    ],
+] = {}
 _LOCK = threading.RLock()
 
 
@@ -1051,6 +1060,142 @@ def active_source_snapshot(project_dir: Path) -> Optional[SourceSnapshot]:
         return _ACTIVE.get(_active_key(project_dir))
 
 
+def _retire_live_source_watcher(snapshot: SourceSnapshot) -> None:
+    key = _active_key(snapshot.original_project_path)
+    with _LOCK:
+        entry = _LIVE_SOURCE_WATCHERS.pop(key, None)
+    if entry is not None:
+        entry[1].stop()
+
+
+def source_snapshot_live_source_continuity(
+    snapshot: SourceSnapshot,
+    *,
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+) -> bool:
+    # Git HEAD is provenance only. Ignored/generated files are SourceSnapshot
+    # inputs too, so hot reuse requires continuity of all covered live bytes.
+    policy = SourceInputPolicy()
+    if snapshot.policy_key != policy.key:
+        return False
+
+    live_root = (
+        Path(snapshot.git_root).expanduser().resolve()
+        if snapshot.git_root
+        else snapshot.original_project_path.expanduser().resolve()
+    )
+    live_project = snapshot.original_project_path.expanduser().resolve()
+    if not live_root.is_dir() or not live_project.is_dir():
+        _retire_live_source_watcher(snapshot)
+        return False
+
+    key = _active_key(snapshot.original_project_path)
+    with _LOCK:
+        entry = _LIVE_SOURCE_WATCHERS.get(key)
+
+    if entry is not None and entry[0] is snapshot:
+        _snap, watcher, sealed_root_identity, sealed_project_identity = entry
+        thread = watcher._thread
+        continuity = bool(
+            sealed_root_identity is not None
+            and sealed_project_identity is not None
+            and _tree_object_identity(live_root) == sealed_root_identity
+            and _tree_object_identity(live_project) == sealed_project_identity
+            and thread is not None
+            and thread.is_alive()
+            and not watcher.errors
+            and _drain_watcher(watcher, live_root)
+            and not _content_relevant_events(list(watcher.events))
+        )
+        emit_observability_event(
+            "source.snapshot.live-continuity",
+            snapshotKey=snapshot.key,
+            outcome="watcher-hit" if continuity else "watcher-invalidated",
+            authority="SOURCE_TRUTH_GUARD",
+        )
+        if not continuity:
+            _retire_live_source_watcher(snapshot)
+        return continuity
+
+    if entry is not None:
+        with _LOCK:
+            stale = _LIVE_SOURCE_WATCHERS.pop(key, None)
+        if stale is not None:
+            stale[1].stop()
+
+    candidate_watcher = None
+    sealed_root_identity = None
+    sealed_project_identity = None
+    if os.name == "nt":
+        candidate_watcher = _DirectoryWatcher(live_root)
+        if not candidate_watcher.start():
+            candidate_watcher.stop()
+            candidate_watcher = None
+        else:
+            sealed_root_identity = _tree_object_identity(live_root)
+            sealed_project_identity = _tree_object_identity(live_project)
+            if sealed_root_identity is None or sealed_project_identity is None:
+                candidate_watcher.stop()
+                candidate_watcher = None
+
+    try:
+        observed = build_source_tree_manifest(
+            live_root,
+            policy=policy,
+            timeout_seconds=timeout_seconds,
+            progress=progress,
+            progress_label="hot SourceSnapshot live-source continuity",
+        )
+    except SourceCaptureError:
+        if candidate_watcher is not None:
+            candidate_watcher.stop()
+        raise
+
+    if observed.key != snapshot.manifest_key:
+        if candidate_watcher is not None:
+            candidate_watcher.stop()
+        emit_observability_event(
+            "source.snapshot.live-continuity",
+            snapshotKey=snapshot.key,
+            outcome="manifest-mismatch",
+            authority="SOURCE_TRUTH_GUARD",
+        )
+        return False
+
+    if candidate_watcher is not None:
+        armed_clean = bool(
+            _tree_object_identity(live_root) == sealed_root_identity
+            and _tree_object_identity(live_project) == sealed_project_identity
+            and _drain_watcher(candidate_watcher, live_root)
+            and not candidate_watcher.errors
+            and not _content_relevant_events(list(candidate_watcher.events))
+        )
+        if not armed_clean:
+            candidate_watcher.stop()
+            return False
+        with _LOCK:
+            _LIVE_SOURCE_WATCHERS[key] = (
+                snapshot,
+                candidate_watcher,
+                sealed_root_identity,
+                sealed_project_identity,
+            )
+        outcome = "manifest-match-watcher-armed"
+    else:
+        # No proven event stream => this one continuation is authorized only by
+        # the full manifest comparison; the next continuation repeats it.
+        outcome = "manifest-match"
+
+    emit_observability_event(
+        "source.snapshot.live-continuity",
+        snapshotKey=snapshot.key,
+        outcome=outcome,
+        authority="SOURCE_TRUTH_GUARD",
+    )
+    return True
+
+
 def validate_source_snapshot(
     snapshot: SourceSnapshot,
     *,
@@ -1391,7 +1536,9 @@ def _cleanup_all() -> None:
     with _LOCK:
         _ACTIVE.clear()
         watchers = [entry[1] for entry in _ACTIVE_WATCHERS.values()]
+        watchers.extend(entry[1] for entry in _LIVE_SOURCE_WATCHERS.values())
         _ACTIVE_WATCHERS.clear()
+        _LIVE_SOURCE_WATCHERS.clear()
         containers = list(_ALL_CONTAINERS)
         _ALL_CONTAINERS.clear()
     for watcher in watchers:

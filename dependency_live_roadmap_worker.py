@@ -17,6 +17,15 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+def _configure_protocol_stdio() -> None:
+    # The worker protocol is UTF-8 regardless of the Windows active code page.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="strict")
+
+
+_configure_protocol_stdio()
 _PROTOCOL_OUT = sys.stdout
 _PROTOCOL_LOCK = threading.Lock()
 
@@ -99,7 +108,7 @@ def _run_request(
 def main() -> int:
     base_env = dict(os.environ)
     generator = importlib.import_module("dependency_live_roadmap_generator")
-    _send({"type": "ready", "pid": os.getpid()})
+    _send({"type": "ready", "pid": os.getpid(), "encoding": "utf-8"})
     for raw in sys.stdin:
         if not raw.strip():
             continue
@@ -110,7 +119,13 @@ def main() -> int:
                 raise ValueError("request must be an object")
             request_id = str(payload.get("id") or "")
             code = _run_request(generator, payload, base_env)
-            _send({"type": "complete", "id": request_id, "code": code})
+            reusable = code in {0, 3}
+            _send({
+                "type": "complete", "id": request_id, "code": code,
+                "reusable": reusable,
+            })
+            if not reusable:
+                return code
         except BaseException as exc:
             _send({
                 "type": "stream",
@@ -125,8 +140,10 @@ def main() -> int:
                 "type": "complete",
                 "id": request_id,
                 "code": 4,
+                "reusable": False,
                 "error": traceback.format_exc()[-12000:],
             })
+            return 4
     return 0
 
 
