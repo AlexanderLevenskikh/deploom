@@ -78,6 +78,60 @@ class PackageManagerProfile:
         }
 
 
+# BLOCK_PSI4_INSTALL_COST_V1
+@dataclasses.dataclass(frozen=True)
+class ResolverSeedContinuationCapability:
+    manager_family: str
+    supported: bool
+    strategy: str
+    reason: str
+
+
+def resolver_seed_continuation_capability(
+    profile: PackageManagerProfile,
+) -> ResolverSeedContinuationCapability:
+    """Return whether a pre-lifecycle resolver tree may seed lifecycle install.
+
+    A resolver seed is performance-only and can never establish ResolverProof,
+    PreparationProof, ProjectProof, or learned Solver authority.
+    """
+    family = str(profile.family or "")
+    if family == "yarn-classic":
+        return ResolverSeedContinuationCapability(
+            manager_family=family,
+            supported=False,
+            strategy="none",
+            reason=(
+                "YARN1_RESOLVER_SEED_CONTINUATION_UNSUPPORTED: lifecycle "
+                "equivalence from an --ignore-scripts tree is not certified"
+            ),
+        )
+    if family == "npm":
+        return ResolverSeedContinuationCapability(
+            manager_family=family,
+            supported=False,
+            strategy="none",
+            reason=(
+                "NPM_RESOLVER_SEED_CONTINUATION_UNSUPPORTED: authoritative "
+                "frozen npm ci semantics replace node_modules"
+            ),
+        )
+    return ResolverSeedContinuationCapability(
+        manager_family=family or "unknown",
+        supported=False,
+        strategy="none",
+        reason="RESOLVER_SEED_CONTINUATION_UNSUPPORTED",
+    )
+
+
+def logical_resolution_without_materialization_supported(
+    profile: PackageManagerProfile,
+) -> bool:
+    """Whether the PM has a certified native logical-only resolution path."""
+    # Ψ.4 deliberately does not introduce a home-grown package-manager resolver.
+    return False
+
+
 def normalize_declared_package_manager(value: object) -> tuple[str, str]:
     text = str(value or "").strip()
     if not text:

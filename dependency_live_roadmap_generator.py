@@ -9821,11 +9821,15 @@ def resolve_peer_compatibility_with_verification(
             if progress_path is not None
             else None
         )
+        # BLOCK_PSI4_ROLE_BASED_PUBLICATION_V1
+        # Candidate/probe verification stays private in EVERY search mode.
         config = dataclasses.replace(
             config,
             registry=client.registry,
             telemetry_path=str(verification_telemetry_path) if verification_telemetry_path is not None else "",
             proof_cache_dir=str(verification_proof_cache_dir) if verification_proof_cache_dir is not None else "",
+            verification_purpose="intermediate-candidate",
+            publish_durable_prepared_artifact=False,
         )
         configure_observability_path(
             verification_telemetry_path,
@@ -10007,8 +10011,11 @@ def resolve_peer_compatibility_with_verification(
                 # verify_assignment already owns the strong Resolver/ProjectProof
                 # cache and binds project reuse to an exact ResolvedStateKey.
                 control_config = dataclasses.replace(
-                    config, project_checks="diagnostic", commands=(command,),
-                    publish_durable_prepared_artifact=not _baseline_preseal_screening_enabled(has_incumbent=anytime.incumbent is not None),
+                    config,
+                    project_checks="diagnostic",
+                    commands=(command,),
+                    verification_purpose="baseline-control",
+                    publish_durable_prepared_artifact=True,
                 )
                 control_request_key = (
                     project_source_snapshot_key,
@@ -10688,14 +10695,25 @@ def resolve_peer_compatibility_with_verification(
                             and len(config.commands) > 1
                         ):
                             screen_command = config.commands[0]
-                            screen_preseal = _baseline_preseal_screening_enabled(has_incumbent=anytime.incumbent is not None)
                             screen_config = dataclasses.replace(
-                                config, commands=(screen_command,),
-                                publish_durable_prepared_artifact=not screen_preseal,
+                                config,
+                                commands=(screen_command,),
+                                verification_purpose="intermediate-candidate",
+                                publish_durable_prepared_artifact=False,
                             )
-                            if screen_preseal:
-                                progress_reporter.emit(project, mode, "adaptive-screen-preseal", iteration=iteration, assignment=fingerprint, command=screen_command, executionMode=_baseline_execution_mode(), durablePublicationDeferred=True, authority="PROJECT_CHECK")
-                                eprint(f"[info] {project}: Baseline {_baseline_execution_mode().lower()} pre-seal screen; command={screen_command}; durable publication deferred")
+                            progress_reporter.emit(
+                                project,
+                                mode,
+                                "adaptive-screen-private-publication",
+                                iteration=iteration,
+                                assignment=fingerprint,
+                                command=screen_command,
+                                executionMode=_baseline_execution_mode(),
+                                searchMode=anytime.search_mode.value,
+                                durablePublicationDeferred=True,
+                                publicationRole="intermediate-candidate",
+                                authority="PROJECT_CHECK",
+                            )
                             progress_reporter.emit(
                                 project, mode, "adaptive-screen-started",
                                 iteration=iteration,
@@ -10914,7 +10932,9 @@ def resolve_peer_compatibility_with_verification(
 
                     confirmation_project_checks = result.kind in {"preparation", "project"}
                     confirmation_config = dataclasses.replace(
-                        config, publish_durable_prepared_artifact=not _baseline_preseal_screening_enabled(has_incumbent=anytime.incumbent is not None),
+                        config,
+                        verification_purpose="exact-failure-confirmation",
+                        publish_durable_prepared_artifact=False,
                     )
                     if result.kind == "project" and config.project_checks == "adaptive":
                         targeted_commands = _targeted_adaptive_confirmation_commands(result, config)

@@ -90,6 +90,26 @@ def _new_metrics() -> dict[str, object]:
         "preparationRequestsCoalesced": 0,
         "totalArtifactPrepareMs": 0,
         "totalProjectTrialMs": 0,
+        # BLOCK_PSI4_INSTALL_COST_V1
+        "resolverProcessesStarted": 0,
+        "resolverProcessesAvoided": 0,
+        "resolverInstallMs": 0,
+        "resolvedStateCaptureMs": 0,
+        "lifecycleInstallMs": 0,
+        "persistentControlPreparedHits": 0,
+        "persistentControlLifecycleAvoided": 0,
+        "intermediateDurableSealsAvoided": 0,
+        "durableSealsPerformedByRole": {},
+        "durableSealMsByRole": {},
+        "incumbentPromotionMs": 0,
+        "controlDurablePublications": 0,
+        "resolverSeedBuilds": 0,
+        "resolverSeedHits": 0,
+        "resolverSeedInvalidations": 0,
+        "resolverSeedCloneMs": 0,
+        "neighborSeedAttempts": 0,
+        "neighborSeedHits": 0,
+        "neighborSeedFallbacks": 0,
     }
 
 
@@ -362,6 +382,7 @@ def performance_category(event: str) -> str:
         "filesystem.integrity.finish": "dependency-integrity",
         "source.manifest.finish": "source-manifest",
         "verify.resolver.finish": "resolver-install",
+        "verify.resolved-state.capture.finish": "resolved-state-capture",
         "verify.preparation.finish": "lifecycle-preparation",
         "verify.preparation.snapshot-publish.finish": "snapshot-publish",
         "verify.project-check.clone.finish": "project-clone",
@@ -529,6 +550,92 @@ def record_verification_event(event: str, payload: Mapping[str, object]) -> None
             _METRICS["totalArtifactPrepareMs"] = int(_METRICS["totalArtifactPrepareMs"]) + _int_field(payload, ("durationMs",))
         elif event == "verify.project-check.finish":
             _METRICS["totalProjectTrialMs"] = int(_METRICS["totalProjectTrialMs"]) + _int_field(payload, ("durationMs",))
+
+        # Ψ.4 performance counters are observability-only.
+        if event == "verify.resolver.start":
+            _METRICS["resolverProcessesStarted"] = int(
+                _METRICS["resolverProcessesStarted"]
+            ) + 1
+        elif (
+            event == "proof.cache.hit"
+            and str(payload.get("proofType") or "") == "resolver"
+        ):
+            _METRICS["resolverProcessesAvoided"] = int(
+                _METRICS["resolverProcessesAvoided"]
+            ) + 1
+
+        if event == "verify.resolver.finish":
+            _METRICS["resolverInstallMs"] = int(
+                _METRICS["resolverInstallMs"]
+            ) + _int_field(payload, ("durationMs",))
+        elif event == "verify.resolved-state.capture.finish":
+            _METRICS["resolvedStateCaptureMs"] = int(
+                _METRICS["resolvedStateCaptureMs"]
+            ) + _int_field(payload, ("durationMs",))
+        elif event == "verify.preparation.finish":
+            _METRICS["lifecycleInstallMs"] = int(
+                _METRICS["lifecycleInstallMs"]
+            ) + _int_field(payload, ("durationMs",))
+
+        if event == "persistent-control.prepared.hit":
+            _METRICS["persistentControlPreparedHits"] = int(
+                _METRICS["persistentControlPreparedHits"]
+            ) + 1
+            _METRICS["persistentControlLifecycleAvoided"] = int(
+                _METRICS["persistentControlLifecycleAvoided"]
+            ) + 1
+        elif event == "prepared.publication.skipped":
+            if str(payload.get("role") or "") in {
+                "intermediate-candidate",
+                "exact-failure-confirmation",
+                "diagnostic-probe",
+            }:
+                _METRICS["intermediateDurableSealsAvoided"] = int(
+                    _METRICS["intermediateDurableSealsAvoided"]
+                ) + 1
+        elif event == "prepared.publication.promote.finish":
+            role = str(payload.get("role") or "unknown")
+            duration = _int_field(payload, ("durationMs",))
+            if str(payload.get("outcome") or "") == "passed":
+                _bump_dict("durableSealsPerformedByRole", role)
+                _bump_dict("durableSealMsByRole", role, duration)
+                if role == "baseline-control":
+                    _METRICS["controlDurablePublications"] = int(
+                        _METRICS["controlDurablePublications"]
+                    ) + 1
+            if role == "verified-incumbent":
+                _METRICS["incumbentPromotionMs"] = int(
+                    _METRICS["incumbentPromotionMs"]
+                ) + duration
+
+        if event == "resolver-seed.created":
+            _METRICS["resolverSeedBuilds"] = int(
+                _METRICS["resolverSeedBuilds"]
+            ) + 1
+        elif event == "resolver-seed.hit":
+            _METRICS["resolverSeedHits"] = int(
+                _METRICS["resolverSeedHits"]
+            ) + 1
+        elif event == "resolver-seed.invalidated":
+            _METRICS["resolverSeedInvalidations"] = int(
+                _METRICS["resolverSeedInvalidations"]
+            ) + 1
+        elif event == "resolver-seed.clone.finish":
+            _METRICS["resolverSeedCloneMs"] = int(
+                _METRICS["resolverSeedCloneMs"]
+            ) + _int_field(payload, ("durationMs",))
+        elif event == "neighbor-seed.attempt":
+            _METRICS["neighborSeedAttempts"] = int(
+                _METRICS["neighborSeedAttempts"]
+            ) + 1
+        elif event == "neighbor-seed.hit":
+            _METRICS["neighborSeedHits"] = int(
+                _METRICS["neighborSeedHits"]
+            ) + 1
+        elif event == "neighbor-seed.fallback":
+            _METRICS["neighborSeedFallbacks"] = int(
+                _METRICS["neighborSeedFallbacks"]
+            ) + 1
 
         if str(payload.get("stagePairing") or "") == "orphan-finish":
             _METRICS["orphanStageFinishes"] = int(_METRICS["orphanStageFinishes"]) + 1

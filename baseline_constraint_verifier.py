@@ -78,6 +78,8 @@ from source_snapshot import (
 from package_manager_profile import (
     PackageManagerProfileError,
     install_args_for_profile,
+    logical_resolution_without_materialization_supported,
+    resolver_seed_continuation_capability,
 )
 from project_topology import (
     ProjectTopologyError,
@@ -128,10 +130,16 @@ class BaselineVerifyConfig:
     attempt_timeout_seconds: int = 3600
     localization_timeout_seconds: int = 7200
     progress_interval_seconds: int = 15
-    # Performance policy only. False keeps authoritative lifecycle/project checks
-    # but keeps the PreparedSnapshot request-private, so a failing early screen
-    # does not pay the full durable integrity seal.
+    # Performance policy only. The low-level boolean is retained for legacy
+    # callers, while Baseline uses verification_purpose as the typed publication
+    # policy. Neither field participates in proof authority.
     publish_durable_prepared_artifact: bool = True
+    # BLOCK_PSI4_ROLE_BASED_PUBLICATION_V1
+    # legacy | intermediate-candidate | exact-failure-confirmation |
+    # diagnostic-probe | baseline-control | incumbent-promotion
+    verification_purpose: str = "legacy"
+    # Neighboring-assignment seeding is experimental and default-off.
+    enable_neighbor_resolver_seed: bool = False
     snapshot_copy_timeout_seconds: int = 1800
     project_checks: str = "adaptive"  # off | diagnostic | adaptive | strict
     commands: Tuple[str, ...] = ()
@@ -178,6 +186,40 @@ class BaselineVerifyConfig:
             project_checks=mode,
             commands=commands,
         )
+
+
+_PSI4_VERIFICATION_PURPOSES = frozenset({
+    "legacy",
+    "intermediate-candidate",
+    "exact-failure-confirmation",
+    "diagnostic-probe",
+    "baseline-control",
+    "incumbent-promotion",
+})
+_PSI4_INTERMEDIATE_PURPOSES = frozenset({
+    "intermediate-candidate",
+    "exact-failure-confirmation",
+    "diagnostic-probe",
+})
+
+
+def _verification_purpose(config: BaselineVerifyConfig) -> str:
+    purpose = str(config.verification_purpose or "legacy").strip().lower()
+    return purpose if purpose in _PSI4_VERIFICATION_PURPOSES else "legacy"
+
+
+def _durable_prepared_publication_policy(
+    config: BaselineVerifyConfig,
+) -> Tuple[bool, str]:
+    """Choose durable publication by artifact role, never search depth."""
+    purpose = _verification_purpose(config)
+    if purpose in _PSI4_INTERMEDIATE_PURPOSES:
+        return False, "intermediate-role-private"
+    if purpose == "baseline-control":
+        return bool(config.publish_durable_prepared_artifact), "stable-baseline-control"
+    if purpose == "incumbent-promotion":
+        return bool(config.publish_durable_prepared_artifact), "verified-incumbent"
+    return bool(config.publish_durable_prepared_artifact), "legacy-explicit-policy"
 
 
 def project_proof_cache_reusable(commands: Sequence[str]) -> bool:
@@ -2692,9 +2734,46 @@ def verify_assignment(
                 f"{progress_label}: ResolverProof HIT; exact proven lockfile restored. "
                 "Fresh lifecycle remains frozen and authoritative.",
             )
+            if run_project_checks and config.commands:
+                seed_capability = resolver_seed_continuation_capability(
+                    workspace_topology.profile
+                )
+                event(
+                    "resolver-seed.capability",
+                    managerFamily=seed_capability.manager_family,
+                    supported=seed_capability.supported,
+                    strategy=seed_capability.strategy,
+                    reason=seed_capability.reason,
+                    logicalOnlyResolutionSupported=(
+                        logical_resolution_without_materialization_supported(
+                            workspace_topology.profile
+                        )
+                    ),
+                )
+                if not seed_capability.supported:
+                    event(
+                        "resolver-seed.continuation.unsupported",
+                        operationId=new_observability_id(
+                            "resolver-seed-unsupported"
+                        ),
+                        managerFamily=seed_capability.manager_family,
+                        reason=seed_capability.reason,
+                    )
+                    _emit_progress(
+                        progress,
+                        f"{progress_label}: "
+                        "PSI4_RESOLVER_SEED_CONTINUATION_UNSUPPORTED; "
+                        f"{seed_capability.reason}",
+                    )
         else:
             resolver_started = time.monotonic()
-            event("verify.resolver.start", command=" ".join(argv))
+            resolver_operation_id = new_observability_id("resolver-process")
+            event(
+                "verify.resolver.start",
+                operationId=resolver_operation_id,
+                command=" ".join(argv),
+                verificationPurpose=_verification_purpose(config),
+            )
             try:
                 result = _run(
                     argv,
@@ -2733,9 +2812,11 @@ def verify_assignment(
                 )
             event(
                 "verify.resolver.finish",
+                operationId=resolver_operation_id,
                 durationMs=int((time.monotonic() - resolver_started) * 1000),
                 exitCode=result.returncode,
                 outcome=kind,
+                verificationPurpose=_verification_purpose(config),
             )
             if result.returncode != 0:
                 tail = "\n".join(output.splitlines()[-80:])
@@ -2795,6 +2876,15 @@ def verify_assignment(
                 return BaselineVerifyResult(
                     False, "unknown", str(exc), workspace=str(workspace_project)
                 )
+            resolved_state_capture_started = time.monotonic()
+            resolved_state_capture_operation_id = new_observability_id(
+                "resolved-state-capture"
+            )
+            event(
+                "verify.resolved-state.capture.start",
+                operationId=resolved_state_capture_operation_id,
+                resolverInputKey=proof_identity.resolver_input_key,
+            )
             try:
                 resolved_state = capture_resolved_dependency_state(
                     workspace_project,
@@ -2804,12 +2894,30 @@ def verify_assignment(
                     proof_cache_dir=proof_store.root,
                 )
             except ResolvedDependencyStateError as exc:
+                event(
+                    "verify.resolved-state.capture.finish",
+                    operationId=resolved_state_capture_operation_id,
+                    durationMs=int(
+                        (time.monotonic() - resolved_state_capture_started) * 1000
+                    ),
+                    outcome="failed",
+                    errorType=type(exc).__name__,
+                )
                 return BaselineVerifyResult(
                     False,
                     "unknown",
                     str(exc),
                     workspace=str(workspace_project),
                 )
+            event(
+                "verify.resolved-state.capture.finish",
+                operationId=resolved_state_capture_operation_id,
+                durationMs=int(
+                    (time.monotonic() - resolved_state_capture_started) * 1000
+                ),
+                outcome="passed",
+                resolvedStateKey=resolved_state.key,
+            )
             proof_identity = bind_resolved_state_identity(
                 proof_identity,
                 resolved_state.key,
@@ -2924,6 +3032,23 @@ def verify_assignment(
                     pin_prepared_artifact_record(proof_identity.preparation_proof_key)
                     event("same-run.prepared-artifact.hit", marker="SAME_RUN_PREPARED_ARTIFACT_HIT", identity=proof_identity.preparation_proof_key, consumer=progress_label, originalProducer=producer, lifecycleInstallAvoided=True, integritySealAvoided=True, storageTier="durable")
                 if not snapshot_is_private:
+                    if _verification_purpose(config) == "baseline-control":
+                        event(
+                            "persistent-control.prepared.hit",
+                            operationId=new_observability_id(
+                                "persistent-control-hit"
+                            ),
+                            marker="PSI4_PERSISTENT_CONTROL_PREPARED_HIT",
+                            preparationProofKey=proof_identity.preparation_proof_key,
+                            lifecycleInstallAvoided=True,
+                            integritySealAvoided=True,
+                        )
+                        _emit_progress(
+                            progress,
+                            f"{progress_label}: "
+                            "PSI4_PERSISTENT_CONTROL_PREPARED_HIT; "
+                            "fresh isolated control command still required",
+                        )
                     _emit_progress(progress, f"{progress_label}: lifecycle preparation snapshot HIT; fresh project-check clones will be materialized from the sealed tree")
                 observed_versions = dict(snapshot.observed_resolved_versions)
             else:
@@ -2959,7 +3084,13 @@ def verify_assignment(
                 }
                 lifecycle_env.update(_package_manager_cache_environment(config, manager))
                 preparation_started = time.monotonic()
-                event("verify.preparation.start", command=" ".join(full_argv))
+                lifecycle_operation_id = new_observability_id("lifecycle-install")
+                event(
+                    "verify.preparation.start",
+                    operationId=lifecycle_operation_id,
+                    command=" ".join(full_argv),
+                    verificationPurpose=_verification_purpose(config),
+                )
                 event(
                     "same-run.prepared-artifact.build",
                     identity=proof_identity.preparation_proof_key,
@@ -2987,9 +3118,11 @@ def verify_assignment(
                 )
                 event(
                     "verify.preparation.finish",
+                    operationId=lifecycle_operation_id,
                     durationMs=int((time.monotonic() - preparation_started) * 1000),
                     exitCode=full_result.returncode,
                     outcome=preparation_classified,
+                    verificationPurpose=_verification_purpose(config),
                 )
                 if full_result.returncode != 0:
                     tail = "\n".join((full_result.stdout or "").splitlines()[-80:])
@@ -3077,9 +3210,47 @@ def verify_assignment(
                     progress,
                     f"{progress_label}: snapshot publish started; hardTimeout={snapshot_timeout}s",
                 )
-                durable_snapshot_requested = bool(
-                    preparation_publication_allowed and config.publish_durable_prepared_artifact
+                publication_operation_id = new_observability_id(
+                    "prepared-publication"
                 )
+                role_allows_durable, publication_reason = (
+                    _durable_prepared_publication_policy(config)
+                )
+                durable_snapshot_requested = bool(
+                    preparation_publication_allowed and role_allows_durable
+                )
+                purpose = _verification_purpose(config)
+                event(
+                    "prepared.publication.decision",
+                    operationId=publication_operation_id,
+                    role=purpose,
+                    durableRequested=durable_snapshot_requested,
+                    decisionReason=(
+                        publication_reason
+                        if preparation_publication_allowed
+                        else "process-tree-supervision-not-guaranteed"
+                    ),
+                    preparationProofKey=proof_identity.preparation_proof_key,
+                )
+                if not durable_snapshot_requested:
+                    event(
+                        "prepared.publication.skipped",
+                        operationId=publication_operation_id,
+                        role=purpose,
+                        preparationProofKey=proof_identity.preparation_proof_key,
+                        decisionReason=(
+                            publication_reason
+                            if preparation_publication_allowed
+                            else "process-tree-supervision-not-guaranteed"
+                        ),
+                    )
+                    if purpose in _PSI4_INTERMEDIATE_PURPOSES:
+                        _emit_progress(
+                            progress,
+                            f"{progress_label}: "
+                            "PSI4_INTERMEDIATE_DURABLE_SEAL_SKIPPED; "
+                            f"role={purpose}; same-run private continuity remains required",
+                        )
                 try:
                     snapshot = _publish_prepared_workspace_snapshot(
                         workspace_root, workspace_project,
@@ -3117,6 +3288,21 @@ def verify_assignment(
                     progress,
                     f"{progress_label}: snapshot publish PASS; elapsed={snapshot_duration_ms // 1000}s; mode={snapshot.storage_mode}",
                 )
+                if durable_snapshot_requested:
+                    event(
+                        "prepared.publication.promote.finish",
+                        operationId=publication_operation_id,
+                        role=purpose,
+                        durationMs=snapshot_duration_ms,
+                        outcome="passed",
+                        preparationProofKey=proof_identity.preparation_proof_key,
+                    )
+                    if purpose == "baseline-control":
+                        event(
+                            "persistent-control.prepared.published",
+                            operationId=publication_operation_id,
+                            preparationProofKey=proof_identity.preparation_proof_key,
+                        )
                 workspace_project = snapshot.workspace_root / snapshot.project_relative
                 if durable_snapshot_requested:
                     _PREPARED_SNAPSHOT_PRODUCERS[
@@ -3731,10 +3917,22 @@ def promote_same_run_prepared_artifact(
         _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(slot, None)
         _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.pop(slot, None)
 
+    promotion_operation_id = new_observability_id(
+        "incumbent-durable-promotion"
+    )
+    promotion_started = time.monotonic()
     emit_observability_event(
         "same-run.private-prepared.promote.start",
+        operationId=promotion_operation_id,
         identity=key,
         originalProducer=str(producer or ""),
+        sourceProject=str(project_dir),
+    )
+    emit_observability_event(
+        "prepared.publication.promote.start",
+        operationId=promotion_operation_id,
+        role="verified-incumbent",
+        preparationProofKey=key,
         sourceProject=str(project_dir),
     )
     _emit_progress(
@@ -3759,10 +3957,20 @@ def promote_same_run_prepared_artifact(
         _retire_prepared_workspace_snapshot(snapshot)
         emit_observability_event(
             "same-run.private-prepared.promote.finish",
+            operationId=promotion_operation_id,
             identity=key,
             promoted=False,
             reason=f"promotion-error:{type(exc).__name__}",
             originalProducer=str(producer or ""),
+        )
+        emit_observability_event(
+            "prepared.publication.promote.finish",
+            operationId=promotion_operation_id,
+            role="verified-incumbent",
+            preparationProofKey=key,
+            durationMs=int((time.monotonic() - promotion_started) * 1000),
+            outcome="failed",
+            reason=f"promotion-error:{type(exc).__name__}",
         )
         _emit_progress(
             progress,
@@ -3782,12 +3990,25 @@ def promote_same_run_prepared_artifact(
                 producer or progress_label
             )
         pin_prepared_artifact_record(key)
+    promotion_duration_ms = int(
+        (time.monotonic() - promotion_started) * 1000
+    )
     emit_observability_event(
         "same-run.private-prepared.promote.finish",
+        operationId=promotion_operation_id,
         identity=key,
         promoted=durable_ok,
         reason="strong-durable-seal" if durable_ok else "durable-record-missing",
         originalProducer=str(producer or ""),
+    )
+    emit_observability_event(
+        "prepared.publication.promote.finish",
+        operationId=promotion_operation_id,
+        role="verified-incumbent",
+        preparationProofKey=key,
+        durationMs=promotion_duration_ms,
+        outcome="passed" if durable_ok else "failed",
+        reason="strong-durable-seal" if durable_ok else "durable-record-missing",
     )
     return durable_ok
 
