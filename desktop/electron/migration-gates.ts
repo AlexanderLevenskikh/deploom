@@ -36,11 +36,16 @@ function packageScriptCommands(packageJson: unknown, packageManager: 'yarn' | 'n
   // Run production build before tests: test runners commonly write caches or
   // result files inside the source tree, and strict build plugins can then
   // reject those artifacts as unused inputs.
-  const candidates = ['lint:types', 'typecheck', 'lint:styles', 'lint:scripts', 'build', 'test:unit', 'test']
+  const focusedCandidates = ['lint:types', 'typecheck', 'lint:styles', 'lint:scripts']
   const selectedNames: string[] = []
-  for (const name of candidates) {
+  for (const name of focusedCandidates) {
     if (typeof scripts[name] !== 'string') continue
     if (name === 'typecheck' && selectedNames.includes('lint:types')) continue
+    selectedNames.push(name)
+  }
+  if (!selectedNames.length && typeof scripts.lint === 'string') selectedNames.push('lint')
+  for (const name of ['build', 'test:unit', 'test']) {
+    if (typeof scripts[name] !== 'string') continue
     if (name === 'test' && selectedNames.includes('test:unit')) continue
     selectedNames.push(name)
   }

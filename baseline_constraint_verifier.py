@@ -391,13 +391,17 @@ def discover_baseline_project_checks(project_dir: Path) -> Tuple[str, ...]:
     # Keep checks deterministic and ordered. Build runs before tests because
     # several real Vite/Vitest projects write caches during tests that can make a
     # later build fail for environmental rather than dependency reasons.
-    preferred = (
+    focused = (
         "lint:types", "typecheck",
         "flow:check", "lint:flow", "typecheck:flow", "flow",
         "lint:styles", "lint:scripts",
-        "build", "test:unit", "test",
     )
-    names = [name for name in preferred if isinstance(scripts.get(name), str) and scripts.get(name, "").strip()]
+    names = [name for name in focused if isinstance(scripts.get(name), str) and scripts.get(name, "").strip()]
+    if not names and isinstance(scripts.get("lint"), str) and scripts.get("lint", "").strip():
+        names.append("lint")
+    for name in ("build", "test:unit", "test"):
+        if isinstance(scripts.get(name), str) and scripts.get(name, "").strip():
+            names.append(name)
     # Do not run two aliases for the same Flow checker in one Baseline. Prefer
     # the most explicit script name above; this avoids starting/checking the
     # same Flow server repeatedly in legacy projects.

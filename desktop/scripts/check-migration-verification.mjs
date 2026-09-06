@@ -1,8 +1,8 @@
-import { assessMigrationCheckpoint, baselineFailureDecision, baselineFailuresNeedingProbe, baselineObservationMatchesFailure, normalizeVerificationDiagnostics, unexplainedFailures } from "../dist-electron/migration-verification.js";
+import { assessMigrationCheckpoint, baselineFailureDecision, baselineFailuresNeedingProbe, baselineObservationMatchesFailure, createVerificationDiagnosticCollector, verificationDiagnosticEvidenceFromText, unexplainedFailures } from "../dist-electron/migration-verification.js";
 import { migrationGatePolicy } from "../dist-electron/migration-gates.js";
 import { buildMergedRepairPrompt, readMergedRepairResult } from "../dist-electron/merged-repair.js";
 import { buildGroupVerificationRepairPrompt } from "../dist-electron/group-repair.js";
-import { baselineVerificationCacheKey, cleanEphemeralVerificationCaches, integrationVerificationReceiptKey } from "../dist-electron/verification-environment.js";
+import { baselineVerificationCacheKey, cleanEphemeralVerificationCaches, liveBaselineObservationCacheKey } from "../dist-electron/verification-environment.js";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -129,8 +129,8 @@ if (baselineVerificationCacheKey("Demo", "main", "yarn lint:types") !== baseline
 }
 
 
-// Ψ.2 regressions: numeric checkpoint exits, diagnostic-aware baseline,
-// nested-project live baseline wiring, and exact same-state receipt identity.
+
+// Ψ.2.1 — complete streaming diagnostics, not the bounded UI tail.
 assessment = assessMigrationCheckpoint({
   verification: { commands: [{ command: "yarn build", baseline: 0, post: 2 }] },
 }, ["libs-group-1"]);
@@ -138,51 +138,104 @@ if (assessment.status !== "repair-required" || assessment.regressions[0]?.baseli
   throw new Error(`Numeric structured exits must preserve baseline=0 -> post=2: ${JSON.stringify(assessment)}`);
 }
 
-const baselineDiagnostics = normalizeVerificationDiagnostics("C:/baseline/apps/web/src/a.ts(1,2): error TS2322: old", "C:/baseline/apps/web");
-const samePostDiagnostics = normalizeVerificationDiagnostics("C:/repo/apps/web/src/a.ts(1,2): error TS2322: old", "C:/repo/apps/web");
-const changedPostDiagnostics = normalizeVerificationDiagnostics("C:/repo/apps/web/src/a.ts(1,2): error TS2322: old\nC:/repo/apps/web/src/b.ts(3,4): error TS2345: new", "C:/repo/apps/web");
-const sameFailure = { command: "yarn lint:types", code: 2, diagnostics: samePostDiagnostics };
-const changedFailure = { command: "yarn lint:types", code: 2, diagnostics: changedPostDiagnostics };
-const redEvidence = { command: "lint:types", baselineExit: 2, baselineDiagnostics };
-if (baselineFailureDecision(sameFailure, redEvidence) !== "tolerate") throw new Error("Equivalent red diagnostics should be tolerated");
-if (baselineFailureDecision(changedFailure, redEvidence) !== "probe") throw new Error("Additional diagnostics must require a live baseline probe");
-if (baselineFailureDecision(changedFailure, { command: "lint:types", baselineExit: 0 }) !== "regression") throw new Error("Green baseline -> red post must be a regression");
-if (!baselineObservationMatchesFailure(sameFailure, { code: 2, diagnostics: baselineDiagnostics })) throw new Error("Equivalent live diagnostics must match");
-if (baselineObservationMatchesFailure(changedFailure, { code: 2, diagnostics: baselineDiagnostics })) throw new Error("Live baseline must not hide an added diagnostic");
-if (baselineFailuresNeedingProbe([sameFailure], [{ command: "lint:types", baselineExit: 2 }]).length !== 1) throw new Error("Exit-only red evidence must be probed");
-
-const receiptBase = {
-  projectName: "Demo",
-  projectPath: "C:/repo/apps/web",
-  mergedBranch: "deps-merged",
-  sourceBranch: "deps-group-2",
-  head: "abc123",
-  commands: ["yarn lint:types", "yarn build"],
-  planFingerprint: "{\"plan\":1}",
-  baselineEvidenceFingerprint: "{\"evidence\":1}",
-  environment: { PATH: "X:/bin", NODE_ENV: "test" },
+const baselineDiag = verificationDiagnosticEvidenceFromText(
+  "C:/base/apps/web/src/a.ts(1,2): error TS2322: old\nCommand failed with exit code 1",
+  "C:/base/apps/web",
+);
+const samePostDiag = verificationDiagnosticEvidenceFromText(
+  "C:/post/apps/web/src/a.ts(1,2): error TS2322: old\nCommand failed with exit code 1",
+  "C:/post/apps/web",
+);
+const newEarlyDiag = verificationDiagnosticEvidenceFromText(
+  "C:/post/apps/web/src/new.ts(3,4): error TS2345: NEW\n" +
+  "x".repeat(7000) +
+  "\nC:/post/apps/web/src/a.ts(1,2): error TS2322: old\nCommand failed with exit code 1",
+  "C:/post/apps/web",
+);
+const sameFailure = { command: "yarn lint:types", code: 2, diagnostics: samePostDiag };
+const redEvidence = {
+  command: "lint:types",
+  baselineExit: 2,
+  baselineDiagnostics: baselineDiag.lines,
+  baselineDiagnosticsComplete: baselineDiag.complete,
+  baselineDiagnosticsInformative: baselineDiag.informative,
+  baselineDiagnosticsTruncated: baselineDiag.truncated,
 };
-const receipt = integrationVerificationReceiptKey(receiptBase);
-if (receipt !== integrationVerificationReceiptKey({ ...receiptBase })) throw new Error("Receipt identity must be deterministic");
-if (receipt === integrationVerificationReceiptKey({ ...receiptBase, head: "def456" })) throw new Error("Receipt must invalidate on HEAD change");
-if (receipt === integrationVerificationReceiptKey({ ...receiptBase, commands: ["yarn build"] })) throw new Error("Receipt must invalidate on command change");
-if (receipt === integrationVerificationReceiptKey({ ...receiptBase, environment: { ...receiptBase.environment, NODE_ENV: "production" } })) throw new Error("Receipt must invalidate on environment change");
-if (receipt === integrationVerificationReceiptKey({ ...receiptBase, baselineEvidenceFingerprint: "{\"evidence\":2}" })) throw new Error("Receipt must invalidate on evidence change");
+if (baselineFailureDecision(sameFailure, redEvidence) !== "tolerate") {
+  throw new Error("Complete informative equivalent diagnostics should be tolerated");
+}
+const newFailure = { command: "yarn lint:types", code: 2, diagnostics: newEarlyDiag };
+if (baselineFailureDecision(newFailure, redEvidence) !== "probe") {
+  throw new Error("A new early diagnostic outside the 6000-char UI tail must not be tolerated");
+}
+if (baselineObservationMatchesFailure(newFailure, { code: 2, diagnostics: baselineDiag })) {
+  throw new Error("Physical baseline comparison must detect an added early diagnostic");
+}
+
+const causeA = verificationDiagnosticEvidenceFromText("reason A\nCommand failed with exit code 1");
+const causeB = verificationDiagnosticEvidenceFromText("reason B\nCommand failed with exit code 1");
+if (baselineObservationMatchesFailure(
+  { command: "build", code: 1, diagnostics: causeB },
+  { code: 1, diagnostics: causeA },
+)) throw new Error("Different causes with the same generic footer must not be equivalent");
+
+const genericOnly = verificationDiagnosticEvidenceFromText("Command failed with exit code 1");
+if (genericOnly.informative) throw new Error("Generic-only footer must not be authoritative");
+
+const tinyCollector = createVerificationDiagnosticCollector("C:/repo", 64);
+tinyCollector.push("src/a.ts: error TS1001: one\nsrc/b.ts: error TS1002: two\nsrc/c.ts: error TS1003: three\n");
+const truncated = tinyCollector.finish();
+if (truncated.complete || !truncated.truncated) throw new Error("Collector must expose truncation");
+if (baselineObservationMatchesFailure(
+  { command: "build", code: 1, diagnostics: truncated },
+  { code: 1, diagnostics: truncated },
+)) throw new Error("Truncated diagnostics must never authorize tolerated PASS");
+
+if (baselineFailuresNeedingProbe(
+  [{ command: "lint:types", code: 2, diagnostics: samePostDiag }],
+  [{ command: "lint:types", baselineExit: 2 }],
+).length !== 1) throw new Error("Exit-only red evidence must require live baseline");
+
+policy = migrationGatePolicy({}, "Demo", { scripts: { lint: "eslint .", build: "vite build" } }, "yarn");
+if (JSON.stringify(policy.verificationCommands) !== JSON.stringify(["yarn lint", "yarn build"])) {
+  throw new Error(`Plain lint fallback missing: ${JSON.stringify(policy)}`);
+}
+policy = migrationGatePolicy({}, "Demo", { scripts: {
+  lint: "eslint .", "lint:types": "tsc --noEmit", "lint:scripts": "eslint src",
+  build: "vite build", "test:unit": "vitest run", test: "vitest",
+} }, "yarn");
+if (policy.verificationCommands.includes("yarn lint") || policy.verificationCommands.includes("yarn test")) {
+  throw new Error(`Focused lint/test:unit must suppress duplicate fallback: ${JSON.stringify(policy)}`);
+}
+
+const keyA = liveBaselineObservationCacheKey("Demo", "apps/web", "a".repeat(40), "yarn lint:types");
+const keyB = liveBaselineObservationCacheKey("Demo", "apps/web", "b".repeat(40), "yarn lint:types");
+if (keyA === keyB) throw new Error("Live baseline identity must change with exact base SHA");
+if (keyA !== liveBaselineObservationCacheKey("Demo", "apps/web", "a".repeat(40), "lint:types")) {
+  throw new Error("Live baseline command spelling normalization regressed");
+}
 
 const mainSource = readFileSync(new URL("../electron/main.ts", import.meta.url), "utf8");
-const liveStart = mainSource.indexOf("async function liveBaselineObservations");
-const liveEnd = mainSource.indexOf("async function allowLiveBaselineFailures", liveStart);
-const liveSource = liveStart >= 0 && liveEnd > liveStart ? mainSource.slice(liveStart, liveEnd) : "";
-if (!liveSource.includes("packageRelativePath = (await resolveProjectGitLayout(project)).packageRelativePath")
-  || !liveSource.includes("const baselineProjectPath = projectPathInWorktree(temporaryTree, packageRelativePath)")
-  || !liveSource.includes("cwd: baselineProjectPath")
-  || !liveSource.includes("cleanEphemeralVerificationCaches(baselineProjectPath)")) {
-  throw new Error("Nested live baseline must execute at the package path inside the detached worktree");
+for (const contract of [
+  "captureVerificationDiagnostics?: boolean",
+  "MIGRATION_VERIFICATION_TIMEOUT_MS",
+  "LIVE_BASELINE_INSTALL_TIMEOUT_MS",
+  "LIVE_BASELINE_COMMAND_TIMEOUT_MS",
+  "captureVerificationDiagnostics: true",
+  "const probe = (async () =>",
+  "if (root.baselineVerificationProbe === probe)",
+  "liveBaselineObservationCacheKey(project.name, packageRelativePath, baseCommit, command)",
+  "async function runClassifiedProjectVerification",
+]) {
+  if (!mainSource.includes(contract)) throw new Error(`Ψ.2.1 main contract missing: ${contract}`);
 }
-const allowStart = mainSource.indexOf("async function allowLiveBaselineFailures");
-const receiptStart = mainSource.indexOf("async function currentIntegrationVerificationReceiptIdentity", allowStart);
-const allowSource = allowStart >= 0 && receiptStart > allowStart ? mainSource.slice(allowStart, receiptStart) : "";
-if (!allowSource.includes("...candidates.map((item) => item.command)")) throw new Error("Current integration-only failures must join the live baseline probe");
-if (!mainSource.includes("rememberIntegrationVerificationReceipt")) throw new Error("Integration receipt wiring is missing");
+if ((mainSource.match(/runClassifiedProjectVerification\(/g) ?? []).length < 3) {
+  throw new Error("Initial and post-repair gates must share one classification pipeline");
+}
+if (mainSource.includes("currentIntegrationVerificationReceiptIdentity")
+  || mainSource.includes("rememberIntegrationVerificationReceipt")
+  || mainSource.includes("integrationVerificationReceiptKey")) {
+  throw new Error("Weak integration receipt reuse must stay disabled until strong materialization-proof binding exists");
+}
 
 console.log("Migration verification and integration-repair checks passed");

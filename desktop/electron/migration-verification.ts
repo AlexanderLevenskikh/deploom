@@ -1,3 +1,11 @@
+export type VerificationDiagnosticEvidence = {
+  lines: string[]
+  complete: boolean
+  informative: boolean
+  truncated: boolean
+  totalBytes: number
+}
+
 export type VerificationEvidence = {
   command: string
   baselineExit?: number
@@ -6,17 +14,23 @@ export type VerificationEvidence = {
   postText?: string
   baselineDiagnostics?: string[]
   postDiagnostics?: string[]
+  baselineDiagnosticsComplete?: boolean
+  postDiagnosticsComplete?: boolean
+  baselineDiagnosticsInformative?: boolean
+  postDiagnosticsInformative?: boolean
+  baselineDiagnosticsTruncated?: boolean
+  postDiagnosticsTruncated?: boolean
 }
 
 export type VerificationFailure = {
   command: string
   code: number
-  diagnostics: string[]
+  diagnostics: VerificationDiagnosticEvidence
 }
 
 export type BaselineVerificationObservation = {
   code: number
-  diagnostics: string[]
+  diagnostics: VerificationDiagnosticEvidence
 }
 
 export type BaselineFailureDecision = 'tolerate' | 'probe' | 'regression'
@@ -31,6 +45,10 @@ export type MigrationVerificationAssessment = {
 }
 
 type UnknownRecord = Record<string, unknown>
+
+const DEFAULT_DIAGNOSTIC_MAX_CHARS = 256 * 1024
+const ANSI_PATTERN = /\u001B\[[0-?]*[ -/]*[@-~]/g
+const GENERIC_DIAGNOSTIC_PATTERN = /^(?:error\s+)?command failed(?: with exit code \d+)?\.?$|^process exited with (?:code|status) \d+\.?$|^npm err! lifecycle script .* failed.*$|^npm err! code elifecycle$|^error command failed\.?$/i
 
 function asRecord(value: unknown): UnknownRecord {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as UnknownRecord : {}
@@ -60,8 +78,14 @@ function diagnosticArray(value: unknown): string[] | undefined {
   return result.length ? [...new Set(result)] : undefined
 }
 
-export function normalizeVerificationDiagnostics(text: string, cwd?: string): string[] {
-  let normalized = String(text ?? '').replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, '')
+function booleanValue(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined
+}
+
+function canonicalizeDiagnosticLine(line: string, cwd?: string): string | undefined {
+  let normalized = line.replace(ANSI_PATTERN, '').trim()
+  if (!normalized) return undefined
+
   const root = String(cwd ?? '').trim()
   if (root) {
     const variants = [...new Set([
@@ -74,19 +98,95 @@ export function normalizeVerificationDiagnostics(text: string, cwd?: string): st
     }
   }
 
-  const lines = normalized
-    .replace(/\r/g, '')
-    .split('\n')
-    .map((line) => line.trim().replace(/\\/g, '/').replace(/\s+/g, ' '))
-    .filter(Boolean)
-    .filter((line) => !/^Done in \d+(?:\.\d+)?s\.?$/i.test(line))
-    .filter((line) => !/^(?:real|user|sys)\s+\d+(?:\.\d+)?/i.test(line))
+  normalized = normalized
+    .replace(/\\/g, '/')
+    .replace(/\s+/g, ' ')
+    .replace(/\bpid[=: ]+\d+\b/gi, 'pid=<pid>')
+    .replace(/\b\d+(?:\.\d+)?\s*(?:ms|s|sec|seconds|minutes|min)\b/gi, '<duration>')
+    .trim()
 
-  const diagnosticLike = lines.filter((line) =>
-    /\b(?:error|failed|failure|exception|fatal|err!|ts\d{4})\b|[✖×]/i.test(line)
-    || /[:(]\d+[:,]\d+\)?/.test(line),
-  )
-  return [...new Set(diagnosticLike.length ? diagnosticLike : lines)]
+  if (/^Done in <duration>\.?$/i.test(normalized)) return undefined
+  if (/^(?:real|user|sys)\s+<duration>$/i.test(normalized)) return undefined
+  if (/^yarn run v\d+/i.test(normalized)) return undefined
+  if (/^>\s+[^ ]+@[^ ]+\s+[^ ]+$/i.test(normalized)) return undefined
+  if (/^\$\s+/.test(normalized)) return undefined
+  if (/^(?:info|verbose)\s+.*progress/i.test(normalized)) return undefined
+
+  return normalized
+}
+
+export function isGenericVerificationDiagnostic(line: string): boolean {
+  return GENERIC_DIAGNOSTIC_PATTERN.test(line.trim())
+}
+
+export function createVerificationDiagnosticCollector(
+  cwd?: string,
+  maxStoredChars = DEFAULT_DIAGNOSTIC_MAX_CHARS,
+): {
+  push: (text: string) => void
+  finish: () => VerificationDiagnosticEvidence
+} {
+  let carry = ''
+  let storedChars = 0
+  let totalBytes = 0
+  let truncated = false
+  let finished = false
+  const lines: string[] = []
+  const seen = new Set<string>()
+
+  const store = (raw: string): void => {
+    const line = canonicalizeDiagnosticLine(raw, cwd)
+    if (!line || seen.has(line)) return
+    const cost = line.length + 1
+    if (storedChars + cost > maxStoredChars) {
+      truncated = true
+      return
+    }
+    seen.add(line)
+    lines.push(line)
+    storedChars += cost
+  }
+
+  const push = (text: string): void => {
+    if (finished || !text) return
+    totalBytes += Buffer.byteLength(text)
+    const combined = carry + text
+    const parts = combined.split(/\r?\n/)
+    carry = parts.pop() ?? ''
+    for (const part of parts) store(part)
+  }
+
+  const finish = (): VerificationDiagnosticEvidence => {
+    if (!finished) {
+      finished = true
+      if (carry) store(carry)
+      carry = ''
+    }
+    const informative = lines.some((line) => !isGenericVerificationDiagnostic(line))
+    return {
+      lines: [...lines],
+      complete: !truncated,
+      informative,
+      truncated,
+      totalBytes,
+    }
+  }
+
+  return { push, finish }
+}
+
+export function verificationDiagnosticEvidenceFromText(
+  text: string,
+  cwd?: string,
+  maxStoredChars = DEFAULT_DIAGNOSTIC_MAX_CHARS,
+): VerificationDiagnosticEvidence {
+  const collector = createVerificationDiagnosticCollector(cwd, maxStoredChars)
+  collector.push(text)
+  return collector.finish()
+}
+
+export function normalizeVerificationDiagnostics(text: string, cwd?: string): string[] {
+  return verificationDiagnosticEvidenceFromText(text, cwd).lines
 }
 
 export function baselineObservationMatchesFailure(
@@ -94,9 +194,31 @@ export function baselineObservationMatchesFailure(
   baseline: BaselineVerificationObservation,
 ): boolean {
   if (failure.code === 0 || baseline.code === 0) return false
-  if (!failure.diagnostics.length || !baseline.diagnostics.length) return false
-  const known = new Set(baseline.diagnostics)
-  return failure.diagnostics.every((diagnostic) => known.has(diagnostic))
+  if (!failure.diagnostics.complete || !baseline.diagnostics.complete) return false
+  if (failure.diagnostics.truncated || baseline.diagnostics.truncated) return false
+  if (!failure.diagnostics.informative || !baseline.diagnostics.informative) return false
+  if (!failure.diagnostics.lines.length || !baseline.diagnostics.lines.length) return false
+
+  const known = new Set(baseline.diagnostics.lines)
+  return failure.diagnostics.lines.every((diagnostic) => known.has(diagnostic))
+}
+
+function evidenceBaselineObservation(evidence: VerificationEvidence): BaselineVerificationObservation | undefined {
+  if (evidence.baselineExit === undefined || evidence.baselineExit === 0) return undefined
+  if (!evidence.baselineDiagnostics?.length) return undefined
+  if (evidence.baselineDiagnosticsComplete !== true) return undefined
+  if (evidence.baselineDiagnosticsInformative !== true) return undefined
+  if (evidence.baselineDiagnosticsTruncated === true) return undefined
+  return {
+    code: evidence.baselineExit,
+    diagnostics: {
+      lines: evidence.baselineDiagnostics,
+      complete: true,
+      informative: true,
+      truncated: false,
+      totalBytes: 0,
+    },
+  }
 }
 
 export function baselineFailureDecision(
@@ -105,13 +227,9 @@ export function baselineFailureDecision(
 ): BaselineFailureDecision {
   if (!evidence || evidence.baselineExit === undefined) return 'probe'
   if (evidence.baselineExit === 0) return 'regression'
-  const baselineDiagnostics = evidence.baselineDiagnostics?.length
-    ? evidence.baselineDiagnostics
-    : normalizeVerificationDiagnostics(evidence.baselineText ?? '')
-  return baselineObservationMatchesFailure(
-    failure,
-    { code: evidence.baselineExit, diagnostics: baselineDiagnostics },
-  ) ? 'tolerate' : 'probe'
+  const baseline = evidenceBaselineObservation(evidence)
+  if (!baseline) return 'probe'
+  return baselineObservationMatchesFailure(failure, baseline) ? 'tolerate' : 'probe'
 }
 
 export function baselineFailuresNeedingProbe(
@@ -154,18 +272,26 @@ function evidenceFromObject(value: UnknownRecord): VerificationEvidence | undefi
     : typeof value.command === 'string' ? value.command.trim()
       : ''
   if (!command) return undefined
+
   const baselineRaw = value.baseline ?? value.baselineExit
   const postRaw = value.post ?? value.postExit ?? value.result ?? value.current
   const baselineText = baselineRaw === undefined ? undefined : String(baselineRaw)
   const postText = postRaw === undefined ? undefined : String(postRaw)
   const baselineDiagnostics = diagnosticArray(value.baselineDiagnostics)
   const postDiagnostics = diagnosticArray(value.postDiagnostics)
+
   return {
     command,
     ...(baselineRaw !== undefined ? { baselineText, baselineExit: parseExit(baselineRaw) } : {}),
     ...(postRaw !== undefined ? { postText, postExit: parseExit(postRaw) } : {}),
     ...(baselineDiagnostics ? { baselineDiagnostics } : {}),
     ...(postDiagnostics ? { postDiagnostics } : {}),
+    ...(booleanValue(value.baselineDiagnosticsComplete) !== undefined ? { baselineDiagnosticsComplete: booleanValue(value.baselineDiagnosticsComplete) } : {}),
+    ...(booleanValue(value.postDiagnosticsComplete) !== undefined ? { postDiagnosticsComplete: booleanValue(value.postDiagnosticsComplete) } : {}),
+    ...(booleanValue(value.baselineDiagnosticsInformative) !== undefined ? { baselineDiagnosticsInformative: booleanValue(value.baselineDiagnosticsInformative) } : {}),
+    ...(booleanValue(value.postDiagnosticsInformative) !== undefined ? { postDiagnosticsInformative: booleanValue(value.postDiagnosticsInformative) } : {}),
+    ...(booleanValue(value.baselineDiagnosticsTruncated) !== undefined ? { baselineDiagnosticsTruncated: booleanValue(value.baselineDiagnosticsTruncated) } : {}),
+    ...(booleanValue(value.postDiagnosticsTruncated) !== undefined ? { postDiagnosticsTruncated: booleanValue(value.postDiagnosticsTruncated) } : {}),
   }
 }
 
@@ -286,12 +412,19 @@ export function assessMigrationCheckpoint(checkpointValue: unknown, planBranches
   if (reason && !parts.some((part) => part.includes(reason as string))) parts.push(reason)
   if (!parts.length) parts.push(status === 'pass' ? 'новых regression gates в checkpoint не обнаружено' : 'verification evidence недостаточно')
 
-  return { status, regressions, missingPlanGroups, evidence: [...latest.values()].map((item) => ({ ...item, baselineExit: item.baselineExit ?? baselineByCommand.get(verificationCommandKey(item.command)) })), ...(reason ? { reason } : {}), feedback: parts.join('; ') }
+  return {
+    status,
+    regressions,
+    missingPlanGroups,
+    evidence: [...latest.values()].map((item) => ({
+      ...item,
+      baselineExit: item.baselineExit ?? baselineByCommand.get(verificationCommandKey(item.command)),
+    })),
+    ...(reason ? { reason } : {}),
+    feedback: parts.join('; '),
+  }
 }
 
-// Backwards-compatible helper for older focused checks. The live gate uses
-// baselineFailuresNeedingProbe(), because a defined non-zero exit alone is no
-// longer sufficient authority to suppress a migration failure.
 export function unexplainedFailures(failures: readonly { command: string }[], evidence: readonly VerificationEvidence[]): { command: string }[] {
   const explainedKeys = new Set(
     evidence.filter((item) => item.baselineExit !== undefined).map((item) => verificationCommandKey(item.command)),

@@ -26,9 +26,9 @@ import { classifyFlowRecovery, type FlowRecoveryIssue } from './flow-recovery.js
 import { deterministicPlannerDecision } from './deterministic-planner.js'
 import { plannerResultCacheKey, plannerResultCachePath, writePlannerResultCache } from './planner-result-cache.js'
 import { buildReleaseRecoveryPrompt, readReleaseRecoveryResult } from './release-recovery.js'
-import { assessMigrationCheckpoint, baselineFailureDecision, baselineFailuresNeedingProbe, baselineObservationMatchesFailure, normalizeVerificationDiagnostics, verificationCommandKey, type BaselineVerificationObservation, type MigrationVerificationAssessment, type VerificationEvidence, type VerificationFailure } from './migration-verification.js'
+import { assessMigrationCheckpoint, baselineFailureDecision, baselineFailuresNeedingProbe, baselineObservationMatchesFailure, createVerificationDiagnosticCollector, verificationCommandKey, type BaselineVerificationObservation, type MigrationVerificationAssessment, type VerificationDiagnosticEvidence, type VerificationEvidence, type VerificationFailure } from './migration-verification.js'
 import { migrationGatePolicy } from './migration-gates.js'
-import { baselineVerificationCacheKey, cleanEphemeralVerificationCaches, integrationVerificationReceiptKey } from './verification-environment.js'
+import { cleanEphemeralVerificationCaches, liveBaselineObservationCacheKey } from './verification-environment.js'
 import { buildMergedRepairPrompt, readMergedRepairResult } from './merged-repair.js'
 import { assessPromptRevision, buildPlannerPrompt, partitionPlannerDeferrals, readPlannerResult, residualStabilityTargets, validateSupervisorScopeAdditions, type PlannerResult } from './planner-session.js'
 import { autonomyPolicy, normalizedPlannerFailure } from './autonomy-policy.js'
@@ -199,6 +199,7 @@ type CommandSpec = {
   skipWhenNoStagedChanges?: boolean
   finalizeTeamStateBeforeRun?: boolean
   captureAgentSession?: boolean
+  captureVerificationDiagnostics?: boolean
   timeoutMs?: number
   stallWarningMs?: number
   stallAbortMs?: number
@@ -253,7 +254,6 @@ type JobRecord = {
   // fresh install/worktree for every group that happens to hit the same gate.
   baselineVerificationObservations?: Map<string, BaselineVerificationObservation>
   baselineVerificationProbe?: Promise<void>
-  integrationVerificationReceipt?: { identity: string; head: string; verifiedAt: string }
   logSource?: { kind: 'group' | 'planner'; id: string; label: string }
   branchRuntime?: Map<string, MigrationBranchRuntime>
   // True for actions launched by the UI Autopilot. Per-stage OS notifications
@@ -2783,6 +2783,10 @@ function shellCommandSpec(label: string, commandText: string, cwd: string): Comm
     : { label, command: 'sh', args: ['-lc', commandText], cwd, captureAgentSession: false }
 }
 
+const MIGRATION_VERIFICATION_TIMEOUT_MS = 15 * 60_000
+const LIVE_BASELINE_INSTALL_TIMEOUT_MS = 20 * 60_000
+const LIVE_BASELINE_COMMAND_TIMEOUT_MS = 15 * 60_000
+
 type VerificationRun = { ok: boolean; feedback: string; failures: VerificationFailure[] }
 
 async function runProjectVerification(job: JobRecord, project: ProjectSpec, commands: readonly string[], labelPrefix: string): Promise<VerificationRun> {
@@ -2796,14 +2800,27 @@ async function runProjectVerification(job: JobRecord, project: ProjectSpec, comm
     })
   }
   for (const commandText of commands) {
-    const result = await executeCommand(job, shellCommandSpec(`${labelPrefix}: ${commandText}`, commandText, project.path))
+    const result = await executeCommand(job, {
+      ...shellCommandSpec(`${labelPrefix}: ${commandText}`, commandText, project.path),
+      timeoutMs: MIGRATION_VERIFICATION_TIMEOUT_MS,
+      captureVerificationDiagnostics: true,
+    })
+    if (result.timedOut) {
+      throw new Error(`MIGRATION_VERIFICATION_TIMEOUT: ${commandText} exceeded ${Math.ceil(MIGRATION_VERIFICATION_TIMEOUT_MS / 60_000)} minutes; timeout is infrastructure evidence, not a source/dependency regression.`)
+    }
     const output = `${result.stderr}\n${result.stdout}`.trim()
     const tail = output.slice(-2200)
     if (result.code !== 0) {
       failures.push({
         command: commandText,
         code: result.code,
-        diagnostics: normalizeVerificationDiagnostics(output, project.path),
+        diagnostics: result.diagnostics ?? {
+          lines: [],
+          complete: false,
+          informative: false,
+          truncated: true,
+          totalBytes: 0,
+        },
       })
     }
     feedback.push(`${commandText}: exit ${result.code}${tail ? `\n${tail}` : ''}`)
@@ -2822,16 +2839,11 @@ function checkpointAssessment(path: string | undefined, plan: MigrationPlan) {
 
 function allowKnownBaselineFailures(run: VerificationRun, assessment: MigrationVerificationAssessment): VerificationRun {
   if (run.ok || !assessment.evidence.length) return run
-  const evidenceByCommand = new Map(
-    assessment.evidence.map((item) => [verificationCommandKey(item.command), item]),
-  )
+  const evidenceByCommand = new Map(assessment.evidence.map((item) => [verificationCommandKey(item.command), item]))
   const tolerated: VerificationFailure[] = []
   const remaining: VerificationFailure[] = []
   for (const failure of run.failures) {
-    const decision = baselineFailureDecision(
-      failure,
-      evidenceByCommand.get(verificationCommandKey(failure.command)),
-    )
+    const decision = baselineFailureDecision(failure, evidenceByCommand.get(verificationCommandKey(failure.command)))
     if (decision === 'tolerate') tolerated.push(failure)
     else remaining.push(failure)
   }
@@ -2839,7 +2851,7 @@ function allowKnownBaselineFailures(run: VerificationRun, assessment: MigrationV
   return {
     ok: remaining.length === 0,
     failures: remaining,
-    feedback: `${run.feedback}\n\nBaseline note: pre-existing red checks were tolerated only after diagnostic equivalence, not by exit code alone: ${tolerated.map((item) => `${item.command}=exit${item.code}`).join(', ')}. They may still block the real release hook and should remain documented.`,
+    feedback: `${run.feedback}\n\nBaseline note: only COMPLETE informative diagnostic-equivalent pre-existing failures were tolerated.`,
   }
 }
 
@@ -3572,85 +3584,117 @@ async function pendingMergeBranch(project: ProjectSpec, progress: MigrationProgr
   throw new Error(`MERGE_RECOVERY_SCOPE_VIOLATION: MERGE_HEAD ${wanted.slice(0, 12)} не совпадает ни с одной веткой сохранённого Branch plan. Автовосстановление остановлено без изменения Git-состояния.`)
 }
 
-// A non-zero baseline exit is not sufficient evidence that a later non-zero
-// result is pre-existing. Cache normalized diagnostics and compare the actual
-// failure set before suppressing repair.
+// Physical baseline observations are keyed by exact base SHA and carry
+// COMPLETE streaming diagnostics independent from the bounded UI tail.
 async function liveBaselineObservations(job: JobRecord, project: ProjectSpec, plan: MigrationPlan, commands: readonly string[]): Promise<Map<string, BaselineVerificationObservation>> {
   const root = migrationRootJob(job)
   root.baselineVerificationObservations ??= new Map<string, BaselineVerificationObservation>()
   const cache = root.baselineVerificationObservations
+
+  const [baseCommitResult, layout] = await Promise.all([
+    spawnCapture('git', ['-C', project.path, 'rev-parse', plan.baseBranch], project.path, 15_000),
+    resolveProjectGitLayout(project),
+  ])
+  if (baseCommitResult.timedOut || baseCommitResult.code !== 0 || !baseCommitResult.stdout.trim()) {
+    throw new Error(`MERGED_VERIFICATION_GIT_STATE_FAILED: не удалось разрешить exact base SHA для ${plan.baseBranch}.`)
+  }
+  const baseCommit = baseCommitResult.stdout.trim()
+  const packageRelativePath = layout.packageRelativePath
   const uniqueCommands = [...new Map(commands.map((command) => [verificationCommandKey(command), command])).values()]
+  const keyFor = (command: string) => liveBaselineObservationCacheKey(project.name, packageRelativePath, baseCommit, command)
 
   const collect = (): Map<string, BaselineVerificationObservation> => {
     const result = new Map<string, BaselineVerificationObservation>()
     for (const command of uniqueCommands) {
-      const cached = cache.get(baselineVerificationCacheKey(project.name, plan.baseBranch, command))
+      const cached = cache.get(keyFor(command))
       if (cached !== undefined) result.set(verificationCommandKey(command), cached)
     }
     return result
   }
+  const missingCommands = (): string[] => uniqueCommands.filter((command) => !cache.has(keyFor(command)))
 
-  const missingCommands = (): string[] => uniqueCommands.filter((command) =>
-    !cache.has(baselineVerificationCacheKey(project.name, plan.baseBranch, command)))
-
-  if (!missingCommands().length) return collect()
-
-  if (root.baselineVerificationProbe) {
-    await root.baselineVerificationProbe
-    if (!missingCommands().length) return collect()
-  }
-
-  const toProbe = missingCommands()
-  if (!toProbe.length) return collect()
-
-  let packageRelativePath: string
-  try {
-    packageRelativePath = (await resolveProjectGitLayout(project)).packageRelativePath
-  } catch {
-    return collect()
-  }
-
-  root.baselineVerificationProbe = (async () => {
-    const parent = join(app.getPath('temp'), `dependency-flow-${root.id.replace(/[^a-zA-Z0-9._-]+/g, '-')}-baseline-${randomUUID()}`)
-    const temporaryTree = join(parent, 'worktree')
-    mkdirSync(parent, { recursive: true })
-    const added = await spawnCapture('git', ['-C', project.path, 'worktree', 'add', '--detach', temporaryTree, plan.baseBranch], project.path, 300_000)
-    if (added.code !== 0) {
-      rmSync(parent, { recursive: true, force: true })
-      return
+  while (missingCommands().length) {
+    const existing = root.baselineVerificationProbe
+    if (existing) {
+      await existing
+      continue
     }
-    const baselineProjectPath = projectPathInWorktree(temporaryTree, packageRelativePath)
-    try {
-      const manager = projectPackageManager(project)
-      const install = manager === 'yarn' ? { command: 'yarn', args: ['install', '--frozen-lockfile'] }
-        : manager === 'pnpm' ? { command: 'pnpm', args: ['install', '--frozen-lockfile'] }
-        : { command: 'npm', args: ['ci'] }
-      const installResult = await executeCommand(job, { label: `Установка зависимостей baseline (${plan.baseBranch})`, command: install.command, args: install.args, cwd: baselineProjectPath, captureAgentSession: false })
-      if (installResult.code !== 0) return
-      cleanEphemeralVerificationCaches(baselineProjectPath)
-      for (const commandText of toProbe) {
-        const run = await executeCommand(job, { ...shellCommandSpec(`Baseline (${plan.baseBranch}): ${commandText}`, commandText, baselineProjectPath), captureAgentSession: false })
-        cache.set(
-          baselineVerificationCacheKey(project.name, plan.baseBranch, commandText),
-          {
-            code: run.code,
-            diagnostics: normalizeVerificationDiagnostics(`${run.stderr}\n${run.stdout}`, baselineProjectPath),
-          },
-        )
+
+    const toProbe = missingCommands()
+    if (!toProbe.length) break
+
+    const probe = (async () => {
+      const parent = join(app.getPath('temp'), `dependency-flow-${root.id.replace(/[^a-zA-Z0-9._-]+/g, '-')}-baseline-${randomUUID()}`)
+      const temporaryTree = join(parent, 'worktree')
+      mkdirSync(parent, { recursive: true })
+      const added = await spawnCapture('git', ['-C', project.path, 'worktree', 'add', '--detach', temporaryTree, baseCommit], project.path, 300_000)
+      if (added.code !== 0) {
+        rmSync(parent, { recursive: true, force: true })
+        throw new Error(`MERGED_VERIFICATION_GIT_STATE_FAILED: live baseline worktree add failed for ${baseCommit.slice(0, 12)}.`)
       }
-    } catch {
-      // A baseline probe that itself fails to run must never be read as proof.
-    } finally {
-      await spawnCapture('git', ['-C', project.path, 'worktree', 'remove', '--force', temporaryTree], project.path, 120_000)
-      rmSync(parent, { recursive: true, force: true })
-    }
-  })()
+      const baselineProjectPath = projectPathInWorktree(temporaryTree, packageRelativePath)
+      try {
+        const manager = projectPackageManager(project)
+        const install = manager === 'yarn' ? { command: 'yarn', args: ['install', '--frozen-lockfile'] }
+          : manager === 'pnpm' ? { command: 'pnpm', args: ['install', '--frozen-lockfile'] }
+          : { command: 'npm', args: ['ci'] }
 
-  try {
-    await root.baselineVerificationProbe
-  } finally {
-    root.baselineVerificationProbe = undefined
+        const installResult = await executeCommand(job, {
+          label: `Установка зависимостей baseline (${plan.baseBranch}@${baseCommit.slice(0, 12)})`,
+          command: install.command,
+          args: install.args,
+          cwd: baselineProjectPath,
+          captureAgentSession: false,
+          timeoutMs: LIVE_BASELINE_INSTALL_TIMEOUT_MS,
+        })
+        if (installResult.timedOut) {
+          throw new Error(`LIVE_BASELINE_INSTALL_TIMEOUT: ${manager} install exceeded ${Math.ceil(LIVE_BASELINE_INSTALL_TIMEOUT_MS / 60_000)} minutes; this is infrastructure, not compatibility evidence.`)
+        }
+        if (installResult.code !== 0) {
+          throw new Error(`LIVE_BASELINE_INSTALL_FAILED: ${manager} install exit=${installResult.code}; live baseline evidence was not published.`)
+        }
+
+        cleanEphemeralVerificationCaches(baselineProjectPath)
+        for (const commandText of toProbe) {
+          const run = await executeCommand(job, {
+            ...shellCommandSpec(`Baseline (${plan.baseBranch}@${baseCommit.slice(0, 12)}): ${commandText}`, commandText, baselineProjectPath),
+            captureAgentSession: false,
+            captureVerificationDiagnostics: true,
+            timeoutMs: LIVE_BASELINE_COMMAND_TIMEOUT_MS,
+          })
+          if (run.timedOut) {
+            throw new Error(`LIVE_BASELINE_COMMAND_TIMEOUT: ${commandText} exceeded ${Math.ceil(LIVE_BASELINE_COMMAND_TIMEOUT_MS / 60_000)} minutes; timeout is infrastructure evidence.`)
+          }
+          cache.set(
+            keyFor(commandText),
+            {
+              code: run.code,
+              diagnostics: run.diagnostics ?? {
+                lines: [],
+                complete: false,
+                informative: false,
+                truncated: true,
+                totalBytes: 0,
+              },
+            },
+          )
+        }
+      } finally {
+        await spawnCapture('git', ['-C', project.path, 'worktree', 'remove', '--force', temporaryTree], project.path, 120_000)
+        rmSync(parent, { recursive: true, force: true })
+      }
+    })()
+
+    root.baselineVerificationProbe = probe
+    try {
+      await probe
+    } finally {
+      if (root.baselineVerificationProbe === probe) {
+        root.baselineVerificationProbe = undefined
+      }
+    }
   }
+
   return collect()
 }
 
@@ -3658,11 +3702,7 @@ async function allowLiveBaselineFailures(job: JobRecord, project: ProjectSpec, p
   if (run.ok) return run
   const candidates = baselineFailuresNeedingProbe(run.failures, assessment.evidence)
   if (!candidates.length) return run
-  send('flow:job-output', {
-    jobId: job.id,
-    stream: 'system',
-    line: `${candidates.length} проверка(и) требуют физического baseline-сравнения diagnostics (${candidates.map((item) => item.command).join(', ')}) — проверяю ${plan.baseBranch}.`,
-  })
+
   const root = migrationRootJob(job)
   const gatePolicy = migrationGatePolicy(readSettings(root.workspace), project.name, readProjectPackageJson(project), projectPackageManager(project))
   const baselineCommands = [...new Map(
@@ -3673,6 +3713,7 @@ async function allowLiveBaselineFailures(job: JobRecord, project: ProjectSpec, p
   const candidateKeys = new Set(candidates.map((item) => verificationCommandKey(item.command)))
   const tolerated: VerificationFailure[] = []
   const remaining: VerificationFailure[] = []
+
   for (const failure of run.failures) {
     const key = verificationCommandKey(failure.command)
     if (!candidateKeys.has(key)) {
@@ -3683,71 +3724,34 @@ async function allowLiveBaselineFailures(job: JobRecord, project: ProjectSpec, p
     if (baseline && baselineObservationMatchesFailure(failure, baseline)) tolerated.push(failure)
     else remaining.push(failure)
   }
+
   if (!tolerated.length) return run
-  send('flow:job-output', {
-    jobId: job.id,
-    stream: 'system',
-    line: `Живой baseline на ${plan.baseBranch} подтвердил diagnostic-equivalence для: ${tolerated.map((item) => `${item.command}=exit${item.code}`).join(', ')}. Только эти pre-existing failures исключены из migration regressions.`,
-  })
   return {
     ok: remaining.length === 0,
     failures: remaining,
-    feedback: `${run.feedback}\n\nLive baseline note: diagnostic-equivalent pre-existing failures: ${tolerated.map((item) => item.command).join(', ')}.`,
+    feedback: `${run.feedback}\n\nLive baseline note: only COMPLETE informative diagnostic-equivalent pre-existing failures were tolerated: ${tolerated.map((item) => item.command).join(', ')}.`,
   }
 }
 
-async function currentIntegrationVerificationReceiptIdentity(
-  project: ProjectSpec,
-  plan: MigrationPlan,
-  commands: readonly string[],
-  sourceBranch: string,
-  assessment: MigrationVerificationAssessment,
-): Promise<{ identity: string; head: string } | undefined> {
-  const [branch, head, status] = await Promise.all([
-    spawnCapture('git', ['-C', project.path, 'branch', '--show-current'], project.path, 15_000),
-    spawnCapture('git', ['-C', project.path, 'rev-parse', 'HEAD'], project.path, 15_000),
-    spawnCapture('git', ['-C', project.path, 'status', '--porcelain=v1', '--untracked-files=all'], project.path, 15_000),
-  ])
-  if ([branch, head, status].some((item) => item.timedOut || item.code !== 0)) return undefined
-  if (branch.stdout.trim() !== plan.mergedBranch || relevantGitStatus(status.stdout)) return undefined
-  const resolvedHead = head.stdout.trim()
-  const planFingerprint = JSON.stringify({
-    baseBranch: plan.baseBranch,
-    mergedBranch: plan.mergedBranch,
-    branches: plan.branches.map((item) => ({ branch: item.branch, packages: item.packages })),
-  })
-  const baselineEvidenceFingerprint = JSON.stringify(assessment.evidence)
-  return {
-    head: resolvedHead,
-    identity: integrationVerificationReceiptKey({
-      projectName: project.name,
-      projectPath: resolve(project.path),
-      mergedBranch: plan.mergedBranch,
-      sourceBranch,
-      head: resolvedHead,
-      commands,
-      planFingerprint,
-      baselineEvidenceFingerprint,
-      environment: commandEnvironment(process.env),
-    }),
-  }
-}
-
-async function rememberIntegrationVerificationReceipt(
+async function runClassifiedProjectVerification(
   job: JobRecord,
   project: ProjectSpec,
   plan: MigrationPlan,
   commands: readonly string[],
-  sourceBranch: string,
+  labelPrefix: string,
   assessment: MigrationVerificationAssessment,
-): Promise<void> {
-  const current = await currentIntegrationVerificationReceiptIdentity(project, plan, commands, sourceBranch, assessment)
-  if (!current) return
-  migrationRootJob(job).integrationVerificationReceipt = {
-    ...current,
-    verifiedAt: new Date().toISOString(),
-  }
+): Promise<VerificationRun> {
+  let run = allowKnownBaselineFailures(
+    await runProjectVerification(job, project, commands, labelPrefix),
+    assessment,
+  )
+  if (!run.ok) run = await allowLiveBaselineFailures(job, project, plan, run, assessment)
+  return run
 }
+
+// Ψ.2.1 fail-closed: IntegrationVerificationReceipt reuse stays disabled until
+// cumulative merged state can be bound to a currently-valid MaterializationProof.
+// A real gate is safer than HEAD+clean+env proof over ignored node_modules.
 
 async function runMergedIntegrationVerification(
   job: JobRecord,
@@ -3763,26 +3767,15 @@ async function runMergedIntegrationVerification(
     return
   }
   const sourceAssessment = checkpointAssessment(latestAgentCheckpoint(join(artifactPath(job.workspace, 'historyDir', '.dependency-roadmap/history'), 'runs'), project.name, sourceBranch, 0), plan)
-  const receiptIdentity = await currentIntegrationVerificationReceiptIdentity(project, plan, commands, sourceBranch, sourceAssessment)
-  const previousReceipt = migrationRootJob(job).integrationVerificationReceipt
-  if (receiptIdentity && previousReceipt?.identity === receiptIdentity.identity) {
-    send('flow:job-output', {
-      jobId: job.id,
-      stream: 'system',
-      line: `Накопительный ${plan.mergedBranch}: integration verification reuse для exact HEAD ${receiptIdentity.head.slice(0, 12)}; состояние/commands/evidence/environment не изменились.`,
-    })
-    setBranchRuntime(job, sourceBranch)
-    return
-  }
 
   const before = await readMigrationProgress(job.workspace, project)
   if (!before || !before.trustworthy) throw new Error('MERGED_VERIFICATION_GIT_STATE_FAILED: не удалось надёжно прочитать состояние Branch plan перед integration gate.')
   const expectedMerged = new Set(before.branches.filter((entry) => entry.status === 'merged').map((entry) => entry.branch))
 
-  let gate = allowKnownBaselineFailures(await runProjectVerification(job, project, commands, `Integration gate ${plan.mergedBranch}`), sourceAssessment)
-  if (!gate.ok) gate = await allowLiveBaselineFailures(job, project, plan, gate, sourceAssessment)
+  let gate = await runClassifiedProjectVerification(
+    job, project, plan, commands, `Integration gate ${plan.mergedBranch}`, sourceAssessment,
+  )
   if (gate.ok) {
-    await rememberIntegrationVerificationReceipt(job, project, plan, commands, sourceBranch, sourceAssessment)
     send('flow:job-output', { jobId: job.id, stream: 'system', line: `Накопительный ${plan.mergedBranch}: integration verification зелёная.` })
     setBranchRuntime(job, sourceBranch)
     return
@@ -3852,7 +3845,9 @@ async function runMergedIntegrationVerification(
       continue
     }
 
-    gate = allowKnownBaselineFailures(await runProjectVerification(job, project, commands, `Повтор integration gate ${plan.mergedBranch}`), sourceAssessment)
+    gate = await runClassifiedProjectVerification(
+      job, project, plan, commands, `Повтор integration gate ${plan.mergedBranch}`, sourceAssessment,
+    )
     if (!gate.ok) {
       feedback = `После integration repair проверки всё ещё красные${agent.code !== 0 ? `; agent exit=${agent.code}` : ''}.\n\n${gate.feedback}`
       continue
@@ -3868,7 +3863,6 @@ async function runMergedIntegrationVerification(
     if (statusAfterGate.code !== 0 || relevantGitStatus(statusAfterGate.stdout)) {
       throw new Error(`MERGED_INTEGRATION_REPAIR_DIRTY: verification зелёная, но ${plan.mergedBranch} содержит незакоммиченные изменения после проверки.`)
     }
-    await rememberIntegrationVerificationReceipt(job, project, plan, commands, sourceBranch, sourceAssessment)
     send('flow:job-output', { jobId: job.id, stream: 'system', line: `Integration repair завершён: ${plan.mergedBranch} снова зелёный, ранее достигнутые package targets сохранены.` })
     setBranchRuntime(job, sourceBranch)
     job.agentBranch = undefined
@@ -5252,7 +5246,7 @@ function nonRetryableDeterministicFailure(result: { code: number; stderr: string
   return /BASELINE_RECOVERY_CONTINUE_UNAVAILABLE|BASELINE_RECOVERY_CONCURRENT_RUN|BASELINE_VERIFY_UNKNOWN_ERROR|BASELINE_VERIFY_INCONCLUSIVE_PROJECT_ERROR|BASELINE_PLAN_BROKEN|BASELINE_CONSTRAINT_LOOP_STUCK|BASELINE_CONSTRAINT_BUDGET_EXHAUSTED|BASELINE_VERIFICATION_PLATEAU|BASELINE_VERIFICATION_HARD_BUDGET_EXHAUSTED|BASELINE_VERIFICATION_HARD_SAFETY_LIMIT|EXACT_SOLVER_UNSAT_PROVEN|EXACT_SOLVER_UNKNOWN|EXACT_SOLVER_BUDGET_EXHAUSTED|GLOBAL_EXACT_EXCLUSION_UNSAT_PROVEN|GLOBAL_EXACT_EXCLUSION_BUDGET_EXHAUSTED|GLOBAL_EXACT_EXCLUSION_SOLVER_UNKNOWN|BASELINE_SOLVER_REPEATED_FAILED_ASSIGNMENT|BASELINE_CONSTRAINT_MINIMIZATION_INCONCLUSIVE|BASELINE_NOOP_RESOLVER_INVALID|EXACT_SOLVER_PROOF_REQUIRED|FIXED_INPUT_CONSTRAINT_CONFLICT|HETEROGENEOUS_DIRECT_DEPENDENCY_DECLARATION|FIXED_DEPENDENCY_DECLARATION_MISMATCH|ASSIGNMENT_HETEROGENEOUS_SOURCE_CONFLICT|ASSIGNMENT_TARGETS_FIXED_INPUT|ASSIGNMENT_REMOVES_FIXED_INPUT|PROVEN_ASSIGNMENT_REOPENED|PROVEN_ASSIGNMENT_MUTATED|PROVEN_DEPENDENCY_SOURCE_DIRTY|PROVEN_DEPENDENCY_SOURCE_SNAPSHOT_INVALID|PROVEN_DEPENDENCY_PROOF_IDENTITY_UNAVAILABLE|PROVEN_DEPENDENCY_ENVELOPE_INVALID|FINAL_BASELINE_COMPATIBILITY_INVALID|OBSERVED_RESOLVED_ASSIGNMENT_[A-Z0-9_]+/i.test(text)
 }
 
-async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code: number; stderr: string; stdout: string }> {
+async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code: number; stderr: string; stdout: string; timedOut: boolean; diagnostics?: VerificationDiagnosticEvidence }> {
   const rootJob = job.parallelParent ?? job
   if (job.cancelled || rootJob.cancelled) throw new Error('Выполнение отменено пользователем.')
   if (['opencode', 'codex', 'claude'].includes(spec.command)) {
@@ -5263,6 +5257,8 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
   send('flow:job-output', { jobId: job.id, stream: 'system', line: `▶ ${spec.label}\n$ ${spec.command} ${spec.args.join(' ')}` })
   let stderr = ''
   let stdout = ''
+  let timedOut = false
+  const diagnosticCollector = spec.captureVerificationDiagnostics ? createVerificationDiagnosticCollector(spec.cwd) : undefined
   const code = await new Promise<number>((resolvePromise, reject) => {
     const pythonPath = join(bundledToolDir(), 'vendor')
     const baseEnv: NodeJS.ProcessEnv = commandEnvironment({ ...process.env, ...spec.env, FORCE_COLOR: '0' })
@@ -5292,7 +5288,6 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
     rootJob.parallelChildren ??= new Set<ChildProcessWithoutNullStreams>()
     rootJob.parallelChildren.add(child)
     let settled = false
-    let timedOut = false
     let forceTimer: ReturnType<typeof setTimeout> | undefined
     let lastOutputAt = Date.now()
     let lastStallNoticeAt = 0
@@ -5331,6 +5326,7 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
     child.stdout.on('data', (chunk: Buffer) => {
       markOutput()
       const text = decodeProcessOutputChunk(chunk)
+      diagnosticCollector?.push(text)
       stdout = `${stdout}${text}`.slice(-6000)
       if (spec.captureAgentSession !== false) captureAgentSession(job, text)
       send('flow:job-output', { jobId: job.id, stream: 'stdout', line: text })
@@ -5338,6 +5334,7 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
     child.stderr.on('data', (chunk: Buffer) => {
       markOutput()
       const text = decodeProcessOutputChunk(chunk)
+      diagnosticCollector?.push(text)
       if (spec.captureAgentSession !== false) captureAgentSession(job, text)
       stderr = `${stderr}${text}`.slice(-6000)
       send('flow:job-output', { jobId: job.id, stream: 'stderr', line: text })
@@ -5394,7 +5391,7 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
   if (spec.command === 'opencode' && code !== 0 && openCodeDatabaseLocked(`${stderr}\n${stdout}`)) {
     throw new Error(`OPENCODE_SQLITE_BUSY: OpenCode CLI не получил доступ к своей runtime DB. Это инфраструктурный сбой; immutable dependency plan остаётся действительным.${stderr.trim() ? `\n\n${stderr.trim()}` : ''}`)
   }
-  return { code, stderr, stdout }
+  return { code, stderr, stdout, timedOut, ...(diagnosticCollector ? { diagnostics: diagnosticCollector.finish() } : {}) }
 }
 
 async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void> {

@@ -216,6 +216,37 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 discover_baseline_project_checks(root),
             )
 
+    def test_auto_discovers_plain_lint_as_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(json.dumps({
+                "packageManager": "yarn@1.22.22",
+                "scripts": {"lint": "eslint .", "build": "vite build"},
+            }), encoding="utf-8")
+            self.assertEqual(
+                ("yarn lint", "yarn build"),
+                discover_baseline_project_checks(root),
+            )
+
+    def test_auto_discovery_prefers_focused_lint_over_plain_lint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(json.dumps({
+                "packageManager": "yarn@1.22.22",
+                "scripts": {
+                    "lint": "eslint .",
+                    "lint:types": "tsc --noEmit",
+                    "lint:scripts": "eslint src",
+                    "build": "vite build",
+                    "test:unit": "vitest run",
+                    "test": "vitest",
+                },
+            }), encoding="utf-8")
+            self.assertEqual(
+                ("yarn lint:types", "yarn lint:scripts", "yarn build", "yarn test:unit"),
+                discover_baseline_project_checks(root),
+            )
+
     def test_auto_discovers_flow_typecheck_without_typescript(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
