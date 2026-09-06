@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Long-lived Desktop worker for DepLoom Baseline.
 
-Protocol stdout is newline-delimited JSON. Generator stdout/stderr are framed
-inside protocol messages so arbitrary progress text can never corrupt framing.
-Requests execute serially through the existing generator implementation.
+Protocol stdout is newline-delimited UTF-8 JSON. Generator stdout/stderr are
+framed inside protocol messages. An unsafe request retires the whole worker.
 """
 from __future__ import annotations
 
@@ -17,8 +16,13 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from worker_runtime_state import (
+    reset_worker_reuse_state,
+    worker_reuse_unsafe_reason,
+)
+
+
 def _configure_protocol_stdio() -> None:
-    # The worker protocol is UTF-8 regardless of the Windows active code page.
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
@@ -118,11 +122,17 @@ def main() -> int:
             if not isinstance(payload, dict):
                 raise ValueError("request must be an object")
             request_id = str(payload.get("id") or "")
+
+            reset_worker_reuse_state()
             code = _run_request(generator, payload, base_env)
-            reusable = code in {0, 3}
+            unsafe_reason = worker_reuse_unsafe_reason()
+            reusable = code in {0, 3} and not unsafe_reason
             _send({
-                "type": "complete", "id": request_id, "code": code,
+                "type": "complete",
+                "id": request_id,
+                "code": code,
                 "reusable": reusable,
+                **({"retirementReason": unsafe_reason} if unsafe_reason else {}),
             })
             if not reusable:
                 return code
@@ -141,6 +151,7 @@ def main() -> int:
                 "id": request_id,
                 "code": 4,
                 "reusable": False,
+                "retirementReason": "worker-request-exception",
                 "error": traceback.format_exc()[-12000:],
             })
             return 4

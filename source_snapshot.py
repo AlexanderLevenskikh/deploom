@@ -1097,7 +1097,7 @@ def source_snapshot_live_source_continuity(
     if entry is not None and entry[0] is snapshot:
         _snap, watcher, sealed_root_identity, sealed_project_identity = entry
         thread = watcher._thread
-        continuity = bool(
+        delivery_and_identity_ok = bool(
             sealed_root_identity is not None
             and sealed_project_identity is not None
             and _tree_object_identity(live_root) == sealed_root_identity
@@ -1106,17 +1106,36 @@ def source_snapshot_live_source_continuity(
             and thread.is_alive()
             and not watcher.errors
             and _drain_watcher(watcher, live_root)
-            and not _content_relevant_events(list(watcher.events))
         )
+        if not delivery_and_identity_ok:
+            emit_observability_event(
+                "source.snapshot.live-continuity",
+                snapshotKey=snapshot.key,
+                outcome="watcher-invalidated",
+                authority="SOURCE_TRUTH_GUARD",
+            )
+            _retire_live_source_watcher(snapshot)
+            return False
+
+        relevant_events = _content_relevant_events(list(watcher.events))
+        if not relevant_events:
+            emit_observability_event(
+                "source.snapshot.live-continuity",
+                snapshotKey=snapshot.key,
+                outcome="watcher-hit",
+                authority="SOURCE_TRUTH_GUARD",
+            )
+            return True
+
         emit_observability_event(
             "source.snapshot.live-continuity",
             snapshotKey=snapshot.key,
-            outcome="watcher-hit" if continuity else "watcher-invalidated",
+            outcome="watcher-event-strong-revalidation",
+            eventCount=len(relevant_events),
             authority="SOURCE_TRUTH_GUARD",
         )
-        if not continuity:
-            _retire_live_source_watcher(snapshot)
-        return continuity
+        _retire_live_source_watcher(snapshot)
+        entry = None
 
     if entry is not None:
         with _LOCK:

@@ -14,6 +14,7 @@ import hashlib
 import heapq
 import time
 from verification_observability import emit_observability_event
+from worker_runtime_state import mark_worker_reuse_unsafe
 from verification_experiment_registry import (
     PhysicalExperimentKey,
     run_physical_experiment,
@@ -535,7 +536,8 @@ def parallel_ddmin(
         except Exception:
             for future in future_map:
                 future.cancel()
-            pool.shutdown(wait=True, cancel_futures=True)
+            mark_worker_reuse_unsafe("localization-screening-aborted")
+            pool.shutdown(wait=False, cancel_futures=True)
             raise
         else:
             pool.shutdown(wait=True)
@@ -601,7 +603,8 @@ def parallel_ddmin(
                 confirmed = bool(future.result())
             except Exception:
                 future.cancel()
-                pool.shutdown(wait=True, cancel_futures=True)
+                mark_worker_reuse_unsafe("localization-confirmation-aborted")
+                pool.shutdown(wait=False, cancel_futures=True)
                 raise
             else:
                 pool.shutdown(wait=True)

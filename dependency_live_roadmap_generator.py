@@ -9918,13 +9918,13 @@ def resolve_peer_compatibility_with_verification(
             try:
                 validate_source_snapshot(
                     existing_hot_snapshot,
-                    timeout_seconds=config.hard_timeout_seconds,
+                    timeout_seconds=config.snapshot_copy_timeout_seconds,
                     progress=lambda message: eprint(f"[info] {project}: {message}"),
                     progress_label="hot SourceSnapshot private continuity",
                 )
                 hot_epoch_reusable = source_snapshot_live_source_continuity(
                     existing_hot_snapshot,
-                    timeout_seconds=config.hard_timeout_seconds,
+                    timeout_seconds=config.snapshot_copy_timeout_seconds,
                     progress=lambda message: eprint(f"[info] {project}: {message}"),
                 )
             except SourceCaptureError as exc:

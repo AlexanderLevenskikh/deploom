@@ -14,7 +14,17 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+def _close_process_pipes(process):
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
 import source_snapshot
+import worker_runtime_state
 from constraint_verify import LocalizationTimeoutError, VerificationUnit, parallel_ddmin
 
 
@@ -71,6 +81,8 @@ class Psi51WorkerUtf8Tests(unittest.TestCase):
                     process.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     process.kill()
+                    process.wait(timeout=3)
+                _close_process_pipes(process)
 
     def test_bad_request_retires_worker(self) -> None:
         worker = ROOT / "dependency_live_roadmap_worker.py"
@@ -102,57 +114,98 @@ class Psi51WorkerUtf8Tests(unittest.TestCase):
         finally:
             if process.poll() is None:
                 process.kill()
+                process.wait(timeout=3)
+            _close_process_pipes(process)
 
 
 class Psi51RequestQuiescenceTests(unittest.TestCase):
-    def test_screen_timeout_waits_for_started_workers(self) -> None:
+    def tearDown(self) -> None:
+        worker_runtime_state.reset_worker_reuse_state()
+
+    def _wait_for_zero(self, lock, active_value) -> None:
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            with lock:
+                if active_value() == 0:
+                    return
+            time.sleep(0.01)
+        with lock:
+            self.assertEqual(0, active_value())
+
+    def test_screen_timeout_returns_bounded_and_taints_worker(self) -> None:
         units = tuple(VerificationUnit(name, (name,)) for name in "abcd")
         active = 0
         lock = threading.Lock()
+
+        def active_value():
+            return active
 
         def fails(_candidate):
             nonlocal active
             with lock:
                 active += 1
             try:
-                time.sleep(0.16)
+                time.sleep(0.30)
                 return False
             finally:
                 with lock:
                     active -= 1
 
+        started = time.monotonic()
         with self.assertRaises(LocalizationTimeoutError):
             parallel_ddmin(
-                units, fails, parallelism=2, max_checks=2,
-                timeout_seconds=0.02, progress_interval_seconds=0.01,
+                units,
+                fails,
+                parallelism=2,
+                max_checks=2,
+                timeout_seconds=0.02,
+                progress_interval_seconds=0.01,
             )
-        with lock:
-            self.assertEqual(0, active)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.20)
+        self.assertEqual(
+            "localization-screening-aborted",
+            worker_runtime_state.worker_reuse_unsafe_reason(),
+        )
+        self._wait_for_zero(lock, active_value)
 
-    def test_confirmation_timeout_waits_for_started_worker(self) -> None:
+    def test_confirmation_timeout_returns_bounded_and_taints_worker(self) -> None:
         units = tuple(VerificationUnit(name, (name,)) for name in "ab")
         active = 0
         lock = threading.Lock()
+
+        def active_value():
+            return active
 
         def confirm(_candidate):
             nonlocal active
             with lock:
                 active += 1
             try:
-                time.sleep(0.16)
+                time.sleep(0.30)
                 return True
             finally:
                 with lock:
                     active -= 1
 
+        started = time.monotonic()
         with self.assertRaises(LocalizationTimeoutError):
             parallel_ddmin(
-                units, lambda _candidate: True, confirm_failure=confirm,
-                parallelism=1, max_checks=2,
-                timeout_seconds=0.02, progress_interval_seconds=0.01,
+                units,
+                lambda _candidate: True,
+                confirm_failure=confirm,
+                parallelism=1,
+                max_checks=2,
+                timeout_seconds=0.02,
+                progress_interval_seconds=0.01,
             )
-        with lock:
-            self.assertEqual(0, active)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.20)
+        self.assertEqual(
+            "localization-confirmation-aborted",
+            worker_runtime_state.worker_reuse_unsafe_reason(),
+        )
+        self._wait_for_zero(lock, active_value)
 
 
 class Psi51LiveSourceContinuityTests(unittest.TestCase):

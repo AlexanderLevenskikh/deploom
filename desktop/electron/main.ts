@@ -1845,6 +1845,7 @@ function baselineWorker(): BaselineWorkerPool {
   baselineWorkerPool ??= new BaselineWorkerPool(
     'python',
     join(bundledToolDir(), 'dependency_live_roadmap_worker.py'),
+    killProcessTree,
   )
   return baselineWorkerPool
 }

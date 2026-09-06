@@ -21,7 +21,10 @@ type WorkerRecord = {
   carry: string
   pending: Map<string, PendingRequest>
   alive: boolean
+  closing: boolean
+  closed: boolean
   idleTimer?: ReturnType<typeof setTimeout>
+  forceTimer?: ReturnType<typeof setTimeout>
 }
 
 export class BaselineWorkerPool {
@@ -30,7 +33,9 @@ export class BaselineWorkerPool {
   constructor(
     private readonly pythonCommand: string,
     private readonly workerPath: string,
+    private readonly terminateTree: (child: ChildProcessWithoutNullStreams) => void,
     private readonly idleTimeoutMs = 20 * 60_000,
+    private readonly gracefulShutdownTimeoutMs = 5_000,
   ) {}
 
   private start(key: string, cwd: string): WorkerRecord {
@@ -64,13 +69,12 @@ export class BaselineWorkerPool {
       carry: '',
       pending: new Map(),
       alive: true,
+      closing: false,
+      closed: false,
     }
     this.records.set(key, record)
 
-    const failPending = (message: string) => {
-      if (!record.alive) return
-      record.alive = false
-      if (record.idleTimer) clearTimeout(record.idleTimer)
+    const rejectPending = (message: string) => {
       for (const request of record.pending.values()) {
         if (!request.settled) {
           request.settled = true
@@ -78,7 +82,32 @@ export class BaselineWorkerPool {
         }
       }
       record.pending.clear()
-      if (this.records.get(key) === record) this.records.delete(key)
+    }
+
+    const beginRetirement = (
+      message: string,
+      mode: 'graceful' | 'force',
+    ) => {
+      if (record.closing || record.closed) return
+      record.alive = false
+      record.closing = true
+      if (record.idleTimer) clearTimeout(record.idleTimer)
+      rejectPending(message)
+
+      if (mode === 'force') {
+        this.terminateTree(record.child)
+        return
+      }
+
+      try {
+        record.child.stdin.end()
+      } catch {
+        this.terminateTree(record.child)
+        return
+      }
+      record.forceTimer = setTimeout(() => {
+        if (!record.closed) this.terminateTree(record.child)
+      }, this.gracefulShutdownTimeoutMs)
     }
 
     const scheduleIdle = () => {
@@ -86,17 +115,21 @@ export class BaselineWorkerPool {
       if (record.idleTimer) clearTimeout(record.idleTimer)
       record.idleTimer = setTimeout(() => {
         if (record.pending.size !== 0 || !record.alive) return
-        record.alive = false
-        if (this.records.get(key) === record) this.records.delete(key)
-        record.child.kill()
+        beginRetirement('BASELINE_WORKER_IDLE_SHUTDOWN', 'graceful')
       }, this.idleTimeoutMs)
     }
 
     child.on('error', error => {
-      failPending(`BASELINE_WORKER_START_FAILED: ${error.message}`)
+      beginRetirement(`BASELINE_WORKER_START_FAILED: ${error.message}`, 'force')
     })
     child.on('close', code => {
-      failPending(`BASELINE_WORKER_EXITED: code=${code ?? -1}`)
+      record.closed = true
+      record.alive = false
+      record.closing = false
+      if (record.idleTimer) clearTimeout(record.idleTimer)
+      if (record.forceTimer) clearTimeout(record.forceTimer)
+      rejectPending(`BASELINE_WORKER_EXITED: code=${code ?? -1}`)
+      if (this.records.get(key) === record) this.records.delete(key)
     })
     child.stderr.on('data', (text: string) => {
       if (!text) return
@@ -112,25 +145,30 @@ export class BaselineWorkerPool {
         const line = record.carry.slice(0, newline)
         record.carry = record.carry.slice(newline + 1)
         if (!line.trim()) continue
+
         let message: any
         try {
           message = JSON.parse(line)
         } catch {
-          failPending(
+          beginRetirement(
             `BASELINE_WORKER_PROTOCOL_INVALID: ${line.slice(0, 500)}`,
+            'force',
           )
           return
         }
+
         if (message?.type === 'ready') continue
         const id = typeof message?.id === 'string' ? message.id : ''
         const request = record.pending.get(id)
         if (!request) continue
+
         if (message?.type === 'stream') {
           const stream: 'stdout' | 'stderr' =
             message?.stream === 'stderr' ? 'stderr' : 'stdout'
           request.onOutput(stream, String(message?.data ?? ''))
           continue
         }
+
         if (message?.type === 'complete') {
           const code = Number.isFinite(Number(message?.code))
             ? Number(message.code)
@@ -145,15 +183,13 @@ export class BaselineWorkerPool {
           if (reusable) {
             scheduleIdle()
           } else {
-            record.alive = false
-            if (record.idleTimer) clearTimeout(record.idleTimer)
-            if (this.records.get(key) === record) this.records.delete(key)
-            for (const pending of record.pending.values()) {
-              if (!pending.settled) {
-                pending.settled = true
-                pending.reject(new Error('BASELINE_WORKER_RETIRED_AFTER_UNSAFE_REQUEST'))
-              }
-            }
+            beginRetirement(
+              String(
+                message?.retirementReason
+                  || 'BASELINE_WORKER_RETIRED_AFTER_UNSAFE_REQUEST'
+              ),
+              'force',
+            )
           }
         }
       }
@@ -174,7 +210,13 @@ export class BaselineWorkerPool {
     result: Promise<BaselineWorkerResult>
   } {
     let record = this.records.get(key)
-    if (!record || !record.alive || record.child.killed) {
+    if (record && (record.closing || (!record.alive && !record.closed))) {
+      return {
+        child: record.child,
+        result: Promise.reject(new Error('BASELINE_WORKER_RETIRING')),
+      }
+    }
+    if (!record || record.closed || record.child.killed) {
       record = this.start(key, request.cwd)
     }
     if (record.idleTimer) {
@@ -209,7 +251,9 @@ export class BaselineWorkerPool {
     for (const [key, record] of this.records) {
       this.records.delete(key)
       record.alive = false
+      record.closing = true
       if (record.idleTimer) clearTimeout(record.idleTimer)
+      if (record.forceTimer) clearTimeout(record.forceTimer)
       kill(record.child)
     }
   }
