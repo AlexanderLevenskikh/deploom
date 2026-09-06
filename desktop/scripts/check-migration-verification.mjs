@@ -204,8 +204,8 @@ policy = migrationGatePolicy({}, "Demo", { scripts: {
   lint: "eslint .", "lint:types": "tsc --noEmit", "lint:scripts": "eslint src",
   build: "vite build", "test:unit": "vitest run", test: "vitest",
 } }, "yarn");
-if (policy.verificationCommands.includes("yarn lint") || policy.verificationCommands.includes("yarn test")) {
-  throw new Error(`Focused lint/test:unit must suppress duplicate fallback: ${JSON.stringify(policy)}`);
+if (!policy.verificationCommands.includes("yarn lint") || policy.verificationCommands.includes("yarn test")) {
+  throw new Error(`Distinct plain lint must run alongside focused checks while test:unit suppresses test: ${JSON.stringify(policy)}`);
 }
 
 const keyA = liveBaselineObservationCacheKey("Demo", "apps/web", "a".repeat(40), "yarn lint:types");
@@ -236,6 +236,58 @@ if (mainSource.includes("currentIntegrationVerificationReceiptIdentity")
   || mainSource.includes("rememberIntegrationVerificationReceipt")
   || mainSource.includes("integrationVerificationReceiptKey")) {
   throw new Error("Weak integration receipt reuse must stay disabled until strong materialization-proof binding exists");
+}
+
+
+// Ψ.2.2 — stdout/stderr partial lines must never be glued together.
+const splitStreams = createVerificationDiagnosticCollector("C:/repo");
+splitStreams.push("$ yarn build", "stdout");
+splitStreams.push("src/new.ts(4,2): error TS2345: NEW ERROR\n", "stderr");
+const splitEvidence = splitStreams.finish();
+if (!splitEvidence.complete || !splitEvidence.informative
+  || !splitEvidence.lines.some((line) => line.includes("TS2345"))) {
+  throw new Error(`Separate stream carry lost stderr diagnostic: ${JSON.stringify(splitEvidence)}`);
+}
+if (splitEvidence.lines.some((line) => line.includes("$ yarn buildsrc/new.ts"))) {
+  throw new Error(`stdout/stderr fragments were incorrectly concatenated: ${JSON.stringify(splitEvidence)}`);
+}
+
+const noNewline = createVerificationDiagnosticCollector("C:/repo", 1024, 128);
+for (let i = 0; i < 100; i += 1) noNewline.push("progress-without-newline-" + "x".repeat(80), "stdout");
+const noNewlineEvidence = noNewline.finish();
+if (noNewlineEvidence.complete || !noNewlineEvidence.truncated) {
+  throw new Error(`Long unterminated output must mark evidence incomplete: ${JSON.stringify(noNewlineEvidence)}`);
+}
+
+const headerOnly = verificationDiagnosticEvidenceFromText(
+  "Starting build\nCommand failed with exit code 1",
+);
+if (headerOnly.informative) {
+  throw new Error(`Ordinary informational text must not become baseline authority: ${JSON.stringify(headerOnly)}`);
+}
+const recognizedTs = verificationDiagnosticEvidenceFromText(
+  "Starting build\nsrc/a.ts(1,2): error TS2322: Type string is not assignable\nCommand failed with exit code 1",
+);
+if (!recognizedTs.informative) {
+  throw new Error(`Recognized TypeScript diagnostic should be informative: ${JSON.stringify(recognizedTs)}`);
+}
+
+policy = migrationGatePolicy({}, "Demo", { scripts: {
+  lint: "eslint .",
+  typecheck: "tsc --noEmit",
+  build: "vite build",
+} }, "yarn");
+if (JSON.stringify(policy.verificationCommands) !== JSON.stringify(["yarn typecheck", "yarn lint", "yarn build"])) {
+  throw new Error(`lint + typecheck parity is wrong: ${JSON.stringify(policy)}`);
+}
+
+policy = migrationGatePolicy({}, "Demo", { scripts: {
+  lint: "eslint .",
+  "lint:scripts": "eslint .",
+  build: "vite build",
+} }, "yarn");
+if (policy.verificationCommands.filter((item) => item.includes("lint")).length !== 1) {
+  throw new Error(`Exact duplicate lint bodies should run once: ${JSON.stringify(policy)}`);
 }
 
 console.log("Migration verification and integration-repair checks passed");

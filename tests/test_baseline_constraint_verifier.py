@@ -243,7 +243,39 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 },
             }), encoding="utf-8")
             self.assertEqual(
-                ("yarn lint:types", "yarn lint:scripts", "yarn build", "yarn test:unit"),
+                ("yarn lint:types", "yarn lint:scripts", "yarn lint", "yarn build", "yarn test:unit"),
+                discover_baseline_project_checks(root),
+            )
+
+    def test_auto_discovery_keeps_plain_lint_with_typecheck(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(json.dumps({
+                "packageManager": "yarn@1.22.22",
+                "scripts": {
+                    "lint": "eslint .",
+                    "typecheck": "tsc --noEmit",
+                    "build": "vite build",
+                },
+            }), encoding="utf-8")
+            self.assertEqual(
+                ("yarn typecheck", "yarn lint", "yarn build"),
+                discover_baseline_project_checks(root),
+            )
+
+    def test_auto_discovery_deduplicates_exact_plain_lint_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(json.dumps({
+                "packageManager": "yarn@1.22.22",
+                "scripts": {
+                    "lint": "eslint .",
+                    "lint:scripts": "eslint .",
+                    "build": "vite build",
+                },
+            }), encoding="utf-8")
+            self.assertEqual(
+                ("yarn lint:scripts", "yarn build"),
                 discover_baseline_project_checks(root),
             )
 

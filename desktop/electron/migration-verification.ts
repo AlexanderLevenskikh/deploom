@@ -47,8 +47,19 @@ export type MigrationVerificationAssessment = {
 type UnknownRecord = Record<string, unknown>
 
 const DEFAULT_DIAGNOSTIC_MAX_CHARS = 256 * 1024
+const DEFAULT_DIAGNOSTIC_MAX_CARRY_CHARS = 16 * 1024
 const ANSI_PATTERN = /\u001B\[[0-?]*[ -/]*[@-~]/g
 const GENERIC_DIAGNOSTIC_PATTERN = /^(?:error\s+)?command failed(?: with exit code \d+)?\.?$|^process exited with (?:code|status) \d+\.?$|^npm err! lifecycle script .* failed.*$|^npm err! code elifecycle$|^error command failed\.?$/i
+const RECOGNIZED_DIAGNOSTIC_PATTERNS = [
+  /\b(?:error|warning)\s+TS\d{4}\b/i,
+  /^\s*\d+:\d+\s+(?:error|warning)\s+\S/i,
+  /\b(?:TypeError|ReferenceError|SyntaxError|RangeError|AssertionError|AggregateError)\s*:\s*\S/i,
+  /\b(?:ERR_[A-Z0-9_]+|Cannot find module|Module not found|No overload matches|is not assignable to|does not exist on type|Unexpected token)\b/i,
+  /^ERROR(?:\s+in\b|\s*:\s*\S)/i,
+  /^error during (?:build|startup|test)\b/i,
+  /^(?:FAIL|FAILED)\b/i,
+  /[✖×]\s+\S/,
+] as const
 
 function asRecord(value: unknown): UnknownRecord {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as UnknownRecord : {}
@@ -108,8 +119,6 @@ function canonicalizeDiagnosticLine(line: string, cwd?: string): string | undefi
   if (/^Done in <duration>\.?$/i.test(normalized)) return undefined
   if (/^(?:real|user|sys)\s+<duration>$/i.test(normalized)) return undefined
   if (/^yarn run v\d+/i.test(normalized)) return undefined
-  if (/^>\s+[^ ]+@[^ ]+\s+[^ ]+$/i.test(normalized)) return undefined
-  if (/^\$\s+/.test(normalized)) return undefined
   if (/^(?:info|verbose)\s+.*progress/i.test(normalized)) return undefined
 
   return normalized
@@ -119,14 +128,22 @@ export function isGenericVerificationDiagnostic(line: string): boolean {
   return GENERIC_DIAGNOSTIC_PATTERN.test(line.trim())
 }
 
+export function isRecognizedVerificationDiagnostic(line: string): boolean {
+  const normalized = line.trim()
+  if (!normalized || isGenericVerificationDiagnostic(normalized)) return false
+  return RECOGNIZED_DIAGNOSTIC_PATTERNS.some((pattern) => pattern.test(normalized))
+}
+
 export function createVerificationDiagnosticCollector(
   cwd?: string,
   maxStoredChars = DEFAULT_DIAGNOSTIC_MAX_CHARS,
+  maxCarryChars = Math.min(DEFAULT_DIAGNOSTIC_MAX_CARRY_CHARS, Math.max(1024, maxStoredChars)),
 ): {
-  push: (text: string) => void
+  push: (text: string, stream?: 'stdout' | 'stderr') => void
   finish: () => VerificationDiagnosticEvidence
 } {
-  let carry = ''
+  const carries: Record<'stdout' | 'stderr', string> = { stdout: '', stderr: '' }
+  const droppingLongLine: Record<'stdout' | 'stderr', boolean> = { stdout: false, stderr: false }
   let storedChars = 0
   let totalBytes = 0
   let truncated = false
@@ -147,22 +164,43 @@ export function createVerificationDiagnosticCollector(
     storedChars += cost
   }
 
-  const push = (text: string): void => {
+  const push = (text: string, stream: 'stdout' | 'stderr' = 'stdout'): void => {
     if (finished || !text) return
     totalBytes += Buffer.byteLength(text)
-    const combined = carry + text
-    const parts = combined.split(/\r?\n/)
-    carry = parts.pop() ?? ''
+    let incoming = text
+
+    if (droppingLongLine[stream]) {
+      const boundary = incoming.search(/[\r\n]/)
+      if (boundary < 0) return
+      incoming = incoming.slice(boundary + 1)
+      droppingLongLine[stream] = false
+    }
+
+    const combined = carries[stream] + incoming
+    const parts = combined.split(/\r\n|\n|\r/)
+    const tail = parts.pop() ?? ''
     for (const part of parts) store(part)
+
+    if (tail.length > maxCarryChars) {
+      truncated = true
+      carries[stream] = ''
+      droppingLongLine[stream] = true
+    } else {
+      carries[stream] = tail
+    }
   }
 
   const finish = (): VerificationDiagnosticEvidence => {
     if (!finished) {
       finished = true
-      if (carry) store(carry)
-      carry = ''
+      for (const stream of ['stdout', 'stderr'] as const) {
+        if (carries[stream]) store(carries[stream])
+        carries[stream] = ''
+        if (droppingLongLine[stream]) truncated = true
+        droppingLongLine[stream] = false
+      }
     }
-    const informative = lines.some((line) => !isGenericVerificationDiagnostic(line))
+    const informative = lines.some(isRecognizedVerificationDiagnostic)
     return {
       lines: [...lines],
       complete: !truncated,

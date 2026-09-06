@@ -397,7 +397,17 @@ def discover_baseline_project_checks(project_dir: Path) -> Tuple[str, ...]:
         "lint:styles", "lint:scripts",
     )
     names = [name for name in focused if isinstance(scripts.get(name), str) and scripts.get(name, "").strip()]
-    if not names and isinstance(scripts.get("lint"), str) and scripts.get("lint", "").strip():
+    plain_lint = scripts.get("lint")
+    plain_lint_text = plain_lint.strip() if isinstance(plain_lint, str) else ""
+    plain_lint_is_exact_duplicate = bool(
+        plain_lint_text
+        and any(
+            isinstance(scripts.get(name), str)
+            and scripts.get(name, "").strip() == plain_lint_text
+            for name in names
+        )
+    )
+    if plain_lint_text and not plain_lint_is_exact_duplicate:
         names.append("lint")
     for name in ("build", "test:unit", "test"):
         if isinstance(scripts.get(name), str) and scripts.get(name, "").strip():

@@ -43,7 +43,11 @@ function packageScriptCommands(packageJson: unknown, packageManager: 'yarn' | 'n
     if (name === 'typecheck' && selectedNames.includes('lint:types')) continue
     selectedNames.push(name)
   }
-  if (!selectedNames.length && typeof scripts.lint === 'string') selectedNames.push('lint')
+  const plainLint = typeof scripts.lint === 'string' ? scripts.lint.trim() : ''
+  const plainLintIsExactDuplicate = plainLint
+    ? selectedNames.some((name) => typeof scripts[name] === 'string' && scripts[name].trim() === plainLint)
+    : false
+  if (plainLint && !plainLintIsExactDuplicate) selectedNames.push('lint')
   for (const name of ['build', 'test:unit', 'test']) {
     if (typeof scripts[name] !== 'string') continue
     if (name === 'test' && selectedNames.includes('test:unit')) continue

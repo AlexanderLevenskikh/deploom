@@ -5326,7 +5326,7 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
     child.stdout.on('data', (chunk: Buffer) => {
       markOutput()
       const text = decodeProcessOutputChunk(chunk)
-      diagnosticCollector?.push(text)
+      diagnosticCollector?.push(text, 'stdout')
       stdout = `${stdout}${text}`.slice(-6000)
       if (spec.captureAgentSession !== false) captureAgentSession(job, text)
       send('flow:job-output', { jobId: job.id, stream: 'stdout', line: text })
@@ -5334,7 +5334,7 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
     child.stderr.on('data', (chunk: Buffer) => {
       markOutput()
       const text = decodeProcessOutputChunk(chunk)
-      diagnosticCollector?.push(text)
+      diagnosticCollector?.push(text, 'stderr')
       if (spec.captureAgentSession !== false) captureAgentSession(job, text)
       stderr = `${stderr}${text}`.slice(-6000)
       send('flow:job-output', { jobId: job.id, stream: 'stderr', line: text })
