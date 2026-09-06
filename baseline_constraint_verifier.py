@@ -222,6 +222,25 @@ def _durable_prepared_publication_policy(
     return bool(config.publish_durable_prepared_artifact), "legacy-explicit-policy"
 
 
+# BLOCK_PSI41_CONTROL_COST_POLICY_V1
+def _persistent_control_cross_run_enabled() -> bool:
+    """Cross-run control reuse is opt-in until its economics are proven.
+
+    Same-run Ψ.3 private reuse remains enabled. Setting
+    DEPLOOM_BASELINE_CONTROL_DURABLE_MODE=force is intended only for a
+    controlled benchmark/certification run.
+    """
+    return (
+        str(
+            os.environ.get("DEPLOOM_BASELINE_CONTROL_DURABLE_MODE")
+            or "same-run-only"
+        )
+        .strip()
+        .lower()
+        == "force"
+    )
+
+
 def project_proof_cache_reusable(commands: Sequence[str]) -> bool:
     """Policy: arbitrary shell-command PASS has no durable external-tool closure."""
     return not any(str(command).strip() for command in commands)
@@ -706,6 +725,9 @@ class PreparedWorkspaceSnapshot:
     # seal and atomically published its locator. It is never deserialized and
     # never substitutes cross-process continuity validation.
     durable_publication_confirmed: bool = False
+    # Ψ.4.1: exact cost of the strong durable integrity-seal substage only.
+    # Performance metadata; never proof/cache identity.
+    durable_seal_duration_ms: int = 0
 
 
 _PREPARED_SNAPSHOT_LOCK = threading.Lock()
@@ -1805,10 +1827,12 @@ def _publish_prepared_workspace_snapshot(
             published = snapshot
 
         durable_published = False
+        durable_seal_duration_ms = 0
         if shared_reuse_allowed and is_durable_prepared_path(published.workspace_root):
             # This performs a FULL whole-tree content hash of the durable
-            # artifact. It is the dominant cost of snapshot publish and used to
-            # run silently right after "zero-copy promotion complete".
+            # artifact. Measure ONLY this substage; snapshot copy/rebase/finalize
+            # are reported separately and must not inflate durableSealMsByRole.
+            durable_seal_started = time.monotonic()
             with _publish_stage(
                 "durable-record:integrity-seal",
                 operation_id=publish_operation_id,
@@ -1828,10 +1852,14 @@ def _publish_prepared_workspace_snapshot(
                     progress=progress,
                     progress_interval_seconds=progress_interval_seconds,
                 )
+            durable_seal_duration_ms = max(
+                0, int((time.monotonic() - durable_seal_started) * 1000)
+            )
         if durable_published:
             confirmed = dataclasses.replace(
                 published,
                 durable_publication_confirmed=True,
+                durable_seal_duration_ms=durable_seal_duration_ms,
             )
             if shared_reuse_allowed:
                 with _PREPARED_SNAPSHOT_LOCK:
@@ -2723,6 +2751,12 @@ def verify_assignment(
 
         if resolver_reused:
             event(
+                "verify.resolver.skipped",
+                operationId=new_observability_id("resolver-skip"),
+                reason="resolver-proof-restored-for-project-verification",
+                resolverInputKey=proof_identity.resolver_input_key,
+            )
+            event(
                 "proof.cache.hit",
                 proofType="resolver",
                 cacheKey=proof_identity.resolver_input_key,
@@ -2995,9 +3029,33 @@ def verify_assignment(
             snapshot_is_private = private_snapshot is not None
             snapshot = private_snapshot
             if snapshot is None and preparation_record is not None:
-                snapshot = _lookup_prepared_workspace_snapshot(
-                    proof_identity.preparation_proof_key, project_dir, progress=progress
-                )
+                durable_lookup_allowed = True
+                if (
+                    _verification_purpose(config) == "baseline-control"
+                    and not _persistent_control_cross_run_enabled()
+                ):
+                    durable_lookup_allowed = False
+                    event(
+                        "persistent-control.prepared.cold-skip",
+                        operationId=new_observability_id(
+                            "persistent-control-cold-skip"
+                        ),
+                        reason="same-run-only-default",
+                        preparationProofKey=proof_identity.preparation_proof_key,
+                    )
+                    _emit_progress(
+                        progress,
+                        f"{progress_label}: "
+                        "PSI41_PERSISTENT_CONTROL_COLD_REUSE_SKIPPED; "
+                        "cross-run full-hash is disabled until benchmarked cheaper "
+                        "than fresh preparation; same-run private reuse remains enabled",
+                    )
+                if durable_lookup_allowed:
+                    snapshot = _lookup_prepared_workspace_snapshot(
+                        proof_identity.preparation_proof_key,
+                        project_dir,
+                        progress=progress,
+                    )
             if snapshot is not None and snapshot.observed_resolved_hash != observed_hash:
                 event(
                     "verify.preparation.snapshot-rejected",
@@ -3220,15 +3278,33 @@ def verify_assignment(
                     preparation_publication_allowed and role_allows_durable
                 )
                 purpose = _verification_purpose(config)
+                control_cost_reason = ""
+                if (
+                    durable_snapshot_requested
+                    and purpose == "baseline-control"
+                    and not _persistent_control_cross_run_enabled()
+                ):
+                    durable_snapshot_requested = False
+                    control_cost_reason = "same-run-only-default"
+                    event(
+                        "persistent-control.prepared.publication-cost-skip",
+                        operationId=publication_operation_id,
+                        reason=control_cost_reason,
+                        preparationProofKey=proof_identity.preparation_proof_key,
+                    )
                 event(
                     "prepared.publication.decision",
                     operationId=publication_operation_id,
                     role=purpose,
                     durableRequested=durable_snapshot_requested,
                     decisionReason=(
-                        publication_reason
-                        if preparation_publication_allowed
-                        else "process-tree-supervision-not-guaranteed"
+                        control_cost_reason
+                        if purpose == "baseline-control" and control_cost_reason
+                        else (
+                            publication_reason
+                            if preparation_publication_allowed
+                            else "process-tree-supervision-not-guaranteed"
+                        )
                     ),
                     preparationProofKey=proof_identity.preparation_proof_key,
                 )
@@ -3239,9 +3315,13 @@ def verify_assignment(
                         role=purpose,
                         preparationProofKey=proof_identity.preparation_proof_key,
                         decisionReason=(
-                            publication_reason
-                            if preparation_publication_allowed
-                            else "process-tree-supervision-not-guaranteed"
+                            control_cost_reason
+                            if purpose == "baseline-control" and control_cost_reason
+                            else (
+                                publication_reason
+                                if preparation_publication_allowed
+                                else "process-tree-supervision-not-guaranteed"
+                            )
                         ),
                     )
                     if purpose in _PSI4_INTERMEDIATE_PURPOSES:
@@ -3288,30 +3368,50 @@ def verify_assignment(
                     progress,
                     f"{progress_label}: snapshot publish PASS; elapsed={snapshot_duration_ms // 1000}s; mode={snapshot.storage_mode}",
                 )
+                durable_snapshot_confirmed = bool(
+                    durable_snapshot_requested
+                    and snapshot.durable_publication_confirmed
+                )
                 if durable_snapshot_requested:
                     event(
                         "prepared.publication.promote.finish",
                         operationId=publication_operation_id,
                         role=purpose,
-                        durationMs=snapshot_duration_ms,
-                        outcome="passed",
+                        durationMs=(
+                            snapshot.durable_seal_duration_ms
+                            if durable_snapshot_confirmed
+                            else 0
+                        ),
+                        totalPublicationMs=snapshot_duration_ms,
+                        outcome=(
+                            "passed"
+                            if durable_snapshot_confirmed
+                            else "failed"
+                        ),
+                        durablePublicationConfirmed=durable_snapshot_confirmed,
                         preparationProofKey=proof_identity.preparation_proof_key,
                     )
-                    if purpose == "baseline-control":
+                    if (
+                        purpose == "baseline-control"
+                        and durable_snapshot_confirmed
+                    ):
                         event(
                             "persistent-control.prepared.published",
                             operationId=publication_operation_id,
                             preparationProofKey=proof_identity.preparation_proof_key,
+                            durableSealMs=snapshot.durable_seal_duration_ms,
                         )
                 workspace_project = snapshot.workspace_root / snapshot.project_relative
-                if durable_snapshot_requested:
+                if durable_snapshot_confirmed:
                     _PREPARED_SNAPSHOT_PRODUCERS[
                         _prepared_snapshot_slot(
                             proof_identity.preparation_proof_key, project_dir
                         )
                     ] = progress_label
-                    pin_prepared_artifact_record(proof_identity.preparation_proof_key)
-                else:
+                    pin_prepared_artifact_record(
+                        proof_identity.preparation_proof_key
+                    )
+                elif not durable_snapshot_requested:
                     _register_same_run_private_prepared_snapshot(
                         snapshot, producer=progress_label
                     )
@@ -4006,7 +4106,12 @@ def promote_same_run_prepared_artifact(
         operationId=promotion_operation_id,
         role="verified-incumbent",
         preparationProofKey=key,
-        durationMs=promotion_duration_ms,
+        durationMs=(
+            promoted.durable_seal_duration_ms
+            if durable_ok
+            else 0
+        ),
+        totalPublicationMs=promotion_duration_ms,
         outcome="passed" if durable_ok else "failed",
         reason="strong-durable-seal" if durable_ok else "durable-record-missing",
     )
@@ -4357,6 +4462,15 @@ def verify_assignment(
         project_record = proof_store.lookup_pass("project", identity.project_proof_key)
         if project_record is not None:
             cache_event("proof.cache.hit", "project", identity.project_proof_key)
+            emit_verification_event(
+                telemetry_path,
+                "verify.resolver.skipped",
+                projectPath=str(project_dir),
+                label=progress_label,
+                operationId=new_observability_id("resolver-skip"),
+                reason="exact-project-proof-hit",
+                **identity.event_fields(),
+            )
             _emit_progress(
                 progress,
                 f"{progress_label}: exact ProjectProof cache HIT for ResolvedState "
@@ -4385,6 +4499,15 @@ def verify_assignment(
         cache_event("proof.cache.miss", "project", identity.project_proof_key)
 
     if resolver_hit and not wants_project_proof:
+        emit_verification_event(
+            telemetry_path,
+            "verify.resolver.skipped",
+            projectPath=str(project_dir),
+            label=progress_label,
+            operationId=new_observability_id("resolver-skip"),
+            reason="exact-resolver-proof-hit",
+            **identity.event_fields(),
+        )
         _emit_progress(
             progress,
             f"{progress_label}: exact ResolverProof + ResolvedState cache HIT; resolver verification skipped",

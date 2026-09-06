@@ -110,6 +110,9 @@ def _new_metrics() -> dict[str, object]:
         "neighborSeedAttempts": 0,
         "neighborSeedHits": 0,
         "neighborSeedFallbacks": 0,
+        # Ψ.4.1 profitability/accounting.
+        "controlColdValidationSkips": 0,
+        "controlDurablePublicationCostSkips": 0,
     }
 
 
@@ -556,10 +559,7 @@ def record_verification_event(event: str, payload: Mapping[str, object]) -> None
             _METRICS["resolverProcessesStarted"] = int(
                 _METRICS["resolverProcessesStarted"]
             ) + 1
-        elif (
-            event == "proof.cache.hit"
-            and str(payload.get("proofType") or "") == "resolver"
-        ):
+        elif event == "verify.resolver.skipped":
             _METRICS["resolverProcessesAvoided"] = int(
                 _METRICS["resolverProcessesAvoided"]
             ) + 1
@@ -583,6 +583,14 @@ def record_verification_event(event: str, payload: Mapping[str, object]) -> None
             ) + 1
             _METRICS["persistentControlLifecycleAvoided"] = int(
                 _METRICS["persistentControlLifecycleAvoided"]
+            ) + 1
+        elif event == "persistent-control.prepared.cold-skip":
+            _METRICS["controlColdValidationSkips"] = int(
+                _METRICS["controlColdValidationSkips"]
+            ) + 1
+        elif event == "persistent-control.prepared.publication-cost-skip":
+            _METRICS["controlDurablePublicationCostSkips"] = int(
+                _METRICS["controlDurablePublicationCostSkips"]
             ) + 1
         elif event == "prepared.publication.skipped":
             if str(payload.get("role") or "") in {
