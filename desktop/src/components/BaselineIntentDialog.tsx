@@ -101,7 +101,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     policies: Object.fromEntries(Object.entries(nextPolicies).filter(([, value]) => value !== 'auto')),
     extraIterations: Math.max(0, Number(plan.intent.extraIterations ?? 0) + extra),
     decisionGrantIterations: grant,
-    searchMode: normalizedExecutionMode(nextExecutionMode) === 'BACKGROUND' ? 'EXHAUSTIVE' : searchMode,
+    searchMode,
     executionMode: normalizedExecutionMode(nextExecutionMode),
     proofMode,
     deferredCohorts: reconcileDeferredCohorts(nextDeferredCohorts, nextPolicies),

@@ -10,9 +10,14 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+import hashlib
 import heapq
 import time
 from verification_observability import emit_observability_event
+from verification_experiment_registry import (
+    PhysicalExperimentKey,
+    run_physical_experiment,
+)
 
 # BLOCK_Y_FULL_OBSERVABILITY_V1
 
@@ -286,6 +291,7 @@ def parallel_ddmin(
     progress_interval_seconds: float = 15.0,
     timeout_seconds: Optional[float] = None,
     confirm_failure: Optional[Callable[[Tuple[VerificationUnit, ...]], bool]] = None,
+    navigation_context_key: str = "",
     resume_state: Optional[Mapping[str, object]] = None,
     checkpoint: Optional[CheckpointCallback] = None,
 ) -> Tuple[VerificationUnit, ...]:
@@ -416,6 +422,27 @@ def parallel_ddmin(
                     finished=resumed_finished,
                 )
 
+    def run_screen(candidate: Tuple[VerificationUnit, ...]) -> tuple[bool, str]:
+        # Ψ.5 completed process-local reuse is SCREENING/NAVIGATION only.
+        # Without a fresh confirm_failure gate it is deliberately disabled.
+        context = str(navigation_context_key or "").strip()
+        if not context or confirm_failure is None:
+            return bool(fails(candidate)), "fresh"
+        candidate_key = key(candidate)
+        slot = "ddmin-screen:" + hashlib.sha256(
+            "\0".join(candidate_key).encode("utf-8")
+        ).hexdigest()
+        value, source = run_physical_experiment(
+            PhysicalExperimentKey(
+                strong_identity=context,
+                proof_slot=slot,
+                purpose="diagnostic-probe",
+            ),
+            lambda: bool(fails(candidate)),
+            is_reusable=lambda result: isinstance(result, bool),
+        )
+        return bool(value), source
+
     def evaluate_many(candidates: Sequence[Tuple[VerificationUnit, ...]], *, wave: str) -> List[bool | None]:
         nonlocal checks
         results: List[bool | None] = [None] * len(candidates)
@@ -446,12 +473,14 @@ def parallel_ddmin(
                 candidatePackages=package_count(candidate),
             )
             try:
-                value = bool(fails(candidate))
+                value, screen_source = run_screen(candidate)
                 emit(
                     "check-finish",
                     wave=wave,
                     check=check_number,
                     failed=value,
+                    screenSource=screen_source,
+                    authority="NAVIGATION_ONLY" if screen_source != "fresh" else "POINT_EVIDENCE",
                     checkElapsedSeconds=round(time.monotonic() - check_started, 1),
                     candidateUnits=len(candidate),
                     candidatePackages=package_count(candidate),

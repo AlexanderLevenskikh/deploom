@@ -114,6 +114,7 @@ from verification_proof import (
 from source_snapshot import (
     SourceCaptureError,
     activate_source_snapshot_epoch,
+    active_source_snapshot,
     source_snapshot_provenance_head,
 )
 from resolved_dependency_state import load_resolved_dependency_state
@@ -159,6 +160,11 @@ from project_topology import (
 from verification_observability import (
     configure_observability_path,
     emit_observability_event,
+)
+from verification_experiment_registry import (
+    navigation_negative_candidates,
+    remember_navigation_negative,
+    reset_physical_experiment_registry,
 )
 
 # BLOCK_Y_FULL_OBSERVABILITY_V1
@@ -331,22 +337,27 @@ def _baseline_execution_mode() -> str:
 
 
 # BLOCK_PSI42_BACKGROUND_AUTONOMY_V1
+# BLOCK_PSI5_TIME_TO_VERIFIED_V1
 def _baseline_background_autonomous() -> bool:
-    """BACKGROUND is a zero-dialog autonomous deep-search execution policy."""
+    """BACKGROUND controls unattended execution, not search-depth authority."""
     return _baseline_execution_mode() == "BACKGROUND"
 
 
 def _baseline_effective_search_mode() -> BaselineSearchMode:
-    """BACKGROUND implicitly authorizes the existing exhaustive narrowing path.
+    """Keep execution mode independent from requested search depth.
 
-    This does not create solver authority and does not mutate USER_POLICY.
-    It only removes the mid-run human continuation boundary for a mode whose
-    product promise is to keep working unattended until the hard safety ceiling.
+    BACKGROUND removes human continuation dialogs and grants the existing hard
+    iteration ceiling, but AUTO still prioritizes first verified incumbent.
+    Only explicit EXHAUSTIVE authorizes pre-incumbent deep localization.
     """
-    requested = _baseline_search_mode()
-    if _baseline_background_autonomous():
-        return BaselineSearchMode.EXHAUSTIVE
-    return requested
+    return _baseline_search_mode()
+
+
+def _baseline_hot_worker_continuation() -> bool:
+    """True only for an explicit Desktop continuation/retry in the same worker."""
+    return str(
+        os.environ.get("DEPLOOM_BASELINE_HOT_CONTINUATION") or ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _baseline_max_expensive_attempts(default: int) -> int:
@@ -363,7 +374,7 @@ def _baseline_max_expensive_attempts(default: int) -> int:
 
 def _baseline_deep_search_allowed(*, has_incumbent: bool, search_mode: Optional[BaselineSearchMode] = None) -> bool:
     effective = search_mode or _baseline_search_mode()
-    return bool(has_incumbent or _baseline_execution_mode() == "BACKGROUND" or effective == BaselineSearchMode.EXHAUSTIVE)
+    return bool(has_incumbent or effective == BaselineSearchMode.EXHAUSTIVE)
 
 
 def _baseline_preseal_screening_enabled(*, has_incumbent: bool) -> bool:
@@ -9742,7 +9753,10 @@ def resolve_peer_compatibility_with_verification(
     diagnostic by default because source repair belongs to Executor; strict mode
     can explicitly promote them to learned constraints.
     """
-    reset_same_run_verification_reuse()
+    hot_worker_continuation = _baseline_hot_worker_continuation()
+    if not hot_worker_continuation:
+        reset_same_run_verification_reuse()
+        reset_physical_experiment_registry()
     progress_reporter = BaselineProgressReporter(progress_path)
     localization_checkpoint_store = BaselineLocalizationCheckpointStore(progress_path)
     # BLOCK_V_BASELINE_RECOVERY_V1
@@ -9877,8 +9891,43 @@ def resolve_peer_compatibility_with_verification(
 
         # BLOCK_X_SOURCE_TRUTH_V1
         # One source epoch is captured before any physical compatibility trial.
-        # Every resolver/project experiment in this project run consumes bytes
-        # cloned from this sealed snapshot, never from the changing live checkout.
+        # Ψ.5 may retain that exact immutable epoch across Desktop continuation,
+        # but only when the live source guard still reports the same Git commit.
+        existing_hot_snapshot = (
+            active_source_snapshot(spec.path)
+            if hot_worker_continuation
+            else None
+        )
+        expected_source_head = str(
+            (spec.source_checkout or {}).get("sourceCommit") or ""
+        )
+        existing_hot_head = str(
+            getattr(existing_hot_snapshot, "git_head", "") or ""
+        )
+        hot_epoch_reusable = bool(
+            hot_worker_continuation
+            and existing_hot_snapshot is not None
+            and bool((spec.source_checkout or {}).get("verified"))
+            and expected_source_head
+            and existing_hot_head == expected_source_head
+        )
+        if hot_worker_continuation and not hot_epoch_reusable:
+            reset_same_run_verification_reuse()
+            reset_physical_experiment_registry()
+            emit_observability_event(
+                "baseline.worker.hot-epoch-rejected",
+                project=project,
+                expectedSourceHead=expected_source_head,
+                existingSourceHead=existing_hot_head,
+                authority="PERFORMANCE_ONLY",
+            )
+        elif hot_epoch_reusable:
+            emit_observability_event(
+                "baseline.worker.hot-epoch-reused",
+                project=project,
+                sourceHead=expected_source_head,
+                authority="PERFORMANCE_ONLY",
+            )
         try:
             source_snapshot = activate_source_snapshot_epoch(
                 spec.path,
@@ -9887,7 +9936,7 @@ def resolve_peer_compatibility_with_verification(
                     f"[info] {project}: {message}"
                 ),
                 progress_interval_seconds=config.progress_interval_seconds,
-                replace=True,
+                replace=not hot_epoch_reusable,
             )
         except SourceCaptureError as exc:
             raise BaselineConstraintVerificationError(
@@ -10188,6 +10237,9 @@ def resolve_peer_compatibility_with_verification(
                     },
                 },
             )
+            graph_generalization_failed_candidates.update(
+                navigation_negative_candidates(recovery_identity)
+            )
             recovery_plan = run_recovery_store.begin(
                 project, mode, identity=recovery_identity,
                 policy=baseline_resume_policy(),
@@ -10272,10 +10324,14 @@ def resolve_peer_compatibility_with_verification(
                 search_mode=effective_search_mode,
             )
             liveness.anytime = anytime
+            if _baseline_background_autonomous():
+                # Legacy field means no human budget boundary here; Ψ.5
+                # keeps actual search depth separately in search_mode.
+                anytime.exhaustive_authorized = True
             liveness.exhaustive_authorized = anytime.exhaustive_authorized
             if _baseline_background_autonomous():
                 eprint(
-                    f"[info] {project}: PSI42_BACKGROUND_AUTONOMOUS_EXHAUSTIVE; "
+                    f"[info] {project}: PSI5_BACKGROUND_AUTONOMOUS; "
                     f"requestedSearchMode={requested_search_mode.value}; "
                     f"effectiveSearchMode={effective_search_mode.value}; "
                     "human continuation/cohort dialogs disabled; "
@@ -10288,7 +10344,7 @@ def resolve_peer_compatibility_with_verification(
                     executionMode="BACKGROUND",
                     requestedSearchMode=requested_search_mode.value,
                     effectiveSearchMode=effective_search_mode.value,
-                    marker="PSI42_BACKGROUND_AUTONOMOUS_EXHAUSTIVE",
+                    marker="PSI5_BACKGROUND_AUTONOMOUS",
                     zeroDialog=True,
                     authority="ORCHESTRATION_POLICY",
                 )
@@ -10304,7 +10360,9 @@ def resolve_peer_compatibility_with_verification(
                 # must not silently downgrade a newly requested BACKGROUND run
                 # back into a human-decision boundary.
                 if _baseline_background_autonomous():
-                    anytime.search_mode = BaselineSearchMode.EXHAUSTIVE
+                    # Resume keeps the newly requested search depth. BACKGROUND
+                    # only restores unattended hard-ceiling authorization.
+                    anytime.search_mode = effective_search_mode
                     anytime.exhaustive_authorized = True
                     anytime.continuation_reason = None
                 liveness.exhaustive_authorized = anytime.exhaustive_authorized
@@ -12207,6 +12265,11 @@ def resolve_peer_compatibility_with_verification(
                         graph_generalization_failed_candidates.add(
                             (proposal.navigation_key, candidate_fingerprint)
                         )
+                        remember_navigation_negative(
+                            recovery_identity,
+                            proposal.navigation_key,
+                            candidate_fingerprint,
+                        )
                         eprint(
                             f"[info] {project}: graph-guided candidate remains diagnostic {mode}; "
                             f"candidate={candidate_fingerprint}, repeat={proposal.repeat_count}, "
@@ -12411,6 +12474,7 @@ def resolve_peer_compatibility_with_verification(
                         # shrink the search after the same experiment fails again
                         # with no sibling probe running.
                         confirm_failure=subset_fails,
+                        navigation_context_key=localization_identity,
                         resume_state=localization_resume_state,
                         checkpoint=lambda state: localization_checkpoint_store.save(
                             project, mode, localization_identity, state, source_head=source_head
@@ -17997,23 +18061,26 @@ def _report_domain_failure(exc: BaseException, *, expected: bool) -> int:
     return 3 if expected else 4
 
 
-if __name__ == "__main__":
+def run_cli() -> int:
+    """Run one generator request without terminating a long-lived worker."""
     try:
         main()
-    except SystemExit:
-        raise
+        return 0
+    except SystemExit as exc:
+        code = exc.code
+        return int(code) if isinstance(code, int) else (0 if code is None else 1)
     except KeyboardInterrupt:
         eprint("Baseline interrupted by user.")
-        raise SystemExit(130)
+        return 130
     except BaselineConstraintVerificationError as exc:
         message = str(exc)
         if message.startswith(BASELINE_DECISION_MARKER):
-            # Expected product control-flow boundary, not a crash.
             eprint(message)
-            raise SystemExit(3)
-        # Every other verification failure is still an EXPECTED domain outcome.
-        # It must stop the run with a structured, readable result instead of a
-        # raw traceback -- that was the primary user-facing defect.
-        raise SystemExit(_report_domain_failure(exc, expected=True))
+            return 3
+        return _report_domain_failure(exc, expected=True)
     except Exception as exc:  # genuine tool defect
-        raise SystemExit(_report_domain_failure(exc, expected=False))
+        return _report_domain_failure(exc, expected=False)
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_cli())

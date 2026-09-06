@@ -654,7 +654,9 @@ def load_prepared_artifact_record(
     sealed_identity = watcher_entry[1] if watcher_entry is not None else None
 
     validation_mode = "full-hash"
+    validation_started = time.monotonic()
     candidate_watcher: Optional[_DirectoryWatcher] = None
+    candidate_identity: Optional[tuple[int, int]] = None
     if watcher is not None:
         # A memo HIT must mean the SAME sealed bytes, the SAME directory object
         # and proven notification delivery -- not merely "the watcher has not
@@ -710,6 +712,8 @@ def load_prepared_artifact_record(
                 if not candidate_watcher.start():
                     candidate_watcher.stop()
                     candidate_watcher = None
+                else:
+                    candidate_identity = tree_object_identity(workspace)
         else:
             validation_mode = "watcher-memo"
     elif os.name == "nt":
@@ -717,14 +721,28 @@ def load_prepared_artifact_record(
         if not candidate_watcher.start():
             candidate_watcher.stop()
             candidate_watcher = None
+        else:
+            candidate_identity = tree_object_identity(workspace)
 
     if validation_mode == "full-hash":
         try:
             if progress:
                 progress("prepared artifact continuity: full integrity validation started")
+            def cold_validation_cancelled() -> bool:
+                if candidate_watcher is None:
+                    return False
+                current_identity = tree_object_identity(workspace)
+                return bool(
+                    candidate_identity is None
+                    or current_identity is None
+                    or current_identity != candidate_identity
+                    or not _watcher_is_clean(candidate_watcher)
+                )
+
             observed_integrity = build_artifact_tree_integrity(
                 workspace, progress=progress,
                 progress_label="prepared artifact continuity",
+                cancelled=cold_validation_cancelled,
             )
         except ArtifactIntegrityError as exc:
             if candidate_watcher is not None:
@@ -782,6 +800,7 @@ def load_prepared_artifact_record(
         durableRecordPresent=True, generationMatch=True,
         contentKeyMatch=True, invalidationReason="",
         validationMode=validation_mode,
+        validationMs=max(0, int((time.monotonic() - validation_started) * 1000)),
     )
     project = workspace / relative
     if not project.is_dir():

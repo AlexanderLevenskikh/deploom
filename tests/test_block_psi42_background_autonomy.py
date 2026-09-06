@@ -30,7 +30,7 @@ class Psi42BackgroundAutonomyTests(unittest.TestCase):
                 generator._baseline_effective_search_mode(),
             )
 
-    def test_background_forces_existing_exhaustive_path(self) -> None:
+    def test_background_keeps_requested_auto_search_depth(self) -> None:
         with patch.dict(
             os.environ,
             {
@@ -41,21 +41,34 @@ class Psi42BackgroundAutonomyTests(unittest.TestCase):
         ):
             self.assertTrue(generator._baseline_background_autonomous())
             self.assertEqual(
-                BaselineSearchMode.EXHAUSTIVE,
+                BaselineSearchMode.AUTO,
                 generator._baseline_effective_search_mode(),
             )
             state = BaselineAnytimeState(
                 search_mode=generator._baseline_effective_search_mode()
             )
-            self.assertTrue(state.exhaustive_authorized)
-            self.assertIsNone(state.automatic_continuation_reason())
+            self.assertFalse(state.exhaustive_authorized)
 
-    def test_background_overrides_bounded_request_too(self) -> None:
+    def test_background_keeps_bounded_request_too(self) -> None:
         with patch.dict(
             os.environ,
             {
                 "DEPLOOM_BASELINE_EXECUTION_MODE": "BACKGROUND",
                 "DEPLOOM_BASELINE_SEARCH_MODE": "BOUNDED_IMPROVEMENT",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                BaselineSearchMode.BOUNDED_IMPROVEMENT,
+                generator._baseline_effective_search_mode(),
+            )
+
+    def test_explicit_exhaustive_remains_exhaustive(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "DEPLOOM_BASELINE_EXECUTION_MODE": "BACKGROUND",
+                "DEPLOOM_BASELINE_SEARCH_MODE": "EXHAUSTIVE",
             },
             clear=False,
         ):
@@ -68,23 +81,21 @@ class Psi42BackgroundAutonomyTests(unittest.TestCase):
         source = (ROOT / "dependency_live_roadmap_generator.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("PSI42_BACKGROUND_AUTONOMOUS_EXHAUSTIVE", source)
+        self.assertIn("PSI5_BACKGROUND_AUTONOMOUS", source)
         self.assertIn(
             "and not _baseline_background_autonomous()",
             source,
         )
-        # Both human-decision gates (policy UNSAT and continuation boundary)
-        # must be guarded from BACKGROUND.
         self.assertGreaterEqual(
             source.count("not _baseline_background_autonomous()"),
             2,
         )
         self.assertIn(
-            "anytime.search_mode = BaselineSearchMode.EXHAUSTIVE",
+            "anytime.exhaustive_authorized = True",
             source,
         )
         self.assertIn(
-            "anytime.exhaustive_authorized = True",
+            "time-to-first-verified-usable-result",
             source,
         )
 
@@ -93,10 +104,7 @@ class Psi42BackgroundAutonomyTests(unittest.TestCase):
             encoding="utf-8"
         )
         marker_at = source.index("BLOCK_PSI42_BACKGROUND_AUTONOMY_V1")
-        helper_region = source[marker_at: marker_at + 2200]
-
-        # Check executable policy-mutation mechanisms, not harmless explanatory
-        # prose such as "does not mutate USER_POLICY" in a docstring.
+        helper_region = source[marker_at: marker_at + 2400]
         self.assertNotIn('"keep-current"', helper_region)
         self.assertNotIn("_apply_baseline_intent_scope(", helper_region)
         self.assertNotIn("_baseline_cohort_action(", helper_region)
@@ -104,15 +112,15 @@ class Psi42BackgroundAutonomyTests(unittest.TestCase):
         self.assertNotIn("exclusion_source", helper_region)
         self.assertNotIn("scope_excluded =", helper_region)
 
-    def test_desktop_serializes_background_as_exhaustive(self) -> None:
+    def test_desktop_does_not_force_background_to_exhaustive(self) -> None:
         source = (
             ROOT / "desktop" / "src" / "components" / "BaselineIntentDialog.tsx"
         ).read_text(encoding="utf-8")
-        self.assertIn(
+        self.assertNotIn(
             "normalizedExecutionMode(nextExecutionMode) === 'BACKGROUND' ? 'EXHAUSTIVE' : searchMode",
             source,
         )
-        self.assertIn("Автономный режим", source)
+        self.assertIn("searchMode,", source)
         self.assertIn("Запустить автономный глубокий поиск", source)
 
     def test_draft_prompt_export_is_external_agent_handoff(self) -> None:
@@ -151,7 +159,6 @@ class Psi42BackgroundAutonomyTests(unittest.TestCase):
             "Компактный формат рекомендуется для небольшого контекстного окна",
             source,
         )
-        # Existing full/compact selector must remain available.
         self.assertIn(
             '<option value="compact">Компактный — для моделей с малым контекстом</option>',
             source,

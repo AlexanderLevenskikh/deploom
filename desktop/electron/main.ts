@@ -3,6 +3,7 @@ import updaterPackage from 'electron-updater'
 import { isDeterministicToolFailure } from './baseline-retry.js'
 import { BASELINE_DECISION_MARKER, extractBaselineDecisionEnvelope } from './migration-baseline-decision.js'
 import { buildDependencyGraphSnapshot } from './dependency-graph.js'
+import { BaselineWorkerPool } from './baseline-worker.js'
 const { autoUpdater } = updaterPackage
 import { buildClaudeAgentArgs, buildClaudeResumeArgs, buildCodexAgentArgs, buildCodexResumeArgs, buildOpenCodeAgentArgs, buildOpenCodeResumeArgs, parseOpencodeModelsOutput } from './agent-command.js'
 import { agentBatchCompletionFingerprint, agentScopeFingerprint, extractAgentSessionId, resumableAgentSessionId } from './agent-session.js'
@@ -205,6 +206,7 @@ type CommandSpec = {
   stallWarningMs?: number
   stallAbortMs?: number
   env?: NodeJS.ProcessEnv
+  useBaselineWorker?: boolean
 }
 
 type JobRecord = {
@@ -1837,6 +1839,162 @@ function generatorPath(): string {
   return join(bundledToolDir(), 'dependency_live_roadmap_generator.py')
 }
 
+let baselineWorkerPool: BaselineWorkerPool | undefined
+
+function baselineWorker(): BaselineWorkerPool {
+  baselineWorkerPool ??= new BaselineWorkerPool(
+    'python',
+    join(bundledToolDir(), 'dependency_live_roadmap_worker.py'),
+  )
+  return baselineWorkerPool
+}
+
+async function executeBaselineWorkerCommand(
+  job: JobRecord,
+  spec: CommandSpec,
+): Promise<{ code: number; stderr: string; stdout: string; timedOut: boolean; diagnostics?: VerificationDiagnosticEvidence }> {
+  const rootJob = job.parallelParent ?? job
+  const expectedGenerator = normalizePathForComparison(normalize(resolve(generatorPath())))
+  const suppliedGenerator = spec.args[0]
+    ? normalizePathForComparison(normalize(resolve(spec.args[0])))
+    : ''
+  if (suppliedGenerator !== expectedGenerator) {
+    throw new Error(
+      `BASELINE_WORKER_GENERATOR_IDENTITY_INVALID: expected=${generatorPath()}, got=${spec.args[0] ?? '<missing>'}`,
+    )
+  }
+
+  let stderr = ''
+  let stdout = ''
+  let timedOut = false
+  let lastOutputAt = Date.now()
+  let lastStallNoticeAt = 0
+  let stallNoticeCount = 0
+  let hardStallTriggered = false
+  const diagnosticCollector = spec.captureVerificationDiagnostics
+    ? createVerificationDiagnosticCollector(spec.cwd)
+    : undefined
+  const workerKey = `${job.workspace.id}:${job.projectName ?? ''}:${normalizePathForComparison(normalize(resolve(spec.cwd)))}`
+  const hotContinuation = spec.env?.DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE === '1'
+  const request = baselineWorker().run(workerKey, {
+    cwd: spec.cwd,
+    argv: spec.args.slice(1),
+    env: {
+      ...spec.env,
+      DEPLOOM_BASELINE_HOT_CONTINUATION: hotContinuation ? '1' : '0',
+    },
+    onOutput: (stream, text) => {
+      if (!text) return
+      if (
+        stallNoticeCount > 0
+        && Date.now() - lastOutputAt >= (spec.stallWarningMs ?? Number.POSITIVE_INFINITY)
+      ) {
+        send('flow:job-output', {
+          jobId: job.id,
+          stream: 'system',
+          line: `${spec.label}: вывод worker возобновился после периода тишины.`,
+        })
+      }
+      lastOutputAt = Date.now()
+      diagnosticCollector?.push(text, stream)
+      if (stream === 'stdout') stdout = `${stdout}${text}`.slice(-6000)
+      else stderr = `${stderr}${text}`.slice(-6000)
+      send('flow:job-output', { jobId: job.id, stream, line: text })
+    },
+  })
+  job.child = request.child
+  rootJob.parallelChildren ??= new Set<ChildProcessWithoutNullStreams>()
+  rootJob.parallelChildren.add(request.child)
+
+  let abortResolve!: (value: { code: number; error?: string }) => void
+  const abortPromise = new Promise<{ code: number; error?: string }>((resolveAbort) => {
+    abortResolve = resolveAbort
+  })
+  let aborted = false
+  const abortWorker = (reason: string) => {
+    if (aborted) return
+    aborted = true
+    timedOut = true
+    stderr = `${stderr}\n${reason}`.slice(-6000)
+    killProcessTree(request.child)
+    abortResolve({ code: 124, error: reason })
+  }
+
+  const stallTimer = spec.stallWarningMs
+    ? setInterval(() => {
+      const now = Date.now()
+      const silentMs = now - lastOutputAt
+      if (
+        spec.stallAbortMs
+        && silentMs >= spec.stallAbortMs
+        && !hardStallTriggered
+      ) {
+        hardStallTriggered = true
+        send('flow:job-output', {
+          jobId: job.id,
+          stream: 'stderr',
+          line: `[error] ⛔ ${spec.label}: HARD_STALL worker — нет heartbeat/output ${Math.max(1, Math.floor(silentMs / 60_000))} мин; завершаю worker process tree. Durable checkpoints сохранены.`,
+        })
+        abortWorker('BASELINE_WORKER_HARD_STALL')
+        return
+      }
+      if (
+        silentMs < spec.stallWarningMs!
+        || now - lastStallNoticeAt < spec.stallWarningMs!
+      ) return
+      stallNoticeCount += 1
+      lastStallNoticeAt = now
+      send('flow:job-output', {
+        jobId: job.id,
+        stream: 'stderr',
+        line: `[warn] ⚠ ${spec.label}: worker молчит ${Math.max(1, Math.floor(silentMs / 60_000))} мин; процесс ещё запущен.`,
+      })
+    }, Math.min(spec.stallWarningMs, 60_000))
+    : undefined
+
+  const timeoutTimer = spec.timeoutMs
+    ? setTimeout(() => {
+      send('flow:job-output', {
+        jobId: job.id,
+        stream: 'system',
+        line: `${spec.label}: лимит ${Math.ceil(spec.timeoutMs! / 60_000)} мин достигнут; завершаю worker process tree.`,
+      })
+      abortWorker('BASELINE_WORKER_TIMEOUT')
+    }, spec.timeoutMs)
+    : undefined
+
+  let workerResult: { code: number; error?: string }
+  try {
+    workerResult = await Promise.race([request.result, abortPromise])
+  } catch (error) {
+    if (job.cancelled || rootJob.cancelled) {
+      throw new Error('Выполнение остановлено.')
+    }
+    const message = error instanceof Error ? error.message : String(error)
+    stderr = `${stderr}\n${message}`.slice(-6000)
+    workerResult = { code: 1, error: message }
+  } finally {
+    if (stallTimer) clearInterval(stallTimer)
+    if (timeoutTimer) clearTimeout(timeoutTimer)
+    rootJob.parallelChildren?.delete(request.child)
+    if (job.child === request.child) job.child = undefined
+  }
+
+  if (job.cancelled || rootJob.cancelled) {
+    throw new Error('Выполнение остановлено.')
+  }
+  if (workerResult.error && workerResult.code !== 0) {
+    stderr = `${stderr}\n${workerResult.error}`.slice(-6000)
+  }
+  return {
+    code: workerResult.code,
+    stderr,
+    stdout,
+    timedOut,
+    ...(diagnosticCollector ? { diagnostics: diagnosticCollector.finish() } : {}),
+  }
+}
+
 function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project: ProjectSpec): CommandSpec[] {
   const toolDir = bundledToolDir()
   const settingsPath = resolveSettingsPath(workspace)
@@ -1891,6 +2049,7 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
         command: 'python',
         cwd: workspace.path,
         args: [...commonGeneratorArgs, ...baselineOutputArgs, ...baselineModeArgs],
+        useBaselineWorker: proofMode !== 'DRAFT',
         env: {
           DEPLOOM_BASELINE_RESUME: input.baselineResume === 'restart' ? 'restart' : input.baselineResume === 'continue' ? 'continue' : 'auto',
           DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE: input.baselineResume === 'continue' ? '1' : '0',
@@ -5267,6 +5426,10 @@ function nonRetryableDeterministicFailure(result: { code: number; stderr: string
 async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code: number; stderr: string; stdout: string; timedOut: boolean; diagnostics?: VerificationDiagnosticEvidence }> {
   const rootJob = job.parallelParent ?? job
   if (job.cancelled || rootJob.cancelled) throw new Error('Выполнение отменено пользователем.')
+  if (spec.useBaselineWorker) {
+    send('flow:job-output', { jobId: job.id, stream: 'system', line: `▶ ${spec.label}\n$ baseline-worker ${spec.args.slice(1).join(' ')}` })
+    return executeBaselineWorkerCommand(job, spec)
+  }
   if (['opencode', 'codex', 'claude'].includes(spec.command)) {
     const modelIndex = spec.args.indexOf('--model')
     const model = modelIndex >= 0 ? spec.args[modelIndex + 1] : undefined
@@ -6161,6 +6324,8 @@ app.whenReady().then(async () => {
 app.on('before-quit', () => {
   stopUpdateChecks?.()
   stopUpdateChecks = undefined
+  baselineWorkerPool?.dispose(killProcessTree)
+  baselineWorkerPool = undefined
   // Nothing else tears these down when the window is closed mid-run: an agent
   // CLI keeps writing to a repository the user is about to reopen elsewhere,
   // and the `opencode serve` sidecar survives as an orphan still holding its

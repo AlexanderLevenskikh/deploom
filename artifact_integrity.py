@@ -50,13 +50,21 @@ def _canonical_hash(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _hash_file(path: Path) -> tuple[str, int, bool]:
+def _hash_file(
+    path: Path,
+    cancelled: Optional[Callable[[], bool]] = None,
+) -> tuple[str, int, bool]:
     try:
         before = path.stat(follow_symlinks=False)
         digest = hashlib.sha256()
         with io_slot("hash", label="prepared-artifact-integrity"):
             with path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    if cancelled is not None and cancelled():
+                        raise ArtifactIntegrityError(
+                            "PREPARED_ARTIFACT_INTEGRITY_CANCELLED: "
+                            f"content continuity invalidated while hashing {path}"
+                        )
                     digest.update(chunk)
         after = path.stat(follow_symlinks=False)
     except OSError as exc:
@@ -103,6 +111,7 @@ def build_artifact_tree_integrity(
     progress_label: str = "prepared artifact integrity",
     progress_interval_seconds: int = 15,
     reparse_plan: Optional[Sequence[ReparseLink]] = None,
+    cancelled: Optional[Callable[[], bool]] = None,
 ) -> ArtifactTreeIntegrity:
     """Whole-tree content seal.
 
@@ -112,6 +121,13 @@ def build_artifact_tree_integrity(
     """
     started = time.monotonic()
     next_progress = started + max(1, int(progress_interval_seconds))
+
+    def check_cancelled() -> None:
+        if cancelled is not None and cancelled():
+            raise ArtifactIntegrityError(
+                "PREPARED_ARTIFACT_INTEGRITY_CANCELLED: "
+                "content continuity invalidated during strong seal"
+            )
 
     def heartbeat(subphase: str, done: int, total: Optional[int] = None) -> None:
         nonlocal next_progress
@@ -126,6 +142,7 @@ def build_artifact_tree_integrity(
             f"{progress_label}: {subphase} {scope}; "
             f"elapsed={int(now - started)}s"
         )
+    check_cancelled()
     root = root.resolve()
     if not root.is_dir():
         raise ArtifactIntegrityError(
@@ -154,6 +171,7 @@ def build_artifact_tree_integrity(
     scanned_entries = 0
     pending = [(root, Path("."))]
     while pending:
+        check_cancelled()
         directory, relative_directory = pending.pop()
         directories.append((directory, _directory_stamp(directory)))
         try:
@@ -316,10 +334,12 @@ def build_artifact_tree_integrity(
                     path, relative = next(iterator)
                 except StopIteration:
                     break
-                pending[executor.submit(_hash_file, path)] = (path, relative)
+                check_cancelled()
+                pending[executor.submit(_hash_file, path, cancelled)] = (path, relative)
 
         submit_until_full()
         while pending:
+            check_cancelled()
             done, _ = concurrent.futures.wait(
                 tuple(pending), return_when=concurrent.futures.FIRST_COMPLETED
             )
@@ -338,8 +358,10 @@ def build_artifact_tree_integrity(
                 })
             submit_until_full()
 
+    check_cancelled()
     heartbeat("verifying directory stamps", len(directories), len(directories))
     for directory, stamp in directories:
+        check_cancelled()
         if _directory_stamp(directory) != stamp:
             raise ArtifactIntegrityError(
                 f"PREPARED_ARTIFACT_CONTENT_UNSTABLE: directory changed: {directory}"
