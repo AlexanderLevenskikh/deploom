@@ -101,7 +101,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     policies: Object.fromEntries(Object.entries(nextPolicies).filter(([, value]) => value !== 'auto')),
     extraIterations: Math.max(0, Number(plan.intent.extraIterations ?? 0) + extra),
     decisionGrantIterations: grant,
-    searchMode,
+    searchMode: normalizedExecutionMode(nextExecutionMode) === 'BACKGROUND' ? 'EXHAUSTIVE' : searchMode,
     executionMode: normalizedExecutionMode(nextExecutionMode),
     proofMode,
     deferredCohorts: reconcileDeferredCohorts(nextDeferredCohorts, nextPolicies),
@@ -258,14 +258,14 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
           <div>
             <strong>{executionMode === 'BACKGROUND' ? text('☾ Глубокий поиск', '☾ Deep search') : text('⚡ Fast-first', '⚡ Fast-first')}</strong>
             <span>{executionMode === 'BACKGROUND'
-              ? text('Дополнительный режим: DepLoom тратит больше времени на глобальные комбинации и глубокую диагностику.', 'Optional mode: DepLoom spends more time on global combinations and deeper diagnostics.')
+              ? text('Автономный режим: DepLoom сам продолжает исчерпывающий narrowing и глубокую диагностику до результата или hard safety limit, не останавливаясь на cohort-диалогах.', 'Autonomous mode: DepLoom keeps running exhaustive narrowing and deep diagnostics until a result or the hard safety limit, without stopping for cohort dialogs.')
               : text('Никакого массового DEV-exclude: беспроблемные dev-зависимости тоже обновляются. Отступаем только вокруг реально наблюдаемого compatibility-региона.', 'No blanket DEV exclusion: healthy dev dependencies are updated too. We only step back around an actually observed compatibility region.')}</span>
           </div>
           <details className="baseline-advanced-flow">
             <summary>{text('Дополнительно', 'Advanced')}</summary>
             {executionMode === 'BACKGROUND'
               ? <button type="button" className="button secondary" disabled={busy} onClick={() => setExecutionMode('FAST')}>{text('Вернуться к Fast-first', 'Return to Fast-first')}</button>
-              : <button type="button" className="button secondary" disabled={busy} onClick={() => setExecutionMode('BACKGROUND')}>{text('Готов ждать: искать глубже в фоне', 'I can wait: search deeper in background')}</button>}
+              : <button type="button" className="button secondary" disabled={busy} onClick={() => setExecutionMode('BACKGROUND')}>{text('Запустить автономный глубокий поиск', 'Run autonomous deep search')}</button>}
           </details>
         </div>
 

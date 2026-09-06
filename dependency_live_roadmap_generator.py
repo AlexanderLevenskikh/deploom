@@ -330,6 +330,25 @@ def _baseline_execution_mode() -> str:
     return raw if raw in BASELINE_EXECUTION_MODES else "FAST"
 
 
+# BLOCK_PSI42_BACKGROUND_AUTONOMY_V1
+def _baseline_background_autonomous() -> bool:
+    """BACKGROUND is a zero-dialog autonomous deep-search execution policy."""
+    return _baseline_execution_mode() == "BACKGROUND"
+
+
+def _baseline_effective_search_mode() -> BaselineSearchMode:
+    """BACKGROUND implicitly authorizes the existing exhaustive narrowing path.
+
+    This does not create solver authority and does not mutate USER_POLICY.
+    It only removes the mid-run human continuation boundary for a mode whose
+    product promise is to keep working unattended until the hard safety ceiling.
+    """
+    requested = _baseline_search_mode()
+    if _baseline_background_autonomous():
+        return BaselineSearchMode.EXHAUSTIVE
+    return requested
+
+
 def _baseline_max_expensive_attempts(default: int) -> int:
     raw = _baseline_env_nonnegative_int("DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS")
     if raw:
@@ -10243,15 +10262,36 @@ def resolve_peer_compatibility_with_verification(
                 max_learning_extensions=config.max_iterations,
                 starting_learned_constraints=len(learned[project][mode]),
             )
+            requested_search_mode = _baseline_search_mode()
+            effective_search_mode = _baseline_effective_search_mode()
             anytime = BaselineAnytimeState(
                 policy=AutomaticBudgetPolicy(
                     wall_clock_seconds=_baseline_automatic_budget_seconds(),
                     max_expensive_attempts=_baseline_max_expensive_attempts(config.max_iterations),
                 ),
-                search_mode=_baseline_search_mode(),
+                search_mode=effective_search_mode,
             )
             liveness.anytime = anytime
             liveness.exhaustive_authorized = anytime.exhaustive_authorized
+            if _baseline_background_autonomous():
+                eprint(
+                    f"[info] {project}: PSI42_BACKGROUND_AUTONOMOUS_EXHAUSTIVE; "
+                    f"requestedSearchMode={requested_search_mode.value}; "
+                    f"effectiveSearchMode={effective_search_mode.value}; "
+                    "human continuation/cohort dialogs disabled; "
+                    "existing exact/localization/deep-search proof paths preserved"
+                )
+                progress_reporter.emit(
+                    project,
+                    mode,
+                    "background-autonomy-enabled",
+                    executionMode="BACKGROUND",
+                    requestedSearchMode=requested_search_mode.value,
+                    effectiveSearchMode=effective_search_mode.value,
+                    marker="PSI42_BACKGROUND_AUTONOMOUS_EXHAUSTIVE",
+                    zeroDialog=True,
+                    authority="ORCHESTRATION_POLICY",
+                )
             user_extra_iterations = _baseline_extra_iterations()
             liveness.max_learning_extensions = max(
                 liveness.max_learning_extensions,
@@ -10260,6 +10300,13 @@ def resolve_peer_compatibility_with_verification(
             if restored_liveness:
                 restore_liveness_budget(liveness, restored_liveness)
                 anytime.restore(restored_liveness)
+                # A checkpoint created under an older bounded/background policy
+                # must not silently downgrade a newly requested BACKGROUND run
+                # back into a human-decision boundary.
+                if _baseline_background_autonomous():
+                    anytime.search_mode = BaselineSearchMode.EXHAUSTIVE
+                    anytime.exhaustive_authorized = True
+                    anytime.continuation_reason = None
                 liveness.exhaustive_authorized = anytime.exhaustive_authorized
             try:
                 restored_user_extensions = max(0, int(restored_liveness.get("userExtensions") or 0))
@@ -10279,7 +10326,9 @@ def resolve_peer_compatibility_with_verification(
                 f"maxIterations={config.max_iterations}, hardIterations={liveness.hard_iterations}, "
                 f"learningExtensionLimit={liveness.max_learning_extensions}, parallelism={config.parallelism}, "
                 f"solverManagedInputs={solver_managed_inputs}, fixedInputs={len(fixed_input_names)}, "
-                f"executionMode={_baseline_execution_mode()}"
+                f"executionMode={_baseline_execution_mode()}, "
+                f"searchMode={anytime.search_mode.value}, "
+                f"autonomous={str(_baseline_background_autonomous()).lower()}"
             )
             progress_reporter.emit(
                 project,
@@ -10293,6 +10342,10 @@ def resolve_peer_compatibility_with_verification(
                 localizationHardTimeoutSeconds=config.localization_timeout_seconds,
                 solverManagedInputs=solver_managed_inputs,
                 fixedInputs=len(fixed_input_names),
+                executionMode=_baseline_execution_mode(),
+                requestedSearchMode=requested_search_mode.value,
+                effectiveSearchMode=anytime.search_mode.value,
+                autonomous=_baseline_background_autonomous(),
                 details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
             )
             last_fingerprint = ""
@@ -10443,6 +10496,7 @@ def resolve_peer_compatibility_with_verification(
                     active_intent_packages = sorted(set(baseline_keep_current) | set(baseline_required))
                     if (
                         _baseline_interactive()
+                        and not _baseline_background_autonomous()
                         and exc.terminal_status == BaselineTerminalStatus.UNSAT_PROVEN.value
                         and active_intent_packages
                     ):
@@ -12831,7 +12885,11 @@ def resolve_peer_compatibility_with_verification(
                     base_iteration_limit_hit=iteration >= liveness.allowed_iterations,
                 ) or ContinuationReason.BASE_ITERATION_LIMIT
                 anytime.continuation_reason = continuation_reason
-                if _baseline_interactive() and not anytime.exhaustive_authorized:
+                if (
+                    _baseline_interactive()
+                    and not _baseline_background_autonomous()
+                    and not anytime.exhaustive_authorized
+                ):
                     decision_focus = _baseline_human_decision_focus(
                         learned[project][mode], baseline_current_versions,
                         min_confirmed=1,
@@ -15112,11 +15170,26 @@ function proofEnvelopeForProject(project, mode){
   const state = REPORT_CONTEXT.provenDependencyState || {};
   return state?.projects?.[project]?.[mode] || null;
 }
+// BLOCK_PSI42_DRAFT_EXTERNAL_HANDOFF_V1
 function proofEnvelopesForProjects(projects, mode){
   const result = {};
+  const draft = REPORT_CONTEXT.baselineResult?.kind === 'DRAFT';
   for (const project of projects) {
     const envelope = proofEnvelopeForProject(project, mode);
-    if (!envelope) throw new Error(`PROVEN_DEPENDENCY_PROOF_MISSING: ${project}/${mode}`);
+    if (!envelope) {
+      if (!draft) throw new Error(`PROVEN_DEPENDENCY_PROOF_MISSING: ${project}/${mode}`);
+      result[project] = {
+        schemaVersion: 1,
+        project,
+        mode,
+        verificationStatus: 'NOT_VERIFIED',
+        authority: 'PLANNING_ONLY',
+        compatibility: 'UNKNOWN',
+        draft: true,
+        note: 'No DepLoom ProofEnvelope exists for Draft Baseline. External agent must perform real package-manager install/lifecycle/project checks before claiming compatibility.'
+      };
+      continue;
+    }
     result[project] = envelope;
   }
   return result;
@@ -16261,11 +16334,14 @@ function openPromptModal(prompt, title){
   const meta = document.getElementById('promptMeta');
   if (heading && title) heading.textContent = title;
   const description = document.getElementById('promptDescription');
+  const draftExternalHandoff = REPORT_CONTEXT.baselineResult?.kind === 'DRAFT';
   if (description) description.textContent = title === 'Техническое задание'
     ? 'Человеко-читаемая постановка задачи: scope, план, риски, проверки и критерии приёмки. Это не исполняемый агентский контракт.'
     : (title && title.includes('Package')
       ? 'Ручной package.json patch и пояснения. Перед применением требуется сверка с текущим checkout и lockfile.'
-      : 'Сформирован по выбранному scope и цели. Агентский prompt содержит строгий manifest и правила выполнения.');
+      : (draftExternalHandoff
+        ? 'Промпт для внешнего агента, если вы хотите продолжить вне DepLoom. Draft не содержит физического proof: агент обязан выполнить install/lifecycle/project checks. Компактный формат рекомендуется для небольшого контекстного окна; полный — для глубокой диагностики.'
+        : 'Сформирован по выбранному scope и цели. Агентский prompt содержит строгий manifest и правила выполнения.'));
   if (textarea) textarea.value = prompt;
   if (meta) {
     const approxTokens = Math.max(1, Math.ceil(prompt.length / 4));
@@ -17198,8 +17274,24 @@ function initDraftBaselineBanner(){
   if (!header || !controls) return;
   const banner = document.createElement('div');
   banner.className = 'baseline-banner baseline-neutral';
-  banner.innerHTML = '<strong>⚠ Draft Baseline — NOT_VERIFIED / PLANNING_ONLY</strong><div class="muted">Target рассчитан статически. Physical install/lifecycle/project checks не выполнялись; compatibility = UNKNOWN. Prompt export предназначен как starting point для внешнего агента.</div>';
+  banner.innerHTML = '<strong>⚠ Draft Baseline — NOT_VERIFIED / PLANNING_ONLY</strong><div class="muted">Target рассчитан статически. Physical install/lifecycle/project checks не выполнялись; compatibility = UNKNOWN. Prompt уже можно использовать как handoff для внешнего агента; DepLoom не требует продолжать встроенным агентом.</div>';
   header.insertBefore(banner, controls);
+
+  // Preserve the existing automatic prompt download/handoff path. In addition,
+  // surface the same artifact for users who prefer Claude/Codex/OpenCode/etc.
+  // Delay until initPromptExport() has attached Copy/Download handlers.
+  window.setTimeout(() => {
+    try {
+      const formatSelect = document.getElementById('promptFormat');
+      if (formatSelect) formatSelect.value = 'compact';
+      const prompt = buildPromptFromCurrentView();
+      if (!prompt) return;
+      openPromptModal(prompt, 'Draft prompt для внешнего агента');
+    } catch (error) {
+      console.error(error);
+      showToast(String(error?.message || error));
+    }
+  }, 0);
 }
 
 initThemeControl();
