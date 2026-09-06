@@ -659,6 +659,11 @@ class PreparedWorkspaceSnapshot:
     # Legacy field retained for old tests/artifacts. Ω does not populate or
     # consult it on the authoritative production path.
     dependency_integrity: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    # Same-call performance receipt only. True means this exact invocation of
+    # _publish_prepared_workspace_snapshot completed the existing strong durable
+    # seal and atomically published its locator. It is never deserialized and
+    # never substitutes cross-process continuity validation.
+    durable_publication_confirmed: bool = False
 
 
 _PREPARED_SNAPSHOT_LOCK = threading.Lock()
@@ -776,46 +781,63 @@ def _enforce_same_run_private_prepared_budget(
         tuple[
             Tuple[str, str],
             PreparedWorkspaceSnapshot,
-            Optional[WorkspaceChangeGuard],
+            WorkspaceChangeGuard,
             Optional[str],
         ]
     ] = []
+    budget_deferred = False
+    cache_size = 0
     with _PREPARED_SNAPSHOT_LOCK:
         while (
             len(_SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS)
             > _SAME_RUN_PRIVATE_PREPARED_MAX_COUNT
         ):
-            slot = next(iter(_SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS))
-            if (
-                slot == protected_slot
-                and len(_SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS) > 1
-            ):
-                snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.pop(slot)
-                _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS[slot] = snapshot
-                producer = _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.pop(slot, None)
-                if producer is not None:
-                    _SAME_RUN_PRIVATE_PREPARED_PRODUCERS[slot] = producer
-                guard = _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(slot, None)
-                if guard is not None:
-                    _SAME_RUN_PRIVATE_PREPARED_GUARDS[slot] = guard
-                slot = next(iter(_SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS))
-            snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.pop(slot)
-            guard = _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(slot, None)
-            producer = _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.pop(slot, None)
-            victims.append((slot, snapshot, guard, producer))
+            victim_slot: Optional[Tuple[str, str]] = None
+            for candidate_slot in _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS:
+                if candidate_slot == protected_slot:
+                    continue
+                # A parked guard is the explicit idle marker. _claim() removes
+                # it before handing the tree to a consumer, so active snapshots
+                # are fail-closed against budget retirement.
+                if candidate_slot not in _SAME_RUN_PRIVATE_PREPARED_GUARDS:
+                    continue
+                victim_slot = candidate_slot
+                break
+
+            if victim_slot is None:
+                budget_deferred = True
+                break
+
+            snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.pop(victim_slot)
+            guard = _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(victim_slot)
+            producer = _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.pop(
+                victim_slot, None
+            )
+            victims.append((victim_slot, snapshot, guard, producer))
+        cache_size = len(_SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS)
+
     for slot, snapshot, guard, producer in victims:
-        if guard is not None:
-            try:
-                guard.stop()
-            except Exception:
-                pass
+        try:
+            guard.stop()
+        except Exception:
+            pass
         _retire_prepared_workspace_snapshot(snapshot)
         emit_observability_event(
             "same-run.private-prepared.invalidated",
+            operationId=new_observability_id("private-prepared-evict"),
             identity=slot[0],
             sourceProject=slot[1],
             originalProducer=str(producer or ""),
             reason="same-run-private-budget",
+        )
+
+    if budget_deferred:
+        emit_observability_event(
+            "same-run.private-prepared.budget-deferred",
+            operationId=new_observability_id("private-prepared-budget"),
+            cacheSize=cache_size,
+            maxCount=_SAME_RUN_PRIVATE_PREPARED_MAX_COUNT,
+            reason="all-nonprotected-snapshots-active-or-unparked",
         )
 
 
@@ -841,10 +863,12 @@ def _register_same_run_private_prepared_snapshot(
     _enforce_same_run_private_prepared_budget(slot)
     emit_observability_event(
         "same-run.private-prepared.created",
+        operationId=new_observability_id("private-prepared-create"),
         identity=snapshot.key,
         sourceProject=str(snapshot.source_project),
         originalProducer=str(producer),
         durable=False,
+        durableSealAvoided=True,
     )
 
 
@@ -1701,7 +1725,17 @@ def _publish_prepared_workspace_snapshot(
                     progress=progress,
                     progress_interval_seconds=progress_interval_seconds,
                 )
-        if shared_reuse_allowed and not durable_published:
+        if durable_published:
+            confirmed = dataclasses.replace(
+                published,
+                durable_publication_confirmed=True,
+            )
+            if shared_reuse_allowed:
+                with _PREPARED_SNAPSHOT_LOCK:
+                    if _PREPARED_SNAPSHOTS.get(slot) is published:
+                        _PREPARED_SNAPSHOTS[slot] = confirmed
+            published = confirmed
+        elif shared_reuse_allowed:
             with _PREPARED_SNAPSHOT_LOCK:
                 if _PREPARED_SNAPSHOTS.get(slot) is published:
                     _PREPARED_SNAPSHOTS.pop(slot, None)
@@ -2813,8 +2847,17 @@ def verify_assignment(
                 )
                 event("verify.preparation.snapshot-hit", preparationProofKey=proof_identity.preparation_proof_key, observedResolvedHash=observed_hash, storageTier="same-run-private" if snapshot_is_private else "durable")
                 if snapshot_is_private:
-                    event("same-run.private-prepared.hit", marker="PSI3_SAME_RUN_PRIVATE_PREPARED_HIT", identity=proof_identity.preparation_proof_key, consumer=progress_label, originalProducer=str(producer or ""), lifecycleInstallAvoided=True, durableSealAvoided=True)
-                    event("same-run.prepared-artifact.hit", marker="SAME_RUN_PREPARED_ARTIFACT_HIT", identity=proof_identity.preparation_proof_key, consumer=progress_label, originalProducer=str(producer or ""), lifecycleInstallAvoided=True, integritySealAvoided=True, storageTier="same-run-private")
+                    event(
+                        "same-run.prepared-artifact.hit",
+                        operationId=new_observability_id("private-prepared-hit"),
+                        marker="PSI3_SAME_RUN_PRIVATE_PREPARED_HIT",
+                        identity=proof_identity.preparation_proof_key,
+                        consumer=progress_label,
+                        originalProducer=str(producer or ""),
+                        lifecycleInstallAvoided=True,
+                        integritySealAvoided=True,
+                        storageTier="same-run-private",
+                    )
                     _emit_progress(progress, f"{progress_label}: Ψ.3 same-run private PreparedArtifact HIT; lifecycle replay and durable seal skipped; fresh project-check clone still required")
                 elif producer is not None:
                     pin_prepared_artifact_record(proof_identity.preparation_proof_key)
@@ -3022,8 +3065,9 @@ def verify_assignment(
                     ] = progress_label
                     pin_prepared_artifact_record(proof_identity.preparation_proof_key)
                 else:
-                    _register_same_run_private_prepared_snapshot(snapshot, producer=progress_label)
-                    event("same-run.private-prepared.created", identity=proof_identity.preparation_proof_key, producer=progress_label, durable=False, durableSealAvoided=True)
+                    _register_same_run_private_prepared_snapshot(
+                        snapshot, producer=progress_label
+                    )
 
             if snapshot is None:
                 return BaselineVerifyResult(False, "infrastructure", "PREPARED_SNAPSHOT_UNAVAILABLE: project checks require a sealed preparation tree")
@@ -3665,9 +3709,8 @@ def promote_same_run_prepared_artifact(
         )
         return False
 
-    record = load_prepared_artifact_record(key, project_dir, progress=progress)
     durable_ok = bool(
-        record is not None
+        promoted.durable_publication_confirmed
         and is_durable_prepared_path(promoted.workspace_root)
         and promoted.workspace_root.is_dir()
     )
@@ -3693,6 +3736,30 @@ def assignment_fingerprint(assignment: Mapping[str, str]) -> str:
 
 
 _verify_assignment_uncached_impl = verify_assignment
+
+
+def _effective_result_proof_identity(
+    proof_identity: VerificationProofIdentity,
+    result: BaselineVerifyResult,
+    *,
+    config: BaselineVerifyConfig,
+    run_project_checks: bool,
+) -> VerificationProofIdentity:
+    """Return the exact identity actually reached by the inner verifier."""
+    resolved_state_key = str(result.resolved_state_key or "").strip()
+    if (
+        resolved_state_key
+        and resolved_state_key != str(proof_identity.resolved_state_key or "")
+    ):
+        return bind_resolved_state_identity(
+            proof_identity,
+            resolved_state_key,
+            project_checks=(
+                config.project_checks if run_project_checks else "off"
+            ),
+            commands=(config.commands if run_project_checks else ()),
+        )
+    return proof_identity
 
 
 def _verify_assignment_uncached(
@@ -3775,12 +3842,28 @@ def _verify_assignment_uncached(
             raise
 
         if proof_identity is not None:
-            result = dataclasses.replace(result, preparation_proof_key=proof_identity.preparation_proof_key)
+            effective_identity = _effective_result_proof_identity(
+                proof_identity,
+                result,
+                config=config,
+                run_project_checks=run_project_checks,
+            )
+            result = dataclasses.replace(
+                result,
+                preparation_proof_key=effective_identity.preparation_proof_key,
+            )
             if run_project_checks and config.commands:
                 if result.kind in {"project", "passed"}:
-                    _park_same_run_private_prepared_snapshot(proof_identity.preparation_proof_key, project_dir)
+                    _park_same_run_private_prepared_snapshot(
+                        effective_identity.preparation_proof_key,
+                        project_dir,
+                    )
                 else:
-                    _evict_same_run_private_prepared_snapshot(proof_identity.preparation_proof_key, project_dir, reason=f"verify-result-{result.kind}")
+                    _evict_same_run_private_prepared_snapshot(
+                        effective_identity.preparation_proof_key,
+                        project_dir,
+                        reason=f"verify-result-{result.kind}",
+                    )
 
         for terminal_event, terminal_fields in pending_stage_finishes(
             terminal_reason=result.kind
