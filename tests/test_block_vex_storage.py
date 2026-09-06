@@ -15,6 +15,11 @@ class VexStorageTests(unittest.TestCase):
             "NODE_ENV": "test",
             "DEPLOOM_VERIFICATION_ROOT": "D:/fast",
             "DEPLOOM_BASELINE_RESUME": "restart",
+            "DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE": "1",
+            "DEPLOOM_BASELINE_SEARCH_MODE": "BOUNDED_IMPROVEMENT",
+            "DEPLOOM_BASELINE_EXECUTION_MODE": "FAST",
+            "DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS": "900",
+            "DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS": "2",
             "DEPLOOM_PREDICATE_PROBE_BUDGET": "3",
             "DEPLOOM_IO_COPY_SLOTS": "2",
             "DEPLOOM_IO_HASH_SLOTS": "2",
@@ -35,6 +40,11 @@ class VexStorageTests(unittest.TestCase):
         self.assertEqual(result["MY_PROJECT_FLAG"], "keep")
         self.assertNotIn("DEPLOOM_VERIFICATION_ROOT", result)
         self.assertNotIn("DEPLOOM_BASELINE_RESUME", result)
+        self.assertNotIn("DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE", result)
+        self.assertNotIn("DEPLOOM_BASELINE_SEARCH_MODE", result)
+        self.assertNotIn("DEPLOOM_BASELINE_EXECUTION_MODE", result)
+        self.assertNotIn("DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS", result)
+        self.assertNotIn("DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS", result)
         self.assertNotIn("DEPLOOM_PREDICATE_PROBE_BUDGET", result)
         self.assertNotIn("DEPLOOM_IO_COPY_SLOTS", result)
         self.assertNotIn("DEPLOOM_IO_HASH_SLOTS", result)
@@ -47,6 +57,35 @@ class VexStorageTests(unittest.TestCase):
         self.assertNotIn("DEPLOOM_BASELINE_DECISION_GRANT_ITERATIONS", result)
         self.assertNotIn("DEPLOOM_BASELINE_INTERACTIVE", result)
         self.assertNotIn("DEPLOOM_RUN_ID", result)
+
+    def test_baseline_continuation_controls_do_not_change_semantic_environment(self) -> None:
+        base = {
+            "PATH": "x",
+            "NODE_ENV": "test",
+            "NODE_OPTIONS": "--max-old-space-size=4096",
+            "DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE": "0",
+            "DEPLOOM_BASELINE_SEARCH_MODE": "AUTO",
+            "DEPLOOM_BASELINE_EXECUTION_MODE": "FAST",
+            "DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS": "900",
+            "DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS": "2",
+        }
+        continued = {
+            **base,
+            "DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE": "1",
+            "DEPLOOM_BASELINE_SEARCH_MODE": "BOUNDED_IMPROVEMENT",
+            "DEPLOOM_BASELINE_EXECUTION_MODE": "BACKGROUND",
+            "DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS": "3600",
+            "DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS": "8",
+        }
+        self.assertEqual(
+            storage.semantic_verification_environment(base),
+            storage.semantic_verification_environment(continued),
+        )
+        changed_semantics = {**continued, "NODE_OPTIONS": "--max-old-space-size=8192"}
+        self.assertNotEqual(
+            storage.semantic_verification_environment(base),
+            storage.semantic_verification_environment(changed_semantics),
+        )
 
     def test_explicit_root_is_created(self):
         with tempfile.TemporaryDirectory() as temp:

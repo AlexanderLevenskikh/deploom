@@ -24,6 +24,15 @@ _PROOF_NEUTRAL_ENV = frozenset({
     "DEPLOOM_WORKSPACE_COPY_WORKERS",
     "DEPLOOM_NTFS_FASTPATH_MIN_COMMANDS",
     "DEPLOOM_BASELINE_RESUME",
+    # Block Psi continuation/search controls are orchestration-only. Keep this
+    # list explicit (never wildcard DEPLOOM_BASELINE_*): future variables must
+    # be classified deliberately, so a genuinely PM-semantic input remains
+    # identity-bearing until reviewed.
+    "DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE",
+    "DEPLOOM_BASELINE_SEARCH_MODE",
+    "DEPLOOM_BASELINE_EXECUTION_MODE",
+    "DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS",
+    "DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS",
     "DEPLOOM_COMPATIBILITY_HINTS",
     "DEPLOOM_PREDICATE_ACTIVE_SEARCH",
     "DEPLOOM_PREDICATE_REPEAT_THRESHOLD",

@@ -74,6 +74,24 @@ class BlockPsiAnytimeTests(unittest.TestCase):
         self.assertEqual(ContinuationReason.STAGNATION, state.automatic_continuation_reason())
         self.assertEqual(0, state.learned_constraints_at_last_rejection)
 
+    def test_unclassified_rejection_preserves_last_actionable_predicate_without_stagnation(self) -> None:
+        state = BaselineAnytimeState(policy=AutomaticBudgetPolicy(stagnation_rejections=3))
+        state.observe_candidate(
+            duration_seconds=10,
+            passed=False,
+            predicate="duplicate-type-universe:rollup",
+            learned_constraints=1,
+        )
+        state.observe_candidate(
+            duration_seconds=10,
+            passed=False,
+            predicate="",
+            learned_constraints=1,
+        )
+        self.assertEqual("duplicate-type-universe:rollup", state.repeated_predicate)
+        self.assertEqual(0, state.repeated_predicate_count)
+        self.assertFalse(state.stagnating)
+
     def test_wall_clock_and_forecast_exhaust_automatic_budget(self) -> None:
         clock = FakeClock()
         state = BaselineAnytimeState(policy=AutomaticBudgetPolicy(wall_clock_seconds=100), clock=clock)

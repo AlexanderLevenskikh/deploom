@@ -89,6 +89,61 @@ class BaselineCohortInferenceTests(unittest.TestCase):
         self.assertEqual("vite-build", suggestion.expanded_from)
         self.assertIn("@storybook/builder-vite", suggestion.packages)
 
+    def test_first_post_defer_rollup_blocker_expands_one_boundary_shell(self) -> None:
+        graph = {
+            "vite": {"@vitejs/plugin-react", "jsdom"},
+            "@vitejs/plugin-react": {"vite"},
+            "jsdom": {"vite"},
+        }
+        suggestion = infer_baseline_cohort(
+            predicate="duplicate-type-universe:rollup",
+            direct_packages=graph,
+            subject_consumers={"rollup": {"vite"}},
+            interaction_graph=graph,
+            policy_by_package={
+                "vite": "keep-current",
+                "@vitejs/plugin-react": "keep-current",
+            },
+            previous_deferred=[{
+                "id": "vite-build",
+                "predicate": "duplicate-type-universe:rollup",
+                "packages": ["vite", "@vitejs/plugin-react"],
+            }],
+            repeated_count=1,
+        )
+        self.assertIsNotNone(suggestion)
+        assert suggestion is not None
+        self.assertEqual("vite-build", suggestion.cohort_id)
+        self.assertEqual("vite-build", suggestion.expanded_from)
+        self.assertEqual(("jsdom",), suggestion.packages)
+        self.assertIn("post-defer-boundary-expansion", suggestion.reasons)
+        self.assertEqual("DIAGNOSTIC_HINT", suggestion.authority)
+
+    def test_first_post_defer_expansion_stays_none_when_boundary_is_not_safe(self) -> None:
+        graph = {
+            "vite": {"@vitejs/plugin-react", "jsdom"},
+            "@vitejs/plugin-react": {"vite"},
+            "jsdom": {"vite"},
+        }
+        suggestion = infer_baseline_cohort(
+            predicate="duplicate-type-universe:rollup",
+            direct_packages=graph,
+            subject_consumers={"rollup": {"vite"}},
+            interaction_graph=graph,
+            policy_by_package={
+                "vite": "keep-current",
+                "@vitejs/plugin-react": "keep-current",
+                "jsdom": "required",
+            },
+            previous_deferred=[{
+                "id": "vite-build",
+                "predicate": "duplicate-type-universe:rollup",
+                "packages": ["vite", "@vitejs/plugin-react"],
+            }],
+            repeated_count=1,
+        )
+        self.assertIsNone(suggestion)
+
     def test_unknown_transitive_without_structural_path_does_not_invent_group(self) -> None:
         suggestion = infer_baseline_cohort(
             predicate="duplicate-type-universe:totally-unrelated",

@@ -12821,9 +12821,29 @@ def resolve_peer_compatibility_with_verification(
                         client=client,
                         repeated_count=anytime.repeated_predicate_count,
                     )
+                    # `None` is valid inside inference but not as an opaque UX
+                    # state. Always tell Desktop whether a cohort is actionable.
+                    decision_payload["cohortResolution"] = {
+                        "status": "NO_ACTIONABLE_COHORT",
+                        "reason": (
+                            "PREDICATE_UNAVAILABLE"
+                            if not cohort_predicate
+                            else "NO_SAFE_DEFERRABLE_PACKAGE_OR_NEIGHBORHOOD"
+                        ),
+                        "predicate": cohort_predicate or None,
+                        "authority": "DIAGNOSTIC_HINT",
+                    }
                     if cohort_suggestion is not None:
                         cohort_payload = cohort_suggestion.to_json()
                         decision_payload["suggestedCohort"] = cohort_payload
+                        decision_payload["cohortResolution"] = {
+                            "status": "SUGGESTED",
+                            "reason": "ACTIONABLE_DIAGNOSTIC_COHORT",
+                            "predicate": cohort_suggestion.predicate or cohort_predicate or None,
+                            "cohortId": cohort_suggestion.cohort_id,
+                            "decisionId": cohort_suggestion.decision_id,
+                            "authority": cohort_suggestion.authority,
+                        }
                         decision_payload["recommendedAction"] = "DEFER_COHORT_AND_CONTINUE"
                         decision_payload["availableActions"] = [
                             "DEFER_COHORT_AND_CONTINUE",

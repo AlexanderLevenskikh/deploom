@@ -131,7 +131,12 @@ class BaselineAnytimeState:
         elif predicate:
             self.repeated_predicate, self.repeated_predicate_count = predicate, 1
         else:
-            self.repeated_predicate, self.repeated_predicate_count = "", 0
+            # An unclassified rejection must not erase the last actionable
+            # blocker used by the human-decision/cohort navigation contract.
+            # Reset only repetition authority: with count=0 this cannot trigger
+            # stagnation or become Solver proof, while the next decision can
+            # still explain the most recent non-empty confirmed predicate.
+            self.repeated_predicate_count = 0
         delta = max(0, int(learned_constraints) - self.learned_constraints_at_last_rejection)
         self.learned_constraints_at_last_rejection = max(self.learned_constraints_at_last_rejection, int(learned_constraints))
         if self.stagnating and delta == 0:

@@ -253,17 +253,29 @@ def infer_baseline_cohort(
         break
     if previous_packages:
         candidates.update(previous_packages)
-        if int(repeated_count or 0) >= 2:
+        # Once a suggested cohort has actually been deferred, its members are
+        # persisted as non-auto policy. If the same ecosystem blocker is then
+        # observed on the next candidate, waiting for repeated_count >= 2 leaves
+        # the user with a predicate but no actionable cohort: all original
+        # members are no longer deferrable. Expand exactly one bounded boundary
+        # shell on that first post-defer blocker. This remains DIAGNOSTIC_HINT;
+        # every resulting assignment is still physically verified globally.
+        previous_unavailable = all(
+            policies.get(name, "auto") != "auto" for name in previous_packages
+        )
+        if int(repeated_count or 0) >= 2 or previous_unavailable:
             boundary = set()
             for name in previous_packages:
                 boundary.update(_neighbors(graph, name))
             expandable = [name for name in sorted(boundary - previous_packages) if name in direct]
-            # Expand only a bounded shell. It remains diagnostic and every final
-            # assignment is still globally verified.
             for name in expandable[:4]:
                 candidates.add(name)
             if expandable:
-                reasons.append("repeated-boundary-expansion")
+                reasons.append(
+                    "repeated-boundary-expansion"
+                    if int(repeated_count or 0) >= 2
+                    else "post-defer-boundary-expansion"
+                )
 
     blocked: list[str] = []
     warnings: list[str] = []
