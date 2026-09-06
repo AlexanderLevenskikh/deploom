@@ -691,6 +691,10 @@ _SAME_RUN_PRIVATE_PREPARED_ROOT: Optional[Path] = None
 _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS: Dict[Tuple[str, str], PreparedWorkspaceSnapshot] = {}
 _SAME_RUN_PRIVATE_PREPARED_GUARDS: Dict[Tuple[str, str], WorkspaceChangeGuard] = {}
 _SAME_RUN_PRIVATE_PREPARED_PRODUCERS: Dict[Tuple[str, str], str] = {}
+# BLOCK_PSI32_ATTEMPT_SCOPED_PRIVATE_CLEANUP_V1
+# slot -> verification attempt currently owning unparked/claimed private bytes.
+# Parked snapshots have no active owner. This is performance/safety state only.
+_SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS: Dict[Tuple[str, str], str] = {}
 _SAME_RUN_PRIVATE_PREPARED_MAX_COUNT = 2
 
 
@@ -757,6 +761,7 @@ def _evict_same_run_private_prepared_snapshot(
         guard = _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(slot, None)
         snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.pop(slot, None)
         producer = _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.pop(slot, None)
+        _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.pop(slot, None)
     if guard is not None:
         try:
             guard.stop()
@@ -775,7 +780,7 @@ def _evict_same_run_private_prepared_snapshot(
 
 
 def _enforce_same_run_private_prepared_budget(
-    protected_slot: Tuple[str, str],
+    protected_slot: Optional[Tuple[str, str]] = None,
 ) -> None:
     victims: list[
         tuple[
@@ -811,6 +816,9 @@ def _enforce_same_run_private_prepared_budget(
             snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.pop(victim_slot)
             guard = _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(victim_slot)
             producer = _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.pop(
+                victim_slot, None
+            )
+            _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.pop(
                 victim_slot, None
             )
             victims.append((victim_slot, snapshot, guard, producer))
@@ -857,9 +865,14 @@ def _register_same_run_private_prepared_snapshot(
         snapshot.source_project,
         reason="same-run-private-replaced",
     )
+    active_attempt = current_attempt_id()
     with _PREPARED_SNAPSHOT_LOCK:
         _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS[slot] = snapshot
         _SAME_RUN_PRIVATE_PREPARED_PRODUCERS[slot] = str(producer)
+        if active_attempt:
+            _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS[slot] = active_attempt
+        else:
+            _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.pop(slot, None)
     _enforce_same_run_private_prepared_budget(slot)
     emit_observability_event(
         "same-run.private-prepared.created",
@@ -914,11 +927,16 @@ def _park_same_run_private_prepared_snapshot(
                 pass
             return False
         _SAME_RUN_PRIVATE_PREPARED_GUARDS[slot] = guard
+        _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.pop(slot, None)
     emit_observability_event(
         "same-run.private-prepared.parked",
+        operationId=new_observability_id("private-prepared-park"),
         identity=str(key),
         sourceProject=str(source_project.resolve()),
     )
+    # A prior registration may have deferred budget enforcement because every
+    # candidate was active. Parking creates a safe idle victim, so retry now.
+    _enforce_same_run_private_prepared_budget()
     return True
 
 
@@ -960,7 +978,49 @@ def _claim_same_run_private_prepared_snapshot(
             key, source_project, reason="same-run-private-path-missing"
         )
         return None, producer, "path-missing"
+    active_attempt = current_attempt_id()
+    with _PREPARED_SNAPSHOT_LOCK:
+        if _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.get(slot) is snapshot:
+            if active_attempt:
+                _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS[slot] = active_attempt
+            else:
+                _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.pop(slot, None)
     return snapshot, producer, "hit"
+
+
+def _evict_same_run_private_prepared_for_attempt(
+    attempt_id: str,
+    *,
+    reason: str,
+) -> int:
+    """Retire private trees actually held by one verification attempt."""
+    owner = str(attempt_id or "").strip()
+    if not owner:
+        return 0
+    with _PREPARED_SNAPSHOT_LOCK:
+        slots = [
+            slot
+            for slot, active_owner
+            in _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.items()
+            if active_owner == owner
+        ]
+    for key, source_project in slots:
+        _evict_same_run_private_prepared_snapshot(
+            key,
+            Path(source_project),
+            reason=reason,
+        )
+    if slots:
+        emit_observability_event(
+            "same-run.private-prepared.attempt-cleanup",
+            operationId=new_observability_id(
+                "private-prepared-attempt-cleanup"
+            ),
+            attemptId=owner,
+            count=len(slots),
+            reason=reason,
+        )
+    return len(slots)
 
 
 def _cleanup_same_run_private_prepared_snapshots() -> None:
@@ -971,6 +1031,7 @@ def _cleanup_same_run_private_prepared_snapshots() -> None:
         _SAME_RUN_PRIVATE_PREPARED_GUARDS.clear()
         _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.clear()
         _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.clear()
+        _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.clear()
         _SAME_RUN_PRIVATE_PREPARED_ROOT = None
     for guard in guards:
         try:
@@ -3668,6 +3729,7 @@ def promote_same_run_prepared_artifact(
         _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.pop(slot, None)
         _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.pop(slot, None)
         _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(slot, None)
+        _SAME_RUN_PRIVATE_PREPARED_ACTIVE_ATTEMPTS.pop(slot, None)
 
     emit_observability_event(
         "same-run.private-prepared.promote.start",
@@ -3810,8 +3872,11 @@ def _verify_assignment_uncached(
                 _allow_prepared_fastpath=_allow_prepared_fastpath,
             )
         except BaseException as exc:
-            if proof_identity is not None and run_project_checks and config.commands:
-                _evict_same_run_private_prepared_snapshot(proof_identity.preparation_proof_key, project_dir, reason="verify-attempt-exception")
+            if run_project_checks and config.commands:
+                _evict_same_run_private_prepared_for_attempt(
+                    attempt_id,
+                    reason="verify-attempt-exception",
+                )
             for terminal_event, terminal_fields in pending_stage_finishes(
                 terminal_reason="exception"
             ):
@@ -3859,9 +3924,8 @@ def _verify_assignment_uncached(
                         project_dir,
                     )
                 else:
-                    _evict_same_run_private_prepared_snapshot(
-                        effective_identity.preparation_proof_key,
-                        project_dir,
+                    _evict_same_run_private_prepared_for_attempt(
+                        attempt_id,
                         reason=f"verify-result-{result.kind}",
                     )
 

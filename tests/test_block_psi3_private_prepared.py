@@ -341,6 +341,127 @@ class Psi3PrivatePreparedTests(unittest.TestCase):
                     verifier._same_run_private_snapshot_exists(third.key, source)
                 )
 
+    def test_cold_miss_exception_and_infrastructure_cleanup_use_actual_owned_key(self) -> None:
+        class FakeIdentity:
+            def __init__(self, preparation_key: str):
+                self.preparation_proof_key = preparation_key
+                self.resolved_state_key = ""
+
+            def event_fields(self):
+                return {}
+
+        config = verifier.BaselineVerifyConfig(
+            project_checks="adaptive",
+            commands=("yarn lint:types",),
+        )
+
+        for terminal_kind in ("exception", "infrastructure"):
+            with self.subTest(terminal_kind=terminal_kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "source"
+                source.mkdir()
+                old_key = "a" * 32
+                rebound_key = (
+                    "b" * 32 if terminal_kind == "exception" else "c" * 32
+                )
+                old_identity = FakeIdentity(old_key)
+
+                def fake_inner(*args, **kwargs):
+                    snapshot = self._snapshot(
+                        root / "private",
+                        source,
+                        key=rebound_key,
+                    )
+                    verifier._register_same_run_private_prepared_snapshot(
+                        snapshot,
+                        producer=f"cold-{terminal_kind}",
+                    )
+                    if terminal_kind == "exception":
+                        raise TimeoutError("synthetic project-check timeout")
+                    return verifier.BaselineVerifyResult(
+                        False,
+                        "infrastructure",
+                        "synthetic timeout result without resolved_state_key",
+                    )
+
+                with patch.object(
+                    verifier,
+                    "_verify_assignment_uncached_impl",
+                    side_effect=fake_inner,
+                ):
+                    if terminal_kind == "exception":
+                        with self.assertRaises(TimeoutError):
+                            verifier._verify_assignment_uncached(
+                                source,
+                                {"demo": "2.0.0"},
+                                config=config,
+                                run_project_checks=True,
+                                proof_identity=old_identity,
+                            )
+                    else:
+                        result = verifier._verify_assignment_uncached(
+                            source,
+                            {"demo": "2.0.0"},
+                            config=config,
+                            run_project_checks=True,
+                            proof_identity=old_identity,
+                        )
+                        self.assertEqual("infrastructure", result.kind)
+
+                self.assertFalse(
+                    verifier._same_run_private_snapshot_exists(
+                        rebound_key,
+                        source,
+                    )
+                )
+                self.assertFalse(
+                    verifier._same_run_private_snapshot_exists(
+                        old_key,
+                        source,
+                    )
+                )
+
+    def test_deferred_budget_is_restored_when_snapshot_parks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            first = self._snapshot(root / "one", source, key="1" * 32)
+            second = self._snapshot(root / "two", source, key="2" * 32)
+            third = self._snapshot(root / "three", source, key="3" * 32)
+
+            with patch.object(
+                verifier,
+                "WorkspaceChangeGuard",
+                _FakeGuard,
+            ), patch.object(
+                verifier,
+                "_SAME_RUN_PRIVATE_PREPARED_MAX_COUNT",
+                2,
+            ):
+                verifier._register_same_run_private_prepared_snapshot(
+                    first, producer="first"
+                )
+                verifier._register_same_run_private_prepared_snapshot(
+                    second, producer="second"
+                )
+                verifier._register_same_run_private_prepared_snapshot(
+                    third, producer="third"
+                )
+                self.assertEqual(
+                    3,
+                    len(verifier._SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS),
+                )
+
+                verifier._park_same_run_private_prepared_snapshot(
+                    first.key,
+                    source,
+                )
+                self.assertLessEqual(
+                    len(verifier._SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS),
+                    2,
+                )
+
     def test_snapshot_publisher_returns_same_call_durable_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
