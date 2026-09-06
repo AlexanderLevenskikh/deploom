@@ -221,6 +221,7 @@ class BaselineVerifyResult:
     resolved_lockfile_path: str = ""
     resolved_lockfile_hash: str = ""
     resolved_state_artifact: str = ""
+    preparation_proof_key: str = ""
 
     @property
     def hard_failure(self) -> bool:
@@ -677,6 +678,16 @@ _PREPARATION_COORDINATION_LOCK = threading.Lock()
 _PREPARATION_COORDINATION: Dict[Tuple[object, ...], threading.Lock] = {}
 _PREPARED_SNAPSHOT_PRODUCERS: Dict[Tuple[str, str], str] = {}
 
+# BLOCK_PSI3_PRIVATE_PREPARED_V1
+# Performance-only same-process tier. Reuse still requires the exact
+# PreparationProofKey plus clean watcher continuity between verify requests.
+# Nothing in this tier is cross-process/durable authority.
+_SAME_RUN_PRIVATE_PREPARED_ROOT: Optional[Path] = None
+_SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS: Dict[Tuple[str, str], PreparedWorkspaceSnapshot] = {}
+_SAME_RUN_PRIVATE_PREPARED_GUARDS: Dict[Tuple[str, str], WorkspaceChangeGuard] = {}
+_SAME_RUN_PRIVATE_PREPARED_PRODUCERS: Dict[Tuple[str, str], str] = {}
+_SAME_RUN_PRIVATE_PREPARED_MAX_COUNT = 2
+
 
 def _preparation_coordination_key(
     project_dir: Path,
@@ -705,8 +716,249 @@ def _coalesce_same_run_preparation(key: Tuple[object, ...]):
         lock.release()
 
 
+
+def _same_run_private_prepared_root(parent: Optional[Path] = None) -> Path:
+    global _SAME_RUN_PRIVATE_PREPARED_ROOT
+    with _PREPARED_SNAPSHOT_LOCK:
+        current = _SAME_RUN_PRIVATE_PREPARED_ROOT
+        if current is not None and current.is_dir():
+            return current
+        base = parent.resolve() if parent is not None else None
+        if base is not None:
+            base.mkdir(parents=True, exist_ok=True)
+        created = Path(tempfile.mkdtemp(
+            prefix="dependency-flow-same-run-prepared-",
+            dir=str(base) if base is not None else None,
+        ))
+        _SAME_RUN_PRIVATE_PREPARED_ROOT = created
+        return created
+
+
+def _same_run_private_snapshot_exists(key: str, source_project: Path) -> bool:
+    slot = _prepared_snapshot_slot(key, source_project)
+    with _PREPARED_SNAPSHOT_LOCK:
+        snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.get(slot)
+    return bool(snapshot is not None and snapshot.workspace_root.is_dir())
+
+
+def _evict_same_run_private_prepared_snapshot(
+    key: str,
+    source_project: Path,
+    *,
+    reason: str = "",
+) -> None:
+    slot = _prepared_snapshot_slot(key, source_project)
+    with _PREPARED_SNAPSHOT_LOCK:
+        guard = _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(slot, None)
+        snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.pop(slot, None)
+        producer = _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.pop(slot, None)
+    if guard is not None:
+        try:
+            guard.stop()
+        except Exception:
+            pass
+    if snapshot is not None:
+        _retire_prepared_workspace_snapshot(snapshot)
+    if snapshot is not None or producer is not None:
+        emit_observability_event(
+            "same-run.private-prepared.invalidated",
+            identity=str(key),
+            sourceProject=str(source_project.resolve()),
+            originalProducer=str(producer or ""),
+            reason=str(reason or "evicted"),
+        )
+
+
+def _enforce_same_run_private_prepared_budget(
+    protected_slot: Tuple[str, str],
+) -> None:
+    victims: list[
+        tuple[
+            Tuple[str, str],
+            PreparedWorkspaceSnapshot,
+            Optional[WorkspaceChangeGuard],
+            Optional[str],
+        ]
+    ] = []
+    with _PREPARED_SNAPSHOT_LOCK:
+        while (
+            len(_SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS)
+            > _SAME_RUN_PRIVATE_PREPARED_MAX_COUNT
+        ):
+            slot = next(iter(_SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS))
+            if (
+                slot == protected_slot
+                and len(_SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS) > 1
+            ):
+                snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.pop(slot)
+                _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS[slot] = snapshot
+                producer = _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.pop(slot, None)
+                if producer is not None:
+                    _SAME_RUN_PRIVATE_PREPARED_PRODUCERS[slot] = producer
+                guard = _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(slot, None)
+                if guard is not None:
+                    _SAME_RUN_PRIVATE_PREPARED_GUARDS[slot] = guard
+                slot = next(iter(_SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS))
+            snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.pop(slot)
+            guard = _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(slot, None)
+            producer = _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.pop(slot, None)
+            victims.append((slot, snapshot, guard, producer))
+    for slot, snapshot, guard, producer in victims:
+        if guard is not None:
+            try:
+                guard.stop()
+            except Exception:
+                pass
+        _retire_prepared_workspace_snapshot(snapshot)
+        emit_observability_event(
+            "same-run.private-prepared.invalidated",
+            identity=slot[0],
+            sourceProject=slot[1],
+            originalProducer=str(producer or ""),
+            reason="same-run-private-budget",
+        )
+
+
+def _register_same_run_private_prepared_snapshot(
+    snapshot: PreparedWorkspaceSnapshot,
+    *,
+    producer: str,
+) -> None:
+    if is_durable_prepared_path(snapshot.workspace_root):
+        raise RuntimeError(
+            "SAME_RUN_PRIVATE_PREPARED_DURABLE_ESCAPE: "
+            "private tier cannot register a durable path"
+        )
+    slot = _prepared_snapshot_slot(snapshot.key, snapshot.source_project)
+    _evict_same_run_private_prepared_snapshot(
+        snapshot.key,
+        snapshot.source_project,
+        reason="same-run-private-replaced",
+    )
+    with _PREPARED_SNAPSHOT_LOCK:
+        _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS[slot] = snapshot
+        _SAME_RUN_PRIVATE_PREPARED_PRODUCERS[slot] = str(producer)
+    _enforce_same_run_private_prepared_budget(slot)
+    emit_observability_event(
+        "same-run.private-prepared.created",
+        identity=snapshot.key,
+        sourceProject=str(snapshot.source_project),
+        originalProducer=str(producer),
+        durable=False,
+    )
+
+
+def _park_same_run_private_prepared_snapshot(
+    key: str,
+    source_project: Path,
+) -> bool:
+    """Arm continuity evidence after the current request stops using the tree."""
+    slot = _prepared_snapshot_slot(key, source_project)
+    with _PREPARED_SNAPSHOT_LOCK:
+        snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.get(slot)
+        existing_guard = _SAME_RUN_PRIVATE_PREPARED_GUARDS.get(slot)
+    if snapshot is None:
+        return False
+    if existing_guard is not None:
+        return True
+    if not snapshot.workspace_root.is_dir():
+        _evict_same_run_private_prepared_snapshot(
+            key, source_project, reason="same-run-private-path-missing"
+        )
+        return False
+
+    guard = WorkspaceChangeGuard(snapshot.workspace_root)
+    try:
+        started = bool(guard.start())
+    except Exception:
+        started = False
+    if not started:
+        try:
+            guard.stop()
+        except Exception:
+            pass
+        _evict_same_run_private_prepared_snapshot(
+            key, source_project, reason="same-run-private-watcher-unavailable"
+        )
+        return False
+
+    with _PREPARED_SNAPSHOT_LOCK:
+        if _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.get(slot) is not snapshot:
+            try:
+                guard.stop()
+            except Exception:
+                pass
+            return False
+        _SAME_RUN_PRIVATE_PREPARED_GUARDS[slot] = guard
+    emit_observability_event(
+        "same-run.private-prepared.parked",
+        identity=str(key),
+        sourceProject=str(source_project.resolve()),
+    )
+    return True
+
+
+def _claim_same_run_private_prepared_snapshot(
+    key: str,
+    source_project: Path,
+) -> Tuple[Optional[PreparedWorkspaceSnapshot], Optional[str], str]:
+    """Consume watcher evidence and claim an exact same-run private tree."""
+    slot = _prepared_snapshot_slot(key, source_project)
+    with _PREPARED_SNAPSHOT_LOCK:
+        snapshot = _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.get(slot)
+        guard = _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(slot, None)
+        producer = _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.get(slot)
+
+    if snapshot is None:
+        return None, None, "missing"
+    if guard is None:
+        return None, producer, "busy"
+    try:
+        continuity = guard.stop()
+    except Exception:
+        _evict_same_run_private_prepared_snapshot(
+            key, source_project, reason="same-run-private-watcher-stop"
+        )
+        return None, producer, "watcher-error"
+
+    if continuity.errors:
+        _evict_same_run_private_prepared_snapshot(
+            key, source_project, reason="same-run-private-watcher-error"
+        )
+        return None, producer, "watcher-error"
+    if continuity.changes:
+        _evict_same_run_private_prepared_snapshot(
+            key, source_project, reason="same-run-private-mutated"
+        )
+        return None, producer, "workspace-mutated"
+    if not snapshot.workspace_root.is_dir():
+        _evict_same_run_private_prepared_snapshot(
+            key, source_project, reason="same-run-private-path-missing"
+        )
+        return None, producer, "path-missing"
+    return snapshot, producer, "hit"
+
+
+def _cleanup_same_run_private_prepared_snapshots() -> None:
+    global _SAME_RUN_PRIVATE_PREPARED_ROOT
+    with _PREPARED_SNAPSHOT_LOCK:
+        guards = list(_SAME_RUN_PRIVATE_PREPARED_GUARDS.values())
+        root = _SAME_RUN_PRIVATE_PREPARED_ROOT
+        _SAME_RUN_PRIVATE_PREPARED_GUARDS.clear()
+        _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.clear()
+        _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.clear()
+        _SAME_RUN_PRIVATE_PREPARED_ROOT = None
+    for guard in guards:
+        try:
+            guard.stop()
+        except Exception:
+            pass
+    if root is not None:
+        shutil.rmtree(root, ignore_errors=True)
+
 def reset_same_run_verification_reuse() -> None:
     """Start a new Baseline run without restoring process-local trust."""
+    _cleanup_same_run_private_prepared_snapshots()
     clear_prepared_artifact_pins()
     with _PREPARATION_COORDINATION_LOCK:
         _PREPARATION_COORDINATION.clear()
@@ -716,6 +968,7 @@ def reset_same_run_verification_reuse() -> None:
 
 def _cleanup_prepared_snapshot_root() -> None:
     global _PREPARED_SNAPSHOT_ROOT
+    _cleanup_same_run_private_prepared_snapshots()
     root = _PREPARED_SNAPSHOT_ROOT
     # Block V durable PreparedArtifacts intentionally survive process exit.
     # Only the historical process-local temporary root is deleted here.
@@ -1209,6 +1462,7 @@ def _retire_prepared_workspace_snapshot(snapshot: PreparedWorkspaceSnapshot) -> 
 
 
 def _evict_prepared_workspace_snapshot(key: str, source_project: Path) -> None:
+    _evict_same_run_private_prepared_snapshot(key, source_project, reason="prepared-artifact-evicted")
     slot = _prepared_snapshot_slot(key, source_project)
     unpin_prepared_artifact_record(key)
     with _PREPARED_SNAPSHOT_LOCK:
@@ -2526,13 +2780,21 @@ def verify_assignment(
                 cacheKey=proof_identity.preparation_proof_key,
                 cacheOperationId=preparation_cache_operation_id,
             )
-            snapshot = (
-                _lookup_prepared_workspace_snapshot(
+            private_snapshot: Optional[PreparedWorkspaceSnapshot] = None
+            private_producer: Optional[str] = None
+            private_claim_reason = "proof-missing"
+            if preparation_record is not None:
+                private_snapshot, private_producer, private_claim_reason = _claim_same_run_private_prepared_snapshot(
+                    proof_identity.preparation_proof_key, project_dir
+                )
+                if private_snapshot is None and private_claim_reason not in {"missing", "busy"}:
+                    event("same-run.private-prepared.invalidated", identity=proof_identity.preparation_proof_key, consumer=progress_label, originalProducer=str(private_producer or ""), reason=private_claim_reason)
+            snapshot_is_private = private_snapshot is not None
+            snapshot = private_snapshot
+            if snapshot is None and preparation_record is not None:
+                snapshot = _lookup_prepared_workspace_snapshot(
                     proof_identity.preparation_proof_key, project_dir, progress=progress
                 )
-                if preparation_record is not None
-                else None
-            )
             if snapshot is not None and snapshot.observed_resolved_hash != observed_hash:
                 event(
                     "verify.preparation.snapshot-rejected",
@@ -2546,31 +2808,19 @@ def verify_assignment(
                 snapshot = None
 
             if snapshot is not None:
-                producer = _PREPARED_SNAPSHOT_PRODUCERS.get(
-                    _prepared_snapshot_slot(
-                        proof_identity.preparation_proof_key, project_dir
-                    )
+                producer = private_producer if snapshot_is_private else _PREPARED_SNAPSHOT_PRODUCERS.get(
+                    _prepared_snapshot_slot(proof_identity.preparation_proof_key, project_dir)
                 )
-                event(
-                    "verify.preparation.snapshot-hit",
-                    preparationProofKey=proof_identity.preparation_proof_key,
-                    observedResolvedHash=observed_hash,
-                )
-                if producer is not None:
+                event("verify.preparation.snapshot-hit", preparationProofKey=proof_identity.preparation_proof_key, observedResolvedHash=observed_hash, storageTier="same-run-private" if snapshot_is_private else "durable")
+                if snapshot_is_private:
+                    event("same-run.private-prepared.hit", marker="PSI3_SAME_RUN_PRIVATE_PREPARED_HIT", identity=proof_identity.preparation_proof_key, consumer=progress_label, originalProducer=str(producer or ""), lifecycleInstallAvoided=True, durableSealAvoided=True)
+                    event("same-run.prepared-artifact.hit", marker="SAME_RUN_PREPARED_ARTIFACT_HIT", identity=proof_identity.preparation_proof_key, consumer=progress_label, originalProducer=str(producer or ""), lifecycleInstallAvoided=True, integritySealAvoided=True, storageTier="same-run-private")
+                    _emit_progress(progress, f"{progress_label}: Ψ.3 same-run private PreparedArtifact HIT; lifecycle replay and durable seal skipped; fresh project-check clone still required")
+                elif producer is not None:
                     pin_prepared_artifact_record(proof_identity.preparation_proof_key)
-                    event(
-                        "same-run.prepared-artifact.hit",
-                        marker="SAME_RUN_PREPARED_ARTIFACT_HIT",
-                        identity=proof_identity.preparation_proof_key,
-                        consumer=progress_label,
-                        originalProducer=producer,
-                        lifecycleInstallAvoided=True,
-                        integritySealAvoided=True,
-                    )
-                _emit_progress(
-                    progress,
-                    f"{progress_label}: lifecycle preparation snapshot HIT; fresh project-check clones will be materialized from the sealed tree",
-                )
+                    event("same-run.prepared-artifact.hit", marker="SAME_RUN_PREPARED_ARTIFACT_HIT", identity=proof_identity.preparation_proof_key, consumer=progress_label, originalProducer=producer, lifecycleInstallAvoided=True, integritySealAvoided=True, storageTier="durable")
+                if not snapshot_is_private:
+                    _emit_progress(progress, f"{progress_label}: lifecycle preparation snapshot HIT; fresh project-check clones will be materialized from the sealed tree")
                 observed_versions = dict(snapshot.observed_resolved_versions)
             else:
                 invalidated_producer = _PREPARED_SNAPSHOT_PRODUCERS.pop(
@@ -2738,7 +2988,7 @@ def verify_assignment(
                         publication_root=(
                             None
                             if durable_snapshot_requested
-                            else temp_root / "private-prepared-snapshots"
+                            else _same_run_private_prepared_root(trial_parent)
                         ),
                         progress=progress,
                         progress_label=f"{progress_label}: snapshot-publish",
@@ -2771,6 +3021,9 @@ def verify_assignment(
                         )
                     ] = progress_label
                     pin_prepared_artifact_record(proof_identity.preparation_proof_key)
+                else:
+                    _register_same_run_private_prepared_snapshot(snapshot, producer=progress_label)
+                    event("same-run.private-prepared.created", identity=proof_identity.preparation_proof_key, producer=progress_label, durable=False, durableSealAvoided=True)
 
             if snapshot is None:
                 return BaselineVerifyResult(False, "infrastructure", "PREPARED_SNAPSHOT_UNAVAILABLE: project checks require a sealed preparation tree")
@@ -3313,6 +3566,127 @@ def verify_assignment(
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
+
+def promote_same_run_prepared_artifact(
+    project_dir: Path,
+    preparation_proof_key: str,
+    *,
+    proof_cache_dir: str = "",
+    progress: Optional[ProgressCallback] = None,
+    progress_label: str = "verified incumbent prepared-artifact promotion",
+) -> bool:
+    """Promote an exact clean same-run tree through the existing strong seal."""
+    project_dir = project_dir.resolve()
+    key = str(preparation_proof_key or "").strip()
+    if not key:
+        return False
+
+    configure_prepared_artifact_store(proof_cache_dir or None)
+    proof_store = VerificationProofStore(
+        Path(proof_cache_dir) if proof_cache_dir else None
+    )
+    if proof_store.root is None or proof_store.lookup_pass("preparation", key) is None:
+        emit_observability_event(
+            "same-run.private-prepared.promote.finish",
+            identity=key,
+            promoted=False,
+            reason="preparation-proof-missing",
+        )
+        return False
+
+    durable = _lookup_prepared_workspace_snapshot(
+        key, project_dir, progress=progress
+    )
+    if durable is not None:
+        emit_observability_event(
+            "same-run.private-prepared.promote.finish",
+            identity=key,
+            promoted=True,
+            reason="already-durable",
+        )
+        return True
+
+    snapshot, producer, reason = _claim_same_run_private_prepared_snapshot(
+        key, project_dir
+    )
+    if snapshot is None:
+        emit_observability_event(
+            "same-run.private-prepared.promote.finish",
+            identity=key,
+            promoted=False,
+            reason=f"private-{reason}",
+            originalProducer=str(producer or ""),
+        )
+        return False
+
+    slot = _prepared_snapshot_slot(key, project_dir)
+    with _PREPARED_SNAPSHOT_LOCK:
+        _SAME_RUN_PRIVATE_PREPARED_SNAPSHOTS.pop(slot, None)
+        _SAME_RUN_PRIVATE_PREPARED_PRODUCERS.pop(slot, None)
+        _SAME_RUN_PRIVATE_PREPARED_GUARDS.pop(slot, None)
+
+    emit_observability_event(
+        "same-run.private-prepared.promote.start",
+        identity=key,
+        originalProducer=str(producer or ""),
+        sourceProject=str(project_dir),
+    )
+    _emit_progress(
+        progress,
+        f"{progress_label}: Ψ.3 promoting verified incumbent to strong durable PreparedArtifact",
+    )
+    try:
+        promoted = _publish_prepared_workspace_snapshot(
+            snapshot.workspace_root,
+            snapshot.workspace_root / snapshot.project_relative,
+            key=key,
+            observed_versions=snapshot.observed_resolved_versions,
+            observed_hash=snapshot.observed_resolved_hash,
+            source_project=project_dir,
+            seal_dependency_integrity=True,
+            shared_reuse_allowed=True,
+            publication_root=None,
+            progress=progress,
+            progress_label=f"{progress_label}: durable-promotion",
+        )
+    except Exception as exc:
+        _retire_prepared_workspace_snapshot(snapshot)
+        emit_observability_event(
+            "same-run.private-prepared.promote.finish",
+            identity=key,
+            promoted=False,
+            reason=f"promotion-error:{type(exc).__name__}",
+            originalProducer=str(producer or ""),
+        )
+        _emit_progress(
+            progress,
+            f"{progress_label}: Ψ.3 durable promotion unavailable; "
+            "verified result remains valid and no durable reuse is claimed",
+        )
+        return False
+
+    record = load_prepared_artifact_record(key, project_dir, progress=progress)
+    durable_ok = bool(
+        record is not None
+        and is_durable_prepared_path(promoted.workspace_root)
+        and promoted.workspace_root.is_dir()
+    )
+    if durable_ok:
+        with _PREPARED_SNAPSHOT_LOCK:
+            _PREPARED_SNAPSHOT_PRODUCERS[slot] = str(
+                producer or progress_label
+            )
+        pin_prepared_artifact_record(key)
+    emit_observability_event(
+        "same-run.private-prepared.promote.finish",
+        identity=key,
+        promoted=durable_ok,
+        reason="strong-durable-seal" if durable_ok else "durable-record-missing",
+        originalProducer=str(producer or ""),
+    )
+    return durable_ok
+
+
 def assignment_fingerprint(assignment: Mapping[str, str]) -> str:
     payload = json.dumps(dict(sorted(assignment.items())), separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
@@ -3369,6 +3743,8 @@ def _verify_assignment_uncached(
                 _allow_prepared_fastpath=_allow_prepared_fastpath,
             )
         except BaseException as exc:
+            if proof_identity is not None and run_project_checks and config.commands:
+                _evict_same_run_private_prepared_snapshot(proof_identity.preparation_proof_key, project_dir, reason="verify-attempt-exception")
             for terminal_event, terminal_fields in pending_stage_finishes(
                 terminal_reason="exception"
             ):
@@ -3397,6 +3773,14 @@ def _verify_assignment_uncached(
                 **identity_fields,
             )
             raise
+
+        if proof_identity is not None:
+            result = dataclasses.replace(result, preparation_proof_key=proof_identity.preparation_proof_key)
+            if run_project_checks and config.commands:
+                if result.kind in {"project", "passed"}:
+                    _park_same_run_private_prepared_snapshot(proof_identity.preparation_proof_key, project_dir)
+                else:
+                    _evict_same_run_private_prepared_snapshot(proof_identity.preparation_proof_key, project_dir, reason=f"verify-result-{result.kind}")
 
         for terminal_event, terminal_fields in pending_stage_finishes(
             terminal_reason=result.kind

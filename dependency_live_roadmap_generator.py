@@ -99,7 +99,7 @@ from baseline_constraint_verifier import (
     BaselineVerifyConfig, BaselineVerifyResult, assignment_fingerprint,
     detect_package_manager, discover_baseline_project_checks, resolve_executable,
     reset_same_run_verification_reuse, structural_project_failure_signatures,
-    verify_assignment,
+    promote_same_run_prepared_artifact, verify_assignment,
 )
 from verification_proof import (
     VerificationProofStore,
@@ -10857,6 +10857,14 @@ def resolve_peer_compatibility_with_verification(
                             verification_assignment, fingerprint,
                             getattr(result, "resolved_state_key", "") or fingerprint,
                         )
+                        if (config.project_checks != "off" and config.commands and project_result is not None and project_result.ok and getattr(project_result, "preparation_proof_key", "")):
+                            promoted_incumbent = promote_same_run_prepared_artifact(
+                                spec.path, project_result.preparation_proof_key,
+                                proof_cache_dir=config.proof_cache_dir,
+                                progress=lambda message: (progress_reporter.emit(project, mode, "incumbent-prepared-promotion", iteration=iteration, assignment=fingerprint, message=message), eprint(f"[info] {project}: {message}")),
+                                progress_label=f"Baseline verified incumbent {mode} {fingerprint}",
+                            )
+                            progress_reporter.emit(project, mode, "incumbent-prepared-promotion-finished", iteration=iteration, assignment=fingerprint, promoted=bool(promoted_incumbent), authority="PERFORMANCE_ONLY")
                         final_assignments.setdefault(project, {})[mode] = assignment
                         if unknown_budget_names:
                             eprint(
