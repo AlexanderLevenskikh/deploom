@@ -167,6 +167,11 @@ NPM_REGISTRY = "https://registry.npmjs.org"
 OSV_QUERY_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/{id}"
 
+# Per-process report authority marker. The generator is a single-shot CLI; this
+# is intentionally reset by main() for every invocation and consumed only by
+# report writers / prompt export.
+GENERATION_RESULT_METADATA: Dict[str, Any] = {}
+
 REQUEST_TIMEOUT = 30
 OSV_BATCH_SIZE = 100
 RATE_SLEEP_SEC = 0.05
@@ -13385,6 +13390,12 @@ def write_markdown(
     with out.open("w", encoding="utf-8") as f:
         f.write("# Live dependency roadmap\n\n")
         f.write(f"Дата генерации: `{now}`.\n\n")
+        if GENERATION_RESULT_METADATA.get("kind") == "DRAFT":
+            f.write(
+                "> ⚠️ **Draft Baseline — NOT_VERIFIED / PLANNING_ONLY.** "
+                "Target рассчитан статически; install/lifecycle/project checks не выполнялись, "
+                "physical compatibility остаётся **UNKNOWN**. Используйте результат как planning/agent handoff, а не как proof.\n\n"
+            )
         f.write("Источники: direct versions из `package.json`; project lockfile для install-consistency; isolated package-lock/Nexus audit; npm registry и OSV.dev.\n\n")
         f.write("> Важно: dashboard использует OSV для известной уязвимости конкретной package/version пары и registry metadata для версий/дат. Ручной Nexus/npm audit — отдельная пользовательская сверка транзитивного дерева и внутренних пакетов; `generate` его не запускает.\n\n")
         f.write(GROUP_PRINCIPLES + "\n\n")
@@ -13846,6 +13857,7 @@ def write_html(
         "historyDir": str(history_dir),
         "settingsSources": [str(p) for p in settings_sources],
         "baselineComparisons": baseline_comparisons,
+        "baselineResult": dict(GENERATION_RESULT_METADATA),
         "dashboardStatePath": str(dashboard_state_path or ""),
         "dashboardState": dashboard_state_data,
         "historySnapshots": history_snapshots,
@@ -16229,7 +16241,17 @@ function buildTaskSpecification(){
 
 function buildPromptFromCurrentView(){
   const format = document.getElementById('promptFormat')?.value || 'compact';
-  return format === 'full' ? buildFullPromptFromCurrentView() : buildCompactPromptFromCurrentView();
+  const prompt = format === 'full' ? buildFullPromptFromCurrentView() : buildCompactPromptFromCurrentView();
+  if (REPORT_CONTEXT.baselineResult?.kind !== 'DRAFT') return prompt;
+  const warning = `# IMPORTANT — DRAFT BASELINE / PLANNING ONLY
+
+This target is NOT_VERIFIED. DepLoom deliberately skipped physical resolver/lifecycle/project verification.
+compatibility = UNKNOWN; authority = PLANNING_ONLY.
+
+Use the proposed assignment only as a starting point. Run the real package-manager install and the project's discovered lint/type/build/test checks. Preserve already-working scope where possible, localize incompatible cohorts, and explain every deviation from the proposed target. Do not claim DepLoom ProofEnvelope authority for this Draft.
+
+`;
+  return warning + prompt;
 }
 
 function openPromptModal(prompt, title){
@@ -17168,7 +17190,20 @@ function initDashboardInteractions(){
   document.addEventListener('keydown', e => { if (e.key === 'Escape') ['releaseModal','settingsModal','historyModal'].forEach(closeModalById); });
 }
 
+function initDraftBaselineBanner(){
+  const result = REPORT_CONTEXT.baselineResult || {};
+  if (result.kind !== 'DRAFT') return;
+  const header = document.querySelector('header');
+  const controls = header?.querySelector('.controls');
+  if (!header || !controls) return;
+  const banner = document.createElement('div');
+  banner.className = 'baseline-banner baseline-neutral';
+  banner.innerHTML = '<strong>⚠ Draft Baseline — NOT_VERIFIED / PLANNING_ONLY</strong><div class="muted">Target рассчитан статически. Physical install/lifecycle/project checks не выполнялись; compatibility = UNKNOWN. Prompt export предназначен как starting point для внешнего агента.</div>';
+  header.insertBefore(banner, controls);
+}
+
 initThemeControl();
+initDraftBaselineBanner();
 initDetailsExpandControl();
 initProjectGroupToggles();
 initPromptExport();
@@ -17208,6 +17243,7 @@ def write_json(
     health_by_project = health_by_project or enrich_project_targets(rows_by_project)
     suggestions_by_project, global_suggestions = build_all_suggestions(rows_by_project)
     data = {
+        "baseline_result": dict(GENERATION_RESULT_METADATA),
         "project_health": {project: dataclasses.asdict(h) for project, h in health_by_project.items()},
         "baseline_comparisons": baseline_comparisons or {},
         "project_git": {
@@ -17267,6 +17303,11 @@ def main() -> None:
     ap.add_argument("--knowledge-log", help="Append-only, revisioned package migration knowledge JSON. Overrides settings.knowledgeLog.")
     ap.add_argument("--only-project", action="append", help="Analyze only the named project from settings/projects. Can be passed multiple times.")
     ap.add_argument("--capture-baseline", action="store_true", help="Store the current project state as a migration baseline in history/baselines after generating the report.")
+    ap.add_argument(
+        "--draft-baseline",
+        action="store_true",
+        help="Plan a source-baseline dependency target without physical verification or authoritative proof publication.",
+    )
     ap.add_argument("--baseline-label", default="", help="Optional label stored with --capture-baseline, for example ticket or branch name.")
     ap.add_argument("--registry", help="npm registry URL; can point to corporate registry. Overrides settings.registry.")
     ap.add_argument("--use-system-proxy", action="store_true", help="Allow requests to inherit OS/env proxy settings. Default is disabled to avoid stale local proxies for corporate registries.")
@@ -17299,6 +17340,21 @@ def main() -> None:
         help="Validate, refresh when stale, or disable project lockfile sync. Default: validate for --capture-baseline, update for current-checkout generation.",
     )
     args = ap.parse_args()
+    if args.capture_baseline and args.draft_baseline:
+        ap.error("--capture-baseline and --draft-baseline are mutually exclusive")
+    source_baseline_mode = bool(args.capture_baseline or args.draft_baseline)
+
+    global GENERATION_RESULT_METADATA
+    GENERATION_RESULT_METADATA = (
+        {
+            "kind": "DRAFT",
+            "verificationStatus": "NOT_VERIFIED",
+            "authority": "PLANNING_ONLY",
+            "compatibility": "UNKNOWN",
+        }
+        if args.draft_baseline
+        else {}
+    )
 
     residual_targets_by_project: Dict[str, Dict[str, str]] = {}
     if args.residual_stability_file:
@@ -17385,7 +17441,11 @@ def main() -> None:
     use_system_proxy = args.use_system_proxy or as_bool(settings_get(settings, "use-system-proxy", "useSystemProxy"), False)
     release_intel_enabled = not args.skip_release_intel and as_bool(settings_get(settings, "release-intel-enabled", "releaseIntelEnabled"), True)
     release_intel_max = args.release_intel_max_packages if args.release_intel_max_packages is not None else as_int(settings_get(settings, "release-intel-max-packages", "releaseIntelMaxPackages"), 0)
-    history_snapshot_enabled = not args.no_history_snapshot and as_bool(settings_get(settings, "history-snapshots-enabled", "historySnapshotsEnabled"), True)
+    history_snapshot_enabled = (
+        not args.draft_baseline
+        and not args.no_history_snapshot
+        and as_bool(settings_get(settings, "history-snapshots-enabled", "historySnapshotsEnabled"), True)
+    )
     source_checkout_guard_enabled = (
         not args.skip_source_checkout_guard
         and as_bool(settings_get(settings, "source-checkout-guard", "sourceCheckoutGuard"), False)
@@ -17478,7 +17538,7 @@ def main() -> None:
             if project.source_checkout_guard is None
             else project.source_checkout_guard and not args.skip_source_checkout_guard
         )
-        guard_enabled = bool(args.capture_baseline and configured_guard)
+        guard_enabled = bool(source_baseline_mode and configured_guard)
         if not guard_enabled:
             project.source_checkout = {
                 "verified": False,
@@ -17514,7 +17574,7 @@ def main() -> None:
 
         baseline_mode = str(project.lockfile_sync_config.get("baselineMode") or project.lockfile_sync_config.get("mode") or "validate").strip().lower()
         current_mode = str(project.lockfile_sync_config.get("currentMode") or "update").strip().lower()
-        lock_mode = args.lockfile_mode or (baseline_mode if args.capture_baseline else current_mode)
+        lock_mode = args.lockfile_mode or (baseline_mode if source_baseline_mode else current_mode)
         try:
             lock_state = ensure_lockfile_consistency(
                 project.path,
@@ -17525,7 +17585,7 @@ def main() -> None:
             )
         except LockfileConsistencyError as exc:
             eprint(f"[error] {exc}")
-            if not args.capture_baseline:
+            if not source_baseline_mode:
                 eprint("[hint] current-checkout generation refreshes the project's own lockfile before dashboard analysis")
             raise SystemExit(2) from None
         project.lockfile_state = lock_state.as_dict()
@@ -17593,7 +17653,9 @@ def main() -> None:
     eprint(f"[info] dashboard state: {dashboard_state_path}")
     eprint(f"[info] release intelligence: {'enabled' if release_intel_enabled else 'disabled'}")
     eprint(f"[info] system proxy: {'enabled' if use_system_proxy else 'disabled'}")
-    if args.capture_baseline:
+    if args.draft_baseline:
+        eprint("[info] analysis mode: Draft Baseline from source branch; physical verification disabled")
+    elif args.capture_baseline:
         eprint("[info] analysis mode: fetched source-branch baseline")
     else:
         eprint("[info] analysis mode: current checkout compared with the saved baseline; the project-manager lockfile is refreshed before analysis")
@@ -17618,7 +17680,7 @@ def main() -> None:
 
     baselines_dir = history_dir / "baselines"
     planning_baselines: Dict[str, Dict[str, Any]] = {}
-    if not args.capture_baseline:
+    if not source_baseline_mode:
         planning_baselines = {
             project: baseline
             for project in rows_by_project
@@ -17652,27 +17714,42 @@ def main() -> None:
         count = sum(len(targets) for targets in residual_targets_by_project.values())
         eprint(f"[info] residual stability: loaded {count} previously approved target(s); merged matches are hard-fixed, pending matches are preferred")
     proven_dependency_envelopes: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    proven_assignments = resolve_peer_compatibility_with_verification(
-        rows_by_project, projects_by_name, client,
-        residual_targets_by_project=residual_targets_by_project,
-        external_evidence_by_project=external_evidence_by_project,
-        progress_path=baseline_progress_path,
-        proof_envelopes_out=proven_dependency_envelopes,
-    )
-    # Everything below this line is a consumer of the proven assignment.
+    proven_assignments: Dict[str, Dict[str, Dict[str, str]]] = {}
+    if args.draft_baseline:
+        eprint(
+            "[info] Draft Baseline: exact static dependency planning only; "
+            "verificationStatus=NOT_VERIFIED, authority=PLANNING_ONLY, compatibility=UNKNOWN"
+        )
+        resolve_peer_compatibility(
+            rows_by_project,
+            client,
+            modes=("yellow", "green", "default"),
+            apply_results=True,
+            residual_targets_by_project=residual_targets_by_project,
+        )
+    else:
+        proven_assignments = resolve_peer_compatibility_with_verification(
+            rows_by_project, projects_by_name, client,
+            residual_targets_by_project=residual_targets_by_project,
+            external_evidence_by_project=external_evidence_by_project,
+            progress_path=baseline_progress_path,
+            proof_envelopes_out=proven_dependency_envelopes,
+        )
+
     enrich_registry_target_evidence(
         rows_by_project,
         client,
         allow_target_mutation=False,
     )
     # A late @types action decision may fail the handoff, but may not mutate a
-    # package-manager-proven dependency target.
+    # finalized dependency target.
     plan_executable_actions(
         rows_by_project,
         client,
         immutable_targets=True,
     )
-    assert_proven_assignment_conformance(rows_by_project, proven_assignments)
+    if not args.draft_baseline:
+        assert_proven_assignment_conformance(rows_by_project, proven_assignments)
     final_peer_issues = validate_final_peer_assignment(rows_by_project, client)
     if final_peer_issues:
         raise RuntimeError(
@@ -17682,14 +17759,26 @@ def main() -> None:
     proven_dependency_state_path = (
         settings_base / ".dependency-roadmap" / "state" / "proven-dependency-state.json"
     )
-    proven_dependency_state = write_proven_dependency_state(
-        proven_dependency_state_path,
-        proven_dependency_envelopes,
-    )
-    eprint(
-        f"[info] persisted content-addressed ProofEnvelope state: "
-        f"{proven_dependency_state_path}"
-    )
+    if args.draft_baseline:
+        # Never overwrite the last verified epoch. The Draft dashboard embeds an
+        # empty proof set so the internal Executor fails closed if somebody tries
+        # to use a planning-only artifact as authoritative input.
+        proven_dependency_state = {"schemaVersion": 1, "projects": {}}
+        dashboard_proven_dependency_state_path: Optional[Path] = None
+        eprint(
+            "[info] Draft Baseline: ProofEnvelope publication skipped; "
+            "existing verified proof state left untouched"
+        )
+    else:
+        proven_dependency_state = write_proven_dependency_state(
+            proven_dependency_state_path,
+            proven_dependency_envelopes,
+        )
+        dashboard_proven_dependency_state_path = proven_dependency_state_path
+        eprint(
+            f"[info] persisted content-addressed ProofEnvelope state: "
+            f"{proven_dependency_state_path}"
+        )
     # Health status is based on installed versions, but lag_blockers also carry
     # plannedTargetYellow/Green. Recompute only after every Supervisor, peer and
     # registry pass has finalized targets; otherwise target closure can claim
@@ -17780,7 +17869,7 @@ def main() -> None:
             knowledge_entries=knowledge_entries,
             knowledge_log_path=knowledge_log_path,
             proven_dependency_state=proven_dependency_state,
-            proven_dependency_state_path=proven_dependency_state_path,
+            proven_dependency_state_path=dashboard_proven_dependency_state_path,
         )
     eprint(
         f"[done] wrote {out_path} and {html_out_path}; "

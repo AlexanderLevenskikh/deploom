@@ -59,10 +59,12 @@ class FastExactFailurePublicationTests(unittest.TestCase):
     def test_request_private_snapshot_path_preserves_authoritative_checks(self) -> None:
         for required in (
             "publish_durable_prepared_artifact: bool = True",
+            "_durable_prepared_publication_policy(config)",
+            "role_allows_durable, publication_reason = (",
             "durable_snapshot_requested = bool(",
-            "preparation_publication_allowed and config.publish_durable_prepared_artifact",
+            "preparation_publication_allowed and role_allows_durable",
             "shared_reuse_allowed=durable_snapshot_requested",
-            'else temp_root / "private-prepared-snapshots"',
+            "else _same_run_private_prepared_root(trial_parent)",
         ):
             self.assertIn(required, self.verifier)
 

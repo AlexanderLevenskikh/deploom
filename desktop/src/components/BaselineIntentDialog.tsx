@@ -1,7 +1,7 @@
 import { AlertTriangle, Search, ShieldCheck, X } from 'lucide-react'
 import { useDeferredValue, useEffect, useMemo, useState } from 'react'
 import { useLanguage } from '../i18n'
-import type { BaselineDecision, BaselineExecutionMode, BaselineIntent, BaselineIntentPlan, BaselinePackagePolicy } from '../types'
+import type { BaselineDecision, BaselineExecutionMode, BaselineIntent, BaselineIntentPlan, BaselinePackagePolicy, BaselineProofMode } from '../types'
 import { QuickSelect } from './QuickSelect'
 
 type Props = {
@@ -84,6 +84,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     nextPolicies = policies,
     searchMode = 'AUTO' as BaselineIntent['searchMode'],
     nextExecutionMode = executionMode,
+    proofMode = 'VERIFIED' as BaselineProofMode,
     nextDeferredCohorts = deferredCohorts,
     cohortAction,
   }: {
@@ -92,6 +93,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     nextPolicies?: Record<string, BaselinePackagePolicy>
     searchMode?: BaselineIntent['searchMode']
     nextExecutionMode?: BaselineExecutionMode
+    proofMode?: BaselineProofMode
     nextDeferredCohorts?: DeferredCohort[]
     cohortAction?: BaselineIntent['cohortAction']
   } = {}): BaselineIntent => ({
@@ -101,6 +103,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     decisionGrantIterations: grant,
     searchMode,
     executionMode: normalizedExecutionMode(nextExecutionMode),
+    proofMode,
     deferredCohorts: reconcileDeferredCohorts(nextDeferredCohorts, nextPolicies),
     ...(cohortAction ? { cohortAction } : {}),
   })
@@ -215,6 +218,12 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     searchMode: mode === 'decision' ? 'BOUNDED_IMPROVEMENT' : 'AUTO',
   }))
 
+  const buildDraft = () => void submit(buildIntent({
+    proofMode: 'DRAFT',
+    searchMode: 'AUTO',
+    nextExecutionMode: 'FAST',
+  }))
+
   const keepFocusAndContinue = () => {
     if (!decision?.package) return
     const next = { ...policies, [decision.package]: 'keep-current' as const }
@@ -236,7 +245,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
           <div>
             {mode === 'decision' ? <AlertTriangle size={18} /> : <ShieldCheck size={18} />}
             <div>
-              <strong id="baseline-intent-title">{mode === 'decision' ? text('Нужно решение по Baseline', 'Baseline decision required') : text('Быстрый Baseline', 'Fast Baseline')}</strong>
+              <strong id="baseline-intent-title">{mode === 'decision' ? text('Нужно решение по Baseline', 'Baseline decision required') : text('Проверенный Baseline', 'Verified Baseline')}</strong>
               <span>{mode === 'decision'
                 ? text('DepLoom сохранил подтверждённые ограничения. Основной Flow пытается быстро получить рабочий verified результат, откладывая только локально проблемную группу после вашего подтверждения.', 'DepLoom preserved confirmed constraints. The main flow aims for a working verified result quickly and defers only a locally problematic group after your confirmation.')
                 : text('Сначала пробуем весь выбранный scope. Если совместимость локально блокирует поиск, DepLoom предложит временно отложить связанную группу и вернуться к ней следующим проходом.', 'We first try the full selected scope. If compatibility is locally blocked, DepLoom will suggest temporarily deferring the related group and revisiting it in a later pass.')}</span>
@@ -353,6 +362,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
         <footer className="baseline-intent-actions">
           <span className="baseline-intent-apply-hint">{dirty ? text('Есть неприменённые изменения', 'There are unapplied changes') : text('Scope готов', 'Scope is ready')}</span>
           <button type="button" className="button secondary" disabled={busy} onClick={requestCancel}>{mode === 'decision' ? text('Оставить на паузе', 'Keep paused') : text('Отмена', 'Cancel')}</button>
+          {mode === 'prepare' ? <button type="button" className="button secondary" disabled={busy} onClick={buildDraft} title={text('Без install/lifecycle/project checks. Compatibility останется UNKNOWN.', 'No install/lifecycle/project checks. Compatibility remains UNKNOWN.')}>{text('Сформировать Draft без проверки', 'Build unverified Draft')}</button> : null}
           {mode === 'prepare' ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{executionMode === 'BACKGROUND' ? text('Запустить глубокий поиск', 'Start deep search') : text('Запустить Fast Baseline', 'Start Fast Baseline')}</button> : null}
           {mode === 'decision' && !suggestedCohort?.packages.length && decision?.package ? <button type="button" className="button primary" disabled={busy} onClick={keepFocusAndContinue}>{text(`Пока оставить ${decision.package} current`, `Keep ${decision.package} current for now`)}</button> : null}
           {mode === 'decision' && !suggestedCohort?.packages.length && !decision?.package ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{text('Применить scope и продолжить', 'Apply scope and continue')}</button> : null}
@@ -360,6 +370,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
             <details className="baseline-advanced-actions">
               <summary>{text('Другие варианты', 'Other options')}</summary>
               <button type="button" className="button secondary" disabled={busy} onClick={applyAndContinue}>{text('Применить ручные изменения', 'Apply manual changes')}</button>
+              <button type="button" className="button secondary" disabled={busy} onClick={buildDraft}>{text('Сформировать Draft для передачи агенту', 'Build Draft for agent handoff')}</button>
               <button type="button" className="button secondary" disabled={busy} onClick={continueExhaustive}>{text('Готов ждать: исчерпывающий поиск в фоне', 'I can wait: exhaustive search in background')}</button>
             </details>
           ) : null}

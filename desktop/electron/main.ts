@@ -65,9 +65,10 @@ type ThemePreference = 'system' | 'light' | 'dark'
 type BaselinePackagePolicy = 'auto' | 'keep-current' | 'required'
 type BaselineSearchMode = 'AUTO' | 'BOUNDED_IMPROVEMENT' | 'EXHAUSTIVE'
 type BaselineExecutionMode = 'FAST' | 'AUTOPILOT' | 'BACKGROUND'
+type BaselineProofMode = 'VERIFIED' | 'DRAFT'
 type BaselineDeferredCohort = { id: string; label: string; packages: string[]; predicate?: string; confidence?: number; authority: 'DIAGNOSTIC_HINT'; deferredAt?: string; decisionId?: string; boundaryPackages?: string[]; warningPackages?: string[] }
 type BaselineCohortAction = { kind: 'DEFER' | 'REACTIVATE'; cohortId: string; label: string; packages: string[]; predicate?: string; confidence?: number; decisionId?: string }
-type BaselineIntent = { schemaVersion: 1; policies: Record<string, BaselinePackagePolicy>; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction }
+type BaselineIntent = { schemaVersion: 1; policies: Record<string, BaselinePackagePolicy>; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; proofMode?: BaselineProofMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction }
 type BaselineIntentCandidate = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string }
 type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent }
 type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
@@ -260,6 +261,9 @@ type JobRecord = {
   // are suppressed for these jobs because a successful agent iteration may be
   // followed immediately by another residual/replan cycle.
   autopilot?: boolean
+  // Invocation-local authority boundary. Draft Baseline produces planning
+  // artifacts only and must never advance the authoritative FLOW state.
+  baselineProofMode?: BaselineProofMode
 }
 
 type UpdateStatus = { state: 'idle' | 'checking' | 'available' | 'downloading' | 'current' | 'ready' | 'error'; version?: string; percent?: number; message?: string; authRequired?: boolean }
@@ -345,6 +349,7 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
     decisionGrantIterations: Math.max(0, Math.floor(Number(raw.decisionGrantIterations ?? 0) || 0)),
     searchMode: raw.searchMode === 'EXHAUSTIVE' || raw.searchMode === 'BOUNDED_IMPROVEMENT' ? raw.searchMode : 'AUTO',
     executionMode: raw.executionMode === 'BACKGROUND' ? 'BACKGROUND' : 'FAST',
+    proofMode: raw.proofMode === 'DRAFT' ? 'DRAFT' : 'VERIFIED',
     deferredCohorts,
     ...(cohortAction ? { cohortAction } : {}),
   }
@@ -364,8 +369,11 @@ function saveBaselineIntent(workspace: WorkspaceRecord, projectName: string, int
   const normalized = normalizeBaselineIntent(intent)
   // decisionGrantIterations is invocation-local; persisting it would silently
   // grant a new tranche after an unrelated crash/restart.
+  // proofMode is invocation-local too: a one-off Draft must never become the
+  // default for the next Baseline after restart.
   const durable = { ...normalized }
   delete durable.cohortAction
+  delete durable.proofMode
   atomicWriteJsonSync(baselineIntentPath(workspace, projectName), { ...durable, decisionGrantIterations: 0, searchMode: 'AUTO' })
 }
 
@@ -753,6 +761,7 @@ function writeBestEffortHandoff(job: JobRecord): string | undefined {
 
 function updateTeamState(job: JobRecord, status: 'running' | 'passed' | 'failed' | 'paused'): void {
   if (!job.projectName) return
+  if (job.action === 'baseline' && job.baselineProofMode === 'DRAFT') return
   const path = teamStatePath(job.workspace)
   const current = readTeamState(job.workspace) ?? { schemaVersion: 1, updatedAt: new Date().toISOString(), projects: {} }
   current.updatedAt = new Date().toISOString()
@@ -809,6 +818,7 @@ function updateTeamState(job: JobRecord, status: 'running' | 'passed' | 'failed'
 
 async function persistRecoveryIssue(job: JobRecord, message: string): Promise<FlowRecoveryIssue | undefined> {
   if (!job.projectName || job.cancelled) return undefined
+  if (job.action === 'baseline' && job.baselineProofMode === 'DRAFT') return undefined
   const project = findProject(job.workspace, job.projectName)
   const branch = await spawnCapture('git', ['-C', project.path, 'branch', '--show-current'], project.path, 15_000)
   const classified = classifyFlowRecovery(message, job.action)
@@ -1851,6 +1861,7 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
       const explicitIntent = input.baselineIntent ? normalizeBaselineIntent(input.baselineIntent) : undefined
       const effectiveIntent = explicitIntent ?? persistedIntent
       if (explicitIntent) saveBaselineIntent(workspace, project.name, explicitIntent)
+      const proofMode: BaselineProofMode = explicitIntent?.proofMode === 'DRAFT' ? 'DRAFT' : 'VERIFIED'
       const executionMode: BaselineExecutionMode = effectiveIntent.executionMode === 'BACKGROUND' ? 'BACKGROUND' : 'FAST'
       const automaticBudgetSeconds = executionMode === 'FAST' ? 15 * 60 : executionMode === 'BACKGROUND' ? 2 * 60 * 60 : 30 * 60
       const maxExpensiveAttempts = executionMode === 'FAST' ? 2 : executionMode === 'BACKGROUND' ? 8 : 4
@@ -1871,15 +1882,22 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
         '--no-history-snapshot',
       ]
 
+      const baselineModeArgs = proofMode === 'DRAFT'
+        ? ['--draft-baseline']
+        : ['--capture-baseline', '--baseline-label', input.label?.trim() || `dependency-flow-${new Date().toISOString().slice(0, 10)}`]
+
       return [{
-        label: 'Создание исходного baseline', command: 'python', cwd: workspace.path,
-        args: [...commonGeneratorArgs, ...baselineOutputArgs, '--capture-baseline', '--baseline-label', input.label?.trim() || `dependency-flow-${new Date().toISOString().slice(0, 10)}`],
+        label: proofMode === 'DRAFT' ? 'Расчёт Draft Baseline (без physical verification)' : 'Создание исходного baseline',
+        command: 'python',
+        cwd: workspace.path,
+        args: [...commonGeneratorArgs, ...baselineOutputArgs, ...baselineModeArgs],
         env: {
           DEPLOOM_BASELINE_RESUME: input.baselineResume === 'restart' ? 'restart' : input.baselineResume === 'continue' ? 'continue' : 'auto',
           DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE: input.baselineResume === 'continue' ? '1' : '0',
           DEPLOOM_BASELINE_INTENT_JSON: JSON.stringify({ schemaVersion: 1, policies: effectiveIntent.policies, executionMode }),
-          DEPLOOM_BASELINE_INTERACTIVE: '1',
+          DEPLOOM_BASELINE_INTERACTIVE: proofMode === 'DRAFT' ? '0' : '1',
           DEPLOOM_BASELINE_EXECUTION_MODE: executionMode,
+          DEPLOOM_BASELINE_PROOF_MODE: proofMode,
           DEPLOOM_BASELINE_EXTRA_ITERATIONS: String(effectiveIntent.extraIterations ?? 0),
           DEPLOOM_BASELINE_DECISION_GRANT_ITERATIONS: String(explicitIntent?.decisionGrantIterations ?? 0),
           DEPLOOM_BASELINE_SEARCH_MODE: explicitIntent?.searchMode ?? 'AUTO',
@@ -5471,7 +5489,7 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
     // snapshotted do we discard the previous execution epoch. Manual FLOW
     // therefore lands on Step 3; explicit Autopilot may immediately continue
     // to agent because its own stage scheduler is still active.
-    if (job.action === 'baseline' && job.projectName) {
+    if (job.action === 'baseline' && job.projectName && job.baselineProofMode !== 'DRAFT') {
       await cleanupSupersededMigrationAfterBaseline(job, findProject(job.workspace, job.projectName))
     }
     if (job.action === 'agent') await runAutonomousMigrationStage(job)
@@ -5828,11 +5846,19 @@ function setupIpc(): void {
     input.target = effectiveTarget
     if (input.action === 'release') input.releaseBranch = releaseBranchForAction('release', input.releaseBranch, savedReleaseBranch, project.git?.releaseBranch)
     if (input.action === 'push-workspace') input.releaseBranch = releaseBranchForAction('publish', input.releaseBranch, savedReleaseBranch, project.git?.releaseBranch)
+    const requestedBaselineProofMode: BaselineProofMode | undefined = input.action === 'baseline'
+      ? (input.baselineIntent?.proofMode === 'DRAFT' ? 'DRAFT' : 'VERIFIED')
+      : undefined
+    if (requestedBaselineProofMode === 'DRAFT' && input.autopilot) {
+      throw new Error('DRAFT_BASELINE_AUTOPILOT_FORBIDDEN: planning-only Draft cannot advance authoritative FLOW automatically.')
+    }
     // Supervisor deferrals belong to one planning epoch only. A fresh baseline
     // reconsiders every package from scratch instead of inheriting an old
     // "temporarily unreachable" decision forever. A migration-only restart
     // intentionally keeps the current plan; rebuilding it is the baseline's job.
-    if (input.action === 'baseline' && input.baselineResume !== 'continue') clearPlannerDeferrals(workspace, project.name)
+    // A Draft is observational/planning-only and must not reset verified epoch
+    // state just because the user wants a quick handoff.
+    if (input.action === 'baseline' && requestedBaselineProofMode !== 'DRAFT' && input.baselineResume !== 'continue') clearPlannerDeferrals(workspace, project.name)
 
     let bestEffortReleaseReason: string | undefined
     let bestEffortCurrentLevel: string | undefined
@@ -5870,6 +5896,7 @@ function setupIpc(): void {
       ...(input.action === 'release' ? { releaseSourceCommit: input.sourceCommit, releaseGateCommand: input.gateCommand?.trim() || undefined } : {}),
       ...(bestEffortReleaseReason ? { bestEffortReason: bestEffortReleaseReason, bestEffortCurrentLevel } : {}),
       ...(input.autopilot === true ? { autopilot: true } : {}),
+      ...(requestedBaselineProofMode ? { baselineProofMode: requestedBaselineProofMode } : {}),
     }
     jobs.set(job.id, job)
     void executeJob(job, commands)

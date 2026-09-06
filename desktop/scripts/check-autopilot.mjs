@@ -66,7 +66,7 @@ mustContain(main, 'ensureCurrentAgentPrompt(job.workspace, project', 'prompt aut
 mustContain(main, 'needsGoalSeekingSupervisor', 'empty fresh plan falls back to a valid prior seed only for goal-seeking')
 mustContain(main, 'Пустой scope не будет отправлен Executor', 'fallback seed is explicitly separated from executor scope')
 mustContain(main, 'AGENT_BRANCH_SCOPE_VIOLATION', 'wrong-branch agent sessions are routed to Supervisor reconciliation')
-mustContain(main, "input.action === 'baseline' && input.baselineResume !== 'continue'", 'fresh baseline resets planner epoch while Continue preserves it')
+mustContain(main, "input.action === 'baseline' && requestedBaselineProofMode !== 'DRAFT' && input.baselineResume !== 'continue'", 'fresh verified baseline resets planner epoch while Continue and Draft preserve it')
 mustContain(main, 'clearPlannerDeferrals(workspace, project.name)', 'baseline can reset temporary planner deferrals')
 mustContain(main, 'SOURCE_SNAPSHOT_BASELINE_LIVE_CHECKOUT', 'fresh baseline seals the live checkout without a clean-Git precondition')
 mustContain(main, 'cleanupSupersededMigrationAfterBaseline', 'successful baseline closes the previous execution epoch')
