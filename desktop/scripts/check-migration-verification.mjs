@@ -1,9 +1,9 @@
-import { assessMigrationCheckpoint, unexplainedFailures } from "../dist-electron/migration-verification.js";
+import { assessMigrationCheckpoint, baselineFailureDecision, baselineFailuresNeedingProbe, baselineObservationMatchesFailure, normalizeVerificationDiagnostics, unexplainedFailures } from "../dist-electron/migration-verification.js";
 import { migrationGatePolicy } from "../dist-electron/migration-gates.js";
 import { buildMergedRepairPrompt, readMergedRepairResult } from "../dist-electron/merged-repair.js";
 import { buildGroupVerificationRepairPrompt } from "../dist-electron/group-repair.js";
-import { baselineVerificationCacheKey, cleanEphemeralVerificationCaches } from "../dist-electron/verification-environment.js";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { baselineVerificationCacheKey, cleanEphemeralVerificationCaches, integrationVerificationReceiptKey } from "../dist-electron/verification-environment.js";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -127,5 +127,62 @@ if (!removedCaches.includes("node_modules/.vite") || !removedCaches.includes("sr
 if (baselineVerificationCacheKey("Demo", "main", "yarn lint:types") !== baselineVerificationCacheKey("Demo", "main", "lint:types")) {
   throw new Error("Shared baseline evidence cache must normalize package-manager command spelling");
 }
+
+
+// Ψ.2 regressions: numeric checkpoint exits, diagnostic-aware baseline,
+// nested-project live baseline wiring, and exact same-state receipt identity.
+assessment = assessMigrationCheckpoint({
+  verification: { commands: [{ command: "yarn build", baseline: 0, post: 2 }] },
+}, ["libs-group-1"]);
+if (assessment.status !== "repair-required" || assessment.regressions[0]?.baselineExit !== 0 || assessment.regressions[0]?.postExit !== 2) {
+  throw new Error(`Numeric structured exits must preserve baseline=0 -> post=2: ${JSON.stringify(assessment)}`);
+}
+
+const baselineDiagnostics = normalizeVerificationDiagnostics("C:/baseline/apps/web/src/a.ts(1,2): error TS2322: old", "C:/baseline/apps/web");
+const samePostDiagnostics = normalizeVerificationDiagnostics("C:/repo/apps/web/src/a.ts(1,2): error TS2322: old", "C:/repo/apps/web");
+const changedPostDiagnostics = normalizeVerificationDiagnostics("C:/repo/apps/web/src/a.ts(1,2): error TS2322: old\nC:/repo/apps/web/src/b.ts(3,4): error TS2345: new", "C:/repo/apps/web");
+const sameFailure = { command: "yarn lint:types", code: 2, diagnostics: samePostDiagnostics };
+const changedFailure = { command: "yarn lint:types", code: 2, diagnostics: changedPostDiagnostics };
+const redEvidence = { command: "lint:types", baselineExit: 2, baselineDiagnostics };
+if (baselineFailureDecision(sameFailure, redEvidence) !== "tolerate") throw new Error("Equivalent red diagnostics should be tolerated");
+if (baselineFailureDecision(changedFailure, redEvidence) !== "probe") throw new Error("Additional diagnostics must require a live baseline probe");
+if (baselineFailureDecision(changedFailure, { command: "lint:types", baselineExit: 0 }) !== "regression") throw new Error("Green baseline -> red post must be a regression");
+if (!baselineObservationMatchesFailure(sameFailure, { code: 2, diagnostics: baselineDiagnostics })) throw new Error("Equivalent live diagnostics must match");
+if (baselineObservationMatchesFailure(changedFailure, { code: 2, diagnostics: baselineDiagnostics })) throw new Error("Live baseline must not hide an added diagnostic");
+if (baselineFailuresNeedingProbe([sameFailure], [{ command: "lint:types", baselineExit: 2 }]).length !== 1) throw new Error("Exit-only red evidence must be probed");
+
+const receiptBase = {
+  projectName: "Demo",
+  projectPath: "C:/repo/apps/web",
+  mergedBranch: "deps-merged",
+  sourceBranch: "deps-group-2",
+  head: "abc123",
+  commands: ["yarn lint:types", "yarn build"],
+  planFingerprint: "{\"plan\":1}",
+  baselineEvidenceFingerprint: "{\"evidence\":1}",
+  environment: { PATH: "X:/bin", NODE_ENV: "test" },
+};
+const receipt = integrationVerificationReceiptKey(receiptBase);
+if (receipt !== integrationVerificationReceiptKey({ ...receiptBase })) throw new Error("Receipt identity must be deterministic");
+if (receipt === integrationVerificationReceiptKey({ ...receiptBase, head: "def456" })) throw new Error("Receipt must invalidate on HEAD change");
+if (receipt === integrationVerificationReceiptKey({ ...receiptBase, commands: ["yarn build"] })) throw new Error("Receipt must invalidate on command change");
+if (receipt === integrationVerificationReceiptKey({ ...receiptBase, environment: { ...receiptBase.environment, NODE_ENV: "production" } })) throw new Error("Receipt must invalidate on environment change");
+if (receipt === integrationVerificationReceiptKey({ ...receiptBase, baselineEvidenceFingerprint: "{\"evidence\":2}" })) throw new Error("Receipt must invalidate on evidence change");
+
+const mainSource = readFileSync(new URL("../electron/main.ts", import.meta.url), "utf8");
+const liveStart = mainSource.indexOf("async function liveBaselineObservations");
+const liveEnd = mainSource.indexOf("async function allowLiveBaselineFailures", liveStart);
+const liveSource = liveStart >= 0 && liveEnd > liveStart ? mainSource.slice(liveStart, liveEnd) : "";
+if (!liveSource.includes("packageRelativePath = (await resolveProjectGitLayout(project)).packageRelativePath")
+  || !liveSource.includes("const baselineProjectPath = projectPathInWorktree(temporaryTree, packageRelativePath)")
+  || !liveSource.includes("cwd: baselineProjectPath")
+  || !liveSource.includes("cleanEphemeralVerificationCaches(baselineProjectPath)")) {
+  throw new Error("Nested live baseline must execute at the package path inside the detached worktree");
+}
+const allowStart = mainSource.indexOf("async function allowLiveBaselineFailures");
+const receiptStart = mainSource.indexOf("async function currentIntegrationVerificationReceiptIdentity", allowStart);
+const allowSource = allowStart >= 0 && receiptStart > allowStart ? mainSource.slice(allowStart, receiptStart) : "";
+if (!allowSource.includes("...candidates.map((item) => item.command)")) throw new Error("Current integration-only failures must join the live baseline probe");
+if (!mainSource.includes("rememberIntegrationVerificationReceipt")) throw new Error("Integration receipt wiring is missing");
 
 console.log("Migration verification and integration-repair checks passed");

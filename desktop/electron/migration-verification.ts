@@ -4,7 +4,22 @@ export type VerificationEvidence = {
   postExit?: number
   baselineText?: string
   postText?: string
+  baselineDiagnostics?: string[]
+  postDiagnostics?: string[]
 }
+
+export type VerificationFailure = {
+  command: string
+  code: number
+  diagnostics: string[]
+}
+
+export type BaselineVerificationObservation = {
+  code: number
+  diagnostics: string[]
+}
+
+export type BaselineFailureDecision = 'tolerate' | 'probe' | 'regression'
 
 export type MigrationVerificationAssessment = {
   status: 'pass' | 'repair-required' | 'replan-required' | 'unknown'
@@ -32,6 +47,82 @@ function parseExit(value: unknown): number | undefined {
   return undefined
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function diagnosticArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const result = value
+    .filter((item): item is string => typeof item === 'string')
+    .map((item) => item.trim().replace(/\\/g, '/').replace(/\s+/g, ' '))
+    .filter(Boolean)
+  return result.length ? [...new Set(result)] : undefined
+}
+
+export function normalizeVerificationDiagnostics(text: string, cwd?: string): string[] {
+  let normalized = String(text ?? '').replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, '')
+  const root = String(cwd ?? '').trim()
+  if (root) {
+    const variants = [...new Set([
+      root,
+      root.replace(/\\/g, '/'),
+      root.replace(/\//g, '\\'),
+    ].filter(Boolean))].sort((left, right) => right.length - left.length)
+    for (const variant of variants) {
+      normalized = normalized.replace(new RegExp(escapeRegExp(variant), 'gi'), '<project>')
+    }
+  }
+
+  const lines = normalized
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.trim().replace(/\\/g, '/').replace(/\s+/g, ' '))
+    .filter(Boolean)
+    .filter((line) => !/^Done in \d+(?:\.\d+)?s\.?$/i.test(line))
+    .filter((line) => !/^(?:real|user|sys)\s+\d+(?:\.\d+)?/i.test(line))
+
+  const diagnosticLike = lines.filter((line) =>
+    /\b(?:error|failed|failure|exception|fatal|err!|ts\d{4})\b|[✖×]/i.test(line)
+    || /[:(]\d+[:,]\d+\)?/.test(line),
+  )
+  return [...new Set(diagnosticLike.length ? diagnosticLike : lines)]
+}
+
+export function baselineObservationMatchesFailure(
+  failure: VerificationFailure,
+  baseline: BaselineVerificationObservation,
+): boolean {
+  if (failure.code === 0 || baseline.code === 0) return false
+  if (!failure.diagnostics.length || !baseline.diagnostics.length) return false
+  const known = new Set(baseline.diagnostics)
+  return failure.diagnostics.every((diagnostic) => known.has(diagnostic))
+}
+
+export function baselineFailureDecision(
+  failure: VerificationFailure,
+  evidence: VerificationEvidence | undefined,
+): BaselineFailureDecision {
+  if (!evidence || evidence.baselineExit === undefined) return 'probe'
+  if (evidence.baselineExit === 0) return 'regression'
+  const baselineDiagnostics = evidence.baselineDiagnostics?.length
+    ? evidence.baselineDiagnostics
+    : normalizeVerificationDiagnostics(evidence.baselineText ?? '')
+  return baselineObservationMatchesFailure(
+    failure,
+    { code: evidence.baselineExit, diagnostics: baselineDiagnostics },
+  ) ? 'tolerate' : 'probe'
+}
+
+export function baselineFailuresNeedingProbe(
+  failures: readonly VerificationFailure[],
+  evidence: readonly VerificationEvidence[],
+): VerificationFailure[] {
+  const byCommand = new Map(evidence.map((item) => [verificationCommandKey(item.command), item]))
+  return failures.filter((failure) =>
+    baselineFailureDecision(failure, byCommand.get(verificationCommandKey(failure.command))) === 'probe')
+}
+
 export function verificationCommandKey(command: string): string {
   return command
     .trim()
@@ -52,7 +143,6 @@ function commandLabelFromString(text: string): string | undefined {
 function baselineSummaryEntries(text: string): Array<{ command: string; exit: number }> {
   if (!/\bbaseline\b/i.test(text)) return []
   const entries: Array<{ command: string; exit: number }> = []
-  // Covers compact evidence such as: "BASELINE: lint:types=0, lint:styles=0"
   for (const match of text.matchAll(/([@\w.-]+(?::[\w.-]+)*)\s*=\s*(\d+)/g)) {
     entries.push({ command: match[1], exit: Number(match[2]) })
   }
@@ -64,13 +154,18 @@ function evidenceFromObject(value: UnknownRecord): VerificationEvidence | undefi
     : typeof value.command === 'string' ? value.command.trim()
       : ''
   if (!command) return undefined
-  const baselineText = value.baseline === undefined ? undefined : String(value.baseline)
-  const postRaw = value.post ?? value.result ?? value.current
+  const baselineRaw = value.baseline ?? value.baselineExit
+  const postRaw = value.post ?? value.postExit ?? value.result ?? value.current
+  const baselineText = baselineRaw === undefined ? undefined : String(baselineRaw)
   const postText = postRaw === undefined ? undefined : String(postRaw)
+  const baselineDiagnostics = diagnosticArray(value.baselineDiagnostics)
+  const postDiagnostics = diagnosticArray(value.postDiagnostics)
   return {
     command,
-    ...(baselineText !== undefined ? { baselineText, baselineExit: parseExit(baselineText) } : {}),
-    ...(postText !== undefined ? { postText, postExit: parseExit(postText) } : {}),
+    ...(baselineRaw !== undefined ? { baselineText, baselineExit: parseExit(baselineRaw) } : {}),
+    ...(postRaw !== undefined ? { postText, postExit: parseExit(postRaw) } : {}),
+    ...(baselineDiagnostics ? { baselineDiagnostics } : {}),
+    ...(postDiagnostics ? { postDiagnostics } : {}),
   }
 }
 
@@ -109,8 +204,6 @@ function missingCrossCohortGroups(checkpoint: UnknownRecord, branches: readonly 
   const known = planGroupNames(branches)
   const haystack = JSON.stringify(checkpoint)
   const missing = new Set<string>()
-  // Do not treat an arbitrary mention of a group as a blocker. Require the
-  // agent to have explicitly classified it as CROSS-COHORT / cross cohort.
   for (const match of haystack.matchAll(/cross[- _]?cohort[^\n\r"]{0,240}\b(group-[\w.-]+)/gi)) {
     const group = match[1].toLowerCase()
     if (!known.has(group)) missing.add(group)
@@ -145,8 +238,6 @@ export function assessMigrationCheckpoint(checkpointValue: unknown, planBranches
     latest.set(key, evidence)
   }
 
-  // The structured `verification.commands` form is preferred for new runs,
-  // but historical checkpoints stored the same objects directly in commands.
   const verification = asRecord(checkpoint.verification)
   const structuredCommands = Array.isArray(verification.commands) ? verification.commands : []
   for (const raw of structuredCommands) {
@@ -198,18 +289,9 @@ export function assessMigrationCheckpoint(checkpointValue: unknown, planBranches
   return { status, regressions, missingPlanGroups, evidence: [...latest.values()].map((item) => ({ ...item, baselineExit: item.baselineExit ?? baselineByCommand.get(verificationCommandKey(item.command)) })), ...(reason ? { reason } : {}), feedback: parts.join('; ') }
 }
 
-// Which of a set of currently-failing verification commands have no defined
-// baseline exit code recorded anywhere in a checkpoint's evidence. These are
-// the only safe candidates for a live baseline probe (running the command
-// fresh against the plan's own baseBranch) -- a command some group's own
-// focused checks DID record, whether tolerated already or a genuine
-// baseline=0-to-failing regression, must never be re-judged by a live probe;
-// that stricter, evidence-backed classification always wins. Without this
-// distinction, a gate command no group's scope ever happened to cover (e.g.
-// an eslint step unrelated to any updated package) has no evidence anywhere
-// and can never be forgiven, which is exactly what exhausted 3 real repair
-// attempts on a chronic, migration-unrelated .eslintrc.js/tsconfig.json
-// mismatch on a real deps-demo-merged run.
+// Backwards-compatible helper for older focused checks. The live gate uses
+// baselineFailuresNeedingProbe(), because a defined non-zero exit alone is no
+// longer sufficient authority to suppress a migration failure.
 export function unexplainedFailures(failures: readonly { command: string }[], evidence: readonly VerificationEvidence[]): { command: string }[] {
   const explainedKeys = new Set(
     evidence.filter((item) => item.baselineExit !== undefined).map((item) => verificationCommandKey(item.command)),

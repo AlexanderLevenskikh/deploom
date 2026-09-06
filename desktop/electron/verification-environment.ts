@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { verificationCommandKey } from './migration-verification.js'
@@ -27,4 +28,35 @@ export function cleanEphemeralVerificationCaches(projectPath: string): string[] 
 
 export function baselineVerificationCacheKey(projectName: string, baseBranch: string, command: string): string {
   return `${projectName}\u0000${baseBranch}\u0000${verificationCommandKey(command)}`
+}
+
+export type IntegrationVerificationReceiptInput = {
+  projectName: string
+  projectPath: string
+  mergedBranch: string
+  sourceBranch: string
+  head: string
+  commands: readonly string[]
+  planFingerprint: string
+  baselineEvidenceFingerprint: string
+  environment: NodeJS.ProcessEnv
+}
+
+export function integrationVerificationReceiptKey(input: IntegrationVerificationReceiptInput): string {
+  const environment = Object.entries(input.environment)
+    .filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+    .sort(([left], [right]) => left.localeCompare(right))
+  const payload = JSON.stringify({
+    schemaVersion: 1,
+    projectName: input.projectName,
+    projectPath: input.projectPath,
+    mergedBranch: input.mergedBranch,
+    sourceBranch: input.sourceBranch,
+    head: input.head,
+    commands: [...input.commands],
+    planFingerprint: input.planFingerprint,
+    baselineEvidenceFingerprint: input.baselineEvidenceFingerprint,
+    environment,
+  })
+  return createHash('sha256').update(payload).digest('hex')
 }

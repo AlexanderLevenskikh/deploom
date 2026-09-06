@@ -26,9 +26,9 @@ import { classifyFlowRecovery, type FlowRecoveryIssue } from './flow-recovery.js
 import { deterministicPlannerDecision } from './deterministic-planner.js'
 import { plannerResultCacheKey, plannerResultCachePath, writePlannerResultCache } from './planner-result-cache.js'
 import { buildReleaseRecoveryPrompt, readReleaseRecoveryResult } from './release-recovery.js'
-import { assessMigrationCheckpoint, unexplainedFailures, verificationCommandKey, type MigrationVerificationAssessment, type VerificationEvidence } from './migration-verification.js'
+import { assessMigrationCheckpoint, baselineFailureDecision, baselineFailuresNeedingProbe, baselineObservationMatchesFailure, normalizeVerificationDiagnostics, verificationCommandKey, type BaselineVerificationObservation, type MigrationVerificationAssessment, type VerificationEvidence, type VerificationFailure } from './migration-verification.js'
 import { migrationGatePolicy } from './migration-gates.js'
-import { baselineVerificationCacheKey, cleanEphemeralVerificationCaches } from './verification-environment.js'
+import { baselineVerificationCacheKey, cleanEphemeralVerificationCaches, integrationVerificationReceiptKey } from './verification-environment.js'
 import { buildMergedRepairPrompt, readMergedRepairResult } from './merged-repair.js'
 import { assessPromptRevision, buildPlannerPrompt, partitionPlannerDeferrals, readPlannerResult, residualStabilityTargets, validateSupervisorScopeAdditions, type PlannerResult } from './planner-session.js'
 import { autonomyPolicy, normalizedPlannerFailure } from './autonomy-policy.js'
@@ -251,8 +251,9 @@ type JobRecord = {
   // Shared by all parallel group workers through migrationRootJob(). A base
   // branch command is probed at most once per FLOW job instead of creating a
   // fresh install/worktree for every group that happens to hit the same gate.
-  baselineVerificationExitCodes?: Map<string, number>
+  baselineVerificationObservations?: Map<string, BaselineVerificationObservation>
   baselineVerificationProbe?: Promise<void>
+  integrationVerificationReceipt?: { identity: string; head: string; verifiedAt: string }
   logSource?: { kind: 'group' | 'planner'; id: string; label: string }
   branchRuntime?: Map<string, MigrationBranchRuntime>
   // True for actions launched by the UI Autopilot. Per-stage OS notifications
@@ -2782,10 +2783,10 @@ function shellCommandSpec(label: string, commandText: string, cwd: string): Comm
     : { label, command: 'sh', args: ['-lc', commandText], cwd, captureAgentSession: false }
 }
 
-type VerificationRun = { ok: boolean; feedback: string; failures: Array<{ command: string; code: number }> }
+type VerificationRun = { ok: boolean; feedback: string; failures: VerificationFailure[] }
 
 async function runProjectVerification(job: JobRecord, project: ProjectSpec, commands: readonly string[], labelPrefix: string): Promise<VerificationRun> {
-  const failures: Array<{ command: string; code: number }> = []
+  const failures: VerificationFailure[] = []
   const feedback: string[] = []
   const cleaned = cleanEphemeralVerificationCaches(project.path)
   if (cleaned.length) {
@@ -2796,8 +2797,15 @@ async function runProjectVerification(job: JobRecord, project: ProjectSpec, comm
   }
   for (const commandText of commands) {
     const result = await executeCommand(job, shellCommandSpec(`${labelPrefix}: ${commandText}`, commandText, project.path))
-    const tail = `${result.stderr}\n${result.stdout}`.trim().slice(-2200)
-    if (result.code !== 0) failures.push({ command: commandText, code: result.code })
+    const output = `${result.stderr}\n${result.stdout}`.trim()
+    const tail = output.slice(-2200)
+    if (result.code !== 0) {
+      failures.push({
+        command: commandText,
+        code: result.code,
+        diagnostics: normalizeVerificationDiagnostics(output, project.path),
+      })
+    }
     feedback.push(`${commandText}: exit ${result.code}${tail ? `\n${tail}` : ''}`)
   }
   return { ok: failures.length === 0, failures, feedback: feedback.join('\n\n').slice(-9000) }
@@ -2814,18 +2822,24 @@ function checkpointAssessment(path: string | undefined, plan: MigrationPlan) {
 
 function allowKnownBaselineFailures(run: VerificationRun, assessment: MigrationVerificationAssessment): VerificationRun {
   if (run.ok || !assessment.evidence.length) return run
-  const baselineFailed = new Set(
-    assessment.evidence
-      .filter((item) => item.baselineExit !== undefined && item.baselineExit !== 0)
-      .map((item) => verificationCommandKey(item.command)),
+  const evidenceByCommand = new Map(
+    assessment.evidence.map((item) => [verificationCommandKey(item.command), item]),
   )
-  const newFailures = run.failures.filter((item) => !baselineFailed.has(verificationCommandKey(item.command)))
-  if (newFailures.length === run.failures.length) return run
-  const tolerated = run.failures.filter((item) => baselineFailed.has(verificationCommandKey(item.command)))
+  const tolerated: VerificationFailure[] = []
+  const remaining: VerificationFailure[] = []
+  for (const failure of run.failures) {
+    const decision = baselineFailureDecision(
+      failure,
+      evidenceByCommand.get(verificationCommandKey(failure.command)),
+    )
+    if (decision === 'tolerate') tolerated.push(failure)
+    else remaining.push(failure)
+  }
+  if (!tolerated.length) return run
   return {
-    ok: newFailures.length === 0,
-    failures: newFailures,
-    feedback: `${run.feedback}\n\nBaseline note: pre-existing non-zero checks are not treated as dependency regressions here: ${tolerated.map((item) => `${item.command}=exit${item.code}`).join(', ')}. They may still block the real release hook and should remain documented.`,
+    ok: remaining.length === 0,
+    failures: remaining,
+    feedback: `${run.feedback}\n\nBaseline note: pre-existing red checks were tolerated only after diagnostic equivalence, not by exit code alone: ${tolerated.map((item) => `${item.command}=exit${item.code}`).join(', ')}. They may still block the real release hook and should remain documented.`,
   }
 }
 
@@ -3558,23 +3572,17 @@ async function pendingMergeBranch(project: ProjectSpec, progress: MigrationProgr
   throw new Error(`MERGE_RECOVERY_SCOPE_VIOLATION: MERGE_HEAD ${wanted.slice(0, 12)} не совпадает ни с одной веткой сохранённого Branch plan. Автовосстановление остановлено без изменения Git-состояния.`)
 }
 
-// allowKnownBaselineFailures only forgives a failing command when some
-// earlier group's own focused checks happened to record its baseline. A gate
-// command no group's scope ever touched (e.g. an eslint step unrelated to
-// any updated package) has no evidence anywhere and can never be forgiven
-// that way -- which is exactly what exhausted 3 real repair attempts on a
-// chronic, migration-unrelated .eslintrc.js/tsconfig.json mismatch on a real
-// deps-demo-merged run: the repair agent correctly diagnosed it as
-// pre-existing and documented it, but documentation isn't the machine
-// evidence this gate reads, so it stayed red anyway.
-async function liveBaselineExitCodes(job: JobRecord, project: ProjectSpec, plan: MigrationPlan, commands: readonly string[]): Promise<Map<string, number>> {
+// A non-zero baseline exit is not sufficient evidence that a later non-zero
+// result is pre-existing. Cache normalized diagnostics and compare the actual
+// failure set before suppressing repair.
+async function liveBaselineObservations(job: JobRecord, project: ProjectSpec, plan: MigrationPlan, commands: readonly string[]): Promise<Map<string, BaselineVerificationObservation>> {
   const root = migrationRootJob(job)
-  root.baselineVerificationExitCodes ??= new Map<string, number>()
-  const cache = root.baselineVerificationExitCodes
+  root.baselineVerificationObservations ??= new Map<string, BaselineVerificationObservation>()
+  const cache = root.baselineVerificationObservations
   const uniqueCommands = [...new Map(commands.map((command) => [verificationCommandKey(command), command])).values()]
 
-  const collect = (): Map<string, number> => {
-    const result = new Map<string, number>()
+  const collect = (): Map<string, BaselineVerificationObservation> => {
+    const result = new Map<string, BaselineVerificationObservation>()
     for (const command of uniqueCommands) {
       const cached = cache.get(baselineVerificationCacheKey(project.name, plan.baseBranch, command))
       if (cached !== undefined) result.set(verificationCommandKey(command), cached)
@@ -3587,9 +3595,6 @@ async function liveBaselineExitCodes(job: JobRecord, project: ProjectSpec, plan:
 
   if (!missingCommands().length) return collect()
 
-  // Parallel workers share one root job. If another worker is already building
-  // the base-branch proof, wait for it and reuse its results before deciding
-  // whether anything remains to probe.
   if (root.baselineVerificationProbe) {
     await root.baselineVerificationProbe
     if (!missingCommands().length) return collect()
@@ -3597,6 +3602,13 @@ async function liveBaselineExitCodes(job: JobRecord, project: ProjectSpec, plan:
 
   const toProbe = missingCommands()
   if (!toProbe.length) return collect()
+
+  let packageRelativePath: string
+  try {
+    packageRelativePath = (await resolveProjectGitLayout(project)).packageRelativePath
+  } catch {
+    return collect()
+  }
 
   root.baselineVerificationProbe = (async () => {
     const parent = join(app.getPath('temp'), `dependency-flow-${root.id.replace(/[^a-zA-Z0-9._-]+/g, '-')}-baseline-${randomUUID()}`)
@@ -3607,21 +3619,27 @@ async function liveBaselineExitCodes(job: JobRecord, project: ProjectSpec, plan:
       rmSync(parent, { recursive: true, force: true })
       return
     }
+    const baselineProjectPath = projectPathInWorktree(temporaryTree, packageRelativePath)
     try {
       const manager = projectPackageManager(project)
       const install = manager === 'yarn' ? { command: 'yarn', args: ['install', '--frozen-lockfile'] }
         : manager === 'pnpm' ? { command: 'pnpm', args: ['install', '--frozen-lockfile'] }
         : { command: 'npm', args: ['ci'] }
-      const installResult = await executeCommand(job, { label: `Установка зависимостей baseline (${plan.baseBranch})`, command: install.command, args: install.args, cwd: temporaryTree, captureAgentSession: false })
+      const installResult = await executeCommand(job, { label: `Установка зависимостей baseline (${plan.baseBranch})`, command: install.command, args: install.args, cwd: baselineProjectPath, captureAgentSession: false })
       if (installResult.code !== 0) return
-      cleanEphemeralVerificationCaches(temporaryTree)
+      cleanEphemeralVerificationCaches(baselineProjectPath)
       for (const commandText of toProbe) {
-        const run = await executeCommand(job, { ...shellCommandSpec(`Baseline (${plan.baseBranch}): ${commandText}`, commandText, temporaryTree), captureAgentSession: false })
-        cache.set(baselineVerificationCacheKey(project.name, plan.baseBranch, commandText), run.code)
+        const run = await executeCommand(job, { ...shellCommandSpec(`Baseline (${plan.baseBranch}): ${commandText}`, commandText, baselineProjectPath), captureAgentSession: false })
+        cache.set(
+          baselineVerificationCacheKey(project.name, plan.baseBranch, commandText),
+          {
+            code: run.code,
+            diagnostics: normalizeVerificationDiagnostics(`${run.stderr}\n${run.stdout}`, baselineProjectPath),
+          },
+        )
       }
     } catch {
-      // A baseline probe that itself fails to run must never be read as proof
-      // of anything. Keep only complete command results already captured.
+      // A baseline probe that itself fails to run must never be read as proof.
     } finally {
       await spawnCapture('git', ['-C', project.path, 'worktree', 'remove', '--force', temporaryTree], project.path, 120_000)
       rmSync(parent, { recursive: true, force: true })
@@ -3636,42 +3654,99 @@ async function liveBaselineExitCodes(job: JobRecord, project: ProjectSpec, plan:
   return collect()
 }
 
-// Only probes commands `allowKnownBaselineFailures` couldn't judge at all
-// (no group ever recorded a defined baseline exit code for them) -- a
-// command some group DID baseline, whether tolerated or a genuine
-// baseline=0-to-failing regression, is left entirely to that stricter check;
-// this never overrides it.
 async function allowLiveBaselineFailures(job: JobRecord, project: ProjectSpec, plan: MigrationPlan, run: VerificationRun, assessment: MigrationVerificationAssessment): Promise<VerificationRun> {
   if (run.ok) return run
-  const unexplained = unexplainedFailures(run.failures, assessment.evidence)
-  if (!unexplained.length) return run
+  const candidates = baselineFailuresNeedingProbe(run.failures, assessment.evidence)
+  if (!candidates.length) return run
   send('flow:job-output', {
     jobId: job.id,
     stream: 'system',
-    line: `${unexplained.length} проверка(и) без baseline evidence ни в одной группе (${unexplained.map((item) => item.command).join(', ')}) — проверяю живой baseline на ${plan.baseBranch}.`,
+    line: `${candidates.length} проверка(и) требуют физического baseline-сравнения diagnostics (${candidates.map((item) => item.command).join(', ')}) — проверяю ${plan.baseBranch}.`,
   })
   const root = migrationRootJob(job)
   const gatePolicy = migrationGatePolicy(readSettings(root.workspace), project.name, readProjectPackageJson(project), projectPackageManager(project))
-  // Probe the complete deterministic gate set once. Parallel groups then reuse
-  // the same base-branch evidence instead of each performing a detached install.
-  const baselineCommands = gatePolicy.verificationCommands.length
-    ? gatePolicy.verificationCommands
-    : unexplained.map((item) => item.command)
-  const liveExitCodes = await liveBaselineExitCodes(job, project, plan, baselineCommands)
-  const liveEvidence: VerificationEvidence[] = unexplained
-    .filter((item) => liveExitCodes.has(verificationCommandKey(item.command)))
-    .map((item) => ({ command: item.command, baselineExit: liveExitCodes.get(verificationCommandKey(item.command)) }))
-  if (!liveEvidence.length) return run
-  const retried = allowKnownBaselineFailures(run, { ...assessment, evidence: [...assessment.evidence, ...liveEvidence] })
-  const confirmedPreExisting = liveEvidence.filter((item) => item.baselineExit !== 0)
-  if (confirmedPreExisting.length) {
-    send('flow:job-output', {
-      jobId: job.id,
-      stream: 'system',
-      line: `Живой baseline на ${plan.baseBranch} подтвердил: ${confirmedPreExisting.map((item) => `${item.command}=exit${item.baselineExit}`).join(', ')} уже падали до миграции — не считаю это регрессией.`,
-    })
+  const baselineCommands = [...new Map(
+    [...gatePolicy.verificationCommands, ...candidates.map((item) => item.command)]
+      .map((command) => [verificationCommandKey(command), command]),
+  ).values()]
+  const observations = await liveBaselineObservations(job, project, plan, baselineCommands)
+  const candidateKeys = new Set(candidates.map((item) => verificationCommandKey(item.command)))
+  const tolerated: VerificationFailure[] = []
+  const remaining: VerificationFailure[] = []
+  for (const failure of run.failures) {
+    const key = verificationCommandKey(failure.command)
+    if (!candidateKeys.has(key)) {
+      remaining.push(failure)
+      continue
+    }
+    const baseline = observations.get(key)
+    if (baseline && baselineObservationMatchesFailure(failure, baseline)) tolerated.push(failure)
+    else remaining.push(failure)
   }
-  return retried
+  if (!tolerated.length) return run
+  send('flow:job-output', {
+    jobId: job.id,
+    stream: 'system',
+    line: `Живой baseline на ${plan.baseBranch} подтвердил diagnostic-equivalence для: ${tolerated.map((item) => `${item.command}=exit${item.code}`).join(', ')}. Только эти pre-existing failures исключены из migration regressions.`,
+  })
+  return {
+    ok: remaining.length === 0,
+    failures: remaining,
+    feedback: `${run.feedback}\n\nLive baseline note: diagnostic-equivalent pre-existing failures: ${tolerated.map((item) => item.command).join(', ')}.`,
+  }
+}
+
+async function currentIntegrationVerificationReceiptIdentity(
+  project: ProjectSpec,
+  plan: MigrationPlan,
+  commands: readonly string[],
+  sourceBranch: string,
+  assessment: MigrationVerificationAssessment,
+): Promise<{ identity: string; head: string } | undefined> {
+  const [branch, head, status] = await Promise.all([
+    spawnCapture('git', ['-C', project.path, 'branch', '--show-current'], project.path, 15_000),
+    spawnCapture('git', ['-C', project.path, 'rev-parse', 'HEAD'], project.path, 15_000),
+    spawnCapture('git', ['-C', project.path, 'status', '--porcelain=v1', '--untracked-files=all'], project.path, 15_000),
+  ])
+  if ([branch, head, status].some((item) => item.timedOut || item.code !== 0)) return undefined
+  if (branch.stdout.trim() !== plan.mergedBranch || relevantGitStatus(status.stdout)) return undefined
+  const resolvedHead = head.stdout.trim()
+  const planFingerprint = JSON.stringify({
+    baseBranch: plan.baseBranch,
+    mergedBranch: plan.mergedBranch,
+    branches: plan.branches.map((item) => ({ branch: item.branch, packages: item.packages })),
+  })
+  const baselineEvidenceFingerprint = JSON.stringify(assessment.evidence)
+  return {
+    head: resolvedHead,
+    identity: integrationVerificationReceiptKey({
+      projectName: project.name,
+      projectPath: resolve(project.path),
+      mergedBranch: plan.mergedBranch,
+      sourceBranch,
+      head: resolvedHead,
+      commands,
+      planFingerprint,
+      baselineEvidenceFingerprint,
+      environment: commandEnvironment(process.env),
+    }),
+  }
+}
+
+async function rememberIntegrationVerificationReceipt(
+  job: JobRecord,
+  project: ProjectSpec,
+  plan: MigrationPlan,
+  commands: readonly string[],
+  sourceBranch: string,
+  assessment: MigrationVerificationAssessment,
+): Promise<void> {
+  const current = await currentIntegrationVerificationReceiptIdentity(project, plan, commands, sourceBranch, assessment)
+  if (!current) return
+  migrationRootJob(job).integrationVerificationReceipt = {
+    ...current,
+    verifiedAt: new Date().toISOString(),
+  }
 }
 
 async function runMergedIntegrationVerification(
@@ -3687,14 +3762,27 @@ async function runMergedIntegrationVerification(
     setBranchRuntime(job, sourceBranch)
     return
   }
+  const sourceAssessment = checkpointAssessment(latestAgentCheckpoint(join(artifactPath(job.workspace, 'historyDir', '.dependency-roadmap/history'), 'runs'), project.name, sourceBranch, 0), plan)
+  const receiptIdentity = await currentIntegrationVerificationReceiptIdentity(project, plan, commands, sourceBranch, sourceAssessment)
+  const previousReceipt = migrationRootJob(job).integrationVerificationReceipt
+  if (receiptIdentity && previousReceipt?.identity === receiptIdentity.identity) {
+    send('flow:job-output', {
+      jobId: job.id,
+      stream: 'system',
+      line: `Накопительный ${plan.mergedBranch}: integration verification reuse для exact HEAD ${receiptIdentity.head.slice(0, 12)}; состояние/commands/evidence/environment не изменились.`,
+    })
+    setBranchRuntime(job, sourceBranch)
+    return
+  }
+
   const before = await readMigrationProgress(job.workspace, project)
   if (!before || !before.trustworthy) throw new Error('MERGED_VERIFICATION_GIT_STATE_FAILED: не удалось надёжно прочитать состояние Branch plan перед integration gate.')
   const expectedMerged = new Set(before.branches.filter((entry) => entry.status === 'merged').map((entry) => entry.branch))
 
-  const sourceAssessment = checkpointAssessment(latestAgentCheckpoint(join(artifactPath(job.workspace, 'historyDir', '.dependency-roadmap/history'), 'runs'), project.name, sourceBranch, 0), plan)
   let gate = allowKnownBaselineFailures(await runProjectVerification(job, project, commands, `Integration gate ${plan.mergedBranch}`), sourceAssessment)
   if (!gate.ok) gate = await allowLiveBaselineFailures(job, project, plan, gate, sourceAssessment)
   if (gate.ok) {
+    await rememberIntegrationVerificationReceipt(job, project, plan, commands, sourceBranch, sourceAssessment)
     send('flow:job-output', { jobId: job.id, stream: 'system', line: `Накопительный ${plan.mergedBranch}: integration verification зелёная.` })
     setBranchRuntime(job, sourceBranch)
     return
@@ -3780,6 +3868,7 @@ async function runMergedIntegrationVerification(
     if (statusAfterGate.code !== 0 || relevantGitStatus(statusAfterGate.stdout)) {
       throw new Error(`MERGED_INTEGRATION_REPAIR_DIRTY: verification зелёная, но ${plan.mergedBranch} содержит незакоммиченные изменения после проверки.`)
     }
+    await rememberIntegrationVerificationReceipt(job, project, plan, commands, sourceBranch, sourceAssessment)
     send('flow:job-output', { jobId: job.id, stream: 'system', line: `Integration repair завершён: ${plan.mergedBranch} снова зелёный, ранее достигнутые package targets сохранены.` })
     setBranchRuntime(job, sourceBranch)
     job.agentBranch = undefined
