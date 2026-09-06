@@ -50,7 +50,7 @@ from substrate_identity import tool_build_id
 
 # BLOCK_X_SOURCE_TRUTH_V1
 SOURCE_SNAPSHOT_SCHEMA = "source-snapshot-v2-tool-build-content"
-SOURCE_INPUT_POLICY_SCHEMA = "source-input-policy-v1-explicit"
+SOURCE_INPUT_POLICY_SCHEMA = "source-input-policy-v2-explicit-git-admin"
 SOURCE_CAPTURE_RETRIES = 3
 
 # Deliberately small and explicit. In particular: dist/, build/, .next/,
@@ -89,6 +89,7 @@ class SourceInputPolicy:
             "schema": SOURCE_INPUT_POLICY_SCHEMA,
             "excludedDirNames": list(self.excluded_dir_names),
             "excludedFileNames": list(self.excluded_file_names),
+            "gitAdministrativeExclusions": [".git/**/*.lock"],
         }, length=64)
 
 
@@ -174,6 +175,8 @@ def _content_relevant_events(
         if any(part in DEFAULT_EXCLUDED_DIR_NAMES for part in parts):
             continue
         if parts and parts[-1] in DEFAULT_EXCLUDED_FILE_NAMES:
+            continue
+        if parts and _is_ephemeral_git_admin_path(Path(*parts)):
             continue
         relevant.append((action, relative))
     return relevant
@@ -299,6 +302,8 @@ def _run_git(project_dir: Path, args: list[str]) -> subprocess.CompletedProcess[
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=30,
+            # Read-only Git probes must not refresh the live index while Source Truth is captured.
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -524,7 +529,48 @@ def _local_dependency_preflight(project_path: Path, capture_root: Path) -> None:
                 )
 
 
+
+def _is_ephemeral_git_admin_path(relative: Path) -> bool:
+    """Git lock files coordinate writers; they are not repository/source state."""
+    return ".git" in relative.parts and relative.name.lower().endswith(".lock")
+
+
+def _remove_ephemeral_git_admin_files(root: Path) -> int:
+    """Remove copied Git lock artifacts before sealing; never follow links/junctions."""
+    removed = 0
+    pending = [(root, Path("."))]
+    while pending:
+        directory, relative_dir = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                items = list(iterator)
+        except OSError as exc:
+            raise SourceCaptureError(f"SOURCE_DIRECTORY_UNREADABLE: {directory}: {exc}") from exc
+        for item in items:
+            relative = relative_dir / item.name
+            path = Path(item.path)
+            try:
+                if item.is_symlink():
+                    continue
+                if item.is_dir(follow_symlinks=False):
+                    is_junction = getattr(path, "is_junction", None)
+                    if callable(is_junction) and is_junction():
+                        continue
+                    pending.append((path, relative))
+                elif item.is_file(follow_symlinks=False) and _is_ephemeral_git_admin_path(relative):
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except FileNotFoundError:
+                        pass
+            except OSError as exc:
+                raise SourceCaptureError(f"SOURCE_GIT_ADMIN_CLEANUP_FAILED: {path}: {exc}") from exc
+    return removed
+
+
 def _excluded(relative: Path, policy: SourceInputPolicy) -> bool:
+    if _is_ephemeral_git_admin_path(relative):
+        return True
     if any(part in policy.excluded_dir_names for part in relative.parts):
         return True
     return relative.name in policy.excluded_file_names
@@ -576,16 +622,31 @@ def _source_hash_workers() -> int:
     return max(2, min(8, logical // 2 or 1))
 
 
-def _directory_stability_stamp(path: Path) -> tuple[int, int, int]:
+def _directory_stability_stamp(path: Path, *, relative: Path = Path(".")) -> tuple[object, ...]:
     try:
         value = path.stat(follow_symlinks=False)
     except OSError as exc:
         raise SourceCaptureError(f"SOURCE_DIRECTORY_UNREADABLE: {path}: {exc}") from exc
-    return (
-        int(value.st_mtime_ns),
-        int(value.st_size),
-        int(getattr(value, "st_ino", 0)),
-    )
+    if ".git" not in relative.parts:
+        return (
+            "strict",
+            int(value.st_mtime_ns),
+            int(value.st_size),
+            int(getattr(value, "st_ino", 0)),
+        )
+    # Git writers create/remove *.lock names as their atomic update protocol.
+    # Preserve persistent-entry detection while ignoring only those synchronization names.
+    try:
+        with os.scandir(path) as iterator:
+            names = sorted(
+                item.name
+                for item in iterator
+                if not _is_ephemeral_git_admin_path(relative / item.name)
+            )
+    except OSError as exc:
+        raise SourceCaptureError(f"SOURCE_DIRECTORY_UNREADABLE: {path}: {exc}") from exc
+    name_key = hashlib.sha256("\0".join(names).encode("utf-8", errors="surrogatepass")).hexdigest()
+    return ("git-admin", int(getattr(value, "st_ino", 0)), name_key)
 
 
 def _build_source_tree_manifest_impl(
@@ -614,7 +675,7 @@ def _build_source_tree_manifest_impl(
     byte_count = 0
     workers = _source_hash_workers()
     max_pending = max(workers, workers * 3)
-    directory_stamps: list[tuple[Path, tuple[int, int, int]]] = []
+    directory_stamps: list[tuple[Path, Path, tuple[object, ...]]] = []
     pending: dict[concurrent.futures.Future[tuple[str, os.stat_result]], tuple[Path, str]] = {}
 
     def tick() -> None:
@@ -671,7 +732,7 @@ def _build_source_tree_manifest_impl(
         def walk(directory: Path, relative_dir: Path) -> None:
             nonlocal directories
             tick()
-            directory_stamps.append((directory, _directory_stability_stamp(directory)))
+            directory_stamps.append((directory, relative_dir, _directory_stability_stamp(directory, relative=relative_dir)))
             try:
                 with os.scandir(directory) as iterator:
                     scanned = sorted(iterator, key=lambda entry: entry.name)
@@ -758,8 +819,8 @@ def _build_source_tree_manifest_impl(
         while pending:
             drain_one()
 
-    for directory, stamp in directory_stamps:
-        if _directory_stability_stamp(directory) != stamp:
+    for directory, relative_dir, stamp in directory_stamps:
+        if _directory_stability_stamp(directory, relative=relative_dir) != stamp:
             raise SourceCaptureError(
                 f"SOURCE_CAPTURE_UNSTABLE: directory changed while hashing: {directory}"
             )
@@ -845,6 +906,10 @@ def _capture_once(
             if os.name != "nt" and "REPARSE_EXTERNAL_TARGET_UNSUPPORTED" in detail:
                 raise SourceCaptureError(f"SOURCE_SYMLINK_ESCAPE: {detail}") from exc
             raise SourceCaptureError(f"SOURCE_REPARSE_LAYOUT_UNSUPPORTED: {detail}") from exc
+        # Never carry a live Git writer's synchronization lock into the sealed repository.
+        removed_git_locks = _remove_ephemeral_git_admin_files(snapshot_root)
+        if removed_git_locks and progress is not None:
+            progress(f"source capture: removed {removed_git_locks} transient Git lock file(s) from private copy")
         # Seal BEFORE hashing so the sealed manifest measures bytes that are
         # already write-protected against every alias to the same file object.
         _apply_tree_write_protection(snapshot_root, readonly=True)

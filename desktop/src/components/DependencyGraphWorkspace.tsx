@@ -6,8 +6,14 @@ import {
   Focus,
   GitBranch,
   Layers3,
+  Maximize2,
+  Minimize2,
   Minus,
   Network,
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
   Plus,
   RefreshCw,
   Search,
@@ -109,12 +115,24 @@ export function DependencyGraphWorkspace({
   baselineDecision,
   onGetSnapshot,
   onOpenFlow,
+  fullscreen,
+  leftPaneHidden,
+  rightPaneHidden,
+  onToggleFullscreen,
+  onToggleLeftPane,
+  onToggleRightPane,
 }: {
   details: WorkspaceDetails
   project: ProjectSpec
   baselineDecision?: BaselineDecision
   onGetSnapshot: (projectName: string) => Promise<DependencyGraphSnapshot>
   onOpenFlow: () => void
+  fullscreen: boolean
+  leftPaneHidden: boolean
+  rightPaneHidden: boolean
+  onToggleFullscreen: () => void
+  onToggleLeftPane: () => void
+  onToggleRightPane: () => void
 }) {
   const { language } = useLanguage()
   const ru = language === 'ru'
@@ -129,6 +147,13 @@ export function DependencyGraphWorkspace({
   const [focusActive, setFocusActive] = useState(false)
   const [zoom, setZoom] = useState(0.9)
   const [selected, setSelected] = useState<Selected>()
+
+  useEffect(() => {
+    if (!fullscreen) return
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onToggleFullscreen() }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [fullscreen, onToggleFullscreen])
 
   const reload = async () => {
     setLoading(true)
@@ -279,6 +304,9 @@ export function DependencyGraphWorkspace({
         <label className="graph-check"><input type="checkbox" checked={showBridges} onChange={(event) => setShowBridges(event.target.checked)} /> Bridges</label>
         <button className={`graph-tool-button${focusActive ? ' active' : ''}`} disabled={!activeGroup} onClick={() => setFocusActive((value) => !value)}><Focus size={14} /> {text('Фокус', 'Focus')}</button>
         <span className="graph-toolbar-spacer" />
+        <button className="graph-icon-button" disabled={fullscreen} title={text(leftPaneHidden ? 'Показать список проектов' : 'Скрыть список проектов', leftPaneHidden ? 'Show project rail' : 'Hide project rail')} onClick={onToggleLeftPane}>{leftPaneHidden ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}</button>
+        <button className="graph-icon-button" disabled={fullscreen} title={text(rightPaneHidden ? 'Показать мониторинг' : 'Скрыть мониторинг', rightPaneHidden ? 'Show monitoring' : 'Hide monitoring')} onClick={onToggleRightPane}>{rightPaneHidden ? <PanelRightOpen size={15} /> : <PanelRightClose size={15} />}</button>
+        <button className={`graph-icon-button${fullscreen ? ' active' : ''}`} title={text(fullscreen ? 'Выйти из полноэкранного графа (Esc)' : 'Развернуть граф на всё окно', fullscreen ? 'Exit Graph fullscreen (Esc)' : 'Use the whole window for Graph')} onClick={onToggleFullscreen}>{fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button>
         <button className="graph-icon-button" title={text('Уменьшить', 'Zoom out')} onClick={() => setZoom((value) => Math.max(0.55, Number((value - 0.1).toFixed(2))))}><Minus size={15} /></button>
         <span className="graph-zoom">{Math.round(zoom * 100)}%</span>
         <button className="graph-icon-button" title={text('Увеличить', 'Zoom in')} onClick={() => setZoom((value) => Math.min(1.5, Number((value + 0.1).toFixed(2))))}><Plus size={15} /></button>

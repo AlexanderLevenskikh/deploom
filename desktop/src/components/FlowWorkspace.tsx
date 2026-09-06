@@ -157,6 +157,16 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
     }
   }
 
+  const openDeferredImprovementDialog = async () => {
+    try {
+      const loaded = normalizeBaselineIntentPlan(await onGetBaselineIntentPlan(project.name))
+      // Improvement preserves the deferred queue/user keep-current policy.
+      setBaselineIntentDialog({ mode: 'prepare', resume: 'restart', plan: loaded })
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : String(error))
+    }
+  }
+
   const baselinePolicyIdentity = (intent: BaselineIntent) =>
     JSON.stringify(Object.entries(intent.policies ?? {}).sort(([left], [right]) => left.localeCompare(right)))
 
@@ -306,10 +316,10 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
         <div className="stage-detail">
           {actionsComplete && goalMissed && selectedStageIndex === null ? <div className="flow-complete goal-missed">
             <span className="flow-complete-icon"><AlertTriangle size={24} /></span>
-            <h3>{run?.bestEffortRelease ? text('FLOW завершён в best-effort режиме', 'FLOW completed in best-effort mode') : text('Цель не достигнута', 'Target not reached')}</h3>
+            <h3>{run?.bestEffortRelease ? text('FLOW завершён: VERIFIED_PARTIAL_SCOPE', 'FLOW completed: VERIFIED_PARTIAL_SCOPE') : text('Цель не достигнута', 'Target not reached')}</h3>
             <p>{run?.bestEffortRelease ? text(
-              'Все исполнимые этапы завершены и release прошёл обычные project gates/hooks, но выбранный health-level остался недостижим текущим безопасным планом. Оставшиеся blockers сохранены для следующей итерации или другого агента.',
-              'All executable stages completed and release passed the normal project gates/hooks, but the selected health level is still unreachable by the current safe plan. Remaining blockers are preserved for the next iteration or another agent.',
+              'Текущий интегрированный результат физически проверен и опубликован как VERIFIED_PARTIAL_SCOPE. Идеальный health-level не достигнут, но deferred scope сохранён и может быть реактивирован отдельным следующим Fast-проходом.',
+              'The integrated result is physically verified and published as VERIFIED_PARTIAL_SCOPE. The ideal health level was not reached, while deferred scope is preserved and can be reactivated in a later Fast pass.',
             ) : bestEffortReleaseEligible ? text(
               'Текущий исполнимый план исчерпан. Можно продолжить audit/release/state в best-effort режиме: проверки и repository hooks останутся обязательными.',
               'The current executable plan is exhausted. Audit/release/state may continue in best-effort mode; verification and repository hooks remain mandatory.',
@@ -321,6 +331,7 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
             <div className="stage-actions">
               {details.targetClosure ? <button className="button secondary" onClick={() => setGoalDetailsOpen(true)}><Info size={16} /> {text('Почему не достигнута', 'Why it was not reached')}</button> : null}
               {run?.bestEffortRelease?.handoffPath ? <button className="button secondary" onClick={() => void onOpenPath(run.bestEffortRelease?.handoffPath)}><FileText size={16} /> {text('Открыть handoff', 'Open handoff')}</button> : null}
+              {run?.bestEffortRelease ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} /> {text('Продолжить улучшение', 'Continue improving')}</button> : null}
               <button className="button primary" onClick={onOpenDashboard}><ExternalLink size={16} /> {text('Открыть свежий dashboard', 'Open fresh Dashboard')}</button>
             </div>
             <div className="autopilot-actions">
@@ -343,6 +354,16 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
             <div>{details.dashboardExists ? <Check className="success-text" size={17} /> : <Circle size={17} />}<span>{t('flow.check.dashboard')}</span><strong>{details.dashboardExists ? t('common.ready') : t('common.waiting')}</strong><small>{details.dashboardExists ? (details.dashboardPath || '—') : t('flow.check.dashboardMissing')}</small></div>
             <div>{promptReady ? <Check className="success-text" size={17} /> : <Circle size={17} />}<span>{t('flow.check.agentPrompt')}</span><strong>{promptReady ? t('common.ready') : t('common.waiting')}</strong><small>{details.projectPromptPath || t('flow.check.exportPrompt')}</small></div>
           </div>
+          {goalMissed && bestEffortReleaseEligible ? <div className="verified-partial-decision">
+            <ShieldCheck size={18} />
+            <div>
+              <strong>VERIFIED_PARTIAL_SCOPE</strong>
+              <span>{text(
+                'Текущий executable scope исчерпан и проверен. Можно завершить этот проход через обычные release/state/publish gates либо реактивировать deferred group и расширить verified scope.',
+                'The current executable scope is exhausted and verified. You may finish this pass through the normal release/state/publish gates or reactivate a deferred group to expand verified scope.',
+              )}</span>
+            </div>
+          </div> : null}
           {goalMissed ? <div className="confirmation"><AlertTriangle size={18} /><span>{text('Цель', 'Target')} «{runTarget === 'yellow' ? t('levels.yellow') : t('levels.green')}» {text('ещё не достигнута', 'is not reached yet')}{typeof currentLevel?.lagOkPct === 'number' ? `: ${currentLevel.lagOkPct.toFixed(1)}%` : ''}{typeof details.targetClosure?.neededForYellow === 'number' && details.targetClosure.neededForYellow > 0 ? `, ${text('не хватает', 'missing')} ${details.targetClosure.neededForYellow}` : ''}. {bestEffortReleaseEligible ? text('Исполнимый plan исчерпан: audit/release/state можно довести автоматически в best-effort режиме; проверки не ослабляются.', 'The executable plan is exhausted: audit/release/state may continue automatically in best-effort mode; verification is not weakened.') : text('Release пока заблокирован, но audit/state можно сохранять — Supervisor должен сначала исчерпать безопасные варианты migration/replan.', 'Release is still blocked, but audit/state may be saved. Supervisor must first exhaust safe migration/replan options.')}</span>{details.targetClosure ? <button className="button secondary" onClick={() => setGoalDetailsOpen(true)}><Info size={16} /> {t('common.details')}</button> : null}</div> : null}
           {details.migrationProgress ? <section className="migration-progress" aria-label={t('flow.migrationProgressAria')}>
             <div className="migration-progress-heading"><div><strong>{t('flow.migrationGroups')}</strong><span>{text(
@@ -390,7 +411,8 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
             {FLOW_STAGES[displayedIndex].action === 'agent' && !canResumeAgent ? <button className="button secondary" disabled={active} title={text('Необязательно: Desktop сам построит актуальный prompt. Используйте только чтобы явно подменить его файлом.', 'Optional: Desktop builds the current prompt automatically. Use this only to explicitly replace it with a file.')} onClick={() => void onChoosePrompt(project.name)}><FileText size={16} /> {t('flow.customPrompt')}</button> : null}
             {FLOW_STAGES[displayedIndex].action === 'agent' ? <button className="button secondary" disabled={active} onClick={() => { if (window.confirm(text('Текущие изменения сохранятся в safety stash. Ветки Branch plan (work-ветки и merged) для этого проекта будут удалены локально, сохранённая сессия агента забудется. Начать миграцию заново?', 'Current changes will be saved to a safety stash. Branch-plan work and merged branches for this project will be removed locally and the saved agent session will be forgotten. Start migration over?'))) void execute(displayedIndex, false, true) }}><RotateCcw size={16} /> {t('flow.restartMigration')}</button> : null}
             {FLOW_STAGES[displayedIndex].action === 'baseline' ? <button className="button secondary" disabled={active} onClick={() => { if (window.confirm(text('Начать Baseline заново? Оркестрационный checkpoint будет сброшен, но exact proof/artifact cache с совпадающей identity останется доступен.', 'Restart Baseline? The orchestration checkpoint will be reset, while exact proof/artifact cache with matching identity remains reusable.'))) void execute(displayedIndex, undefined, undefined, 'restart') }}><RotateCcw size={16} /> {text('Начать заново', 'Start over')}</button> : null}
-            <button className="button primary" disabled={active || goalBlocked} title={goalBlocked ? t('flow.release.blockedTitle') : bestEffortReleaseEligible && displayedAction === 'release' ? t('flow.release.bestEffortTitle') : undefined} onClick={() => void execute(displayedIndex, undefined, undefined, FLOW_STAGES[displayedIndex].action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}>{active ? <LoaderCircle className="spin" size={17} /> : displayedIndex === 2 ? <ExternalLink size={17} /> : displayedIndex === 5 ? <ShieldCheck size={17} /> : <Play size={17} />}{FLOW_STAGES[displayedIndex].action === 'baseline' ? (details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Запустить', 'Start')) : FLOW_STAGES[displayedIndex].action === 'agent' && canResumeAgent ? t('flow.continueAgent') : FLOW_STAGES[displayedIndex].action === 'agent' && hasMigrationProgress ? t('flow.continueMigration') : FLOW_STAGES[displayedIndex].action === 'release' && goalMissed && bestEffortReleaseEligible ? t('flow.bestEffortRelease') : t(FLOW_STAGES[displayedIndex].buttonKey)}</button>
+            {displayedAction === 'release' && goalMissed && bestEffortReleaseEligible ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} /> {text('Продолжить улучшение', 'Continue improving')}</button> : null}
+            <button className="button primary" disabled={active || goalBlocked} title={goalBlocked ? t('flow.release.blockedTitle') : bestEffortReleaseEligible && displayedAction === 'release' ? t('flow.release.bestEffortTitle') : undefined} onClick={() => void execute(displayedIndex, undefined, undefined, FLOW_STAGES[displayedIndex].action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}>{active ? <LoaderCircle className="spin" size={17} /> : displayedIndex === 2 ? <ExternalLink size={17} /> : displayedIndex === 5 ? <ShieldCheck size={17} /> : <Play size={17} />}{FLOW_STAGES[displayedIndex].action === 'baseline' ? (details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Запустить', 'Start')) : FLOW_STAGES[displayedIndex].action === 'agent' && canResumeAgent ? t('flow.continueAgent') : FLOW_STAGES[displayedIndex].action === 'agent' && hasMigrationProgress ? t('flow.continueMigration') : FLOW_STAGES[displayedIndex].action === 'release' && goalMissed && bestEffortReleaseEligible ? text('Завершить с текущим verified результатом', 'Finish with current verified result') : t(FLOW_STAGES[displayedIndex].buttonKey)}</button>
           </div>
           <div className="autopilot-actions">
             {autopilotActive

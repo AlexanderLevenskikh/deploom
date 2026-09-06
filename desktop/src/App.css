@@ -765,3 +765,22 @@ textarea::placeholder {
 .dependency-graph-loading,.dependency-graph-error { height:100%; display:flex; align-items:center; justify-content:center; gap:8px; color:var(--muted); }
 .spin { animation:dependency-graph-spin 1s linear infinite; } @keyframes dependency-graph-spin { to { transform:rotate(360deg); } }
 @media (max-width:1180px) { .dependency-graph-summary { grid-template-columns:repeat(3,1fr); } .dependency-graph-main { grid-template-columns:minmax(0,1fr) 240px; } .graph-blockage-panel { grid-template-columns:auto minmax(0,1fr); } .graph-blockage-actions { grid-column:2; justify-self:start; } }
+
+/* BLOCK_VERIFIED_PARTIAL_GRAPH_FOCUS_V1 */
+.app-shell.graph-fullscreen { grid-template-rows: minmax(0, 1fr); }
+.app-shell.graph-fullscreen > .app-header,
+.app-shell.graph-fullscreen > .status-bar,
+.app-shell.graph-fullscreen .workspace-titlebar { display: none; }
+.app-shell.graph-fullscreen .main-workspace { grid-template-rows: minmax(0, 1fr); }
+.app-grid.graph-hide-project-rail { grid-template-columns: minmax(620px, 1fr) 370px; }
+.app-grid.graph-hide-monitor { grid-template-columns: 236px minmax(620px, 1fr); }
+.app-grid.graph-hide-project-rail.graph-hide-monitor { grid-template-columns: minmax(0, 1fr); }
+.graph-icon-button.active { color: var(--blue); border-color: var(--blue); background: var(--blue-soft); }
+.verified-partial-decision {
+  margin-top: 12px; display: grid; grid-template-columns: auto minmax(0, 1fr);
+  gap: 9px; padding: 10px 12px; border: 1px solid #9bd1aa; border-radius: 6px;
+  background: var(--green-soft); color: var(--green);
+}
+.verified-partial-decision > div { display: grid; gap: 3px; }
+.verified-partial-decision strong { font-size: 11px; letter-spacing: .03em; }
+.verified-partial-decision span { color: var(--muted); font-size: 10px; line-height: 1.45; }
