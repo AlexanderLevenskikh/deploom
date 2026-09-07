@@ -27,6 +27,7 @@ for (const sentinel of [
   'Отложить группу (',
   'Вернуться к этой группе',
   'Готов ждать: исчерпывающий поиск в фоне',
+  'Автономный режим',
   'baseline-policy-toggle',
   "setPolicy(item.name, 'keep-current')",
   "setPolicy(item.name, 'required')",
@@ -43,6 +44,8 @@ for (const sentinel of [
   'DEPLOOM_BASELINE_INTENT_JSON',
   'DEPLOOM_BASELINE_EXTRA_ITERATIONS',
   'DEPLOOM_BASELINE_DECISION_GRANT_ITERATIONS',
+  "DEPLOOM_BASELINE_SEARCH_MODE: effectiveIntent.searchMode ?? 'AUTO'",
+  'deferredCohorts: effectiveIntent.deferredCohorts ?? []',
   'baselineHumanDecisionRequired',
   "flow:baseline-intent-plan",
 ]) if (!main.includes(sentinel)) throw new Error(`Baseline intent main-process contract missing: ${sentinel}`)

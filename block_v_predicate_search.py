@@ -56,7 +56,9 @@ class PredicateProbePolicy:
     This policy controls only experiment *cost*.  It never changes the solver
     domain or proof authority.  The defaults are intentionally conservative:
     active probing starts only after the same package/predicate has been freshly
-    observed at two distinct failing direct versions.
+    observed at two independent exact failing points. Distinct surrounding
+    assignment fingerprints at the same direct version count for activation,
+    but never imply version-wide incompatibility.
     """
 
     enabled: bool = True
@@ -237,6 +239,34 @@ def predicate_repeat_count(
         package=package, predicate=predicate, observations=observations
     )
     return sum(1 for present in status.values() if present)
+
+
+def predicate_activation_repeat_count(
+    *,
+    package: str,
+    predicate: str,
+    observations: Sequence[PredicateObservation],
+) -> int:
+    """Count independent confirmed PRESENT exact points for probe activation.
+
+    This is diagnostic scheduling evidence only. Independent surrounding
+    assignment fingerprints at the same direct version may justify a bounded
+    point probe, but never imply version-wide incompatibility and never create
+    solver authority.
+    """
+    point_status: dict[tuple[str, str], set[bool]] = {}
+    for item in observations:
+        if item.package.lower() != package.lower() or item.predicate != predicate:
+            continue
+        version = str(item.version or "")
+        if not version:
+            continue
+        fingerprint = str(item.assignment_fingerprint or "").strip()
+        point_identity = fingerprint if fingerprint else "<version-only>"
+        point_status.setdefault((version, point_identity), set()).add(
+            bool(item.present)
+        )
+    return sum(1 for statuses in point_status.values() if statuses == {True})
 
 
 def _boundary_score(

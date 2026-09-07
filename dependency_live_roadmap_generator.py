@@ -251,12 +251,12 @@ def _baseline_intent_payload() -> Dict[str, Any]:
         return _BASELINE_INTENT_CACHE
     _BASELINE_INTENT_CACHE_RAW = raw
     if not raw:
-        _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": {}, "executionMode": "FAST", "deferredCohorts": [], "cohortAction": {}}
+        _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": {}, "searchMode": "AUTO", "executionMode": "FAST", "deferredCohorts": [], "cohortAction": {}}
         return _BASELINE_INTENT_CACHE
     try:
         parsed = json.loads(raw)
     except (TypeError, ValueError):
-        _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": {}, "executionMode": "FAST", "deferredCohorts": [], "cohortAction": {}}
+        _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": {}, "searchMode": "AUTO", "executionMode": "FAST", "deferredCohorts": [], "cohortAction": {}}
         return _BASELINE_INTENT_CACHE
     policies: Dict[str, str] = {}
     if isinstance(parsed, dict) and isinstance(parsed.get("policies"), dict):
@@ -267,9 +267,13 @@ def _baseline_intent_payload() -> Dict[str, Any]:
     execution_mode = str(parsed.get("executionMode") or "FAST").strip().upper() if isinstance(parsed, dict) else "FAST"
     if execution_mode not in BASELINE_EXECUTION_MODES:
         execution_mode = "FAST"
+    search_mode = str(parsed.get("searchMode") or "AUTO").strip().upper() if isinstance(parsed, dict) else "AUTO"
+    if search_mode not in {"AUTO", "BOUNDED_IMPROVEMENT", "EXHAUSTIVE"}:
+        search_mode = "AUTO"
     _BASELINE_INTENT_CACHE = {
         "schemaVersion": 1,
         "policies": policies,
+        "searchMode": search_mode,
         "executionMode": execution_mode,
         "deferredCohorts": _normalize_baseline_deferred_cohorts(parsed.get("deferredCohorts") if isinstance(parsed, dict) else None),
         "cohortAction": _normalize_baseline_cohort_action(parsed.get("cohortAction") if isinstance(parsed, dict) else None),
@@ -324,7 +328,11 @@ def _baseline_interactive() -> bool:
 
 
 def _baseline_search_mode() -> BaselineSearchMode:
-    raw = str(os.environ.get("DEPLOOM_BASELINE_SEARCH_MODE") or "AUTO").strip().upper()
+    raw = str(
+        os.environ.get("DEPLOOM_BASELINE_SEARCH_MODE")
+        or _baseline_intent_payload().get("searchMode")
+        or "AUTO"
+    ).strip().upper()
     try:
         return BaselineSearchMode(raw)
     except ValueError:
@@ -374,9 +382,19 @@ def _baseline_max_expensive_attempts(default: int) -> int:
     return max(1, int(default))
 
 
-def _baseline_deep_search_allowed(*, has_incumbent: bool, search_mode: Optional[BaselineSearchMode] = None) -> bool:
+def _baseline_deep_search_allowed(
+    *,
+    has_incumbent: bool,
+    search_mode: Optional[BaselineSearchMode] = None,
+    repeated_predicate_count: int = 0,
+) -> bool:
     effective = search_mode or _baseline_search_mode()
-    return bool(has_incumbent or effective == BaselineSearchMode.EXHAUSTIVE)
+    repeated_escape = max(0, int(repeated_predicate_count or 0)) >= 3
+    return bool(
+        has_incumbent
+        or effective == BaselineSearchMode.EXHAUSTIVE
+        or repeated_escape
+    )
 
 
 def _baseline_preseal_screening_enabled(*, has_incumbent: bool) -> bool:
@@ -11575,7 +11593,24 @@ def resolve_peer_compatibility_with_verification(
                     deep_search_allowed = _baseline_deep_search_allowed(
                         has_incumbent=anytime.incumbent is not None,
                         search_mode=anytime.search_mode,
+                        repeated_predicate_count=anytime.repeated_predicate_count,
                     )
+                    repeated_predicate_escape = bool(
+                        anytime.incumbent is None
+                        and anytime.search_mode != BaselineSearchMode.EXHAUSTIVE
+                        and anytime.repeated_predicate_count >= 3
+                    )
+                    if repeated_predicate_escape:
+                        progress_reporter.emit(
+                            project,
+                            mode,
+                            "pre-incumbent-repeated-predicate-escape",
+                            iteration=iteration,
+                            assignment=fingerprint,
+                            predicate=anytime.repeated_predicate,
+                            repeatCount=anytime.repeated_predicate_count,
+                            authority="DIAGNOSTIC_HINT",
+                        )
                     if deep_search_allowed:
                         proposal = _adaptive_graph_guided_generalization_proposal(
                             rows_by_name,

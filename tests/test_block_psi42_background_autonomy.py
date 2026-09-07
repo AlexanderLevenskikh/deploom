@@ -121,7 +121,9 @@ class Psi42BackgroundAutonomyTests(unittest.TestCase):
             source,
         )
         self.assertIn("searchMode,", source)
-        self.assertIn("Запустить автономный глубокий поиск", source)
+        self.assertIn("Работать автономно", source)
+        self.assertIn("Готов ждать: исчерпывающий поиск в фоне", source)
+        self.assertNotIn("Запустить автономный глубокий поиск", source)
 
     def test_draft_prompt_export_is_external_agent_handoff(self) -> None:
         source = (ROOT / "dependency_live_roadmap_generator.py").read_text(

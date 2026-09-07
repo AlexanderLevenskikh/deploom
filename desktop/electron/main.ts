@@ -376,7 +376,7 @@ function saveBaselineIntent(workspace: WorkspaceRecord, projectName: string, int
   const durable = { ...normalized }
   delete durable.cohortAction
   delete durable.proofMode
-  atomicWriteJsonSync(baselineIntentPath(workspace, projectName), { ...durable, decisionGrantIterations: 0, searchMode: 'AUTO' })
+  atomicWriteJsonSync(baselineIntentPath(workspace, projectName), { ...durable, decisionGrantIterations: 0 })
 }
 
 function projectInstalledVersion(projectPath: string, packageName: string): string | undefined {
@@ -2054,13 +2054,20 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
         env: {
           DEPLOOM_BASELINE_RESUME: input.baselineResume === 'restart' ? 'restart' : input.baselineResume === 'continue' ? 'continue' : 'auto',
           DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE: input.baselineResume === 'continue' ? '1' : '0',
-          DEPLOOM_BASELINE_INTENT_JSON: JSON.stringify({ schemaVersion: 1, policies: effectiveIntent.policies, executionMode }),
+          DEPLOOM_BASELINE_INTENT_JSON: JSON.stringify({
+            schemaVersion: 1,
+            policies: effectiveIntent.policies,
+            searchMode: effectiveIntent.searchMode ?? 'AUTO',
+            executionMode,
+            deferredCohorts: effectiveIntent.deferredCohorts ?? [],
+            ...(explicitIntent?.cohortAction ? { cohortAction: explicitIntent.cohortAction } : {}),
+          }),
           DEPLOOM_BASELINE_INTERACTIVE: proofMode === 'DRAFT' ? '0' : '1',
           DEPLOOM_BASELINE_EXECUTION_MODE: executionMode,
           DEPLOOM_BASELINE_PROOF_MODE: proofMode,
           DEPLOOM_BASELINE_EXTRA_ITERATIONS: String(effectiveIntent.extraIterations ?? 0),
           DEPLOOM_BASELINE_DECISION_GRANT_ITERATIONS: String(explicitIntent?.decisionGrantIterations ?? 0),
-          DEPLOOM_BASELINE_SEARCH_MODE: explicitIntent?.searchMode ?? 'AUTO',
+          DEPLOOM_BASELINE_SEARCH_MODE: effectiveIntent.searchMode ?? 'AUTO',
           DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS: String(automaticBudgetSeconds),
           DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS: String(maxExpensiveAttempts),
           ...(executionMode === 'BACKGROUND' ? { DEPLOOM_IO_COPY_SLOTS: '1', DEPLOOM_IO_HASH_SLOTS: '1', DEPLOOM_IO_PM_SLOTS: '1' } : {}),

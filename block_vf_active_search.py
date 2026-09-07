@@ -16,7 +16,7 @@ from block_v_predicate_search import (
     PredicateObservation,
     PredicateProbePolicy,
     controlled_probe_assignment,
-    predicate_repeat_count,
+    predicate_activation_repeat_count,
     rank_version_probes,
 )
 
@@ -69,7 +69,7 @@ def run_active_predicate_search(
     """
     working = list(observations)
     attempts = {str(item) for item in attempted_versions if str(item)}
-    repeats = predicate_repeat_count(
+    repeats = predicate_activation_repeat_count(
         package=package, predicate=predicate, observations=working
     )
     if not policy.enabled or repeats < policy.repeat_threshold:

@@ -256,16 +256,16 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
 
         <div className="baseline-fast-flow">
           <div>
-            <strong>{executionMode === 'BACKGROUND' ? text('☾ Глубокий поиск', '☾ Deep search') : text('⚡ Fast-first', '⚡ Fast-first')}</strong>
+            <strong>{executionMode === 'BACKGROUND' ? text('☾ Автономный режим', '☾ Autonomous') : text('⚡ Fast-first', '⚡ Fast-first')}</strong>
             <span>{executionMode === 'BACKGROUND'
-              ? text('Автономный режим: DepLoom сам продолжает исчерпывающий narrowing и глубокую диагностику до результата или hard safety limit, не останавливаясь на cohort-диалогах.', 'Autonomous mode: DepLoom keeps running exhaustive narrowing and deep diagnostics until a result or the hard safety limit, without stopping for cohort dialogs.')
+              ? text('Работает без диалогов продолжения. Глубина поиска задаётся отдельно: AUTO остаётся incumbent-first, а исчерпывающий поиск запускается явным действием ниже.', 'Runs without continuation dialogs. Search depth is separate: AUTO remains incumbent-first, while exhaustive search is started explicitly below.')
               : text('Никакого массового DEV-exclude: беспроблемные dev-зависимости тоже обновляются. Отступаем только вокруг реально наблюдаемого compatibility-региона.', 'No blanket DEV exclusion: healthy dev dependencies are updated too. We only step back around an actually observed compatibility region.')}</span>
           </div>
           <details className="baseline-advanced-flow">
             <summary>{text('Дополнительно', 'Advanced')}</summary>
             {executionMode === 'BACKGROUND'
               ? <button type="button" className="button secondary" disabled={busy} onClick={() => setExecutionMode('FAST')}>{text('Вернуться к Fast-first', 'Return to Fast-first')}</button>
-              : <button type="button" className="button secondary" disabled={busy} onClick={() => setExecutionMode('BACKGROUND')}>{text('Запустить автономный глубокий поиск', 'Run autonomous deep search')}</button>}
+              : <button type="button" className="button secondary" disabled={busy} onClick={() => setExecutionMode('BACKGROUND')}>{text('Работать автономно', 'Run autonomously')}</button>}
           </details>
         </div>
 

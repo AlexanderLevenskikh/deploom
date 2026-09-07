@@ -115,6 +115,17 @@ _CATEGORY_RULES: tuple[tuple[str, str, str, str], ...] = (
         "not-retryable",
         "The project's own checks failed on this dependency combination.",
     ),
+
+(
+    r"BASELINE_VERIFICATION_(HARD_SAFETY_LIMIT|PLATEAU)"
+    r"|HARD_SAFETY_LIMIT|absolute-hard-safety-ceiling|STAGNATION",
+    "SEARCH_LIMIT",
+    "user-action-required",
+    "The verified search reached its bounded safety/plateau limit without "
+    "a proven incumbent. Do not retry unchanged; use the suggested "
+    "predicate/cohort action, explicitly choose exhaustive search, or "
+    "change scope before continuing.",
+),
     (
         r"BASELINE_VERIFY_UNKNOWN_ERROR|UNKNOWN",
         "UNKNOWN",
