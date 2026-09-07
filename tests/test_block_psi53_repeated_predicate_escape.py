@@ -211,9 +211,15 @@ class Psi53DesktopContracts(unittest.TestCase):
         source = (
             ROOT / "desktop" / "src" / "components" / "BaselineIntentDialog.tsx"
         ).read_text(encoding="utf-8")
-        self.assertIn("☾ Автономный режим", source)
+        self.assertIn("Режим Baseline", source)
+        self.assertIn("Как выполнять", source)
+        self.assertIn("Работать автономно", source)
+        self.assertIn("Глубина поиска", source)
+        self.assertIn("AUTO · Рекомендуется", source)
+        self.assertIn("EXHAUSTIVE", source)
         self.assertIn("Готов ждать: исчерпывающий поиск в фоне", source)
         self.assertNotIn("Запустить автономный глубокий поиск", source)
+        self.assertNotIn("Запустить глубокий поиск", source)
 
 
 class Psi53FailureTaxonomyTests(unittest.TestCase):

@@ -1,7 +1,7 @@
 import { AlertTriangle, Search, ShieldCheck, X } from 'lucide-react'
 import { useDeferredValue, useEffect, useMemo, useState } from 'react'
 import { useLanguage } from '../i18n'
-import type { BaselineDecision, BaselineExecutionMode, BaselineIntent, BaselineIntentPlan, BaselinePackagePolicy, BaselineProofMode } from '../types'
+import type { BaselineDecision, BaselineExecutionMode, BaselineIntent, BaselineIntentPlan, BaselinePackagePolicy, BaselineProofMode, BaselineSearchMode } from '../types'
 import { QuickSelect } from './QuickSelect'
 
 type Props = {
@@ -18,6 +18,10 @@ const DECISION_TRANCHE = 8
 
 function normalizedExecutionMode(value: BaselineExecutionMode | undefined): BaselineExecutionMode {
   return value === 'BACKGROUND' ? 'BACKGROUND' : 'FAST'
+}
+
+function normalizedSearchMode(value: BaselineIntent['searchMode']): BaselineSearchMode {
+  return value === 'EXHAUSTIVE' ? 'EXHAUSTIVE' : 'AUTO'
 }
 
 function policyFingerprint(policies: Record<string, BaselinePackagePolicy>): string {
@@ -47,6 +51,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
   const [kind, setKind] = useState<'all' | 'runtime' | 'dev' | 'peer'>('all')
   const [policies, setPolicies] = useState<Record<string, BaselinePackagePolicy>>({ ...plan.intent.policies })
   const [executionMode, setExecutionMode] = useState<BaselineExecutionMode>(normalizedExecutionMode(plan.intent.executionMode))
+  const [searchDepth, setSearchDepth] = useState<BaselineSearchMode>(normalizedSearchMode(plan.intent.searchMode))
   const [deferredCohorts, setDeferredCohorts] = useState<DeferredCohort[]>([...(plan.intent.deferredCohorts ?? [])])
   const [busy, setBusy] = useState(false)
   const deferredQuery = useDeferredValue(query)
@@ -54,6 +59,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
   useEffect(() => {
     setPolicies({ ...plan.intent.policies })
     setExecutionMode(normalizedExecutionMode(plan.intent.executionMode))
+    setSearchDepth(normalizedSearchMode(plan.intent.searchMode))
     setDeferredCohorts([...(plan.intent.deferredCohorts ?? [])])
   }, [plan])
 
@@ -74,15 +80,16 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
   const dirty = useMemo(
     () => policyFingerprint(policies) !== policyFingerprint(plan.intent.policies)
       || executionMode !== normalizedExecutionMode(plan.intent.executionMode)
+      || searchDepth !== normalizedSearchMode(plan.intent.searchMode)
       || cohortFingerprint(deferredCohorts) !== cohortFingerprint(plan.intent.deferredCohorts ?? []),
-    [deferredCohorts, executionMode, plan.intent.deferredCohorts, plan.intent.executionMode, plan.intent.policies, policies],
+    [deferredCohorts, executionMode, plan.intent.deferredCohorts, plan.intent.executionMode, plan.intent.policies, plan.intent.searchMode, policies, searchDepth],
   )
 
   const buildIntent = ({
     extra = 0,
     grant = 0,
     nextPolicies = policies,
-    searchMode = 'AUTO' as BaselineIntent['searchMode'],
+    searchMode = searchDepth as BaselineIntent['searchMode'],
     nextExecutionMode = executionMode,
     proofMode = 'VERIFIED' as BaselineProofMode,
     nextDeferredCohorts = deferredCohorts,
@@ -215,7 +222,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
   const applyAndContinue = () => void submit(buildIntent({
     extra: mode === 'decision' ? DECISION_TRANCHE : 0,
     grant: mode === 'decision' ? DECISION_TRANCHE : 0,
-    searchMode: mode === 'decision' ? 'BOUNDED_IMPROVEMENT' : 'AUTO',
+    searchMode: mode === 'decision' ? 'BOUNDED_IMPROVEMENT' : searchDepth,
   }))
 
   const buildDraft = () => void submit(buildIntent({
@@ -256,17 +263,33 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
 
         <div className="baseline-fast-flow">
           <div>
-            <strong>{executionMode === 'BACKGROUND' ? text('☾ Автономный режим', '☾ Autonomous') : text('⚡ Fast-first', '⚡ Fast-first')}</strong>
-            <span>{executionMode === 'BACKGROUND'
-              ? text('Работает без диалогов продолжения. Глубина поиска задаётся отдельно: AUTO остаётся incumbent-first, а исчерпывающий поиск запускается явным действием ниже.', 'Runs without continuation dialogs. Search depth is separate: AUTO remains incumbent-first, while exhaustive search is started explicitly below.')
-              : text('Никакого массового DEV-exclude: беспроблемные dev-зависимости тоже обновляются. Отступаем только вокруг реально наблюдаемого compatibility-региона.', 'No blanket DEV exclusion: healthy dev dependencies are updated too. We only step back around an actually observed compatibility region.')}</span>
+            <strong>{text('Режим Baseline', 'Baseline mode')}</strong>
+            <span>{text('Способ выполнения и глубина поиска независимы: можно оставить AUTO в фоне или включить EXHAUSTIVE с остановками для решений.', 'Execution behavior and search depth are independent: AUTO can run in background, or EXHAUSTIVE can still stop for decisions.')}</span>
           </div>
-          <details className="baseline-advanced-flow">
-            <summary>{text('Дополнительно', 'Advanced')}</summary>
-            {executionMode === 'BACKGROUND'
-              ? <button type="button" className="button secondary" disabled={busy} onClick={() => setExecutionMode('FAST')}>{text('Вернуться к Fast-first', 'Return to Fast-first')}</button>
-              : <button type="button" className="button secondary" disabled={busy} onClick={() => setExecutionMode('BACKGROUND')}>{text('Работать автономно', 'Run autonomously')}</button>}
-          </details>
+          <div className="baseline-run-controls">
+            <div className="baseline-run-control">
+              <span className="baseline-run-control-label">{text('Как выполнять', 'Execution')}</span>
+              <div className="baseline-mode-toggle" role="group" aria-label={text('Режим выполнения Baseline', 'Baseline execution mode')}>
+                <button type="button" className={executionMode === 'FAST' ? 'active' : ''} aria-pressed={executionMode === 'FAST'} disabled={busy} onClick={() => setExecutionMode('FAST')}>{text('С контролем', 'Interactive')}</button>
+                <button type="button" className={executionMode === 'BACKGROUND' ? 'active' : ''} aria-pressed={executionMode === 'BACKGROUND'} disabled={busy} onClick={() => setExecutionMode('BACKGROUND')}>{text('Работать автономно', 'Autonomous')}</button>
+              </div>
+              <small>{executionMode === 'BACKGROUND'
+                ? text('Без диалогов продолжения: DepLoom работает до результата или safety limit.', 'No continuation dialogs: DepLoom runs until a result or the safety limit.')
+                : text('DepLoom остановится, если понадобится ваше решение по scope или продолжению.', 'DepLoom stops when it needs your decision about scope or continuation.')}</small>
+            </div>
+            {mode === 'prepare' ? (
+              <div className="baseline-run-control">
+                <span className="baseline-run-control-label">{text('Глубина поиска', 'Search depth')}</span>
+                <div className="baseline-mode-toggle" role="group" aria-label={text('Глубина поиска Baseline', 'Baseline search depth')}>
+                  <button type="button" className={searchDepth === 'AUTO' ? 'active' : ''} aria-pressed={searchDepth === 'AUTO'} disabled={busy} onClick={() => setSearchDepth('AUTO')}>{text('AUTO · Рекомендуется', 'AUTO · Recommended')}</button>
+                  <button type="button" className={searchDepth === 'EXHAUSTIVE' ? 'active' : ''} aria-pressed={searchDepth === 'EXHAUSTIVE'} disabled={busy} onClick={() => setSearchDepth('EXHAUSTIVE')}>EXHAUSTIVE</button>
+                </div>
+                <small>{searchDepth === 'EXHAUSTIVE'
+                  ? text('Сразу разрешает глубокую локализацию и physically certified generalization. Может работать заметно дольше.', 'Immediately allows deep localization and physically certified generalization. It can take substantially longer.')
+                  : text('Incumbent-first: сначала быстро ищет первый verified результат; при повторяющемся blocker углубляется точечно.', 'Incumbent-first: first seeks a verified result quickly, then deepens selectively around repeated blockers.')}</small>
+              </div>
+            ) : null}
+          </div>
         </div>
 
         {deferredCohorts.length ? (
@@ -363,7 +386,15 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
           <span className="baseline-intent-apply-hint">{dirty ? text('Есть неприменённые изменения', 'There are unapplied changes') : text('Scope готов', 'Scope is ready')}</span>
           <button type="button" className="button secondary" disabled={busy} onClick={requestCancel}>{mode === 'decision' ? text('Оставить на паузе', 'Keep paused') : text('Отмена', 'Cancel')}</button>
           {mode === 'prepare' ? <button type="button" className="button secondary" disabled={busy} onClick={buildDraft} title={text('Без install/lifecycle/project checks. Compatibility останется UNKNOWN.', 'No install/lifecycle/project checks. Compatibility remains UNKNOWN.')}>{text('Сформировать Draft без проверки', 'Build unverified Draft')}</button> : null}
-          {mode === 'prepare' ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{executionMode === 'BACKGROUND' ? text('Запустить глубокий поиск', 'Start deep search') : text('Запустить Fast Baseline', 'Start Fast Baseline')}</button> : null}
+          {mode === 'prepare' ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{
+            searchDepth === 'EXHAUSTIVE'
+              ? executionMode === 'BACKGROUND'
+                ? text('Запустить исчерпывающий Baseline в фоне', 'Start exhaustive Baseline in background')
+                : text('Запустить исчерпывающий Baseline', 'Start exhaustive Baseline')
+              : executionMode === 'BACKGROUND'
+                ? text('Запустить AUTO автономно', 'Start AUTO autonomously')
+                : text('Запустить Fast Baseline', 'Start Fast Baseline')
+          }</button> : null}
           {mode === 'decision' && !suggestedCohort?.packages.length && decision?.package ? <button type="button" className="button primary" disabled={busy} onClick={keepFocusAndContinue}>{text(`Пока оставить ${decision.package} current`, `Keep ${decision.package} current for now`)}</button> : null}
           {mode === 'decision' && !suggestedCohort?.packages.length && !decision?.package ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{text('Применить scope и продолжить', 'Apply scope and continue')}</button> : null}
           {mode === 'decision' ? (

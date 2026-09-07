@@ -639,6 +639,62 @@ textarea::placeholder {
 .baseline-technical-details { display: grid; gap: 5px; }
 .baseline-advanced-actions[open] { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
+/* BLOCK_PSI53_SEARCH_DEPTH_UX_V1 */
+.baseline-run-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.baseline-run-control {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--border-color, rgba(127,127,127,.24));
+  border-radius: 8px;
+  background: var(--surface-raised, #fff);
+}
+.baseline-run-control-label {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+.baseline-run-control small {
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+.baseline-mode-toggle {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.baseline-mode-toggle button {
+  min-width: 0;
+  min-height: 32px;
+  padding: 5px 8px;
+  border: 0;
+  border-right: 1px solid var(--border);
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+}
+.baseline-mode-toggle button:last-child { border-right: 0; }
+.baseline-mode-toggle button:hover:not(:disabled) { background: var(--surface-hover); }
+.baseline-mode-toggle button.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 700;
+}
+.baseline-mode-toggle button:disabled { opacity: .5; cursor: not-allowed; }
+@media (max-width: 760px) {
+  .baseline-run-controls { grid-template-columns: 1fr; }
+}
+
 /* BLOCK_ITERATIVE_VERIFIED_COHORT_BASELINE_V1 */
 .baseline-fast-flow,
 .baseline-cohort-suggestion,
