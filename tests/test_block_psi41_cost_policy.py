@@ -80,14 +80,29 @@ class Psi41CostPolicyTests(unittest.TestCase):
             source,
         )
 
-    def test_yarn_resolver_seed_remains_fail_closed(self) -> None:
-        source = (ROOT / "package_manager_profile.py").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn(
-            "YARN1_RESOLVER_SEED_CONTINUATION_UNSUPPORTED",
-            source,
-        )
+    def test_yarn_resolver_seed_remains_fail_closed_outside_certified_runtime(self) -> None:
+        import block_psi57_yarn1_resolver_seed as seed_module
+
+        with patch.object(seed_module.os, "name", "posix"), patch.object(
+            seed_module, "yarn1_runtime_version", return_value="1.22.22"
+        ):
+            supported, version = seed_module.yarn1_resolver_seed_runtime_supported("yarn")
+            self.assertFalse(supported)
+            self.assertEqual("1.22.22", version)
+
+        with patch.object(seed_module.os, "name", "nt"), patch.object(
+            seed_module, "yarn1_runtime_version", return_value="1.22.21"
+        ):
+            supported, version = seed_module.yarn1_resolver_seed_runtime_supported("yarn")
+            self.assertFalse(supported)
+            self.assertEqual("1.22.21", version)
+
+        with patch.object(seed_module.os, "name", "nt"), patch.object(
+            seed_module, "yarn1_runtime_version", return_value="1.22.22"
+        ):
+            supported, version = seed_module.yarn1_resolver_seed_runtime_supported("yarn")
+            self.assertTrue(supported)
+            self.assertEqual("1.22.22", version)
 
     def test_arbitrary_shell_project_proof_policy_unchanged(self) -> None:
         self.assertFalse(
