@@ -7616,6 +7616,38 @@ def _coordinate_solver_global_exclusions(
     return assignment
 
 
+def _solver_navigation_stability_targets(
+    *,
+    residual_targets: Mapping[str, str],
+    diagnostic_preferences: Mapping[str, str],
+    domains: Mapping[str, Sequence[str]],
+) -> Dict[str, str]:
+    """Merge diagnostic navigation into the existing soft stability objective.
+
+    This is scheduling/cost only. Diagnostic preferences never prune a domain,
+    never become a clause, and therefore cannot create UNSAT proof authority.
+    Explicit residual/approved targets always take precedence.
+    """
+    targets = {
+        str(name): str(version)
+        for name, version in residual_targets.items()
+        if str(name) and str(version)
+    }
+    for name, version in sorted(diagnostic_preferences.items()):
+        normalized_name = str(name)
+        normalized_version = str(version)
+        if (
+            not normalized_name
+            or not normalized_version
+            or normalized_name in targets
+        ):
+            continue
+        if normalized_version not in tuple(domains.get(normalized_name, ())):
+            continue
+        targets[normalized_name] = normalized_version
+    return targets
+
+
 def resolve_peer_compatibility(
     rows_by_project: Dict[str, List[DependencyRow]],
     client: LiveDataClient,
@@ -7714,6 +7746,26 @@ def resolve_peer_compatibility(
                     "authority=DIAGNOSTIC_HINT; domain remains complete"
                 )
 
+            solver_stability_targets = _solver_navigation_stability_targets(
+                residual_targets=residual_targets,
+                diagnostic_preferences=diagnostic_preferences,
+                domains=domains,
+            )
+            for preferred_name, preferred_version in sorted(
+                diagnostic_preferences.items()
+            ):
+                if (
+                    preferred_name not in residual_targets
+                    and solver_stability_targets.get(preferred_name)
+                    == preferred_version
+                ):
+                    eprint(
+                        f"[info] {project}: diagnostic-navigation-objective {mode}; "
+                        f"package={preferred_name}, preferred={preferred_version}, "
+                        "authority=DIAGNOSTIC_HINT; objective-only, "
+                        "domain remains complete"
+                    )
+
             domains, fixed_peer_stats = _apply_fixed_peer_constant_constraints(
                 solver_rows_by_name, fixed_rows_by_name, domains, client,
             )
@@ -7762,7 +7814,7 @@ def resolve_peer_compatibility(
                         mode,
                         learned_nogoods,
                         solver_config,
-                        residual_targets,
+                        solver_stability_targets,
                     )
                     shadow_status = str(pre_shadow_report.get("status") or "")
                     if shadow_status == "unavailable":
@@ -7794,7 +7846,7 @@ def resolve_peer_compatibility(
                         mode,
                         learned_nogoods,
                         solver_config,
-                        residual_targets,
+                        solver_stability_targets,
                     )
                     exact_status = str(exact_report.get("status") or "")
                     if exact_status == "optimal" and isinstance(exact_report.get("assignment"), dict):
@@ -7971,7 +8023,7 @@ def resolve_peer_compatibility(
                         mode,
                         learned_nogoods,
                         solver_config,
-                        residual_targets,
+                        solver_stability_targets,
                     )
                 except GlobalExactExclusionError as exc:
                     terminal_status = _terminal_status_for_global_exact_reason(exc.reason)
@@ -11278,6 +11330,7 @@ def resolve_peer_compatibility_with_verification(
                     # may steer the next exact solve by reordering a complete domain,
                     # but cannot create a clause or prune any version.
                     predicate_search_steered = False
+                    predicate_search_handoff_to_generalization = False
                     if expected_structural:
                         for target_predicate in sorted(expected_structural):
                             predicate_pkg = predicate_package(target_predicate)
@@ -11553,6 +11606,40 @@ def resolve_peer_compatibility_with_verification(
                                     f"authority={EVIDENCE_DIAGNOSTIC_HINT}; solver domain remains complete"
                                 )
 
+                                predicate_search_handoff_to_generalization = bool(
+                                    anytime.incumbent is None
+                                    and anytime.search_mode
+                                    != BaselineSearchMode.EXHAUSTIVE
+                                    and search_result.repeat_count >= 3
+                                )
+                                if predicate_search_handoff_to_generalization:
+                                    progress_reporter.emit(
+                                        project,
+                                        mode,
+                                        "predicate-search-handoff-to-generalization",
+                                        iteration=iteration,
+                                        assignment=fingerprint,
+                                        package=predicate_pkg,
+                                        predicate=target_predicate,
+                                        preferredVersion=preferred_version,
+                                        repeatCount=search_result.repeat_count,
+                                        authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                    )
+                                    eprint(
+                                        f"[info] {project}: predicate search handoff {mode}; "
+                                        f"package={predicate_pkg}, "
+                                        f"preferred={preferred_version}, "
+                                        f"predicate={target_predicate}, "
+                                        f"repeat={search_result.repeat_count}; "
+                                        "bounded graph proposal gets a chance before "
+                                        "another exact-only iteration"
+                                    )
+                                    # Do not publish the exact exclusion here. The
+                                    # common generalization/fallback path below will
+                                    # publish this freshly confirmed exact point even
+                                    # if graph certification remains diagnostic.
+                                    break
+
                                 # The current full assignment itself was freshly
                                 # confirmed above, so excluding exactly that point is
                                 # authoritative. Probe observations remain diagnostic.
@@ -11590,15 +11677,23 @@ def resolve_peer_compatibility_with_verification(
                         continue
 
                     generalized_nogood: Optional[Dict[str, str]] = None
+                    escape_repeat_count = max(
+                        int(anytime.repeated_predicate_count or 0),
+                        3 if predicate_search_handoff_to_generalization else 0,
+                    )
                     deep_search_allowed = _baseline_deep_search_allowed(
                         has_incumbent=anytime.incumbent is not None,
                         search_mode=anytime.search_mode,
-                        repeated_predicate_count=anytime.repeated_predicate_count,
+                        repeated_predicate_count=escape_repeat_count,
                     )
                     repeated_predicate_escape = bool(
-                        anytime.incumbent is None
-                        and anytime.search_mode != BaselineSearchMode.EXHAUSTIVE
-                        and anytime.repeated_predicate_count >= 3
+                        predicate_search_handoff_to_generalization
+                        or (
+                            anytime.incumbent is None
+                            and anytime.search_mode
+                            != BaselineSearchMode.EXHAUSTIVE
+                            and escape_repeat_count >= 3
+                        )
                     )
                     if repeated_predicate_escape:
                         progress_reporter.emit(
@@ -11607,8 +11702,12 @@ def resolve_peer_compatibility_with_verification(
                             "pre-incumbent-repeated-predicate-escape",
                             iteration=iteration,
                             assignment=fingerprint,
-                            predicate=anytime.repeated_predicate,
-                            repeatCount=anytime.repeated_predicate_count,
+                            predicate=(
+                                target_predicate
+                                if predicate_search_handoff_to_generalization
+                                else anytime.repeated_predicate
+                            ),
+                            repeatCount=escape_repeat_count,
                             authority="DIAGNOSTIC_HINT",
                         )
                     if deep_search_allowed:
