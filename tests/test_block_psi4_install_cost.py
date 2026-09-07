@@ -53,7 +53,7 @@ class Psi4InstallCostTests(unittest.TestCase):
             self.assertEqual(requested, allowed)
             self.assertEqual("legacy-explicit-policy", reason)
 
-    def test_yarn_classic_seed_continuation_is_fail_closed(self) -> None:
+    def test_yarn_classic_seed_continuation_is_candidate_capable_but_not_logical_only(self) -> None:
         profile = pm.PackageManagerProfile(
             manager="yarn",
             family="yarn-classic",
@@ -64,11 +64,17 @@ class Psi4InstallCostTests(unittest.TestCase):
             authoritative_supported=True,
         )
         capability = pm.resolver_seed_continuation_capability(profile)
-        self.assertFalse(capability.supported)
+        self.assertTrue(capability.supported)
+        self.assertEqual(
+            "yarn1-private-resolver-seed-integrity-reset-v1",
+            capability.strategy,
+        )
         self.assertIn(
-            "YARN1_RESOLVER_SEED_CONTINUATION_UNSUPPORTED",
+            "YARN1_RESOLVER_SEED_CONTINUATION_CERTIFIED",
             capability.reason,
         )
+        # Ψ.5.7 reuses a physical resolver tree only. It does not introduce
+        # a logical-only package-manager resolver or weaken ResolverProof.
         self.assertFalse(
             pm.logical_resolution_without_materialization_supported(profile)
         )
@@ -150,9 +156,12 @@ class Psi4InstallCostTests(unittest.TestCase):
         )
         self.assertIn("PSI4_INTERMEDIATE_DURABLE_SEAL_SKIPPED", source)
         self.assertIn("PSI4_PERSISTENT_CONTROL_PREPARED_HIT", source)
-        self.assertIn(
-            "PSI4_RESOLVER_SEED_CONTINUATION_UNSUPPORTED", source
-        )
+        # Ψ.5.7 supersedes the old unconditional Ψ.4 unsupported marker.
+        # The family is candidate-capable, while the exact Windows/Yarn runtime
+        # gate and any seed validation failure remain fail-closed.
+        self.assertIn("# BLOCK_PSI57_YARN1_RESOLVER_SEED_V1", source)
+        self.assertIn('"resolver-seed.hit"', source)
+        self.assertIn('"resolver-seed.fallback"', source)
 
     def test_arbitrary_shell_project_proof_policy_unchanged(self) -> None:
         self.assertFalse(
