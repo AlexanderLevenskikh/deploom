@@ -158,6 +158,16 @@ from block_psi55_resolver_overrides import (
     resolver_override_fingerprint,
     resolver_override_log_label,
 )
+from block_psi56_causal_anytime_search import (
+    PromisingAssignmentQueue,
+    build_promising_assignment,
+    causal_decision_projection,
+    select_projected_followup,
+)
+from block_v_prepared_artifact import (
+    SEARCH_PRIORITY_PROMISING,
+    prioritize_prepared_artifact_record,
+)
 from project_topology import (
     ProjectTopologyError,
     discover_project_package_directories,
@@ -9920,6 +9930,9 @@ def resolve_peer_compatibility_with_verification(
     # Ψ.5.4 continuation has a strict physical-probe budget per project/mode.
     # Persisted state never replenishes or manufactures same-run branch evidence.
     predicate_branch_probes_used: Dict[Tuple[str, str], int] = {}
+    # Ψ.5.6 exact diagnostic points are same-run scheduling state only.
+    # Persisted predicate preferences cannot reconstruct an exact assignment.
+    pending_promising_assignments = PromisingAssignmentQueue()
     learned: Dict[str, Dict[str, List[Dict[str, str]]]] = {
         project: {mode: [] for mode in modes} for project in rows_by_project
     }
@@ -10747,6 +10760,49 @@ def resolve_peer_compatibility_with_verification(
                         )
                     raise
                 assignment = candidate_map[project][mode]
+                promising_candidate = pending_promising_assignments.pop(project, mode)
+                if promising_candidate is not None:
+                    promising_assignment = promising_candidate.assignment_dict
+                    promising_identity = assignment_fingerprint(promising_assignment)
+                    if promising_identity != promising_candidate.assignment_fingerprint:
+                        raise BaselineConstraintVerificationError(
+                            f"PSI56_PROMISING_ASSIGNMENT_IDENTITY_MISMATCH: {project}/{mode}: "
+                            f"stored={promising_candidate.assignment_fingerprint}, "
+                            f"observed={promising_identity}"
+                        )
+                    assignment = promising_assignment
+                    solver_statuses.setdefault(project, {})[mode] = {}
+                    if promising_candidate.preparation_proof_key:
+                        prioritize_prepared_artifact_record(
+                            promising_candidate.preparation_proof_key,
+                            priority=SEARCH_PRIORITY_PROMISING,
+                        )
+                    progress_reporter.emit(
+                        project,
+                        mode,
+                        "promising-assignment-prioritized",
+                        iteration=iteration,
+                        candidate=promising_identity,
+                        originatingPredicate=promising_candidate.originating_predicate,
+                        removedPredicates=list(promising_candidate.removed_predicates),
+                        remainingPredicates=list(promising_candidate.remaining_predicates),
+                        authority=EVIDENCE_DIAGNOSTIC_HINT,
+                    )
+                    emit_observability_event(
+                        "baseline.search.promising-prioritized",
+                        project=project,
+                        mode=mode,
+                        iteration=iteration,
+                        candidate=promising_identity,
+                        authority=EVIDENCE_DIAGNOSTIC_HINT,
+                    )
+                    eprint(
+                        f"[info] {project}: exact promising assignment prioritized {mode}; "
+                        f"candidate={promising_identity}, "
+                        f"origin={promising_candidate.originating_predicate}, "
+                        f"authority={EVIDENCE_DIAGNOSTIC_HINT}; "
+                        "ordinary full Baseline verification remains authoritative"
+                    )
                 component_statuses = solver_statuses.get(project, {}).get(mode, {})
                 unknown_budget_names = sorted(
                     name for name, status in component_statuses.items() if status == "unknown_budget"
@@ -11680,6 +11736,18 @@ def resolve_peer_compatibility_with_verification(
                             targetedPackages=[implicated] if implicated else [],
                             relaxationReason="repeated-predicate-no-authoritative-learning",
                         )
+                        progress_reporter.emit(
+                            project,
+                            mode,
+                            "search-strategy-switched",
+                            iteration=iteration,
+                            assignment=fingerprint,
+                            predicate=failure_predicate,
+                            strategyBefore="exact-neighbor-refinement",
+                            strategyAfter=anytime.search_strategy,
+                            reason="repeated-predicate-no-authoritative-learning",
+                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                        )
 
                     # BLOCK_VF_ACTIVE_PREDICATE_EXECUTION_V1
                     # Exact confirmation above is the authority boundary. Point
@@ -11689,13 +11757,78 @@ def resolve_peer_compatibility_with_verification(
                     predicate_search_steered = False
                     predicate_search_handoff_to_generalization = False
                     if expected_structural:
+                        # BLOCK_PSI56_CAUSAL_ANYTIME_SEARCH_V1
                         for target_predicate in sorted(expected_structural):
-                            predicate_pkg = predicate_package(target_predicate)
+                            predicate_subject = predicate_package(target_predicate)
+                            predicate_pkg = predicate_subject
                             current_probe_version = str(
                                 verification_assignment.get(predicate_pkg, "")
                             )
                             if not predicate_pkg or not current_probe_version:
-                                continue
+                                navigation_graph, subject_consumers = (
+                                    _baseline_cohort_navigation_context(
+                                        rows_by_name,
+                                        verification_assignment,
+                                        client,
+                                    )
+                                )
+                                causal_projection = causal_decision_projection(
+                                    predicate=target_predicate,
+                                    direct_packages=verification_assignment.keys(),
+                                    subject_consumers=subject_consumers,
+                                    interaction_graph=navigation_graph,
+                                )
+                                if not causal_projection.ranked_packages:
+                                    progress_reporter.emit(
+                                        project,
+                                        mode,
+                                        "causal-projection-empty",
+                                        iteration=iteration,
+                                        assignment=fingerprint,
+                                        predicate=target_predicate,
+                                        subject=predicate_subject,
+                                        authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                    )
+                                    continue
+                                predicate_pkg = causal_projection.ranked_packages[0]
+                                current_probe_version = str(
+                                    verification_assignment.get(predicate_pkg, "")
+                                )
+                                if not current_probe_version:
+                                    continue
+                                progress_reporter.emit(
+                                    project,
+                                    mode,
+                                    "causal-projection-created",
+                                    iteration=iteration,
+                                    assignment=fingerprint,
+                                    predicate=target_predicate,
+                                    subject=predicate_subject,
+                                    rankedPackages=list(causal_projection.ranked_packages),
+                                    graphBackedPackages=list(causal_projection.graph_backed_packages),
+                                    priorOnlyPackages=list(causal_projection.prior_only_packages),
+                                    reasons=causal_projection.reason_map(),
+                                    confidence=causal_projection.confidence,
+                                    authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                )
+                                progress_reporter.emit(
+                                    project,
+                                    mode,
+                                    "search-information-gain",
+                                    iteration=iteration,
+                                    assignment=fingerprint,
+                                    gainKind="CAUSAL_PROJECTION_DISCOVERED",
+                                    predicate=target_predicate,
+                                    targetedPackage=predicate_pkg,
+                                    authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                )
+                                eprint(
+                                    f"[info] {project}: causal predicate projection {mode}; "
+                                    f"predicate={target_predicate}, subject={predicate_subject or '<none>'}, "
+                                    f"direct={list(causal_projection.ranked_packages)}, "
+                                    f"selected={predicate_pkg}, confidence={causal_projection.confidence}, "
+                                    f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
+                                )
                             meta = client.npm_cache.get(predicate_pkg)
                             row = rows_by_name.get(predicate_pkg)
                             if not isinstance(meta, dict) or row is None:
@@ -11963,6 +12096,63 @@ def resolve_peer_compatibility_with_verification(
                                     f"authority={EVIDENCE_DIAGNOSTIC_HINT}; solver domain remains complete"
                                 )
 
+                                fresh_preferred_executions = [
+                                    execution
+                                    for execution in search_result.executions
+                                    if execution.version == preferred_version
+                                    and execution.outcome == PROBE_OUTCOME_ABSENT
+                                ]
+                                if len(fresh_preferred_executions) == 1:
+                                    promising_assignment = controlled_probe_assignment(
+                                        verification_assignment,
+                                        package=predicate_pkg,
+                                        version=preferred_version,
+                                    )
+                                    promising_fingerprint = assignment_fingerprint(
+                                        promising_assignment
+                                    )
+                                    fresh_execution = fresh_preferred_executions[0]
+                                    if (
+                                        fresh_execution.assignment_fingerprint
+                                        == promising_fingerprint
+                                    ):
+                                        pending_promising_assignments.offer(
+                                            project,
+                                            mode,
+                                            build_promising_assignment(
+                                                assignment=promising_assignment,
+                                                assignment_fingerprint=promising_fingerprint,
+                                                originating_predicate=target_predicate,
+                                                removed_predicates=(target_predicate,),
+                                                remaining_predicates=fresh_execution.other_predicates,
+                                            ),
+                                        )
+                                        progress_reporter.emit(
+                                            project,
+                                            mode,
+                                            "promising-assignment-created",
+                                            iteration=iteration,
+                                            assignment=fingerprint,
+                                            candidate=promising_fingerprint,
+                                            originatingPredicate=target_predicate,
+                                            removedPredicates=[target_predicate],
+                                            remainingPredicates=list(
+                                                fresh_execution.other_predicates
+                                            ),
+                                            source="predicate-active-probe",
+                                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                        )
+                                        progress_reporter.emit(
+                                            project,
+                                            mode,
+                                            "search-information-gain",
+                                            iteration=iteration,
+                                            assignment=fingerprint,
+                                            candidate=promising_fingerprint,
+                                            gainKind="PROMISING_ASSIGNMENT_FOUND",
+                                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                        )
+
                                 # BLOCK_PSI54_PREDICATE_BRANCH_CONTINUATION_V1
                                 # A fresh point that removed the current predicate
                                 # but exposed another structural predicate is more
@@ -12080,6 +12270,63 @@ def resolve_peer_compatibility_with_verification(
                                                     )
                                                 ),
                                             )
+                                            if followup is None:
+                                                branch_navigation_graph, branch_subject_consumers = (
+                                                    _baseline_cohort_navigation_context(
+                                                        rows_by_name,
+                                                        branch_assignment,
+                                                        client,
+                                                    )
+                                                )
+                                                projected_followup = select_projected_followup(
+                                                    predicates=branch_remaining,
+                                                    assignment=branch_assignment,
+                                                    subject_consumers=branch_subject_consumers,
+                                                    interaction_graph=branch_navigation_graph,
+                                                    visited_packages=tuple(
+                                                        sorted(branch_visited_packages)
+                                                    ),
+                                                )
+                                                if projected_followup is not None:
+                                                    (
+                                                        projected_predicate,
+                                                        projected_package,
+                                                        branch_projection,
+                                                    ) = projected_followup
+                                                    followup = (
+                                                        projected_predicate,
+                                                        projected_package,
+                                                    )
+                                                    progress_reporter.emit(
+                                                        project,
+                                                        mode,
+                                                        "causal-branch-selected",
+                                                        iteration=iteration,
+                                                        assignment=fingerprint,
+                                                        branchAssignment=branch_fingerprint,
+                                                        predicate=projected_predicate,
+                                                        package=projected_package,
+                                                        rankedPackages=list(
+                                                            branch_projection.ranked_packages
+                                                        ),
+                                                        graphBackedPackages=list(
+                                                            branch_projection.graph_backed_packages
+                                                        ),
+                                                        reasons=branch_projection.reason_map(),
+                                                        confidence=branch_projection.confidence,
+                                                        authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                                    )
+                                                    progress_reporter.emit(
+                                                        project,
+                                                        mode,
+                                                        "search-information-gain",
+                                                        iteration=iteration,
+                                                        assignment=fingerprint,
+                                                        gainKind="CAUSAL_PROJECTION_DISCOVERED",
+                                                        predicate=projected_predicate,
+                                                        targetedPackage=projected_package,
+                                                        authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                                    )
                                             if followup is None:
                                                 break
                                             (
@@ -12524,6 +12771,90 @@ def resolve_peer_compatibility_with_verification(
                                             ):
                                                 break
 
+                                            branch_preparation_key = str(
+                                                getattr(
+                                                    branch_result,
+                                                    "preparation_proof_key",
+                                                    "",
+                                                )
+                                                or ""
+                                            )
+                                            branch_promising = build_promising_assignment(
+                                                assignment=branch_candidate,
+                                                assignment_fingerprint=(
+                                                    branch_candidate_fingerprint
+                                                ),
+                                                originating_predicate=(
+                                                    branch_predicate
+                                                ),
+                                                removed_predicates=(
+                                                    branch_predicate,
+                                                ),
+                                                remaining_predicates=(
+                                                    branch_execution.other_predicates
+                                                ),
+                                                preparation_proof_key=(
+                                                    branch_preparation_key
+                                                ),
+                                            )
+                                            pending_promising_assignments.offer(
+                                                project,
+                                                mode,
+                                                branch_promising,
+                                            )
+                                            priority_retained = False
+                                            if branch_preparation_key:
+                                                priority_retained = (
+                                                    prioritize_prepared_artifact_record(
+                                                        branch_preparation_key,
+                                                        priority=(
+                                                            SEARCH_PRIORITY_PROMISING
+                                                        ),
+                                                    )
+                                                )
+                                            progress_reporter.emit(
+                                                project,
+                                                mode,
+                                                "promising-assignment-created",
+                                                iteration=iteration,
+                                                assignment=fingerprint,
+                                                candidate=(
+                                                    branch_candidate_fingerprint
+                                                ),
+                                                originatingPredicate=(
+                                                    branch_predicate
+                                                ),
+                                                removedPredicates=[
+                                                    branch_predicate
+                                                ],
+                                                remainingPredicates=list(
+                                                    branch_execution.other_predicates
+                                                ),
+                                                source="predicate-causal-branch",
+                                                preparedCachePriorityRetained=(
+                                                    priority_retained
+                                                ),
+                                                authority=(
+                                                    EVIDENCE_DIAGNOSTIC_HINT
+                                                ),
+                                            )
+                                            progress_reporter.emit(
+                                                project,
+                                                mode,
+                                                "search-information-gain",
+                                                iteration=iteration,
+                                                assignment=fingerprint,
+                                                candidate=(
+                                                    branch_candidate_fingerprint
+                                                ),
+                                                gainKind=(
+                                                    "PROMISING_ASSIGNMENT_FOUND"
+                                                ),
+                                                authority=(
+                                                    EVIDENCE_DIAGNOSTIC_HINT
+                                                ),
+                                            )
+
                                             predicate_state_store.set_preferred_version(
                                                 project,
                                                 mode,
@@ -12608,6 +12939,7 @@ def resolve_peer_compatibility_with_verification(
                                             authority=EVIDENCE_DIAGNOSTIC_HINT,
                                         )
 
+                                # BLOCK_PSI56_CAUSAL_ANYTIME_SEARCH_END
                                 predicate_search_handoff_to_generalization = bool(
                                     anytime.incumbent is None
                                     and anytime.search_mode

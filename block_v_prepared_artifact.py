@@ -156,6 +156,57 @@ _DEFAULT_GC_PAUSE_SECONDS = 5.0
 # not bypass content continuity validation and stale crash pins expire.
 _PIN_MAX_AGE_SECONDS = 6 * 60 * 60
 
+# BLOCK_PSI56_SEARCH_AWARE_PREPARED_CACHE_V1
+# Same-run search priority changes eviction order only. It never bypasses
+# continuity/integrity validation and never expands the hard artifact count.
+_SEARCH_PRIORITY_LOCK = threading.RLock()
+_SEARCH_PRIORITIES: dict[str, tuple[int, float]] = {}
+SEARCH_PRIORITY_PROMISING = 50
+
+
+def prioritize_prepared_artifact_record(
+    key: str,
+    *,
+    priority: int = SEARCH_PRIORITY_PROMISING,
+    ttl_seconds: float = 20 * 60,
+) -> bool:
+    try:
+        normalized = _valid_key(key)
+    except ValueError:
+        return False
+    expires_at = time.monotonic() + max(1.0, float(ttl_seconds))
+    with _SEARCH_PRIORITY_LOCK:
+        _SEARCH_PRIORITIES[normalized] = (int(priority), expires_at)
+    emit_observability_event(
+        "prepared-artifact.search-priority",
+        artifactKey=normalized,
+        priority=int(priority),
+        ttlSeconds=max(1, int(ttl_seconds)),
+        authority="PERFORMANCE_ONLY",
+    )
+    return True
+
+
+def _artifact_search_priority(key: str) -> int:
+    try:
+        normalized = _valid_key(key)
+    except ValueError:
+        return 0
+    with _SEARCH_PRIORITY_LOCK:
+        entry = _SEARCH_PRIORITIES.get(normalized)
+        if entry is None:
+            return 0
+        priority, expires_at = entry
+        if time.monotonic() >= expires_at:
+            _SEARCH_PRIORITIES.pop(normalized, None)
+            return 0
+        return int(priority)
+
+
+def _clear_prepared_artifact_search_priorities_for_tests() -> None:
+    with _SEARCH_PRIORITY_LOCK:
+        _SEARCH_PRIORITIES.clear()
+
 
 def _pin_root(root: Optional[Path] = None) -> Optional[Path]:
     target = root or configured_prepared_artifact_root()
@@ -819,6 +870,8 @@ def load_prepared_artifact_record(
 
 def invalidate_prepared_artifact_record(key: str, *, remove_tree: bool = False) -> bool:
     normalized_key = _valid_key(key)
+    with _SEARCH_PRIORITY_LOCK:
+        _SEARCH_PRIORITIES.pop(normalized_key, None)
     _retire_validation_watchers(key=normalized_key)
     with _INTEGRITY_VALIDATION_LOCK:
         _VALIDATED_CONTENT.difference_update([
@@ -902,7 +955,10 @@ def prune_prepared_artifact_store(
     try:
         records = sorted(
             [path for path in index.glob("*.json") if path.is_file()],
-            key=lambda path: path.stat().st_mtime,
+            key=lambda path: (
+                _artifact_search_priority(path.stem),
+                path.stat().st_mtime,
+            ),
             reverse=True,
         )
     except OSError:
@@ -913,7 +969,16 @@ def prune_prepared_artifact_store(
         if _artifact_key_pinned(record.stem):
             emit_observability_event("prepared-artifact.gc-skip", artifactKey=record.stem, reason="active-same-run-pin")
             continue
+        search_priority = _artifact_search_priority(record.stem)
         if invalidate_prepared_artifact_record(record.stem, remove_tree=True):
+            if search_priority:
+                emit_observability_event(
+                    "prepared-artifact.search-priority-evicted",
+                    artifactKey=record.stem,
+                    priority=search_priority,
+                    reason="hard-cache-count-pressure",
+                    authority="PERFORMANCE_ONLY",
+                )
             removed += 1
             if removal_limit is not None and removed >= removal_limit:
                 break
