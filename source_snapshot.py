@@ -1041,8 +1041,11 @@ def activate_source_snapshot_epoch(
         if existing is not None:
             _ACTIVE.pop(key, None)
             watcher_entry = _ACTIVE_WATCHERS.pop(key, None)
+            live_watcher_entry = _LIVE_SOURCE_WATCHERS.pop(key, None)
             if watcher_entry is not None:
                 watcher_entry[1].stop()
+            if live_watcher_entry is not None:
+                live_watcher_entry[1].stop()
             _force_rmtree(existing.container)
             _ALL_CONTAINERS.discard(existing.container)
         snapshot = capture_source_snapshot(
@@ -1460,9 +1463,11 @@ def clear_source_snapshot_epochs() -> None:
     with _LOCK:
         snapshots = list(_ACTIVE.values())
         watchers = [entry[1] for entry in _ACTIVE_WATCHERS.values()]
+        live_watchers = [entry[1] for entry in _LIVE_SOURCE_WATCHERS.values()]
         _ACTIVE.clear()
         _ACTIVE_WATCHERS.clear()
-    for watcher in watchers:
+        _LIVE_SOURCE_WATCHERS.clear()
+    for watcher in [*watchers, *live_watchers]:
         watcher.stop()
     for snapshot in snapshots:
         _force_rmtree(snapshot.container)

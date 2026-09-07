@@ -25,6 +25,7 @@ type WorkerRecord = {
   closed: boolean
   idleTimer?: ReturnType<typeof setTimeout>
   forceTimer?: ReturnType<typeof setTimeout>
+  retire?: (message: string, mode: 'graceful' | 'force') => void
 }
 
 export class BaselineWorkerPool {
@@ -109,6 +110,7 @@ export class BaselineWorkerPool {
         if (!record.closed) this.terminateTree(record.child)
       }, this.gracefulShutdownTimeoutMs)
     }
+    record.retire = beginRetirement
 
     const scheduleIdle = () => {
       if (!record.alive || record.pending.size > 0) return
@@ -119,6 +121,12 @@ export class BaselineWorkerPool {
       }, this.idleTimeoutMs)
     }
 
+    child.stdin.on('error', error => {
+      beginRetirement(
+        `BASELINE_WORKER_STDIN_FAILED: ${error.message}`,
+        'force',
+      )
+    })
     child.on('error', error => {
       beginRetirement(`BASELINE_WORKER_START_FAILED: ${error.message}`, 'force')
     })
@@ -238,13 +246,30 @@ export class BaselineWorkerPool {
       reject: rejectRequest,
       onOutput: request.onOutput,
     })
-    record.child.stdin.write(`${JSON.stringify({
+    const activeRecord = record
+    const payload = `${JSON.stringify({
       id,
       cwd: request.cwd,
       argv: request.argv,
       env: request.env ?? {},
-    })}\n`, 'utf8')
-    return { child: record.child, result }
+    })}\n`
+    const retireWriteFailure = (error: unknown) => {
+      const normalized = error instanceof Error
+        ? error
+        : new Error(String(error))
+      activeRecord.retire?.(
+        `BASELINE_WORKER_STDIN_FAILED: ${normalized.message}`,
+        'force',
+      )
+    }
+    try {
+      activeRecord.child.stdin.write(payload, 'utf8', error => {
+        if (error) retireWriteFailure(error)
+      })
+    } catch (error) {
+      retireWriteFailure(error)
+    }
+    return { child: activeRecord.child, result }
   }
 
   dispose(kill: (child: ChildProcessWithoutNullStreams) => void): void {
