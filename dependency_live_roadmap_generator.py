@@ -9848,6 +9848,7 @@ def resolve_peer_compatibility_with_verification(
     from block_v_predicate_search import (
         PredicateObservation,
         PredicateProbePolicy,
+        controlled_probe_assignment,
         load_hint_snapshot,
         predicate_package,
         prioritize_probe_preference,
@@ -9861,6 +9862,12 @@ def resolve_peer_compatibility_with_verification(
         ProbeExecution,
         run_active_predicate_search,
     )
+    from block_psi54_branch_search import (
+        PredicateBranchPolicy,
+        choose_followup_version,
+        fresh_predicate_branch_seed,
+        select_followup_predicate,
+    )
     compatibility_hints = load_hint_snapshot(
         os.environ.get("DEPLOOM_COMPATIBILITY_HINTS")
     )
@@ -9873,6 +9880,9 @@ def resolve_peer_compatibility_with_verification(
     predicate_diagnostic_preferences: Dict[
         str, Dict[str, Dict[str, str]]
     ] = {}
+    # Ψ.5.4 continuation has a strict physical-probe budget per project/mode.
+    # Persisted state never replenishes or manufactures same-run branch evidence.
+    predicate_branch_probes_used: Dict[Tuple[str, str], int] = {}
     learned: Dict[str, Dict[str, List[Dict[str, str]]]] = {
         project: {mode: [] for mode in modes} for project in rows_by_project
     }
@@ -9919,6 +9929,9 @@ def resolve_peer_compatibility_with_verification(
                 eprint(f"[info] {project}: Baseline structural checks auto-discovered: {', '.join(fallback_commands)}")
         config = BaselineVerifyConfig.from_mapping(spec.constraint_verify_config, fallback_commands=fallback_commands)
         predicate_probe_policy = PredicateProbePolicy.from_sources(
+            spec.constraint_verify_config, os.environ
+        )
+        predicate_branch_policy = PredicateBranchPolicy.from_sources(
             spec.constraint_verify_config, os.environ
         )
         verification_telemetry_path = (
@@ -11605,6 +11618,651 @@ def resolve_peer_compatibility_with_verification(
                                     f"probes={len(search_result.executions)}, "
                                     f"authority={EVIDENCE_DIAGNOSTIC_HINT}; solver domain remains complete"
                                 )
+
+                                # BLOCK_PSI54_PREDICATE_BRANCH_CONTINUATION_V1
+                                # A fresh point that removed the current predicate
+                                # but exposed another structural predicate is more
+                                # informative than immediately returning to a global
+                                # exact solve. Continue that exact same-run branch
+                                # under a tiny cost budget. Everything produced here
+                                # remains navigation/point evidence only.
+                                branch_budget_key = (project, mode)
+                                branch_used_before = predicate_branch_probes_used.get(
+                                    branch_budget_key, 0
+                                )
+                                branch_seed = fresh_predicate_branch_seed(
+                                    package=predicate_pkg,
+                                    predicate=target_predicate,
+                                    preferred_version=preferred_version,
+                                    executions=search_result.executions,
+                                )
+                                if (
+                                    predicate_branch_policy.enabled
+                                    and branch_seed is not None
+                                    and branch_used_before
+                                    < predicate_branch_policy.probe_budget
+                                ):
+                                    branch_assignment = controlled_probe_assignment(
+                                        verification_assignment,
+                                        package=predicate_pkg,
+                                        version=preferred_version,
+                                    )
+                                    branch_fingerprint = assignment_fingerprint(
+                                        branch_assignment
+                                    )
+                                    if (
+                                        branch_fingerprint
+                                        != branch_seed.assignment_fingerprint
+                                    ):
+                                        progress_reporter.emit(
+                                            project,
+                                            mode,
+                                            "predicate-branch-continuation-skipped",
+                                            iteration=iteration,
+                                            assignment=fingerprint,
+                                            sourcePackage=predicate_pkg,
+                                            sourcePredicate=target_predicate,
+                                            preferredVersion=preferred_version,
+                                            reason="fresh-point-identity-mismatch",
+                                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                        )
+                                    else:
+                                        branch_remaining = (
+                                            branch_seed.other_predicates
+                                        )
+                                        branch_source_package = predicate_pkg
+                                        branch_visited_packages = {
+                                            predicate_pkg.lower()
+                                        }
+                                        progress_reporter.emit(
+                                            project,
+                                            mode,
+                                            "predicate-branch-continuation-selected",
+                                            iteration=iteration,
+                                            assignment=fingerprint,
+                                            branchAssignment=branch_fingerprint,
+                                            sourcePackage=predicate_pkg,
+                                            sourcePredicate=target_predicate,
+                                            preferredVersion=preferred_version,
+                                            remainingPredicates=list(
+                                                branch_remaining
+                                            ),
+                                            maxDepth=(
+                                                predicate_branch_policy.max_depth
+                                            ),
+                                            remainingProbeBudget=max(
+                                                0,
+                                                predicate_branch_policy.probe_budget
+                                                - branch_used_before,
+                                            ),
+                                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                        )
+                                        eprint(
+                                            f"[info] {project}: predicate branch "
+                                            f"continuation selected {mode}; "
+                                            f"source={predicate_pkg}@"
+                                            f"{preferred_version}, "
+                                            f"remaining={len(branch_remaining)}, "
+                                            f"budget="
+                                            f"{predicate_branch_policy.probe_budget - branch_used_before}, "
+                                            f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
+                                        )
+
+                                        for branch_depth in range(
+                                            1,
+                                            predicate_branch_policy.max_depth
+                                            + 1,
+                                        ):
+                                            branch_used = (
+                                                predicate_branch_probes_used.get(
+                                                    branch_budget_key, 0
+                                                )
+                                            )
+                                            if (
+                                                branch_used
+                                                >= predicate_branch_policy.probe_budget
+                                            ):
+                                                break
+
+                                            followup = select_followup_predicate(
+                                                predicates=branch_remaining,
+                                                source_package=(
+                                                    branch_source_package
+                                                ),
+                                                assignment=branch_assignment,
+                                                visited_packages=tuple(
+                                                    sorted(
+                                                        branch_visited_packages
+                                                    )
+                                                ),
+                                            )
+                                            if followup is None:
+                                                break
+                                            (
+                                                branch_predicate,
+                                                branch_pkg,
+                                            ) = followup
+                                            branch_current_version = str(
+                                                branch_assignment.get(
+                                                    branch_pkg, ""
+                                                )
+                                            )
+                                            branch_row = rows_by_name.get(
+                                                branch_pkg
+                                            )
+                                            branch_meta = client.npm_cache.get(
+                                                branch_pkg
+                                            )
+                                            if (
+                                                not branch_current_version
+                                                or branch_row is None
+                                                or not isinstance(
+                                                    branch_meta, dict
+                                                )
+                                            ):
+                                                break
+
+                                            branch_observation_key = (
+                                                project,
+                                                mode,
+                                                branch_pkg.lower(),
+                                                branch_predicate,
+                                            )
+                                            branch_session = (
+                                                predicate_state_store.load_session(
+                                                    project,
+                                                    mode,
+                                                    run_identity=(
+                                                        recovery_identity
+                                                    ),
+                                                    package=branch_pkg,
+                                                    predicate=branch_predicate,
+                                                )
+                                            )
+                                            branch_observations = (
+                                                predicate_probe_observations.setdefault(
+                                                    branch_observation_key,
+                                                    list(
+                                                        branch_session.observations
+                                                    ),
+                                                )
+                                            )
+                                            for restored_point in (
+                                                branch_session.observations
+                                            ):
+                                                if (
+                                                    restored_point
+                                                    not in branch_observations
+                                                ):
+                                                    branch_observations.append(
+                                                        restored_point
+                                                    )
+
+                                            if (
+                                                branch_session.preferred_version
+                                                == branch_current_version
+                                            ):
+                                                predicate_state_store.clear_preferred_version(
+                                                    project,
+                                                    mode,
+                                                    run_identity=(
+                                                        recovery_identity
+                                                    ),
+                                                    package=branch_pkg,
+                                                    predicate=branch_predicate,
+                                                )
+                                                predicate_diagnostic_preferences.setdefault(
+                                                    project, {}
+                                                ).setdefault(mode, {}).pop(
+                                                    branch_pkg, None
+                                                )
+
+                                            branch_point = PredicateObservation(
+                                                package=branch_pkg,
+                                                version=branch_current_version,
+                                                predicate=branch_predicate,
+                                                present=True,
+                                                assignment_fingerprint=(
+                                                    branch_fingerprint
+                                                ),
+                                                other_predicates=tuple(
+                                                    sorted(
+                                                        item
+                                                        for item in branch_remaining
+                                                        if item
+                                                        != branch_predicate
+                                                    )
+                                                ),
+                                            )
+                                            if (
+                                                branch_point
+                                                not in branch_observations
+                                            ):
+                                                branch_observations.append(
+                                                    branch_point
+                                                )
+                                            predicate_state_store.save_observations(
+                                                project,
+                                                mode,
+                                                run_identity=recovery_identity,
+                                                package=branch_pkg,
+                                                predicate=branch_predicate,
+                                                observations=(
+                                                    branch_observations
+                                                ),
+                                            )
+
+                                            branch_published = published_versions(
+                                                branch_meta,
+                                                include_prerelease=False,
+                                            )
+                                            (
+                                                branch_structural_versions,
+                                                _,
+                                            ) = client.registry_structural_candidates(
+                                                branch_meta,
+                                                branch_published,
+                                            )
+                                            branch_domain = [
+                                                version
+                                                for version in (
+                                                    branch_structural_versions
+                                                )
+                                                if compare_semver(
+                                                    version,
+                                                    branch_row.current_version,
+                                                )
+                                                in {0, 1}
+                                            ]
+                                            branch_ranked = rank_version_probes(
+                                                package=branch_pkg,
+                                                predicate=branch_predicate,
+                                                versions=branch_domain,
+                                                observations=(
+                                                    branch_observations
+                                                ),
+                                                hints=compatibility_hints,
+                                            )
+                                            branch_probe_version = (
+                                                choose_followup_version(
+                                                    ranked=branch_ranked,
+                                                    attempted_versions=(
+                                                        branch_session.attempted_versions
+                                                    ),
+                                                    branch_current_version=(
+                                                        branch_current_version
+                                                    ),
+                                                    project_current_version=(
+                                                        branch_row.current_version
+                                                    ),
+                                                )
+                                            )
+                                            if not branch_probe_version:
+                                                break
+
+                                            branch_candidate = (
+                                                controlled_probe_assignment(
+                                                    branch_assignment,
+                                                    package=branch_pkg,
+                                                    version=(
+                                                        branch_probe_version
+                                                    ),
+                                                )
+                                            )
+                                            branch_candidate_fingerprint = (
+                                                assignment_fingerprint(
+                                                    branch_candidate
+                                                )
+                                            )
+                                            branch_removals = (
+                                                _types_stub_removals_for_assignment(
+                                                    rows_by_name,
+                                                    branch_candidate,
+                                                    mode,
+                                                    client,
+                                                )
+                                            )
+                                            progress_reporter.emit(
+                                                project,
+                                                mode,
+                                                "predicate-branch-probe-started",
+                                                iteration=iteration,
+                                                assignment=fingerprint,
+                                                branchAssignment=(
+                                                    branch_fingerprint
+                                                ),
+                                                candidate=(
+                                                    branch_candidate_fingerprint
+                                                ),
+                                                depth=branch_depth,
+                                                package=branch_pkg,
+                                                version=branch_probe_version,
+                                                predicate=branch_predicate,
+                                                authority=(
+                                                    EVIDENCE_DIAGNOSTIC_HINT
+                                                ),
+                                            )
+                                            eprint(
+                                                f"[info] {project}: predicate "
+                                                f"branch probe {mode}; "
+                                                f"depth={branch_depth}, "
+                                                f"package={branch_pkg}, "
+                                                f"version={branch_probe_version}, "
+                                                f"predicate={branch_predicate}, "
+                                                f"candidate="
+                                                f"{branch_candidate_fingerprint}, "
+                                                f"authority="
+                                                f"{EVIDENCE_DIAGNOSTIC_HINT}"
+                                            )
+                                            branch_result = verify_assignment(
+                                                spec.path,
+                                                branch_candidate,
+                                                config=confirmation_config,
+                                                run_project_checks=True,
+                                                remove_packages=branch_removals,
+                                                progress=lambda message, branch_pkg=branch_pkg, branch_probe_version=branch_probe_version, branch_candidate_fingerprint=branch_candidate_fingerprint: (
+                                                    progress_reporter.emit(
+                                                        project,
+                                                        mode,
+                                                        "predicate-branch-probe-running",
+                                                        iteration=iteration,
+                                                        assignment=fingerprint,
+                                                        candidate=branch_candidate_fingerprint,
+                                                        package=branch_pkg,
+                                                        version=branch_probe_version,
+                                                        predicate=branch_predicate,
+                                                        message=message,
+                                                    ),
+                                                    eprint(
+                                                        f"[info] {project}: "
+                                                        f"predicate branch probe "
+                                                        f"{mode} "
+                                                        f"{branch_pkg}@"
+                                                        f"{branch_probe_version}: "
+                                                        f"{message}"
+                                                    ),
+                                                ),
+                                                progress_label=(
+                                                    f"Baseline predicate branch "
+                                                    f"{mode} depth "
+                                                    f"{branch_depth} "
+                                                    f"{branch_pkg}@"
+                                                    f"{branch_probe_version} "
+                                                    f"{branch_candidate_fingerprint}"
+                                                ),
+                                            )
+                                            predicate_branch_probes_used[
+                                                branch_budget_key
+                                            ] = branch_used + 1
+                                            predicate_state_store.mark_attempt(
+                                                project,
+                                                mode,
+                                                run_identity=recovery_identity,
+                                                package=branch_pkg,
+                                                predicate=branch_predicate,
+                                                version=branch_probe_version,
+                                            )
+
+                                            if branch_result.kind in {
+                                                "infrastructure",
+                                                "unknown",
+                                                "dependency",
+                                                "preparation",
+                                            }:
+                                                branch_execution = (
+                                                    ProbeExecution(
+                                                        version=(
+                                                            branch_probe_version
+                                                        ),
+                                                        outcome=(
+                                                            PROBE_OUTCOME_INCONCLUSIVE
+                                                        ),
+                                                        assignment_fingerprint=(
+                                                            branch_candidate_fingerprint
+                                                        ),
+                                                        detail=(
+                                                            f"{branch_result.kind}:"
+                                                            f"{branch_result.summary}"
+                                                        ),
+                                                    )
+                                                )
+                                            elif branch_result.ok:
+                                                branch_execution = (
+                                                    ProbeExecution(
+                                                        version=(
+                                                            branch_probe_version
+                                                        ),
+                                                        outcome=(
+                                                            PROBE_OUTCOME_ABSENT
+                                                        ),
+                                                        assignment_fingerprint=(
+                                                            branch_candidate_fingerprint
+                                                        ),
+                                                    )
+                                                )
+                                            elif branch_result.kind != "project":
+                                                branch_execution = (
+                                                    ProbeExecution(
+                                                        version=(
+                                                            branch_probe_version
+                                                        ),
+                                                        outcome=(
+                                                            PROBE_OUTCOME_INCONCLUSIVE
+                                                        ),
+                                                        assignment_fingerprint=(
+                                                            branch_candidate_fingerprint
+                                                        ),
+                                                        detail=(
+                                                            f"unexpected:"
+                                                            f"{branch_result.kind}"
+                                                        ),
+                                                    )
+                                                )
+                                            else:
+                                                branch_structural = set(
+                                                    structural_project_failure_signatures(
+                                                        branch_result
+                                                    )
+                                                )
+                                                branch_present = (
+                                                    branch_predicate
+                                                    in branch_structural
+                                                )
+                                                branch_execution = (
+                                                    ProbeExecution(
+                                                        version=(
+                                                            branch_probe_version
+                                                        ),
+                                                        outcome=(
+                                                            PROBE_OUTCOME_PRESENT
+                                                            if branch_present
+                                                            else PROBE_OUTCOME_ABSENT
+                                                        ),
+                                                        assignment_fingerprint=(
+                                                            branch_candidate_fingerprint
+                                                        ),
+                                                        other_predicates=tuple(
+                                                            sorted(
+                                                                item
+                                                                for item
+                                                                in branch_structural
+                                                                if item
+                                                                != branch_predicate
+                                                            )
+                                                        ),
+                                                    )
+                                                )
+
+                                            if (
+                                                branch_execution.outcome
+                                                != PROBE_OUTCOME_INCONCLUSIVE
+                                            ):
+                                                branch_candidate_point = (
+                                                    PredicateObservation(
+                                                        package=branch_pkg,
+                                                        version=(
+                                                            branch_probe_version
+                                                        ),
+                                                        predicate=(
+                                                            branch_predicate
+                                                        ),
+                                                        present=(
+                                                            branch_execution.outcome
+                                                            == PROBE_OUTCOME_PRESENT
+                                                        ),
+                                                        assignment_fingerprint=(
+                                                            branch_candidate_fingerprint
+                                                        ),
+                                                        other_predicates=tuple(
+                                                            sorted(
+                                                                set(
+                                                                    branch_execution.other_predicates
+                                                                )
+                                                            )
+                                                        ),
+                                                    )
+                                                )
+                                                if (
+                                                    branch_candidate_point
+                                                    not in branch_observations
+                                                ):
+                                                    branch_observations.append(
+                                                        branch_candidate_point
+                                                    )
+                                                predicate_probe_observations[
+                                                    branch_observation_key
+                                                ] = list(
+                                                    branch_observations
+                                                )
+                                                predicate_state_store.save_observations(
+                                                    project,
+                                                    mode,
+                                                    run_identity=(
+                                                        recovery_identity
+                                                    ),
+                                                    package=branch_pkg,
+                                                    predicate=branch_predicate,
+                                                    observations=(
+                                                        branch_observations
+                                                    ),
+                                                )
+
+                                            progress_reporter.emit(
+                                                project,
+                                                mode,
+                                                "predicate-branch-probe-observed",
+                                                iteration=iteration,
+                                                assignment=fingerprint,
+                                                candidate=(
+                                                    branch_candidate_fingerprint
+                                                ),
+                                                depth=branch_depth,
+                                                package=branch_pkg,
+                                                version=branch_probe_version,
+                                                predicate=branch_predicate,
+                                                outcome=(
+                                                    branch_execution.outcome
+                                                ),
+                                                otherPredicates=list(
+                                                    branch_execution.other_predicates
+                                                ),
+                                                authority=(
+                                                    "POINT_EVIDENCE"
+                                                    if branch_execution.outcome
+                                                    != PROBE_OUTCOME_INCONCLUSIVE
+                                                    else EVIDENCE_DIAGNOSTIC_HINT
+                                                ),
+                                            )
+
+                                            if (
+                                                branch_execution.outcome
+                                                != PROBE_OUTCOME_ABSENT
+                                            ):
+                                                break
+
+                                            predicate_state_store.set_preferred_version(
+                                                project,
+                                                mode,
+                                                run_identity=recovery_identity,
+                                                package=branch_pkg,
+                                                predicate=branch_predicate,
+                                                version=branch_probe_version,
+                                            )
+                                            predicate_diagnostic_preferences.setdefault(
+                                                project, {}
+                                            ).setdefault(mode, {})[
+                                                branch_pkg
+                                            ] = branch_probe_version
+                                            progress_reporter.emit(
+                                                project,
+                                                mode,
+                                                "predicate-branch-preference-selected",
+                                                iteration=iteration,
+                                                assignment=fingerprint,
+                                                candidate=(
+                                                    branch_candidate_fingerprint
+                                                ),
+                                                depth=branch_depth,
+                                                package=branch_pkg,
+                                                predicate=branch_predicate,
+                                                preferredVersion=(
+                                                    branch_probe_version
+                                                ),
+                                                authority=(
+                                                    EVIDENCE_DIAGNOSTIC_HINT
+                                                ),
+                                            )
+                                            eprint(
+                                                f"[info] {project}: predicate "
+                                                f"branch preference {mode}; "
+                                                f"depth={branch_depth}, "
+                                                f"package={branch_pkg}, "
+                                                f"preferred="
+                                                f"{branch_probe_version}, "
+                                                f"predicate={branch_predicate}, "
+                                                f"authority="
+                                                f"{EVIDENCE_DIAGNOSTIC_HINT}; "
+                                                "solver domain remains complete"
+                                            )
+
+                                            branch_assignment = branch_candidate
+                                            branch_fingerprint = (
+                                                branch_candidate_fingerprint
+                                            )
+                                            branch_source_package = branch_pkg
+                                            branch_visited_packages.add(
+                                                branch_pkg.lower()
+                                            )
+                                            branch_remaining = (
+                                                branch_execution.other_predicates
+                                            )
+                                            if not branch_remaining:
+                                                break
+
+                                        progress_reporter.emit(
+                                            project,
+                                            mode,
+                                            "predicate-branch-continuation-complete",
+                                            iteration=iteration,
+                                            assignment=fingerprint,
+                                            sourcePackage=predicate_pkg,
+                                            sourcePredicate=target_predicate,
+                                            probesUsed=(
+                                                predicate_branch_probes_used.get(
+                                                    branch_budget_key, 0
+                                                )
+                                                - branch_used_before
+                                            ),
+                                            totalModeProbes=(
+                                                predicate_branch_probes_used.get(
+                                                    branch_budget_key, 0
+                                                )
+                                            ),
+                                            remainingPredicates=list(
+                                                branch_remaining
+                                            ),
+                                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                        )
 
                                 predicate_search_handoff_to_generalization = bool(
                                     anytime.incumbent is None
