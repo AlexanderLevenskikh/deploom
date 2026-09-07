@@ -81,6 +81,16 @@ from package_manager_profile import (
     logical_resolution_without_materialization_supported,
     resolver_seed_continuation_capability,
 )
+from block_psi57_yarn1_resolver_seed import (
+    AUTHORITY as RESOLVER_SEED_AUTHORITY,
+    ResolverSeedError,
+    prepare_yarn1_resolver_seed_for_lifecycle,
+    reset_same_run_resolver_seed_cache,
+    resolver_seed_identity,
+    same_run_resolver_seed_store,
+    validate_yarn1_lifecycle_completion,
+    yarn1_resolver_seed_runtime_supported,
+)
 from project_topology import (
     ProjectTopologyError,
     resolve_project_topology,
@@ -1119,6 +1129,7 @@ def _cleanup_same_run_private_prepared_snapshots() -> None:
 def reset_same_run_verification_reuse() -> None:
     """Start a new Baseline run without restoring process-local trust."""
     _cleanup_same_run_private_prepared_snapshots()
+    reset_same_run_resolver_seed_cache()
     clear_prepared_artifact_pins()
     with _PREPARATION_COORDINATION_LOCK:
         _PREPARATION_COORDINATION.clear()
@@ -2541,6 +2552,7 @@ def verify_assignment(
                     f"{override_label}; overrideKey={override_key[:12]}",
                 )
             package_manager_relative_to_workspace = package_manager_project.relative_to(workspace_root)
+            project_relative_to_workspace = workspace_project.relative_to(workspace_root)
             event(
                 "verify.workspace.finish",
                 durationMs=int((time.monotonic() - workspace_started) * 1000),
@@ -2670,6 +2682,42 @@ def verify_assignment(
         )
 
         resolved_state: Optional[ResolvedDependencyState] = None
+
+        # BLOCK_PSI57_YARN1_RESOLVER_SEED_V1
+        # A resolver seed is same-run PERFORMANCE_ONLY state. It can influence
+        # filesystem preparation cost, never Resolver/Preparation/ProjectProof
+        # or Solver authority. The full scripts-enabled frozen Yarn install below
+        # remains the lifecycle authority even on a seed HIT.
+        resolver_seed_store = same_run_resolver_seed_store()
+        resolver_seed_capability = resolver_seed_continuation_capability(
+            workspace_topology.profile
+        )
+        if resolver_seed_capability.supported:
+            (
+                resolver_seed_runtime_ok,
+                resolver_seed_runtime_version,
+            ) = yarn1_resolver_seed_runtime_supported(executable)
+        else:
+            resolver_seed_runtime_ok = False
+            resolver_seed_runtime_version = ""
+        resolver_seed_enabled = bool(
+            resolver_seed_capability.supported and resolver_seed_runtime_ok
+        )
+        resolver_seed_key = ""
+        resolver_seed_used = False
+        event(
+            "resolver-seed.runtime-capability",
+            managerFamily=workspace_topology.profile.family,
+            supported=resolver_seed_enabled,
+            profileSupported=resolver_seed_capability.supported,
+            strategy=resolver_seed_capability.strategy,
+            runtimeVersion=resolver_seed_runtime_version,
+            certifiedRuntime=(
+                resolver_seed_runtime_version if resolver_seed_runtime_ok else ""
+            ),
+            authority=RESOLVER_SEED_AUTHORITY,
+        )
+        # BLOCK_PSI57_YARN1_RESOLVER_SEED_END
 
         def publish_pass(
             proof_type: str,
@@ -2812,35 +2860,46 @@ def verify_assignment(
                 "Fresh lifecycle remains frozen and authoritative.",
             )
             if run_project_checks and config.commands:
-                seed_capability = resolver_seed_continuation_capability(
-                    workspace_topology.profile
+                seed_capability = resolver_seed_capability
+                seed_capability_reason = (
+                    seed_capability.reason
+                    if resolver_seed_runtime_ok or not seed_capability.supported
+                    else (
+                        "YARN1_RESOLVER_SEED_RUNTIME_UNCERTIFIED: "
+                        f"observed={resolver_seed_runtime_version or '<unknown>'}; "
+                        "ordinary frozen lifecycle remains authoritative"
+                    )
                 )
                 event(
                     "resolver-seed.capability",
                     managerFamily=seed_capability.manager_family,
-                    supported=seed_capability.supported,
+                    supported=resolver_seed_enabled,
                     strategy=seed_capability.strategy,
-                    reason=seed_capability.reason,
+                    reason=seed_capability_reason,
+                    runtimeVersion=resolver_seed_runtime_version,
                     logicalOnlyResolutionSupported=(
                         logical_resolution_without_materialization_supported(
                             workspace_topology.profile
                         )
                     ),
+                    authority=RESOLVER_SEED_AUTHORITY,
                 )
-                if not seed_capability.supported:
+                if not resolver_seed_enabled:
                     event(
                         "resolver-seed.continuation.unsupported",
                         operationId=new_observability_id(
                             "resolver-seed-unsupported"
                         ),
                         managerFamily=seed_capability.manager_family,
-                        reason=seed_capability.reason,
+                        reason=seed_capability_reason,
+                        runtimeVersion=resolver_seed_runtime_version,
+                        authority=RESOLVER_SEED_AUTHORITY,
                     )
                     _emit_progress(
                         progress,
                         f"{progress_label}: "
-                        "PSI4_RESOLVER_SEED_CONTINUATION_UNSUPPORTED; "
-                        f"{seed_capability.reason}",
+                        "PSI57_RESOLVER_SEED_CONTINUATION_UNAVAILABLE; "
+                        f"{seed_capability_reason}",
                     )
         else:
             resolver_started = time.monotonic()
@@ -3171,6 +3230,155 @@ def verify_assignment(
                         progress,
                         f"{progress_label}: PreparationProof HIT but its durable PreparedArtifact is unavailable or failed continuity validation; replaying frozen lifecycle instead of trusting recovery metadata",
                     )
+
+                # Ψ.5.7 captures a post-resolver/pre-lifecycle tree only when the
+                # normal PreparationArtifact path missed. Fresh resolver work can
+                # seed a later exact ResolverProof HIT; a HIT clones that seed and
+                # still executes the ordinary scripts-enabled frozen Yarn install.
+                if (
+                    resolver_seed_enabled
+                    and resolved_state is not None
+                    and _verification_purpose(config)
+                    not in {"baseline-control", "incumbent-promotion"}
+                ):
+                    try:
+                        resolver_seed_key = resolver_seed_identity(
+                            resolver_input_key=proof_identity.resolver_input_key,
+                            resolved_state_key=resolved_state.key,
+                            observed_resolved_hash=observed_hash,
+                            manager_family=workspace_topology.profile.family,
+                        )
+                        if not resolver_reused:
+                            seed_published = resolver_seed_store.publish(
+                                key=resolver_seed_key,
+                                source_workspace_root=workspace_root,
+                                project_relative=project_relative_to_workspace,
+                                package_manager_relative=(
+                                    package_manager_relative_to_workspace
+                                ),
+                                source_project=project_dir,
+                                resolved_state_key=resolved_state.key,
+                                observed_resolved_hash=observed_hash,
+                                parent=trial_parent,
+                                timeout_seconds=snapshot_copy_timeout(),
+                                progress=phase_progress("resolver-seed-publish"),
+                                progress_label=(
+                                    f"{progress_label}: resolver seed publish"
+                                ),
+                                producer=progress_label,
+                            )
+                            event(
+                                "resolver-seed.published",
+                                seedKey=resolver_seed_key,
+                                resolvedStateKey=resolved_state.key,
+                                observedResolvedHash=observed_hash,
+                                published=bool(seed_published),
+                                strategy=resolver_seed_capability.strategy,
+                                authority=RESOLVER_SEED_AUTHORITY,
+                            )
+                            _emit_progress(
+                                progress,
+                                f"{progress_label}: Ψ.5.7 resolver seed "
+                                f"{'published' if seed_published else 'not published'}; "
+                                f"seed={resolver_seed_key[:12]}; "
+                                "authority=PERFORMANCE_ONLY",
+                            )
+                        else:
+                            seed_target = temp_root / "resolver-seed-lifecycle"
+                            seed_materialization = resolver_seed_store.materialize(
+                                key=resolver_seed_key,
+                                target_workspace_root=seed_target,
+                                source_project=project_dir,
+                                resolved_state_key=resolved_state.key,
+                                observed_resolved_hash=observed_hash,
+                                timeout_seconds=snapshot_copy_timeout(),
+                                progress=phase_progress(
+                                    "resolver-seed-materialization"
+                                ),
+                                progress_label=(
+                                    f"{progress_label}: resolver seed materialization"
+                                ),
+                            )
+                            if seed_materialization is None:
+                                event(
+                                    "resolver-seed.miss",
+                                    seedKey=resolver_seed_key,
+                                    resolvedStateKey=resolved_state.key,
+                                    authority=RESOLVER_SEED_AUTHORITY,
+                                )
+                            else:
+                                seed_project = seed_materialization.project_path
+                                seed_package_manager = (
+                                    seed_materialization.package_manager_path
+                                )
+                                assert_resolved_dependency_state(
+                                    seed_project, resolved_state
+                                )
+                                seed_observed = observed_resolved_assignment(
+                                    seed_project,
+                                    assignment,
+                                    remove_packages=remove_packages,
+                                    package_manager_root=seed_package_manager,
+                                )
+                                seed_observed_hash = observed_resolved_hash(
+                                    seed_observed
+                                )
+                                if seed_observed_hash != observed_hash:
+                                    raise ResolverSeedError(
+                                        "RESOLVER_SEED_OBSERVED_ASSIGNMENT_DRIFT: "
+                                        f"expected={observed_hash} "
+                                        f"observed={seed_observed_hash}"
+                                    )
+                                prepare_yarn1_resolver_seed_for_lifecycle(
+                                    seed_package_manager
+                                )
+                                workspace_root = (
+                                    seed_materialization.workspace_root
+                                )
+                                workspace_project = seed_project
+                                package_manager_project = seed_package_manager
+                                resolver_seed_used = True
+                                event(
+                                    "resolver-seed.hit",
+                                    seedKey=resolver_seed_key,
+                                    resolvedStateKey=resolved_state.key,
+                                    observedResolvedHash=observed_hash,
+                                    materializationMethod=(
+                                        seed_materialization.method
+                                    ),
+                                    integrityReset=True,
+                                    lifecycleInstallStillRequired=True,
+                                    authority=RESOLVER_SEED_AUTHORITY,
+                                )
+                                _emit_progress(
+                                    progress,
+                                    f"{progress_label}: Ψ.5.7 ResolverSeed HIT; "
+                                    "validated exact pre-lifecycle tree cloned, "
+                                    ".yarn-integrity reset in private clone; "
+                                    "ordinary frozen lifecycle remains authoritative",
+                                )
+                    except (
+                        ResolverSeedError,
+                        ResolvedDependencyStateError,
+                        ObservedResolutionError,
+                        OSError,
+                        ValueError,
+                    ) as exc:
+                        resolver_seed_used = False
+                        event(
+                            "resolver-seed.fallback",
+                            seedKey=resolver_seed_key,
+                            reason=f"{type(exc).__name__}: {exc}",
+                            fallback="ordinary-frozen-lifecycle",
+                            authority=RESOLVER_SEED_AUTHORITY,
+                        )
+                        _emit_progress(
+                            progress,
+                            f"{progress_label}: Ψ.5.7 resolver seed unavailable "
+                            f"({type(exc).__name__}: {exc}); "
+                            "ordinary frozen lifecycle remains authoritative",
+                        )
+
                 full_install = install_args_for_profile(
                     workspace_topology.profile,
                     ignore_scripts=False,
@@ -3248,6 +3456,44 @@ def verify_assignment(
                         False, "preparation",
                         "assignment resolves, but lifecycle/preparation failed deterministically",
                         **common,
+                    )
+
+                if resolver_seed_used:
+                    try:
+                        lifecycle_integrity_flags = (
+                            validate_yarn1_lifecycle_completion(
+                                package_manager_project
+                            )
+                        )
+                    except ResolverSeedError as exc:
+                        event(
+                            "resolver-seed.lifecycle-unproven",
+                            seedKey=resolver_seed_key,
+                            reason=str(exc),
+                            authority=RESOLVER_SEED_AUTHORITY,
+                        )
+                        return BaselineVerifyResult(
+                            False,
+                            "unknown",
+                            "YARN1_LIFECYCLE_COMPLETION_UNPROVEN: "
+                            f"{exc}; no PreparationProof was produced",
+                            command=" ".join(full_argv),
+                            workspace=str(workspace_project),
+                            observed_resolved_versions=observed_versions,
+                            observed_resolved_hash=observed_hash,
+                            resolved_state_key=(
+                                resolved_state.key
+                                if resolved_state is not None
+                                else ""
+                            ),
+                        )
+                    event(
+                        "resolver-seed.lifecycle-certified",
+                        seedKey=resolver_seed_key,
+                        integrityFlags=list(lifecycle_integrity_flags),
+                        ignoreScripts=False,
+                        fullFrozenLifecycleExecuted=True,
+                        authority="PACKAGE_MANAGER_LIFECYCLE",
                     )
 
                 fixed_identity_result = fixed_source_identity_gate("lifecycle")

@@ -99,11 +99,13 @@ def resolver_seed_continuation_capability(
     if family == "yarn-classic":
         return ResolverSeedContinuationCapability(
             manager_family=family,
-            supported=False,
-            strategy="none",
+            supported=True,
+            strategy="yarn1-private-resolver-seed-integrity-reset-v1",
             reason=(
-                "YARN1_RESOLVER_SEED_CONTINUATION_UNSUPPORTED: lifecycle "
-                "equivalence from an --ignore-scripts tree is not certified"
+                "YARN1_RESOLVER_SEED_CONTINUATION_CERTIFIED: an exact same-run "
+                "ignore-scripts seed may accelerate the ordinary frozen Yarn "
+                "lifecycle; runtime version is separately fail-closed and the "
+                "seed itself remains performance-only"
             ),
         )
     if family == "npm":
