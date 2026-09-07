@@ -153,6 +153,11 @@ from lockfile_consistency import (
 )
 from semantic_version import NpmSpec, Version
 from block_v_predicate_search import prioritize_probe_preference
+from block_psi55_resolver_overrides import (
+    propose_duplicate_type_override,
+    resolver_override_fingerprint,
+    resolver_override_log_label,
+)
 from project_topology import (
     ProjectTopologyError,
     discover_project_package_directories,
@@ -8311,6 +8316,30 @@ def _verification_assignment(
 
 
 
+def resolver_override_candidate_fingerprint(
+    assignment: Mapping[str, str],
+    overrides: Mapping[str, str],
+) -> str:
+    payload = {
+        "assignment": sorted(
+            (str(name), str(version))
+            for name, version in assignment.items()
+        ),
+        "resolverOverrides": sorted(
+            (str(name), str(version))
+            for name, version in overrides.items()
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:16]
+
+
 def _targeted_adaptive_confirmation_commands(
     result: BaselineVerifyResult,
     config: BaselineVerifyConfig,
@@ -9602,6 +9631,7 @@ def _build_proven_envelope_for_mode(
     *,
     same_run_resolver_evidence: Optional[BaselineVerifyResult] = None,
     same_run_project_evidence: Optional[BaselineVerifyResult] = None,
+    resolver_overrides: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     manager = detect_package_manager(spec.path)
     executable = resolve_executable(manager)
@@ -9611,7 +9641,12 @@ def _build_proven_envelope_for_mode(
             f"package manager {manager} is not available"
         )
 
-    requires_execution = bool(_changed_assignment(assignment, rows_by_name) or removals)
+    resolver_overrides = dict(resolver_overrides or {})
+    requires_execution = bool(
+        _changed_assignment(assignment, rows_by_name)
+        or removals
+        or resolver_overrides
+    )
     requires_fixed_resolver_proof = any(
         _is_fixed_dependency_input(row) for row in rows_by_name.values()
     )
@@ -9631,6 +9666,7 @@ def _build_proven_envelope_for_mode(
         spec.path,
         assignment=assignment,
         remove_packages=tuple(sorted(removals)),
+        resolver_overrides=resolver_overrides,
         manager=manager,
         manager_executable=executable,
         registry=client.registry,
@@ -9803,6 +9839,7 @@ def _build_proven_envelope_for_mode(
                 else "diagnostic-red"
             )
         ),
+        resolver_overrides=resolver_overrides,
     )
 
 
@@ -9896,6 +9933,10 @@ def resolve_peer_compatibility_with_verification(
     final_assignments: Dict[str, Dict[str, Dict[str, str]]] = {}
     successful_resolver_evidence: Dict[Tuple[str, str], BaselineVerifyResult] = {}
     successful_project_evidence: Dict[Tuple[str, str], BaselineVerifyResult] = {}
+    # Ψ.5.5 verified package-manager control dimension. It is kept separate
+    # from direct assignments so legacy solver conformance remains exact.
+    final_resolver_overrides: Dict[str, Dict[str, Dict[str, str]]] = {}
+    resolver_override_attempted: Set[Tuple[str, str, str, str]] = set()
     resolver_cache: Dict[str, BaselineVerifyResult] = {}
     # Project cache keys include the resulting ResolvedStateKey, source snapshot,
     # command set and check policy. Display fingerprints never participate.
@@ -11144,6 +11185,309 @@ def resolve_peer_compatibility_with_verification(
                                 details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
                         )
                         break
+
+                # BLOCK_PSI55_VERIFIED_RESOLVER_OVERRIDES_V1
+                # A duplicate type universe is often caused by two physical
+                # transitive copies of the same package. Before spending more
+                # global solve/minimization work, try one bounded resolver
+                # override that unifies the duplicate subject on the already
+                # planned exact direct version. This is navigation only until
+                # the ordinary resolver + lifecycle + project pipeline accepts
+                # the candidate.
+                if result.kind == "project":
+                    override_signatures = tuple(
+                        structural_project_failure_signatures(result)
+                    )
+                    override_proposal = propose_duplicate_type_override(
+                        signatures=override_signatures,
+                        assignment=verification_assignment,
+                        current_versions={
+                            name: row.current_version
+                            for name, row in rows_by_name.items()
+                        },
+                        manager=detect_package_manager(spec.path),
+                    )
+                    if override_proposal is not None:
+                        override_key = (
+                            project,
+                            mode,
+                            override_proposal.package,
+                            override_proposal.version,
+                        )
+                        if override_key not in resolver_override_attempted:
+                            resolver_override_attempted.add(override_key)
+                            override_values = dict(
+                                override_proposal.overrides
+                            )
+                            override_fingerprint = (
+                                resolver_override_candidate_fingerprint(
+                                    verification_assignment,
+                                    override_values,
+                                )
+                            )
+                            override_label = resolver_override_log_label(
+                                override_proposal.manager,
+                                override_values,
+                            )
+                            progress_reporter.emit(
+                                project,
+                                mode,
+                                "resolver-override-candidate-proposed",
+                                iteration=iteration,
+                                assignment=fingerprint,
+                                candidate=override_fingerprint,
+                                predicate=override_proposal.predicate,
+                                package=override_proposal.package,
+                                version=override_proposal.version,
+                                manager=override_proposal.manager,
+                                manifestPath=override_proposal.manifest_path,
+                                overrideLabel=override_label,
+                                authority=EVIDENCE_DIAGNOSTIC_HINT,
+                            )
+                            eprint(
+                                f"[info] {project}: resolver override candidate "
+                                f"{mode}; predicate={override_proposal.predicate}; "
+                                f"candidate={override_fingerprint}; "
+                                f"{override_label}; "
+                                f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
+                            )
+                            override_config = dataclasses.replace(
+                                config,
+                                resolver_overrides=override_values,
+                                verification_purpose="intermediate-candidate",
+                                publish_durable_prepared_artifact=False,
+                            )
+
+                            override_resolver = verify_assignment(
+                                spec.path,
+                                verification_assignment,
+                                config=override_config,
+                                run_project_checks=False,
+                                remove_packages=removals,
+                                progress=lambda message: (
+                                    progress_reporter.emit(
+                                        project,
+                                        mode,
+                                        "resolver-override-verification-running",
+                                        iteration=iteration,
+                                        assignment=fingerprint,
+                                        candidate=override_fingerprint,
+                                        stage="resolver",
+                                        overrideLabel=override_label,
+                                        message=message,
+                                    ),
+                                    eprint(
+                                        f"[info] {project}: resolver override "
+                                        f"{mode} resolver: {message}"
+                                    ),
+                                ),
+                                progress_label=(
+                                    f"Baseline resolver override {mode} resolver "
+                                    f"{override_fingerprint}"
+                                ),
+                            )
+
+                            if override_resolver.ok:
+                                override_project = verify_assignment(
+                                    spec.path,
+                                    verification_assignment,
+                                    config=override_config,
+                                    run_project_checks=True,
+                                    remove_packages=removals,
+                                    progress=lambda message: (
+                                        progress_reporter.emit(
+                                            project,
+                                            mode,
+                                            "resolver-override-verification-running",
+                                            iteration=iteration,
+                                            assignment=fingerprint,
+                                            candidate=override_fingerprint,
+                                            stage="project",
+                                            overrideLabel=override_label,
+                                            message=message,
+                                        ),
+                                        eprint(
+                                            f"[info] {project}: resolver override "
+                                            f"{mode} project: {message}"
+                                        ),
+                                    ),
+                                    progress_label=(
+                                        f"Baseline resolver override {mode} project "
+                                        f"{override_fingerprint}"
+                                    ),
+                                )
+                                override_remaining = tuple(
+                                    structural_project_failure_signatures(
+                                        override_project
+                                    )
+                                )
+                                override_project_accepted = bool(
+                                    override_project.ok
+                                    or (
+                                        config.project_checks == "adaptive"
+                                        and override_project.kind == "project"
+                                        and not override_remaining
+                                    )
+                                )
+                            else:
+                                override_project = None
+                                override_remaining = ()
+                                override_project_accepted = False
+
+                            if (
+                                override_resolver.ok
+                                and override_project is not None
+                                and override_project_accepted
+                            ):
+                                successful_resolver_evidence[
+                                    (project, mode)
+                                ] = override_resolver
+                                successful_project_evidence[
+                                    (project, mode)
+                                ] = override_project
+                                final_resolver_overrides.setdefault(
+                                    project, {}
+                                )[mode] = override_values
+                                completion_status = record_verified_incumbent(
+                                    verification_assignment,
+                                    override_fingerprint,
+                                    (
+                                        override_resolver.resolved_state_key
+                                        or override_fingerprint
+                                    ),
+                                )
+                                if (
+                                    override_project.ok
+                                    and override_project.preparation_proof_key
+                                ):
+                                    promoted_override = (
+                                        promote_same_run_prepared_artifact(
+                                            spec.path,
+                                            override_project.preparation_proof_key,
+                                            proof_cache_dir=config.proof_cache_dir,
+                                            progress=lambda message: (
+                                                progress_reporter.emit(
+                                                    project,
+                                                    mode,
+                                                    "incumbent-prepared-promotion",
+                                                    iteration=iteration,
+                                                    assignment=override_fingerprint,
+                                                    resolverOverrides=override_values,
+                                                    message=message,
+                                                ),
+                                                eprint(
+                                                    f"[info] {project}: {message}"
+                                                ),
+                                            ),
+                                            progress_label=(
+                                                f"Baseline verified override incumbent "
+                                                f"{mode} {override_fingerprint}"
+                                            ),
+                                        )
+                                    )
+                                    progress_reporter.emit(
+                                        project,
+                                        mode,
+                                        "incumbent-prepared-promotion-finished",
+                                        iteration=iteration,
+                                        assignment=override_fingerprint,
+                                        promoted=bool(promoted_override),
+                                        resolverOverrides=override_values,
+                                        authority="PERFORMANCE_ONLY",
+                                    )
+
+                                final_assignments.setdefault(
+                                    project, {}
+                                )[mode] = assignment
+                                progress_reporter.emit(
+                                    project,
+                                    mode,
+                                    "resolver-override-verified",
+                                    iteration=iteration,
+                                    assignment=fingerprint,
+                                    candidate=override_fingerprint,
+                                    predicate=override_proposal.predicate,
+                                    resolverOverrides=override_values,
+                                    overrideLabel=override_label,
+                                    resolvedStateKey=(
+                                        override_resolver.resolved_state_key
+                                    ),
+                                    projectOutcome=override_project.kind,
+                                    projectOk=override_project.ok,
+                                    authority="PHYSICALLY_VERIFIED",
+                                )
+                                eprint(
+                                    f"[info] {project}: VERIFIED resolver override "
+                                    f"{mode}; candidate={override_fingerprint}; "
+                                    f"{override_label}; "
+                                    f"resolvedState="
+                                    f"{override_resolver.resolved_state_key[:12]}; "
+                                    f"projectOutcome={override_project.kind}"
+                                )
+                                checkpoint_baseline_run(
+                                    "mode-passed",
+                                    completed_iteration=iteration,
+                                    last_assignment=override_fingerprint,
+                                    status="completed",
+                                )
+                                progress_reporter.emit(
+                                    project,
+                                    mode,
+                                    "mode-passed",
+                                    iteration=iteration,
+                                    assignment=override_fingerprint,
+                                    directAssignment=fingerprint,
+                                    resolverOverrides=override_values,
+                                    completionStatus=completion_status.value,
+                                    terminalStatus=(
+                                        BaselineTerminalStatus.SOLVER_UNKNOWN.value
+                                        if unknown_budget_names or sat_unproven_names
+                                        else BaselineTerminalStatus.SAT_PROVEN.value
+                                    ),
+                                    details=liveness.snapshot(
+                                        learned_constraints=len(
+                                            learned[project][mode]
+                                        )
+                                    ),
+                                )
+                                break
+
+                            progress_reporter.emit(
+                                project,
+                                mode,
+                                "resolver-override-candidate-rejected",
+                                iteration=iteration,
+                                assignment=fingerprint,
+                                candidate=override_fingerprint,
+                                predicate=override_proposal.predicate,
+                                resolverOverrides=override_values,
+                                overrideLabel=override_label,
+                                resolverKind=override_resolver.kind,
+                                resolverOk=override_resolver.ok,
+                                projectKind=(
+                                    override_project.kind
+                                    if override_project is not None
+                                    else ""
+                                ),
+                                projectOk=(
+                                    override_project.ok
+                                    if override_project is not None
+                                    else False
+                                ),
+                                remainingStructuralPredicates=list(
+                                    override_remaining
+                                ),
+                                authority=EVIDENCE_DIAGNOSTIC_HINT,
+                            )
+                            eprint(
+                                f"[info] {project}: resolver override candidate "
+                                f"rejected {mode}; candidate={override_fingerprint}; "
+                                f"{override_label}; resolver="
+                                f"{override_resolver.kind}; project="
+                                f"{override_project.kind if override_project is not None else 'not-run'}; "
+                                f"remaining={list(override_remaining)}; "
+                                f"no solver authority produced"
+                            )
 
                 # Proof-preserving fast path: forbid exactly the full assignment
                 # that failed, then re-solve immediately. A localized witness is
@@ -13580,6 +13924,35 @@ def resolve_peer_compatibility_with_verification(
                         predicate="diagnostic-inconclusive-exact-only",
                     )
                 nogood = dict(localized_minimization.minimized)
+                minimized_literal_detail = ", ".join(
+                    f"{name}@{version}"
+                    for name, version in sorted(nogood.items())
+                )
+                eprint(
+                    f"[info] {project}: Baseline conflict minimization {mode} "
+                    f"result; predicate={localized_minimization.predicate}; "
+                    f"literals=[{minimized_literal_detail}]"
+                )
+                if len(nogood) == 1:
+                    culprit_name, culprit_version = next(iter(nogood.items()))
+                    eprint(
+                        f"[info] {project}: isolated diagnostic culprit {mode}: "
+                        f"{culprit_name}@{culprit_version}; "
+                        f"predicate={localized_minimization.predicate}; "
+                        f"scope=context-diagnostic"
+                    )
+                    progress_reporter.emit(
+                        project,
+                        mode,
+                        "isolated-diagnostic-culprit",
+                        iteration=iteration,
+                        assignment=fingerprint,
+                        package=culprit_name,
+                        version=culprit_version,
+                        predicate=localized_minimization.predicate,
+                        clauseScope="context-diagnostic",
+                        authority=EVIDENCE_DIAGNOSTIC_HINT,
+                    )
                 progress_reporter.emit(
                     project,
                     mode,
@@ -13591,6 +13964,7 @@ def resolve_peer_compatibility_with_verification(
                     candidate=assignment_fingerprint(nogood),
                     originalLiterals=len(localized_original),
                     minimizedLiterals=len(nogood),
+                    minimizedLiteralValues=dict(nogood),
                     literals=len(nogood),
                     checks=localized_minimization.checks,
                     maxChecks=localized_minimization_budget,
@@ -13992,6 +14366,9 @@ def resolve_peer_compatibility_with_verification(
                     client,
                     same_run_resolver_evidence=successful_resolver_evidence.get((project, mode)),
                     same_run_project_evidence=successful_project_evidence.get((project, mode)),
+                    resolver_overrides=(
+                        final_resolver_overrides.get(project, {}).get(mode, {})
+                    ),
                 )
                 proof_envelopes_out.setdefault(project, {})[mode] = envelope
 

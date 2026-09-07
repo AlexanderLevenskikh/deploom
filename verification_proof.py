@@ -1002,6 +1002,7 @@ def build_resolver_trial_key(
     resolver_context_key: str,
     assignment: Mapping[str, str],
     remove_packages: Sequence[str],
+    resolver_overrides: Mapping[str, str] | None = None,
 ) -> str:
     context_key = _require_hex_authority_key(
         resolver_context_key, "RESOLVER_CONTEXT_KEY"
@@ -1014,6 +1015,10 @@ def build_resolver_trial_key(
             "resolverContextKey": context_key,
             "assignment": sorted((str(k), str(v)) for k, v in assignment.items()),
             "removals": sorted(str(item) for item in remove_packages),
+            "resolverOverrides": sorted(
+                (str(k), str(v))
+                for k, v in dict(resolver_overrides or {}).items()
+            ),
         },
         length=64,
     )
@@ -1174,6 +1179,7 @@ def build_verification_proof_identity(
     commands: Sequence[str],
     environment: Mapping[str, str],
     source_snapshot_key: str = "",
+    resolver_overrides: Mapping[str, str] | None = None,
 ) -> VerificationProofIdentity:
     logical_project_dir = project_dir.resolve()
     active = active_source_snapshot(logical_project_dir)
@@ -1189,6 +1195,10 @@ def build_verification_proof_identity(
     assignment_key = _canonical_hash({
         "assignment": sorted((str(k), str(v)) for k, v in assignment.items()),
         "removals": sorted(str(item) for item in remove_packages),
+        "resolverOverrides": sorted(
+            (str(k), str(v))
+            for k, v in dict(resolver_overrides or {}).items()
+        ),
     })
 
     # IMPORTANT: persistent learned constraints and resolver proofs share this

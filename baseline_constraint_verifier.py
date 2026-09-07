@@ -107,6 +107,13 @@ from block_vex_storage import (
     semantic_verification_environment,
     storage_summary,
 )
+from block_psi55_resolver_overrides import (
+    ResolverOverrideMaterializationError,
+    apply_resolver_overrides,
+    normalized_resolver_overrides,
+    resolver_override_fingerprint,
+    resolver_override_log_label,
+)
 from block_v_prepared_artifact import (
     configure_prepared_artifact_store,
     invalidate_prepared_artifact_record,
@@ -147,6 +154,9 @@ class BaselineVerifyConfig:
     telemetry_path: str = ""
     proof_cache_dir: str = ""
     reuse_resolver_proof_key: str = ""
+    # Ψ.5.5: candidate-only package-manager controls. These are part of
+    # resolver/proof identity and are materialized only in private verification.
+    resolver_overrides: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
     @staticmethod
     def from_mapping(value: Optional[Mapping[str, object]], *, fallback_commands: Sequence[str] = ()) -> "BaselineVerifyConfig":
@@ -772,6 +782,7 @@ def _preparation_coordination_key(
         os.path.normcase(str(project_dir.resolve())),
         tuple(sorted((str(name), str(version)) for name, version in assignment.items())),
         tuple(sorted(str(item) for item in remove_packages)),
+        tuple(sorted(normalized_resolver_overrides(config.resolver_overrides).items())),
         str(config.registry or "").rstrip("/"),
         tuple(sorted(semantic_verification_environment(os.environ).items())),
     )
@@ -2422,7 +2433,7 @@ def verify_assignment(
     # Cheap capability/topology preflight before SourceSnapshot copies any large
     # tree. Authority is recomputed again from the sealed/materialized subject.
     try:
-        resolve_project_topology(
+        live_topology = resolve_project_topology(
             project_dir,
             allow_discovery=False,
             require_supported=True,
@@ -2498,6 +2509,37 @@ def verify_assignment(
                 require_supported=True,
             )
             package_manager_project = workspace_topology.package_manager_root
+            normalized_overrides = normalized_resolver_overrides(
+                config.resolver_overrides
+            )
+            override_path, override_changed = apply_resolver_overrides(
+                package_manager_project,
+                manager=workspace_topology.profile.manager,
+                overrides=normalized_overrides,
+            )
+            if normalized_overrides:
+                override_key = resolver_override_fingerprint(
+                    normalized_overrides,
+                    length=32,
+                )
+                override_label = resolver_override_log_label(
+                    workspace_topology.profile.manager,
+                    normalized_overrides,
+                )
+                event(
+                    "verify.resolver-override.materialized",
+                    resolverOverrideKey=override_key,
+                    resolverOverrides=normalized_overrides,
+                    manifestPath=override_path,
+                    changedPackages=list(override_changed),
+                    manager=workspace_topology.profile.manager,
+                    packageManagerRoot=str(package_manager_project),
+                )
+                _emit_progress(
+                    progress,
+                    f"{progress_label}: resolver override materialized; "
+                    f"{override_label}; overrideKey={override_key[:12]}",
+                )
             package_manager_relative_to_workspace = package_manager_project.relative_to(workspace_root)
             event(
                 "verify.workspace.finish",
@@ -2519,10 +2561,10 @@ def verify_assignment(
             return BaselineVerifyResult(
                 False, "infrastructure", f"source snapshot preparation failed: {exc}"
             )
-        except AssignmentMaterializationError as exc:
-            # A solver/planner assignment that cannot be represented by the
-            # project manifest is not package-manager evidence and must never
-            # pass vacuously or become a learned dependency nogood.
+        except (AssignmentMaterializationError, ResolverOverrideMaterializationError) as exc:
+            # A solver/planner assignment or resolver-control candidate that
+            # cannot be represented by package.json is not package-manager
+            # evidence and must never become a learned dependency nogood.
             return BaselineVerifyResult(False, "unknown", str(exc))
         except Exception as exc:  # filesystem/git setup is infrastructure, never a nogood
             return BaselineVerifyResult(False, "infrastructure", f"workspace preparation failed: {exc}")
@@ -2554,6 +2596,7 @@ def verify_assignment(
                 source_snapshot.project_path,
                 assignment=assignment,
                 remove_packages=tuple(sorted(str(item) for item in remove_packages)),
+                resolver_overrides=config.resolver_overrides,
                 manager=manager,
                 manager_executable=executable,
                 registry=config.registry,
@@ -4385,6 +4428,7 @@ def verify_assignment(
         project_dir,
         assignment=assignment,
         remove_packages=tuple(sorted(str(item) for item in remove_packages)),
+        resolver_overrides=config.resolver_overrides,
         manager=manager,
         manager_executable=executable,
         registry=config.registry,
@@ -4573,6 +4617,10 @@ def verify_assignment(
     started = time.monotonic()
     resources_before = process_resource_snapshot()
     assignment_hash = assignment_fingerprint(assignment)
+    request_overrides = normalized_resolver_overrides(config.resolver_overrides)
+    request_override_key = resolver_override_fingerprint(
+        request_overrides, length=32
+    )
 
     with request_scope(request_id):
         emit_verification_event(
@@ -4584,6 +4632,8 @@ def verify_assignment(
             runProjectChecks=run_project_checks,
             projectChecks=config.project_checks,
             commands=list(config.commands),
+            resolverOverrides=request_overrides,
+            resolverOverrideKey=request_override_key,
         )
         try:
             if run_project_checks and config.project_checks != "off" and config.commands:

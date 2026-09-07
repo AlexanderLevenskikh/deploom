@@ -64,6 +64,7 @@ def build_proven_dependency_envelope(
     resolver_proof_status: str,
     preparation_proof_status: str,
     project_proof_status: str,
+    resolver_overrides: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     resolver_status = str(resolver_proof_status)
     preparation_status = str(preparation_proof_status)
@@ -102,6 +103,10 @@ def build_proven_dependency_envelope(
             for name, version in sorted(assignment.items())
         },
         "removals": sorted({str(name) for name in removals}),
+        "resolverOverrides": {
+            str(name): str(version)
+            for name, version in sorted(dict(resolver_overrides or {}).items())
+        },
         "verificationCommands": [str(command) for command in verification_commands],
         "projectChecks": str(project_checks),
         "resolverProofStatus": resolver_status,
@@ -140,6 +145,15 @@ def validate_proven_dependency_envelope(
         return False, "removals invalid"
     if any(name not in assignment for name in removals):
         return False, "removal is not part of exactDirectAssignment"
+    resolver_overrides = envelope.get("resolverOverrides", {})
+    if not isinstance(resolver_overrides, dict) or not all(
+        isinstance(name, str)
+        and isinstance(version, str)
+        and name
+        and version
+        for name, version in resolver_overrides.items()
+    ):
+        return False, "resolverOverrides invalid"
     fixed_inputs_key = str(envelope.get("fixedResolverInputsKey") or "").lower()
     if len(fixed_inputs_key) != 64 or any(
         ch not in "0123456789abcdef" for ch in fixed_inputs_key
