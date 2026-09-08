@@ -180,6 +180,12 @@ from block_psi582_pre_run_closure import (
     reserve_causal_physical_probe,
 )
 from block_psi583_duplicate_fallback_control import cohort_handoff_control
+from block_psi59_transitive_override_search import (
+    TransitiveOverridePolicy,
+    propose_transitive_duplicate_override_candidates,
+    reserve_transitive_override_attempt,
+    transitive_duplicate_subject,
+)
 from block_v_prepared_artifact import (
     SEARCH_PRIORITY_PROMISING,
     prioritize_prepared_artifact_record,
@@ -11288,6 +11294,7 @@ def resolve_peer_compatibility_with_verification(
                     override_signatures = tuple(
                         structural_project_failure_signatures(result)
                     )
+                    override_manager = detect_package_manager(spec.path)
                     override_proposal = propose_duplicate_type_override(
                         signatures=override_signatures,
                         assignment=verification_assignment,
@@ -11295,14 +11302,178 @@ def resolve_peer_compatibility_with_verification(
                             name: row.current_version
                             for name, row in rows_by_name.items()
                         },
-                        manager=detect_package_manager(spec.path),
+                        manager=override_manager,
                     )
+                    transitive_candidate = None
+
+                    # BLOCK_PSI59_TRANSITIVE_OVERRIDE_SEARCH_V1
+                    # Ψ.5.5 deliberately refuses to guess a version for a
+                    # transitive duplicate-type subject. Ψ.5.9 may fill that
+                    # gap only from the exact hash-bound Yarn Classic lockfile
+                    # produced by this physical resolver result. Every selector
+                    # for the subject must admit one common exact version.
+                    if override_proposal is None:
+                        transitive_policy = TransitiveOverridePolicy.from_sources(
+                            spec.constraint_verify_config,
+                            os.environ,
+                        )
+                        transitive_subject = transitive_duplicate_subject(
+                            signatures=override_signatures,
+                            managed_packages=tuple(rows_by_name),
+                            manager=override_manager,
+                        )
+                        if transitive_policy.enabled and transitive_subject:
+                            transitive_meta = client.fetch_npm_metadata(
+                                transitive_subject
+                            )
+                            transitive_versions_payload = (
+                                transitive_meta.get("versions")
+                                if isinstance(transitive_meta, dict)
+                                else None
+                            )
+                            transitive_published_versions = (
+                                tuple(transitive_versions_payload)
+                                if isinstance(transitive_versions_payload, dict)
+                                else ()
+                            )
+                            transitive_candidates = (
+                                propose_transitive_duplicate_override_candidates(
+                                    signatures=override_signatures,
+                                    managed_packages=tuple(rows_by_name),
+                                    manager=override_manager,
+                                    proof_cache_dir=config.proof_cache_dir,
+                                    resolved_state_key=result.resolved_state_key,
+                                    resolved_state_artifact=(
+                                        result.resolved_state_artifact
+                                    ),
+                                    resolved_lockfile_path=(
+                                        result.resolved_lockfile_path
+                                    ),
+                                    resolved_lockfile_hash=(
+                                        result.resolved_lockfile_hash
+                                    ),
+                                    published_versions=(
+                                        transitive_published_versions
+                                    ),
+                                    # One physical candidate per exact direct
+                                    # assignment. Family-wide budget below is
+                                    # persisted separately across contexts.
+                                    limit=1,
+                                )
+                            )
+                            if transitive_candidates:
+                                candidate = transitive_candidates[0]
+                                if client.registry_version_is_installable(
+                                    candidate.package,
+                                    transitive_meta,
+                                    candidate.version,
+                                ):
+                                    transitive_permit = (
+                                        reserve_transitive_override_attempt(
+                                            predicate_state_store=(
+                                                predicate_state_store
+                                            ),
+                                            policy=transitive_policy,
+                                            project=project,
+                                            mode=mode,
+                                            run_identity=recovery_identity,
+                                            predicate=candidate.predicate,
+                                            subject_package=candidate.package,
+                                            direct_assignment_fingerprint=(
+                                                fingerprint
+                                            ),
+                                            override_version=candidate.version,
+                                        )
+                                    )
+                                    if transitive_permit.granted:
+                                        transitive_candidate = candidate
+                                        override_proposal = (
+                                            candidate.as_resolver_override_proposal()
+                                        )
+                                        progress_reporter.emit(
+                                            project,
+                                            mode,
+                                            "transitive-resolver-override-evidence-ready",
+                                            iteration=iteration,
+                                            assignment=fingerprint,
+                                            predicate=candidate.predicate,
+                                            package=candidate.package,
+                                            version=candidate.version,
+                                            candidateSource=(
+                                                candidate.candidate_source
+                                            ),
+                                            observedVersions=list(
+                                                candidate.evidence.observed_versions
+                                            ),
+                                            requestedRanges=list(
+                                                candidate.evidence.requested_ranges
+                                            ),
+                                            resolvedStateKey=(
+                                                candidate.evidence.resolved_state_key
+                                            ),
+                                            lockfileHash=(
+                                                candidate.evidence.lockfile_hash
+                                            ),
+                                            budgetUsed=transitive_permit.used,
+                                            budgetRemaining=(
+                                                transitive_permit.remaining
+                                            ),
+                                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                        )
+                                        eprint(
+                                            f"[info] {project}: Ψ.5.9 transitive "
+                                            f"override evidence {mode}; "
+                                            f"predicate={candidate.predicate}; "
+                                            f"{candidate.package}={candidate.version}; "
+                                            f"source={candidate.candidate_source}; "
+                                            f"observed="
+                                            f"{list(candidate.evidence.observed_versions)}; "
+                                            f"ranges="
+                                            f"{list(candidate.evidence.requested_ranges)}; "
+                                            f"budget={transitive_permit.used}/"
+                                            f"{transitive_policy.family_physical_budget}; "
+                                            f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
+                                        )
+                                    else:
+                                        progress_reporter.emit(
+                                            project,
+                                            mode,
+                                            "transitive-resolver-override-probe-denied",
+                                            iteration=iteration,
+                                            assignment=fingerprint,
+                                            predicate=candidate.predicate,
+                                            package=candidate.package,
+                                            version=candidate.version,
+                                            reason=transitive_permit.reason,
+                                            budgetUsed=transitive_permit.used,
+                                            budgetRemaining=(
+                                                transitive_permit.remaining
+                                            ),
+                                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                        )
+                                else:
+                                    progress_reporter.emit(
+                                        project,
+                                        mode,
+                                        "transitive-resolver-override-candidate-unavailable",
+                                        iteration=iteration,
+                                        assignment=fingerprint,
+                                        predicate=candidate.predicate,
+                                        package=candidate.package,
+                                        version=candidate.version,
+                                        authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                    )
+
                     if override_proposal is not None:
                         override_key = (
                             project,
                             mode,
                             override_proposal.package,
-                            override_proposal.version,
+                            (
+                                f"{override_proposal.version}@{fingerprint}"
+                                if transitive_candidate is not None
+                                else override_proposal.version
+                            ),
                         )
                         if override_key not in resolver_override_attempted:
                             resolver_override_attempted.add(override_key)
