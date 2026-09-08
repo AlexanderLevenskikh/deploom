@@ -12531,14 +12531,27 @@ def resolve_peer_compatibility_with_verification(
                                     # graph generalization/minimization path. Build the
                                     # same exact cohort handoff used by projected
                                     # transitive predicates.
+                                    # BLOCK_PSI592_DIRECT_HANDOFF_CONTEXT_V1
+                                    # Direct subjects do not necessarily execute the
+                                    # projected/transitive navigation-context branch.
+                                    # Build a fresh assignment-bound context here so
+                                    # direct handoff cannot observe an unbound or stale
+                                    # function-local subject_consumers/navigation_graph.
+                                    direct_navigation_graph, direct_subject_consumers = (
+                                        _baseline_cohort_navigation_context(
+                                            rows_by_name,
+                                            verification_assignment,
+                                            client,
+                                        )
+                                    )
                                     direct_cohort_plan = plan_cohort_handoff(
                                         predicate=target_predicate,
                                         direct_packages=verification_assignment.keys(),
                                         focus_package=predicate_pkg,
                                         assignment=verification_assignment,
                                         current_versions=baseline_current_versions,
-                                        subject_consumers=subject_consumers,
-                                        interaction_graph=navigation_graph,
+                                        subject_consumers=direct_subject_consumers,
+                                        interaction_graph=direct_navigation_graph,
                                         policy_by_package={
                                             name: _baseline_intent_policy(name)
                                             for name in rows_by_name
