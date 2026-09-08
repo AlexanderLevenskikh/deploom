@@ -179,6 +179,7 @@ from block_psi582_pre_run_closure import (
     cohort_fallback_queue_decision,
     reserve_causal_physical_probe,
 )
+from block_psi583_duplicate_fallback_control import cohort_handoff_control
 from block_v_prepared_artifact import (
     SEARCH_PRIORITY_PROMISING,
     prioritize_prepared_artifact_record,
@@ -12055,20 +12056,6 @@ def resolve_peer_compatibility_with_verification(
                                             )
                                         )
                                         # BLOCK_PSI582_COHORT_FALLBACK_DEDUP_V1
-                                        # The current exact point is authoritative
-                                        # failing evidence regardless of whether its
-                                        # derived cohort fallback is new or duplicate.
-                                        if (
-                                            exact_nogood
-                                            not in global_exact_exclusions[
-                                                project
-                                            ][mode]
-                                        ):
-                                            global_exact_exclusions[
-                                                project
-                                            ][mode].append(exact_nogood)
-                                            liveness.record_exact_exclusion()
-
                                         cohort_queue_decision = (
                                             cohort_fallback_queue_decision(
                                                 cohort_fingerprint,
@@ -12085,7 +12072,15 @@ def resolve_peer_compatibility_with_verification(
                                                 ),
                                             )
                                         )
-                                        if not cohort_queue_decision.queue:
+                                        # BLOCK_PSI583_DUPLICATE_FALLBACK_CONTROL_V1
+                                        # Duplicate/known fallback leaves publication
+                                        # of the current exact exclusion to the common
+                                        # path. A genuinely new fallback publishes it
+                                        # here and steers out of this solver iteration.
+                                        cohort_control = cohort_handoff_control(
+                                            cohort_queue_decision
+                                        )
+                                        if not cohort_control.queue_fallback:
                                             progress_reporter.emit(
                                                 project,
                                                 mode,
@@ -12100,6 +12095,9 @@ def resolve_peer_compatibility_with_verification(
                                                 reason=(
                                                     cohort_queue_decision.reason
                                                 ),
+                                                controlReason=(
+                                                    cohort_control.reason
+                                                ),
                                                 authority=(
                                                     EVIDENCE_DIAGNOSTIC_HINT
                                                 ),
@@ -12109,10 +12107,22 @@ def resolve_peer_compatibility_with_verification(
                                                 f"{cohort_fingerprint} not queued "
                                                 f"for {mode}; reason="
                                                 f"{cohort_queue_decision.reason}; "
-                                                "continuing search without "
-                                                "repeating a known exact failure"
+                                                "current exact exclusion remains "
+                                                "owned by common search flow"
                                             )
                                             continue
+
+                                        if cohort_control.publish_current_exact_now:
+                                            if (
+                                                exact_nogood
+                                                not in global_exact_exclusions[
+                                                    project
+                                                ][mode]
+                                            ):
+                                                global_exact_exclusions[
+                                                    project
+                                                ][mode].append(exact_nogood)
+                                                liveness.record_exact_exclusion()
 
                                         pending_promising_assignments.offer(
                                             project,
@@ -12159,10 +12169,9 @@ def resolve_peer_compatibility_with_verification(
                                             last_assignment=fingerprint,
                                             last_predicate=target_predicate,
                                         )
-                                        # Reuse the existing outer-loop skip: next
-                                        # iteration prioritizes the exact cohort
-                                        # fallback instead of graph minimization.
-                                        predicate_search_steered = True
+                                        predicate_search_steered = (
+                                            cohort_control.steer_outer_iteration
+                                        )
                                         break
                                     continue
 
