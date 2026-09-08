@@ -3124,10 +3124,14 @@ def verify_assignment(
                         producer=progress_label,
                     )
                 except Exception as exc:
+                    failed_publish_ms = int(
+                        (time.monotonic() - seed_publish_started) * 1000
+                    )
                     event(
-                        "resolver-seed.publish-skipped",
+                        "resolver-seed.publish-failed",
                         seedKey=resolver_seed_key,
                         reason=f"publication-error:{type(exc).__name__}:{exc}",
+                        durationMs=failed_publish_ms,
                         publicationHint=config.resolver_seed_publication_hint,
                         authority=RESOLVER_SEED_AUTHORITY,
                     )

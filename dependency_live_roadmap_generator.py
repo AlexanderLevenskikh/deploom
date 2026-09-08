@@ -170,6 +170,10 @@ from block_psi58_bounded_causal_search import (
     family_budget_exhausted,
 )
 from block_psi58_reuse_economics import RESOLVER_SEED_PUBLICATION_BRIDGE
+from block_psi581_probe_budget_and_cohort import (
+    CausalPhysicalProbeLedger,
+    build_cohort_fallback_assignment,
+)
 from block_v_prepared_artifact import (
     SEARCH_PRIORITY_PROMISING,
     prioritize_prepared_artifact_record,
@@ -9994,6 +9998,9 @@ def resolve_peer_compatibility_with_verification(
         causal_search_policy = CausalSearchPolicy.from_sources(
             spec.constraint_verify_config, os.environ
         )
+        # Ψ.5.8.1: main predicate search and branch continuation spend from
+        # the same physical experiment budget.
+        causal_probe_ledger = CausalPhysicalProbeLedger(causal_search_policy)
         predicate_branch_policy = PredicateBranchPolicy.from_sources(
             spec.constraint_verify_config, os.environ
         )
@@ -11926,9 +11933,35 @@ def resolve_peer_compatibility_with_verification(
                                             authority=EVIDENCE_DIAGNOSTIC_HINT,
                                         )
 
-                                family_exhausted = family_budget_exhausted(
-                                    candidate_attempts,
-                                    policy=causal_search_policy,
+                                # Ψ.5.8.1 reconstructs the whole persisted
+                                # family, not only parents in the current projection.
+                                for budget_package in rows_by_name:
+                                    budget_session = predicate_state_store.load_session(
+                                        project,
+                                        mode,
+                                        run_identity=recovery_identity,
+                                        package=budget_package,
+                                        predicate=target_predicate,
+                                    )
+                                    causal_probe_ledger.sync(
+                                        run_identity=recovery_identity,
+                                        project=project,
+                                        mode=mode,
+                                        predicate=target_predicate,
+                                        package=budget_package,
+                                        attempted_versions=(
+                                            budget_session.attempted_versions
+                                        ),
+                                    )
+                                family_used = causal_probe_ledger.family_used(
+                                    run_identity=recovery_identity,
+                                    project=project,
+                                    mode=mode,
+                                    predicate=target_predicate,
+                                )
+                                family_exhausted = (
+                                    family_used
+                                    >= causal_search_policy.family_probe_budget
                                 )
                                 selected_causal = next(
                                     (
@@ -11973,9 +12006,123 @@ def resolve_peer_compatibility_with_verification(
                                         f"predicate={target_predicate}, "
                                         f"reason={handoff_reason}, "
                                         f"attempts={candidate_attempts}, "
+                                        f"familyUsed={family_used}, "
                                         "strategy=target-cohort-relaxation, "
                                         f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
                                     )
+
+                                    # BLOCK_PSI581_REAL_COHORT_HANDOFF_V1
+                                    # Handoff produces a concrete next exact point.
+                                    # Cohort inference is navigation-only; the point
+                                    # still needs ordinary full Baseline verification.
+                                    cohort_suggestion = infer_baseline_cohort(
+                                        predicate=target_predicate,
+                                        direct_packages=verification_assignment.keys(),
+                                        subject_consumers=subject_consumers,
+                                        interaction_graph=navigation_graph,
+                                        policy_by_package={
+                                            name: _baseline_intent_policy(name)
+                                            for name in rows_by_name
+                                        },
+                                        previous_deferred=_baseline_deferred_cohorts(),
+                                        repeated_count=max(
+                                            2,
+                                            int(
+                                                anytime.repeated_predicate_count
+                                                or 0
+                                            ),
+                                        ),
+                                    )
+                                    if cohort_suggestion is not None:
+                                        cohort_fallback = (
+                                            build_cohort_fallback_assignment(
+                                                assignment=verification_assignment,
+                                                current_versions=(
+                                                    baseline_current_versions
+                                                ),
+                                                cohort_packages=(
+                                                    cohort_suggestion.packages
+                                                ),
+                                            )
+                                        )
+                                    else:
+                                        cohort_fallback = None
+                                    if (
+                                        cohort_fallback is not None
+                                        and cohort_fallback.changed
+                                    ):
+                                        cohort_assignment = (
+                                            cohort_fallback.assignment_dict
+                                        )
+                                        cohort_fingerprint = (
+                                            assignment_fingerprint(
+                                                cohort_assignment
+                                            )
+                                        )
+                                        pending_promising_assignments.offer(
+                                            project,
+                                            mode,
+                                            build_promising_assignment(
+                                                assignment=cohort_assignment,
+                                                assignment_fingerprint=(
+                                                    cohort_fingerprint
+                                                ),
+                                                originating_predicate=(
+                                                    target_predicate
+                                                ),
+                                                removed_predicates=(),
+                                                remaining_predicates=(
+                                                    target_predicate,
+                                                ),
+                                            ),
+                                        )
+                                        progress_reporter.emit(
+                                            project,
+                                            mode,
+                                            "causal-cohort.assignment-created",
+                                            iteration=iteration,
+                                            assignment=fingerprint,
+                                            candidate=cohort_fingerprint,
+                                            predicate=target_predicate,
+                                            cohortId=(
+                                                cohort_suggestion.cohort_id
+                                            ),
+                                            deferredPackages=list(
+                                                cohort_fallback.deferred_packages
+                                            ),
+                                            confidence=(
+                                                cohort_suggestion.confidence
+                                            ),
+                                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                        )
+                                        # The current exact assignment is already
+                                        # freshly confirmed failing. Exclude only
+                                        # that exact point; cohort membership is not
+                                        # incompatibility evidence.
+                                        if (
+                                            exact_nogood
+                                            not in global_exact_exclusions[
+                                                project
+                                            ][mode]
+                                        ):
+                                            global_exact_exclusions[
+                                                project
+                                            ][mode].append(exact_nogood)
+                                            liveness.record_exact_exclusion()
+                                        localization_checkpoint_store.clear(
+                                            project, mode
+                                        )
+                                        checkpoint_baseline_run(
+                                            "causal-cohort-fallback-queued",
+                                            completed_iteration=iteration,
+                                            last_assignment=fingerprint,
+                                            last_predicate=target_predicate,
+                                        )
+                                        # Reuse the existing outer-loop skip: next
+                                        # iteration prioritizes the exact cohort
+                                        # fallback instead of graph minimization.
+                                        predicate_search_steered = True
+                                        break
                                     continue
 
                                 predicate_pkg = selected_causal[0]
@@ -12292,6 +12439,41 @@ def resolve_peer_compatibility_with_verification(
                                     )),
                                 )
 
+                            causal_probe_ledger.sync(
+                                run_identity=recovery_identity,
+                                project=project,
+                                mode=mode,
+                                predicate=target_predicate,
+                                package=predicate_pkg,
+                                attempted_versions=session.attempted_versions,
+                            )
+
+                            def permit_main_causal_probe(
+                                _probe_version: str,
+                            ) -> bool:
+                                permit = causal_probe_ledger.try_acquire(
+                                    run_identity=recovery_identity,
+                                    project=project,
+                                    mode=mode,
+                                    predicate=target_predicate,
+                                    package=predicate_pkg,
+                                )
+                                if not permit.granted:
+                                    progress_reporter.emit(
+                                        project,
+                                        mode,
+                                        "causal-physical-probe.denied",
+                                        iteration=iteration,
+                                        assignment=fingerprint,
+                                        predicate=target_predicate,
+                                        package=predicate_pkg,
+                                        reason=permit.reason,
+                                        packageUsed=permit.package_used,
+                                        familyUsed=permit.family_used,
+                                        authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                    )
+                                return permit.granted
+
                             search_result = run_active_predicate_search(
                                 package=predicate_pkg,
                                 predicate=target_predicate,
@@ -12303,6 +12485,7 @@ def resolve_peer_compatibility_with_verification(
                                 hints=compatibility_hints,
                                 policy=predicate_probe_policy,
                                 run_probe=run_predicate_probe,
+                                permit_probe=permit_main_causal_probe,
                             )
                             if search_result.activated:
                                 predicate_probe_observations[observation_key] = list(
@@ -12733,7 +12916,7 @@ def resolve_peer_compatibility_with_verification(
                                                 branch_meta,
                                                 branch_published,
                                             )
-                                            branch_domain = [
+                                            branch_raw_domain = [
                                                 version
                                                 for version in (
                                                     branch_structural_versions
@@ -12744,6 +12927,58 @@ def resolve_peer_compatibility_with_verification(
                                                 )
                                                 in {0, 1}
                                             ]
+                                            # BLOCK_PSI581_SHARED_BRANCH_BUDGET_V1
+                                            causal_probe_ledger.sync(
+                                                run_identity=recovery_identity,
+                                                project=project,
+                                                mode=mode,
+                                                predicate=branch_predicate,
+                                                package=branch_pkg,
+                                                attempted_versions=(
+                                                    branch_session.attempted_versions
+                                                ),
+                                            )
+                                            branch_bounded_domain = (
+                                                bounded_causal_probe_domain(
+                                                    metadata=branch_meta,
+                                                    versions=branch_raw_domain,
+                                                    relevant_packages=(
+                                                        predicate_package(
+                                                            branch_predicate
+                                                        ),
+                                                        branch_source_package,
+                                                        branch_pkg,
+                                                    ),
+                                                    attempted_versions=(
+                                                        branch_session.attempted_versions
+                                                    ),
+                                                    policy=causal_search_policy,
+                                                )
+                                            )
+                                            if branch_bounded_domain.exhausted:
+                                                progress_reporter.emit(
+                                                    project,
+                                                    mode,
+                                                    "causal-package.exhausted",
+                                                    iteration=iteration,
+                                                    assignment=fingerprint,
+                                                    predicate=branch_predicate,
+                                                    package=branch_pkg,
+                                                    attemptedPhysicalProbes=(
+                                                        branch_bounded_domain.attempted_count
+                                                    ),
+                                                    reason=(
+                                                        branch_bounded_domain.reason
+                                                    ),
+                                                    source="predicate-branch",
+                                                    authority=(
+                                                        EVIDENCE_DIAGNOSTIC_HINT
+                                                    ),
+                                                )
+                                                break
+                                            branch_domain = list(
+                                                branch_bounded_domain.versions
+                                            )
                                             branch_ranked = rank_version_probes(
                                                 package=branch_pkg,
                                                 predicate=branch_predicate,
@@ -12824,6 +13059,37 @@ def resolve_peer_compatibility_with_verification(
                                                 f"authority="
                                                 f"{EVIDENCE_DIAGNOSTIC_HINT}"
                                             )
+                                            branch_permit = (
+                                                causal_probe_ledger.try_acquire(
+                                                    run_identity=recovery_identity,
+                                                    project=project,
+                                                    mode=mode,
+                                                    predicate=branch_predicate,
+                                                    package=branch_pkg,
+                                                )
+                                            )
+                                            if not branch_permit.granted:
+                                                progress_reporter.emit(
+                                                    project,
+                                                    mode,
+                                                    "causal-physical-probe.denied",
+                                                    iteration=iteration,
+                                                    assignment=fingerprint,
+                                                    predicate=branch_predicate,
+                                                    package=branch_pkg,
+                                                    reason=branch_permit.reason,
+                                                    packageUsed=(
+                                                        branch_permit.package_used
+                                                    ),
+                                                    familyUsed=(
+                                                        branch_permit.family_used
+                                                    ),
+                                                    source="predicate-branch",
+                                                    authority=(
+                                                        EVIDENCE_DIAGNOSTIC_HINT
+                                                    ),
+                                                )
+                                                break
                                             branch_result = verify_assignment(
                                                 spec.path,
                                                 branch_candidate,

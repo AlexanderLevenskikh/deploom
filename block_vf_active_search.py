@@ -46,6 +46,7 @@ class ActiveSearchResult:
 
 
 ProbeRunner = Callable[[str, Mapping[str, str]], ProbeExecution]
+ProbePermit = Callable[[str], bool]
 
 
 def run_active_predicate_search(
@@ -60,6 +61,7 @@ def run_active_predicate_search(
     hints: Sequence[DiagnosticHint] = (),
     policy: PredicateProbePolicy = PredicateProbePolicy(),
     run_probe: ProbeRunner,
+    permit_probe: ProbePermit | None = None,
 ) -> ActiveSearchResult:
     """Run a bounded sequence of high-information exact point experiments.
 
@@ -103,6 +105,10 @@ def run_active_predicate_search(
             None,
         )
         if candidate is None:
+            break
+        # Ψ.5.8.1: shared physical-cost authority may deny this point before
+        # any verifier process starts. Denial affects scheduling only.
+        if permit_probe is not None and not permit_probe(candidate.version):
             break
         attempts.add(candidate.version)
         assignment = controlled_probe_assignment(

@@ -488,14 +488,25 @@ class SameRunResolverSeedStore:
             method = ""
             try:
                 plan = inventory_reparse_plan(record.workspace_root)
-                method = materialize_private_tree(
-                    record.workspace_root,
-                    target_workspace_root,
-                    timeout_seconds=max(1, int(timeout_seconds)),
-                    progress=progress,
-                    progress_label=progress_label,
-                    reparse_plan=plan,
-                )
+                clone_started = time.monotonic()
+                try:
+                    method = materialize_private_tree(
+                        record.workspace_root,
+                        target_workspace_root,
+                        timeout_seconds=max(1, int(timeout_seconds)),
+                        progress=progress,
+                        progress_label=progress_label,
+                        reparse_plan=plan,
+                    )
+                finally:
+                    emit_observability_event(
+                        "resolver-seed.clone.finish",
+                        seedKey=seed_key,
+                        durationMs=int(
+                            (time.monotonic() - clone_started) * 1000
+                        ),
+                        authority=AUTHORITY,
+                    )
                 clean, reason = self._stop_guard(record)
                 if not clean:
                     shutil.rmtree(target_workspace_root, ignore_errors=True)

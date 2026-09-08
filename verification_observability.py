@@ -629,6 +629,10 @@ def record_verification_event(event: str, payload: Mapping[str, object]) -> None
             _METRICS["resolverSeedPublishMs"] = int(
                 _METRICS["resolverSeedPublishMs"]
             ) + _int_field(payload, ("durationMs",))
+        elif event == "resolver-seed.publish-failed":
+            _METRICS["resolverSeedPublishMs"] = int(
+                _METRICS["resolverSeedPublishMs"]
+            ) + _int_field(payload, ("durationMs",))
         elif event == "resolver-seed.hit":
             _METRICS["resolverSeedHits"] = int(
                 _METRICS["resolverSeedHits"]
