@@ -174,6 +174,11 @@ from block_psi581_probe_budget_and_cohort import (
     CausalPhysicalProbeLedger,
     build_cohort_fallback_assignment,
 )
+from block_psi582_pre_run_closure import (
+    CausalFamilyBudgetHydrator,
+    cohort_fallback_queue_decision,
+    reserve_causal_physical_probe,
+)
 from block_v_prepared_artifact import (
     SEARCH_PRIORITY_PROMISING,
     prioritize_prepared_artifact_record,
@@ -10001,6 +10006,9 @@ def resolve_peer_compatibility_with_verification(
         # Ψ.5.8.1: main predicate search and branch continuation spend from
         # the same physical experiment budget.
         causal_probe_ledger = CausalPhysicalProbeLedger(causal_search_policy)
+        # Ψ.5.8.2: either route may be first after resume. Hydrate the whole
+        # predicate family lazily before the first permit, regardless of route.
+        causal_family_hydrator = CausalFamilyBudgetHydrator()
         predicate_branch_policy = PredicateBranchPolicy.from_sources(
             spec.constraint_verify_config, os.environ
         )
@@ -11933,31 +11941,18 @@ def resolve_peer_compatibility_with_verification(
                                             authority=EVIDENCE_DIAGNOSTIC_HINT,
                                         )
 
-                                # Ψ.5.8.1 reconstructs the whole persisted
-                                # family, not only parents in the current projection.
-                                for budget_package in rows_by_name:
-                                    budget_session = predicate_state_store.load_session(
-                                        project,
-                                        mode,
-                                        run_identity=recovery_identity,
-                                        package=budget_package,
-                                        predicate=target_predicate,
-                                    )
-                                    causal_probe_ledger.sync(
-                                        run_identity=recovery_identity,
-                                        project=project,
-                                        mode=mode,
-                                        predicate=target_predicate,
-                                        package=budget_package,
-                                        attempted_versions=(
-                                            budget_session.attempted_versions
-                                        ),
-                                    )
-                                family_used = causal_probe_ledger.family_used(
+                                # BLOCK_PSI582_LAZY_FAMILY_HYDRATION_V1
+                                # Main and branch share this one lazy hydration
+                                # contract, so branch-first resume cannot regain
+                                # physical budget spent by another parent.
+                                family_used = causal_family_hydrator.ensure(
+                                    ledger=causal_probe_ledger,
+                                    predicate_state_store=predicate_state_store,
                                     run_identity=recovery_identity,
                                     project=project,
                                     mode=mode,
                                     predicate=target_predicate,
+                                    packages=tuple(rows_by_name),
                                 )
                                 family_exhausted = (
                                     family_used
@@ -12059,6 +12054,66 @@ def resolve_peer_compatibility_with_verification(
                                                 cohort_assignment
                                             )
                                         )
+                                        # BLOCK_PSI582_COHORT_FALLBACK_DEDUP_V1
+                                        # The current exact point is authoritative
+                                        # failing evidence regardless of whether its
+                                        # derived cohort fallback is new or duplicate.
+                                        if (
+                                            exact_nogood
+                                            not in global_exact_exclusions[
+                                                project
+                                            ][mode]
+                                        ):
+                                            global_exact_exclusions[
+                                                project
+                                            ][mode].append(exact_nogood)
+                                            liveness.record_exact_exclusion()
+
+                                        cohort_queue_decision = (
+                                            cohort_fallback_queue_decision(
+                                                cohort_fingerprint,
+                                                confirmed_failed_fingerprints=(
+                                                    confirmed_failed_assignments
+                                                ),
+                                                exact_exclusion_fingerprints=(
+                                                    assignment_fingerprint(item)
+                                                    for item in (
+                                                        global_exact_exclusions[
+                                                            project
+                                                        ][mode]
+                                                    )
+                                                ),
+                                            )
+                                        )
+                                        if not cohort_queue_decision.queue:
+                                            progress_reporter.emit(
+                                                project,
+                                                mode,
+                                                "causal-cohort.assignment-skipped-known-failed",
+                                                iteration=iteration,
+                                                assignment=fingerprint,
+                                                candidate=cohort_fingerprint,
+                                                predicate=target_predicate,
+                                                cohortId=(
+                                                    cohort_suggestion.cohort_id
+                                                ),
+                                                reason=(
+                                                    cohort_queue_decision.reason
+                                                ),
+                                                authority=(
+                                                    EVIDENCE_DIAGNOSTIC_HINT
+                                                ),
+                                            )
+                                            eprint(
+                                                f"[info] {project}: cohort fallback "
+                                                f"{cohort_fingerprint} not queued "
+                                                f"for {mode}; reason="
+                                                f"{cohort_queue_decision.reason}; "
+                                                "continuing search without "
+                                                "repeating a known exact failure"
+                                            )
+                                            continue
+
                                         pending_promising_assignments.offer(
                                             project,
                                             mode,
@@ -12095,20 +12150,6 @@ def resolve_peer_compatibility_with_verification(
                                             ),
                                             authority=EVIDENCE_DIAGNOSTIC_HINT,
                                         )
-                                        # The current exact assignment is already
-                                        # freshly confirmed failing. Exclude only
-                                        # that exact point; cohort membership is not
-                                        # incompatibility evidence.
-                                        if (
-                                            exact_nogood
-                                            not in global_exact_exclusions[
-                                                project
-                                            ][mode]
-                                        ):
-                                            global_exact_exclusions[
-                                                project
-                                            ][mode].append(exact_nogood)
-                                            liveness.record_exact_exclusion()
                                         localization_checkpoint_store.clear(
                                             project, mode
                                         )
@@ -12439,24 +12480,24 @@ def resolve_peer_compatibility_with_verification(
                                     )),
                                 )
 
-                            causal_probe_ledger.sync(
-                                run_identity=recovery_identity,
-                                project=project,
-                                mode=mode,
-                                predicate=target_predicate,
-                                package=predicate_pkg,
-                                attempted_versions=session.attempted_versions,
-                            )
-
                             def permit_main_causal_probe(
                                 _probe_version: str,
                             ) -> bool:
-                                permit = causal_probe_ledger.try_acquire(
+                                # BLOCK_PSI582_CRASH_SAFE_PROBE_RESERVATION_V1
+                                # Persist the exact physical-cost reservation before
+                                # the verifier starts. A crash may conservatively
+                                # spend a slot, but cannot regain already-paid cost.
+                                permit = reserve_causal_physical_probe(
+                                    ledger=causal_probe_ledger,
+                                    hydrator=causal_family_hydrator,
+                                    predicate_state_store=predicate_state_store,
                                     run_identity=recovery_identity,
                                     project=project,
                                     mode=mode,
                                     predicate=target_predicate,
                                     package=predicate_pkg,
+                                    version=_probe_version,
+                                    family_packages=tuple(rows_by_name),
                                 )
                                 if not permit.granted:
                                     progress_reporter.emit(
@@ -12467,6 +12508,7 @@ def resolve_peer_compatibility_with_verification(
                                         assignment=fingerprint,
                                         predicate=target_predicate,
                                         package=predicate_pkg,
+                                        version=_probe_version,
                                         reason=permit.reason,
                                         packageUsed=permit.package_used,
                                         familyUsed=permit.family_used,
@@ -12928,15 +12970,19 @@ def resolve_peer_compatibility_with_verification(
                                                 in {0, 1}
                                             ]
                                             # BLOCK_PSI581_SHARED_BRANCH_BUDGET_V1
-                                            causal_probe_ledger.sync(
+                                            # Ψ.5.8.2 hydration is deliberately not
+                                            # package-local; branch may be the first
+                                            # family consumer after process resume.
+                                            causal_family_hydrator.ensure(
+                                                ledger=causal_probe_ledger,
+                                                predicate_state_store=(
+                                                    predicate_state_store
+                                                ),
                                                 run_identity=recovery_identity,
                                                 project=project,
                                                 mode=mode,
                                                 predicate=branch_predicate,
-                                                package=branch_pkg,
-                                                attempted_versions=(
-                                                    branch_session.attempted_versions
-                                                ),
+                                                packages=tuple(rows_by_name),
                                             )
                                             branch_bounded_domain = (
                                                 bounded_causal_probe_domain(
@@ -13059,13 +13105,31 @@ def resolve_peer_compatibility_with_verification(
                                                 f"authority="
                                                 f"{EVIDENCE_DIAGNOSTIC_HINT}"
                                             )
+                                            # BLOCK_PSI582_BRANCH_SHARED_RESERVATION_V1
                                             branch_permit = (
-                                                causal_probe_ledger.try_acquire(
-                                                    run_identity=recovery_identity,
+                                                reserve_causal_physical_probe(
+                                                    ledger=causal_probe_ledger,
+                                                    hydrator=(
+                                                        causal_family_hydrator
+                                                    ),
+                                                    predicate_state_store=(
+                                                        predicate_state_store
+                                                    ),
+                                                    run_identity=(
+                                                        recovery_identity
+                                                    ),
                                                     project=project,
                                                     mode=mode,
                                                     predicate=branch_predicate,
                                                     package=branch_pkg,
+                                                    version=str(
+                                                        branch_candidate.get(
+                                                            branch_pkg, ""
+                                                        )
+                                                    ),
+                                                    family_packages=tuple(
+                                                        rows_by_name
+                                                    ),
                                                 )
                                             )
                                             if not branch_permit.granted:

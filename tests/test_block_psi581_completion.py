@@ -156,7 +156,12 @@ class Psi581StaticIntegrationTests(unittest.TestCase):
         self.assertIn("branch_bounded_domain = (", self.generator)
         self.assertIn("bounded_causal_probe_domain(", self.generator)
         self.assertIn("branch_permit = (", self.generator)
-        self.assertIn("causal_probe_ledger.try_acquire(", self.generator)
+        # Ψ.5.8.2 supersedes the direct ledger acquisition with the shared
+        # crash-safe reservation helper. The helper hydrates the whole family,
+        # acquires the same ledger budget and persists the exact attempt before
+        # verifier execution.
+        self.assertIn("# BLOCK_PSI582_BRANCH_SHARED_RESERVATION_V1", self.generator)
+        self.assertIn("reserve_causal_physical_probe(", self.generator)
 
     def test_handoff_creates_exact_cohort_fallback_candidate(self) -> None:
         self.assertIn("# BLOCK_PSI581_REAL_COHORT_HANDOFF_V1", self.generator)
