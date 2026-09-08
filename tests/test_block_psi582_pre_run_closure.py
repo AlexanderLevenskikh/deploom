@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import sys
 import tempfile
@@ -100,7 +100,7 @@ class Psi582ResumeBudgetTests(unittest.TestCase):
             hydrator=self.hydrator,
             predicate_state_store=store,
             run_identity="run",
-            project="partner-form",
+            project="fixture-project",
             mode="yellow",
             predicate=PREDICATE,
             package=package,
@@ -227,3 +227,4 @@ class Psi582StaticIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
