@@ -186,6 +186,7 @@ from block_psi59_transitive_override_search import (
     reserve_transitive_override_attempt,
     transitive_duplicate_subject,
 )
+from block_psi591_unified_cohort_handoff import plan_cohort_handoff
 from block_v_prepared_artifact import (
     SEARCH_PRIORITY_PROMISING,
     prioritize_prepared_artifact_record,
@@ -12179,12 +12180,18 @@ def resolve_peer_compatibility_with_verification(
                                     )
 
                                     # BLOCK_PSI581_REAL_COHORT_HANDOFF_V1
-                                    # Handoff produces a concrete next exact point.
-                                    # Cohort inference is navigation-only; the point
-                                    # still needs ordinary full Baseline verification.
-                                    cohort_suggestion = infer_baseline_cohort(
+                                    # BLOCK_PSI591_UNIFIED_COHORT_HANDOFF_V1
+                                    # Both direct and projected-transitive exhaustion
+                                    # now use one proof-neutral planning contract.
+                                    # plan_cohort_handoff delegates to
+                                    # build_cohort_fallback_assignment(...) and
+                                    # cohort_handoff_control(...); physical project
+                                    # verification remains the only success authority.
+                                    cohort_plan = plan_cohort_handoff(
                                         predicate=target_predicate,
                                         direct_packages=verification_assignment.keys(),
+                                        assignment=verification_assignment,
+                                        current_versions=baseline_current_versions,
                                         subject_consumers=subject_consumers,
                                         interaction_graph=navigation_graph,
                                         policy_by_package={
@@ -12199,58 +12206,34 @@ def resolve_peer_compatibility_with_verification(
                                                 or 0
                                             ),
                                         ),
-                                    )
-                                    if cohort_suggestion is not None:
-                                        cohort_fallback = (
-                                            build_cohort_fallback_assignment(
-                                                assignment=verification_assignment,
-                                                current_versions=(
-                                                    baseline_current_versions
-                                                ),
-                                                cohort_packages=(
-                                                    cohort_suggestion.packages
-                                                ),
+                                        confirmed_failed_fingerprints=(
+                                            confirmed_failed_assignments
+                                        ),
+                                        exact_exclusion_fingerprints=(
+                                            assignment_fingerprint(item)
+                                            for item in (
+                                                global_exact_exclusions[
+                                                    project
+                                                ][mode]
                                             )
-                                        )
-                                    else:
-                                        cohort_fallback = None
-                                    if (
-                                        cohort_fallback is not None
-                                        and cohort_fallback.changed
-                                    ):
+                                        ),
+                                        assignment_fingerprint_fn=(
+                                            assignment_fingerprint
+                                        ),
+                                    )
+                                    if cohort_plan.actionable:
+                                        cohort_suggestion = cohort_plan.suggestion
+                                        cohort_fallback = cohort_plan.fallback
                                         cohort_assignment = (
-                                            cohort_fallback.assignment_dict
+                                            cohort_plan.assignment_dict
                                         )
                                         cohort_fingerprint = (
-                                            assignment_fingerprint(
-                                                cohort_assignment
-                                            )
+                                            cohort_plan.fingerprint
                                         )
-                                        # BLOCK_PSI582_COHORT_FALLBACK_DEDUP_V1
                                         cohort_queue_decision = (
-                                            cohort_fallback_queue_decision(
-                                                cohort_fingerprint,
-                                                confirmed_failed_fingerprints=(
-                                                    confirmed_failed_assignments
-                                                ),
-                                                exact_exclusion_fingerprints=(
-                                                    assignment_fingerprint(item)
-                                                    for item in (
-                                                        global_exact_exclusions[
-                                                            project
-                                                        ][mode]
-                                                    )
-                                                ),
-                                            )
+                                            cohort_plan.queue_decision
                                         )
-                                        # BLOCK_PSI583_DUPLICATE_FALLBACK_CONTROL_V1
-                                        # Duplicate/known fallback leaves publication
-                                        # of the current exact exclusion to the common
-                                        # path. A genuinely new fallback publishes it
-                                        # here and steers out of this solver iteration.
-                                        cohort_control = cohort_handoff_control(
-                                            cohort_queue_decision
-                                        )
+                                        cohort_control = cohort_plan.control
                                         if not cohort_control.queue_fallback:
                                             progress_reporter.emit(
                                                 project,
@@ -12541,6 +12524,167 @@ def resolve_peer_compatibility_with_verification(
                                     anytime.search_strategy = (
                                         "target-cohort-relaxation"
                                     )
+
+                                    # BLOCK_PSI591_DIRECT_COHORT_HANDOFF_V1
+                                    # Direct predicate subjects used to stop at a
+                                    # strategy-name change and fall back into the old
+                                    # graph generalization/minimization path. Build the
+                                    # same exact cohort handoff used by projected
+                                    # transitive predicates.
+                                    direct_cohort_plan = plan_cohort_handoff(
+                                        predicate=target_predicate,
+                                        direct_packages=verification_assignment.keys(),
+                                        focus_package=predicate_pkg,
+                                        assignment=verification_assignment,
+                                        current_versions=baseline_current_versions,
+                                        subject_consumers=subject_consumers,
+                                        interaction_graph=navigation_graph,
+                                        policy_by_package={
+                                            name: _baseline_intent_policy(name)
+                                            for name in rows_by_name
+                                        },
+                                        previous_deferred=_baseline_deferred_cohorts(),
+                                        repeated_count=max(
+                                            2,
+                                            int(
+                                                anytime.repeated_predicate_count
+                                                or 0
+                                            ),
+                                        ),
+                                        confirmed_failed_fingerprints=(
+                                            confirmed_failed_assignments
+                                        ),
+                                        exact_exclusion_fingerprints=(
+                                            assignment_fingerprint(item)
+                                            for item in (
+                                                global_exact_exclusions[
+                                                    project
+                                                ][mode]
+                                            )
+                                        ),
+                                        assignment_fingerprint_fn=(
+                                            assignment_fingerprint
+                                        ),
+                                    )
+                                    if direct_cohort_plan.actionable:
+                                        cohort_suggestion = (
+                                            direct_cohort_plan.suggestion
+                                        )
+                                        cohort_fallback = direct_cohort_plan.fallback
+                                        cohort_assignment = (
+                                            direct_cohort_plan.assignment_dict
+                                        )
+                                        cohort_fingerprint = (
+                                            direct_cohort_plan.fingerprint
+                                        )
+                                        cohort_queue_decision = (
+                                            direct_cohort_plan.queue_decision
+                                        )
+                                        cohort_control = direct_cohort_plan.control
+
+                                        if not cohort_control.queue_fallback:
+                                            progress_reporter.emit(
+                                                project,
+                                                mode,
+                                                "causal-cohort.assignment-skipped-known-failed",
+                                                iteration=iteration,
+                                                assignment=fingerprint,
+                                                candidate=cohort_fingerprint,
+                                                predicate=target_predicate,
+                                                cohortId=(
+                                                    cohort_suggestion.cohort_id
+                                                ),
+                                                reason=(
+                                                    cohort_queue_decision.reason
+                                                ),
+                                                controlReason=(
+                                                    cohort_control.reason
+                                                ),
+                                                sourcePath=(
+                                                    "direct-subject-exhausted"
+                                                ),
+                                                authority=(
+                                                    EVIDENCE_DIAGNOSTIC_HINT
+                                                ),
+                                            )
+                                            eprint(
+                                                f"[info] {project}: direct-subject "
+                                                f"cohort fallback "
+                                                f"{cohort_fingerprint} not queued "
+                                                f"for {mode}; reason="
+                                                f"{cohort_queue_decision.reason}; "
+                                                "current exact exclusion remains "
+                                                "owned by common search flow"
+                                            )
+                                            continue
+
+                                        if cohort_control.publish_current_exact_now:
+                                            if (
+                                                exact_nogood
+                                                not in global_exact_exclusions[
+                                                    project
+                                                ][mode]
+                                            ):
+                                                global_exact_exclusions[
+                                                    project
+                                                ][mode].append(exact_nogood)
+                                                liveness.record_exact_exclusion()
+
+                                        pending_promising_assignments.offer(
+                                            project,
+                                            mode,
+                                            build_promising_assignment(
+                                                assignment=cohort_assignment,
+                                                assignment_fingerprint=(
+                                                    cohort_fingerprint
+                                                ),
+                                                originating_predicate=(
+                                                    target_predicate
+                                                ),
+                                                removed_predicates=(),
+                                                remaining_predicates=(
+                                                    target_predicate,
+                                                ),
+                                            ),
+                                        )
+                                        progress_reporter.emit(
+                                            project,
+                                            mode,
+                                            "causal-cohort.assignment-created",
+                                            iteration=iteration,
+                                            assignment=fingerprint,
+                                            candidate=cohort_fingerprint,
+                                            predicate=target_predicate,
+                                            cohortId=(
+                                                cohort_suggestion.cohort_id
+                                            ),
+                                            deferredPackages=list(
+                                                cohort_fallback.deferred_packages
+                                            ),
+                                            confidence=(
+                                                cohort_suggestion.confidence
+                                            ),
+                                            sourcePath=(
+                                                "direct-subject-exhausted"
+                                            ),
+                                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                        )
+                                        localization_checkpoint_store.clear(
+                                            project, mode
+                                        )
+                                        checkpoint_baseline_run(
+                                            "direct-causal-cohort-fallback-queued",
+                                            completed_iteration=iteration,
+                                            last_assignment=fingerprint,
+                                            last_predicate=target_predicate,
+                                        )
+                                        predicate_search_steered = (
+                                            cohort_control.steer_outer_iteration
+                                        )
+                                        break
+
+                                    # If inference cannot create a changed exact
+                                    # fallback, preserve the old proof-safe path.
                                     continue
                             ranked = rank_version_probes(
                                 package=predicate_pkg,

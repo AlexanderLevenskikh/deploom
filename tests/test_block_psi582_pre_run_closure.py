@@ -203,6 +203,9 @@ class Psi582StaticIntegrationTests(unittest.TestCase):
         cls.generator = (
             ROOT / "dependency_live_roadmap_generator.py"
         ).read_text(encoding="utf-8")
+        cls.handoff = (
+            ROOT / "block_psi591_unified_cohort_handoff.py"
+        ).read_text(encoding="utf-8")
 
     def test_main_and_branch_use_shared_reservation_helper(self):
         self.assertGreaterEqual(
@@ -215,9 +218,21 @@ class Psi582StaticIntegrationTests(unittest.TestCase):
         )
 
     def test_duplicate_cohort_fallback_is_explicitly_skipped(self):
+        # Ψ.5.9.1 moved duplicate/exclusion planning into the shared
+        # proof-neutral cohort handoff helper. The generator composes that
+        # helper and keeps the observable skip event; the helper retains
+        # the canonical Ψ.5.8.2 duplicate filter through lazy injection.
         self.assertIn(
-            "cohort_fallback_queue_decision(",
+            "plan_cohort_handoff(",
             self.generator,
+        )
+        self.assertIn(
+            "from block_psi582_pre_run_closure import cohort_fallback_queue_decision",
+            self.handoff,
+        )
+        self.assertIn(
+            "_queue_decision = cohort_fallback_queue_decision",
+            self.handoff,
         )
         self.assertIn(
             '"causal-cohort.assignment-skipped-known-failed"',
