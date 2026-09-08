@@ -104,7 +104,12 @@ def _new_metrics() -> dict[str, object]:
         "incumbentPromotionMs": 0,
         "controlDurablePublications": 0,
         "resolverSeedBuilds": 0,
+        "resolverSeedPublishMs": 0,
         "resolverSeedHits": 0,
+        "resolverSeedMisses": 0,
+        "resolverSeedMissReasons": {},
+        "resolverSeedEvictions": 0,
+        "resolverSeedEvictionReasons": {},
         "resolverSeedInvalidations": 0,
         "resolverSeedCloneMs": 0,
         "neighborSeedAttempts": 0,
@@ -616,14 +621,34 @@ def record_verification_event(event: str, payload: Mapping[str, object]) -> None
                     _METRICS["incumbentPromotionMs"]
                 ) + duration
 
-        if event == "resolver-seed.created":
-            _METRICS["resolverSeedBuilds"] = int(
-                _METRICS["resolverSeedBuilds"]
-            ) + 1
+        if event in {"resolver-seed.created", "resolver-seed.published"}:
+            if event == "resolver-seed.created" or bool(payload.get("published", True)):
+                _METRICS["resolverSeedBuilds"] = int(
+                    _METRICS["resolverSeedBuilds"]
+                ) + 1
+            _METRICS["resolverSeedPublishMs"] = int(
+                _METRICS["resolverSeedPublishMs"]
+            ) + _int_field(payload, ("durationMs",))
         elif event == "resolver-seed.hit":
             _METRICS["resolverSeedHits"] = int(
                 _METRICS["resolverSeedHits"]
             ) + 1
+        elif event == "resolver-seed.miss":
+            _METRICS["resolverSeedMisses"] = int(
+                _METRICS["resolverSeedMisses"]
+            ) + 1
+            _bump_dict(
+                "resolverSeedMissReasons",
+                str(payload.get("reason") or "unknown"),
+            )
+        elif event == "resolver-seed.evicted":
+            _METRICS["resolverSeedEvictions"] = int(
+                _METRICS["resolverSeedEvictions"]
+            ) + 1
+            _bump_dict(
+                "resolverSeedEvictionReasons",
+                str(payload.get("reason") or "unknown"),
+            )
         elif event == "resolver-seed.invalidated":
             _METRICS["resolverSeedInvalidations"] = int(
                 _METRICS["resolverSeedInvalidations"]

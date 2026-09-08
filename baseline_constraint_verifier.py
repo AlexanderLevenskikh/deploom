@@ -91,6 +91,9 @@ from block_psi57_yarn1_resolver_seed import (
     validate_yarn1_lifecycle_completion,
     yarn1_resolver_seed_runtime_supported,
 )
+from block_psi58_reuse_economics import (
+    resolver_seed_publication_decision,
+)
 from project_topology import (
     ProjectTopologyError,
     resolve_project_topology,
@@ -167,6 +170,10 @@ class BaselineVerifyConfig:
     # Ψ.5.5: candidate-only package-manager controls. These are part of
     # resolver/proof identity and are materialized only in private verification.
     resolver_overrides: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    # Ψ.5.8 performance hint only. It is intentionally not part of proof identity:
+    # it controls whether already-proven resolver bytes are copied for a known
+    # later lifecycle consumer.
+    resolver_seed_publication_hint: str = ""
 
     @staticmethod
     def from_mapping(value: Optional[Mapping[str, object]], *, fallback_commands: Sequence[str] = ()) -> "BaselineVerifyConfig":
@@ -3081,6 +3088,82 @@ def verify_assignment(
                 lockfilePath=resolved_state.lockfile_path,
                 lockfileHash=resolved_state.lockfile_hash,
             )
+
+            # BLOCK_PSI58_RESOLVER_SEED_ECONOMICS_V1
+            # Publish only at a real resolver -> later lifecycle boundary.
+            # A fresh resolver inside a project-check attempt continues directly
+            # into lifecycle in the same workspace and must not pay for a copy.
+            seed_publication = resolver_seed_publication_decision(
+                capability_enabled=resolver_seed_enabled,
+                fresh_resolver=True,
+                run_project_checks=run_project_checks,
+                publication_hint=config.resolver_seed_publication_hint,
+                verification_purpose=_verification_purpose(config),
+            )
+            if seed_publication.publish:
+                resolver_seed_key = resolver_seed_identity(
+                    resolver_input_key=proof_identity.resolver_input_key,
+                    resolved_state_key=resolved_state.key,
+                    observed_resolved_hash=observed_hash,
+                    manager_family=workspace_topology.profile.family,
+                )
+                seed_publish_started = time.monotonic()
+                try:
+                    seed_published = resolver_seed_store.publish(
+                        key=resolver_seed_key,
+                        source_workspace_root=workspace_root,
+                        project_relative=project_relative_to_workspace,
+                        package_manager_relative=package_manager_relative_to_workspace,
+                        source_project=project_dir,
+                        resolved_state_key=resolved_state.key,
+                        observed_resolved_hash=observed_hash,
+                        parent=trial_parent,
+                        timeout_seconds=snapshot_copy_timeout(),
+                        progress=phase_progress("resolver-seed-publish"),
+                        progress_label=f"{progress_label}: resolver seed publish",
+                        producer=progress_label,
+                    )
+                except Exception as exc:
+                    event(
+                        "resolver-seed.publish-skipped",
+                        seedKey=resolver_seed_key,
+                        reason=f"publication-error:{type(exc).__name__}:{exc}",
+                        publicationHint=config.resolver_seed_publication_hint,
+                        authority=RESOLVER_SEED_AUTHORITY,
+                    )
+                    _emit_progress(
+                        progress,
+                        f"{progress_label}: Ψ.5.8 ResolverSeed bridge publication "
+                        f"skipped ({type(exc).__name__}: {exc}); proof flow unchanged",
+                    )
+                else:
+                    publish_ms = int((time.monotonic() - seed_publish_started) * 1000)
+                    event(
+                        "resolver-seed.published",
+                        seedKey=resolver_seed_key,
+                        resolvedStateKey=resolved_state.key,
+                        observedResolvedHash=observed_hash,
+                        published=bool(seed_published),
+                        durationMs=publish_ms,
+                        reason=seed_publication.reason,
+                        publicationHint=config.resolver_seed_publication_hint,
+                        strategy=resolver_seed_capability.strategy,
+                        authority=RESOLVER_SEED_AUTHORITY,
+                    )
+                    _emit_progress(
+                        progress,
+                        f"{progress_label}: Ψ.5.8 ResolverSeed bridge published; "
+                        f"seed={resolver_seed_key[:12]}; publishMs={publish_ms}; "
+                        "authority=PERFORMANCE_ONLY",
+                    )
+            elif config.resolver_seed_publication_hint:
+                event(
+                    "resolver-seed.publish-skipped",
+                    reason=seed_publication.reason,
+                    publicationHint=config.resolver_seed_publication_hint,
+                    runProjectChecks=run_project_checks,
+                    authority=RESOLVER_SEED_AUTHORITY,
+                )
         elif not observed_hash or resolved_state is None:
             return BaselineVerifyResult(
                 False,
@@ -3249,39 +3332,11 @@ def verify_assignment(
                             manager_family=workspace_topology.profile.family,
                         )
                         if not resolver_reused:
-                            seed_published = resolver_seed_store.publish(
-                                key=resolver_seed_key,
-                                source_workspace_root=workspace_root,
-                                project_relative=project_relative_to_workspace,
-                                package_manager_relative=(
-                                    package_manager_relative_to_workspace
-                                ),
-                                source_project=project_dir,
-                                resolved_state_key=resolved_state.key,
-                                observed_resolved_hash=observed_hash,
-                                parent=trial_parent,
-                                timeout_seconds=snapshot_copy_timeout(),
-                                progress=phase_progress("resolver-seed-publish"),
-                                progress_label=(
-                                    f"{progress_label}: resolver seed publish"
-                                ),
-                                producer=progress_label,
-                            )
                             event(
-                                "resolver-seed.published",
+                                "resolver-seed.publish-skipped",
+                                reason="inline-lifecycle-no-copy",
                                 seedKey=resolver_seed_key,
-                                resolvedStateKey=resolved_state.key,
-                                observedResolvedHash=observed_hash,
-                                published=bool(seed_published),
-                                strategy=resolver_seed_capability.strategy,
                                 authority=RESOLVER_SEED_AUTHORITY,
-                            )
-                            _emit_progress(
-                                progress,
-                                f"{progress_label}: Ψ.5.7 resolver seed "
-                                f"{'published' if seed_published else 'not published'}; "
-                                f"seed={resolver_seed_key[:12]}; "
-                                "authority=PERFORMANCE_ONLY",
                             )
                         else:
                             seed_target = temp_root / "resolver-seed-lifecycle"
@@ -3304,6 +3359,9 @@ def verify_assignment(
                                     "resolver-seed.miss",
                                     seedKey=resolver_seed_key,
                                     resolvedStateKey=resolved_state.key,
+                                    reason=resolver_seed_store.miss_reason(
+                                        resolver_seed_key
+                                    ),
                                     authority=RESOLVER_SEED_AUTHORITY,
                                 )
                             else:

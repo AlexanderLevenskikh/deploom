@@ -164,6 +164,12 @@ from block_psi56_causal_anytime_search import (
     causal_decision_projection,
     select_projected_followup,
 )
+from block_psi58_bounded_causal_search import (
+    CausalSearchPolicy,
+    bounded_causal_probe_domain,
+    family_budget_exhausted,
+)
+from block_psi58_reuse_economics import RESOLVER_SEED_PUBLICATION_BRIDGE
 from block_v_prepared_artifact import (
     SEARCH_PRIORITY_PROMISING,
     prioritize_prepared_artifact_record,
@@ -9985,6 +9991,9 @@ def resolve_peer_compatibility_with_verification(
         predicate_probe_policy = PredicateProbePolicy.from_sources(
             spec.constraint_verify_config, os.environ
         )
+        causal_search_policy = CausalSearchPolicy.from_sources(
+            spec.constraint_verify_config, os.environ
+        )
         predicate_branch_policy = PredicateBranchPolicy.from_sources(
             spec.constraint_verify_config, os.environ
         )
@@ -10926,10 +10935,19 @@ def resolve_peer_compatibility_with_verification(
                     # Resolver authority first. Project checks are scheduled below
                     # so adaptive mode can reject a freshly introduced structural
                     # regression before paying for the complete project suite.
+                    # BLOCK_PSI58_RESOLVER_SEED_BRIDGE_V1
+                    resolver_bridge_config = dataclasses.replace(
+                        config,
+                        resolver_seed_publication_hint=(
+                            RESOLVER_SEED_PUBLICATION_BRIDGE
+                            if config.project_checks != "off" and config.commands
+                            else ""
+                        ),
+                    )
                     result = verify_assignment(
                         spec.path,
                         verification_assignment,
-                        config=config,
+                        config=resolver_bridge_config,
                         run_project_checks=False,
                         remove_packages=removals,
                         progress=lambda message: (
@@ -11764,6 +11782,7 @@ def resolve_peer_compatibility_with_verification(
                             current_probe_version = str(
                                 verification_assignment.get(predicate_pkg, "")
                             )
+                            causal_probe_domain: Optional[List[str]] = None
                             if not predicate_pkg or not current_probe_version:
                                 navigation_graph, subject_consumers = (
                                     _baseline_cohort_navigation_context(
@@ -11790,9 +11809,183 @@ def resolve_peer_compatibility_with_verification(
                                         authority=EVIDENCE_DIAGNOSTIC_HINT,
                                     )
                                     continue
-                                predicate_pkg = causal_projection.ranked_packages[0]
+
+                                # BLOCK_PSI58_BOUNDED_CAUSAL_SEARCH_V1
+                                causal_candidates = list(
+                                    causal_projection.ranked_packages[
+                                        : causal_search_policy.max_parents
+                                    ]
+                                )
+                                relevant_causal_packages = tuple(dict.fromkeys(
+                                    [
+                                        predicate_subject,
+                                        *causal_projection.graph_backed_packages,
+                                        *causal_candidates,
+                                    ]
+                                ))
+                                candidate_attempts: Dict[str, int] = {}
+                                candidate_domains: List[Tuple[str, object]] = []
+                                for causal_candidate in causal_candidates:
+                                    candidate_meta = client.npm_cache.get(
+                                        causal_candidate
+                                    )
+                                    candidate_row = rows_by_name.get(
+                                        causal_candidate
+                                    )
+                                    if (
+                                        not isinstance(candidate_meta, dict)
+                                        or candidate_row is None
+                                    ):
+                                        continue
+                                    candidate_session = (
+                                        predicate_state_store.load_session(
+                                            project,
+                                            mode,
+                                            run_identity=recovery_identity,
+                                            package=causal_candidate,
+                                            predicate=target_predicate,
+                                        )
+                                    )
+                                    candidate_published = published_versions(
+                                        candidate_meta,
+                                        include_prerelease=False,
+                                    )
+                                    (
+                                        candidate_structural,
+                                        _,
+                                    ) = client.registry_structural_candidates(
+                                        candidate_meta,
+                                        candidate_published,
+                                    )
+                                    candidate_raw_domain = [
+                                        version
+                                        for version in candidate_structural
+                                        if compare_semver(
+                                            version,
+                                            candidate_row.current_version,
+                                        )
+                                        in {0, 1}
+                                    ]
+                                    bounded_domain = bounded_causal_probe_domain(
+                                        metadata=candidate_meta,
+                                        versions=candidate_raw_domain,
+                                        relevant_packages=(
+                                            relevant_causal_packages
+                                        ),
+                                        attempted_versions=(
+                                            candidate_session.attempted_versions
+                                        ),
+                                        policy=causal_search_policy,
+                                    )
+                                    candidate_attempts[causal_candidate] = (
+                                        bounded_domain.attempted_count
+                                    )
+                                    candidate_domains.append(
+                                        (causal_candidate, bounded_domain)
+                                    )
+                                    if bounded_domain.exhausted:
+                                        observed_absent = any(
+                                            (
+                                                item.package.lower()
+                                                == causal_candidate.lower()
+                                                and item.predicate
+                                                == target_predicate
+                                                and not item.present
+                                            )
+                                            for item in candidate_session.observations
+                                        )
+                                        if (
+                                            bounded_domain.attempted_count > 0
+                                            and not observed_absent
+                                        ):
+                                            progress_reporter.emit(
+                                                project,
+                                                mode,
+                                                "causal-package.no-gain",
+                                                iteration=iteration,
+                                                assignment=fingerprint,
+                                                predicate=target_predicate,
+                                                package=causal_candidate,
+                                                attemptedPhysicalProbes=(
+                                                    bounded_domain.attempted_count
+                                                ),
+                                                authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                            )
+                                        progress_reporter.emit(
+                                            project,
+                                            mode,
+                                            "causal-package.exhausted",
+                                            iteration=iteration,
+                                            assignment=fingerprint,
+                                            predicate=target_predicate,
+                                            package=causal_candidate,
+                                            attemptedPhysicalProbes=(
+                                                bounded_domain.attempted_count
+                                            ),
+                                            reason=bounded_domain.reason,
+                                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                        )
+
+                                family_exhausted = family_budget_exhausted(
+                                    candidate_attempts,
+                                    policy=causal_search_policy,
+                                )
+                                selected_causal = next(
+                                    (
+                                        (name, domain)
+                                        for name, domain in candidate_domains
+                                        if not domain.exhausted
+                                    ),
+                                    None,
+                                )
+                                if family_exhausted or selected_causal is None:
+                                    predicate_search_handoff_to_generalization = True
+                                    anytime.search_strategy = (
+                                        "target-cohort-relaxation"
+                                    )
+                                    handoff_reason = (
+                                        "family-physical-budget-exhausted"
+                                        if family_exhausted
+                                        else "causal-parents-exhausted"
+                                    )
+                                    progress_reporter.emit(
+                                        project,
+                                        mode,
+                                        "causal-family.cohort-handoff",
+                                        iteration=iteration,
+                                        assignment=fingerprint,
+                                        predicate=target_predicate,
+                                        rankedPackages=list(
+                                            causal_projection.ranked_packages
+                                        ),
+                                        attemptedByPackage=dict(
+                                            candidate_attempts
+                                        ),
+                                        reason=handoff_reason,
+                                        targetStrategy=(
+                                            "target-cohort-relaxation"
+                                        ),
+                                        authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                    )
+                                    eprint(
+                                        f"[info] {project}: bounded causal "
+                                        f"search handoff {mode}; "
+                                        f"predicate={target_predicate}, "
+                                        f"reason={handoff_reason}, "
+                                        f"attempts={candidate_attempts}, "
+                                        "strategy=target-cohort-relaxation, "
+                                        f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
+                                    )
+                                    continue
+
+                                predicate_pkg = selected_causal[0]
+                                causal_probe_domain = list(
+                                    selected_causal[1].versions
+                                )
                                 current_probe_version = str(
-                                    verification_assignment.get(predicate_pkg, "")
+                                    verification_assignment.get(
+                                        predicate_pkg, ""
+                                    )
                                 )
                                 if not current_probe_version:
                                     continue
@@ -11804,9 +11997,19 @@ def resolve_peer_compatibility_with_verification(
                                     assignment=fingerprint,
                                     predicate=target_predicate,
                                     subject=predicate_subject,
-                                    rankedPackages=list(causal_projection.ranked_packages),
-                                    graphBackedPackages=list(causal_projection.graph_backed_packages),
-                                    priorOnlyPackages=list(causal_projection.prior_only_packages),
+                                    rankedPackages=list(
+                                        causal_projection.ranked_packages
+                                    ),
+                                    graphBackedPackages=list(
+                                        causal_projection.graph_backed_packages
+                                    ),
+                                    priorOnlyPackages=list(
+                                        causal_projection.prior_only_packages
+                                    ),
+                                    selectedPackage=predicate_pkg,
+                                    representativeVersions=list(
+                                        causal_probe_domain
+                                    ),
                                     reasons=causal_projection.reason_map(),
                                     confidence=causal_projection.confidence,
                                     authority=EVIDENCE_DIAGNOSTIC_HINT,
@@ -11823,10 +12026,14 @@ def resolve_peer_compatibility_with_verification(
                                     authority=EVIDENCE_DIAGNOSTIC_HINT,
                                 )
                                 eprint(
-                                    f"[info] {project}: causal predicate projection {mode}; "
-                                    f"predicate={target_predicate}, subject={predicate_subject or '<none>'}, "
+                                    f"[info] {project}: causal predicate "
+                                    f"projection {mode}; "
+                                    f"predicate={target_predicate}, "
+                                    f"subject={predicate_subject or '<none>'}, "
                                     f"direct={list(causal_projection.ranked_packages)}, "
-                                    f"selected={predicate_pkg}, confidence={causal_projection.confidence}, "
+                                    f"selected={predicate_pkg}, "
+                                    f"representatives={causal_probe_domain}, "
+                                    f"confidence={causal_projection.confidence}, "
                                     f"authority={EVIDENCE_DIAGNOSTIC_HINT}"
                                 )
                             meta = client.npm_cache.get(predicate_pkg)
@@ -11891,10 +12098,82 @@ def resolve_peer_compatibility_with_verification(
                             structural_versions, _ = client.registry_structural_candidates(
                                 meta, published
                             )
-                            probe_domain = [
+                            raw_probe_domain = [
                                 version for version in structural_versions
-                                if compare_semver(version, row.current_version) in {0, 1}
+                                if compare_semver(
+                                    version, row.current_version
+                                ) in {0, 1}
                             ]
+                            if causal_probe_domain is not None:
+                                # Ψ.5.8 representatives constrain diagnostic
+                                # experiments only. The solver domain above remains
+                                # the original complete structural domain.
+                                probe_domain = list(causal_probe_domain)
+                            else:
+                                direct_bounded_domain = (
+                                    bounded_causal_probe_domain(
+                                        metadata=meta,
+                                        versions=raw_probe_domain,
+                                        relevant_packages=(
+                                            predicate_subject,
+                                            predicate_pkg,
+                                        ),
+                                        attempted_versions=(
+                                            session.attempted_versions
+                                        ),
+                                        policy=causal_search_policy,
+                                    )
+                                )
+                                probe_domain = list(
+                                    direct_bounded_domain.versions
+                                )
+                                if (
+                                    direct_bounded_domain.exhausted
+                                    and direct_bounded_domain.attempted_count > 0
+                                ):
+                                    observed_absent = any(
+                                        (
+                                            item.package.lower()
+                                            == predicate_pkg.lower()
+                                            and item.predicate
+                                            == target_predicate
+                                            and not item.present
+                                        )
+                                        for item in session.observations
+                                    )
+                                    if not observed_absent:
+                                        progress_reporter.emit(
+                                            project,
+                                            mode,
+                                            "causal-package.no-gain",
+                                            iteration=iteration,
+                                            assignment=fingerprint,
+                                            predicate=target_predicate,
+                                            package=predicate_pkg,
+                                            attemptedPhysicalProbes=(
+                                                direct_bounded_domain.attempted_count
+                                            ),
+                                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                        )
+                                    progress_reporter.emit(
+                                        project,
+                                        mode,
+                                        "causal-package.exhausted",
+                                        iteration=iteration,
+                                        assignment=fingerprint,
+                                        predicate=target_predicate,
+                                        package=predicate_pkg,
+                                        attemptedPhysicalProbes=(
+                                            direct_bounded_domain.attempted_count
+                                        ),
+                                        reason=direct_bounded_domain.reason,
+                                        authority=EVIDENCE_DIAGNOSTIC_HINT,
+                                    )
+                                    predicate_search_handoff_to_generalization = True
+                                    anytime.search_strategy = (
+                                        "target-cohort-relaxation"
+                                    )
+                                    continue
                             ranked = rank_version_probes(
                                 package=predicate_pkg,
                                 predicate=target_predicate,

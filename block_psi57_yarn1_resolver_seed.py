@@ -37,6 +37,7 @@ from prepared_workspace_fastpath import WorkspaceChangeGuard
 from reparse_materialization import inventory_reparse_plan
 from substrate_identity import tool_build_id
 from verification_workspace_backend import materialize_private_tree
+from verification_observability import emit_observability_event
 
 
 AUTHORITY = "PERFORMANCE_ONLY"
@@ -267,6 +268,7 @@ class SameRunResolverSeedStore:
         self._lock = threading.RLock()
         self._root: Optional[Path] = None
         self._records: dict[str, _ResolverSeedRecord] = {}
+        self._miss_reasons: dict[str, str] = {}
 
     def _ensure_root(self, parent: Optional[Path] = None) -> Path:
         with self._lock:
@@ -336,10 +338,18 @@ class SameRunResolverSeedStore:
             return
         shutil.rmtree(container, ignore_errors=True)
 
-    def _evict_locked(self, key: str) -> None:
-        record = self._records.pop(str(key), None)
+    def _evict_locked(self, key: str, *, reason: str = "evicted") -> None:
+        seed_key = str(key)
+        record = self._records.pop(seed_key, None)
         if record is None:
             return
+        self._miss_reasons[seed_key] = str(reason or "evicted")
+        emit_observability_event(
+            "resolver-seed.evicted",
+            seedKey=seed_key,
+            reason=self._miss_reasons[seed_key],
+            authority=AUTHORITY,
+        )
         try:
             record.guard.stop()
         except Exception:
@@ -355,7 +365,7 @@ class SameRunResolverSeedStore:
             if not candidates:
                 return
             victim = min(candidates, key=lambda item: (item.last_used, item.key))
-            self._evict_locked(victim.key)
+            self._evict_locked(victim.key, reason="evicted-budget")
 
     def publish(
         self,
@@ -426,8 +436,9 @@ class SameRunResolverSeedStore:
                     guard=guard,
                     last_used=time.monotonic(),
                 )
-                self._evict_locked(seed_key)
+                self._evict_locked(seed_key, reason="replaced")
                 self._records[seed_key] = record
+                self._miss_reasons.pop(seed_key, None)
                 self._enforce_budget_locked(seed_key)
                 return True
             except Exception:
@@ -467,7 +478,7 @@ class SameRunResolverSeedStore:
                 or record.resolved_state_key != str(resolved_state_key or "")
                 or record.observed_resolved_hash != str(observed_resolved_hash or "")
             ):
-                self._evict_locked(seed_key)
+                self._evict_locked(seed_key, reason="identity-mismatch")
                 return None
             if target_workspace_root.exists():
                 raise ResolverSeedError(
@@ -488,7 +499,9 @@ class SameRunResolverSeedStore:
                 clean, reason = self._stop_guard(record)
                 if not clean:
                     shutil.rmtree(target_workspace_root, ignore_errors=True)
-                    self._evict_locked(seed_key)
+                    self._evict_locked(
+                        seed_key, reason=f"continuity-{reason}"
+                    )
                     return None
                 # The clone itself must still carry the resolver-stage marker.
                 validate_yarn1_resolver_seed(
@@ -501,6 +514,13 @@ class SameRunResolverSeedStore:
                     # Current clone is valid because continuity was proven
                     # through the completed copy. Retire only future reuse.
                     self._records.pop(seed_key, None)
+                    self._miss_reasons[seed_key] = "watcher-rearm-unavailable"
+                    emit_observability_event(
+                        "resolver-seed.evicted",
+                        seedKey=seed_key,
+                        reason="watcher-rearm-unavailable",
+                        authority=AUTHORITY,
+                    )
                     self._retire_record_tree(record)
                 return ResolverSeedMaterialization(
                     key=seed_key,
@@ -512,7 +532,9 @@ class SameRunResolverSeedStore:
             except Exception:
                 shutil.rmtree(target_workspace_root, ignore_errors=True)
                 try:
-                    self._evict_locked(seed_key)
+                    self._evict_locked(
+                        seed_key, reason="materialization-error"
+                    )
                 except Exception:
                     pass
                 raise
@@ -521,11 +543,18 @@ class SameRunResolverSeedStore:
         with self._lock:
             keys = tuple(self._records)
             for key in keys:
-                self._evict_locked(key)
+                self._evict_locked(key, reason="cache-clear")
             root = self._root
             self._root = None
+            self._miss_reasons.clear()
         if root is not None:
             shutil.rmtree(root, ignore_errors=True)
+
+    def miss_reason(self, key: str) -> str:
+        with self._lock:
+            return str(
+                self._miss_reasons.get(str(key or "").strip()) or "not-published"
+            )
 
     def size(self) -> int:
         with self._lock:
