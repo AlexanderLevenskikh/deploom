@@ -207,19 +207,38 @@ class Psi53DesktopContracts(unittest.TestCase):
             source,
         )
 
-    def test_background_copy_is_autonomy_not_implicit_exhaustive(self) -> None:
+    def test_control_mode_is_product_semantics_and_search_depth_is_technical(self) -> None:
         source = (
             ROOT / "desktop" / "src" / "components" / "BaselineIntentDialog.tsx"
         ).read_text(encoding="utf-8")
-        self.assertIn("Режим Baseline", source)
-        self.assertIn("Как выполнять", source)
-        self.assertIn("Работать автономно", source)
-        self.assertIn("Глубина поиска", source)
-        self.assertIn("AUTO · Рекомендуется", source)
-        self.assertIn("EXHAUSTIVE", source)
-        self.assertIn("Готов ждать: исчерпывающий поиск в фоне", source)
-        self.assertNotIn("Запустить автономный глубокий поиск", source)
-        self.assertNotIn("Запустить глубокий поиск", source)
+
+        # Product control is independent from the legacy FAST/BACKGROUND
+        # transport. Search depth remains an advanced algorithm knob and must
+        # never become an implicit product completion goal.
+        for required in (
+            "Как работать",
+            "Контроль",
+            "AUTONOMOUS",
+            "CONFIRM_SIGNIFICANT",
+            "Автономно",
+            "Подтверждать существенное",
+            "Техническая глубина поиска",
+            "AUTO",
+            "EXHAUSTIVE",
+            "Технически: продолжить EXHAUSTIVE автономно",
+        ):
+            self.assertIn(required, source)
+
+        for legacy in (
+            "Режим Baseline",
+            "Как выполнять",
+            "Работать автономно",
+            "AUTO · Рекомендуется",
+            "Готов ждать: исчерпывающий поиск в фоне",
+            "Запустить автономный глубокий поиск",
+            "Запустить глубокий поиск",
+        ):
+            self.assertNotIn(legacy, source)
 
 
 class Psi53FailureTaxonomyTests(unittest.TestCase):

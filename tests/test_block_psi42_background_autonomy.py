@@ -121,8 +121,10 @@ class Psi42BackgroundAutonomyTests(unittest.TestCase):
             source,
         )
         self.assertIn("searchMode,", source)
-        self.assertIn("Работать автономно", source)
-        self.assertIn("Готов ждать: исчерпывающий поиск в фоне", source)
+        self.assertIn("Автономно", source)
+        self.assertIn("controlMode === 'AUTONOMOUS'", source)
+        self.assertNotIn("setExecutionMode", source)
+        self.assertIn("Технически: продолжить EXHAUSTIVE автономно", source)
         self.assertNotIn("Запустить автономный глубокий поиск", source)
 
     def test_draft_prompt_export_is_external_agent_handoff(self) -> None:

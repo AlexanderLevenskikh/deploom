@@ -25,9 +25,17 @@ const main = fs.readFileSync(path.resolve(here, '..', 'electron', 'main.ts'), 'u
 for (const required of [
   "planner.status === 'expand-plan'",
   'applySupervisorScopeAdditions',
-  'TARGET_PLAN_INSUFFICIENT',
+  'ACCEPTANCE_REMEDIATION_REQUIRED',
+  'acceptanceRemediationMessage(acceptance)',
+  "acceptance.status === 'UNKNOWN' || acceptance.accepted",
   "planner.status === 'blocked'",
 ]) {
-  if (!main.includes(required)) throw new Error(`autonomous residual-plan contract missing: ${required}`)
+  if (!main.includes(required)) throw new Error(`autonomous progressive-acceptance contract missing: ${required}`)
 }
-console.log('Autonomy policy contract OK')
+for (const forbidden of [
+  'TARGET_PLAN_INSUFFICIENT',
+  'planCanReachYellow === false',
+]) {
+  if (main.includes(forbidden)) throw new Error(`legacy health-target autonomy gate remains: ${forbidden}`)
+}
+console.log('Autonomy policy progressive-acceptance contract OK')

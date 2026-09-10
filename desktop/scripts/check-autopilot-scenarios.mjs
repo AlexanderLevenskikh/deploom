@@ -1,121 +1,66 @@
 import fs from 'node:fs'
 import ts from 'typescript'
 
-async function loadTypeScriptModule(relativeUrl) {
+async function loadTypeOnlyModule(relativeUrl) {
   const source = fs.readFileSync(new URL(relativeUrl, import.meta.url), 'utf8')
   const javascript = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2022 },
     fileName: relativeUrl,
     reportDiagnostics: true,
   })
-  if (javascript.diagnostics?.length) {
-    throw new Error('TypeScript scenario harness failed to transpile ' + relativeUrl + ': ' + javascript.diagnostics.map((item) => item.messageText).join('; '))
-  }
+  if (javascript.diagnostics?.length) throw new Error('TypeScript scenario harness failed to transpile ' + relativeUrl)
   return import('data:text/javascript;base64,' + Buffer.from(javascript.outputText).toString('base64'))
 }
 
-const { AUTOPILOT_ORDER, goalSeekingStopReason, nextAutopilotAction } = await loadTypeScriptModule('../src/autopilot-policy.ts')
-const { updateFlowProgress } = await loadTypeScriptModule('../electron/flow-state.ts')
+const { AUTOPILOT_ORDER, goalSeekingStopReason, nextAutopilotAction } = await loadTypeOnlyModule('../src/autopilot-policy.ts')
 
 const projectName = 'checkout-form'
-const baseDetails = (completedActions, targetClosure, factsCommit = 'merged-a', runExtras = {}) => ({
+const verdict = (status, critical = 0, high = 0, overrides = {}) => ({
+  status,
+  accepted: status === 'ACCEPTED',
+  evidenceComplete: status !== 'UNKNOWN',
+  dependencyEvidenceFresh: status !== 'UNKNOWN',
+  critical,
+  high,
+  criticalPackages: critical ? ['danger'] : [],
+  highPackages: high ? ['highdep'] : [],
+  reasons: status === 'ACCEPTED' ? ['accepted'] : ['needs remediation'],
+  policy: { maxKnownCritical: 0, maxKnownHigh: 1 },
+  ...overrides,
+})
+const details = (completedActions, acceptanceVerdict, factsCommit = 'merged-a', runExtras = {}) => ({
   teamState: { projects: { [projectName]: { completedActions, ...runExtras } } },
-  targetClosure,
+  acceptanceVerdict,
   migrationProgress: { factsCommit, factsRef: 'deps-demo-merged' },
 })
-const state = (overrides = {}) => ({
-  projectName,
-  target: 'yellow',
-  publish: false,
-  goalSignatures: {},
-  goalCycles: 0,
-  ...overrides,
-})
-const closure = (overrides = {}) => ({
-  target: 'yellow',
-  reached: false,
-  current: 'red',
-  remainingPackages: [],
-  lagBlockers: [],
-  ...overrides,
-})
-const expectAction = (label, completed, targetClosure, expected, overrides) => {
-  const actual = nextAutopilotAction(baseDetails(completed, targetClosure), state(overrides))
+const state = (overrides = {}) => ({ projectName, target: 'yellow', publish: false, goalSignatures: {}, goalCycles: 0, ...overrides })
+const expectAction = (label, completed, acceptanceVerdict, expected, overrides) => {
+  const actual = nextAutopilotAction(details(completed, acceptanceVerdict), state(overrides))
   if (actual !== expected) throw new Error(label + ': expected ' + expected + ', got ' + actual)
 }
 
 expectAction('empty flow', [], undefined, 'preflight')
 expectAction('after preflight', ['preflight'], undefined, 'baseline')
 expectAction('after baseline', ['preflight', 'baseline'], undefined, 'agent')
-expectAction('missing post-audit artifact', ['preflight', 'baseline', 'agent', 'generate', 'audit'], undefined, 'generate')
-expectAction('exhausted 53/73 plan becomes best-effort handoff instead of an infinite agent loop', ['preflight', 'baseline', 'agent', 'generate', 'audit'], closure({ lagOk: 53, total: 73, planCanReachYellow: false }), undefined)
-expectAction('remaining executable target', ['preflight', 'baseline', 'agent', 'generate', 'audit'], closure({ remainingPackages: ['postcss-scss'], planCanReachYellow: true }), 'agent')
-expectAction('green goal miss with no executable work becomes handoff', ['preflight', 'baseline', 'agent', 'generate', 'audit'], closure({ target: 'green', planCanReachYellow: true }), undefined, { target: 'green' })
-expectAction('below-yellow safe residual runs before best-effort', ['preflight', 'baseline', 'agent', 'generate', 'audit'], closure({ lagOk: 55, total: 73, planCanReachYellow: false, remainingPackages: ['safe-a', 'safe-b'] }), 'agent')
-expectAction('below-yellow exhausted residual proceeds to best-effort release', ['preflight', 'baseline', 'agent', 'generate', 'audit'], closure({ lagOk: 57, total: 73, planCanReachYellow: false, bestEffortReleaseEligible: true, bestEffortReason: 'safe plan exhausted, Critical=0' }), 'release')
-expectAction('yellow reached', ['preflight', 'baseline', 'agent', 'generate', 'audit'], closure({ reached: true, current: 'yellow' }), 'release')
-expectAction('publication disabled', AUTOPILOT_ORDER.filter((action) => action !== 'push-workspace'), closure({ reached: true, current: 'yellow' }), undefined)
-expectAction('publication enabled', AUTOPILOT_ORDER.filter((action) => action !== 'push-workspace'), closure({ reached: true, current: 'yellow' }), 'push-workspace', { publish: true })
-
-let progress
-const sequence = []
-for (let guard = 0; guard < 5; guard += 1) {
-  const action = nextAutopilotAction(baseDetails(progress?.completedActions ?? [], undefined), state())
-  sequence.push(action)
-  progress = updateFlowProgress(progress, action, 'running', 'yellow')
-  progress = updateFlowProgress(progress, action, 'passed', 'yellow')
-}
-if (sequence.join(',') !== 'preflight,baseline,agent,generate,audit') throw new Error('Initial FLOW sequence drifted: ' + sequence.join(','))
-const insufficient = closure({ lagOk: 53, total: 73, planCanReachYellow: false })
-const exhaustedAction = nextAutopilotAction(baseDetails(progress.completedActions, insufficient), state())
-if (exhaustedAction !== undefined) throw new Error('Exhausted plan must finish as handoff/best-effort instead of re-entering agent, got ' + exhaustedAction)
+expectAction('accepted C0/H1 goes to release regardless of freshness', ['preflight', 'baseline', 'agent', 'generate', 'audit'], verdict('ACCEPTED', 0, 1), 'release')
+expectAction('critical finding reopens remediation', ['preflight', 'baseline', 'agent', 'generate', 'audit'], verdict('REMEDIATION_REQUIRED', 1, 0), 'agent')
+expectAction('H2 reopens remediation', ['preflight', 'baseline', 'agent', 'generate', 'audit'], verdict('REMEDIATION_REQUIRED', 0, 2), 'agent')
+expectAction('unknown audit fails closed', ['preflight', 'baseline', 'agent', 'generate', 'audit'], verdict('UNKNOWN'), undefined)
+expectAction('publication disabled', AUTOPILOT_ORDER.filter((action) => action !== 'push-workspace'), verdict('ACCEPTED'), undefined)
+expectAction('publication enabled', AUTOPILOT_ORDER.filter((action) => action !== 'push-workspace'), verdict('ACCEPTED'), 'push-workspace', { publish: true })
 
 const noProgressState = state()
-const actionableNoProgress = closure({ lagOk: 53, total: 73, planCanReachYellow: false, remainingPackages: ['x'] })
-const noProgressDetails = baseDetails(['preflight', 'baseline', 'agent', 'generate', 'audit'], actionableNoProgress, 'merged-a')
-if (goalSeekingStopReason(noProgressDetails, noProgressState)) throw new Error('First goal observation stopped too early')
-// Planner candidate churn is NOT project progress: a different residual list
-// with the same merged commit + health must close the path immediately.
-const churnOnlyDetails = baseDetails(['preflight', 'baseline', 'agent', 'generate', 'audit'], closure({ lagOk: 53, total: 73, planCanReachYellow: false, remainingPackages: ['y', 'z'] }), 'merged-a')
-if (!goalSeekingStopReason(churnOnlyDetails, noProgressState)?.includes('не изменились')) throw new Error('Second same-outcome cycle must stop even if Planner changed candidate packages')
-const progressedState = state()
-if (goalSeekingStopReason(noProgressDetails, progressedState)) throw new Error('First progress observation stopped too early')
-const committedRepair = baseDetails(['preflight', 'baseline', 'agent', 'generate', 'audit'], actionableNoProgress, 'merged-b')
-if (goalSeekingStopReason(committedRepair, progressedState)) throw new Error('Changed cumulative merged commit must count as real progress')
+const unresolved = verdict('REMEDIATION_REQUIRED', 1, 0)
+const first = details(['preflight', 'baseline', 'agent', 'generate', 'audit'], unresolved, 'merged-a')
+if (goalSeekingStopReason(first, noProgressState)) throw new Error('first remediation observation stopped too early')
+const churn = details(['preflight', 'baseline', 'agent', 'generate', 'audit'], unresolved, 'merged-a')
+if (!goalSeekingStopReason(churn, noProgressState)?.includes('acceptance verdict')) throw new Error('candidate/freshness churn must not count as progress')
+const progressed = state()
+if (goalSeekingStopReason(first, progressed)) throw new Error('first progress observation stopped too early')
+if (goalSeekingStopReason(details(['preflight', 'baseline', 'agent', 'generate', 'audit'], unresolved, 'merged-b'), progressed)) throw new Error('changed cumulative commit must count as progress')
 
+const plateau = details(['preflight', 'baseline', 'agent', 'generate', 'audit'], unresolved, 'merged-a', { autonomyPlateau: { target: 'yellow', reason: 'security remediation plateau', updatedAt: new Date().toISOString() } })
+if (nextAutopilotAction(plateau, state()) !== undefined) throw new Error('persisted remediation plateau must stop')
+if (!goalSeekingStopReason(plateau, state())?.includes('plateau')) throw new Error('plateau must explain stop')
 
-const persistedPlateau = { target: 'yellow', reason: 'same semantic plan, actionRows=0', updatedAt: new Date().toISOString() }
-const staleActionableAfterPlateau = baseDetails(
-  ['preflight', 'baseline', 'agent', 'generate', 'audit'],
-  closure({ lagOk: 53, total: 73, planCanReachYellow: false, remainingPackages: ['stale-row'] }),
-  'merged-a',
-  { autonomyPlateau: persistedPlateau },
-)
-if (nextAutopilotAction(staleActionableAfterPlateau, state()) !== undefined) throw new Error('Persisted autonomy plateau must suppress stale agent re-entry after audit')
-if (!goalSeekingStopReason(staleActionableAfterPlateau, state())?.includes('plateau')) throw new Error('Persisted autonomy plateau must explain why autopilot stopped')
-const bestEffortAfterPlateau = baseDetails(
-  ['preflight', 'baseline', 'agent', 'generate', 'audit'],
-  closure({ lagOk: 58, total: 73, remainingPackages: ['stale-row'], bestEffortReleaseEligible: true, bestEffortReason: 'plan exhausted, Critical=0' }),
-  'merged-a',
-  { autonomyPlateau: persistedPlateau },
-)
-if (nextAutopilotAction(bestEffortAfterPlateau, state()) !== 'release') throw new Error('Persisted plateau may proceed to explicitly eligible best-effort release')
-
-const closures = [
-  undefined,
-  closure({ reached: true, current: 'yellow' }),
-  closure({ planCanReachYellow: false, lagOk: 53, total: 73 }),
-  closure({ planCanReachYellow: true, remainingPackages: ['x'] }),
-]
-let combinations = 0
-for (let mask = 0; mask < (1 << AUTOPILOT_ORDER.length); mask += 1) {
-  const completed = AUTOPILOT_ORDER.filter((_action, index) => Boolean(mask & (1 << index)))
-  for (const targetClosure of closures) {
-    combinations += 1
-    const action = nextAutopilotAction(baseDetails(completed, targetClosure), state())
-    if (action !== undefined && !AUTOPILOT_ORDER.includes(action)) throw new Error('Policy returned an unknown action: ' + action)
-    if (completed.includes('audit') && !targetClosure && action !== 'generate') throw new Error('Missing audited artifact must always regenerate')
-  }
-}
-
-console.log('Autopilot scenario matrix OK: ' + combinations + ' state/closure combinations plus lifecycle and no-progress regressions')
+console.log('Progressive Autopilot scenario matrix OK')

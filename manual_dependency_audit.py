@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -37,6 +38,30 @@ SEVERITIES = ("critical", "high", "moderate", "low", "unknown")
 
 def read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+DEPENDENCY_INPUT_FILES = ("package.json", "yarn.lock", "pnpm-lock.yaml", "package-lock.json", "npm-shrinkwrap.json")
+
+
+def dependency_input_identity(project: Path) -> Tuple[str, List[str]]:
+    """Bind audit authority to the exact dependency inputs it inspected.
+
+    The order and NUL framing intentionally match Desktop's Node implementation.
+    Unknown/extra lockfile situations remain visible because every recognized
+    dependency input present in the project participates in the digest.
+    """
+    digest = hashlib.sha256()
+    files: List[str] = []
+    for name in DEPENDENCY_INPUT_FILES:
+        path = project / name
+        if not path.exists() or not path.is_file():
+            continue
+        files.append(name)
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest(), files
+
 
 
 def _normalize_iso_for_fromisoformat(value: Any) -> str:
@@ -1934,9 +1959,12 @@ def build_report(
     manager = package_manager(project)
     deps = direct_dependencies(project)
     policies = load_lag_policies(dashboard_state, project_name)
+    dependency_input_hash, dependency_input_files = dependency_input_identity(project)
     report = {
         "schemaVersion": 2,
         "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "dependencyInputHash": dependency_input_hash,
+        "dependencyInputFiles": dependency_input_files,
         "projectName": project_name,
         "projectDir": project_dir_display if project_dir_display is not None else str(project),
         "registry": registry,

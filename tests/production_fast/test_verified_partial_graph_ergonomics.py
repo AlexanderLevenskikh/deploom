@@ -5,22 +5,28 @@ from pathlib import Path
 
 
 class VerifiedPartialGraphErgonomicsContracts(unittest.TestCase):
-    def test_verified_partial_has_finish_and_improve_paths(self) -> None:
+    def test_accepted_result_has_finish_and_improve_paths(self) -> None:
         root = Path(__file__).resolve().parents[2]
         flow = (root / "desktop/src/components/FlowWorkspace.tsx").read_text(encoding="utf-8")
         dialog = (root / "desktop/src/components/BaselineIntentDialog.tsx").read_text(encoding="utf-8")
 
-        # FlowWorkspace owns the product decision and the hand-off into the
-        # Baseline intent dialog.
+        # Acceptance owns completion. Freshness remains observable and a user
+        # may explicitly start another progressive improvement pass.
         for required in (
-            "VERIFIED_PARTIAL_SCOPE",
-            "Завершить с текущим verified результатом",
+            "Результат принят",
+            "Создать accepted release",
             "Продолжить улучшение",
+            "acceptanceAccepted",
             "openDeferredImprovementDialog",
             "onGetBaselineIntentPlan",
             "resume: 'restart'",
         ):
             self.assertIn(required, flow)
+        for forbidden in (
+            "VERIFIED_PARTIAL_SCOPE",
+            "Завершить с текущим verified результатом",
+        ):
+            self.assertNotIn(forbidden, flow)
 
         # The persisted deferred-cohort queue is intentionally owned/rendered
         # by BaselineIntentDialog, not duplicated in FlowWorkspace.

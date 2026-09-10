@@ -1,7 +1,7 @@
 import { AlertTriangle, Search, ShieldCheck, X } from 'lucide-react'
 import { useDeferredValue, useEffect, useMemo, useState } from 'react'
 import { useLanguage } from '../i18n'
-import type { BaselineDecision, BaselineExecutionMode, BaselineIntent, BaselineIntentPlan, BaselinePackagePolicy, BaselineProofMode, BaselineSearchMode } from '../types'
+import type { BaselineControlMode, BaselineDecision, BaselineIntent, BaselineIntentPlan, BaselinePackagePolicy, BaselineProofMode, BaselineSearchMode } from '../types'
 import { QuickSelect } from './QuickSelect'
 
 type Props = {
@@ -16,8 +16,15 @@ type DeferredCohort = NonNullable<BaselineIntent['deferredCohorts']>[number]
 
 const DECISION_TRANCHE = 8
 
-function normalizedExecutionMode(value: BaselineExecutionMode | undefined): BaselineExecutionMode {
-  return value === 'BACKGROUND' ? 'BACKGROUND' : 'FAST'
+function normalizedControlMode(intent: BaselineIntent): BaselineControlMode {
+  if (intent.controlMode === 'AUTONOMOUS' || intent.controlMode === 'CONFIRM_SIGNIFICANT') return intent.controlMode
+  return intent.executionMode === 'BACKGROUND' ? 'AUTONOMOUS' : 'CONFIRM_SIGNIFICANT'
+}
+
+function boundedInteger(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.max(min, Math.min(max, Math.round(parsed)))
 }
 
 function normalizedSearchMode(value: BaselineIntent['searchMode']): BaselineSearchMode {
@@ -50,7 +57,10 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
   const [query, setQuery] = useState('')
   const [kind, setKind] = useState<'all' | 'runtime' | 'dev' | 'peer'>('all')
   const [policies, setPolicies] = useState<Record<string, BaselinePackagePolicy>>({ ...plan.intent.policies })
-  const [executionMode, setExecutionMode] = useState<BaselineExecutionMode>(normalizedExecutionMode(plan.intent.executionMode))
+  const [controlMode, setControlMode] = useState<BaselineControlMode>(normalizedControlMode(plan.intent))
+  const [budgetMinutes, setBudgetMinutes] = useState(boundedInteger(plan.intent.budgetMinutes, 30, 5, 240))
+  const [maxKnownCritical, setMaxKnownCritical] = useState(boundedInteger(plan.intent.acceptancePolicy?.maxKnownCritical, 0, 0, 99))
+  const [maxKnownHigh, setMaxKnownHigh] = useState(boundedInteger(plan.intent.acceptancePolicy?.maxKnownHigh, 1, 0, 99))
   const [searchDepth, setSearchDepth] = useState<BaselineSearchMode>(normalizedSearchMode(plan.intent.searchMode))
   const [deferredCohorts, setDeferredCohorts] = useState<DeferredCohort[]>([...(plan.intent.deferredCohorts ?? [])])
   const [busy, setBusy] = useState(false)
@@ -58,7 +68,10 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
 
   useEffect(() => {
     setPolicies({ ...plan.intent.policies })
-    setExecutionMode(normalizedExecutionMode(plan.intent.executionMode))
+    setControlMode(normalizedControlMode(plan.intent))
+    setBudgetMinutes(boundedInteger(plan.intent.budgetMinutes, 30, 5, 240))
+    setMaxKnownCritical(boundedInteger(plan.intent.acceptancePolicy?.maxKnownCritical, 0, 0, 99))
+    setMaxKnownHigh(boundedInteger(plan.intent.acceptancePolicy?.maxKnownHigh, 1, 0, 99))
     setSearchDepth(normalizedSearchMode(plan.intent.searchMode))
     setDeferredCohorts([...(plan.intent.deferredCohorts ?? [])])
   }, [plan])
@@ -79,10 +92,13 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
 
   const dirty = useMemo(
     () => policyFingerprint(policies) !== policyFingerprint(plan.intent.policies)
-      || executionMode !== normalizedExecutionMode(plan.intent.executionMode)
+      || controlMode !== normalizedControlMode(plan.intent)
+      || budgetMinutes !== boundedInteger(plan.intent.budgetMinutes, 30, 5, 240)
+      || maxKnownCritical !== boundedInteger(plan.intent.acceptancePolicy?.maxKnownCritical, 0, 0, 99)
+      || maxKnownHigh !== boundedInteger(plan.intent.acceptancePolicy?.maxKnownHigh, 1, 0, 99)
       || searchDepth !== normalizedSearchMode(plan.intent.searchMode)
       || cohortFingerprint(deferredCohorts) !== cohortFingerprint(plan.intent.deferredCohorts ?? []),
-    [deferredCohorts, executionMode, plan.intent.deferredCohorts, plan.intent.executionMode, plan.intent.policies, plan.intent.searchMode, policies, searchDepth],
+    [budgetMinutes, controlMode, deferredCohorts, maxKnownCritical, maxKnownHigh, plan.intent, policies, searchDepth],
   )
 
   const buildIntent = ({
@@ -90,7 +106,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     grant = 0,
     nextPolicies = policies,
     searchMode = searchDepth as BaselineIntent['searchMode'],
-    nextExecutionMode = executionMode,
+    nextControlMode = controlMode,
     proofMode = 'VERIFIED' as BaselineProofMode,
     nextDeferredCohorts = deferredCohorts,
     cohortAction,
@@ -99,21 +115,30 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     grant?: number
     nextPolicies?: Record<string, BaselinePackagePolicy>
     searchMode?: BaselineIntent['searchMode']
-    nextExecutionMode?: BaselineExecutionMode
+    nextControlMode?: BaselineControlMode
     proofMode?: BaselineProofMode
     nextDeferredCohorts?: DeferredCohort[]
     cohortAction?: BaselineIntent['cohortAction']
-  } = {}): BaselineIntent => ({
-    schemaVersion: 1,
-    policies: Object.fromEntries(Object.entries(nextPolicies).filter(([, value]) => value !== 'auto')),
-    extraIterations: Math.max(0, Number(plan.intent.extraIterations ?? 0) + extra),
-    decisionGrantIterations: grant,
-    searchMode,
-    executionMode: normalizedExecutionMode(nextExecutionMode),
-    proofMode,
-    deferredCohorts: reconcileDeferredCohorts(nextDeferredCohorts, nextPolicies),
-    ...(cohortAction ? { cohortAction } : {}),
-  })
+  } = {}): BaselineIntent => {
+    return {
+      schemaVersion: 2,
+      policies: Object.fromEntries(Object.entries(nextPolicies).filter(([, value]) => value !== 'auto')),
+      controlMode: nextControlMode,
+      budgetMinutes: boundedInteger(budgetMinutes, 30, 5, 240),
+      acceptancePolicy: {
+        maxKnownCritical: boundedInteger(maxKnownCritical, 0, 0, 99),
+        maxKnownHigh: boundedInteger(maxKnownHigh, 1, 0, 99),
+      },
+      extraIterations: Math.max(0, Number(plan.intent.extraIterations ?? 0) + extra),
+      decisionGrantIterations: grant,
+      // Transport-only compatibility hints for the current Python engine.
+      searchMode,
+      executionMode: nextControlMode === 'AUTONOMOUS' ? 'BACKGROUND' : 'FAST',
+      proofMode,
+      deferredCohorts: reconcileDeferredCohorts(nextDeferredCohorts, nextPolicies),
+      ...(cohortAction ? { cohortAction } : {}),
+    }
+  }
 
   const submit = async (intent: BaselineIntent) => {
     setBusy(true)
@@ -172,7 +197,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
       grant: DECISION_TRANCHE,
       nextPolicies,
       searchMode: 'BOUNDED_IMPROVEMENT',
-      nextExecutionMode: 'FAST',
+      nextControlMode: controlMode,
       nextDeferredCohorts: nextDeferred,
       cohortAction: {
         kind: 'DEFER',
@@ -198,7 +223,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     void submit(buildIntent({
       nextPolicies,
       searchMode: 'AUTO',
-      nextExecutionMode: 'FAST',
+      nextControlMode: controlMode,
       nextDeferredCohorts: nextDeferred,
       cohortAction: {
         kind: 'REACTIVATE',
@@ -216,7 +241,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     extra: DECISION_TRANCHE * 8,
     grant: DECISION_TRANCHE * 8,
     searchMode: 'EXHAUSTIVE',
-    nextExecutionMode: 'BACKGROUND',
+    nextControlMode: 'AUTONOMOUS',
   }))
 
   const applyAndContinue = () => void submit(buildIntent({
@@ -228,14 +253,14 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
   const buildDraft = () => void submit(buildIntent({
     proofMode: 'DRAFT',
     searchMode: 'AUTO',
-    nextExecutionMode: 'FAST',
+    nextControlMode: controlMode,
   }))
 
   const keepFocusAndContinue = () => {
     if (!decision?.package) return
     const next = { ...policies, [decision.package]: 'keep-current' as const }
     setPolicies(next)
-    void submit(buildIntent({ extra: DECISION_TRANCHE, grant: DECISION_TRANCHE, nextPolicies: next, searchMode: 'BOUNDED_IMPROVEMENT', nextExecutionMode: 'FAST' }))
+    void submit(buildIntent({ extra: DECISION_TRANCHE, grant: DECISION_TRANCHE, nextPolicies: next, searchMode: 'BOUNDED_IMPROVEMENT', nextControlMode: controlMode }))
   }
 
   const kindOptions = [
@@ -263,33 +288,40 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
 
         <div className="baseline-fast-flow">
           <div>
-            <strong>{text('Режим Baseline', 'Baseline mode')}</strong>
-            <span>{text('Способ выполнения и глубина поиска независимы: можно оставить AUTO в фоне или включить EXHAUSTIVE с остановками для решений.', 'Execution behavior and search depth are independent: AUTO can run in background, or EXHAUSTIVE can still stop for decisions.')}</span>
+            <strong>{text('Как работать', 'How to run')}</strong>
+            <span>{text('DepLoom ищет первый physically verified полезный результат, затем улучшает его, пока есть смысл. Acceptance и freshness теперь независимы.', 'DepLoom seeks the first physically verified useful result, then improves it while worthwhile. Acceptance and freshness are now independent.')}</span>
           </div>
           <div className="baseline-run-controls">
             <div className="baseline-run-control">
-              <span className="baseline-run-control-label">{text('Как выполнять', 'Execution')}</span>
-              <div className="baseline-mode-toggle" role="group" aria-label={text('Режим выполнения Baseline', 'Baseline execution mode')}>
-                <button type="button" className={executionMode === 'FAST' ? 'active' : ''} aria-pressed={executionMode === 'FAST'} disabled={busy} onClick={() => setExecutionMode('FAST')}>{text('С контролем', 'Interactive')}</button>
-                <button type="button" className={executionMode === 'BACKGROUND' ? 'active' : ''} aria-pressed={executionMode === 'BACKGROUND'} disabled={busy} onClick={() => setExecutionMode('BACKGROUND')}>{text('Работать автономно', 'Autonomous')}</button>
+              <span className="baseline-run-control-label">{text('Контроль', 'Control')}</span>
+              <div className="baseline-mode-toggle" role="group" aria-label={text('Режим контроля Baseline', 'Baseline control mode')}>
+                <button type="button" className={controlMode === 'AUTONOMOUS' ? 'active' : ''} aria-pressed={controlMode === 'AUTONOMOUS'} disabled={busy} onClick={() => setControlMode('AUTONOMOUS')}>{text('Автономно', 'Autonomous')}</button>
+                <button type="button" className={controlMode === 'CONFIRM_SIGNIFICANT' ? 'active' : ''} aria-pressed={controlMode === 'CONFIRM_SIGNIFICANT'} disabled={busy} onClick={() => setControlMode('CONFIRM_SIGNIFICANT')}>{text('Подтверждать существенное', 'Confirm significant')}</button>
               </div>
-              <small>{executionMode === 'BACKGROUND'
-                ? text('Без диалогов продолжения: DepLoom работает до результата или safety limit.', 'No continuation dialogs: DepLoom runs until a result or the safety limit.')
-                : text('DepLoom остановится, если понадобится ваше решение по scope или продолжению.', 'DepLoom stops when it needs your decision about scope or continuation.')}</small>
+              <small>{controlMode === 'AUTONOMOUS'
+                ? text('Без обычных continuation-диалогов: только safety/authority stop. Deferred cohorts сохраняются для следующих проходов.', 'No ordinary continuation dialogs: only safety/authority stops. Deferred cohorts remain available for later passes.')
+                : text('DepLoom попросит решение, когда нужно существенно менять scope или продолжать дорогой поиск.', 'DepLoom asks when it needs a significant scope change or an expensive continuation.')}</small>
             </div>
-            {mode === 'prepare' ? (
-              <div className="baseline-run-control">
-                <span className="baseline-run-control-label">{text('Глубина поиска', 'Search depth')}</span>
-                <div className="baseline-mode-toggle" role="group" aria-label={text('Глубина поиска Baseline', 'Baseline search depth')}>
-                  <button type="button" className={searchDepth === 'AUTO' ? 'active' : ''} aria-pressed={searchDepth === 'AUTO'} disabled={busy} onClick={() => setSearchDepth('AUTO')}>{text('AUTO · Рекомендуется', 'AUTO · Recommended')}</button>
-                  <button type="button" className={searchDepth === 'EXHAUSTIVE' ? 'active' : ''} aria-pressed={searchDepth === 'EXHAUSTIVE'} disabled={busy} onClick={() => setSearchDepth('EXHAUSTIVE')}>EXHAUSTIVE</button>
-                </div>
-                <small>{searchDepth === 'EXHAUSTIVE'
-                  ? text('Сразу разрешает глубокую локализацию и physically certified generalization. Может работать заметно дольше.', 'Immediately allows deep localization and physically certified generalization. It can take substantially longer.')
-                  : text('Incumbent-first: сначала быстро ищет первый verified результат; при повторяющемся blocker углубляется точечно.', 'Incumbent-first: first seeks a verified result quickly, then deepens selectively around repeated blockers.')}</small>
-              </div>
-            ) : null}
+            <div className="baseline-run-control">
+              <span className="baseline-run-control-label">{text('Бюджет Baseline / планирования', 'Baseline / planning budget')}</span>
+              <label>{text('Минуты', 'Minutes')}<input type="number" min={5} max={240} step={5} value={budgetMinutes} disabled={busy} onChange={(event) => setBudgetMinutes(boundedInteger(event.target.value, 30, 5, 240))} /></label>
+              <small>{text('Ограничивает дорогой поиск и physical verification на этапе Baseline. Это не таймер всего FLOW.', 'Bounds expensive search and physical verification during Baseline. It is not a timer for the whole FLOW.')}</small>
+            </div>
+            <div className="baseline-run-control">
+              <span className="baseline-run-control-label">{text('Acceptance policy', 'Acceptance policy')}</span>
+              <label>Critical ≤ <input type="number" min={0} max={99} value={maxKnownCritical} disabled={busy} onChange={(event) => setMaxKnownCritical(boundedInteger(event.target.value, 0, 0, 99))} /></label>
+              <label>High ≤ <input type="number" min={0} max={99} value={maxKnownHigh} disabled={busy} onChange={(event) => setMaxKnownHigh(boundedInteger(event.target.value, 1, 0, 99))} /></label>
+              <small>{text('По умолчанию C=0/H≤1. UNKNOWN audit evidence никогда не считается accepted.', 'Default is C=0/H≤1. UNKNOWN audit evidence is never accepted.')}</small>
+            </div>
           </div>
+          <details className="baseline-advanced-actions">
+            <summary>{text('Техническая глубина поиска', 'Technical search depth')}</summary>
+            <div className="baseline-mode-toggle" role="group" aria-label={text('Техническая глубина поиска Baseline', 'Technical Baseline search depth')}>
+              <button type="button" className={searchDepth === 'AUTO' ? 'active' : ''} aria-pressed={searchDepth === 'AUTO'} disabled={busy} onClick={() => setSearchDepth('AUTO')}>AUTO</button>
+              <button type="button" className={searchDepth === 'EXHAUSTIVE' ? 'active' : ''} aria-pressed={searchDepth === 'EXHAUSTIVE'} disabled={busy} onClick={() => setSearchDepth('EXHAUSTIVE')}>EXHAUSTIVE</button>
+            </div>
+            <small>{text('Это диагностическая настройка алгоритма, а не цель результата.', 'This is an algorithm diagnostic setting, not a result goal.')}</small>
+          </details>
         </div>
 
         {deferredCohorts.length ? (
@@ -332,10 +364,10 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
               <strong>{decision.reason === 'policy-unsat'
                 ? text('Для выбранной политики нет совместимого assignment', 'No compatible assignment exists under the selected policy')
                 : suggestedCohort
-                  ? text('Fast-first нашёл локальную точку сложности', 'Fast-first found a local hard region')
-                  : text('Fast-first дошёл до границы автоматического поиска', 'Fast-first reached the automatic search boundary')}</strong>
+                  ? text('Progressive search нашёл локальную точку сложности', 'Progressive search found a local hard region')
+                  : text('Progressive search дошёл до границы автоматического поиска', 'Progressive search reached the automatic search boundary')}</strong>
               <span>{suggestedCohort
-                ? text('Рекомендуемое действие выше позволит продолжить к первому verified partial/Yellow результату.', 'The recommended action above lets the search continue toward the first verified partial/Yellow result.')
+                ? text('Рекомендуемое действие выше позволит продолжить к первому verified accepted результату.', 'The recommended action above lets the search continue toward the first verified accepted result.')
                 : decision.package
                   ? `${decision.package}${decision.currentVersion ? ` · current ${decision.currentVersion}` : ''}`
                   : decision.cohortResolution?.reason === 'PREDICATE_UNAVAILABLE'
@@ -386,15 +418,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
           <span className="baseline-intent-apply-hint">{dirty ? text('Есть неприменённые изменения', 'There are unapplied changes') : text('Scope готов', 'Scope is ready')}</span>
           <button type="button" className="button secondary" disabled={busy} onClick={requestCancel}>{mode === 'decision' ? text('Оставить на паузе', 'Keep paused') : text('Отмена', 'Cancel')}</button>
           {mode === 'prepare' ? <button type="button" className="button secondary" disabled={busy} onClick={buildDraft} title={text('Без install/lifecycle/project checks. Compatibility останется UNKNOWN.', 'No install/lifecycle/project checks. Compatibility remains UNKNOWN.')}>{text('Сформировать Draft без проверки', 'Build unverified Draft')}</button> : null}
-          {mode === 'prepare' ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{
-            searchDepth === 'EXHAUSTIVE'
-              ? executionMode === 'BACKGROUND'
-                ? text('Запустить исчерпывающий Baseline в фоне', 'Start exhaustive Baseline in background')
-                : text('Запустить исчерпывающий Baseline', 'Start exhaustive Baseline')
-              : executionMode === 'BACKGROUND'
-                ? text('Запустить AUTO автономно', 'Start AUTO autonomously')
-                : text('Запустить Fast Baseline', 'Start Fast Baseline')
-          }</button> : null}
+          {mode === 'prepare' ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{controlMode === 'AUTONOMOUS' ? text('Запустить автономно', 'Start autonomously') : text('Запустить Baseline', 'Start Baseline')}</button> : null}
           {mode === 'decision' && !suggestedCohort?.packages.length && decision?.package ? <button type="button" className="button primary" disabled={busy} onClick={keepFocusAndContinue}>{text(`Пока оставить ${decision.package} current`, `Keep ${decision.package} current for now`)}</button> : null}
           {mode === 'decision' && !suggestedCohort?.packages.length && !decision?.package ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{text('Применить scope и продолжить', 'Apply scope and continue')}</button> : null}
           {mode === 'decision' ? (
@@ -402,7 +426,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
               <summary>{text('Другие варианты', 'Other options')}</summary>
               <button type="button" className="button secondary" disabled={busy} onClick={applyAndContinue}>{text('Применить ручные изменения', 'Apply manual changes')}</button>
               <button type="button" className="button secondary" disabled={busy} onClick={buildDraft}>{text('Сформировать Draft для передачи агенту', 'Build Draft for agent handoff')}</button>
-              <button type="button" className="button secondary" disabled={busy} onClick={continueExhaustive}>{text('Готов ждать: исчерпывающий поиск в фоне', 'I can wait: exhaustive search in background')}</button>
+              <button type="button" className="button secondary" disabled={busy} onClick={continueExhaustive}>{text('Технически: продолжить EXHAUSTIVE автономно', 'Technical: continue EXHAUSTIVE autonomously')}</button>
             </details>
           ) : null}
         </footer>

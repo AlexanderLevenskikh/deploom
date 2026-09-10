@@ -1,9 +1,24 @@
 import type { BaselineDecision, BaselineIntent, BaselineIntentPlan } from '../types'
+import { DEFAULT_ACCEPTANCE_POLICY, normalizeAcceptancePolicy, normalizeBudgetMinutes } from '../progressive-policy'
 
 export const BASELINE_DECISION_MARKER = 'DEPLOOM_BASELINE_DECISION_V1 '
 
 export function freshBaselineIntent(): BaselineIntent {
-  return { schemaVersion: 1, policies: {}, extraIterations: 0, decisionGrantIterations: 0, searchMode: 'AUTO', executionMode: 'FAST', proofMode: 'VERIFIED', deferredCohorts: [] }
+  return {
+    schemaVersion: 2,
+    policies: {},
+    controlMode: 'AUTONOMOUS',
+    budgetMinutes: 30,
+    acceptancePolicy: { ...DEFAULT_ACCEPTANCE_POLICY },
+    extraIterations: 0,
+    decisionGrantIterations: 0,
+    // Legacy transport fields remain normalized for the Python compatibility
+    // adapter. They are not user-facing product modes anymore.
+    searchMode: 'AUTO',
+    executionMode: 'BACKGROUND',
+    proofMode: 'VERIFIED',
+    deferredCohorts: [],
+  }
 }
 
 export function parseBaselineDecision(message: string | undefined): BaselineDecision | undefined {
@@ -27,17 +42,25 @@ export function parseBaselineDecision(message: string | undefined): BaselineDeci
 }
 
 export function normalizeBaselineIntentPlan(plan: BaselineIntentPlan): BaselineIntentPlan {
+  const raw = plan.intent ?? freshBaselineIntent()
+  const legacyAutonomous = raw.executionMode === 'BACKGROUND'
+  const controlMode = raw.controlMode === 'AUTONOMOUS' || raw.controlMode === 'CONFIRM_SIGNIFICANT'
+    ? raw.controlMode
+    : legacyAutonomous ? 'AUTONOMOUS' : 'CONFIRM_SIGNIFICANT'
   return {
     candidates: [...plan.candidates].sort((a, b) => a.name.localeCompare(b.name)),
     intent: {
-      schemaVersion: 1,
-      policies: { ...(plan.intent?.policies ?? {}) },
-      extraIterations: Math.max(0, Number(plan.intent?.extraIterations ?? 0) || 0),
+      schemaVersion: 2,
+      policies: { ...(raw.policies ?? {}) },
+      controlMode,
+      budgetMinutes: normalizeBudgetMinutes(raw.budgetMinutes, 30),
+      acceptancePolicy: normalizeAcceptancePolicy(raw.acceptancePolicy),
+      extraIterations: Math.max(0, Number(raw.extraIterations ?? 0) || 0),
       decisionGrantIterations: 0,
-      searchMode: plan.intent?.searchMode ?? 'AUTO',
-      executionMode: plan.intent?.executionMode === 'BACKGROUND' ? 'BACKGROUND' : 'FAST',
-      proofMode: plan.intent?.proofMode === 'DRAFT' ? 'DRAFT' : 'VERIFIED',
-      deferredCohorts: [...(plan.intent?.deferredCohorts ?? [])],
+      searchMode: raw.searchMode ?? 'AUTO',
+      executionMode: controlMode === 'AUTONOMOUS' ? 'BACKGROUND' : 'FAST',
+      proofMode: raw.proofMode === 'DRAFT' ? 'DRAFT' : 'VERIFIED',
+      deferredCohorts: [...(raw.deferredCohorts ?? [])],
     },
   }
 }

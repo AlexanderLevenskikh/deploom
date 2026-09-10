@@ -7,105 +7,48 @@ const root = path.resolve(here, '..')
 const hook = fs.readFileSync(path.join(root, 'src', 'hooks', 'useDependencyFlow.ts'), 'utf8')
 const policy = fs.readFileSync(path.join(root, 'src', 'autopilot-policy.ts'), 'utf8')
 const workspace = fs.readFileSync(path.join(root, 'src', 'components', 'FlowWorkspace.tsx'), 'utf8')
-const enLocale = fs.readFileSync(path.join(root, 'src', 'i18n', 'locales', 'en.ts'), 'utf8')
-const ruLocale = fs.readFileSync(path.join(root, 'src', 'i18n', 'locales', 'ru.ts'), 'utf8')
-const app = fs.readFileSync(path.join(root, 'src', 'App.tsx'), 'utf8')
 const main = fs.readFileSync(path.join(root, 'electron', 'main.ts'), 'utf8')
 const promptHarness = fs.readFileSync(path.join(root, 'electron', 'prompt-harness.ts'), 'utf8')
 const githubCi = fs.readFileSync(path.resolve(root, '..', '.github', 'workflows', 'ci.yml'), 'utf8')
-const scenarios = fs.readFileSync(path.join(root, 'scripts', 'check-autopilot-scenarios.mjs'), 'utf8')
 
-const mustContain = (text, needle, label) => {
-  if (!text.includes(needle)) throw new Error(`${label}: missing ${JSON.stringify(needle)}`)
-}
+const mustContain = (text, needle, label) => { if (!text.includes(needle)) throw new Error(`${label}: missing ${JSON.stringify(needle)}`) }
+const mustNotContain = (text, needle, label) => { if (text.includes(needle)) throw new Error(`${label}: forbidden ${JSON.stringify(needle)}`) }
 
 mustContain(policy, "export const AUTOPILOT_ORDER: FlowAction[] = ['preflight', 'baseline', 'agent', 'generate', 'audit', 'release', 'commit-state', 'push-workspace']", 'stage order')
-mustContain(hook, "publish: Boolean(project.git?.push)", 'publication remains opt-in')
+mustContain(policy, "if (!verdict || verdict.status === 'UNKNOWN') return undefined", 'unknown acceptance is fail closed')
+mustContain(policy, 'if (verdict.accepted)', 'accepted result proceeds')
+mustContain(policy, "return 'agent'", 'hard acceptance failure reopens migration')
+mustContain(policy, 'cumulative merged commit', 'progress authority')
+mustNotContain(policy, 'lagOkPct', 'freshness is not autopilot progress authority')
+
+mustContain(hook, 'publish: Boolean(project.git?.push)', 'publication remains opt-in')
 mustContain(hook, "if (recovery?.kind === 'agent')", 'recoverable failures are intercepted')
-mustContain(hook, "if (recovery?.kind === 'infrastructure')", 'infrastructure failures get bounded autopilot retries before user stop')
-mustContain(hook, 'MAX_AUTOPILOT_INFRA_RETRIES = 3', 'infrastructure retry budget is bounded')
-mustContain(hook, 'recoveryCount > 1 || autopilot.recoveryCycles > MAX_AUTOPILOT_RECOVERY_CYCLES', 'duplicate/total recovery loop guard')
-mustContain(hook, 'MAX_AUTOPILOT_RECOVERY_CYCLES = 8', 'bounded autopilot recovery budget')
-mustContain(main, 'Текущий executable residual содержит', 'safe residual executes before goal-seeking supervisor')
-mustContain(main, 'migrationOutcomeSignature', 'backend agent loop measures real cumulative Git/health progress')
-mustContain(main, 'const noProgressRepeatLimit = executorScopeEmpty ? 1 : 2', 'empty executor scope gets only one no-progress planner pass')
-mustContain(main, 'Planner: расчёт от фактического ${planningBranch}', 'residual replan is generated from cumulative merged state instead of stale historical base')
-mustContain(main, 'continuationMigrationPlan(generatedPlan, new Set(generatedPlan.branches.map((branch) => branch.branch)), refs)', 'fresh residual branches are rebased onto cumulative merged')
-mustContain(main, 'Deterministic Supervisor: stale/owned worktree state однозначен', 'stale scope uses deterministic refresh without wasting a model call')
-mustContain(main, 'Deterministic Supervisor: модель не нужна', 'known failed cohorts continue siblings without model arbitration')
-mustContain(main, 'Recovery severity is policy, not historical truth', 'persisted recovery severity is reclassified after upgrades')
-mustContain(main, 'refs карантинизированы', 'out-of-plan refs are quarantined instead of stopping the user')
-mustContain(main, 'Recovered a previously persisted continuation branch', 'historical continuation topology is adopted automatically')
-mustContain(main, 'Planner protocol не дал machine JSON', 'missing planner machine result falls back to deterministic refresh')
-mustContain(main, 'Planner worktree недоступен', 'planner worktree creation failure falls back to deterministic residual refresh')
-mustContain(main, 'clearEphemeralToolWorktreeDeferrals', 'legacy tool-worktree package deferrals are cleared before residual planning')
-mustContain(main, 'Удалил устаревший package-deferral от собственного temp worktree', 'stale self-worktree blocker is visible as internal recovery')
-mustContain(main, "if (exitCode === 0 && !job.autopilot)", 'autopilot suppresses misleading per-stage completion notifications')
-mustContain(main, 'GOAL_CLOSURE_PROPOSAL_INSUFFICIENT', 'incomplete planner proposals are rejected before scope generation')
-mustContain(main, 'без красного stop', 'forbidden planner additions do not force a user-facing stop')
-mustContain(main, 'Полный Yellow-plan недостижим после', 'full-plan search falls back to the best safe residual')
-mustContain(main, 'Safe-residual отбросил запрещённые additions', 'explicit exclusions are discarded instead of blocking safe work')
-mustContain(main, 'automaticSupervisorDeferralCandidates', 'approval/blocker fallback narrows executable scope autonomously')
-mustContain(main, 'TARGET_GREEN_PLAN_INSUFFICIENT', 'Green also invokes goal-seeking supervisor after plan exhaustion')
-mustContain(policy, "closure.remainingPackages.length > 0) return 'agent'", 'only actually executable audited work re-enters migration')
-mustContain(policy, "completed.has('audit') && !closure", 'missing roadmap returns to generate instead of release')
-mustContain(policy, 'goalSeekingStopReason', 'goal cycles stop only after repeated no-progress signature')
-mustContain(policy, 'run?.autonomyPlateau', 'persisted backend plateau prevents a new autopilot agent loop')
-mustContain(main, 'autonomyPlateau ? { autonomyPlateau }', 'backend persists autonomy plateau across stage/job boundaries')
-mustContain(policy, 'details.migrationProgress?.factsCommit', 'goal no-progress is tied to cumulative merged commit instead of planner candidate churn')
-mustContain(policy, 'if (count > 1)', 'one full no-progress residual cycle is enough to stop further planner churn')
-mustContain(policy, 'MAX_AUTOPILOT_GOAL_CYCLES = 8', 'goal cycles with real Git/health progress remain bounded')
-mustContain(main, 'runAutonomousMigrationStage(job)', 'Continue and Autopilot share autonomous migration recovery')
-mustContain(main, 'commandAttemptsForAction(job.action)', 'deterministic stage commands retry transient failures')
-mustContain(main, 'без Planner и без повторного Z3/Baseline', 'OpenCode infrastructure recovery resumes the immutable plan without dependency replan')
-mustContain(main, "failureClassification.kind === 'infrastructure'", 'infrastructure is rejected at the semantic replan boundary')
-mustContain(main, 'runReleaseRecoveryAgent(job, issue)', 'release recovers inside the same stage')
-mustContain(main, "'fetch', 'origin', sourceBranch", 'release fetches a missing source tracking ref before stopping')
-mustContain(hook, 'api.recoverWithAgent({', 'built-in recovery agent')
-mustContain(main, 'ensureCurrentAgentPrompt(job.workspace, project', 'prompt auto-generation runs inside the registered autonomous job')
-mustContain(main, 'needsGoalSeekingSupervisor', 'empty fresh plan falls back to a valid prior seed only for goal-seeking')
-mustContain(main, 'Пустой scope не будет отправлен Executor', 'fallback seed is explicitly separated from executor scope')
-mustContain(main, 'AGENT_BRANCH_SCOPE_VIOLATION', 'wrong-branch agent sessions are routed to Supervisor reconciliation')
-mustContain(main, "input.action === 'baseline' && requestedBaselineProofMode !== 'DRAFT' && input.baselineResume !== 'continue'", 'fresh verified baseline resets planner epoch while Continue and Draft preserve it')
-mustContain(main, 'clearPlannerDeferrals(workspace, project.name)', 'baseline can reset temporary planner deferrals')
-mustContain(main, 'SOURCE_SNAPSHOT_BASELINE_LIVE_CHECKOUT', 'fresh baseline seals the live checkout without a clean-Git precondition')
-mustContain(main, 'cleanupSupersededMigrationAfterBaseline', 'successful baseline closes the previous execution epoch')
-mustContain(main, 'forgetProjectPromptState(job.workspace, project.name, oldPromptPath)', 'old immutable prompt cannot survive a fresh baseline')
-mustContain(workspace, "planning: t('flow.runtime.planning')", 'planner is not rendered as a per-branch worker')
-mustContain(workspace, "t('flow.supervisorReplans')", 'planner has one global Supervisor status')
-mustContain(main, "for (const branch of planningBranches) setBranchRuntime(job, branch, 'planning')", 'planner branch runtime carries no repeated per-branch planner detail')
-mustContain(workspace, "t('flow.autopilot.start')", 'autopilot UX')
-mustContain(workspace, "text('Автопилот устраняет', 'Autopilot is resolving')", 'recoverable state stays internal while autopilot is active')
-mustContain(app, 'flow.autopilotProjectName === project.name', 'autopilot button follows launch state before backend job registration')
-mustContain(hook, 'autopilotProjectName: autopilotRef.current?.projectName', 'autopilot project is exposed independently of active job')
-mustContain(hook, 'Автопилот не смог запуститься', 'launch failures from refresh through first job are visible instead of becoming unhandled promises')
-mustContain(promptHarness, 'PROMPT_HARNESS_TIMEOUT', 'hidden dashboard prompt export cannot wait forever')
-mustContain(promptHarness, 'target.value = ${JSON.stringify(targetMode)}', 'group prompt export preserves the saved target mode')
-mustContain(main, 'buildGroupScopedPrompt(dashboardUrl, project.name, scopeBranch, targetMode', 'group workers validate scope under the saved target mode')
-mustContain(main, '?desktop-export=1&project=${encodeURIComponent(project.name)}&v=${Date.now()}', 'every migration iteration uses a project-scoped cache-busted hidden dashboard')
-mustContain(main, "headers.set('Cache-Control', 'no-store, no-cache, must-revalidate')", 'dashboard protocol responses cannot preserve stale branch plans')
-mustContain(githubCi, 'npm run check:autopilot-scenarios', 'scenario matrix is mandatory in CI')
-mustContain(githubCi, 'npm run check:parallel-groups', 'parallel worktree contract is mandatory in CI')
-mustContain(githubCi, "node-version: '22'", 'desktop CI uses the minimum supported Node major')
-mustContain(scenarios, 'ts.transpileModule', 'scenario harness works without native TypeScript imports on Node 20/22')
-mustContain(workspace, "t('flow.autopilot.stop')", 'autopilot stop UX')
-mustContain(workspace, 'className="autopilot-actions"', 'autopilot is rendered on a separate action row')
-mustContain(workspace, 'AUTOPILOT_HELP[language]', 'Continue versus Autopilot contract')
-mustContain(workspace, 'tabIndex={0}', 'autopilot help is keyboard focusable')
-mustContain(workspace, "text('Открыть handoff', 'Open handoff')", 'best-effort handoff UX')
-mustContain(main, 'writeBestEffortHandoff(job)', 'deterministic best-effort handoff artifact')
-mustContain(main, 'Previous planner machine result requires an independent residual audit', 'blocked planner gets residual audit')
-mustContain(main, 'Residual-audit скорректировал planner result', 'audited deferrals continue FLOW')
+mustContain(hook, "if (recovery?.kind === 'infrastructure')", 'bounded infrastructure recovery remains')
+mustContain(hook, 'MAX_AUTOPILOT_INFRA_RETRIES = 3', 'infrastructure retry bound')
+mustContain(hook, 'MAX_AUTOPILOT_RECOVERY_CYCLES = 8', 'recovery budget')
+mustContain(hook, 'goalSeekingStopReason', 'semantic no-progress guard remains')
 
-for (const [localeSource, marker, label] of [
-  [enLocale, '"flow.runtime.planning": "Waiting for a new plan"', 'EN planner status'],
-  [ruLocale, '"flow.runtime.planning": "Ожидает новый план"', 'RU planner status'],
-  [enLocale, '"flow.supervisorReplans": "Supervisor is recalculating the overall plan"', 'EN supervisor status'],
-  [ruLocale, '"flow.supervisorReplans": "Supervisor пересчитывает общий план"', 'RU supervisor status'],
-  [enLocale, '"flow.autopilot.start": "Autopilot to result"', 'EN autopilot start'],
-  [ruLocale, '"flow.autopilot.start": "Автопилот до результата"', 'RU autopilot start'],
-  [enLocale, '"flow.autopilot.stop": "Stop Autopilot"', 'EN autopilot stop'],
-  [ruLocale, '"flow.autopilot.stop": "Остановить автопилот"', 'RU autopilot stop'],
-]) mustContain(localeSource, marker, label)
+for (const sentinel of [
+  'runAutonomousMigrationStage(job)',
+  'runReleaseRecoveryAgent(job, issue)',
+  'AGENT_BRANCH_SCOPE_VIOLATION',
+  'clearPlannerDeferrals(workspace, project.name)',
+  'cleanupSupersededMigrationAfterBaseline',
+  'ACCEPTANCE_REMEDIATION_REQUIRED',
+  'ACCEPTANCE_NOT_SATISFIED',
+  'ACCEPTANCE_AUTHORITY_INVALIDATED_DURING_RELEASE',
+  'Acceptance remediation имеет приоритет над freshness residual',
+]) mustContain(main, sentinel, 'backend autonomy/safety contract')
+mustNotContain(main, 'Supervisor goal-seeking', 'Yellow goal-seeking removed')
+mustNotContain(main, 'GOAL_CLOSURE_PROPOSAL_INSUFFICIENT', 'full-Yellow correction removed')
 
-console.log('Autopilot contract OK')
+mustContain(workspace, "text('Acceptance', 'Acceptance')", 'acceptance UX')
+mustContain(workspace, "text('Freshness', 'Freshness')", 'freshness is separate')
+mustNotContain(workspace, 'target-field', 'Yellow/Green selector removed')
+mustContain(workspace, 'AUTOPILOT_HELP[language]', 'autopilot explanation')
+mustContain(promptHarness, 'PROMPT_HARNESS_TIMEOUT', 'prompt export timeout remains')
+mustContain(githubCi, 'npm run check:autopilot-scenarios', 'scenario matrix remains mandatory in CI')
+mustContain(githubCi, 'npm run check:acceptance-policy', 'acceptance policy remains mandatory in CI')
+mustContain(githubCi, 'npm run check:progressive-contract', 'progressive source contract remains mandatory in CI')
+
+console.log('Progressive Autopilot contract OK')

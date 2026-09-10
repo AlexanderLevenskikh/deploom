@@ -39,7 +39,8 @@ import { scheduleUpdateChecks } from './updater-schedule.js'
 import { teamStatePaths } from './state-commit.js'
 import { changedOverrideProjects } from './dashboard-state.js'
 import { forgetScopedPromptPath, rememberScopedPromptPath, roadmapContainsProject, scopedPromptPath } from './project-context.js'
-import { scopeExpansionCoverage, shouldUseSupervisorSeed, targetClosureFromRoadmap, targetClosureFromRoadmapWithTargets, targetClosureMessage, type ClosureTarget, type TargetClosure } from './target-closure.js'
+import { targetClosureFromRoadmap, targetClosureFromRoadmapWithTargets, type ClosureTarget, type TargetClosure } from './target-closure.js'
+import { acceptanceVerdictFromManualAudit, dependencyInputIdentity, normalizeAcceptancePolicy, type AcceptancePolicy, type AcceptanceVerdict } from './acceptance-policy.js'
 import { summarizeUpdaterError } from './updater-error.js'
 import { flowNotificationContent, type FlowNotificationEvent } from './notifications.js'
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
@@ -67,9 +68,10 @@ type BaselinePackagePolicy = 'auto' | 'keep-current' | 'required'
 type BaselineSearchMode = 'AUTO' | 'BOUNDED_IMPROVEMENT' | 'EXHAUSTIVE'
 type BaselineExecutionMode = 'FAST' | 'AUTOPILOT' | 'BACKGROUND'
 type BaselineProofMode = 'VERIFIED' | 'DRAFT'
+type BaselineControlMode = 'AUTONOMOUS' | 'CONFIRM_SIGNIFICANT'
 type BaselineDeferredCohort = { id: string; label: string; packages: string[]; predicate?: string; confidence?: number; authority: 'DIAGNOSTIC_HINT'; deferredAt?: string; decisionId?: string; boundaryPackages?: string[]; warningPackages?: string[] }
 type BaselineCohortAction = { kind: 'DEFER' | 'REACTIVATE'; cohortId: string; label: string; packages: string[]; predicate?: string; confidence?: number; decisionId?: string }
-type BaselineIntent = { schemaVersion: 1; policies: Record<string, BaselinePackagePolicy>; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; proofMode?: BaselineProofMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction }
+type BaselineIntent = { schemaVersion: 1 | 2; policies: Record<string, BaselinePackagePolicy>; controlMode?: BaselineControlMode; budgetMinutes?: number; acceptancePolicy?: AcceptancePolicy; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; proofMode?: BaselineProofMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction }
 type BaselineIntentCandidate = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string }
 type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent }
 type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
@@ -133,6 +135,7 @@ type WorkspaceDetails = {
   teamState?: TeamFlowState
   projectLevels: Record<string, ProjectLevel>
   targetClosure?: TargetClosure
+  acceptanceVerdict?: AcceptanceVerdict
   migrationProgress?: MigrationProgress
   baselineRecovery?: BaselineRecoveryInfo
 }
@@ -344,13 +347,23 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
       decisionId: String(action.decisionId ?? '').slice(0, 120),
     }
   }
+  const controlMode: BaselineControlMode = raw.controlMode === 'AUTONOMOUS' || raw.controlMode === 'CONFIRM_SIGNIFICANT'
+    ? raw.controlMode
+    : raw.executionMode === 'BACKGROUND' ? 'AUTONOMOUS' : 'CONFIRM_SIGNIFICANT'
+  const budgetParsed = Number(raw.budgetMinutes ?? 30)
+  const budgetMinutes = Number.isFinite(budgetParsed) ? Math.max(5, Math.min(240, Math.round(budgetParsed))) : 30
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     policies,
+    controlMode,
+    budgetMinutes,
+    acceptancePolicy: normalizeAcceptancePolicy(raw.acceptancePolicy),
     extraIterations: Math.max(0, Math.floor(Number(raw.extraIterations ?? 0) || 0)),
     decisionGrantIterations: Math.max(0, Math.floor(Number(raw.decisionGrantIterations ?? 0) || 0)),
     searchMode: raw.searchMode === 'EXHAUSTIVE' || raw.searchMode === 'BOUNDED_IMPROVEMENT' ? raw.searchMode : 'AUTO',
-    executionMode: raw.executionMode === 'BACKGROUND' ? 'BACKGROUND' : 'FAST',
+    // Compatibility adapter for the Python engine. Product semantics live in
+    // controlMode; FAST/BACKGROUND are no longer user-facing goal modes.
+    executionMode: controlMode === 'AUTONOMOUS' ? 'BACKGROUND' : 'FAST',
     proofMode: raw.proofMode === 'DRAFT' ? 'DRAFT' : 'VERIFIED',
     deferredCohorts,
     ...(cohortAction ? { cohortAction } : {}),
@@ -1629,10 +1642,9 @@ async function ensureCurrentAgentPrompt(workspace: WorkspaceRecord, project: Pro
   const markdown = await buildProjectPrompt(dashboardUrl, project.name, target)
   const generatedPlan = migrationPlanFromPrompt(markdown, project.name)
   if (!generatedPlan) {
-    const closure = readTargetClosure(workspace, project, target)
-    const needsGoalSeekingSupervisor = shouldUseSupervisorSeed(closure, target, Boolean(currentPlan))
-    if (current && needsGoalSeekingSupervisor) {
-      send('flow:job-output', { jobId: 'system', stream: 'system', workspaceId: workspace.id, projectName: project.name, line: `Свежий Dashboard не содержит executable Branch plan для ${project.name}: сохраняю валидный предыдущий plan только как seed для goal-seeking Supervisor. Пустой scope не будет отправлен Executor.` })
+    const acceptance = readAcceptanceVerdict(workspace, project)
+    if (current && currentPlan && acceptance.status === 'REMEDIATION_REQUIRED') {
+      send('flow:job-output', { jobId: 'system', stream: 'system', workspaceId: workspace.id, projectName: project.name, line: `Свежий Dashboard не содержит executable Branch plan для ${project.name}: сохраняю предыдущий proven plan только как seed для acceptance-remediation Supervisor. Пустой scope не будет отправлен Executor.` })
       return current
     }
     throw new Error(`AGENT_PROMPT_AUTOBUILD_FAILED: Dashboard не вернул Branch plan для ${project.name}.`)
@@ -1662,6 +1674,25 @@ function readTargetClosure(workspace: WorkspaceRecord, project: ProjectSpec | un
   } catch {
     return undefined
   }
+}
+
+function manualAuditReportPath(workspace: WorkspaceRecord, projectName: string): string {
+  const slug = projectName.toLowerCase().replace(/[^a-z0-9._-]+/g, '-')
+  return join(artifactPath(workspace, 'artifactsDir', '.dependency-roadmap/artifacts'), `manual-audit-${slug}.json`)
+}
+
+function readAcceptanceVerdict(workspace: WorkspaceRecord, project: ProjectSpec): AcceptanceVerdict {
+  const identity = dependencyInputIdentity(project.path)
+  const reportPath = manualAuditReportPath(workspace, project.name)
+  let report: unknown
+  try { report = existsSync(reportPath) ? JSON.parse(readFileSync(reportPath, 'utf8')) as unknown : undefined } catch { report = undefined }
+  const policy = loadBaselineIntent(workspace, project.name).acceptancePolicy
+  return acceptanceVerdictFromManualAudit(report, identity.hash, policy)
+}
+
+function acceptanceRemediationMessage(verdict: AcceptanceVerdict): string {
+  const packages = [...new Set([...verdict.criticalPackages, ...verdict.highPackages])].slice(0, 20)
+  return `ACCEPTANCE_REMEDIATION_REQUIRED: Critical=${verdict.critical ?? '?'}, High=${verdict.high ?? '?'}, policy=C<=${verdict.policy.maxKnownCritical}/H<=${verdict.policy.maxKnownHigh}.${packages.length ? ` Vulnerability findings: ${packages.join(', ')}.` : ''} Findings are diagnostic evidence, not authorization to add transitive packages directly: resolve them through the declared/direct-parent dependency graph and keep deterministic solver/verifier authority. ${verdict.reasons.join(' ')}`
 }
 
 async function workspaceDetails(workspace: WorkspaceRecord): Promise<WorkspaceDetails> {
@@ -1698,6 +1729,7 @@ async function workspaceDetails(workspace: WorkspaceRecord): Promise<WorkspaceDe
     teamState,
     projectLevels: readProjectLevels(workspace),
     targetClosure: readTargetClosure(workspace, project, savedTarget === 'green' ? 'green' : 'yellow'),
+    acceptanceVerdict: project ? readAcceptanceVerdict(workspace, project) : undefined,
     migrationProgress,
     baselineRecovery: baselineRecoveryInfo(workspace, project?.name),
   }
@@ -2021,9 +2053,11 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
       const effectiveIntent = explicitIntent ?? persistedIntent
       if (explicitIntent) saveBaselineIntent(workspace, project.name, explicitIntent)
       const proofMode: BaselineProofMode = explicitIntent?.proofMode === 'DRAFT' ? 'DRAFT' : 'VERIFIED'
-      const executionMode: BaselineExecutionMode = effectiveIntent.executionMode === 'BACKGROUND' ? 'BACKGROUND' : 'FAST'
-      const automaticBudgetSeconds = executionMode === 'FAST' ? 15 * 60 : executionMode === 'BACKGROUND' ? 2 * 60 * 60 : 30 * 60
-      const maxExpensiveAttempts = executionMode === 'FAST' ? 2 : executionMode === 'BACKGROUND' ? 8 : 4
+      const controlMode: BaselineControlMode = effectiveIntent.controlMode === 'CONFIRM_SIGNIFICANT' ? 'CONFIRM_SIGNIFICANT' : 'AUTONOMOUS'
+      const executionMode: BaselineExecutionMode = controlMode === 'AUTONOMOUS' ? 'BACKGROUND' : 'FAST'
+      const budgetMinutes = Math.max(5, Math.min(240, Math.round(Number(effectiveIntent.budgetMinutes ?? 30) || 30)))
+      const automaticBudgetSeconds = budgetMinutes * 60
+      const maxExpensiveAttempts = Math.max(2, Math.min(8, Math.ceil(budgetMinutes / 10)))
 
       // Concurrent project Baselines must not race on the workspace's shared
       // dependency-roadmap.{md,json,html} publication. Baseline evidence and
@@ -2055,6 +2089,8 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
           DEPLOOM_BASELINE_RESUME: input.baselineResume === 'restart' ? 'restart' : input.baselineResume === 'continue' ? 'continue' : 'auto',
           DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE: input.baselineResume === 'continue' ? '1' : '0',
           DEPLOOM_BASELINE_INTENT_JSON: JSON.stringify({
+            // Keep the Python engine on its stable v1 transport contract.
+            // Product control/budget/acceptance semantics travel separately below.
             schemaVersion: 1,
             policies: effectiveIntent.policies,
             searchMode: effectiveIntent.searchMode ?? 'AUTO',
@@ -2062,7 +2098,10 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
             deferredCohorts: effectiveIntent.deferredCohorts ?? [],
             ...(explicitIntent?.cohortAction ? { cohortAction: explicitIntent.cohortAction } : {}),
           }),
-          DEPLOOM_BASELINE_INTERACTIVE: proofMode === 'DRAFT' ? '0' : '1',
+          DEPLOOM_BASELINE_CONTROL_MODE: controlMode,
+          DEPLOOM_BASELINE_BUDGET_MINUTES: String(budgetMinutes),
+          DEPLOOM_ACCEPTANCE_POLICY_JSON: JSON.stringify(effectiveIntent.acceptancePolicy ?? normalizeAcceptancePolicy(undefined)),
+          DEPLOOM_BASELINE_INTERACTIVE: proofMode === 'DRAFT' || controlMode === 'AUTONOMOUS' ? '0' : '1',
           DEPLOOM_BASELINE_EXECUTION_MODE: executionMode,
           DEPLOOM_BASELINE_PROOF_MODE: proofMode,
           DEPLOOM_BASELINE_EXTRA_ITERATIONS: String(effectiveIntent.extraIterations ?? 0),
@@ -2098,6 +2137,8 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
         args: [join(toolDir, 'manual_dependency_audit.py'), '--project-dir', project.path, '--project-name', project.name,
           '--dashboard-state', artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json'),
           '--audit-workspace', join(artifacts, `manual-audit-${slug}-workspace`),
+          // Release acceptance requires canonical Yarn graph authority. For npm/pnpm this option is accepted but ignored.
+          '--yarn-audit-engine', 'yarn-inventory',
           '--json-out', join(artifacts, `manual-audit-${slug}.json`), '--md-out', join(artifacts, `manual-audit-${slug}.md`)],
       }]
     }
@@ -4757,58 +4798,9 @@ Do not repeat the previous classification. Check whether any subset of the curre
       send('flow:job-output', { jobId: job.id, stream: 'system', line: `Residual-audit скорректировал planner result: status=${planner.status}, deferPackages=${planner.deferPackages?.join(', ') || 'none'}.` })
     }
   }
-  let residualPlanAuthorized = false
-  let bestSafeAdditions: Array<{ package: string; target: string }> = []
-  let bestSafeCoverage = -1
-  if (job.target !== 'green') {
-    const capacity = readTargetClosure(job.workspace, project, 'yellow')
-    const maxFullPlanAttempts = Math.min(2, autonomy.maxPlannerRevisions)
-    for (let correction = 0; planner.status === 'expand-plan' && capacity?.planCanReachYellow === false; correction += 1) {
-      const proposals = validateSupervisorScopeAdditions(previousMarkdown, project.name, planner.proposedScopeAdditions ?? [])
-      const coverage = scopeExpansionCoverage(capacity, proposals.accepted)
-      if (coverage.covered > bestSafeCoverage || (coverage.covered === bestSafeCoverage && proposals.accepted.length > bestSafeAdditions.length)) {
-        bestSafeCoverage = coverage.covered
-        bestSafeAdditions = proposals.accepted
-      }
-      if (coverage.covered >= coverage.required) break
-      if (correction >= maxFullPlanAttempts - 1) {
-        if (!autonomy.allowResidualPlanDeferral || !bestSafeAdditions.length) {
-          const fallback = autonomy.autoDeferApprovalBlockers ? automaticSupervisorDeferralCandidates(job.workspace, project, previousPlan, failure) : []
-          if (fallback.length && autonomy.allowResidualPlanDeferral) {
-            const deferred = applyPlannerDeferrals(job.workspace, project.name, fallback, `Full-plan search исчерпан без безопасного expansion: ${planner.reason}`)
-            planner = { ...planner, status: 'defer-blockers', deferPackages: deferred, proposedScopeAdditions: [], reason: `${planner.reason} Full-plan search исчерпан; текущий blocker/cohort автоматически отложен.` }
-            send('flow:job-output', { jobId: job.id, stream: 'system', line: `Planner не нашёл полного Yellow expansion за ${maxFullPlanAttempts} попытки. Вместо красного stop откладываю ${deferred.join(', ')} и продолжаю residual plan.` })
-            break
-          }
-          markAutonomyPlateau(job, `Planner не предложил ни полного, ни безопасного residual plan после ${maxFullPlanAttempts} независимых попыток.`)
-          planner = { ...planner, status: 'blocked', proposedScopeAdditions: [], reason: planner.reason }
-          break
-        }
-        residualPlanAuthorized = true
-        planner = {
-          ...planner,
-          status: 'expand-plan',
-          proposedScopeAdditions: bestSafeAdditions.map((item) => item.package + '@' + item.target),
-          reason: planner.reason + ' Full Yellow доказанно недостижим без запрещённого/несовместимого scope; выполняется максимальный безопасный residual plan.',
-        }
-        send('flow:job-output', { jobId: job.id, stream: 'system', line: 'Полный Yellow-plan недостижим после ' + maxFullPlanAttempts + ' независимых попыток. Запускаю лучший безопасный residual: ' + bestSafeAdditions.map((item) => item.package + '@' + item.target).join(', ') + '. Explicit exclusions и отклонённые additions не применяются.' })
-        break
-      }
-      const missing = coverage.missingPackages.slice(0, 12).join(', ')
-      send('flow:job-output', { jobId: job.id, stream: 'system', line: 'Supervisor proposal неполный: для Yellow нужно ещё ' + coverage.required + ' lag-fix, предложение доказанно закрывает ' + coverage.covered + '. Запрашиваю один полный replacement plan перед safe-residual fallback.' })
-      const correctionFailure = failure + '\n\nGOAL_CLOSURE_PROPOSAL_INSUFFICIENT: previous proposedScopeAdditions cover only ' + coverage.covered + ' of ' + coverage.required + ' required additional lag-policy rows. Return a COMPLETE replacement proposedScopeAdditions list in one response. Candidate lag blockers include: ' + missing + '. Companions that do not themselves reach each package lag-policy minimum do not count toward the required total. Never include an explicit exclusion.'
-      planner = await runIndependentPlannerWithProgress(job, project, correctionFailure, previousPromptPath)
-    }
-    if (planner.status !== 'expand-plan' && bestSafeAdditions.length && autonomy.allowResidualPlanDeferral) {
-      residualPlanAuthorized = true
-      planner = {
-        ...planner,
-        status: 'expand-plan',
-        proposedScopeAdditions: bestSafeAdditions.map((item) => item.package + '@' + item.target),
-        reason: planner.reason + ' Full Yellow недостижим; выполняется лучший ранее доказанный безопасный residual plan.',
-      }
-    }
-  }
+  // Planner expansion now responds only to concrete migration/acceptance evidence.
+  // Freshness/Yellow capacity is not a correctness gate and is never used to
+  // demand a mathematically complete replacement plan.
   if (planner.executorGuidance) send('flow:job-output', { jobId: job.id, stream: 'system', line: `Planner guidance: ${planner.executorGuidance}` })
 
   if (planner.status === 'expand-plan') {
@@ -4829,7 +4821,7 @@ Do not repeat the previous classification. Check whether any subset of the curre
         throw new Error(`MIGRATION_PLAN_APPROVAL_REQUIRED: безопасное автоматическое расширение невозможно: ${details}. ${planner.reason}`)
       }
     }
-    if (proposals.rejected.length && !residualPlanAuthorized && planner.status === 'expand-plan') {
+    if (proposals.rejected.length && planner.status === 'expand-plan') {
       send('flow:job-output', { jobId: job.id, stream: 'system', line: 'Supervisor отбросил запрещённые additions без красного stop: ' + proposals.rejected.join('; ') + '. Они не применяются к manifest/exclusions.' })
     }
     if (proposals.rejected.length) {
@@ -4952,17 +4944,7 @@ Do not repeat the previous classification. Check whether any subset of the curre
     throw new Error(`${code}: ${assessment.reason}. Candidate: ${candidatePath}${assessment.additions.length ? `. Изменения: ${assessment.additions.join(', ')}` : ''}`)
   }
   persistLatestPrompt(job.workspace, project.name, candidatePath)
-  const revisedCapacity = readTargetClosure(job.workspace, project, job.target === 'green' ? 'green' : 'yellow')
-  if (job.target !== 'green' && revisedCapacity?.planCanReachYellow === false) {
-    if (residualPlanAuthorized && revisedCapacity.remainingPackages.length) {
-      job.residualExecutionPromptPath = candidatePath
-      send('flow:job-output', { jobId: job.id, stream: 'system', line: 'Goal-capacity остаётся ниже Yellow, но полный plan доказанно недостижим без запрещённого scope. Разрешаю один запуск безопасного residual (' + revisedCapacity.remainingPackages.length + ' actions); после него обязателен новый audit.' })
-      return
-    }
-    send('flow:job-output', { jobId: job.id, stream: 'system', line: 'Planner revision пока недостаточна: фактический executable plan даёт максимум ' + (revisedCapacity.maxLagOkPctAfterPlan?.toFixed(1) ?? '?') + '%, не хватает ещё ' + (revisedCapacity.neededBeyondCurrentPlan ?? '?') + ' lag-fix. Executor запрещён; Supervisor продолжает собирать полный план.' })
-    return
-  }
-  send('flow:job-output', { jobId: job.id, stream: 'system', line: 'Planner revision принята автоматически: ' + assessment.reason + '. Goal-capacity проверена по фактическому executable roadmap; FLOW продолжает migration.' })
+  send('flow:job-output', { jobId: job.id, stream: 'system', line: 'Planner revision принята автоматически: ' + assessment.reason + '. Scope/registry/peer/merged verification остаются обязательными; freshness percentage не является executor gate.' })
 }
 
 async function migrationOutcomeSignature(job: JobRecord, project: ProjectSpec): Promise<string> {
@@ -4972,8 +4954,8 @@ async function migrationOutcomeSignature(job: JobRecord, project: ProjectSpec): 
   const ref = plan?.mergedBranch || 'HEAD'
   const commitResult = await spawnCapture('git', ['-C', project.path, 'rev-parse', ref], project.path, 15_000)
   const commit = commitResult.code === 0 ? commitResult.stdout.trim() : ref
-  const closure = readTargetClosure(job.workspace, project, job.target === 'green' ? 'green' : 'yellow')
-  return `commit=${commit}:lag=${closure?.lagOk ?? '?'}/${closure?.total ?? '?'}:critical=${closure?.critical ?? '?'}:high=${closure?.high ?? '?'}`
+  const acceptance = readAcceptanceVerdict(job.workspace, project)
+  return `commit=${commit}:acceptance=${acceptance.status}:critical=${acceptance.critical ?? '?'}:high=${acceptance.high ?? '?'}`
 }
 
 async function runMigrationAgentLoop(job: JobRecord): Promise<void> {
@@ -4981,6 +4963,7 @@ async function runMigrationAgentLoop(job: JobRecord): Promise<void> {
   const autonomy = autonomyPolicy(readSettings(job.workspace), project.name)
   const repeats = new Map<string, number>()
   const outcomeRepeats = new Map<string, number>()
+  let acceptanceRemediationPrepared = false
   job.autonomyPlateauReason = undefined
 
   for (let revision = 0; revision <= autonomy.maxPlannerRevisions; revision += 1) {
@@ -4998,10 +4981,13 @@ async function runMigrationAgentLoop(job: JobRecord): Promise<void> {
       ? migrationScopeManifestFromPrompt(readFileSync(promptPathForBudget, 'utf8'))
       : undefined
     const promptActionRows = typeof promptManifestForBudget?.actionRows === 'number' ? promptManifestForBudget.actionRows : undefined
-    const executorScopeEmpty = capacity?.remainingPackages.length === 0 || promptActionRows === 0
+    // The reviewed/proven prompt is execution authority. TargetClosure remains
+    // a freshness projection and must not veto proven executable work.
+    const executableActionRows = promptActionRows ?? capacity?.remainingPackages.length ?? 0
+    const executorScopeEmpty = executableActionRows === 0
     const noProgressRepeatLimit = executorScopeEmpty ? 1 : 2
     if (outcomeSeen > noProgressRepeatLimit) {
-      const reason = `Нет фактического Git/health-прогресса после ${outcomeSeen - 1} residual/replan циклов (${outcome}); executor actions=${capacity?.remainingPackages.length ?? promptActionRows ?? '?'}. Следующие candidate combinations не исследуются автоматически.`
+      const reason = `Нет фактического Git/acceptance-прогресса после ${outcomeSeen - 1} residual/replan циклов (${outcome}); executor actions=${executableActionRows}. Следующие candidate combinations не исследуются автоматически.`
       if (autonomy.softStopOnAutonomyPlateau) {
         markAutonomyPlateau(job, reason)
         return
@@ -5009,19 +4995,34 @@ async function runMigrationAgentLoop(job: JobRecord): Promise<void> {
       throw new Error(`MIGRATION_REPLAN_STALLED: ${reason}`)
     }
 
-    // Residual-first autonomy: do useful, already-approved work before asking
-    // Supervisor to mathematically close the entire target.  The previous
-    // implementation could stop at 76-78% without executing a perfectly safe
-    // residual iteration merely because the *future* Yellow plan was not yet
-    // complete.
-    if (capacity?.remainingPackages.length) {
-      if (capacity.planCanReachYellow === false) {
-        send('flow:job-output', {
-          jobId: job.id,
-          stream: 'system',
-          line: `Текущий executable residual содержит ${capacity.remainingPackages.length} безопасных actions. Выполняю их до goal-seeking replan; недостающие ${capacity.neededBeyondCurrentPlan ?? '?'} lag-fix Supervisor будет закрывать уже по фактическому новому состоянию.`,
-        })
+    const currentAcceptance = readAcceptanceVerdict(job.workspace, project)
+    if (currentAcceptance.status === 'REMEDIATION_REQUIRED' && !acceptanceRemediationPrepared) {
+      const remediationPromptPath = promptPathForProject(job.workspace, project.name)
+      if (!remediationPromptPath || !existsSync(remediationPromptPath)) {
+        if (autonomy.softStopOnAutonomyPlateau) {
+          markAutonomyPlateau(job, `Acceptance требует remediation, но proven seed prompt отсутствует. ${acceptanceRemediationMessage(currentAcceptance)}`)
+          return
+        }
+        throw new Error(`MIGRATION_REPLAN_INPUT_INVALID: ${acceptanceRemediationMessage(currentAcceptance)}`)
       }
+      if (revision >= autonomy.maxPlannerRevisions) {
+        if (autonomy.softStopOnAutonomyPlateau) {
+          markAutonomyPlateau(job, `Исчерпан budget ${autonomy.maxPlannerRevisions} acceptance-remediation revisions. ${acceptanceRemediationMessage(currentAcceptance)}`)
+          return
+        }
+        throw new Error(`MIGRATION_REPLAN_EXHAUSTED: ${acceptanceRemediationMessage(currentAcceptance)}`)
+      }
+      send('flow:job-output', { jobId: job.id, stream: 'system', line: `Acceptance remediation имеет приоритет над freshness residual: сначала строю минимальный verified scope для ${[...new Set([...currentAcceptance.criticalPackages, ...currentAcceptance.highPackages])].join(', ') || 'audit findings'}.` })
+      await refreshMigrationPlan(job, project, remediationPromptPath, `MIGRATION_REPLAN_REQUIRED: ${acceptanceRemediationMessage(currentAcceptance)}`)
+      if (job.autonomyPlateauReason) return
+      acceptanceRemediationPrepared = true
+      continue
+    }
+
+    // Execute useful, already-approved prompt work. Its freshness contribution
+    // is informational; only verifier results and the subsequent audit can
+    // change acceptance authority.
+    if (executableActionRows > 0) {
       try {
         job.residualExecutionPromptPath = undefined
         await runMigrationAgentIteration(job)
@@ -5064,26 +5065,40 @@ async function runMigrationAgentLoop(job: JobRecord): Promise<void> {
       }
     }
 
-    if (!capacity || capacity.reached) return
+    const acceptance = readAcceptanceVerdict(job.workspace, project)
+    // Before the first independent audit there is no acceptance authority yet.
+    // An empty initial migration plan is therefore simply complete for this
+    // stage; generate→audit decides whether remediation is actually needed.
+    if (acceptance.status === 'UNKNOWN' || acceptance.accepted) return
 
-    // Only after all currently executable work is exhausted do we ask the
-    // Supervisor to close the remaining health gap.  If it cannot do so
-    // safely, that is an autonomy plateau/best-effort handoff -- not a crash.
     const promptPath = promptPathForProject(job.workspace, project.name)
-    if (!promptPath || !existsSync(promptPath)) throw new Error(targetClosureMessage(capacity))
-    if (revision >= autonomy.maxPlannerRevisions) {
+    if (!promptPath || !existsSync(promptPath)) {
       if (autonomy.softStopOnAutonomyPlateau) {
-        markAutonomyPlateau(job, `Текущий executable plan исчерпан; Supervisor не нашёл безопасного расширения за ${autonomy.maxPlannerRevisions} revisions. ${targetClosureMessage(capacity)}`)
+        markAutonomyPlateau(job, `Acceptance требует remediation, но proven seed prompt отсутствует. ${acceptanceRemediationMessage(acceptance)}`)
         return
       }
-      throw new Error(`MIGRATION_REPLAN_EXHAUSTED: ${targetClosureMessage(capacity)}`)
+      throw new Error(`MIGRATION_REPLAN_INPUT_INVALID: ${acceptanceRemediationMessage(acceptance)}`)
     }
-    const targetGap = job.target === 'green'
-      ? `TARGET_GREEN_PLAN_INSUFFICIENT: executable plan исчерпан, Green пока не достигнут. ${targetClosureMessage(capacity)}`
-      : `TARGET_PLAN_INSUFFICIENT: executable plan исчерпан; до Yellow не хватает ${capacity.neededBeyondCurrentPlan ?? '?'} совместимых lag-fix. ${targetClosureMessage(capacity)}`
-    send('flow:job-output', { jobId: job.id, stream: 'system', line: `Supervisor goal-seeking ${revision + 1}/${autonomy.maxPlannerRevisions}: безопасная работа уже выполнена; теперь ищу следующий residual scope.` })
-    await refreshMigrationPlan(job, project, promptPath, `MIGRATION_REPLAN_REQUIRED: ${targetGap}`)
+    if (revision >= autonomy.maxPlannerRevisions) {
+      if (autonomy.softStopOnAutonomyPlateau) {
+        markAutonomyPlateau(job, `Исчерпан budget ${autonomy.maxPlannerRevisions} acceptance-remediation revisions. ${acceptanceRemediationMessage(acceptance)}`)
+        return
+      }
+      throw new Error(`MIGRATION_REPLAN_EXHAUSTED: ${acceptanceRemediationMessage(acceptance)}`)
+    }
+    const acceptanceGap = acceptanceRemediationMessage(acceptance)
+    if (acceptanceRemediationPrepared) {
+      const reason = `Acceptance-remediation replan не создал executable proven actions. ${acceptanceGap}`
+      if (autonomy.softStopOnAutonomyPlateau) {
+        markAutonomyPlateau(job, reason)
+        return
+      }
+      throw new Error(`MIGRATION_REPLAN_STALLED: ${reason}`)
+    }
+    send('flow:job-output', { jobId: job.id, stream: 'system', line: `Supervisor acceptance-remediation ${revision + 1}/${autonomy.maxPlannerRevisions}: executable residual исчерпан, но независимый audit не проходит policy. Ищу минимальный verified residual для ${[...new Set([...acceptance.criticalPackages, ...acceptance.highPackages])].join(', ') || 'audit findings'}.` })
+    await refreshMigrationPlan(job, project, promptPath, `MIGRATION_REPLAN_REQUIRED: ${acceptanceGap}`)
     if (job.autonomyPlateauReason) return
+    acceptanceRemediationPrepared = true
   }
 }
 
@@ -5666,7 +5681,12 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
     if (job.action === 'agent') await runAutonomousMigrationStage(job)
     if (job.action === 'recover') await runRecoveryAgentLoop(job)
     if (job.action === 'release' && job.projectName) {
-      await cleanupToolManagedProjectWorktreesAfterRelease(job, findProject(job.workspace, job.projectName))
+      const releaseProject = findProject(job.workspace, job.projectName)
+      const postReleaseAcceptance = readAcceptanceVerdict(job.workspace, releaseProject)
+      if (!postReleaseAcceptance.accepted) {
+        throw new Error(`ACCEPTANCE_AUTHORITY_INVALIDATED_DURING_RELEASE: ${postReleaseAcceptance.status}; ${postReleaseAcceptance.reasons.join('; ') || 'dependency audit authority no longer matches the release tree'}`)
+      }
+      await cleanupToolManagedProjectWorktreesAfterRelease(job, releaseProject)
     }
     exitCode = 0
     if (!teamStateFinalized) updateTeamState(job, 'passed')
@@ -6031,22 +6051,11 @@ function setupIpc(): void {
     // state just because the user wants a quick handoff.
     if (input.action === 'baseline' && requestedBaselineProofMode !== 'DRAFT' && input.baselineResume !== 'continue') clearPlannerDeferrals(workspace, project.name)
 
-    let bestEffortReleaseReason: string | undefined
-    let bestEffortCurrentLevel: string | undefined
-    // Audit/state publication are useful even when the desired health level is
-    // not fully reachable.  Only release needs a closure decision.  When the
-    // executable plan is exhausted and Critical=0, allow a *best-effort*
-    // release: all normal build/type/lint/final-gate/hooks still run, so this
-    // never turns health degradation into a verifier bypass.
     if (input.action === 'release') {
-      const roadmapPath = projectRoadmapPath(workspace, project.name)
-      if (!roadmapPath || !existsSync(roadmapPath)) throw new Error('Нельзя продолжить FLOW: свежий roadmap JSON этого проекта не найден. Сначала выполните «Верификация».')
-      const closure = targetClosureFromRoadmap(JSON.parse(readFileSync(roadmapPath, 'utf8')), project.name, effectiveTarget)
-      const autonomy = autonomyPolicy(readSettings(workspace), project.name)
-      if (!closure.reached && (!closure.bestEffortReleaseEligible || !autonomy.allowBestEffortRelease)) throw new Error(targetClosureMessage(closure))
-      if (!closure.reached && closure.bestEffortReleaseEligible && autonomy.allowBestEffortRelease) {
-        bestEffortReleaseReason = closure.bestEffortReason || targetClosureMessage(closure)
-        bestEffortCurrentLevel = closure.current
+      const acceptance = readAcceptanceVerdict(workspace, project)
+      if (!acceptance.accepted) {
+        const detail = acceptance.reasons.join('; ') || acceptance.status
+        throw new Error(`ACCEPTANCE_NOT_SATISFIED: ${acceptance.status}; Critical=${acceptance.critical ?? '?'}, High=${acceptance.high ?? '?'}. ${detail}`)
       }
     }
     if (input.action === 'release') {
@@ -6065,7 +6074,6 @@ function setupIpc(): void {
       ...(['agent', 'recover'].includes(input.action) ? { agentProvider: workspace.agent, agentNote: input.agentNote?.trim() || undefined } : {}),
       ...(['release', 'push-workspace'].includes(input.action) ? { releaseBranch: input.releaseBranch } : {}),
       ...(input.action === 'release' ? { releaseSourceCommit: input.sourceCommit, releaseGateCommand: input.gateCommand?.trim() || undefined } : {}),
-      ...(bestEffortReleaseReason ? { bestEffortReason: bestEffortReleaseReason, bestEffortCurrentLevel } : {}),
       ...(input.autopilot === true ? { autopilot: true } : {}),
       ...(requestedBaselineProofMode ? { baselineProofMode: requestedBaselineProofMode } : {}),
     }

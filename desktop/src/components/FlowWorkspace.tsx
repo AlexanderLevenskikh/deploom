@@ -1,10 +1,9 @@
-import { AlertCircle, AlertTriangle, Check, ChevronDown, Circle, CircleHelp, ExternalLink, FileText, Info, LoaderCircle, Pause, Play, RotateCcw, Send, ShieldCheck } from 'lucide-react'
+import { AlertCircle, AlertTriangle, Check, ChevronDown, Circle, CircleHelp, ExternalLink, FileText, LoaderCircle, Pause, Play, RotateCcw, Send, ShieldCheck } from 'lucide-react'
 
 import { useEffect, useMemo, useState } from 'react'
 import { ACTION_ORDER, FLOW_STAGES } from '../data/flow'
 import { useLanguage } from '../i18n'
 import { BranchFailureModal } from './BranchFailureModal'
-import { GoalDetailsModal } from './GoalDetailsModal'
 import { QuickSelect } from './QuickSelect'
 import { ModelPicker } from './ModelPicker'
 import { BaselineIntentDialog } from './BaselineIntentDialog'
@@ -12,8 +11,8 @@ import { freshBaselineIntent, normalizeBaselineIntentPlan } from '../data/baseli
 import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, FlowAction, MigrationBranchProgress, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
 
 const AUTOPILOT_HELP = {
-  ru: '«Продолжить» автономно доводит текущий этап: Supervisor, retry и recovery работают без ручных перезапусков. Автопилот делает то же самое и дополнительно сам переходит между этапами FLOW, возвращаясь к migration после недостигнутой цели.',
-  en: 'Continue autonomously completes the current stage: Supervisor, retry and recovery work without manual restarts. Autopilot also advances between FLOW stages and returns to migration when the target is still unmet.',
+  ru: '«Продолжить» автономно доводит текущий этап. Автопилот дополнительно проходит весь FLOW до принятого результата: после audit он возвращается в migration только при реальном acceptance blocker, а не ради процента freshness.',
+  en: 'Continue autonomously completes the current stage. Autopilot also advances through FLOW to an accepted result: after audit it re-enters migration only for a real acceptance blocker, never to chase a freshness percentage.',
 } as const
 
 type Props = {
@@ -39,13 +38,14 @@ type Props = {
 
 export function FlowWorkspace({ details, project, activeAction, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels }: Props) {
   const { language, text, t } = useLanguage()
-  const [target, setTarget] = useState<TargetLevel>('yellow')
+  // Compatibility-only planner hint for legacy roadmap/prompt export.
+  // Yellow/Green is no longer a user goal or a completion gate.
+  const target: TargetLevel = 'yellow'
   const [label, setLabel] = useState('')
   const [releaseBranch, setReleaseBranch] = useState(project.git?.releaseBranch || 'libs-release')
   const [gateCommand, setGateCommand] = useState('')
   const [agentNote, setAgentNote] = useState('')
   const [noteSendState, setNoteSendState] = useState<'idle' | 'sending' | 'sent'>('idle')
-  const [goalDetailsOpen, setGoalDetailsOpen] = useState(false)
   const [selectedBranchFailure, setSelectedBranchFailure] = useState<MigrationBranchProgress | null>(null)
   const [selectedStageIndex, setSelectedStageIndex] = useState<number | null>(null)
   const [baselineIntentDialog, setBaselineIntentDialog] = useState<{ mode: 'prepare' | 'decision'; resume: 'auto' | 'continue' | 'restart'; plan: BaselineIntentPlan; decision?: BaselineDecision }>()
@@ -82,26 +82,27 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
   const levelRefreshing = ['baseline', 'generate', 'generate-all'].includes(activeAction ?? '')
   const measuredDate = currentLevel?.measuredAt ? new Date(currentLevel.measuredAt) : undefined
   const measuredLabel = measuredDate && !Number.isNaN(measuredDate.getTime()) ? measuredDate.toLocaleString(language === 'ru' ? 'ru-RU' : 'en-US', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : undefined
-  const runTarget: TargetLevel = run?.target === 'green' ? 'green' : 'yellow'
-  const statusRank = { red: 0, yellow: 1, green: 2 } as const
-  const remainingForTarget = runTarget === 'yellow' ? currentLevel?.remainingYellow : currentLevel?.remainingGreen
-  const targetReached = Boolean(currentLevel && statusRank[currentLevel.status] >= statusRank[runTarget] && (remainingForTarget ?? 0) === 0)
-  const actionsComplete = !activeAction && currentIndex < 0
-  const goalMissed = completed.has('generate') && !targetReached
-  const flowComplete = actionsComplete && targetReached
+  const acceptance = details.acceptanceVerdict
+  const acceptanceAccepted = acceptance?.status === 'ACCEPTED'
+  const acceptanceNeedsRemediation = acceptance?.status === 'REMEDIATION_REQUIRED'
+  const acceptanceUnknown = !acceptance || acceptance.status === 'UNKNOWN'
+  // Publication is an explicit opt-in. An accepted, release/state-complete run
+  // is a completed product result even when git.push is intentionally disabled.
+  const requiredCompletionActions = project.git?.push ? ACTION_ORDER : ACTION_ORDER.filter((action) => action !== 'push-workspace')
+  const actionsComplete = !activeAction && requiredCompletionActions.every((action) => completed.has(action))
+  const flowComplete = actionsComplete && acceptanceAccepted
   const activeIndex = currentIndex < 0 ? FLOW_STAGES.length - 1 : currentIndex
   const displayedIndex = selectedStageIndex ?? activeIndex
   const active = Boolean(activeAction)
   const displayedAction = FLOW_STAGES[displayedIndex].action
-  const bestEffortReleaseEligible = Boolean(details.targetClosure?.bestEffortReleaseEligible)
-  const goalBlocked = goalMissed && displayedAction === 'release' && !bestEffortReleaseEligible
+  const releaseBlocked = displayedAction === 'release' && !acceptanceAccepted
+  const acceptanceTone = acceptanceAccepted ? 'success' : acceptanceNeedsRemediation ? 'danger' : 'muted'
+  const acceptanceLabel = acceptanceAccepted ? 'ACCEPTED' : acceptanceNeedsRemediation ? 'REMEDIATION_REQUIRED' : 'UNKNOWN'
   const configuredBranch = project.git?.baseBranch || project.git?.branchPrefix || 'libs'
   const [branchBase, setBranchBase] = useState(configuredBranch)
   const [pushEnabled, setPushEnabled] = useState(Boolean(project.git?.push))
   const [agentModel, setAgentModel] = useState(details.workspace.agentModel ?? '')
   const [modelSuggestions, setModelSuggestions] = useState<string[]>([])
-  const levelLabels = { red: t('levels.red'), yellow: t('levels.yellow'), green: t('levels.green') } as const
-  const levelTones = { red: 'danger', yellow: 'warning', green: 'success' } as const
   const migrationStatusLabels = {
     waiting: t('flow.status.waiting'), created: t('flow.status.created'), partial: t('flow.status.partial'),
     changes: t('flow.status.changes'), ready: t('flow.status.ready'), integrated: t('flow.status.integrated'), merged: t('flow.status.merged'),
@@ -131,7 +132,6 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
   }, [configuredBranch, project.git?.push, project.name])
 
   useEffect(() => { setAgentModel(details.workspace.agentModel ?? '') }, [details.workspace.agentModel, details.workspace.id])
-  useEffect(() => { if (run?.target === 'yellow' || run?.target === 'green') setTarget(run.target) }, [run?.target])
   useEffect(() => { setReleaseBranch(run?.releaseBranch || project.git?.releaseBranch || 'libs-release') }, [project.git?.releaseBranch, project.name, run?.releaseBranch])
   // Resetting on `currentIndex` moved the detail panel -- and the primary
   // button with it -- out from under the user whenever a background refresh
@@ -150,7 +150,15 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
   const openBaselineIntentDialog = async (mode: 'prepare' | 'decision', resume: 'auto' | 'continue' | 'restart', decision?: BaselineDecision) => {
     try {
       const loaded = normalizeBaselineIntentPlan(await onGetBaselineIntentPlan(project.name))
-      const plan = mode === 'prepare' ? { ...loaded, intent: freshBaselineIntent() } : loaded
+      const fresh = freshBaselineIntent()
+      // A new Baseline retries package scope/deferred cohorts from a clean slate,
+      // but product-level risk/control preferences must not silently reset.
+      const plan = mode === 'prepare' ? { ...loaded, intent: {
+        ...fresh,
+        controlMode: loaded.intent.controlMode ?? fresh.controlMode,
+        budgetMinutes: loaded.intent.budgetMinutes ?? fresh.budgetMinutes,
+        acceptancePolicy: loaded.intent.acceptancePolicy ?? fresh.acceptancePolicy,
+      } } : loaded
       setBaselineIntentDialog({ mode, resume, plan, decision })
     } catch (error) {
       window.alert(error instanceof Error ? error.message : String(error))
@@ -253,7 +261,7 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
   }
 
   const startAutopilotWithCurrentModel = async () => {
-    if (!window.confirm(`Автопилот самостоятельно пройдёт оставшиеся этапы FLOW для ${project.name}, будет чинить recoverable-ошибки и использовать best-effort release только при исчерпанном безопасном плане. Публикация ${project.git?.push ? 'разрешена настройкой git.push' : 'НЕ выполняется: git.push выключен'}. Запустить?`)) return
+    if (!window.confirm(`Автопилот самостоятельно пройдёт оставшиеся этапы FLOW для ${project.name}, будет чинить recoverable-ошибки и после audit продолжит migration только пока не выполнена acceptance policy. Freshness не является обязательным порогом. Публикация ${project.git?.push ? 'разрешена настройкой git.push' : 'НЕ выполняется: git.push выключен'}. Запустить?`)) return
     await persistAgentModel()
     await onStartAutopilot({ workspaceId: details.workspace.id, projectName: project.name, target, releaseBranch })
   }
@@ -280,8 +288,8 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
     <section className="flow-workspace">
       <div className="project-facts">
         <div><span>{t('flow.projectPath')}</span><strong title={project.path}>{project.path}</strong></div>
-        <div><span title={currentLevel?.measuredAt ? t('flow.lastMeasured', { value: currentLevel.measuredAt }) : undefined}>{t('flow.currentLevel')}{levelRefreshing ? ` · ${t('flow.recalculating')}` : measuredLabel ? ` · ${measuredLabel}` : ''}</span><strong className="level-label"><i className={`status-dot ${currentLevel ? levelTones[currentLevel.status] : 'muted'}`} />{currentLevel ? levelLabels[currentLevel.status] : t('levels.unknown')}{typeof currentLevel?.lagOkPct === 'number' ? ` · ${currentLevel.lagOkPct.toFixed(1)}%` : ''}</strong></div>
-        <fieldset className="target-field"><legend>{t('flow.targetLevel')}</legend><label><input type="radio" checked={target === 'yellow'} onChange={() => setTarget('yellow')} /><span className="target-dot yellow" />{t('levels.yellow')}</label><label><input type="radio" checked={target === 'green'} onChange={() => setTarget('green')} /><span className="target-dot green" />{t('levels.green')}</label></fieldset>
+        <div><span>{text('Acceptance', 'Acceptance')}</span><strong className="level-label" title={acceptance?.reasons.join(' · ')}><i className={`status-dot ${acceptanceTone}`} />{acceptanceLabel}{typeof acceptance?.critical === 'number' && typeof acceptance?.high === 'number' ? ` · C${acceptance.critical}/H${acceptance.high}` : ''}</strong></div>
+        <div><span title={currentLevel?.measuredAt ? t('flow.lastMeasured', { value: currentLevel.measuredAt }) : undefined}>{text('Freshness', 'Freshness')}{levelRefreshing ? ` · ${t('flow.recalculating')}` : measuredLabel ? ` · ${measuredLabel}` : ''}</span><strong>{typeof currentLevel?.lagOkPct === 'number' ? `${currentLevel.lagOkPct.toFixed(1)}%` : text('не рассчитана', 'not calculated')}</strong></div>
         <div><span>{t('common.branch')}</span><div className="git-plan-control"><input aria-label={t('flow.updateBranch')} value={branchBase} onChange={(event) => setBranchBase(event.target.value)} onBlur={() => void persistGitSettings()} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }} placeholder="libs" /><label className="push-toggle" title={t('flow.pushTitle')}><input type="checkbox" checked={pushEnabled} onChange={(event) => void persistGitSettings(branchBase, event.target.checked)} />Push</label></div></div>
         <div><span>{t('flow.workspace')}</span><strong className={details.git.dirty ? 'warning-text' : 'success-text'}>{details.git.dirty ? t('flow.workspaceDirty', { count: details.git.summary.length }) : t('flow.workspaceClean')}</strong></div>
         <div><span>{t('flow.agent')}</span><QuickSelect value={details.workspace.agent} options={[{ value: 'codex', label: 'Codex' }, { value: 'opencode', label: 'OpenCode' }, { value: 'claude', label: 'Claude' }]} onChange={(value) => void onUpdateWorkspace({ id: details.workspace.id, agent: value as AgentProvider })} ariaLabel={t('flow.agent')} /></div>
@@ -314,38 +322,16 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
         </ol>
 
         <div className="stage-detail">
-          {actionsComplete && goalMissed && selectedStageIndex === null ? <div className="flow-complete goal-missed">
-            <span className="flow-complete-icon"><AlertTriangle size={24} /></span>
-            <h3>{run?.bestEffortRelease ? text('FLOW завершён: VERIFIED_PARTIAL_SCOPE', 'FLOW completed: VERIFIED_PARTIAL_SCOPE') : text('Цель не достигнута', 'Target not reached')}</h3>
-            <p>{run?.bestEffortRelease ? text(
-              'Текущий интегрированный результат физически проверен и опубликован как VERIFIED_PARTIAL_SCOPE. Идеальный health-level не достигнут, но deferred scope сохранён и может быть реактивирован отдельным следующим Fast-проходом.',
-              'The integrated result is physically verified and published as VERIFIED_PARTIAL_SCOPE. The ideal health level was not reached, while deferred scope is preserved and can be reactivated in a later Fast pass.',
-            ) : bestEffortReleaseEligible ? text(
-              'Текущий исполнимый план исчерпан. Можно продолжить audit/release/state в best-effort режиме: проверки и repository hooks останутся обязательными.',
-              'The current executable plan is exhausted. Audit/release/state may continue in best-effort mode; verification and repository hooks remain mandatory.',
-            ) : text(
-              'В текущем плане ещё есть исполнимые действия или критичный blocker. Supervisor продолжит/перепланирует миграцию; release пока заблокирован.',
-              'The current plan still contains executable actions or a critical blocker. Supervisor will continue/replan migration; release remains blocked.',
-            )}</p>
-            <strong>{currentLevel ? `${levelLabels[currentLevel.status]}${typeof currentLevel.lagOkPct === 'number' ? ` · ${currentLevel.lagOkPct.toFixed(1)}%` : ''}; ${text('цель', 'target')} — ${runTarget === 'yellow' ? `${t('levels.yellow')} (≥ 80%)` : t('levels.green')}` : text('Итоговый уровень не рассчитан', 'Final level is not calculated')}</strong>
-            <div className="stage-actions">
-              {details.targetClosure ? <button className="button secondary" onClick={() => setGoalDetailsOpen(true)}><Info size={16} /> {text('Почему не достигнута', 'Why it was not reached')}</button> : null}
-              {run?.bestEffortRelease?.handoffPath ? <button className="button secondary" onClick={() => void onOpenPath(run.bestEffortRelease?.handoffPath)}><FileText size={16} /> {text('Открыть handoff', 'Open handoff')}</button> : null}
-              {run?.bestEffortRelease ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} /> {text('Продолжить улучшение', 'Continue improving')}</button> : null}
-              <button className="button primary" onClick={onOpenDashboard}><ExternalLink size={16} /> {text('Открыть свежий dashboard', 'Open fresh Dashboard')}</button>
-            </div>
-            <div className="autopilot-actions">
-              {autopilotActive
-                ? <button className="button secondary" onClick={() => void onStopAutopilot()}><Pause size={16} /> {t('flow.autopilot.stop')}</button>
-                : <button className="button secondary" disabled={active} onClick={() => void startAutopilotWithCurrentModel()}><Play size={16} /> {t('flow.autopilot.start')}</button>}
-              <span className="autopilot-help" tabIndex={0} title={AUTOPILOT_HELP[language]} aria-label={AUTOPILOT_HELP[language]}><CircleHelp size={15} /></span>
-            </div>
-          </div> : flowComplete && selectedStageIndex === null ? <div className="flow-complete">
+          {flowComplete && selectedStageIndex === null ? <div className="flow-complete">
             <span className="flow-complete-icon"><Check size={24} /></span>
-            <h3>{text('Прогон завершён', 'Run completed')}</h3>
-            <p>{text('Все этапы FLOW выполнены. Финальный roadmap сохранён и готов к просмотру.', 'All FLOW stages completed. The final roadmap is saved and ready for review.')}</p>
-            <strong>{currentLevel ? `${text('Итоговый уровень', 'Final level')}: ${levelLabels[currentLevel.status]}${typeof currentLevel.lagOkPct === 'number' ? ` · ${currentLevel.lagOkPct.toFixed(1)}%` : ''}` : text('Итоговый уровень не рассчитан', 'Final level is not calculated')}</strong>
-            <button className="button primary" onClick={onOpenDashboard}><ExternalLink size={16} /> {text('Открыть финальный dashboard', 'Open final Dashboard')}</button>
+            <h3>{text('Результат принят', 'Result accepted')}</h3>
+            <p>{text('Независимый dependency audit проходит acceptance policy, а release/state gates завершены. Freshness — отдельная метрика улучшения и не была обязательным порогом.', 'The independent dependency audit satisfies the acceptance policy and release/state gates are complete. Freshness is a separate improvement metric and was not a mandatory threshold.')}</p>
+            <strong>{`Acceptance: C${acceptance?.critical ?? '?'}/H${acceptance?.high ?? '?'} · ${text('Freshness', 'Freshness')}: ${typeof currentLevel?.lagOkPct === 'number' ? `${currentLevel.lagOkPct.toFixed(1)}%` : '—'}`}</strong>
+            <div className="stage-actions">
+              <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} /> {text('Продолжить улучшение', 'Continue improving')}</button>
+              {run?.bestEffortRelease?.handoffPath ? <button className="button secondary" onClick={() => void onOpenPath(run.bestEffortRelease?.handoffPath)}><FileText size={16} /> {text('Открыть legacy handoff', 'Open legacy handoff')}</button> : null}
+              <button className="button primary" onClick={onOpenDashboard}><ExternalLink size={16} /> {text('Открыть финальный dashboard', 'Open final Dashboard')}</button>
+            </div>
           </div> : <>
           <div className="stage-detail-title"><div><h3>{t(FLOW_STAGES[displayedIndex].titleKey)}</h3><p>{t(FLOW_STAGES[displayedIndex].descriptionKey)}</p></div><span className="step-number">{t('flow.step', { step: displayedIndex + 1 })}</span></div>
           <div className="check-table">
@@ -354,17 +340,14 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
             <div>{details.dashboardExists ? <Check className="success-text" size={17} /> : <Circle size={17} />}<span>{t('flow.check.dashboard')}</span><strong>{details.dashboardExists ? t('common.ready') : t('common.waiting')}</strong><small>{details.dashboardExists ? (details.dashboardPath || '—') : t('flow.check.dashboardMissing')}</small></div>
             <div>{promptReady ? <Check className="success-text" size={17} /> : <Circle size={17} />}<span>{t('flow.check.agentPrompt')}</span><strong>{promptReady ? t('common.ready') : t('common.waiting')}</strong><small>{details.projectPromptPath || t('flow.check.exportPrompt')}</small></div>
           </div>
-          {goalMissed && bestEffortReleaseEligible ? <div className="verified-partial-decision">
-            <ShieldCheck size={18} />
-            <div>
-              <strong>VERIFIED_PARTIAL_SCOPE</strong>
-              <span>{text(
-                'Текущий executable scope исчерпан и проверен. Можно завершить этот проход через обычные release/state/publish gates либо реактивировать deferred group и расширить verified scope.',
-                'The current executable scope is exhausted and verified. You may finish this pass through the normal release/state/publish gates or reactivate a deferred group to expand verified scope.',
-              )}</span>
-            </div>
-          </div> : null}
-          {goalMissed ? <div className="confirmation"><AlertTriangle size={18} /><span>{text('Цель', 'Target')} «{runTarget === 'yellow' ? t('levels.yellow') : t('levels.green')}» {text('ещё не достигнута', 'is not reached yet')}{typeof currentLevel?.lagOkPct === 'number' ? `: ${currentLevel.lagOkPct.toFixed(1)}%` : ''}{typeof details.targetClosure?.neededForYellow === 'number' && details.targetClosure.neededForYellow > 0 ? `, ${text('не хватает', 'missing')} ${details.targetClosure.neededForYellow}` : ''}. {bestEffortReleaseEligible ? text('Исполнимый plan исчерпан: audit/release/state можно довести автоматически в best-effort режиме; проверки не ослабляются.', 'The executable plan is exhausted: audit/release/state may continue automatically in best-effort mode; verification is not weakened.') : text('Release пока заблокирован, но audit/state можно сохранять — Supervisor должен сначала исчерпать безопасные варианты migration/replan.', 'Release is still blocked, but audit/state may be saved. Supervisor must first exhaust safe migration/replan options.')}</span>{details.targetClosure ? <button className="button secondary" onClick={() => setGoalDetailsOpen(true)}><Info size={16} /> {t('common.details')}</button> : null}</div> : null}
+          {acceptanceNeedsRemediation ? <div className="confirmation"><AlertTriangle size={18} /><span>{text(
+            `Acceptance пока не выполнен: Critical=${acceptance?.critical ?? '?'}, High=${acceptance?.high ?? '?'}. Autopilot/Supervisor будет искать минимальный verified residual именно для этих findings; freshness ${typeof currentLevel?.lagOkPct === 'number' ? `${currentLevel.lagOkPct.toFixed(1)}%` : '—'} не является blocker.`,
+            `Acceptance is not satisfied yet: Critical=${acceptance?.critical ?? '?'}, High=${acceptance?.high ?? '?'}. Autopilot/Supervisor will seek the smallest verified residual for these findings; freshness ${typeof currentLevel?.lagOkPct === 'number' ? `${currentLevel.lagOkPct.toFixed(1)}%` : '—'} is not a blocker.`,
+          )}</span></div> : null}
+          {acceptanceUnknown && completed.has('audit') ? <div className="confirmation"><AlertTriangle size={18} /><span>{text(
+            `Acceptance UNKNOWN: ${acceptance?.reasons.join(' · ') || 'нет свежего полного audit evidence'}. Release fail-closed до свежего независимого audit.`,
+            `Acceptance is UNKNOWN: ${acceptance?.reasons.join(' · ') || 'fresh complete audit evidence is unavailable'}. Release fails closed until a fresh independent audit is available.`,
+          )}</span></div> : null}
           {details.migrationProgress ? <section className="migration-progress" aria-label={t('flow.migrationProgressAria')}>
             <div className="migration-progress-heading"><div><strong>{t('flow.migrationGroups')}</strong><span>{text(
               `${details.migrationProgress.completedBranches} в merged · ${details.migrationProgress.readyBranches} готовы · ${details.migrationProgress.activeBranches} выполняются${details.migrationProgress.activeDependencies ? ` (${details.migrationProgress.activeDependencies} целей)` : ''}${planningMigrationBranches ? ` · ${t('flow.supervisorReplans')}` : ''}${queuedMigrationBranches ? ` · ${queuedMigrationBranches} ${t('flow.queued')}` : ''}${failedMigrationBranches ? ` · ${failedMigrationBranches} ${t('flow.waitSupervisor')}` : ''} · ${t('flow.total')} ${details.migrationProgress.totalBranches}`,
@@ -411,8 +394,8 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
             {FLOW_STAGES[displayedIndex].action === 'agent' && !canResumeAgent ? <button className="button secondary" disabled={active} title={text('Необязательно: Desktop сам построит актуальный prompt. Используйте только чтобы явно подменить его файлом.', 'Optional: Desktop builds the current prompt automatically. Use this only to explicitly replace it with a file.')} onClick={() => void onChoosePrompt(project.name)}><FileText size={16} /> {t('flow.customPrompt')}</button> : null}
             {FLOW_STAGES[displayedIndex].action === 'agent' ? <button className="button secondary" disabled={active} onClick={() => { if (window.confirm(text('Текущие изменения сохранятся в safety stash. Ветки Branch plan (work-ветки и merged) для этого проекта будут удалены локально, сохранённая сессия агента забудется. Начать миграцию заново?', 'Current changes will be saved to a safety stash. Branch-plan work and merged branches for this project will be removed locally and the saved agent session will be forgotten. Start migration over?'))) void execute(displayedIndex, false, true) }}><RotateCcw size={16} /> {t('flow.restartMigration')}</button> : null}
             {FLOW_STAGES[displayedIndex].action === 'baseline' ? <button className="button secondary" disabled={active} onClick={() => { if (window.confirm(text('Начать Baseline заново? Оркестрационный checkpoint будет сброшен, но exact proof/artifact cache с совпадающей identity останется доступен.', 'Restart Baseline? The orchestration checkpoint will be reset, while exact proof/artifact cache with matching identity remains reusable.'))) void execute(displayedIndex, undefined, undefined, 'restart') }}><RotateCcw size={16} /> {text('Начать заново', 'Start over')}</button> : null}
-            {displayedAction === 'release' && goalMissed && bestEffortReleaseEligible ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} /> {text('Продолжить улучшение', 'Continue improving')}</button> : null}
-            <button className="button primary" disabled={active || goalBlocked} title={goalBlocked ? t('flow.release.blockedTitle') : bestEffortReleaseEligible && displayedAction === 'release' ? t('flow.release.bestEffortTitle') : undefined} onClick={() => void execute(displayedIndex, undefined, undefined, FLOW_STAGES[displayedIndex].action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}>{active ? <LoaderCircle className="spin" size={17} /> : displayedIndex === 2 ? <ExternalLink size={17} /> : displayedIndex === 5 ? <ShieldCheck size={17} /> : <Play size={17} />}{FLOW_STAGES[displayedIndex].action === 'baseline' ? (details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Запустить', 'Start')) : FLOW_STAGES[displayedIndex].action === 'agent' && canResumeAgent ? t('flow.continueAgent') : FLOW_STAGES[displayedIndex].action === 'agent' && hasMigrationProgress ? t('flow.continueMigration') : FLOW_STAGES[displayedIndex].action === 'release' && goalMissed && bestEffortReleaseEligible ? text('Завершить с текущим verified результатом', 'Finish with current verified result') : t(FLOW_STAGES[displayedIndex].buttonKey)}</button>
+            {displayedAction === 'release' && acceptanceAccepted ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} /> {text('Продолжить улучшение', 'Continue improving')}</button> : null}
+            <button className="button primary" disabled={active || releaseBlocked} title={releaseBlocked ? text(`Release заблокирован acceptance: ${acceptance?.reasons.join(' · ') || acceptanceLabel}`, `Release is blocked by acceptance: ${acceptance?.reasons.join(' · ') || acceptanceLabel}`) : undefined} onClick={() => void execute(displayedIndex, undefined, undefined, FLOW_STAGES[displayedIndex].action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}>{active ? <LoaderCircle className="spin" size={17} /> : displayedIndex === 2 ? <ExternalLink size={17} /> : displayedIndex === 5 ? <ShieldCheck size={17} /> : <Play size={17} />}{FLOW_STAGES[displayedIndex].action === 'baseline' ? (details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Запустить', 'Start')) : FLOW_STAGES[displayedIndex].action === 'agent' && canResumeAgent ? t('flow.continueAgent') : FLOW_STAGES[displayedIndex].action === 'agent' && hasMigrationProgress ? t('flow.continueMigration') : FLOW_STAGES[displayedIndex].action === 'release' ? text('Создать accepted release', 'Create accepted release') : t(FLOW_STAGES[displayedIndex].buttonKey)}</button>
           </div>
           <div className="autopilot-actions">
             {autopilotActive
@@ -423,7 +406,6 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
           </>}
         </div>
       </div>
-      {goalDetailsOpen && details.targetClosure ? <GoalDetailsModal closure={details.targetClosure} projectName={project.name} onClose={() => setGoalDetailsOpen(false)} /> : null}
       {selectedBranchFailure?.runtime?.phase === 'failed' ? <BranchFailureModal branch={selectedBranchFailure} onClose={() => setSelectedBranchFailure(null)} /> : null}
       {baselineIntentDialog ? <BaselineIntentDialog mode={baselineIntentDialog.mode} plan={baselineIntentDialog.plan} decision={baselineIntentDialog.decision} onCancel={() => { setBaselineIntentDialog(undefined); if (baselineIntentDialog.mode === 'decision') setBaselineDecisionDismissed(true) }} onSubmit={runBaselineIntent} /> : null}
     </section>

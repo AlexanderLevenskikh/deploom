@@ -6,9 +6,12 @@ export type BaselinePackagePolicy = 'auto' | 'keep-current' | 'required'
 export type BaselineSearchMode = 'AUTO' | 'BOUNDED_IMPROVEMENT' | 'EXHAUSTIVE'
 export type BaselineExecutionMode = 'FAST' | 'AUTOPILOT' | 'BACKGROUND'
 export type BaselineProofMode = 'VERIFIED' | 'DRAFT'
+export type BaselineControlMode = 'AUTONOMOUS' | 'CONFIRM_SIGNIFICANT'
+export type AcceptancePolicy = { maxKnownCritical: number; maxKnownHigh: number }
+export type AcceptanceVerdict = { status: 'ACCEPTED' | 'REMEDIATION_REQUIRED' | 'UNKNOWN'; accepted: boolean; evidenceComplete: boolean; dependencyEvidenceFresh: boolean; critical?: number; high?: number; criticalPackages: string[]; highPackages: string[]; auditGeneratedAt?: string; auditEngine?: string; reasons: string[]; policy: AcceptancePolicy }
 export type BaselineDeferredCohort = { id: string; label: string; packages: string[]; predicate?: string; confidence?: number; authority: 'DIAGNOSTIC_HINT'; deferredAt?: string; decisionId?: string; boundaryPackages?: string[]; warningPackages?: string[] }
 export type BaselineCohortAction = { kind: 'DEFER' | 'REACTIVATE'; cohortId: string; label: string; packages: string[]; predicate?: string; confidence?: number; decisionId?: string }
-export type BaselineIntent = { schemaVersion: 1; policies: Record<string, BaselinePackagePolicy>; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; proofMode?: BaselineProofMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction }
+export type BaselineIntent = { schemaVersion: 1 | 2; policies: Record<string, BaselinePackagePolicy>; controlMode?: BaselineControlMode; budgetMinutes?: number; acceptancePolicy?: AcceptancePolicy; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; proofMode?: BaselineProofMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction }
 export type BaselineIntentCandidate = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string }
 export type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent }
 export type BaselineCohortSuggestion = { id: string; label: string; predicate: string; subjects: string[]; packages: string[]; blockedPackages: string[]; warningPackages: string[]; boundaryPackages: string[]; confidence: number; reasons: string[]; decisionId: string; expandedFrom?: string; authority: 'DIAGNOSTIC_HINT' }
@@ -176,6 +179,7 @@ export type WorkspaceDetails = {
   teamState?: TeamFlowState
   projectLevels: Record<string, ProjectLevel>
   targetClosure?: TargetClosure
+  acceptanceVerdict?: AcceptanceVerdict
   migrationProgress?: MigrationProgress
   baselineRecovery?: BaselineRecoveryInfo
 }

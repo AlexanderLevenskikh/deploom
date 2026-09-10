@@ -16,7 +16,7 @@ const css = readFileSync(new URL('../src/App.css', import.meta.url), 'utf8')
 
 for (const [name, source, sentinels] of [
   ['AddProjectDialog', add, ['dialog-actions', "t('common.cancel')", 'button primary']],
-  ['BaselineIntentDialog', baseline, ['baseline-intent-actions', 'Запустить Fast Baseline', 'Отложить группу', 'Вернуться к этой группе', 'Изменения состава Baseline ещё не применены', 'baseline-policy-toggle']],
+  ['BaselineIntentDialog', baseline, ['baseline-intent-actions', 'Запустить автономно', 'Запустить Baseline', 'Подтверждать существенное', 'Техническая глубина поиска', 'Отложить группу', 'Вернуться к этой группе', 'Изменения состава Baseline ещё не применены', 'baseline-policy-toggle']],
   ['WorkspaceDialog', workspace, ['dialog-actions', "t('common.cancel')", "t('workspaceDialog.create')", "t('workspaceDialog.connect.title')"]],
   ['BranchFailureModal', branchFailure, ['modal-actions', "t('common.understood')", 'onClose']],
   ['GoalDetailsModal', goal, ['modal-actions', "t('common.understood')", 'onClose']],
@@ -24,6 +24,10 @@ for (const [name, source, sentinels] of [
   for (const sentinel of sentinels) {
     if (!source.includes(sentinel)) throw new Error(`${name} interaction contract missing: ${sentinel}`)
   }
+}
+
+for (const legacy of ['Запустить Fast Baseline', 'Работать автономно', 'Режим Baseline']) {
+  if (baseline.includes(legacy)) throw new Error(`Legacy Baseline product interaction remains: ${legacy}`)
 }
 
 const tsxFiles = readdirSync(components).filter((name) => name.endsWith('.tsx'))

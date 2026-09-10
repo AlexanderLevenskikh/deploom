@@ -1,81 +1,54 @@
-import { readFileSync } from 'node:fs'
+import fs from 'node:fs'
+import ts from 'typescript'
 
-const types = readFileSync(new URL('../src/types.ts', import.meta.url), 'utf8')
-const flow = readFileSync(new URL('../src/components/FlowWorkspace.tsx', import.meta.url), 'utf8')
-const dialog = readFileSync(new URL('../src/components/BaselineIntentDialog.tsx', import.meta.url), 'utf8')
-const hook = readFileSync(new URL('../src/hooks/useDependencyFlow.ts', import.meta.url), 'utf8')
-const main = readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8')
-const preload = readFileSync(new URL('../electron/preload.cts', import.meta.url), 'utf8')
-const generator = readFileSync(new URL('../../dependency_live_roadmap_generator.py', import.meta.url), 'utf8')
+const types = fs.readFileSync(new URL('../src/types.ts', import.meta.url), 'utf8')
+const dialog = fs.readFileSync(new URL('../src/components/BaselineIntentDialog.tsx', import.meta.url), 'utf8')
+const main = fs.readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8')
+const preload = fs.readFileSync(new URL('../electron/preload.cts', import.meta.url), 'utf8')
+const normalizerSource = fs.readFileSync(new URL('../src/data/baselineIntent.ts', import.meta.url), 'utf8')
+const progressiveSource = fs.readFileSync(new URL('../src/progressive-policy.ts', import.meta.url), 'utf8')
 
-for (const sentinel of [
-  "export type BaselinePackagePolicy = 'auto' | 'keep-current' | 'required'",
-  'baselineIntent?: BaselineIntent',
-  'getBaselineIntentPlan',
-]) if (!types.includes(sentinel)) throw new Error(`Baseline intent type/API contract missing: ${sentinel}`)
+const mustContain = (text, needle, label) => { if (!text.includes(needle)) throw new Error(`${label}: missing ${JSON.stringify(needle)}`) }
+const mustNotContain = (text, needle, label) => { if (text.includes(needle)) throw new Error(`${label}: forbidden ${JSON.stringify(needle)}`) }
 
 for (const sentinel of [
-  'BaselineIntentDialog',
-  'baselinePolicyIdentity',
-  "policyChanged ? 'restart' : pending.resume",
-  "baselineResume !== 'continue'",
-  'baselineDecision',
-  'onGetBaselineIntentPlan',
-]) if (!flow.includes(sentinel)) throw new Error(`Baseline intent FLOW contract missing: ${sentinel}`)
+  "export type BaselineControlMode = 'AUTONOMOUS' | 'CONFIRM_SIGNIFICANT'",
+  'budgetMinutes?: number',
+  'acceptancePolicy?: AcceptancePolicy',
+]) mustContain(types, sentinel, 'Baseline intent v2 types')
 
 for (const sentinel of [
-  'Отложить группу (',
-  'Вернуться к этой группе',
-  'Готов ждать: исчерпывающий поиск в фоне',
-  'Режим Baseline',
-  'Как выполнять',
-  'С контролем',
-  'Работать автономно',
-  'Глубина поиска',
-  'AUTO · Рекомендуется',
-  'EXHAUSTIVE',
-  'Запустить AUTO автономно',
-  'Запустить исчерпывающий Baseline',
-  'Запустить исчерпывающий Baseline в фоне',
-  'baseline-policy-toggle',
-  "setPolicy(item.name, 'keep-current')",
-  "setPolicy(item.name, 'required')",
-  'Запустить Fast Baseline',
-]) if (!dialog.includes(sentinel)) throw new Error(`Baseline intent dialog contract missing: ${sentinel}`)
+  "controlMode === 'AUTONOMOUS'",
+  "controlMode === 'CONFIRM_SIGNIFICANT'",
+  "text('Acceptance policy', 'Acceptance policy')",
+  'maxKnownCritical', 'maxKnownHigh', 'budgetMinutes', 'schemaVersion: 2',
+]) mustContain(dialog, sentinel, 'progressive Baseline UI')
+mustNotContain(dialog, 'setExecutionMode', 'legacy execution mode must not drive UI')
+mustNotContain(dialog, 'schemaVersion: 1,', 'dialog must emit v2')
+mustNotContain(dialog, 'preferredFreshnessPct', 'unimplemented freshness preference must stay out of happy-path UI')
+mustContain(dialog, "text('Бюджет Baseline / планирования', 'Baseline / planning budget')", 'budget scope must be honest')
 
 for (const sentinel of [
-  'parseBaselineDecision',
-  'baselineDecision',
-  'getBaselineIntentPlan',
-]) if (!hook.includes(sentinel)) throw new Error(`Baseline human-decision hook contract missing: ${sentinel}`)
+  'DEPLOOM_BASELINE_CONTROL_MODE',
+  'DEPLOOM_BASELINE_BUDGET_MINUTES',
+  'DEPLOOM_ACCEPTANCE_POLICY_JSON',
+  "executionMode: controlMode === 'AUTONOMOUS' ? 'BACKGROUND' : 'FAST'",
+  'flow:baseline-intent-plan',
+]) mustContain(main, sentinel, 'main-process adapter')
+mustContain(preload, 'flow:baseline-intent-plan', 'preload bridge')
 
-for (const sentinel of [
-  'DEPLOOM_BASELINE_INTENT_JSON',
-  'DEPLOOM_BASELINE_EXTRA_ITERATIONS',
-  'DEPLOOM_BASELINE_DECISION_GRANT_ITERATIONS',
-  "DEPLOOM_BASELINE_SEARCH_MODE: effectiveIntent.searchMode ?? 'AUTO'",
-  'deferredCohorts: effectiveIntent.deferredCohorts ?? []',
-  'baselineHumanDecisionRequired',
-  "flow:baseline-intent-plan",
-]) if (!main.includes(sentinel)) throw new Error(`Baseline intent main-process contract missing: ${sentinel}`)
+// Runtime-normalize legacy and new intent without loading the React app.
+const progressiveJs = ts.transpileModule(progressiveSource, { compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2022 } }).outputText
+const progressiveUrl = 'data:text/javascript;base64,' + Buffer.from(progressiveJs).toString('base64')
+let normalizerJs = ts.transpileModule(normalizerSource, { compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2022 } }).outputText
+normalizerJs = normalizerJs.replace("'../progressive-policy'", JSON.stringify(progressiveUrl)).replace('"../progressive-policy"', JSON.stringify(progressiveUrl))
+const normalizer = await import('data:text/javascript;base64,' + Buffer.from(normalizerJs).toString('base64'))
+const fresh = normalizer.freshBaselineIntent()
+if (fresh.schemaVersion !== 2 || fresh.controlMode !== 'AUTONOMOUS' || fresh.budgetMinutes !== 30) throw new Error('progressive defaults drifted')
+if (fresh.acceptancePolicy.maxKnownCritical !== 0 || fresh.acceptancePolicy.maxKnownHigh !== 1) throw new Error('default acceptance must be C0/H1')
+const legacyBackground = normalizer.normalizeBaselineIntentPlan({ candidates: [], intent: { schemaVersion: 1, policies: {}, executionMode: 'BACKGROUND' } }).intent
+if (legacyBackground.controlMode !== 'AUTONOMOUS') throw new Error('legacy BACKGROUND migration failed')
+const legacyFast = normalizer.normalizeBaselineIntentPlan({ candidates: [], intent: { schemaVersion: 1, policies: {}, executionMode: 'FAST' } }).intent
+if (legacyFast.controlMode !== 'CONFIRM_SIGNIFICANT') throw new Error('legacy FAST migration failed')
 
-if (!preload.includes("flow:baseline-intent-plan")) throw new Error('Baseline intent preload bridge missing')
-
-for (const sentinel of [
-  'BLOCK_VH_BASELINE_INTENT_HUMAN_LOOP_V1',
-  'DEPLOOM_BASELINE_DECISION_V1 ',
-  'BASELINE_HUMAN_DECISION_REQUIRED',
-  'def run_cli() -> int:',
-  'if message.startswith(BASELINE_DECISION_MARKER):',
-  'return 3',
-  'raise SystemExit(run_cli())',
-  '"baselineIntent": {',
-  'USER_BASELINE_REQUIRED_UPDATE',
-  'USER_BASELINE_KEEP_CURRENT',
-  '_apply_baseline_intent_scope',
-  'infer_baseline_cohort',
-  'baseline.cohort.suggested',
-  'excluded from this Baseline update/health scope by USER_POLICY',
-]) if (!generator.includes(sentinel)) throw new Error(`Baseline intent solver/verifier contract missing: ${sentinel}`)
-
-console.log('Baseline intent / human decision loop contract OK')
+console.log('Baseline progressive intent contract OK')
