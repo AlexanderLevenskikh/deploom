@@ -13,7 +13,8 @@ const mainSource = await readFile(new URL("../electron/main.ts", import.meta.url
 if (!mainSource.includes("stallWarningMs: 2 * 60_000") || !mainSource.includes("stallAbortMs: 15 * 60_000")) throw new Error("Baseline/generate commands must expose silence watchdog thresholds");
 if (!mainSource.includes("HARD_STALL") || !mainSource.includes("метка возможного зависания")) throw new Error("Long deterministic jobs must surface visible stall markers");
 if (!mainSource.includes("deterministicWatchdogFailure") || !mainSource.includes("полный Baseline автоматически повторно не запускаю")) throw new Error("A watchdog stop must not trigger three identical full Baseline retries");
-if (!appSource.includes("for (const branch of details.migrationProgress?.branches ?? []) sessionBranches.add(branch.branch)")) throw new Error("Every planned migration group must appear before its first log/session");
+if (appSource.includes("<MonitoringPanel")) throw new Error("Default App must not mount the technical MonitoringPanel");
+if (!mainSource.includes("BLOCK_HUMAN_FLOW_ARTIFACT_LOG_V1")) throw new Error("Raw job output must be persisted to run artifacts after removing the default monitor");
 const failedGroupI18nContract = [
   [flowSource, "migration-error-indicator"],
   [flowSource, "t('flow.runtime.failed')"],

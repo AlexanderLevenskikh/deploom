@@ -33,6 +33,9 @@ export const DEFAULT_ACCEPTANCE_POLICY: AcceptancePolicy = Object.freeze({
   maxKnownHigh: 1,
 })
 
+export const MAX_ACCEPTANCE_AUDIT_AGE_MS = 24 * 60 * 60 * 1000
+export const MAX_ACCEPTANCE_AUDIT_FUTURE_SKEW_MS = 5 * 60 * 1000
+
 function boundedCount(value: unknown, fallback: number): number {
   const parsed = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(parsed)) return fallback
@@ -41,7 +44,7 @@ function boundedCount(value: unknown, fallback: number): number {
 
 export function normalizeAcceptancePolicy(value: Partial<AcceptancePolicy> | undefined): AcceptancePolicy {
   return {
-    maxKnownCritical: boundedCount(value?.maxKnownCritical, DEFAULT_ACCEPTANCE_POLICY.maxKnownCritical),
+    maxKnownCritical: 0,
     maxKnownHigh: boundedCount(value?.maxKnownHigh, DEFAULT_ACCEPTANCE_POLICY.maxKnownHigh),
   }
 }
@@ -49,6 +52,7 @@ export function normalizeAcceptancePolicy(value: Partial<AcceptancePolicy> | und
 export function assessAcceptance(
   evidence: AcceptanceAuditEvidence | undefined,
   policyValue?: Partial<AcceptancePolicy>,
+  nowMs = Date.now(),
 ): AcceptanceVerdict {
   const policy = normalizeAcceptancePolicy(policyValue)
   const critical = typeof evidence?.critical === 'number' && Number.isFinite(evidence.critical) ? Math.max(0, Math.trunc(evidence.critical)) : undefined
@@ -57,6 +61,8 @@ export function assessAcceptance(
   const currentInputHash = String(evidence?.currentDependencyInputHash ?? '').trim()
   const hashBound = Boolean(inputHash && currentInputHash)
   const dependencyEvidenceFresh = hashBound && inputHash === currentInputHash
+  const generatedAt = String(evidence?.generatedAt ?? '').trim()
+  const generatedAtMs = generatedAt ? Date.parse(generatedAt) : Number.NaN
   const reasons: string[] = []
 
   if (!evidence?.auditComplete) reasons.push('vulnerability audit is incomplete')
@@ -64,6 +70,10 @@ export function assessAcceptance(
   if (critical === undefined || high === undefined) reasons.push('vulnerability package totals are unknown')
   if (!hashBound) reasons.push('audit is not bound to the current dependency inputs')
   else if (!dependencyEvidenceFresh) reasons.push('dependency inputs changed after the audit')
+  if (!generatedAt) reasons.push('audit generatedAt is missing')
+  else if (!Number.isFinite(generatedAtMs)) reasons.push('audit generatedAt is invalid')
+  else if (generatedAtMs > nowMs + MAX_ACCEPTANCE_AUDIT_FUTURE_SKEW_MS) reasons.push('audit timestamp is too far in the future')
+  else if (nowMs - generatedAtMs > MAX_ACCEPTANCE_AUDIT_AGE_MS) reasons.push('vulnerability audit evidence is older than 24 hours')
 
   if (reasons.length) {
     return {

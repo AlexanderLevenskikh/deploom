@@ -29,7 +29,7 @@ const report = (critical, high, overrides = {}) => {
   auditComplete: true,
   dependencyInputHash: identity.hash,
   dependencyInputFiles: identity.files,
-  generatedAt: '2026-09-09T00:00:00Z',
+  generatedAt: new Date(Date.now() - 60_000).toISOString(),
   audit: {
     complete: true,
     engine: 'yarn-inventory',
@@ -49,8 +49,13 @@ const report = (critical, high, overrides = {}) => {
 const accepted = acceptanceVerdictFromManualAudit(report(0, 1), identity.hash)
 if (!accepted.accepted || accepted.status !== 'ACCEPTED' || accepted.highPackages[0] !== 'highdep') throw new Error('default C0/H1 must accept')
 if (acceptanceVerdictFromManualAudit(report(1, 0), identity.hash).status !== 'REMEDIATION_REQUIRED') throw new Error('Critical must block')
+if (acceptanceVerdictFromManualAudit(report(1, 0), identity.hash, { maxKnownCritical: 99, maxKnownHigh: 99 }).accepted) throw new Error('Critical=0 is a backend invariant and cannot be relaxed')
 if (acceptanceVerdictFromManualAudit(report(0, 2), identity.hash).status !== 'REMEDIATION_REQUIRED') throw new Error('H2 must block default policy')
 if (acceptanceVerdictFromManualAudit(report(0, 1), identity.hash, { maxKnownCritical: 0, maxKnownHigh: 0 }).accepted) throw new Error('stricter H0 policy must block H1')
+const oldAudit = report(0, 0, { generatedAt: '2020-01-01T00:00:00Z' })
+if (acceptanceVerdictFromManualAudit(oldAudit, identity.hash).status !== 'UNKNOWN') throw new Error('stale vulnerability evidence must fail closed')
+const futureAudit = report(0, 0, { generatedAt: new Date(Date.now() + 10 * 60_000).toISOString() })
+if (acceptanceVerdictFromManualAudit(futureAudit, identity.hash).status !== 'UNKNOWN') throw new Error('future-dated vulnerability evidence beyond clock skew must fail closed')
 
 const approximateBridge = report(0, 0, { audit: { engine: 'npm-lock-bridge', trusted: true, accuracy: 'npm-resolved-approximation', bridgeReconciliation: { faithful: false } } })
 if (acceptanceVerdictFromManualAudit(approximateBridge, identity.hash).status !== 'UNKNOWN') throw new Error('approximate npm bridge must not become release authority')

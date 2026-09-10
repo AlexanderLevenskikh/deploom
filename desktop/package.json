@@ -60,7 +60,8 @@
     "check:dependency-graph": "node scripts/check-dependency-graph.mjs",
     "check:ui-lifecycle": "node scripts/check-ui-lifecycle.mjs",
     "check:acceptance-policy": "node scripts/check-acceptance-policy.mjs",
-    "check:progressive-contract": "node scripts/check-progressive-contract.mjs"
+    "check:progressive-contract": "node scripts/check-progressive-contract.mjs",
+    "check:human-flow": "node scripts/check-human-flow.mjs"
   },
   "dependencies": {
     "electron-updater": "^6.8.9",

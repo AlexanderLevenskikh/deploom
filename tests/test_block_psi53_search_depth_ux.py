@@ -40,9 +40,20 @@ class Psi53ProgressiveControlUxTests(unittest.TestCase):
         self.assertIn("Запустить Baseline", self.dialog)
         self.assertNotIn("Запустить исчерпывающий Baseline", self.dialog)
 
-    def test_v2_settings_participate_in_dirty_state(self) -> None:
-        for sentinel in ("controlMode !== normalizedControlMode(plan.intent)", "budgetMinutes !== boundedInteger", "maxKnownCritical !== boundedInteger", "maxKnownHigh !== boundedInteger", "searchDepth !== normalizedSearchMode"):
+    def test_v2_mutable_settings_participate_in_dirty_state_and_critical_is_fixed(self) -> None:
+        for sentinel in (
+            "controlMode !== normalizedControlMode(plan.intent)",
+            "budgetMinutes !== boundedInteger",
+            "maxKnownHigh !== boundedInteger",
+            "searchDepth !== normalizedSearchMode",
+            "cohortFingerprint(deferredCohorts)",
+        ):
             self.assertIn(sentinel, self.dialog)
+        # Critical=0 is a backend/product invariant, not mutable dialog state.
+        self.assertNotIn("maxKnownCritical !== boundedInteger", self.dialog)
+        self.assertNotIn("setMaxKnownCritical", self.dialog)
+        self.assertNotIn("value={maxKnownCritical}", self.dialog)
+        self.assertIn("maxKnownCritical: 0", self.dialog)
         self.assertIn("schemaVersion: 2", self.dialog)
 
     def test_controls_keep_existing_layout_contract(self) -> None:

@@ -146,21 +146,25 @@ class BaselineAnytimeState:
         return False
 
     def automatic_continuation_reason(self, *, base_iteration_limit_hit: bool = False) -> Optional[ContinuationReason]:
+        # BLOCK_ACCEPTANCE_POLICY_CLOSURE_V1
+        # EXHAUSTIVE authorizes deeper search, not unlimited wall-clock/cost.
+        # Hard user budget always wins; only heuristic stagnation/base-limit
+        # stops are bypassed by explicit exhaustive search.
+        if self.elapsed_seconds >= self.policy.wall_clock_seconds:
+            return ContinuationReason.AUTOMATIC_BUDGET_EXHAUSTED
+        if self.expensive_attempts >= self.policy.max_expensive_attempts:
+            return ContinuationReason.AUTOMATIC_BUDGET_EXHAUSTED
+        cost = self.candidate_duration_ewma_seconds
+        if cost and self.elapsed_seconds + cost > self.policy.wall_clock_seconds:
+            return ContinuationReason.AUTOMATIC_BUDGET_EXHAUSTED
         if self.exhaustive_authorized:
             return None
         if self.stagnating:
             return ContinuationReason.STAGNATION
         if base_iteration_limit_hit:
             return ContinuationReason.BASE_ITERATION_LIMIT
-        if self.elapsed_seconds >= self.policy.wall_clock_seconds:
-            return ContinuationReason.AUTOMATIC_BUDGET_EXHAUSTED
-        if self.expensive_attempts >= self.policy.max_expensive_attempts:
-            return ContinuationReason.AUTOMATIC_BUDGET_EXHAUSTED
         if self.consecutive_without_improvement >= self.policy.max_attempts_without_improvement:
             return ContinuationReason.STAGNATION
-        cost = self.candidate_duration_ewma_seconds
-        if cost and self.elapsed_seconds + cost > self.policy.wall_clock_seconds:
-            return ContinuationReason.AUTOMATIC_BUDGET_EXHAUSTED
         return None
 
     def update_incumbent(self, candidate: BestVerifiedIncumbent) -> bool:

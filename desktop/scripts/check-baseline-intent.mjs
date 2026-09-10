@@ -21,7 +21,7 @@ for (const sentinel of [
   "controlMode === 'AUTONOMOUS'",
   "controlMode === 'CONFIRM_SIGNIFICANT'",
   "text('Acceptance policy', 'Acceptance policy')",
-  'maxKnownCritical', 'maxKnownHigh', 'budgetMinutes', 'schemaVersion: 2',
+  'maxKnownCritical: 0', 'maxKnownHigh', 'budgetMinutes', 'schemaVersion: 2',
 ]) mustContain(dialog, sentinel, 'progressive Baseline UI')
 mustNotContain(dialog, 'setExecutionMode', 'legacy execution mode must not drive UI')
 mustNotContain(dialog, 'schemaVersion: 1,', 'dialog must emit v2')
@@ -50,5 +50,7 @@ const legacyBackground = normalizer.normalizeBaselineIntentPlan({ candidates: []
 if (legacyBackground.controlMode !== 'AUTONOMOUS') throw new Error('legacy BACKGROUND migration failed')
 const legacyFast = normalizer.normalizeBaselineIntentPlan({ candidates: [], intent: { schemaVersion: 1, policies: {}, executionMode: 'FAST' } }).intent
 if (legacyFast.controlMode !== 'CONFIRM_SIGNIFICANT') throw new Error('legacy FAST migration failed')
+const missingLegacyMode = normalizer.normalizeBaselineIntentPlan({ candidates: [], intent: { schemaVersion: 2, policies: {} } }).intent
+if (missingLegacyMode.controlMode !== 'AUTONOMOUS') throw new Error('missing intent mode must default to AUTONOMOUS')
 
 console.log('Baseline progressive intent contract OK')

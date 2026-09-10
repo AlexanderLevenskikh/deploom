@@ -6,7 +6,6 @@ import { WorkspaceDialog } from './components/WorkspaceDialog'
 import { DashboardWorkspace } from './components/DashboardWorkspace'
 import { DependencyGraphWorkspace } from './components/DependencyGraphWorkspace'
 import { FlowWorkspace } from './components/FlowWorkspace'
-import { MonitoringPanel } from './components/MonitoringPanel'
 import { ProjectRail } from './components/ProjectRail'
 import { QuickSelect } from './components/QuickSelect'
 import { SetupScreen } from './components/SetupScreen'
@@ -24,7 +23,6 @@ function App() {
   const [showWorkspaceDialog, setShowWorkspaceDialog] = useState(false)
   const [graphFullscreen, setGraphFullscreen] = useState(false)
   const [graphLeftHidden, setGraphLeftHidden] = useState(false)
-  const [graphRightHidden, setGraphRightHidden] = useState(false)
   const themePreference = flow.themePreference
   const payload = flow.payload
   const details = payload?.details
@@ -38,16 +36,9 @@ function App() {
   }
 
   const project = flow.selectedProject
-  const run = project ? details.teamState?.projects[project.name] : undefined
-  const sessionBranches = new Set(Object.keys(run?.agentSessions ?? {}))
-  if (run?.activeAgentBranch) sessionBranches.add(run.activeAgentBranch)
-  for (const branch of details.migrationProgress?.branches ?? []) sessionBranches.add(branch.branch)
-  const branchLabels = new Map((details.migrationProgress?.branches ?? []).map((branch) => [branch.branch, branch.label]))
-  const knownLogSources = [...sessionBranches].map((branch) => ({ kind: 'group' as const, id: branch, label: branchLabels.get(branch) || branch }))
   const openDashboard = () => setTab('dashboard')
   const graphActive = tab === 'graph'
   const graphHideLeft = graphActive && (graphFullscreen || graphLeftHidden)
-  const graphHideRight = graphActive && (graphFullscreen || graphRightHidden)
   const updateReady = flow.updateStatus.state === 'ready'
   const updateDownloading = flow.updateStatus.state === 'checking' || flow.updateStatus.state === 'available' || flow.updateStatus.state === 'downloading'
   const updateTitle = updateReady
@@ -79,7 +70,11 @@ function App() {
         </div>
       </header>
 
-      <div className={`app-grid${graphHideLeft ? ' graph-hide-project-rail' : ''}${graphHideRight ? ' graph-hide-monitor' : ''}`}>
+      {/* BLOCK_PROGRESSIVE_HUMAN_FLOW_V1 */}
+      {/* BLOCK_HUMAN_FLOW_GRAPH_MONITOR_CLEANUP_V1 */}
+      {flow.error ? <div className="human-error-toast" role="alert"><div><strong>{language === 'ru' ? 'Что-то пошло не так' : 'Something went wrong'}</strong><span>{language === 'ru' ? 'Последний проверенный результат не удалён. Подробности доступны ниже и в артефактах запуска.' : 'The last verified result is preserved. Details are available below and in the run artifacts.'}</span><details><summary>{language === 'ru' ? 'Технические детали' : 'Technical details'}</summary><pre>{flow.error}</pre></details></div><button type="button" className="icon-button" aria-label={language === 'ru' ? 'Закрыть' : 'Close'} onClick={() => flow.setError(undefined)}>×</button></div> : null}
+
+      <div className={`app-grid${graphHideLeft ? ' graph-hide-project-rail' : ''}`}>
         {!graphHideLeft ? <ProjectRail details={details} selected={project} active={flow.workspaceBusy} onRefreshAll={() => void flow.runAction({ action: 'generate-all', workspaceId: details.workspace.id, label: 'DepLoom: all projects' })} onSelectProject={(name) => void flow.selectProject(name)} onAddProject={() => setShowAddProject(true)} onAddWorkspace={() => setShowWorkspaceDialog(true)} onRemoveProject={(name) => void flow.removeProject(name).catch((error) => flow.setError(error instanceof Error ? error.message : String(error)))} /> : null}
 
         <main className="main-workspace">
@@ -88,11 +83,10 @@ function App() {
             <div className="tab-switch" role="tablist"><button role="tab" aria-selected={tab === 'flow'} className={tab === 'flow' ? 'active' : ''} onClick={() => setTab('flow')}>FLOW</button><button role="tab" aria-selected={tab === 'graph'} className={tab === 'graph' ? 'active' : ''} onClick={() => setTab('graph')}><Network size={14} />Graph</button><button role="tab" aria-selected={tab === 'dashboard'} className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button></div>
           </div>
           {tab === 'flow' && project ? <FlowWorkspace details={details} project={project} activeAction={flow.activeWorkspaceId === details.workspace.id && flow.activeProjectName === project.name ? flow.activeAction : undefined} autopilotActive={flow.autopilotActive && flow.autopilotProjectName === project.name} baselineDecision={flow.baselineDecision} onClearBaselineDecision={flow.clearBaselineDecision} onGetBaselineIntentPlan={flow.getBaselineIntentPlan} onRun={flow.runAction} onSendAgentNote={flow.sendAgentNote} onStartAutopilot={flow.startAutopilot} onStopAutopilot={flow.stopAutopilot} onRecoverWithAgent={flow.recoverWithAgent} onOpenDashboard={openDashboard} onOpenPath={flow.openPath} onChoosePrompt={flow.choosePrompt} onUpdateWorkspace={flow.updateWorkspace} onUpdateProjectBranches={flow.updateProjectBranches} onListAgentModels={flow.listAgentModels} /> : null}
-          {tab === 'graph' && project ? <DependencyGraphWorkspace details={details} project={project} baselineDecision={flow.baselineDecision} onGetSnapshot={flow.getDependencyGraphSnapshot} onOpenFlow={() => setTab('flow')} fullscreen={graphFullscreen} leftPaneHidden={graphLeftHidden} rightPaneHidden={graphRightHidden} onToggleFullscreen={() => setGraphFullscreen((value) => !value)} onToggleLeftPane={() => setGraphLeftHidden((value) => !value)} onToggleRightPane={() => setGraphRightHidden((value) => !value)} /> : null}
+          {tab === 'graph' && project ? <DependencyGraphWorkspace details={details} project={project} baselineDecision={flow.baselineDecision} onGetSnapshot={flow.getDependencyGraphSnapshot} onOpenFlow={() => setTab('flow')} fullscreen={graphFullscreen} leftPaneHidden={graphLeftHidden} onToggleFullscreen={() => setGraphFullscreen((value) => !value)} onToggleLeftPane={() => setGraphLeftHidden((value) => !value)} /> : null}
           {tab === 'dashboard' ? <DashboardWorkspace details={details} onRefresh={flow.refresh} onOpenExternal={() => flow.openPath(details.dashboardPath)} /> : null}
         </main>
 
-        {!graphHideRight ? <MonitoringPanel logs={flow.logs} knownSources={knownLogSources} environment={payload.environment} active={Boolean(flow.activeJobId)} activeJobId={flow.activeJobId} activeAction={flow.activeAction} runStartedAt={flow.activeRunStartedAt} migrationProgress={details.migrationProgress} baselineRecovery={details.baselineRecovery} error={flow.error} onDismissError={() => flow.setError(undefined)} onSendAgentNote={flow.sendAgentNote} onPauseBaseline={flow.activeAction === 'baseline' ? flow.pauseJob : undefined} onCancel={() => void flow.cancelJob()} onClear={flow.clearLogs} getHardwareSnapshot={flow.getHardwareSnapshot} /> : null}
       </div>
 
       {showAddProject ? <AddProjectDialog workspaceId={details.workspace.id} onClose={() => setShowAddProject(false)} onPickDirectory={flow.pickDirectory} onSubmit={flow.addProject} /> : null}

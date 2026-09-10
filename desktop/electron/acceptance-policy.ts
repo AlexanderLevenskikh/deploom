@@ -23,6 +23,9 @@ export type AcceptanceVerdict = {
 }
 
 export const DEFAULT_ACCEPTANCE_POLICY: AcceptancePolicy = Object.freeze({ maxKnownCritical: 0, maxKnownHigh: 1 })
+// BLOCK_ACCEPTANCE_POLICY_CLOSURE_V1
+export const MAX_ACCEPTANCE_AUDIT_AGE_MS = 24 * 60 * 60 * 1000
+export const MAX_ACCEPTANCE_AUDIT_FUTURE_SKEW_MS = 5 * 60 * 1000
 
 const DEPENDENCY_INPUT_FILES = ['package.json', 'yarn.lock', 'pnpm-lock.yaml', 'package-lock.json', 'npm-shrinkwrap.json'] as const
 
@@ -56,7 +59,9 @@ function boundedCount(value: unknown, fallback: number): number {
 export function normalizeAcceptancePolicy(value: unknown): AcceptancePolicy {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   return {
-    maxKnownCritical: boundedCount(raw.maxKnownCritical, DEFAULT_ACCEPTANCE_POLICY.maxKnownCritical),
+    // Critical is a product safety invariant, not a user-tunable tolerance.
+    // Persisted legacy values are intentionally ignored.
+    maxKnownCritical: 0,
     maxKnownHigh: boundedCount(raw.maxKnownHigh, DEFAULT_ACCEPTANCE_POLICY.maxKnownHigh),
   }
 }
@@ -77,6 +82,7 @@ export function acceptanceVerdictFromManualAudit(
   value: unknown,
   currentDependencyInputHash: string,
   policyValue?: unknown,
+  nowMs = Date.now(),
 ): AcceptanceVerdict {
   const policy = normalizeAcceptancePolicy(policyValue)
   const report = value && typeof value === 'object' ? value as Record<string, unknown> : {}
@@ -103,6 +109,8 @@ export function acceptanceVerdictFromManualAudit(
   const criticalPackages = severityPackages('critical')
   const highPackages = severityPackages('high')
   const dependencyEvidenceFresh = Boolean(reportInputHash && currentDependencyInputHash && reportInputHash === currentDependencyInputHash)
+  const auditGeneratedAt = typeof report.generatedAt === 'string' ? report.generatedAt.trim() : ''
+  const auditGeneratedAtMs = auditGeneratedAt ? Date.parse(auditGeneratedAt) : Number.NaN
   const reasons: string[] = []
 
   if (!auditComplete) reasons.push('Vulnerability audit evidence is incomplete.')
@@ -110,13 +118,17 @@ export function acceptanceVerdictFromManualAudit(
   if (critical === undefined || high === undefined) reasons.push('Vulnerable-package Critical/High totals are unknown.')
   if (!reportInputHash) reasons.push('Audit report is not bound to dependencyInputHash.')
   else if (!dependencyEvidenceFresh) reasons.push('package.json/lockfile inputs changed after the audit.')
+  if (!auditGeneratedAt) reasons.push('Audit report generatedAt is missing.')
+  else if (!Number.isFinite(auditGeneratedAtMs)) reasons.push('Audit report generatedAt is invalid.')
+  else if (auditGeneratedAtMs > nowMs + MAX_ACCEPTANCE_AUDIT_FUTURE_SKEW_MS) reasons.push('Audit report timestamp is too far in the future.')
+  else if (nowMs - auditGeneratedAtMs > MAX_ACCEPTANCE_AUDIT_AGE_MS) reasons.push('Vulnerability audit evidence is older than 24 hours.')
 
   if (reasons.length) {
     return {
       status: 'UNKNOWN', accepted: false, evidenceComplete: false, dependencyEvidenceFresh,
       ...(critical !== undefined ? { critical } : {}), ...(high !== undefined ? { high } : {}),
       criticalPackages, highPackages,
-      ...(typeof report.generatedAt === 'string' ? { auditGeneratedAt: report.generatedAt } : {}),
+      ...(auditGeneratedAt ? { auditGeneratedAt } : {}),
       ...(typeof audit.engine === 'string' ? { auditEngine: audit.engine } : {}),
       reasons, policy,
     }
@@ -133,7 +145,7 @@ export function acceptanceVerdictFromManualAudit(
     high,
     criticalPackages,
     highPackages,
-    ...(typeof report.generatedAt === 'string' ? { auditGeneratedAt: report.generatedAt } : {}),
+    ...(auditGeneratedAt ? { auditGeneratedAt } : {}),
     ...(typeof audit.engine === 'string' ? { auditEngine: audit.engine } : {}),
     reasons: reasons.length ? reasons : ['Complete fresh vulnerability evidence satisfies the configured acceptance policy.'],
     policy,

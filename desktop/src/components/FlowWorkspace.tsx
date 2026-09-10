@@ -284,8 +284,77 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
     }
   }
 
+
+  // BLOCK_PROGRESSIVE_HUMAN_FLOW_V1
+  const humanVerifiedUpdates = details.migrationProgress?.completedDependencies
+    ?? baselineDecision?.bestIncumbent?.changed_dependency_count
+    ?? 0
+  const humanActiveUpdates = details.migrationProgress
+    ? details.migrationProgress.activeDependencies
+    : undefined
+  const humanDeferredUpdates = baselineDecision?.bestIncumbent?.deferred_targets?.length
+  const humanRemainingUpdates = details.migrationProgress?.unmetPackages.length
+  const humanFreshness = typeof currentLevel?.lagOkPct === 'number' ? `${currentLevel.lagOkPct.toFixed(1)}%` : '—'
+  const humanStatusTitle = flowComplete
+    ? text('Полезный результат готов', 'Useful result is ready')
+    : activeAction === 'baseline'
+      ? text('Ищем первый проверенный результат', 'Finding the first verified result')
+      : active
+        ? text('DepLoom продолжает работу', 'DepLoom is working')
+        : baselineDecision?.bestIncumbent
+          ? text('Проверенный результат сохранён', 'Verified result is saved')
+          : acceptanceNeedsRemediation
+            ? text('Улучшаем безопасность', 'Improving security')
+            : acceptanceUnknown && completed.has('audit')
+              ? text('Нужен свежий аудит', 'A fresh audit is required')
+              : text('Готовы к следующему шагу', 'Ready for the next step')
+  const humanStatusBody = flowComplete
+    ? text('Все обязательные проверки пройдены. Можно остановиться здесь или позже вернуться к оставшимся обновлениям.', 'All required checks passed. You can stop here or return to the remaining upgrades later.')
+    : activeAction === 'baseline'
+      ? text('Пробуем полезные наборы обновлений и физически проверяем проект. Неудачная следующая попытка не должна уничтожать последний доказанный результат.', 'Trying useful upgrade sets and physically verifying the project. A failed next attempt must not destroy the last proven result.')
+      : baselineDecision?.bestIncumbent
+        ? text('Последняя рабочая версия сохранена. Можно продолжать искать улучшение без потери уже проверенного результата.', 'The last working result is preserved. Search can continue without losing what is already verified.')
+        : acceptanceNeedsRemediation
+          ? text('Текущий результат ещё нельзя принять из-за security policy. DepLoom сосредоточится на минимальном необходимом исправлении.', 'The current result cannot be accepted yet because of security policy. DepLoom will focus on the smallest required remediation.')
+          : acceptanceUnknown && completed.has('audit')
+            ? text('Данные безопасности неполные или устарели. Нужен новый независимый аудит перед принятием результата.', 'Security evidence is incomplete or stale. A fresh independent audit is required before accepting the result.')
+            : text('DepLoom покажет здесь только полезное состояние работы. Подробные стадии и диагностика спрятаны ниже.', 'DepLoom shows only useful work state here. Detailed stages and diagnostics are kept below.')
+  const humanPrimaryStage = FLOW_STAGES[activeIndex]
+  const artifactsPath = `${details.workspace.path}/.dependency-roadmap/artifacts/runs`
+
   return (
     <section className="flow-workspace">
+
+      <section className="human-flow-card" aria-label={text('Состояние обновления зависимостей', 'Dependency upgrade status')}>
+        <div className="human-flow-hero">
+          <span className={`human-flow-icon ${flowComplete || baselineDecision?.bestIncumbent ? 'success' : active ? 'active' : acceptanceNeedsRemediation ? 'warning' : ''}`}>
+            {active ? <LoaderCircle className="spin" size={22} /> : <ShieldCheck size={22} />}
+          </span>
+          <div><h2>{humanStatusTitle}</h2><p>{humanStatusBody}</p></div>
+        </div>
+        <div className="human-flow-metrics">
+          <div><span>{text('Проверено', 'Verified')}</span><strong>{humanVerifiedUpdates}</strong><small>{text('обновлений', 'updates')}</small></div>
+          <div><span>{text('Сейчас пробуем', 'Trying now')}</span><strong>{typeof humanActiveUpdates === 'number' ? humanActiveUpdates : activeAction === 'baseline' ? '…' : '—'}</strong><small>{activeAction === 'baseline' && humanActiveUpdates === undefined ? text('идёт проверка', 'verification running') : text('обновлений', 'updates')}</small></div>
+          <div><span>{text('Отложено', 'Deferred')}</span><strong>{typeof humanDeferredUpdates === 'number' ? humanDeferredUpdates : '—'}</strong><small>{typeof humanDeferredUpdates === 'number' ? text('на потом', 'for later') : text('пока нет данных', 'not known yet')}</small></div>
+          <div><span>{text('Актуальность библиотек', 'Library freshness')}</span><strong>{humanFreshness}</strong><small>{text('это метрика, не цель', 'metric, not a goal')}</small></div>
+        </div>
+        <div className={`human-flow-safety ${acceptanceAccepted ? 'success' : acceptanceNeedsRemediation ? 'warning' : ''}`}>
+          <ShieldCheck size={17} />
+          <div><strong>{acceptanceAccepted ? text('Безопасность проверена', 'Security verified') : acceptanceNeedsRemediation ? text('Нужно исправить security findings', 'Security findings need remediation') : text('Безопасность ещё проверяется', 'Security is not verified yet')}</strong>
+          <span>{typeof acceptance?.critical === 'number' || typeof acceptance?.high === 'number' ? `Critical ${acceptance?.critical ?? '?'} · High ${acceptance?.high ?? '?'}` : text('Critical всегда должен быть 0. Для принятия нужен свежий полный аудит.', 'Critical must always be 0. Acceptance requires a fresh complete audit.')}</span></div>
+        </div>
+        {typeof humanRemainingUpdates === 'number' && humanRemainingUpdates > 0 ? <p className="human-flow-remaining">{text(`Осталось разобрать: ${humanRemainingUpdates}. Они не обнуляют уже проверенный результат.`, `Remaining to address: ${humanRemainingUpdates}. They do not invalidate the already verified result.`)}</p> : null}
+        <div className="human-flow-actions">
+          {!flowComplete && !active && humanPrimaryStage.action ? <button className="button primary" disabled={humanPrimaryStage.action === 'release' && !acceptanceAccepted} onClick={() => void execute(activeIndex, undefined, undefined, humanPrimaryStage.action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}><Play size={16} />{humanPrimaryStage.action === 'baseline' && details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Продолжить работу', 'Continue')}</button> : null}
+          {flowComplete && acceptanceAccepted ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} />{text('Продолжить улучшение', 'Continue improving')}</button> : null}
+          <button className="button secondary" disabled={!run && !activeAction} onClick={() => void onOpenPath(artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
+        </div>
+      </section>
+
+      <details className="flow-technical-details">
+        <summary>{text('Технические детали', 'Technical details')}</summary>
+        <div className="flow-technical-details-body">
+          <p className="flow-artifact-note">{text('Подробные stdout/stderr и служебные события автоматически сохраняются в .dependency-roadmap/artifacts/runs. Эти данные нужны для диагностики и не определяют результат.', 'Detailed stdout/stderr and service events are saved automatically under .dependency-roadmap/artifacts/runs. They are diagnostic only and do not determine the result.')}</p>
       <div className="project-facts">
         <div><span>{t('flow.projectPath')}</span><strong title={project.path}>{project.path}</strong></div>
         <div><span>{text('Acceptance', 'Acceptance')}</span><strong className="level-label" title={acceptance?.reasons.join(' · ')}><i className={`status-dot ${acceptanceTone}`} />{acceptanceLabel}{typeof acceptance?.critical === 'number' && typeof acceptance?.high === 'number' ? ` · C${acceptance.critical}/H${acceptance.high}` : ''}</strong></div>
@@ -406,6 +475,8 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
           </>}
         </div>
       </div>
+        </div>
+      </details>
       {selectedBranchFailure?.runtime?.phase === 'failed' ? <BranchFailureModal branch={selectedBranchFailure} onClose={() => setSelectedBranchFailure(null)} /> : null}
       {baselineIntentDialog ? <BaselineIntentDialog mode={baselineIntentDialog.mode} plan={baselineIntentDialog.plan} decision={baselineIntentDialog.decision} onCancel={() => { setBaselineIntentDialog(undefined); if (baselineIntentDialog.mode === 'decision') setBaselineDecisionDismissed(true) }} onSubmit={runBaselineIntent} /> : null}
     </section>

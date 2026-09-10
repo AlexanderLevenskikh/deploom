@@ -18,7 +18,8 @@ const DECISION_TRANCHE = 8
 
 function normalizedControlMode(intent: BaselineIntent): BaselineControlMode {
   if (intent.controlMode === 'AUTONOMOUS' || intent.controlMode === 'CONFIRM_SIGNIFICANT') return intent.controlMode
-  return intent.executionMode === 'BACKGROUND' ? 'AUTONOMOUS' : 'CONFIRM_SIGNIFICANT'
+  if (intent.executionMode === 'FAST' || intent.executionMode === 'AUTOPILOT') return 'CONFIRM_SIGNIFICANT'
+  return 'AUTONOMOUS'
 }
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number): number {
@@ -59,7 +60,6 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
   const [policies, setPolicies] = useState<Record<string, BaselinePackagePolicy>>({ ...plan.intent.policies })
   const [controlMode, setControlMode] = useState<BaselineControlMode>(normalizedControlMode(plan.intent))
   const [budgetMinutes, setBudgetMinutes] = useState(boundedInteger(plan.intent.budgetMinutes, 30, 5, 240))
-  const [maxKnownCritical, setMaxKnownCritical] = useState(boundedInteger(plan.intent.acceptancePolicy?.maxKnownCritical, 0, 0, 99))
   const [maxKnownHigh, setMaxKnownHigh] = useState(boundedInteger(plan.intent.acceptancePolicy?.maxKnownHigh, 1, 0, 99))
   const [searchDepth, setSearchDepth] = useState<BaselineSearchMode>(normalizedSearchMode(plan.intent.searchMode))
   const [deferredCohorts, setDeferredCohorts] = useState<DeferredCohort[]>([...(plan.intent.deferredCohorts ?? [])])
@@ -70,7 +70,6 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     setPolicies({ ...plan.intent.policies })
     setControlMode(normalizedControlMode(plan.intent))
     setBudgetMinutes(boundedInteger(plan.intent.budgetMinutes, 30, 5, 240))
-    setMaxKnownCritical(boundedInteger(plan.intent.acceptancePolicy?.maxKnownCritical, 0, 0, 99))
     setMaxKnownHigh(boundedInteger(plan.intent.acceptancePolicy?.maxKnownHigh, 1, 0, 99))
     setSearchDepth(normalizedSearchMode(plan.intent.searchMode))
     setDeferredCohorts([...(plan.intent.deferredCohorts ?? [])])
@@ -94,11 +93,10 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     () => policyFingerprint(policies) !== policyFingerprint(plan.intent.policies)
       || controlMode !== normalizedControlMode(plan.intent)
       || budgetMinutes !== boundedInteger(plan.intent.budgetMinutes, 30, 5, 240)
-      || maxKnownCritical !== boundedInteger(plan.intent.acceptancePolicy?.maxKnownCritical, 0, 0, 99)
       || maxKnownHigh !== boundedInteger(plan.intent.acceptancePolicy?.maxKnownHigh, 1, 0, 99)
       || searchDepth !== normalizedSearchMode(plan.intent.searchMode)
       || cohortFingerprint(deferredCohorts) !== cohortFingerprint(plan.intent.deferredCohorts ?? []),
-    [budgetMinutes, controlMode, deferredCohorts, maxKnownCritical, maxKnownHigh, plan.intent, policies, searchDepth],
+    [budgetMinutes, controlMode, deferredCohorts, maxKnownHigh, plan.intent, policies, searchDepth],
   )
 
   const buildIntent = ({
@@ -126,7 +124,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
       controlMode: nextControlMode,
       budgetMinutes: boundedInteger(budgetMinutes, 30, 5, 240),
       acceptancePolicy: {
-        maxKnownCritical: boundedInteger(maxKnownCritical, 0, 0, 99),
+        maxKnownCritical: 0,
         maxKnownHigh: boundedInteger(maxKnownHigh, 1, 0, 99),
       },
       extraIterations: Math.max(0, Number(plan.intent.extraIterations ?? 0) + extra),
@@ -309,9 +307,9 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
             </div>
             <div className="baseline-run-control">
               <span className="baseline-run-control-label">{text('Acceptance policy', 'Acceptance policy')}</span>
-              <label>Critical ≤ <input type="number" min={0} max={99} value={maxKnownCritical} disabled={busy} onChange={(event) => setMaxKnownCritical(boundedInteger(event.target.value, 0, 0, 99))} /></label>
+              <div className="baseline-critical-fixed"><span>Critical</span><strong>0</strong><small>{text('обязательно', 'required')}</small></div>
               <label>High ≤ <input type="number" min={0} max={99} value={maxKnownHigh} disabled={busy} onChange={(event) => setMaxKnownHigh(boundedInteger(event.target.value, 1, 0, 99))} /></label>
-              <small>{text('По умолчанию C=0/H≤1. UNKNOWN audit evidence никогда не считается accepted.', 'Default is C=0/H≤1. UNKNOWN audit evidence is never accepted.')}</small>
+              <small>{text('Critical всегда должен быть 0. Допуск High можно настроить. Неполный или устаревший аудит никогда не считается безопасным.', 'Critical must always be 0. High tolerance is configurable. Incomplete or stale audit evidence is never accepted.')}</small>
             </div>
           </div>
           <details className="baseline-advanced-actions">

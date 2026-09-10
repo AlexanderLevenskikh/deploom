@@ -40,6 +40,9 @@ for (const sentinel of [
   "text('Acceptance', 'Acceptance')",
   "text('Freshness', 'Freshness')",
   "text('Результат принят', 'Result accepted')",
+  'BLOCK_PROGRESSIVE_HUMAN_FLOW_V1',
+  "text('Проверено', 'Verified')",
+  "text('Открыть артефакты', 'Open artifacts')",
   'releaseBlocked',
   "ACTION_ORDER.filter((action) => action !== 'push-workspace')",
   'acceptancePolicy: loaded.intent.acceptancePolicy ?? fresh.acceptancePolicy',
@@ -57,5 +60,6 @@ has(recovery, "'ACCEPTANCE_NOT_SATISFIED'", 'pre-release acceptance hard stop')
 has(recovery, "'ACCEPTANCE_AUTHORITY_INVALIDATED_DURING_RELEASE'", 'post-release acceptance hard stop')
 has(ci, 'npm run check:acceptance-policy', 'acceptance contract must run in CI')
 has(ci, 'npm run check:progressive-contract', 'progressive contract must run in CI')
+has(ci, 'npm run check:human-flow', 'human-flow contract must run in CI')
 
 console.log('Progressive acceptance source contract OK')

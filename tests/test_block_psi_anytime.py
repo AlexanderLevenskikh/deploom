@@ -99,6 +99,27 @@ class BlockPsiAnytimeTests(unittest.TestCase):
         clock.now = 50
         self.assertEqual(ContinuationReason.AUTOMATIC_BUDGET_EXHAUSTED, state.automatic_continuation_reason())
 
+    def test_exhaustive_never_bypasses_hard_wall_clock_or_attempt_budget(self) -> None:
+        clock = FakeClock()
+        state = BaselineAnytimeState(
+            policy=AutomaticBudgetPolicy(wall_clock_seconds=300, max_expensive_attempts=2),
+            search_mode=BaselineSearchMode.EXHAUSTIVE,
+            clock=clock,
+        )
+        self.assertTrue(state.exhaustive_authorized)
+        clock.now = 301
+        self.assertEqual(ContinuationReason.AUTOMATIC_BUDGET_EXHAUSTED, state.automatic_continuation_reason())
+
+        clock2 = FakeClock()
+        attempts = BaselineAnytimeState(
+            policy=AutomaticBudgetPolicy(wall_clock_seconds=3600, max_expensive_attempts=2),
+            search_mode=BaselineSearchMode.EXHAUSTIVE,
+            clock=clock2,
+        )
+        attempts.observe_candidate(duration_seconds=10, passed=False, predicate="a")
+        attempts.observe_candidate(duration_seconds=10, passed=False, predicate="b")
+        self.assertEqual(ContinuationReason.AUTOMATIC_BUDGET_EXHAUSTED, attempts.automatic_continuation_reason())
+
     def test_continuation_payload_has_required_actions_and_cost(self) -> None:
         state = BaselineAnytimeState()
         state.observe_candidate(duration_seconds=1900, passed=False, predicate="x", learned_constraints=0)

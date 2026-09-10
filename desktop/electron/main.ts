@@ -349,7 +349,7 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
   }
   const controlMode: BaselineControlMode = raw.controlMode === 'AUTONOMOUS' || raw.controlMode === 'CONFIRM_SIGNIFICANT'
     ? raw.controlMode
-    : raw.executionMode === 'BACKGROUND' ? 'AUTONOMOUS' : 'CONFIRM_SIGNIFICANT'
+    : raw.executionMode === 'FAST' || raw.executionMode === 'AUTOPILOT' ? 'CONFIRM_SIGNIFICANT' : 'AUTONOMOUS'
   const budgetParsed = Number(raw.budgetMinutes ?? 30)
   const budgetMinutes = Number.isFinite(budgetParsed) ? Math.max(5, Math.min(240, Math.round(budgetParsed))) : 30
   return {
@@ -1761,6 +1761,75 @@ function jobById(jobId: string): JobRecord | undefined {
   return undefined
 }
 
+
+// BLOCK_HUMAN_FLOW_ARTIFACT_LOG_V1
+// Renderer output is intentionally not the durable diagnostic record anymore.
+// Batch small writes to avoid recreating the NTFS pressure that previous
+// DepLoom runs could produce with per-line synchronous logging.
+type ArtifactLogBuffer = { path: string; chunks: string[]; bufferedChars: number; timer?: ReturnType<typeof setTimeout>; metaWritten: boolean }
+const artifactLogBuffers = new Map<string, ArtifactLogBuffer>()
+const ARTIFACT_LOG_FLUSH_MS = 250
+const ARTIFACT_LOG_MAX_BUFFER_CHARS = 64 * 1024
+
+function artifactSafeSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 120) || 'run'
+}
+
+function flushArtifactJobLog(jobId: string): void {
+  const entry = artifactLogBuffers.get(jobId)
+  if (!entry || !entry.chunks.length) return
+  const chunk = entry.chunks.join('')
+  entry.chunks.length = 0
+  entry.bufferedChars = 0
+  if (entry.timer) { clearTimeout(entry.timer); entry.timer = undefined }
+  try {
+    writeFileSync(entry.path, chunk, { encoding: 'utf8', flag: 'a' })
+  } catch (error) {
+    // Logging is diagnostic-only and must never change FLOW/proof authority.
+    console.warn(`DepLoom artifact log write failed for ${jobId}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+function bufferArtifactJobOutput(payload: Record<string, unknown>): void {
+  const jobId = typeof payload.jobId === 'string' ? payload.jobId : ''
+  if (!jobId) return
+  const job = jobById(jobId)
+  if (!job) return
+  let entry = artifactLogBuffers.get(jobId)
+  if (!entry) {
+    const dir = join(job.workspace.path, '.dependency-roadmap', 'artifacts', 'runs', artifactSafeSegment(jobId))
+    try { mkdirSync(dir, { recursive: true }) } catch { return }
+    entry = { path: join(dir, 'activity.log'), chunks: [], bufferedChars: 0, metaWritten: false }
+    artifactLogBuffers.set(jobId, entry)
+  }
+  if (!entry.metaWritten) {
+    try {
+      writeFileSync(join(dirname(entry.path), 'run.json'), JSON.stringify({
+        schemaVersion: 1,
+        jobId,
+        action: job.action,
+        workspaceId: job.workspace.id,
+        projectName: job.projectName,
+        startedAt: new Date().toISOString(),
+      }, null, 2) + '\n', 'utf8')
+      entry.metaWritten = true
+    } catch { /* diagnostic-only */ }
+  }
+  const stream = typeof payload.stream === 'string' ? payload.stream : 'system'
+  const line = typeof payload.line === 'string' ? payload.line : String(payload.line ?? '')
+  const source = payload.source && typeof payload.source === 'object'
+    ? String((payload.source as Record<string, unknown>).label ?? (payload.source as Record<string, unknown>).id ?? '').trim()
+    : ''
+  const chunk = `[${new Date().toISOString()}] [${stream}]${source ? ` [${source}]` : ''} ${line.replace(/\r?\n$/, '')}\n`
+  entry.chunks.push(chunk)
+  entry.bufferedChars += chunk.length
+  if (entry.bufferedChars >= ARTIFACT_LOG_MAX_BUFFER_CHARS) {
+    flushArtifactJobLog(jobId)
+  } else if (!entry.timer) {
+    entry.timer = setTimeout(() => flushArtifactJobLog(jobId), ARTIFACT_LOG_FLUSH_MS)
+  }
+}
+
 function send(channel: string, payload: unknown): void {
   let outgoing = payload
   if (payload && typeof payload === 'object') {
@@ -1777,6 +1846,14 @@ function send(channel: string, payload: unknown): void {
         outgoing = enriched
       }
     }
+  }
+  if (channel === 'flow:job-output' && outgoing && typeof outgoing === 'object') bufferArtifactJobOutput(outgoing as Record<string, unknown>)
+  if (channel === 'flow:job-finished' && payload && typeof payload === 'object' && typeof (payload as Record<string, unknown>).jobId === 'string') {
+    const finishedJobId = String((payload as Record<string, unknown>).jobId)
+    flushArtifactJobLog(finishedJobId)
+    const entry = artifactLogBuffers.get(finishedJobId)
+    if (entry?.timer) clearTimeout(entry.timer)
+    artifactLogBuffers.delete(finishedJobId)
   }
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, outgoing)
 }

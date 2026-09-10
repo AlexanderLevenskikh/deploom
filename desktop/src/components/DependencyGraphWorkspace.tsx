@@ -12,8 +12,6 @@ import {
   Network,
   PanelLeftClose,
   PanelLeftOpen,
-  PanelRightClose,
-  PanelRightOpen,
   Plus,
   RefreshCw,
   Search,
@@ -117,10 +115,8 @@ export function DependencyGraphWorkspace({
   onOpenFlow,
   fullscreen,
   leftPaneHidden,
-  rightPaneHidden,
   onToggleFullscreen,
   onToggleLeftPane,
-  onToggleRightPane,
 }: {
   details: WorkspaceDetails
   project: ProjectSpec
@@ -129,10 +125,8 @@ export function DependencyGraphWorkspace({
   onOpenFlow: () => void
   fullscreen: boolean
   leftPaneHidden: boolean
-  rightPaneHidden: boolean
   onToggleFullscreen: () => void
   onToggleLeftPane: () => void
-  onToggleRightPane: () => void
 }) {
   const { language } = useLanguage()
   const ru = language === 'ru'
@@ -305,7 +299,6 @@ export function DependencyGraphWorkspace({
         <button className={`graph-tool-button${focusActive ? ' active' : ''}`} disabled={!activeGroup} onClick={() => setFocusActive((value) => !value)}><Focus size={14} /> {text('Фокус', 'Focus')}</button>
         <span className="graph-toolbar-spacer" />
         <button className="graph-icon-button" disabled={fullscreen} title={text(leftPaneHidden ? 'Показать список проектов' : 'Скрыть список проектов', leftPaneHidden ? 'Show project rail' : 'Hide project rail')} onClick={onToggleLeftPane}>{leftPaneHidden ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}</button>
-        <button className="graph-icon-button" disabled={fullscreen} title={text(rightPaneHidden ? 'Показать мониторинг' : 'Скрыть мониторинг', rightPaneHidden ? 'Show monitoring' : 'Hide monitoring')} onClick={onToggleRightPane}>{rightPaneHidden ? <PanelRightOpen size={15} /> : <PanelRightClose size={15} />}</button>
         <button className={`graph-icon-button${fullscreen ? ' active' : ''}`} title={text(fullscreen ? 'Выйти из полноэкранного графа (Esc)' : 'Развернуть граф на всё окно', fullscreen ? 'Exit Graph fullscreen (Esc)' : 'Use the whole window for Graph')} onClick={onToggleFullscreen}>{fullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button>
         <button className="graph-icon-button" title={text('Уменьшить', 'Zoom out')} onClick={() => setZoom((value) => Math.max(0.55, Number((value - 0.1).toFixed(2))))}><Minus size={15} /></button>
         <span className="graph-zoom">{Math.round(zoom * 100)}%</span>

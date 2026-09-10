@@ -43,10 +43,10 @@ export function parseBaselineDecision(message: string | undefined): BaselineDeci
 
 export function normalizeBaselineIntentPlan(plan: BaselineIntentPlan): BaselineIntentPlan {
   const raw = plan.intent ?? freshBaselineIntent()
-  const legacyAutonomous = raw.executionMode === 'BACKGROUND'
+  const legacyConfirm = raw.executionMode === 'FAST' || raw.executionMode === 'AUTOPILOT'
   const controlMode = raw.controlMode === 'AUTONOMOUS' || raw.controlMode === 'CONFIRM_SIGNIFICANT'
     ? raw.controlMode
-    : legacyAutonomous ? 'AUTONOMOUS' : 'CONFIRM_SIGNIFICANT'
+    : legacyConfirm ? 'CONFIRM_SIGNIFICANT' : 'AUTONOMOUS'
   return {
     candidates: [...plan.candidates].sort((a, b) => a.name.localeCompare(b.name)),
     intent: {

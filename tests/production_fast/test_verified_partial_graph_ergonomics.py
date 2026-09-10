@@ -39,17 +39,26 @@ class VerifiedPartialGraphErgonomicsContracts(unittest.TestCase):
         ):
             self.assertIn(required, dialog)
 
-    def test_graph_can_take_over_window_or_hide_side_panes(self) -> None:
+    def test_graph_can_take_over_window_or_hide_project_rail(self) -> None:
         root = Path(__file__).resolve().parents[2]
         app = (root / "desktop/src/App.tsx").read_text(encoding="utf-8")
         graph = (root / "desktop/src/components/DependencyGraphWorkspace.tsx").read_text(encoding="utf-8")
         css = (root / "desktop/src/App.css").read_text(encoding="utf-8")
-        for required in ("graphFullscreen", "graphLeftHidden", "graphRightHidden", "graph-hide-project-rail", "graph-hide-monitor"):
+
+        # Human FLOW no longer mounts a permanent MonitoringPanel. Graph may
+        # still take over the window or hide the project rail, but there is no
+        # dead right-pane toggle/state for a monitor that no longer exists.
+        for required in ("graphFullscreen", "graphLeftHidden", "graph-hide-project-rail"):
             self.assertIn(required, app)
-        for required in ("onToggleFullscreen", "onToggleLeftPane", "onToggleRightPane", "Maximize2", "PanelLeftClose", "PanelRightClose"):
+        for forbidden in ("graphRightHidden", "graph-hide-monitor"):
+            self.assertNotIn(forbidden, app)
+        for required in ("onToggleFullscreen", "onToggleLeftPane", "Maximize2", "PanelLeftClose"):
             self.assertIn(required, graph)
+        for forbidden in ("onToggleRightPane", "rightPaneHidden", "PanelRightClose", "PanelRightOpen", "Скрыть мониторинг"):
+            self.assertNotIn(forbidden, graph)
         self.assertIn(".app-shell.graph-fullscreen", css)
-        self.assertIn(".app-grid.graph-hide-project-rail.graph-hide-monitor", css)
+        self.assertIn(".app-grid.graph-hide-project-rail { grid-template-columns: minmax(0, 1fr); }", css)
+        self.assertNotIn("graph-hide-monitor", css)
 
     def test_graph_remains_projection_only(self) -> None:
         root = Path(__file__).resolve().parents[2]

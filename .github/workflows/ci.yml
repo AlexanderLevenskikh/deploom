@@ -131,6 +131,7 @@ jobs:
           npm run check:autopilot-scenarios
           npm run check:acceptance-policy
           npm run check:progressive-contract
+          npm run check:human-flow
           npm run check:notifications
           npm run check:flow-state
           npm run check:flow-recovery
