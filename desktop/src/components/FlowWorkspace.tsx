@@ -7,8 +7,9 @@ import { BranchFailureModal } from './BranchFailureModal'
 import { QuickSelect } from './QuickSelect'
 import { ModelPicker } from './ModelPicker'
 import { BaselineIntentDialog } from './BaselineIntentDialog'
+import { PromptPreviewDialog } from './PromptPreviewDialog'
 import { freshBaselineIntent, normalizeBaselineIntentPlan } from '../data/baselineIntent'
-import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, FlowAction, MigrationBranchProgress, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
+import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, FlowAction, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
 
 const AUTOPILOT_HELP = {
   ru: '«Продолжить» автономно доводит текущий этап. Автопилот дополнительно проходит весь FLOW до принятого результата: после audit он возвращается в migration только при реальном acceptance blocker, а не ради процента freshness.',
@@ -49,6 +50,8 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
   const [selectedBranchFailure, setSelectedBranchFailure] = useState<MigrationBranchProgress | null>(null)
   const [selectedStageIndex, setSelectedStageIndex] = useState<number | null>(null)
   const [baselineIntentDialog, setBaselineIntentDialog] = useState<{ mode: 'prepare' | 'decision'; resume: 'auto' | 'continue' | 'restart'; plan: BaselineIntentPlan; decision?: BaselineDecision }>()
+  const [draftPromptWatch, setDraftPromptWatch] = useState<{ projectName: string; beforeMtimeMs?: number; beforeSize?: number; seenRunning: boolean }>()
+  const [draftPromptPreview, setDraftPromptPreview] = useState<ProjectPromptPreview>()
   const [baselineDecisionDismissed, setBaselineDecisionDismissed] = useState(false)
   const run = details.teamState?.projects[project.name]
   const recovery = run?.recovery
@@ -178,6 +181,40 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
   const baselinePolicyIdentity = (intent: BaselineIntent) =>
     JSON.stringify(Object.entries(intent.policies ?? {}).sort(([left], [right]) => left.localeCompare(right)))
 
+
+  useEffect(() => {
+    if (!draftPromptWatch) return
+    if (draftPromptWatch.projectName !== project.name) {
+      setDraftPromptWatch(undefined)
+      return
+    }
+    if (activeAction === 'baseline') {
+      if (!draftPromptWatch.seenRunning) setDraftPromptWatch({ ...draftPromptWatch, seenRunning: true })
+      return
+    }
+    if (!draftPromptWatch.seenRunning) return
+
+    let cancelled = false
+    void window.dependencyFlow?.getCurrentProjectPromptPreview().then((preview) => {
+      if (cancelled) return
+      const belongsToProject = preview && (!preview.projectName || preview.projectName === draftPromptWatch.projectName)
+      const changed = preview && (
+        draftPromptWatch.beforeMtimeMs === undefined
+        || preview.mtimeMs !== draftPromptWatch.beforeMtimeMs
+        || preview.size !== draftPromptWatch.beforeSize
+      )
+      if (belongsToProject && changed) setDraftPromptPreview(preview)
+      else window.alert(language === 'ru' ? 'Draft завершился, но свежий prompt artifact не найден. Проверьте артефакты запуска.' : 'Draft finished, but a fresh prompt artifact was not found. Check the run artifacts.')
+      setDraftPromptWatch(undefined)
+    }).catch((error) => {
+      if (!cancelled) {
+        setDraftPromptWatch(undefined)
+        window.alert(error instanceof Error ? error.message : String(error))
+      }
+    })
+    return () => { cancelled = true }
+  }, [activeAction, draftPromptWatch, language, project.name])
+
   const runBaselineIntent = async (intent: BaselineIntent) => {
     const pending = baselineIntentDialog
     if (!pending) return
@@ -185,7 +222,19 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
       pending.mode === 'decision' &&
       baselinePolicyIdentity(pending.plan.intent) !== baselinePolicyIdentity(intent)
     const effectiveBaselineResume = policyChanged ? 'restart' : pending.resume
+    let beforeDraftPrompt: ProjectPromptPreview | undefined
+    if (intent.proofMode === 'DRAFT') {
+      try { beforeDraftPrompt = await window.dependencyFlow?.getCurrentProjectPromptPreview() } catch { /* no previous prompt is fine */ }
+    }
     await onRun({ action: 'baseline', workspaceId: details.workspace.id, projectName: project.name, target, label, releaseBranch, gateCommand, baselineResume: effectiveBaselineResume, baselineIntent: intent, commitMessage: `chore(deps): save ${project.name} roadmap state` })
+    if (intent.proofMode === 'DRAFT') {
+      setDraftPromptWatch({
+        projectName: project.name,
+        beforeMtimeMs: beforeDraftPrompt?.mtimeMs,
+        beforeSize: beforeDraftPrompt?.size,
+        seenRunning: false,
+      })
+    }
     setBaselineIntentDialog(undefined)
     if (pending.mode === 'decision') { setBaselineDecisionDismissed(false); onClearBaselineDecision() }
   }
@@ -346,6 +395,7 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
         {typeof humanRemainingUpdates === 'number' && humanRemainingUpdates > 0 ? <p className="human-flow-remaining">{text(`Осталось разобрать: ${humanRemainingUpdates}. Они не обнуляют уже проверенный результат.`, `Remaining to address: ${humanRemainingUpdates}. They do not invalidate the already verified result.`)}</p> : null}
         <div className="human-flow-actions">
           {!flowComplete && !active && humanPrimaryStage.action ? <button className="button primary" disabled={humanPrimaryStage.action === 'release' && !acceptanceAccepted} onClick={() => void execute(activeIndex, undefined, undefined, humanPrimaryStage.action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}><Play size={16} />{humanPrimaryStage.action === 'baseline' && details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Продолжить работу', 'Continue')}</button> : null}
+          {!active && humanPrimaryStage.action === 'baseline' ? <button className="button secondary" onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button> : null}
           {flowComplete && acceptanceAccepted ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} />{text('Продолжить улучшение', 'Continue improving')}</button> : null}
           <button className="button secondary" disabled={!run && !activeAction} onClick={() => void onOpenPath(artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
         </div>
@@ -479,6 +529,7 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
       </details>
       {selectedBranchFailure?.runtime?.phase === 'failed' ? <BranchFailureModal branch={selectedBranchFailure} onClose={() => setSelectedBranchFailure(null)} /> : null}
       {baselineIntentDialog ? <BaselineIntentDialog mode={baselineIntentDialog.mode} plan={baselineIntentDialog.plan} decision={baselineIntentDialog.decision} onCancel={() => { setBaselineIntentDialog(undefined); if (baselineIntentDialog.mode === 'decision') setBaselineDecisionDismissed(true) }} onSubmit={runBaselineIntent} /> : null}
+      {draftPromptPreview ? <PromptPreviewDialog preview={draftPromptPreview} onClose={() => setDraftPromptPreview(undefined)} onOpenPath={onOpenPath} /> : null}
     </section>
   )
 }

@@ -24,6 +24,7 @@ export type DependencyGraphSnapshot = { schemaVersion: 1; project: string; captu
 
 export type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
 export type BaselineRecoveryInfo = { available: boolean; mode?: 'yellow' | 'green'; status?: string; phase?: string; updatedAt?: string; generation?: number; iteration?: number; lastAssignment?: string; lastPredicate?: string; learnedConstraints?: number; exactExclusions?: number; reason?: string }
+export type ProjectPromptPreview = { path: string; content: string; stale: boolean; mtimeMs: number; size: number; projectName?: string }
 
 export type ProjectLevel = { status: 'red' | 'yellow' | 'green'; lagOkPct?: number; remainingYellow?: number; remainingGreen?: number; measuredAt?: string }
 
@@ -236,6 +237,7 @@ export type DependencyFlowApi = {
   updateProjectBranches: (input: { workspaceId?: string; projectName: string; branchBase?: string; push?: boolean }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   refreshWorkspace: () => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   getBaselineIntentPlan: (input: { workspaceId?: string; projectName: string }) => Promise<BaselineIntentPlan>
+  getCurrentProjectPromptPreview: () => Promise<ProjectPromptPreview | undefined>
   getDependencyGraphSnapshot: (input: { workspaceId?: string; projectName: string }) => Promise<DependencyGraphSnapshot>
   runAction: (input: ActionInput) => Promise<{ jobId: string; preview: string[] }>
   cancelJob: (jobId: string) => Promise<boolean>

@@ -37,6 +37,6 @@ def test_desktop_draft_is_invocation_local_and_does_not_advance_flow() -> None:
 
 
 def test_draft_ui_and_external_agent_handoff_are_visible() -> None:
-    assert "Build unverified Draft" in DIALOG
+    assert "Create Draft and show prompt" in DIALOG
     assert "Build Draft for agent handoff" in DIALOG
     assert "DRAFT BASELINE / PLANNING ONLY" in GENERATOR

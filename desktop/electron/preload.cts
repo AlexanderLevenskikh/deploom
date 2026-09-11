@@ -1,4 +1,36 @@
 import { contextBridge, ipcRenderer } from 'electron'
+import { readFile, stat } from 'node:fs/promises'
+
+const MAX_PROMPT_PREVIEW_BYTES = 2 * 1024 * 1024
+
+async function getCurrentProjectPromptPreview() {
+  // The renderer never supplies a filesystem path here. Resolve the current
+  // project prompt through the existing trusted main-process workspace state,
+  // then read exactly that file from the privileged preload context.
+  const refreshed = await ipcRenderer.invoke('flow:refresh-workspace') as {
+    details?: {
+      workspace?: { selectedProject?: string }
+      projectPromptPath?: string
+      promptStale?: boolean
+    }
+  }
+  const details = refreshed?.details
+  const targetPath = details?.projectPromptPath
+  if (!targetPath) return undefined
+
+  const info = await stat(targetPath)
+  if (!info.isFile()) throw new Error('Current project prompt is not a file')
+  if (info.size > MAX_PROMPT_PREVIEW_BYTES) throw new Error('Current project prompt is too large to preview')
+
+  return {
+    path: targetPath,
+    content: await readFile(targetPath, 'utf8'),
+    stale: Boolean(details?.promptStale),
+    mtimeMs: info.mtimeMs,
+    size: info.size,
+    projectName: details?.workspace?.selectedProject,
+  }
+}
 
 const api = {
   bootstrap: () => ipcRenderer.invoke('flow:bootstrap'),
@@ -14,6 +46,7 @@ const api = {
   updateProjectBranches: (input: unknown) => ipcRenderer.invoke('flow:update-project-branches', input),
   refreshWorkspace: () => ipcRenderer.invoke('flow:refresh-workspace'),
   getBaselineIntentPlan: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:baseline-intent-plan', input),
+  getCurrentProjectPromptPreview,
   getDependencyGraphSnapshot: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:dependency-graph-snapshot', input),
   runAction: (input: unknown) => ipcRenderer.invoke('flow:run-action', input),
   cancelJob: (jobId: string) => ipcRenderer.invoke('flow:cancel-job', jobId),

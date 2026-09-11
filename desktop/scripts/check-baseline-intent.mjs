@@ -3,6 +3,8 @@ import ts from 'typescript'
 
 const types = fs.readFileSync(new URL('../src/types.ts', import.meta.url), 'utf8')
 const dialog = fs.readFileSync(new URL('../src/components/BaselineIntentDialog.tsx', import.meta.url), 'utf8')
+const flowWorkspace = fs.readFileSync(new URL('../src/components/FlowWorkspace.tsx', import.meta.url), 'utf8')
+const promptPreview = fs.readFileSync(new URL('../src/components/PromptPreviewDialog.tsx', import.meta.url), 'utf8')
 const main = fs.readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8')
 const preload = fs.readFileSync(new URL('../electron/preload.cts', import.meta.url), 'utf8')
 const normalizerSource = fs.readFileSync(new URL('../src/data/baselineIntent.ts', import.meta.url), 'utf8')
@@ -27,6 +29,19 @@ mustNotContain(dialog, 'setExecutionMode', 'legacy execution mode must not drive
 mustNotContain(dialog, 'schemaVersion: 1,', 'dialog must emit v2')
 mustNotContain(dialog, 'preferredFreshnessPct', 'unimplemented freshness preference must stay out of happy-path UI')
 mustContain(dialog, "text('Бюджет Baseline / планирования', 'Baseline / planning budget')", 'budget scope must be honest')
+mustContain(dialog, "text('Что обновлять в этом запуске', 'What to update in this run')", 'dependency scope must be visible in the new UI')
+mustContain(dialog, "text('Не обновлять сейчас', 'Do not update now')", 'dependency exclusion control must stay visible')
+mustContain(dialog, "text('Создать Draft и показать промпт', 'Create Draft and show prompt')", 'Draft CTA must promise the prompt handoff')
+mustContain(flowWorkspace, "text('Настроить состав / Draft', 'Configure scope / Draft')", 'scope/Draft chooser must be visible even when a Baseline checkpoint can resume')
+
+mustContain(types, 'getCurrentProjectPromptPreview: () => Promise<ProjectPromptPreview | undefined>', 'prompt preview API type')
+mustContain(preload, 'getCurrentProjectPromptPreview', 'safe prompt preview bridge')
+mustContain(preload, "ipcRenderer.invoke('flow:refresh-workspace')", 'prompt preview path must come from trusted workspace state')
+mustNotContain(preload, 'getCurrentProjectPromptPreview: (targetPath', 'renderer must not choose arbitrary prompt file paths')
+mustContain(flowWorkspace, "intent.proofMode === 'DRAFT'", 'Draft completion routing')
+mustContain(flowWorkspace, '<PromptPreviewDialog', 'Draft prompt modal')
+mustContain(promptPreview, "text('Draft готов — промпт для агента', 'Draft is ready — agent prompt')", 'Draft prompt modal copy')
+mustNotContain(promptPreview, 'onOpenDashboard', 'Draft modal must not route through Dashboard')
 
 for (const sentinel of [
   'DEPLOOM_BASELINE_CONTROL_MODE',

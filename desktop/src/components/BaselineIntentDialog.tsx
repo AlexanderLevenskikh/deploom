@@ -275,10 +275,10 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
           <div>
             {mode === 'decision' ? <AlertTriangle size={18} /> : <ShieldCheck size={18} />}
             <div>
-              <strong id="baseline-intent-title">{mode === 'decision' ? text('Нужно решение по Baseline', 'Baseline decision required') : text('Проверенный Baseline', 'Verified Baseline')}</strong>
+              <strong id="baseline-intent-title">{mode === 'decision' ? text('Нужно решение по Baseline', 'Baseline decision required') : text('Состав Baseline', 'Baseline scope')}</strong>
               <span>{mode === 'decision'
                 ? text('DepLoom сохранил подтверждённые ограничения. Основной Flow пытается быстро получить рабочий verified результат, откладывая только локально проблемную группу после вашего подтверждения.', 'DepLoom preserved confirmed constraints. The main flow aims for a working verified result quickly and defers only a locally problematic group after your confirmation.')
-                : text('Сначала пробуем весь выбранный scope. Если совместимость локально блокирует поиск, DepLoom предложит временно отложить связанную группу и вернуться к ней следующим проходом.', 'We first try the full selected scope. If compatibility is locally blocked, DepLoom will suggest temporarily deferring the related group and revisiting it in a later pass.')}</span>
+                : text('Выберите зависимости для этого запуска. Затем можно либо получить быстрый planning-only Draft с промптом, либо запустить physically verified Baseline.', 'Choose dependencies for this run. Then either build a quick planning-only Draft with an agent prompt or start the physically verified Baseline.')}</span>
             </div>
           </div>
           <button type="button" className="icon-button" aria-label={text('Закрыть без применения', 'Close without applying')} onClick={requestCancel}><X size={17} /></button>
@@ -380,6 +380,13 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
           </>
         ) : null}
 
+        {mode === 'prepare' ? <div className="baseline-fast-flow">
+          <div>
+            <strong>{text('Что обновлять в этом запуске', 'What to update in this run')}</strong>
+            <span>{text('AUTO — DepLoom решает сам. «Не обновлять сейчас» оставляет текущую версию и исключает зависимость из upgrade scope этого запуска. «Обязательно» принудительно оставляет её в scope.', 'AUTO lets DepLoom decide. “Do not update now” keeps the current version and excludes the dependency from this run upgrade scope. “Required” forces it to remain in scope.')}</span>
+          </div>
+        </div> : null}
+
         <div className="baseline-intent-toolbar">
           <label><Search size={14} /><input autoFocus spellCheck={false} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={text('Найти зависимость', 'Find dependency')} /></label>
           <QuickSelect value={kind} options={kindOptions} onChange={(value) => setKind(value as typeof kind)} ariaLabel={text('Фильтр типа зависимости', 'Dependency type filter')} />
@@ -388,7 +395,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
 
         <div className="baseline-intent-stats">
           <span>AUTO <b>{counts.auto}</b></span>
-          <span>{text('Отложено/current', 'Deferred/current')} <b>{counts['keep-current']}</b></span>
+          <span>{text('Не обновлять сейчас', 'Do not update now')} <b>{counts['keep-current']}</b></span>
           <span>{text('Обязательно', 'Required')} <b>{counts.required}</b></span>
         </div>
 
@@ -404,7 +411,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
                 <code>{item.currentVersion || '—'}</code>
                 <div className="baseline-policy-toggle" role="group" aria-label={text(`Правило для ${item.name}`, `Policy for ${item.name}`)}>
                   <button type="button" className={policy === 'auto' ? 'active' : ''} aria-pressed={policy === 'auto'} disabled={busy} onClick={() => setPolicy(item.name, 'auto')}>AUTO</button>
-                  <button type="button" className={policy === 'keep-current' ? 'active' : ''} aria-pressed={policy === 'keep-current'} disabled={busy} onClick={() => setPolicy(item.name, 'keep-current')}>{text('Пока current', 'Keep current')}</button>
+                  <button type="button" className={policy === 'keep-current' ? 'active' : ''} aria-pressed={policy === 'keep-current'} disabled={busy} onClick={() => setPolicy(item.name, 'keep-current')}>{text('Не обновлять сейчас', 'Do not update now')}</button>
                   <button type="button" className={policy === 'required' ? 'active required' : ''} aria-pressed={policy === 'required'} disabled={busy} onClick={() => setPolicy(item.name, 'required')}>{text('Обязательно', 'Required')}</button>
                 </div>
               </div>
@@ -415,7 +422,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
         <footer className="baseline-intent-actions">
           <span className="baseline-intent-apply-hint">{dirty ? text('Есть неприменённые изменения', 'There are unapplied changes') : text('Scope готов', 'Scope is ready')}</span>
           <button type="button" className="button secondary" disabled={busy} onClick={requestCancel}>{mode === 'decision' ? text('Оставить на паузе', 'Keep paused') : text('Отмена', 'Cancel')}</button>
-          {mode === 'prepare' ? <button type="button" className="button secondary" disabled={busy} onClick={buildDraft} title={text('Без install/lifecycle/project checks. Compatibility останется UNKNOWN.', 'No install/lifecycle/project checks. Compatibility remains UNKNOWN.')}>{text('Сформировать Draft без проверки', 'Build unverified Draft')}</button> : null}
+          {mode === 'prepare' ? <button type="button" className="button secondary" disabled={busy} onClick={buildDraft} title={text('Без install/lifecycle/project checks. После завершения сразу откроется готовый prompt; Dashboard не требуется.', 'No install/lifecycle/project checks. The ready prompt opens immediately after completion; Dashboard is not required.')}>{text('Создать Draft и показать промпт', 'Create Draft and show prompt')}</button> : null}
           {mode === 'prepare' ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{controlMode === 'AUTONOMOUS' ? text('Запустить автономно', 'Start autonomously') : text('Запустить Baseline', 'Start Baseline')}</button> : null}
           {mode === 'decision' && !suggestedCohort?.packages.length && decision?.package ? <button type="button" className="button primary" disabled={busy} onClick={keepFocusAndContinue}>{text(`Пока оставить ${decision.package} current`, `Keep ${decision.package} current for now`)}</button> : null}
           {mode === 'decision' && !suggestedCohort?.packages.length && !decision?.package ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{text('Применить scope и продолжить', 'Apply scope and continue')}</button> : null}
