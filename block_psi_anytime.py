@@ -38,11 +38,16 @@ class BestVerifiedIncumbent:
     verified_at: str
     run_identity: str
     objective_rank: tuple[int, int, int]
+    # Resolver overrides are part of the verified incumbent identity/substrate.
+    # Keeping them durable prevents resume from replaying the same direct
+    # assignment against a different package-manager graph.
+    resolver_overrides: tuple[tuple[str, str], ...] = ()
 
     def to_json(self) -> dict[str, object]:
         value = asdict(self)
         value["deferred_targets"] = list(self.deferred_targets)
         value["objective_rank"] = list(self.objective_rank)
+        value["resolver_overrides"] = [list(item) for item in self.resolver_overrides]
         return value
 
     @classmethod
@@ -64,6 +69,14 @@ class BestVerifiedIncumbent:
                 str(value.get("verified_at") or ""),
                 str(value.get("run_identity") or ""),
                 rank,
+                tuple(
+                    (str(item[0]), str(item[1]))
+                    for item in value.get("resolver_overrides", ())
+                    if isinstance(item, (list, tuple))
+                    and len(item) == 2
+                    and str(item[0])
+                    and str(item[1])
+                ),
             )
         except (TypeError, ValueError):
             return None

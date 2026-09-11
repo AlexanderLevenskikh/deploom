@@ -133,7 +133,15 @@ class ProofHandoffFirewallTests(unittest.TestCase):
             "global_exact_exclusions_by_project_mode=global_exact_exclusions",
             baseline,
         )
-        self.assertIn("PROVEN_ASSIGNMENT_REOPENED", baseline)
+        # BLOCK_PSI_PROGRESSIVE_BASELINE_ENGINE_V1:
+        # a physically verified incumbent is applied exactly; it is not reopened
+        # through a fresh optimization pass.
+        self.assertIn("_apply_proven_assignment_exact(", baseline)
+        self.assertNotIn("PROVEN_ASSIGNMENT_REOPENED", baseline)
+        self.assertIn("def _apply_proven_assignment_exact(", source)
+        self.assertIn("PROVEN_ASSIGNMENT_HARD_MODEL_DRIFT", source)
+        self.assertIn("PROVEN_ASSIGNMENT_LEARNED_CONSTRAINT_DRIFT", source)
+        self.assertIn("PROVEN_ASSIGNMENT_TRANSITION_UNSAFE", source)
         self.assertIn("return final_assignments", baseline)
         self.assertIn("target_{mode}_dynamic_locked", baseline)
 

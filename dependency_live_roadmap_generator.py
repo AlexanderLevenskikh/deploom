@@ -78,6 +78,7 @@ from block_psi_anytime import (
     BestVerifiedIncumbent,
     ContinuationReason,
 )
+from block_psi_progressive_baseline import plan_progressive_extension
 from baseline_cohort_inference import infer_baseline_cohort
 
 from deploom_failure import build_failure, write_diagnostic_artifact
@@ -9876,6 +9877,196 @@ def _build_proven_envelope_for_mode(
     )
 
 
+# BLOCK_PSI_PROGRESSIVE_BASELINE_ENGINE_V1
+
+
+def _apply_proven_assignment_exact(
+    *,
+    project: str,
+    mode: str,
+    rows: Sequence[DependencyRow],
+    assignment: Mapping[str, str],
+    client: LiveDataClient,
+    learned_nogoods: Sequence[Mapping[str, str]],
+    global_exact_exclusions: Sequence[Mapping[str, str]],
+    residual_targets: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Materialize an already physically verified assignment without re-solving.
+
+    Solver/verifier chose and proved the assignment earlier.  This handoff only
+    revalidates hard-model/transition safety and projects that exact tuple onto
+    report rows.  It has no authority to pick different package versions.
+    """
+    rows_for_name: Dict[str, List[DependencyRow]] = defaultdict(list)
+    for row in rows:
+        rows_for_name[row.name].append(row)
+    rows_by_name = {
+        name: _aggregate_duplicate_package_row(items)
+        for name, items in rows_for_name.items()
+    }
+    unknown = sorted(set(assignment) - set(rows_by_name))
+    if unknown:
+        raise BaselineConstraintVerificationError(
+            f"PROVEN_ASSIGNMENT_UNKNOWN_INPUT: {project}/{mode}: {unknown[:20]}"
+        )
+
+    exact = {
+        name: str(assignment.get(name) or row.current_version)
+        for name, row in rows_by_name.items()
+    }
+    domains = {
+        name: (
+            [row.current_version]
+            if _is_fixed_dependency_input(row)
+            else _candidate_domain(row, mode, client)
+        )
+        for name, row in rows_by_name.items()
+    }
+    hard_issue = _assignment_constraint_issue(
+        set(rows_by_name), exact, rows_by_name, client, partial=False
+    )
+    if hard_issue:
+        raise BaselineConstraintVerificationError(
+            f"PROVEN_ASSIGNMENT_HARD_MODEL_DRIFT: {project}/{mode}: {hard_issue}"
+        )
+    for learned_clause in learned_nogoods:
+        if assignment_matches_nogood(exact, learned_clause):
+            raise BaselineConstraintVerificationError(
+                f"PROVEN_ASSIGNMENT_LEARNED_CONSTRAINT_DRIFT: {project}/{mode}: "
+                f"{assignment_fingerprint(exact)}"
+            )
+    for excluded in global_exact_exclusions:
+        if assignment_matches_nogood(exact, excluded):
+            raise BaselineConstraintVerificationError(
+                f"PROVEN_ASSIGNMENT_EXCLUDED: {project}/{mode}: "
+                f"{assignment_fingerprint(exact)}"
+            )
+
+    hard_graph = _potential_peer_graph(rows_by_name, domains, client)
+    merge_nogood_edges(hard_graph, learned_nogoods)
+    components = _graph_components(hard_graph)
+
+    actual_graph = _actual_peer_component_graph(rows_by_name, exact, client)
+    merge_nogood_edges(actual_graph, learned_nogoods)
+    actual_components = _graph_components(actual_graph)
+    existing_cohort_groups: Dict[str, Set[str]] = defaultdict(set)
+    for name, row in rows_by_name.items():
+        if row.compatibility_cohort:
+            existing_cohort_groups[row.compatibility_cohort].add(name)
+
+    transition_components: List[List[str]] = []
+    transition_notes: Dict[str, List[str]] = defaultdict(list)
+    transition_merge_count = 0
+    residual = dict(residual_targets or {})
+    for solve_component in components:
+        if all(exact[name] == rows_by_name[name].current_version for name in solve_component):
+            continue
+        component_set = set(solve_component)
+        initial_groups: List[Set[str]] = []
+        for group in actual_components:
+            members = set(group) & component_set
+            if members:
+                initial_groups.append(members)
+        for members in existing_cohort_groups.values():
+            overlap = members & component_set
+            if len(overlap) > 1:
+                initial_groups.append(overlap)
+
+        model = _build_peer_optimization_model(
+            solve_component,
+            rows_by_name,
+            domains,
+            client,
+            mode,
+            list(learned_nogoods),
+            residual,
+        )
+        current_assignment = {
+            name: rows_by_name[name].current_version for name in solve_component
+        }
+        target_assignment = {name: exact[name] for name in solve_component}
+        transition = refine_transition_safe_groups(
+            model,
+            current_assignment,
+            target_assignment,
+            initial_groups=initial_groups,
+        )
+        if not transition.safe:
+            detail = "; ".join(transition.unresolved)
+            raise BaselineConstraintVerificationError(
+                f"PROVEN_ASSIGNMENT_TRANSITION_UNSAFE: {project}/{mode}: {detail}"
+            )
+        transition_merge_count += len(transition.merges)
+        for merge in transition.merges:
+            reason = f"TRANSITION_COHORT: {merge.reason}"
+            for name in set(merge.left) | set(merge.right):
+                transition_notes[name].append(reason)
+        for group in transition.groups:
+            if len(group) > 1:
+                transition_components.append(list(group))
+
+    if transition_merge_count:
+        eprint(
+            f"[info] {project}: exact proven handoff transition safety {mode}; "
+            f"mergedBoundaries={transition_merge_count}, cohorts={len(transition_components)}"
+        )
+
+    cohort_for_name: Dict[str, str] = {}
+    for component in transition_components:
+        cohort = _cohort_name_for_component(component, rows_by_name)
+        for name in component:
+            cohort_for_name[name] = cohort
+
+    changed = 0
+    for name, representative in rows_by_name.items():
+        resolved_version = exact[name]
+        desired = _desired_target_for_mode(representative, mode)
+        resolved_target = (
+            resolved_version
+            if resolved_version != representative.current_version
+            else NO_ACTION
+        )
+        reason = _resolution_change_reason(
+            representative,
+            desired,
+            resolved_version,
+            exact,
+            rows_by_name,
+            client,
+            mode,
+            "optimal",
+        )
+        for row in rows_for_name[name]:
+            old_target = getattr(row, _target_attr(mode))
+            setattr(row, _target_attr(mode), resolved_target)
+            setattr(row, _resolution_reason_attr(mode), reason)
+            if reason:
+                setattr(
+                    row,
+                    _target_reason_attr(mode),
+                    target_reason_join([
+                        getattr(row, _target_reason_attr(mode), ""), reason
+                    ]),
+                )
+                row.compatibility_note = target_reason_join(
+                    [row.compatibility_note, reason]
+                )
+            if name in cohort_for_name:
+                row.compatibility_cohort = cohort_for_name[name]
+            for transition_note in transition_notes.get(name, []):
+                row.compatibility_note = target_reason_join(
+                    [row.compatibility_note, transition_note]
+                )
+            if reason or name in cohort_for_name or old_target != resolved_target:
+                setattr(row, f"target_{mode}_dynamic_locked", True)
+            if old_target != resolved_target:
+                changed += 1
+    if changed:
+        eprint(
+            f"[info] {project}: exact proven assignment materialized {changed} target(s) for {mode}"
+        )
+
+
 def resolve_peer_compatibility_with_verification(
     rows_by_project: Dict[str, List[DependencyRow]],
     projects_by_name: Dict[str, ProjectSpec],
@@ -10607,11 +10798,15 @@ def resolve_peer_compatibility_with_verification(
             desired_identity = anytime.desired_identity
             mode_started = time.monotonic()
             candidate_started = mode_started
+            verified_candidate_evidence: Dict[
+                str, Tuple[Optional[BaselineVerifyResult], Optional[BaselineVerifyResult]]
+            ] = {}
 
             def record_verified_incumbent(
                 verified_assignment: Mapping[str, str],
                 identity: str,
                 evidence: str,
+                resolver_overrides: Optional[Mapping[str, str]] = None,
             ) -> BaselineCompletionStatus:
                 deferred = tuple(sorted(
                     name for name, version in desired_assignment.items()
@@ -10631,6 +10826,10 @@ def resolve_peer_compatibility_with_verification(
                     verified_at=dt.datetime.now(dt.timezone.utc).isoformat(),
                     run_identity=recovery_identity,
                     objective_rank=(len(deferred), -matched, len(verified_assignment)),
+                    resolver_overrides=tuple(sorted(
+                        (str(name), str(version))
+                        for name, version in (resolver_overrides or {}).items()
+                    )),
                 )
                 anytime.observe_candidate(
                     duration_seconds=time.monotonic() - candidate_started,
@@ -10659,6 +10858,56 @@ def resolve_peer_compatibility_with_verification(
                     authority="PHYSICAL_VERIFICATION",
                 )
                 return completion
+            def _progressive_atomic_groups() -> Tuple[Tuple[str, ...], ...]:
+                progressive_domains = {
+                    name: (
+                        [row.current_version]
+                        if _is_fixed_dependency_input(row)
+                        else _candidate_domain(row, mode, client)
+                    )
+                    for name, row in rows_by_name.items()
+                }
+                progressive_graph = _potential_peer_graph(
+                    rows_by_name, progressive_domains, client
+                )
+                merge_nogood_edges(progressive_graph, learned[project][mode])
+                return tuple(
+                    tuple(component)
+                    for component in _graph_components(progressive_graph)
+                )
+
+            def _next_progressive_extension():
+                incumbent = anytime.incumbent
+                if incumbent is None or not desired_assignment:
+                    return None
+                # Resolver overrides are a separate verified decision dimension.
+                # Do not silently drop/rewrite them while extending direct deps.
+                if incumbent.resolver_overrides:
+                    return None
+                blocked = set(confirmed_failed_assignments)
+                blocked.update(
+                    assignment_fingerprint(item)
+                    for item in global_exact_exclusions[project][mode]
+                )
+                return plan_progressive_extension(
+                    incumbent=incumbent.assignment,
+                    desired=desired_assignment,
+                    atomic_groups=_progressive_atomic_groups(),
+                    blocked_fingerprints=blocked,
+                    learned_nogoods=learned[project][mode],
+                    fingerprint_fn=assignment_fingerprint,
+                    priority_packages=baseline_required,
+                )
+
+            def _remember_verified_candidate(
+                identity: str,
+                resolver_evidence: Optional[BaselineVerifyResult],
+                project_evidence: Optional[BaselineVerifyResult],
+            ) -> None:
+                verified_candidate_evidence[str(identity)] = (
+                    resolver_evidence,
+                    project_evidence,
+                )
 
             def checkpoint_baseline_run(
                 phase: str,
@@ -10688,6 +10937,141 @@ def resolve_peer_compatibility_with_verification(
                         project, mode, identity=recovery_identity,
                         state=state, status=status, phase=phase, epochs=recovery_epochs,
                     )
+            def _finalize_verified_incumbent(
+                phase: str,
+                *,
+                completion_status: Optional[BaselineCompletionStatus] = None,
+            ) -> BaselineCompletionStatus:
+                incumbent = anytime.incumbent
+                if incumbent is None:
+                    raise BaselineConstraintVerificationError(
+                        f"PROGRESSIVE_BASELINE_INCUMBENT_MISSING: {project}/{mode}"
+                    )
+                proven = dict(incumbent.assignment)
+                final_assignments.setdefault(project, {})[mode] = proven
+
+                successful_resolver_evidence.pop((project, mode), None)
+                successful_project_evidence.pop((project, mode), None)
+                remembered = verified_candidate_evidence.get(
+                    incumbent.assignment_identity
+                )
+                if remembered is not None:
+                    resolver_evidence, project_evidence = remembered
+                    if resolver_evidence is not None:
+                        successful_resolver_evidence[(project, mode)] = resolver_evidence
+                    if project_evidence is not None:
+                        successful_project_evidence[(project, mode)] = project_evidence
+
+                mode_overrides = dict(incumbent.resolver_overrides)
+                if mode_overrides:
+                    final_resolver_overrides.setdefault(project, {})[mode] = mode_overrides
+                elif project in final_resolver_overrides:
+                    final_resolver_overrides[project].pop(mode, None)
+
+                completion = completion_status
+                if completion is None:
+                    completion = (
+                        BaselineCompletionStatus.VERIFIED_TARGET_COMPLETE
+                        if proven == desired_assignment
+                        else BaselineCompletionStatus.VERIFIED_GOOD_ENOUGH
+                    )
+                    if (
+                        baseline_keep_current
+                        and completion
+                        == BaselineCompletionStatus.VERIFIED_TARGET_COMPLETE
+                    ):
+                        completion = BaselineCompletionStatus.VERIFIED_PARTIAL_SCOPE
+
+                final_fingerprint = assignment_fingerprint(proven)
+                checkpoint_baseline_run(
+                    phase,
+                    completed_iteration=iteration,
+                    last_assignment=final_fingerprint,
+                    status="completed",
+                )
+                progress_reporter.emit(
+                    project,
+                    mode,
+                    "progressive-incumbent-finalized",
+                    iteration=iteration,
+                    assignment=final_fingerprint,
+                    completionStatus=completion.value,
+                    changedDependencyCount=incumbent.changed_dependency_count,
+                    deferredTargets=list(incumbent.deferred_targets),
+                    authority="PHYSICAL_VERIFICATION",
+                )
+                eprint(
+                    f"[info] {project}: Progressive Baseline finalized {mode}; "
+                    f"assignment={final_fingerprint}; "
+                    f"completion={completion.value}; "
+                    f"deferred={len(incumbent.deferred_targets)}"
+                )
+                return completion
+
+            def _continue_after_verified_candidate(
+                *,
+                identity: str,
+                resolver_evidence: Optional[BaselineVerifyResult],
+                project_evidence: Optional[BaselineVerifyResult],
+            ) -> bool:
+                _remember_verified_candidate(
+                    identity, resolver_evidence, project_evidence
+                )
+                incumbent = anytime.incumbent
+                if incumbent is None:
+                    raise BaselineConstraintVerificationError(
+                        f"PROGRESSIVE_BASELINE_INCUMBENT_MISSING_AFTER_PASS: {project}/{mode}"
+                    )
+                if dict(incumbent.assignment) == desired_assignment:
+                    _finalize_verified_incumbent(
+                        "progressive-target-complete",
+                        completion_status=(
+                            BaselineCompletionStatus.VERIFIED_PARTIAL_SCOPE
+                            if baseline_keep_current
+                            else BaselineCompletionStatus.VERIFIED_TARGET_COMPLETE
+                        ),
+                    )
+                    return False
+
+                stop_reason = anytime.automatic_continuation_reason(
+                    base_iteration_limit_hit=(
+                        iteration >= liveness.allowed_iterations
+                    )
+                )
+                if stop_reason is not None:
+                    _finalize_verified_incumbent(
+                        "progressive-budget-ended-with-incumbent",
+                        completion_status=(
+                            BaselineCompletionStatus.SEARCH_BUDGET_EXHAUSTED_WITH_INCUMBENT
+                        ),
+                    )
+                    return False
+
+                extension = _next_progressive_extension()
+                if extension is None:
+                    _finalize_verified_incumbent(
+                        "progressive-no-further-extension"
+                    )
+                    return False
+
+                checkpoint_baseline_run(
+                    "progressive-incumbent-verified",
+                    completed_iteration=iteration,
+                    last_assignment=incumbent.assignment_identity,
+                    status="running",
+                )
+                progress_reporter.emit(
+                    project,
+                    mode,
+                    "progressive-search-continues",
+                    iteration=iteration,
+                    incumbent=incumbent.assignment_identity,
+                    nextCandidate=extension.assignment_fingerprint,
+                    nextPackages=list(extension.packages),
+                    remainingDistance=extension.remaining_distance,
+                    authority=extension.authority,
+                )
+                return True
 
             # This is a SAFE cursor: no current subprocess is represented as done.
             # If the process dies later, this completed-iteration state is retried fresh.
@@ -10731,69 +11115,103 @@ def resolve_peer_compatibility_with_verification(
                     iteration=iteration,
                     details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
                 )
-                solver_statuses: Dict[str, Dict[str, Dict[str, str]]] = {}
-                try:
-                    candidate_map = resolve_peer_compatibility(
-                        {project: rows}, client,
-                        modes=(mode,),
-                        learned_nogoods_by_project_mode=learned,
-                        global_exact_exclusions_by_project_mode=global_exact_exclusions,
-                        apply_results=False,
-                        solver_statuses_out=solver_statuses,
-                        shadow_solver_config_by_project={project: spec.constraint_verify_config},
-                        residual_targets_by_project=residual_targets_by_project,
-                        diagnostic_preferences_by_project_mode=predicate_diagnostic_preferences,
+                progressive_plan = _next_progressive_extension()
+                if progressive_plan is not None:
+                    solver_statuses: Dict[str, Dict[str, Dict[str, str]]] = {
+                        project: {mode: {}}
+                    }
+                    assignment = progressive_plan.assignment_dict
+                    progress_reporter.emit(
+                        project,
+                        mode,
+                        "progressive-extension-selected",
+                        iteration=iteration,
+                        incumbent=(
+                            anytime.incumbent.assignment_identity
+                            if anytime.incumbent is not None
+                            else ""
+                        ),
+                        candidate=progressive_plan.assignment_fingerprint,
+                        packages=list(progressive_plan.packages),
+                        remainingDistance=progressive_plan.remaining_distance,
+                        authority=progressive_plan.authority,
                     )
-                except BaselineConstraintVerificationError as exc:
-                    active_intent_packages = sorted(set(baseline_keep_current) | set(baseline_required))
-                    if (
-                        _baseline_interactive()
-                        and not _baseline_background_autonomous()
-                        and exc.terminal_status == BaselineTerminalStatus.UNSAT_PROVEN.value
-                        and active_intent_packages
-                    ):
-                        focus_name = active_intent_packages[0] if len(active_intent_packages) == 1 else ""
-                        checkpoint_baseline_run(
-                            "human-decision-required",
-                            completed_iteration=max(restored_iteration, iteration - 1),
-                            status="decision-required",
+                    eprint(
+                        f"[info] {project}: progressive extension {mode}; "
+                        f"candidate={progressive_plan.assignment_fingerprint}; "
+                        f"packages={list(progressive_plan.packages)}; "
+                        f"remainingDistance={progressive_plan.remaining_distance}; "
+                        "ordinary full physical verification remains authoritative"
+                    )
+                elif anytime.incumbent is not None:
+                    _finalize_verified_incumbent(
+                        "progressive-no-further-extension"
+                    )
+                    break
+                else:
+                    solver_statuses: Dict[str, Dict[str, Dict[str, str]]] = {}
+                    try:
+                        candidate_map = resolve_peer_compatibility(
+                            {project: rows}, client,
+                            modes=(mode,),
+                            learned_nogoods_by_project_mode=learned,
+                            global_exact_exclusions_by_project_mode=global_exact_exclusions,
+                            apply_results=False,
+                            solver_statuses_out=solver_statuses,
+                            shadow_solver_config_by_project={project: spec.constraint_verify_config},
+                            residual_targets_by_project=residual_targets_by_project,
+                            diagnostic_preferences_by_project_mode=predicate_diagnostic_preferences,
                         )
-                        decision_payload = {
-                            "schemaVersion": 1,
-                            "reason": "policy-unsat",
-                            "project": project,
-                            "mode": mode,
-                            "iteration": iteration,
-                            "hardIterations": liveness.hard_iterations,
-                            "learnedConstraints": len(learned[project][mode]),
-                            **({
-                                "package": focus_name,
-                                "currentVersion": baseline_current_versions.get(focus_name, ""),
-                            } if focus_name else {}),
-                        }
-                        progress_reporter.emit(
-                            project, mode, "human-decision-required",
-                            iteration=iteration,
-                            stopCode="BASELINE_HUMAN_DECISION_REQUIRED",
-                            terminalStatus="HUMAN_DECISION_REQUIRED",
-                            reason="policy-unsat",
-                        )
-                        _raise_baseline_human_decision(decision_payload)
-                    if exc.terminal_status:
-                        progress_reporter.emit(
-                            project,
-                            mode,
-                            "solver-terminal",
-                            iteration=iteration,
-                            terminalStatus=exc.terminal_status,
-                            terminalSource=exc.terminal_source,
-                            stopCode=exc.stop_code,
-                            details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
-                        )
-                    raise
-                assignment = candidate_map[project][mode]
+                    except BaselineConstraintVerificationError as exc:
+                        active_intent_packages = sorted(set(baseline_keep_current) | set(baseline_required))
+                        if (
+                            _baseline_interactive()
+                            and not _baseline_background_autonomous()
+                            and exc.terminal_status == BaselineTerminalStatus.UNSAT_PROVEN.value
+                            and active_intent_packages
+                        ):
+                            focus_name = active_intent_packages[0] if len(active_intent_packages) == 1 else ""
+                            checkpoint_baseline_run(
+                                "human-decision-required",
+                                completed_iteration=max(restored_iteration, iteration - 1),
+                                status="decision-required",
+                            )
+                            decision_payload = {
+                                "schemaVersion": 1,
+                                "reason": "policy-unsat",
+                                "project": project,
+                                "mode": mode,
+                                "iteration": iteration,
+                                "hardIterations": liveness.hard_iterations,
+                                "learnedConstraints": len(learned[project][mode]),
+                                **({
+                                    "package": focus_name,
+                                    "currentVersion": baseline_current_versions.get(focus_name, ""),
+                                } if focus_name else {}),
+                            }
+                            progress_reporter.emit(
+                                project, mode, "human-decision-required",
+                                iteration=iteration,
+                                stopCode="BASELINE_HUMAN_DECISION_REQUIRED",
+                                terminalStatus="HUMAN_DECISION_REQUIRED",
+                                reason="policy-unsat",
+                            )
+                            _raise_baseline_human_decision(decision_payload)
+                        if exc.terminal_status:
+                            progress_reporter.emit(
+                                project,
+                                mode,
+                                "solver-terminal",
+                                iteration=iteration,
+                                terminalStatus=exc.terminal_status,
+                                terminalSource=exc.terminal_source,
+                                stopCode=exc.stop_code,
+                                details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                            )
+                        raise
+                    assignment = candidate_map[project][mode]
                 promising_candidate = pending_promising_assignments.pop(project, mode)
-                if promising_candidate is not None:
+                if promising_candidate is not None and progressive_plan is None:
                     promising_assignment = promising_candidate.assignment_dict
                     promising_identity = assignment_fingerprint(promising_assignment)
                     if promising_identity != promising_candidate.assignment_fingerprint:
@@ -10918,7 +11336,7 @@ def resolve_peer_compatibility_with_verification(
                     final_assignments.setdefault(project, {})[mode] = assignment
                     checkpoint_baseline_run(
                         "mode-passed-no-changes", completed_iteration=iteration,
-                        last_assignment=fingerprint, status="completed",
+                        last_assignment=fingerprint, status="running",
                     )
                     progress_reporter.emit(
                         project,
@@ -10935,6 +11353,12 @@ def resolve_peer_compatibility_with_verification(
                         completionStatus=completion_status.value,
                         details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
                     )
+                    if _continue_after_verified_candidate(
+                        identity=fingerprint,
+                        resolver_evidence=(noop_result if fixed_input_names else None),
+                        project_evidence=None,
+                    ):
+                        continue
                     break
 
                 if not project_resolver_context_key:
@@ -11265,7 +11689,7 @@ def resolve_peer_compatibility_with_verification(
                             )
                         checkpoint_baseline_run(
                             "mode-passed", completed_iteration=iteration,
-                            last_assignment=fingerprint, status="completed",
+                            last_assignment=fingerprint, status="running",
                         )
                         progress_reporter.emit(
                             project,
@@ -11281,6 +11705,16 @@ def resolve_peer_compatibility_with_verification(
                             completionStatus=completion_status.value,
                                 details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
                         )
+                        if _continue_after_verified_candidate(
+                            identity=fingerprint,
+                            resolver_evidence=result,
+                            project_evidence=(
+                                project_result
+                                if config.project_checks != "off" and config.commands
+                                else None
+                            ),
+                        ):
+                            continue
                         break
 
                 # BLOCK_PSI55_VERIFIED_RESOLVER_OVERRIDES_V1
@@ -11617,6 +12051,7 @@ def resolve_peer_compatibility_with_verification(
                                         override_resolver.resolved_state_key
                                         or override_fingerprint
                                     ),
+                                    resolver_overrides=override_values,
                                 )
                                 if (
                                     override_project.ok
@@ -11690,7 +12125,7 @@ def resolve_peer_compatibility_with_verification(
                                     "mode-passed",
                                     completed_iteration=iteration,
                                     last_assignment=override_fingerprint,
-                                    status="completed",
+                                    status="running",
                                 )
                                 progress_reporter.emit(
                                     project,
@@ -11712,6 +12147,12 @@ def resolve_peer_compatibility_with_verification(
                                         )
                                     ),
                                 )
+                                if _continue_after_verified_candidate(
+                                    identity=override_fingerprint,
+                                    resolver_evidence=override_resolver,
+                                    project_evidence=override_project,
+                                ):
+                                    continue
                                 break
 
                             progress_reporter.emit(
@@ -15418,6 +15859,14 @@ def resolve_peer_compatibility_with_verification(
                     base_iteration_limit_hit=iteration >= liveness.allowed_iterations,
                 ) or ContinuationReason.BASE_ITERATION_LIMIT
                 anytime.continuation_reason = continuation_reason
+                if anytime.incumbent is not None:
+                    _finalize_verified_incumbent(
+                        "progressive-budget-ended-with-incumbent",
+                        completion_status=(
+                            BaselineCompletionStatus.SEARCH_BUDGET_EXHAUSTED_WITH_INCUMBENT
+                        ),
+                    )
+                    continue
                 if (
                     _baseline_interactive()
                     and not _baseline_background_autonomous()
@@ -15568,36 +16017,24 @@ def resolve_peer_compatibility_with_verification(
                     source="solve-and-verify",
                 )
 
-    # Re-run only as a fail-closed consistency assertion while legacy target/cohort
-    # materialization still lives inside resolve_peer_compatibility(). This second
-    # solve has NO authority to choose a different assignment: the package-manager
-    # verified final_assignments object is the handoff contract.
-    applied = resolve_peer_compatibility(
-        rows_by_project,
-        client,
-        modes=modes,
-        learned_nogoods_by_project_mode=learned,
-        global_exact_exclusions_by_project_mode=global_exact_exclusions,
-        apply_results=True,
-        shadow_solver_config_by_project={
-            name: spec.constraint_verify_config
-            for name, spec in projects_by_name.items()
-            if name in rows_by_project
-        },
-        residual_targets_by_project=residual_targets_by_project,
-        diagnostic_preferences_by_project_mode=predicate_diagnostic_preferences,
-    )
+    # The physically verified incumbent is the handoff authority.  Do not run a
+    # fresh optimization and ask it to rediscover the same tuple: optimization
+    # may legitimately choose another equally valid point.  Instead, apply the
+    # exact proven assignment and re-check hard-model + transition safety.
     for project, mode_assignments in final_assignments.items():
+        rows = rows_by_project.get(project, [])
         for mode, proven in mode_assignments.items():
-            replayed = (applied.get(project) or {}).get(mode)
-            if replayed != proven:
-                raise BaselineConstraintVerificationError(
-                    f"PROVEN_ASSIGNMENT_REOPENED: {project}/{mode}: "
-                    f"verified={assignment_fingerprint(proven)}, "
-                    f"replayed={assignment_fingerprint(replayed or {})}. "
-                    "A post-verification solve produced a different assignment; no artifact was emitted."
-                )
-            for row in rows_by_project.get(project, []):
+            _apply_proven_assignment_exact(
+                project=project,
+                mode=mode,
+                rows=rows,
+                assignment=proven,
+                client=client,
+                learned_nogoods=learned[project][mode],
+                global_exact_exclusions=global_exact_exclusions[project][mode],
+                residual_targets=(residual_targets_by_project or {}).get(project, {}),
+            )
+            for row in rows:
                 setattr(row, f"target_{mode}_dynamic_locked", True)
 
     for project, mode_assignments in final_assignments.items():
