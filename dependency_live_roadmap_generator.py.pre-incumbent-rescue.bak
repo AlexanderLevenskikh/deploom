@@ -12640,9 +12640,6 @@ def resolve_peer_compatibility_with_verification(
                                             for name in rows_by_name
                                         },
                                         previous_deferred=_baseline_deferred_cohorts(),
-                                        has_verified_incumbent=(
-                                            anytime.incumbent is not None
-                                        ),
                                         repeated_count=max(
                                             2,
                                             int(
@@ -13001,9 +12998,6 @@ def resolve_peer_compatibility_with_verification(
                                             for name in rows_by_name
                                         },
                                         previous_deferred=_baseline_deferred_cohorts(),
-                                        has_verified_incumbent=(
-                                            anytime.incumbent is not None
-                                        ),
                                         repeated_count=max(
                                             2,
                                             int(

@@ -9,7 +9,6 @@ ordinary package-manager/lifecycle/project-check pipeline accepts it.
 from __future__ import annotations
 
 import dataclasses
-import os
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 AUTHORITY = "DIAGNOSTIC_HINT"
@@ -26,8 +25,6 @@ class UnifiedCohortHandoffPlan:
     queue_decision: object | None = None
     control: object | None = None
     authority: str = AUTHORITY
-    # True only for the autonomous, pre-incumbent safety-floor candidate.
-    bootstrap_floor: bool = False
 
     @property
     def assignment_dict(self) -> dict[str, str]:
@@ -45,7 +42,6 @@ def plan_cohort_handoff(
     policy_by_package: Optional[Mapping[str, str]] = None,
     previous_deferred: Sequence[Mapping[str, object]] = (),
     repeated_count: int = 1,
-    has_verified_incumbent: bool = False,
     confirmed_failed_fingerprints: Iterable[str] = (),
     exact_exclusion_fingerprints: Iterable[str] = (),
     assignment_fingerprint_fn: Callable[[Mapping[str, str]], str] | None = None,
@@ -95,85 +91,6 @@ def plan_cohort_handoff(
     )
     if suggestion is None:
         return UnifiedCohortHandoffPlan(False, "cohort-inference-unavailable")
-
-    # BLOCK_PSI_AUTONOMOUS_PRE_INCUMBENT_RESCUE_V1
-    # A repeated predicate before the first verified incumbent is qualitatively
-    # different from an ordinary failed improvement: continuing to mutate the
-    # desired assignment can burn the whole wall-clock budget without ever
-    # establishing a working floor. In AUTONOMOUS mode, after the predicate is
-    # confirmed twice, schedule exactly one conservative floor candidate:
-    # revert every *auto* direct dependency to its observed current version,
-    # while preserving user-required targets. This is orchestration only. The
-    # candidate receives no compatibility/proof authority and must pass the
-    # ordinary full resolver/lifecycle/project verification before it can become
-    # an incumbent. Once verified, the progressive engine can extend that
-    # incumbent cohort-by-cohort instead of searching from an unverified global
-    # desired point.
-    control_mode = str(
-        os.environ.get("DEPLOOM_BASELINE_CONTROL_MODE") or ""
-    ).strip().upper()
-    repeated = max(1, int(repeated_count or 1))
-    if (
-        control_mode == "AUTONOMOUS"
-        and not bool(has_verified_incumbent)
-        and repeated >= 2
-    ):
-        policies = {
-            str(name): str(value or "auto").strip().lower()
-            for name, value in (policy_by_package or {}).items()
-        }
-        floor_packages = tuple(sorted(
-            str(name)
-            for name, version in assignment.items()
-            if str(name) in current_versions
-            and policies.get(str(name), "auto") == "auto"
-            and str(version) != str(current_versions[str(name)])
-        ))
-        if floor_packages:
-            floor_fallback = _build_fallback(
-                assignment=assignment,
-                current_versions=current_versions,
-                cohort_packages=floor_packages,
-            )
-            if floor_fallback is not None and bool(
-                getattr(floor_fallback, "changed", False)
-            ):
-                floor_candidate = dict(
-                    getattr(floor_fallback, "assignment_dict")
-                )
-                floor_fingerprint = str(
-                    assignment_fingerprint_fn(floor_candidate) or ""
-                ).strip()
-                if floor_fingerprint:
-                    floor_decision = _queue_decision(
-                        floor_fingerprint,
-                        confirmed_failed_fingerprints=tuple(
-                            str(item)
-                            for item in confirmed_failed_fingerprints
-                            if str(item)
-                        ),
-                        exact_exclusion_fingerprints=tuple(
-                            str(item)
-                            for item in exact_exclusion_fingerprints
-                            if str(item)
-                        ),
-                    )
-                    floor_control = _handoff_control(floor_decision)
-                    if bool(getattr(floor_control, "queue_fallback", False)):
-                        return UnifiedCohortHandoffPlan(
-                            True,
-                            "autonomous-pre-incumbent-floor",
-                            suggestion=suggestion,
-                            fallback=floor_fallback,
-                            assignment=tuple(sorted(
-                                (str(k), str(v))
-                                for k, v in floor_candidate.items()
-                            )),
-                            fingerprint=floor_fingerprint,
-                            queue_decision=floor_decision,
-                            control=floor_control,
-                            bootstrap_floor=True,
-                        )
 
     fallback = _build_fallback(
         assignment=assignment,
