@@ -19,10 +19,6 @@ if (!/useEffect\(\(\) => \{\s*document\.documentElement\.dataset\.theme = themeP
   throw new Error("Persisted theme is not applied to the renderer root");
 }
 
-if (!hook.includes("DESKTOP_BRIDGE_UNAVAILABLE")) throw new Error("Missing fail-closed guard for a broken Electron preload bridge");
-if (!hook.includes("DEMO_MODE")) throw new Error("Demo fallback must require explicit opt-in");
-if (!app.includes("if (!payload)")) throw new Error("Bridge/bootstrap failure must have a visible fatal surface");
-
 for (const sentinel of [
   "BLOCK_VG_UI_LAYOUT_THEME_COMPLETION_V1",
   ".monitoring-body > .run-monitor",

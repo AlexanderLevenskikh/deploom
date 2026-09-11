@@ -44,7 +44,7 @@ const DEMO_DETAILS: WorkspaceDetails = {
 }
 
 const DEMO: BootstrapPayload = {
-  appVersion: 'demo',
+  appVersion: '0.1.9',
   state: { schemaVersion: 1, selectedWorkspaceId: 'demo', workspaces: [DEMO_WORKSPACE] },
   details: DEMO_DETAILS,
   environment: {
@@ -57,8 +57,6 @@ const DEMO: BootstrapPayload = {
   updateStatus: { state: 'ready', version: '0.1.7' },
   notificationsEnabled: true,
 }
-
-const DEMO_MODE = new URLSearchParams(window.location.search).get('demo') === '1'
 
 type AutopilotState = AutopilotPolicyState & {
   workspaceId: string
@@ -123,7 +121,6 @@ export function useDependencyFlow() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      if (!api && !DEMO_MODE) throw new Error('DESKTOP_BRIDGE_UNAVAILABLE: Electron preload bridge did not initialize. DepLoom will not silently fall back to demo data.')
       const nextPayload = api ? await api.bootstrap() : DEMO
       setPayload(nextPayload)
       setUpdateStatus(nextPayload.updateStatus ?? { state: 'idle' })

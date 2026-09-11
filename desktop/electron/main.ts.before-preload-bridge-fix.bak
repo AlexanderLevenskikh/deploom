@@ -58,7 +58,6 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const DEFAULT_TEMPLATE_REMOTE = ''
 const DEFAULT_TOOL_REMOTE = ''
 const DASHBOARD_SCHEME = 'dependency-flow-dashboard'
-const MAX_PROMPT_PREVIEW_BYTES = 2 * 1024 * 1024
 protocol.registerSchemesAsPrivileged([
   { scheme: DASHBOARD_SCHEME, privileges: { standard: true, secure: true, supportFetchAPI: true } },
 ])
@@ -6074,28 +6073,6 @@ function setupIpc(): void {
     const state = loadState()
     const workspace = findWorkspace(state)
     return { state, details: await workspaceDetails(workspace) }
-  })
-
-  ipcMain.handle('flow:current-project-prompt-preview', async () => {
-    // Keep filesystem authority in the main process. The renderer supplies no
-    // path: the current prompt is resolved from trusted workspace state only.
-    const state = loadState()
-    const workspace = findWorkspace(state)
-    const details = await workspaceDetails(workspace)
-    const targetPath = details.projectPromptPath
-    if (!targetPath) return undefined
-
-    const info = statSync(targetPath)
-    if (!info.isFile()) throw new Error('Current project prompt is not a file')
-    if (info.size > MAX_PROMPT_PREVIEW_BYTES) throw new Error('Current project prompt is too large to preview')
-    return {
-      path: targetPath,
-      content: readFileSync(targetPath, 'utf8'),
-      stale: Boolean(details.promptStale),
-      mtimeMs: info.mtimeMs,
-      size: info.size,
-      projectName: details.workspace.selectedProject,
-    }
   })
 
   ipcMain.handle('flow:baseline-intent-plan', async (_event, input: { workspaceId?: string; projectName: string }) => {

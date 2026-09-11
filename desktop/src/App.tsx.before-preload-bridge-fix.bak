@@ -27,12 +27,8 @@ function App() {
   const payload = flow.payload
   const details = payload?.details
 
-  if (flow.loading) {
+  if (flow.loading || !payload) {
     return <div className="splash"><Workflow size={28} /><strong>DepLoom</strong><span>{t('app.loading')}</span></div>
-  }
-
-  if (!payload) {
-    return <div className="splash"><Workflow size={28} /><strong>DepLoom</strong><span>{flow.error || 'Desktop bridge is unavailable.'}</span></div>
   }
 
   if (!details) {

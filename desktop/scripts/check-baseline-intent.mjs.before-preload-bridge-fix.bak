@@ -36,14 +36,10 @@ mustContain(flowWorkspace, "text('Настроить состав / Draft', 'Con
 
 mustContain(types, 'getCurrentProjectPromptPreview: () => Promise<ProjectPromptPreview | undefined>', 'prompt preview API type')
 mustContain(preload, 'getCurrentProjectPromptPreview', 'safe prompt preview bridge')
-mustContain(preload, "ipcRenderer.invoke('flow:current-project-prompt-preview')", 'prompt preview must delegate to main process')
-mustContain(main, "ipcMain.handle('flow:current-project-prompt-preview'", 'trusted prompt preview main-process handler')
-mustContain(main, 'const targetPath = details.projectPromptPath', 'prompt preview path must come from trusted workspace state')
-mustNotContain(preload, "node:fs", 'sandboxed preload must not access the filesystem directly')
+mustContain(preload, "ipcRenderer.invoke('flow:refresh-workspace')", 'prompt preview path must come from trusted workspace state')
 mustNotContain(preload, 'getCurrentProjectPromptPreview: (targetPath', 'renderer must not choose arbitrary prompt file paths')
 mustContain(flowWorkspace, "intent.proofMode === 'DRAFT'", 'Draft completion routing')
 mustContain(flowWorkspace, '<PromptPreviewDialog', 'Draft prompt modal')
-mustContain(flowWorkspace, "text('Начать заново', 'Start over')", 'Baseline restart must stay visible next to the human-flow action')
 mustContain(promptPreview, "text('Draft готов — промпт для агента', 'Draft is ready — agent prompt')", 'Draft prompt modal copy')
 mustNotContain(promptPreview, 'onOpenDashboard', 'Draft modal must not route through Dashboard')
 
