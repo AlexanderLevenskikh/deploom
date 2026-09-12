@@ -12393,13 +12393,14 @@ def resolve_peer_compatibility_with_verification(
                         )
                     )
                     if _floor_rescue_requested:
+                        # Bootstrap-floor planning intentionally does not depend on
+                        # predicate-navigation locals (subject_consumers/navigation_graph):
+                        # those are initialized only later in the causal-search path.
                         _floor_plan = plan_cohort_handoff(
                             predicate=failure_predicate,
                             direct_packages=verification_assignment.keys(),
                             assignment=verification_assignment,
                             current_versions=baseline_current_versions,
-                            subject_consumers=subject_consumers,
-                            interaction_graph=navigation_graph,
                             policy_by_package={
                                 name: _baseline_intent_policy(name)
                                 for name in rows_by_name

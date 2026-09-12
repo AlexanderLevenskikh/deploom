@@ -163,5 +163,16 @@ class GeneratorIntegrationTests(unittest.TestCase):
         self.assertIn("_floor_last_predicted_slot", source)
 
 
+    def test_early_rescue_does_not_read_late_navigation_locals(self):
+        source = (ROOT / "dependency_live_roadmap_generator.py").read_text(
+            encoding="utf-8"
+        )
+        start = source.index("BLOCK_PSI_AUTONOMOUS_PRE_INCUMBENT_EARLY_RESCUE_V2")
+        end = source.index("\n                    if stagnated:", start)
+        section = source[start:end]
+        self.assertNotIn("subject_consumers=subject_consumers", section)
+        self.assertNotIn("interaction_graph=navigation_graph", section)
+
+
 if __name__ == "__main__":
     unittest.main()
