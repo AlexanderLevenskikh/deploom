@@ -12419,9 +12419,10 @@ def resolve_peer_compatibility_with_verification(
                             assignment_fingerprint_fn=assignment_fingerprint,
                         )
                         if _floor_plan.actionable and _floor_plan.bootstrap_floor:
+                            extension_granted = False
                             if exact_nogood not in global_exact_exclusions[project][mode]:
                                 global_exact_exclusions[project][mode].append(exact_nogood)
-                                liveness.record_exact_exclusion()
+                                extension_granted = liveness.record_exact_exclusion()
                             _floor_assignment = _floor_plan.assignment_dict
                             _floor_fingerprint = _floor_plan.fingerprint
                             pending_promising_assignments.offer(
@@ -12446,6 +12447,7 @@ def resolve_peer_compatibility_with_verification(
                                 repeatedPredicateCount=anytime.repeated_predicate_count,
                                 remainingBudgetSeconds=round(_floor_remaining_seconds, 3),
                                 estimatedCandidateSeconds=round(_floor_estimated_seconds, 3),
+                                extensionGranted=extension_granted,
                                 authority=EVIDENCE_DIAGNOSTIC_HINT,
                             )
                             checkpoint_baseline_run(
