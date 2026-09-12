@@ -12365,6 +12365,97 @@ def resolve_peer_compatibility_with_verification(
                         predicate=failure_predicate,
                         learned_constraints=len(learned[project][mode]),
                     )
+                    # BLOCK_PSI_AUTONOMOUS_PRE_INCUMBENT_EARLY_RESCUE_V2
+                    # Reserve the last predicted expensive slot for acquiring a verified floor,
+                    # instead of spending it on another unverified global-neighbor candidate.
+                    _floor_remaining_seconds = max(
+                        0.0,
+                        anytime.policy.wall_clock_seconds - anytime.elapsed_seconds,
+                    )
+                    _floor_estimated_seconds = max(
+                        0.0,
+                        anytime.candidate_duration_ewma_seconds,
+                    )
+                    _floor_last_predicted_slot = (
+                        _floor_estimated_seconds > 0.0
+                        and _floor_remaining_seconds > _floor_estimated_seconds
+                        and _floor_remaining_seconds <= (_floor_estimated_seconds * 2.25)
+                    )
+                    _floor_rescue_requested = (
+                        _baseline_background_autonomous()
+                        and anytime.incumbent is None
+                        and (
+                            anytime.repeated_predicate_count >= 2
+                            or (
+                                anytime.repeated_predicate_count >= 1
+                                and _floor_last_predicted_slot
+                            )
+                        )
+                    )
+                    if _floor_rescue_requested:
+                        _floor_plan = plan_cohort_handoff(
+                            predicate=failure_predicate,
+                            direct_packages=verification_assignment.keys(),
+                            assignment=verification_assignment,
+                            current_versions=baseline_current_versions,
+                            subject_consumers=subject_consumers,
+                            interaction_graph=navigation_graph,
+                            policy_by_package={
+                                name: _baseline_intent_policy(name)
+                                for name in rows_by_name
+                            },
+                            previous_deferred=_baseline_deferred_cohorts(),
+                            repeated_count=max(
+                                1,
+                                int(anytime.repeated_predicate_count or 0),
+                            ),
+                            has_verified_incumbent=False,
+                            bootstrap_floor_requested=True,
+                            confirmed_failed_fingerprints=confirmed_failed_assignments,
+                            exact_exclusion_fingerprints=(
+                                assignment_fingerprint(item)
+                                for item in global_exact_exclusions[project][mode]
+                            ),
+                            assignment_fingerprint_fn=assignment_fingerprint,
+                        )
+                        if _floor_plan.actionable and _floor_plan.bootstrap_floor:
+                            if exact_nogood not in global_exact_exclusions[project][mode]:
+                                global_exact_exclusions[project][mode].append(exact_nogood)
+                                liveness.record_exact_exclusion()
+                            _floor_assignment = _floor_plan.assignment_dict
+                            _floor_fingerprint = _floor_plan.fingerprint
+                            pending_promising_assignments.offer(
+                                project,
+                                mode,
+                                build_promising_assignment(
+                                    assignment=_floor_assignment,
+                                    assignment_fingerprint=_floor_fingerprint,
+                                    originating_predicate=failure_predicate,
+                                    removed_predicates=(),
+                                    remaining_predicates=(failure_predicate,),
+                                ),
+                            )
+                            progress_reporter.emit(
+                                project,
+                                mode,
+                                "autonomous-pre-incumbent-floor-queued",
+                                iteration=iteration,
+                                assignment=fingerprint,
+                                candidate=_floor_fingerprint,
+                                predicate=failure_predicate,
+                                repeatedPredicateCount=anytime.repeated_predicate_count,
+                                remainingBudgetSeconds=round(_floor_remaining_seconds, 3),
+                                estimatedCandidateSeconds=round(_floor_estimated_seconds, 3),
+                                authority=EVIDENCE_DIAGNOSTIC_HINT,
+                            )
+                            checkpoint_baseline_run(
+                                "autonomous-pre-incumbent-floor-queued",
+                                completed_iteration=iteration,
+                                last_assignment=fingerprint,
+                                last_predicate=failure_predicate,
+                            )
+                            continue
+
                     if stagnated:
                         implicated = predicate_package(failure_predicate)
                         if implicated and implicated in baseline_current_versions:

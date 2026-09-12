@@ -124,11 +124,43 @@ class AutonomousPreIncumbentRescueTests(unittest.TestCase):
         self.assertFalse(plan.bootstrap_floor)
 
 
+    def test_budget_reserved_floor_can_trigger_after_first_observation(self):
+        os.environ["DEPLOOM_BASELINE_CONTROL_MODE"] = "AUTONOMOUS"
+        plan = self.plan(
+            repeated_count=1,
+            bootstrap_floor_requested=True,
+        )
+        self.assertTrue(plan.actionable)
+        self.assertTrue(plan.bootstrap_floor)
+        self.assertEqual(
+            {"plugin": "1", "other": "1", "must": "2"},
+            plan.assignment_dict,
+        )
+
+    def test_floor_does_not_depend_on_cohort_inference(self):
+        os.environ["DEPLOOM_BASELINE_CONTROL_MODE"] = "AUTONOMOUS"
+
+        def no_cohort(**_kwargs):
+            return None
+
+        plan = self.plan(_infer_cohort=no_cohort)
+        self.assertTrue(plan.actionable)
+        self.assertTrue(plan.bootstrap_floor)
+        self.assertIsNone(plan.suggestion)
+
+
+
 class GeneratorIntegrationTests(unittest.TestCase):
     def test_generator_passes_incumbent_context_to_both_handoff_paths(self):
         source = (ROOT / "dependency_live_roadmap_generator.py").read_text(encoding="utf-8")
         self.assertGreaterEqual(source.count("has_verified_incumbent=("), 2)
         self.assertIn("anytime.incumbent is not None", source)
+        self.assertEqual(
+            source.count("stagnated = anytime.observe_candidate("),
+            source.count("BLOCK_PSI_AUTONOMOUS_PRE_INCUMBENT_EARLY_RESCUE_V2"),
+        )
+        self.assertIn("bootstrap_floor_requested=True", source)
+        self.assertIn("_floor_last_predicted_slot", source)
 
 
 if __name__ == "__main__":

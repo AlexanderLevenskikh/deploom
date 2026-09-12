@@ -46,6 +46,7 @@ def plan_cohort_handoff(
     previous_deferred: Sequence[Mapping[str, object]] = (),
     repeated_count: int = 1,
     has_verified_incumbent: bool = False,
+    bootstrap_floor_requested: bool = False,
     confirmed_failed_fingerprints: Iterable[str] = (),
     exact_exclusion_fingerprints: Iterable[str] = (),
     assignment_fingerprint_fn: Callable[[Mapping[str, str]], str] | None = None,
@@ -83,32 +84,11 @@ def plan_cohort_handoff(
             False, "assignment-fingerprint-function-missing"
         )
 
-    suggestion = _infer_cohort(
-        predicate=str(predicate or ""),
-        direct_packages=tuple(direct_packages),
-        focus_package=str(focus_package or ""),
-        subject_consumers=subject_consumers,
-        interaction_graph=interaction_graph,
-        policy_by_package=policy_by_package,
-        previous_deferred=previous_deferred,
-        repeated_count=max(1, int(repeated_count or 1)),
-    )
-    if suggestion is None:
-        return UnifiedCohortHandoffPlan(False, "cohort-inference-unavailable")
-
     # BLOCK_PSI_AUTONOMOUS_PRE_INCUMBENT_RESCUE_V1
-    # A repeated predicate before the first verified incumbent is qualitatively
-    # different from an ordinary failed improvement: continuing to mutate the
-    # desired assignment can burn the whole wall-clock budget without ever
-    # establishing a working floor. In AUTONOMOUS mode, after the predicate is
-    # confirmed twice, schedule exactly one conservative floor candidate:
-    # revert every *auto* direct dependency to its observed current version,
-    # while preserving user-required targets. This is orchestration only. The
-    # candidate receives no compatibility/proof authority and must pass the
-    # ordinary full resolver/lifecycle/project verification before it can become
-    # an incumbent. Once verified, the progressive engine can extend that
-    # incumbent cohort-by-cohort instead of searching from an unverified global
-    # desired point.
+    # Bootstrap-floor planning is intentionally independent from cohort inference.
+    # The floor is not a claim that any cohort is incompatible: it is only a
+    # conservative exact candidate that still requires ordinary full physical
+    # verification before it can become an incumbent.
     control_mode = str(
         os.environ.get("DEPLOOM_BASELINE_CONTROL_MODE") or ""
     ).strip().upper()
@@ -116,7 +96,7 @@ def plan_cohort_handoff(
     if (
         control_mode == "AUTONOMOUS"
         and not bool(has_verified_incumbent)
-        and repeated >= 2
+        and (repeated >= 2 or bool(bootstrap_floor_requested))
     ):
         policies = {
             str(name): str(value or "auto").strip().lower()
@@ -163,7 +143,7 @@ def plan_cohort_handoff(
                         return UnifiedCohortHandoffPlan(
                             True,
                             "autonomous-pre-incumbent-floor",
-                            suggestion=suggestion,
+                            suggestion=None,
                             fallback=floor_fallback,
                             assignment=tuple(sorted(
                                 (str(k), str(v))
@@ -174,6 +154,19 @@ def plan_cohort_handoff(
                             control=floor_control,
                             bootstrap_floor=True,
                         )
+
+    suggestion = _infer_cohort(
+        predicate=str(predicate or ""),
+        direct_packages=tuple(direct_packages),
+        focus_package=str(focus_package or ""),
+        subject_consumers=subject_consumers,
+        interaction_graph=interaction_graph,
+        policy_by_package=policy_by_package,
+        previous_deferred=previous_deferred,
+        repeated_count=max(1, int(repeated_count or 1)),
+    )
+    if suggestion is None:
+        return UnifiedCohortHandoffPlan(False, "cohort-inference-unavailable")
 
     fallback = _build_fallback(
         assignment=assignment,
