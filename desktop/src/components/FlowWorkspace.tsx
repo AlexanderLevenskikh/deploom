@@ -55,11 +55,16 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
   // Draft completion is resolved by runId from workspace state, not by watching
   // file mtime/size. The user dismisses a finished Draft once per run; the ack
   // map keys by project so switching projects does not hide another project's
-  // fresh result. Everything below is renderer-local (not persisted) -- after a
-  // restart the banner simply reappears, which is the safe default.
+  // fresh result. Above that, only projects where the user actually launched a
+  // Draft this session (intent.proofMode === 'DRAFT') route the completion
+  // banner: a verified Baseline never produces workspace.draftResult, and the
+  // guard keeps that routing explicit. Everything below is renderer-local (not
+  // persisted); after a restart a Draft result is still reachable via the
+  // artifact paths on the card and in the run output.
   const [acknowledgedDraftRunIds, setAcknowledgedDraftRunIds] = useState<Record<string, string>>({})
+  const [launchedDraftProjects, setLaunchedDraftProjects] = useState<Set<string>>(new Set())
   const draftResult = details.draftResult
-  const draftResultFresh = Boolean(draftResult && draftResult.runId !== acknowledgedDraftRunIds[project.name])
+  const draftResultFresh = Boolean(draftResult && launchedDraftProjects.has(project.name) && draftResult.runId !== acknowledgedDraftRunIds[project.name])
   const acknowledgeDraftResult = () => { if (draftResult) setAcknowledgedDraftRunIds((current) => ({ ...current, [project.name]: draftResult.runId })) }
   const openDraftPrompt = async () => {
     try {
@@ -207,6 +212,12 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
       pending.mode === 'decision' &&
       baselinePolicyIdentity(pending.plan.intent) !== baselinePolicyIdentity(intent)
     const effectiveBaselineResume = policyChanged ? 'restart' : pending.resume
+    // A Draft launch arms the run-scoped completion banner for this project; a
+    // verified Baseline never produces workspace.draftResult, so only Draft
+    // launches may route the banner.
+    if (intent.proofMode === 'DRAFT') {
+      setLaunchedDraftProjects((current) => new Set(current).add(project.name))
+    }
     await onRun({ action: 'baseline', workspaceId: details.workspace.id, projectName: project.name, target, label, releaseBranch, gateCommand, baselineResume: effectiveBaselineResume, baselineIntent: intent, commitMessage: `chore(deps): save ${project.name} roadmap state` })
     // Completion is delivered through the runId-scoped draft result in
     // workspace details (main.ts imports artifacts/runs/<runId>/draft/*
