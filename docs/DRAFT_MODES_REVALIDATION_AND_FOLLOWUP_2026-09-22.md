@@ -38,13 +38,13 @@
 
 Обычный browser URL без demo=1 ожидаемо показывает DESKTOP_BRIDGE_UNAVAILABLE, поскольку Electron preload в браузере отсутствует. Для визуального smoke явно включён существующий demo-режим. Это НЕ доказательство работающего Electron IPC, реальной установки пакетов, внешнего агента или release. Desktop end-to-end не запускался. Browser проверка охватывает desktop viewport; mobile не проверялся, продукт — Desktop.
 
-Локальные диагностические скрипты и результаты, созданные в разрешённом каталоге вне репозитория:
+Локальные диагностические скрипты и результаты, созданные в разрешённом каталоге вне репозитория (пути к временным файлам профиля опущены для публичной сдачи; см. `docs/DRAFT_MODES_REVALIDATION_REPORT_2026-09-23.md`):
 
-- `C:/Users/levenskikh/.codex/visualizations/2026/09/22/01a0c957-8c3b-76f3-b012-c4eee2196982/revalidate_draft.py`
-- `C:/Users/levenskikh/.codex/visualizations/2026/09/22/01a0c957-8c3b-76f3-b012-c4eee2196982/revalidate_draft_more.py`
-- `C:/Users/levenskikh/.codex/visualizations/2026/09/22/01a0c957-8c3b-76f3-b012-c4eee2196982/revalidate_desktop.cjs`
-- `C:/Users/levenskikh/.codex/visualizations/2026/09/22/01a0c957-8c3b-76f3-b012-c4eee2196982/desktop-probe-results.json`
-- `C:/Users/levenskikh/.codex/visualizations/2026/09/22/01a0c957-8c3b-76f3-b012-c4eee2196982/draft-validation-fixtures/`
+- `revalidate_draft.py`
+- `revalidate_draft_more.py`
+- `revalidate_desktop.cjs`
+- `desktop-probe-results.json`
+- `draft-validation-fixtures/`
 
 Скрипты — диагностические стенды; фикстуры создаются с отказом при повторном существовании каталогов. Для регулярного CI перенести подтверждённые сценарии в изолированные тесты с собственным lifecycle. В первом скрипте pnpm-проба имела конфликт менеджера и npm lock, а OSV stub был неполон: эти два предварительных результата не используются как доказательство. Второй скрипт воспроизводит оба случая на корректных входах.
 
@@ -197,6 +197,4 @@ CLI --mode draft/fast/deep добавлен, но фактический Draft-b
 
 Текущая проверка не меняла код приложения. Добавлен только этот документ; диагностические файлы находятся вне Git-репозитория.
 
-Снимок проверенного диалога (demo UI, 1280×720; показывает текущие поля и отсутствие настроек freshness/трёх режимов):
-
-![Baseline settings v0.2.118](C:/Users/levenskikh/.codex/visualizations/2026/09/22/01a0c957-8c3b-76f3-b012-c4eee2196982/baseline-settings-v02118.png)
+Снимок проверенного диалога (demo UI, 1280×720; показывает текущие поля и отсутствие настроек freshness/трёх режимов) выполнен для v0.2.118 и сохранён в локальной диагностической папке (в публичную сдачу не включается; свежие UI-снимки после исправлений — `.playwright-mcp/flow-after-tab-return.png` и `.playwright-mcp/r10-flow-live.png`).
