@@ -1055,15 +1055,20 @@ class ProjectHealth:
     # a target for it. Without this the UI can only say "77.8%" and leave the
     # user guessing which packages that number is about.
     lag_blockers: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
-    # How many more dependencies must become lag-compliant to reach the 80%
-    # yellow threshold (0 when already there).
+    # How many more dependencies must become lag-compliant to reach the
+    # configured yellow gate (0 when already there).
     lag_needed_for_yellow: int = 0
-    # Installed health stays anchored to the hard 80% gate. Planning is
+    # Installed health stays anchored to the effective gate. Planning is
     # projected separately after compatibility/registry narrowing.
     yellow_plan_required: int = 0
     yellow_projected_lag_ok: int = 0
     yellow_projected_lag_pct: float = 0.0
     yellow_plan_shortfall: int = 0
+    # R9: the stricter green closure goal (user gate + 10 points).
+    green_required: int = 0
+    green_projected_lag_ok: int = 0
+    green_projected_lag_pct: float = 0.0
+    green_plan_shortfall: int = 0
 
 
 @dataclasses.dataclass
@@ -2130,6 +2135,21 @@ def resolved_current_version(
     )
 
 
+def _draft_progress(client: Any, **kwargs: Any) -> None:
+    """Best-effort Draft progress emission that tolerates non-LiveData clients.
+
+    analyze_project/_publish_draft_and_exit are also exercised by unit tests
+    with stub client objects that expose only the network surface; progress
+    reporting must never break the real analyis path.
+    """
+    progress = getattr(client, "progress", None)
+    if callable(progress):
+        try:
+            progress(**kwargs)
+        except Exception:
+            pass
+
+
 class LiveDataClient:
     def __init__(self, registry: str, timeout: int, batch_size: int, sleep_sec: float, use_system_proxy: bool = False):
         self.registry = registry.rstrip("/")
@@ -2161,6 +2181,72 @@ class LiveDataClient:
         self.registry_types_cache = {}
         self.registry_runtime_entrypoint_cache = {}
         self.registry_self_types_cache = {}
+        # Optional run deadline (Draft). When set, every request is bounded by
+        # the remaining budget and the budget is checked before each attempt.
+        self.deadline: Optional["DeadlineClock"] = None
+        # Draft progress reporting (R8): as a Draft run the client emits a
+        # one-line JSON payload on stdout per network operation so the Desktop
+        # can render a live strip (heartbeat, step, package, operation, retry).
+        # Emission is best-effort and never throws.
+        self.run_id: Optional[str] = None
+        self.draft = False
+        self._progress_project: Optional[str] = None
+
+    def set_deadline(self, deadline: Optional["DeadlineClock"]) -> None:
+        self.deadline = deadline
+
+    def set_draft_run(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.draft = True
+
+    def for_project(self, project: str) -> "LiveDataClient":
+        self._progress_project = project
+        return self
+
+    def progress(
+        self,
+        operation: Optional[str] = None,
+        package: Optional[str] = None,
+        retry: Optional[int] = None,
+        step: Optional[str] = None,
+        completed: Optional[int] = None,
+        total: Optional[int] = None,
+        status: Optional[str] = None,
+    ) -> None:
+        if not self.draft:
+            return
+        try:
+            payload = {
+                "runId": self.run_id or "",
+                "project": getattr(self, "_progress_project", None),
+                "step": step,
+                "package": package,
+                "operation": operation,
+                "retry": retry,
+                "completed": completed,
+                "total": total,
+                "status": status,
+            }
+            print(f"[draft-progress] {json.dumps(payload, ensure_ascii=False)}", flush=True)
+        except Exception:
+            pass
+
+    def _budgeted_timeout(self) -> int:
+        """Effective per-request timeout honouring the run deadline.
+
+        Returns a whole-second bound no larger than the remaining budget so a
+        single request cannot outlive the Draft run; raises DraftBudgetExceeded
+        once the budget is already exhausted before the request starts.
+        """
+        if self.deadline is None:
+            return self.timeout
+        self.deadline.check("network")
+        remaining = self.deadline.remaining
+        if remaining is None:
+            return self.timeout
+        if remaining <= 0:
+            raise DraftBudgetExceeded("network")
+        return max(1, min(int(remaining), self.timeout))
 
     @staticmethod
     def _origin_tuple(url: str) -> Tuple[str, str, int]:
@@ -2221,6 +2307,7 @@ class LiveDataClient:
         if key in self.registry_artifact_cache:
             return dict(self.registry_artifact_cache[key])
 
+        self.progress(operation=f"artifact probe {version}", package=pkg, step="scan")
         tarball_url = self.registry_tarball_url(meta, version)
         evidence: Dict[str, Any] = {
             "package": pkg,
@@ -2247,7 +2334,7 @@ class LiveDataClient:
         try:
             response = self.session.get(
                 tarball_url,
-                timeout=self.timeout,
+                timeout=self._budgeted_timeout(),
                 stream=True,
                 headers={"Range": "bytes=0-0", "Accept": "application/octet-stream"},
                 allow_redirects=True,
@@ -2265,6 +2352,8 @@ class LiveDataClient:
                 else:
                     evidence["status"] = "empty-artifact"
                     evidence["error"] = "registry returned an empty artifact response"
+        except DraftBudgetExceeded:
+            raise
         except requests.HTTPError as exc:
             status = int(getattr(exc.response, "status_code", 0) or 0)
             if status in {404, 410}:
@@ -2383,12 +2472,14 @@ class LiveDataClient:
     def fetch_npm_metadata(self, pkg: str):
         if pkg in self.npm_cache:
             return self.npm_cache[pkg]
+        self.progress(operation="registry metadata", package=pkg, step="scan")
         encoded = pkg.replace("/", "%2F")
         url = f"{self.registry}/{encoded}"
         last_error = ""
         for attempt in range(1, REGISTRY_METADATA_MAX_ATTEMPTS + 1):
             try:
-                response = self.session.get(url, timeout=self.timeout)
+                self.progress(operation="registry metadata", package=pkg, retry=attempt - 1, step="scan")
+                response = self.session.get(url, timeout=self._budgeted_timeout())
                 status = int(getattr(response, "status_code", 0) or 0)
                 if status == 404:
                     # A real 404 is a deterministic registry fact. Unlike a
@@ -2402,6 +2493,8 @@ class LiveDataClient:
                 self.npm_cache[pkg] = data
                 time.sleep(self.sleep_sec)
                 return data
+            except DraftBudgetExceeded:
+                raise
             except requests.HTTPError as exc:
                 status = int(getattr(exc.response, "status_code", 0) or 0)
                 if status == 404:
@@ -2440,6 +2533,7 @@ class LiveDataClient:
     ) -> Dict[str, List[Dict[str, Any]]]:
         result: Dict[str, List[Dict[str, Any]]] = {}
         missing = [v for v in versions if (pkg, v) not in self.osv_cache]
+        self.progress(operation=f"OSV query ({len(missing)} version(s))", package=pkg, step="scan")
         batch_total = (len(missing) + self.batch_size - 1) // self.batch_size if missing else 0
         for i in range(0, len(missing), self.batch_size):
             batch = missing[i:i + self.batch_size]
@@ -2454,7 +2548,7 @@ class LiveDataClient:
                 for v in batch
             ]}
             try:
-                r = self.session.post(OSV_QUERY_BATCH, json=payload, timeout=self.timeout)
+                r = self.session.post(OSV_QUERY_BATCH, json=payload, timeout=self._budgeted_timeout())
                 r.raise_for_status()
                 data = r.json().get("results", [])
                 for v, item in zip(batch, data):
@@ -2465,6 +2559,8 @@ class LiveDataClient:
                             details.append(self.fetch_osv_vuln(vuln_id))
                     self.osv_cache[(pkg, v)] = details
                 time.sleep(self.sleep_sec)
+            except DraftBudgetExceeded:
+                raise
             except VulnerabilityEvidenceUnavailable:
                 raise
             except Exception as e:
@@ -2485,8 +2581,9 @@ class LiveDataClient:
     def fetch_osv_vuln(self, vuln_id: str) -> Dict[str, Any]:
         if vuln_id in self.vuln_detail_cache:
             return self.vuln_detail_cache[vuln_id]
+        self.progress(operation="OSV detail", package=vuln_id, step="scan")
         try:
-            r = self.session.get(OSV_VULN.format(id=vuln_id), timeout=self.timeout)
+            r = self.session.get(OSV_VULN.format(id=vuln_id), timeout=self._budgeted_timeout())
             r.raise_for_status()
             data = r.json()
             if not isinstance(data, dict):
@@ -2494,6 +2591,8 @@ class LiveDataClient:
             self.vuln_detail_cache[vuln_id] = data
             time.sleep(self.sleep_sec)
             return data
+        except DraftBudgetExceeded:
+            raise
         except Exception as e:
             raise VulnerabilityEvidenceUnavailable(
                 f"OSV_VULN_DETAIL_UNAVAILABLE: {vuln_id}: {str(e)[-500:]}"
@@ -2503,17 +2602,20 @@ class LiveDataClient:
     def fetch_text(self, url: str, quiet: bool = True) -> Optional[str]:
         if url in self.text_cache:
             return self.text_cache[url]
+        self.progress(operation="fetch text", step="scan")
         try:
             headers = {"Accept": "text/plain, text/markdown, application/json"}
             token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
             if token and "github" in url:
                 headers["Authorization"] = f"Bearer {token}"
-            response = self.session.get(url, timeout=self.timeout, headers=headers)
+            response = self.session.get(url, timeout=self._budgeted_timeout(), headers=headers)
             response.raise_for_status()
             text = response.text
             self.text_cache[url] = text
             time.sleep(self.sleep_sec)
             return text
+        except DraftBudgetExceeded:
+            raise
         except Exception as exc:
             if not quiet:
                 eprint(f"[warn] text unavailable {url}: {exc}")
@@ -2523,17 +2625,20 @@ class LiveDataClient:
     def fetch_json_url(self, url: str, quiet: bool = True) -> Optional[Any]:
         if url in self.json_cache:
             return self.json_cache[url]
+        self.progress(operation="fetch json", step="scan")
         try:
             headers = {"Accept": "application/vnd.github+json, application/json"}
             token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
             if token and "api.github.com" in url:
                 headers["Authorization"] = f"Bearer {token}"
-            response = self.session.get(url, timeout=self.timeout, headers=headers)
+            response = self.session.get(url, timeout=self._budgeted_timeout(), headers=headers)
             response.raise_for_status()
             data = response.json()
             self.json_cache[url] = data
             time.sleep(self.sleep_sec)
             return data
+        except DraftBudgetExceeded:
+            raise
         except Exception as exc:
             if not quiet:
                 eprint(f"[warn] json unavailable {url}: {exc}")
@@ -2544,8 +2649,9 @@ class LiveDataClient:
     def fetch_bytes(self, url: str, quiet: bool = True, max_bytes: int = 8 * 1024 * 1024) -> Optional[bytes]:
         if url in self.bytes_cache:
             return self.bytes_cache[url]
+        self.progress(operation="fetch data", step="scan")
         try:
-            response = self.session.get(url, timeout=self.timeout, stream=True)
+            response = self.session.get(url, timeout=self._budgeted_timeout(), stream=True)
             response.raise_for_status()
             content_length = int(response.headers.get("Content-Length") or 0)
             if content_length and content_length > max_bytes:
@@ -3879,6 +3985,11 @@ def _prefetch_registry_metadata(
     })
     if not names:
         return
+    if getattr(client, "deadline", None) is not None:
+        # Draft: per-package metadata is fetched by the deadline-aware row loop
+        # below; a parallel pool would swallow the per-future DraftBudgetExceeded
+        # signal and hide the run deadline from publication.
+        return
     workers = max(1, min(int(max_workers), 16, len(names)))
     if workers <= 1:
         for name in names:
@@ -3995,6 +4106,11 @@ def _prefetch_osv_evidence(
     names = sorted(name for name, versions in jobs.items() if versions)
     if not names:
         return
+    if getattr(client, "deadline", None) is not None:
+        # Draft: OSV evidence is queried sequentially by the deadline-aware row
+        # loop (query_osv_versions); the parallel pre-warm pool would swallow
+        # per-future DraftBudgetExceeded and hide the run deadline.
+        return
     workers = max(1, min(int(max_workers), 16, len(names)))
     started = time.perf_counter()
     def fetch_one(name: str) -> Tuple[Dict[Tuple[str, str], Any], Dict[str, Any]]:
@@ -4103,17 +4219,35 @@ def analyze_project(
         progress_label=label,
         tolerate=tolerate_registry_failure,
     )
-    _prefetch_osv_evidence(
-        client,
-        project,
-        dependencies,
-        lock=lock,
-        include_prerelease=include_prerelease,
-        max_candidates=max_candidates,
-        progress_label=label,
-    )
+    try:
+        _prefetch_osv_evidence(
+            client,
+            project,
+            dependencies,
+            lock=lock,
+            include_prerelease=include_prerelease,
+            max_candidates=max_candidates,
+            progress_label=label,
+        )
+    except VulnerabilityEvidenceUnavailable:
+        if not tolerate_registry_failure:
+            raise
+        eprint(
+            f"[warn] {label}: OSV prefetch inconsistent; "
+            "Draft continues with per-package queries and records unknown instead of failing"
+        )
 
     for dependency_index, (name, kind, spec) in enumerate(dependencies, start=1):
+        if getattr(client, "deadline", None) is not None:
+            client.deadline.check(f"dependency:{name}")
+        _draft_progress(
+            client,
+            operation="analyze dependency",
+            package=name,
+            step="scan",
+            completed=dependency_index,
+            total=len(dependencies),
+        )
         dependency_started = time.perf_counter()
         dependency_label = f"{progress_prefix} [dependency {dependency_index}/{len(dependencies)}] {name}".strip()
         intent_policy = _baseline_intent_policy(name)
@@ -4298,15 +4432,26 @@ def analyze_project(
         except VulnerabilityEvidenceUnavailable:
             if not tolerate_registry_failure:
                 raise
+            vulns = None
             eprint(
                 f"[warn] {dependency_label}: OSV evidence unavailable; "
-                "Draft records vulnerability state as unknown instead of failing"
+                "Draft records vulnerability state as unknown -- safe targets are NOT invented from an empty finding list"
             )
-            vulns = {}
-        current_summary = vuln_summary(vulns.get(current, []))
-        min_nc = min_by_vuln(candidates, vulns, "no-critical", target_available)
-        min_nh = min_by_vuln(candidates, vulns, "no-high", target_available)
-        min_nv = min_by_vuln(candidates, vulns, "no-vuln", target_available)
+        if vulns is None:
+            # Honest UNKNOWN: an unavailable OSV source is not "zero findings".
+            # A row marked no-critical/no-vuln from an empty list would
+            # advertise an unverified exemption, so vulnerability-based safe
+            # targets stay unavailable and the row carries an explicit marker.
+            current_summary = "unknown"
+            min_nc = "неизвестно"
+            min_nh = "неизвестно"
+            min_nv = "неизвестно"
+            notes.append("OSV evidence недоступен: уязвимости неизвестны, safe target по уязвимостям не вычислялся")
+        else:
+            current_summary = vuln_summary(vulns.get(current, []))
+            min_nc = min_by_vuln(candidates, vulns, "no-critical", target_available)
+            min_nh = min_by_vuln(candidates, vulns, "no-high", target_available)
+            min_nv = min_by_vuln(candidates, vulns, "no-vuln", target_available)
         min_12 = min_by_lag(meta, candidates, 12, latest_override=latest, is_available=target_available)
         min_9 = min_by_lag(meta, candidates, 9, latest_override=latest, is_available=target_available)
         min_6 = min_by_lag(meta, candidates, 6, latest_override=latest, is_available=target_available)
@@ -4680,6 +4825,42 @@ LAG_TARGET_BUFFER_MONTHS = 3
 YELLOW_HEALTH_RATIO = (8, 10)
 # The executable plan keeps a five-point reserve above the release gate.
 YELLOW_PLANNING_RATIO = (17, 20)
+
+# R9: the effective, versioned target policy for the current run. Values are
+# set from --min-lag-ok-pct / --target-level (or the matching DEPLOOM_BASELINE_*
+# environment), become part of the policy snapshot/hash and feed the health and
+# acceptance thresholds, so changing the user's criteria actually changes the
+# plan and the goal condition. Defaults keep the legacy 80 % yellow gate.
+EFFECTIVE_MIN_LAG_OK_PCT = 80
+EFFECTIVE_TARGET_LEVEL = "yellow"
+
+
+def health_yellow_ratio() -> Tuple[int, int]:
+    """Release-gate ratio for the configured minimum lag-compliant share.
+
+    (pct, 100) keeps the same ceil semantics as YELLOW_HEALTH_RATIO=(8, 10)
+    when pct == 80 while letting a user setting change the gate.
+    """
+    pct = max(0, min(100, int(EFFECTIVE_MIN_LAG_OK_PCT)))
+    if pct >= 100:
+        return (1, 1)
+    return (pct, 100)
+
+
+def health_green_ratio() -> Tuple[int, int]:
+    """Stricter green closure goal: ten points above the user's yellow gate."""
+    pct = max(0, min(100, int(EFFECTIVE_MIN_LAG_OK_PCT) + 10))
+    if pct >= 100:
+        return (1, 1)
+    return (pct, 100)
+
+
+def health_planning_ratio() -> Tuple[int, int]:
+    """Executable-plan reserve: five points above the user's gate (legacy 85% at the default 80%)."""
+    pct = max(0, min(100, int(EFFECTIVE_MIN_LAG_OK_PCT) + 5))
+    if pct >= 100:
+        return (1, 1)
+    return (pct, 100)
 
 
 def required_ratio_count(total: int, ratio: Tuple[int, int]) -> int:
@@ -5104,9 +5285,11 @@ def compute_project_health(
     lag_bad = total - lag_ok
     lag_pct = (lag_ok / total * 100.0) if total else 100.0
     # -(-a // b) is integer ceil: the smallest lag_ok that still satisfies
-    # lag_ok / total >= 0.80 without float rounding surprises at the boundary.
-    yellow_required = required_ratio_count(total, YELLOW_HEALTH_RATIO)
-    yellow_plan_required = required_ratio_count(total, YELLOW_PLANNING_RATIO)
+    # lag_ok / total >= minLagOkPct without float rounding surprises at the
+    # boundary. The gate follows the user's effective policy (R9), so changing
+    # 80 -> 90 really moves the goal condition.
+    yellow_required = required_ratio_count(total, health_yellow_ratio())
+    yellow_plan_required = required_ratio_count(total, health_planning_ratio())
     lag_needed_for_yellow = max(0, yellow_required - lag_ok)
     yellow_projected_lag_ok = (
         sum(1 for row in lag_known_rows if dependency_is_lag_ok_after_planned_target(row, "yellow"))
@@ -5114,6 +5297,13 @@ def compute_project_health(
     )
     yellow_projected_lag_pct = (yellow_projected_lag_ok / total * 100.0) if total else 100.0
     yellow_plan_shortfall = max(0, yellow_plan_required - yellow_projected_lag_ok)
+    green_required = required_ratio_count(total, health_green_ratio())
+    green_projected_lag_ok = (
+        sum(1 for row in lag_known_rows if dependency_is_lag_ok_after_planned_target(row, "green"))
+        + removed_closed
+    )
+    green_projected_lag_pct = (green_projected_lag_ok / total * 100.0) if total else 100.0
+    green_plan_shortfall = max(0, green_required - green_projected_lag_ok)
     lag_blockers = [
         {
             "package": row.name,
@@ -5139,12 +5329,20 @@ def compute_project_health(
         counts = parse_vuln_counts(r.current_vulns)
         for k in totals:
             totals[k] += counts.get(k, 0)
+    # An unavailable OSV source is NOT a finding of zero vulnerabilities. Count
+    # rows whose vuln state is genuinely unknown so the plan/prompt show honest
+    # coverage instead of implying "no vulnerabilities" (R3).
+    vuln_unknown_rows = sum(
+        1
+        for r in active_rows
+        if str(r.current_vulns or "").strip().lower() in ("unknown", "неизвестно", "—", "registry unavailable", "not assessed")
+    )
 
     critical = totals["C"]
     high = totals["H"]
     moderate = totals["M"]
     low = totals["L"]
-    unknown = totals["U"]
+    unknown = totals["U"] + vuln_unknown_rows
 
     if critical > 0:
         status = "red"
@@ -5154,9 +5352,9 @@ def compute_project_health(
     elif total == 0:
         status = "yellow" if lag_unknown else "green"
         reason = f"lag-policy target неизвестен для {lag_unknown} зависимостей" if lag_unknown else "нет зависимостей в активном scope"
-    elif lag_pct < 80.0:
+    elif lag_pct < float(EFFECTIVE_MIN_LAG_OK_PCT):
         status = "red"
-        reason = f"только {lag_pct:.1f}% библиотек соблюдают свою lag-policy (<80%)"
+        reason = f"только {lag_pct:.1f}% библиотек соблюдают свою lag-policy (<{EFFECTIVE_MIN_LAG_OK_PCT}%)"
     elif lag_bad == 0 and lag_unknown == 0 and critical == 0 and high == 0 and (moderate + low) <= 20:
         status = "green"
         reason = "0 нарушений lag-policy, 0 C/H, Low+Moderate ≤20"
@@ -5196,6 +5394,10 @@ def compute_project_health(
         yellow_projected_lag_ok=yellow_projected_lag_ok,
         yellow_projected_lag_pct=yellow_projected_lag_pct,
         yellow_plan_shortfall=yellow_plan_shortfall,
+        green_required=green_required,
+        green_projected_lag_ok=green_projected_lag_ok,
+        green_projected_lag_pct=green_projected_lag_pct,
+        green_plan_shortfall=green_plan_shortfall,
     )
 
 
@@ -7765,6 +7967,8 @@ def resolve_peer_compatibility(
     """
     assignments_by_project: Dict[str, Dict[str, Dict[str, str]]] = {}
     for project, rows in rows_by_project.items():
+        if getattr(client, "deadline", None) is not None:
+            client.deadline.check(f"peer-planning:{project}")
         assignments_by_project[project] = {}
         # Direct package names are the compatibility identity. If a manifest
         # declares the same package in multiple sections, solve one installed
@@ -7780,6 +7984,8 @@ def resolve_peer_compatibility(
 
         residual_targets = dict((residual_targets_by_project or {}).get(project, {}))
         for mode in modes:
+            if getattr(client, "deadline", None) is not None:
+                client.deadline.check(f"peer-planning:{project}:{mode}")
             raw_learned_nogoods = ((learned_nogoods_by_project_mode or {}).get(project, {}).get(mode, []))
             raw_global_exact_exclusions = (
                 (global_exact_exclusions_by_project_mode or {})
@@ -16450,16 +16656,17 @@ def minimize_yellow_plan_after_compatibility(
 ) -> None:
     """Run greedy minimization only over the final executable target set.
 
-    If compatibility/registry narrowing leaves less than the 85% planning
-    reserve -- even less than the hard 80% Yellow threshold -- keep every safe
-    action. An unreachable health goal is a best-effort outcome, never a reason
-    to discard useful migration work.
+    If compatibility/registry narrowing leaves less than the planning reserve
+    (user gate + 5 points; 85% at the default 80% gate) -- even less than the
+    hard Yellow threshold -- keep every safe action. An unreachable health
+    goal is a best-effort outcome, never a reason to discard useful migration
+    work.
     """
     for project, rows in rows_by_project.items():
         health = health_by_project.get(project)
         if not health or health.status_rank >= TARGET_RANK["yellow"]:
             continue
-        required = required_ratio_count(health.total, YELLOW_PLANNING_RATIO)
+        required = required_ratio_count(health.total, health_planning_ratio())
         projected = projected_lag_ok_count(rows, "yellow", health.removed)
         if projected <= required:
             # The three target modes passed compatibility independently. A red
@@ -20575,6 +20782,11 @@ def policy_snapshot_from_env() -> Dict[str, Any]:
         "mode": os.environ.get("DEPLOOM_MODE", "draft"),
         "draftDeadlineSeconds": os.environ.get("DEPLOOM_DRAFT_DEADLINE_SECONDS", ""),
         "draftMaxCandidates": os.environ.get("DEPLOOM_DRAFT_MAX_CANDIDATES", ""),
+        # R9: the effective numeric target policy. The planner pins the values it
+        # actually applied (falling back to defaults) so the hash changes when
+        # the user moves the gate and acceptance/audit/release can compare it.
+        "targetLevel": os.environ.get("DEPLOOM_BASELINE_TARGET_LEVEL", "") or EFFECTIVE_TARGET_LEVEL,
+        "minLagOkPct": os.environ.get("DEPLOOM_BASELINE_MIN_LAG_OK_PCT", "") or str(EFFECTIVE_MIN_LAG_OK_PCT),
     }
     # Pin down the effective policy hash so UI/audit/closure cannot drift from
     # the planner's decision. Unknown/empty values are included verbatim so a
@@ -20729,6 +20941,7 @@ def build_draft_prompt(
     plan: Dict[str, Any],
     projects_by_name: Dict[str, ProjectSpec],
     language: str = "ru",
+    snapshot: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Planning-only agent prompt, fully independent of the Dashboard/DOM.
 
@@ -20739,6 +20952,8 @@ def build_draft_prompt(
     authority is implied.
     """
     lines: List[str] = []
+    target_level = str(snapshot.get("targetLevel") or "yellow") if snapshot else "yellow"
+    min_lag_pct = str(snapshot.get("minLagOkPct") or "80") if snapshot else "80"
     if language == "ru":
         lines += [
             "# IMPORTANT — DRAFT BASELINE / PLANNING ONLY",
@@ -20753,6 +20968,8 @@ def build_draft_prompt(
             "",
             f"runId: `{run_id}`", f"workspaceId: `{workspace_id}`", f"projectId: `{project_id}`",
             f"mode: `{mode}`", f"policyHash: `{policy_hash}`",
+            f"Цель запуска: уровень `{target_level}`, минимум актуальности `{min_lag_pct}%` библиотек по lag-policy.",
+            f"Draft не доказывает достижение цели: после применения требуется повторная verified acceptance по этой же политике.",
             "",
         ]
     else:
@@ -20768,6 +20985,8 @@ def build_draft_prompt(
             "",
             f"runId: `{run_id}`", f"workspaceId: `{workspace_id}`", f"projectId: `{project_id}`",
             f"mode: `{mode}`", f"policyHash: `{policy_hash}`",
+            f"Run goal: target level `{target_level}`, minimum `{min_lag_pct}%` of lag-policy-compliant libraries.",
+            "The Draft does not prove the goal is met: applying it still requires verified acceptance under the same policy.",
             "",
         ]
 
@@ -20778,9 +20997,22 @@ def build_draft_prompt(
         health = project_plan.get("health") or {}
         if language == "ru":
             lines += [f"# {project} — Draft план", ""]
+            lag_ok = int(health.get("lag_ok_12m", 0) or 0)
+            lag_known = int(health.get("total", 0) or 0)
+            lag_unknown = int(health.get("lag_unknown", 0) or 0)
+            vuln_unknown = int(health.get("unknown", 0) or 0)
+            known_lag_total = lag_known + lag_unknown
+            if lag_unknown or lag_known == 0:
+                coverage = (lag_known / known_lag_total * 100.0) if known_lag_total else 0.0
+                lag_part = f"Lag OK: {lag_ok}/{max(lag_known, 1)} известных, {lag_unknown} без lag-данных (покрытие {coverage:.0f}%)"
+            else:
+                lag_part = f"Lag OK: {health.get('lag_ok_pct', '?')}% ({lag_ok}/{lag_known})"
+            vuln_part = (
+                f"C/H/M/L: {health.get('critical', '?')}/{health.get('high', '?')}/{health.get('moderate', '?')}/{health.get('low', '?')}"
+                + (f", уязвимости неизвестны для {vuln_unknown} пакет(ов)" if vuln_unknown else "")
+            )
             lines += [
-                f"- Lag OK: {health.get('lag_ok_pct', '?')}% ({health.get('lag_ok_12m', '?')}/{health.get('total', '?')}), "
-                f"C/H/M/L: {health.get('critical', '?')}/{health.get('high', '?')}/{health.get('moderate', '?')}/{health.get('low', '?')}.",
+                f"- {lag_part}, {vuln_part}.",
                 f"- Причина статуса: {health.get('reason', '—')}.",
                 "",
                 "## Что требуется изменить (proposed)",
@@ -20813,9 +21045,21 @@ def build_draft_prompt(
                     lines.append("")
         else:
             lines += [f"# {project} — Draft plan", ""]
-            health_entries = []
-            for key, value in (("lagOkPct", "Lag OK"), ("critical", "Critical"), ("high", "High"), ("moderate", "Moderate"), ("low", "Low")):
+            lag_ok = int(health.get("lag_ok_12m", 0) or 0)
+            lag_known = int(health.get("total", 0) or 0)
+            lag_unknown = int(health.get("lag_unknown", 0) or 0)
+            vuln_unknown = int(health.get("unknown", 0) or 0)
+            known_lag_total = lag_known + lag_unknown
+            if lag_unknown or lag_known == 0:
+                coverage = (lag_known / known_lag_total * 100.0) if known_lag_total else 0.0
+                lag_entry = f"Lag OK {lag_ok}/{max(lag_known, 1)} known, {lag_unknown} without lag data (coverage {coverage:.0f}%)"
+            else:
+                lag_entry = f"Lag OK {health.get('lagOkPct', '?')}% ({lag_ok}/{lag_known})"
+            health_entries = [lag_entry]
+            for key, value in (("critical", "Critical"), ("high", "High"), ("moderate", "Moderate"), ("low", "Low")):
                 health_entries.append(f"{value} {health.get(key, '?')}")
+            if vuln_unknown:
+                health_entries.append(f"vulnerabilities unknown for {vuln_unknown} package(s)")
             lines.append(f"- {' · '.join(health_entries)}.")
             if health.get("reason"):
                 lines.append(f"- Status reason: {health['reason']}.")
@@ -20920,7 +21164,7 @@ def publish_draft_result(
     policy_hash = draft_policy_hash(snapshot)
     generated_at = dt.datetime.now(dt.timezone.utc).isoformat()
     plan = build_draft_plan(rows_by_project, projects_by_name, health_by_project)
-    prompt_md = build_draft_prompt(run_id, workspace_id, project_id, mode, policy_hash, plan, projects_by_name, language=language)
+    prompt_md = build_draft_prompt(run_id, workspace_id, project_id, mode, policy_hash, plan, projects_by_name, language=language, snapshot=snapshot)
     counts = plan["counts"]
     proposed = counts.get("proposed", 0)
     # unknown-metadata and the unknowns list are derived from the same rows;
@@ -21023,6 +21267,68 @@ def artifacts_dir_for_draft() -> List[Path]:
     return list(_ARTIFACTS_BASE_FOR_DRAFT)
 
 
+def _draft_local_inventory_rows(
+    project: ProjectSpec,
+    overrides: Dict[str, Dict[str, Any]],
+) -> List[DependencyRow]:
+    """Manifest+lockfile-only Draft inventory (no network, no planning).
+
+    Gathered BEFORE any deadline-sensitive work so an early expiry still
+    publishes the complete local dependency list (packages + current versions +
+    sources) with honest unknown metadata, instead of an empty plan with zero
+    unknowns (R2).
+    """
+    pkg_path = project.path / "package.json"
+    if not pkg_path.exists():
+        eprint(f"[warn] {project.name}: package.json not found in {project.path}")
+        return []
+    selected_lock = str(project.lockfile_state.get("lockfile") or "")
+    lock = Path(selected_lock) if selected_lock else None
+    pkg_json = read_json(pkg_path)
+    profile = build_project_profile(project, pkg_json)
+    dependencies = collect_direct_dependencies(pkg_json)
+    rows: List[DependencyRow] = []
+    for name, kind, spec in dependencies:
+        try:
+            current, current_source = resolved_current_version(project.path, name, spec, kind, lock)
+        except Exception:
+            current, current_source = "", "unknown"
+        override = override_for_package(overrides, profile, name, kind) or {}
+        subgroup = str(override.get("subgroup") or "").strip()
+        scope_excluded = as_bool(
+            override.get("excluded", override.get("excludeFromScope", False)),
+            False,
+        )
+        exclusion_reason = str(
+            override.get("exclusionReason")
+            or override.get("excludeReason")
+            or ""
+        ).strip()
+        lag_months = normalized_lag_months(override.get("lagMonths", override.get("lagThresholdMonths", 12)))
+        rows.append(DependencyRow(
+            project=project.name,
+            package_dir=str(project.path),
+            name=name,
+            kind=kind,
+            requested_spec=spec,
+            current_version=current,
+            current_source=current_source,
+            latest_version="registry unavailable",
+            current_vulns="unknown",
+            min_no_critical="неизвестно", min_no_high="неизвестно", min_no_vuln="неизвестно",
+            min_lag_12m="неизвестно", min_lag_9m="неизвестно", min_lag_6m="неизвестно", min_lag_3m="неизвестно",
+            group=0,
+            reason="инвентаризация до сетевого обогащения",
+            notes="inventory из локального manifest/lockfile: registry/OSV ещё не опрошены",
+            subgroup=subgroup,
+            lag_threshold_months=lag_months,
+            scope_excluded=scope_excluded,
+            exclusion_reason=exclusion_reason,
+        ))
+    eprint(f"[info] {project.name}: local Draft inventory (pre-network): {len(dependencies)} dependency(ies)")
+    return rows
+
+
 def _draft_artifacts_dir(run_id: str) -> Path:
     base = _ARTIFACTS_BASE_FOR_DRAFT[0] if _ARTIFACTS_BASE_FOR_DRAFT else Path(".")
     return base / "runs" / run_id / "draft"
@@ -21048,6 +21354,7 @@ def _publish_draft_and_exit(
     for partialness is recorded. The orchestrator must read the manifest by
     runId rather than treating process exit as success.
     """
+    _draft_progress(client, step="finalize", operation="publish draft", status=status)
     del client
     health_by_project = {
         project: compute_project_health(rows, project, None)
@@ -21152,6 +21459,16 @@ def main() -> None:
         type=int,
         help="Candidate version cap for Draft planning (default 3, 0 = all). Keeps the Draft warm-path bounded.",
     )
+    ap.add_argument(
+        "--target-level",
+        choices=("yellow", "green"),
+        help="Product target level for this run (default yellow). Drives the closure goal and green projections.",
+    )
+    ap.add_argument(
+        "--min-lag-ok-pct",
+        type=int,
+        help="Minimum share (0..100) of lag-policy-compliant libraries for the goal to count as met (default 80). Part of the versioned policy hash.",
+    )
     args = ap.parse_args()
     if args.capture_baseline and args.draft_baseline:
         ap.error("--capture-baseline and --draft-baseline are mutually exclusive")
@@ -21176,6 +21493,24 @@ def main() -> None:
     if args.draft_baseline and args.draft_deadline_seconds is not None:
         os.environ["DEPLOOM_DRAFT_DEADLINE_SECONDS"] = str(args.draft_deadline_seconds)
     deadline_clock = DeadlineClock(draft_deadline_seconds if args.draft_baseline else None)
+
+    # R9: effective target policy. Falls back from CLI to orchestration env to
+    # defaults, then pins itself into the environment so the policy snapshot and
+    # hash always reflect the values the planner applied.
+    global EFFECTIVE_MIN_LAG_OK_PCT, EFFECTIVE_TARGET_LEVEL
+    target_level = (args.target_level or os.environ.get("DEPLOOM_BASELINE_TARGET_LEVEL", "") or "yellow").strip().lower()
+    EFFECTIVE_TARGET_LEVEL = target_level if target_level in ("yellow", "green") else "yellow"
+    raw_lag_pct = args.min_lag_ok_pct
+    if raw_lag_pct is None:
+        raw_lag_pct = (os.environ.get("DEPLOOM_BASELINE_MIN_LAG_OK_PCT") or "").strip()
+        try:
+            raw_lag_pct = int(raw_lag_pct) if raw_lag_pct else 80
+        except (TypeError, ValueError):
+            raw_lag_pct = 80
+    EFFECTIVE_MIN_LAG_OK_PCT = max(0, min(100, int(raw_lag_pct)))
+    if args.draft_baseline:
+        os.environ["DEPLOOM_BASELINE_TARGET_LEVEL"] = EFFECTIVE_TARGET_LEVEL
+        os.environ["DEPLOOM_BASELINE_MIN_LAG_OK_PCT"] = str(EFFECTIVE_MIN_LAG_OK_PCT)
 
     global GENERATION_RESULT_METADATA
     GENERATION_RESULT_METADATA = (
@@ -21449,7 +21784,17 @@ def main() -> None:
             )
             lock_state_dict = lock_state.as_dict()
         except LockfileConsistencyError as exc:
-            if args.draft_baseline and getattr(exc, "code", "") in ("LOCKFILE_MISSING", "LOCKFILE_AMBIGUOUS", "LOCKFILE_CONFLICT"):
+            if args.draft_baseline and getattr(exc, "code", "") in (
+                "LOCKFILE_MISSING",
+                "LOCKFILE_AMBIGUOUS",
+                "LOCKFILE_CONFLICT",
+                # R7: an unsupported physical manager (pnpm / Yarn Berry) is a
+                # limit of the NEXT Verified step, not a ban on a theoretical
+                # planning-only Draft plan. The manifest/available lockfile is
+                # still readable and the plan records the precision boundary.
+                "PACKAGE_MANAGER_PNPM_UNSUPPORTED",
+                "PACKAGE_MANAGER_YARN_BERRY_UNSUPPORTED",
+            ):
                 eprint(f"[info] {project.name}: Draft uses manifest-only precision ({exc}); original lockfile left untouched.")
                 lock_state_dict = {
                     "manager": "",
@@ -21518,6 +21863,13 @@ def main() -> None:
         cli_exclusions,
     )
     client = LiveDataClient(str(registry), timeout, OSV_BATCH_SIZE, RATE_SLEEP_SEC, use_system_proxy=use_system_proxy)
+    if args.draft_baseline:
+        # Draft: every registry/OSV request is bounded by the remaining run
+        # budget (per-request timeout = min(timeout, remaining)) and the budget
+        # is checked before each attempt so a mid-scan expiry publishes a
+        # partial result instead of waiting out a 30s retry storm.
+        client.set_draft_run(run_id)
+        client.set_deadline(deadline_clock)
 
     rows_by_project: Dict[str, List[DependencyRow]] = defaultdict(list)
     projects_by_name = {p.name: p for p in projects}
@@ -21544,19 +21896,29 @@ def main() -> None:
     try:
         for i, project in enumerate(projects, start=1):
             project_prefix = f"[{i}/{len(projects)}]"
+            if args.draft_baseline:
+                # R2: the local manifest+lockfile inventory is gathered before
+                # any deadline-sensitive work, so an early expiry still
+                # publishes the complete local dependency list with honest
+                # unknown metadata instead of an empty plan.
+                rows_by_project[project.name] = _draft_local_inventory_rows(project, overrides)
+                client.for_project(project.name)
+                _draft_progress(client, operation="local inventory", package=project.name, step="inventory", completed=i, total=len(projects))
             deadline_clock.check(f"project-scan:{project.name}")
             eprint(f"[info] {project_prefix} {project.name}: {project.path}")
-            rows_by_project[project.name].extend(
-                analyze_project(
-                    project,
-                    client,
-                    overrides,
-                    include_prerelease,
-                    max_candidates,
-                    progress_prefix=project_prefix,
-                    tolerate_registry_failure=args.draft_baseline,
-                )
+            enriched = analyze_project(
+                project,
+                client,
+                overrides,
+                include_prerelease,
+                max_candidates,
+                progress_prefix=project_prefix,
+                tolerate_registry_failure=args.draft_baseline,
             )
+            # Analyze replaces the pre-network inventory with the same full
+            # dependency set enriched with registry/OSV evidence; on an
+            # in-scan deadline the inventory rows stay published as-is.
+            rows_by_project[project.name] = enriched
             eprint(
                 f"[info] {project_prefix} {project.name}: project dependency scan complete; "
                 f"rows={len(rows_by_project[project.name])}"
@@ -21589,6 +21951,7 @@ def main() -> None:
 
     target_started = time.perf_counter()
     eprint("[info] target planning started")
+    _draft_progress(client, step="solve", operation="target planning")
     try:
         deadline_clock.check("target-planning")
         _apply_baseline_intent_scope(rows_by_project)
@@ -21623,10 +21986,13 @@ def main() -> None:
                 "verificationStatus=NOT_VERIFIED, authority=PLANNING_ONLY, compatibility=UNKNOWN"
             )
             deadline_clock.check("peer-planning")
+            # R2: the first Draft path solves ONE chosen variant ("default"),
+            # not the three required by the Verified planning loop, so the run
+            # stays bounded and any expiry publishes the rows gathered so far.
             resolve_peer_compatibility(
                 rows_by_project,
                 client,
-                modes=("yellow", "green", "default"),
+                modes=("default",),
                 apply_results=True,
                 residual_targets_by_project=residual_targets_by_project,
             )
@@ -21715,19 +22081,37 @@ def main() -> None:
     eprint(f"[info] target planning completed in {time.perf_counter() - target_started:.1f}s")
     draft_manifest: Optional[Dict[str, Any]] = None
     if args.draft_baseline:
-        deadline_clock.check("draft-plane")
-        draft_manifest = publish_draft_result(
-            run_id=run_id,
-            workspace_id=workspace_id,
-            project_id=project_id,
-            mode=mode,
-            rows_by_project=rows_by_project,
-            projects_by_name=projects_by_name,
-            health_by_project=health_by_project,
-            status="DRAFT_READY",
-            partial_reason=None,
-            deadline=deadline_clock,
-        )
+        # The final publish itself must honor the deadline: a DraftBudgetExceeded
+        # raised immediately before/at publication publishes the gathered rows as
+        # DRAFT_PARTIAL instead of losing the result to an uncaught exception.
+        try:
+            deadline_clock.check("draft-plane")
+            draft_manifest = publish_draft_result(
+                run_id=run_id,
+                workspace_id=workspace_id,
+                project_id=project_id,
+                mode=mode,
+                rows_by_project=rows_by_project,
+                projects_by_name=projects_by_name,
+                health_by_project=health_by_project,
+                status="DRAFT_READY",
+                partial_reason=None,
+                deadline=deadline_clock,
+            )
+        except DraftBudgetExceeded as budget_exc:
+            eprint(f"[info] Draft deadline exceeded at finalization: {budget_exc.phase}")
+            _publish_draft_and_exit(
+                run_id=run_id,
+                workspace_id=workspace_id,
+                project_id=project_id,
+                mode=mode,
+                rows_by_project=rows_by_project,
+                projects_by_name=projects_by_name,
+                client=client,
+                deadline_clock=deadline_clock,
+                status="DRAFT_PARTIAL",
+                partial_reason=f"Draft deadline ({deadline_clock.deadline_seconds}s) exceeded at {budget_exc.phase}; plan is partial.",
+            )
         eprint(
             f"[done] Draft result published: status={draft_manifest['status']} "
             f"summary={draft_manifest['summary']}"
@@ -21783,44 +22167,50 @@ def main() -> None:
         eprint(f"[info] history snapshot: {snapshot_path}")
     history_snapshots = load_history_snapshots(history_dir)
 
-    eprint("[info] writing roadmap artifacts")
-    write_markdown(
-        rows_by_project, out_path,
-        baseline_comparisons=baseline_comparisons,
-        project_specs=projects_by_name,
-        health_by_project=health_by_project,
-    )
-    if json_out_path:
-        write_json(
-            rows_by_project,
-            json_out_path,
+    if not args.draft_baseline:
+        # R5: a Draft publishes ONLY its run-scoped artifacts
+        # (artifacts/runs/<runId>/draft/*). Writing the legacy MD/JSON/HTML
+        # reports here would let a planning-only result shadow the last verified
+        # roadmap/dashboard (the Desktop reads these outputs into the Verified
+        # UI cache), so Draft skips them entirely.
+        eprint("[info] writing roadmap artifacts")
+        write_markdown(
+            rows_by_project, out_path,
             baseline_comparisons=baseline_comparisons,
             project_specs=projects_by_name,
             health_by_project=health_by_project,
         )
-    if html_out_path:
-        write_html(
-            rows_by_project,
-            html_out_path,
-            history_dir=history_dir,
-            registry=str(registry),
-            settings_sources=settings_sources,
-            baseline_comparisons=baseline_comparisons,
-            project_specs=projects_by_name,
-            health_by_project=health_by_project,
-            dashboard_state_path=dashboard_state_path,
-            history_snapshots=history_snapshots,
-            roadmap_json_path=json_out_path,
-            knowledge_entries=knowledge_entries,
-            knowledge_log_path=knowledge_log_path,
-            proven_dependency_state=proven_dependency_state,
-            proven_dependency_state_path=dashboard_proven_dependency_state_path,
+        if json_out_path:
+            write_json(
+                rows_by_project,
+                json_out_path,
+                baseline_comparisons=baseline_comparisons,
+                project_specs=projects_by_name,
+                health_by_project=health_by_project,
+            )
+        if html_out_path:
+            write_html(
+                rows_by_project,
+                html_out_path,
+                history_dir=history_dir,
+                registry=str(registry),
+                settings_sources=settings_sources,
+                baseline_comparisons=baseline_comparisons,
+                project_specs=projects_by_name,
+                health_by_project=health_by_project,
+                dashboard_state_path=dashboard_state_path,
+                history_snapshots=history_snapshots,
+                roadmap_json_path=json_out_path,
+                knowledge_entries=knowledge_entries,
+                knowledge_log_path=knowledge_log_path,
+                proven_dependency_state=proven_dependency_state,
+                proven_dependency_state_path=dashboard_proven_dependency_state_path,
+            )
+        eprint(
+            f"[done] wrote {out_path} and {html_out_path}; "
+            f"total elapsed={time.perf_counter() - generation_started:.1f}s"
         )
-    eprint(
-        f"[done] wrote {out_path} and {html_out_path}; "
-        f"total elapsed={time.perf_counter() - generation_started:.1f}s"
-    )
-    eprint(f"[info] history store: events={events_log}, runs={runs_dir}, index={index_file}")
+        eprint(f"[info] history store: events={events_log}, runs={runs_dir}, index={index_file}")
 
 
 def _report_domain_failure(exc: BaseException, *, expected: bool) -> int:

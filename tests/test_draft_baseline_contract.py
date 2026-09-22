@@ -1,5 +1,6 @@
 from pathlib import Path
 import ast
+import os
 import sys
 import tempfile
 import unittest
@@ -68,8 +69,69 @@ def test_desktop_draft_is_invocation_local_and_does_not_advance_flow() -> None:
     assert "export type BaselineProofMode = 'VERIFIED' | 'DRAFT'" in TYPES
     assert "delete durable.proofMode" in DESKTOP_MAIN
     assert "job.action === 'baseline' && job.baselineProofMode === 'DRAFT'" in DESKTOP_MAIN
-    assert "job.baselineProofMode !== 'DRAFT'" in DESKTOP_MAIN
     assert "DRAFT_BASELINE_AUTOPILOT_FORBIDDEN" in DESKTOP_MAIN
+    # Draft finalizes exclusively through its run-scoped artifacts: the import
+    # is scoped to the exact run/project and a missing manifest is a typed
+    # FAILED result instead of a silent exit-0 success (R1).
+    assert "if (job.baselineProofMode === 'DRAFT')" in DESKTOP_MAIN
+    assert "importDraftResult(job.workspace, job.projectName, job.runId)" in DESKTOP_MAIN
+    assert "DRAFT_RESULT_MISSING" in DESKTOP_MAIN
+    assert "DRAFT_RUN_ID_MISSING" in DESKTOP_MAIN
+    # The verified snapshot path stays separate: Draft never snapshots legacy
+    # roadmap outputs into the shared verified UI cache (R5).
+    assert "if (job.baselineProofMode === 'DRAFT')" in DESKTOP_MAIN
+    assert "PROJECT_ARTIFACT_SNAPSHOT_FAILED" in DESKTOP_MAIN
+    assert "baselineProofMode === 'DRAFT' && job.runId ? { runId: job.runId }" in DESKTOP_MAIN
+
+
+def test_desktop_draft_writer_and_reader_resolve_the_same_artifact_root() -> None:
+    # R6: writer passes --artifacts-dir <ws>/.dependency-roadmap/artifacts and
+    # the reader must resolve the SAME path, regardless of where
+    # settings.project.json lives (root-level vs .dependency-roadmap).
+    assert "'--artifacts-dir', join(workspace.path, '.dependency-roadmap', 'artifacts')" in DESKTOP_MAIN
+    assert "return join(workspace.path, '.dependency-roadmap', 'artifacts')" in DESKTOP_MAIN
+    assert "function draftManifestPath" in DESKTOP_MAIN
+
+
+def test_generator_draft_skips_legacy_roadmap_writes() -> None:
+    # R5: a Draft publishes ONLY run-scoped artifacts; the legacy MD/JSON/HTML
+    # reports must not be written so a planning-only result cannot shadow a
+    # verified roadmap/dashboard.
+    assert "if not args.draft_baseline:" in GENERATOR
+    assert "writing roadmap artifacts" in GENERATOR
+    assert "R5: a Draft publishes ONLY its run-scoped artifacts" in GENERATOR
+
+
+def test_generator_draft_honours_deadline_at_finalization() -> None:
+    # R2: an expiry right before/at publication must publish DRAFT_PARTIAL,
+    # not crash the run without an artifact.
+    assert 'deadline_clock.check("draft-plane")' in GENERATOR
+    assert "Draft deadline exceeded at finalization" in GENERATOR
+
+
+def test_generator_draft_builds_local_inventory_before_network() -> None:
+    # R2: local manifest+lockfile inventory is gathered before any deadline-
+    # sensitive work so an early expiry publishes the complete local
+    # dependency list, not an empty plan with zero unknowns.
+    assert "def _draft_local_inventory_rows" in GENERATOR
+    assert "_draft_local_inventory_rows(project, overrides)" in GENERATOR
+    assert "inventory из локального manifest/lockfile" in GENERATOR
+
+
+def test_generator_draft_tolerates_unsupported_package_managers() -> None:
+    # R7: pnpm / Yarn Berry are a Verified-step capability boundary, not a ban
+    # on a theoretical planning-only Draft plan.
+    assert "PACKAGE_MANAGER_PNPM_UNSUPPORTED" in GENERATOR
+    assert "PACKAGE_MANAGER_YARN_BERRY_UNSUPPORTED" in GENERATOR
+    assert "manifest-only precision" in GENERATOR
+
+
+def test_generator_osv_unavailable_never_becomes_zero() -> None:
+    # R3: unavailable OSV evidence must read as UNKNOWN, not as an empty
+    # finding list. Safe targets are not invented from missing evidence.
+    assert "safe target по уязвимостям не вычислялся" in GENERATOR
+    assert 'current_summary = "unknown"' in GENERATOR
+    assert 'min_nv = "неизвестно"' in GENERATOR
 
 
 def test_draft_ui_and_external_agent_handoff_are_visible() -> None:
@@ -246,3 +308,102 @@ def test_draft_manifest_and_command_line_contract_is_run_scoped() -> None:
     assert "flow:get-current-draft-result" in DESKTOP_MAIN
     assert "getCurrentDraftResult" in TYPES
     assert "draftResult" in TYPES
+
+
+def test_r9_numeric_target_policy_changes_health_gate_and_hash() -> None:
+    """R9: the user's freshness goal is effective, not a label.
+
+    80 -> 90 moves the real yellow gate (and the green/planning closures), the
+    policy hash and the prompt's numeric goal; the old hardcoded-80 contract is
+    gone from the planner.
+    """
+    from unittest import mock
+
+    def _ratio(total: int, pct: int) -> int:
+        return roadmap.required_ratio_count(total, (pct, 100))
+
+    with mock.patch.object(roadmap, "EFFECTIVE_MIN_LAG_OK_PCT", 80):
+        assert _ratio(10, roadmap.health_yellow_ratio()[0] / roadmap.health_yellow_ratio()[1] * 100) == 8
+        assert roadmap.required_ratio_count(10, roadmap.health_yellow_ratio()) == 8
+        assert roadmap.required_ratio_count(10, roadmap.health_green_ratio()) == 9
+        assert roadmap.required_ratio_count(10, roadmap.health_planning_ratio()) == 9
+    with mock.patch.object(roadmap, "EFFECTIVE_MIN_LAG_OK_PCT", 90):
+        assert roadmap.required_ratio_count(10, roadmap.health_yellow_ratio()) == 9
+        assert roadmap.required_ratio_count(10, roadmap.health_green_ratio()) == 10
+        assert roadmap.required_ratio_count(10, roadmap.health_planning_ratio()) == 10
+
+    env_patcher = mock.patch.dict(
+        os.environ,
+        {
+            "DEPLOOM_BASELINE_MIN_LAG_OK_PCT": "80",
+            "DEPLOOM_BASELINE_TARGET_LEVEL": "yellow",
+        },
+        clear=False,
+    )
+    env_patcher.start()
+    try:
+        hash80 = roadmap.draft_policy_hash(roadmap.policy_snapshot_from_env())
+    finally:
+        env_patcher.stop()
+    env_patcher = mock.patch.dict(
+        os.environ,
+        {
+            "DEPLOOM_BASELINE_MIN_LAG_OK_PCT": "90",
+            "DEPLOOM_BASELINE_TARGET_LEVEL": "green",
+        },
+        clear=False,
+    )
+    env_patcher.start()
+    try:
+        hash90green = roadmap.draft_policy_hash(roadmap.policy_snapshot_from_env())
+        snapshot = roadmap.policy_snapshot_from_env()
+    finally:
+        env_patcher.stop()
+    assert hash80 != hash90green
+    assert snapshot["targetLevel"] == "green"
+    assert snapshot["minLagOkPct"] == "90"
+
+    prompt = roadmap.build_draft_prompt(
+        "run-r9", "ws", "proj", "draft", hash90green,
+        {"projects": [], "proposals": [], "counts": {"proposed": 0}, "unknowns": []},
+        {},
+        language="ru",
+        snapshot=snapshot,
+    )
+    assert "Цель запуска: уровень `green`, минимум актуальности `90%`" in prompt
+    assert f"policyHash: `{hash90green}`" in prompt
+
+    # The old source contract forbidding freshness controls is inverted: the
+    # dialog now owns the numeric goal and the desktop threads it to the engine.
+    assert "Минимум актуальности" in DIALOG
+    assert "minLagOkPct: boundedInteger(nextMinLagOkPct, 80, 0, 100)" in DIALOG
+    assert "targetLevel === 'green' ? 'green' : 'yellow'" in DIALOG
+    assert "DEPLOOM_BASELINE_TARGET_LEVEL: effectiveIntent.targetLevel" in DESKTOP_MAIN
+    assert "DEPLOOM_BASELINE_MIN_LAG_OK_PCT: String(effectiveIntent.minLagOkPct" in DESKTOP_MAIN
+    assert "minLagOkPct?: number" in TYPES
+    assert "targetLevel?: 'yellow' | 'green'" in TYPES
+    assert "--target-level" in GENERATOR
+    assert "--min-lag-ok-pct" in GENERATOR
+    assert "EFFECTIVE_MIN_LAG_OK_PCT" in GENERATOR
+
+
+def test_r9_green_closure_is_honest_not_partial_as_success() -> None:
+    """Green closure (gate + 10) is an independent, honest projection: it is
+    never reported as reached just because the run published (even though the
+    plan carries both yellow and green projections for every row)."""
+    health = roadmap.compute_project_health([_make_row(
+        current_version="1.0.0",
+        min_lag_12m="2.0.0",
+        min_lag_9m=roadmap.NO_ACTION,
+        min_lag_6m=roadmap.NO_ACTION,
+        min_lag_3m=roadmap.NO_ACTION,
+    )], "tiny-basic", None)
+    # Default 80% gate: 1/1 is known, so yellow gate (80%) is already met but
+    # green closure (90%) is not; the green shortfall must be visible instead of
+    # being collapsed into yellow or into the run's partial status.
+    assert health.green_required == 1
+    assert health.green_projected_lag_ok == 0
+    assert health.green_plan_shortfall == 1
+    assert health.lag_needed_for_yellow == 1
+    assert "green_required" in roadmap.dataclasses.asdict(health)
+    assert "green_projected_lag_ok" in roadmap.dataclasses.asdict(health)

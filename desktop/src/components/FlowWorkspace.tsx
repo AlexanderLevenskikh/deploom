@@ -1,6 +1,6 @@
 import { AlertCircle, AlertTriangle, Check, ChevronDown, Circle, CircleHelp, ExternalLink, FileText, LoaderCircle, Pause, Play, RotateCcw, Send, ShieldCheck } from 'lucide-react'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ACTION_ORDER, FLOW_STAGES } from '../data/flow'
 import { useLanguage } from '../i18n'
 import { BranchFailureModal } from './BranchFailureModal'
@@ -9,6 +9,7 @@ import { ModelPicker } from './ModelPicker'
 import { BaselineIntentDialog } from './BaselineIntentDialog'
 import { PromptPreviewDialog } from './PromptPreviewDialog'
 import { freshBaselineIntent, normalizeBaselineIntentPlan } from '../data/baselineIntent'
+import type { DraftProgressPayload } from '../hooks/useDependencyFlow'
 import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, DraftResultSnapshot, FlowAction, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
 
 const AUTOPILOT_HELP = {
@@ -20,12 +21,18 @@ type Props = {
   details: WorkspaceDetails
   project: ProjectSpec
   activeAction?: FlowAction
+  activeRunId?: string
+  activeRunStartedAt?: number
+  activeDraftProgress?: DraftProgressPayload
+  draftLaunch?: { workspaceId?: string; projectName: string; runId?: string; autoOpen: boolean; at: number }
+  onMarkDraftLaunched: (workspaceId: string | undefined, projectName: string, runId?: string, autoOpen?: boolean) => void
+  onResetDraftLaunch: (workspaceId: string | undefined, projectName: string, autoOpen?: boolean) => void
   autopilotActive?: boolean
   baselineDecision?: BaselineDecision
   onClearBaselineDecision: () => void
   onGetBaselineIntentPlan: (projectName: string) => Promise<BaselineIntentPlan>
-  onGetCurrentDraftResult: () => Promise<{ result: DraftResultSnapshot; prompt?: ProjectPromptPreview; plan?: string } | undefined>
-  onRun: (input: ActionInput) => Promise<void>
+  onGetCurrentDraftResult: (input: { workspaceId?: string; projectName: string; runId?: string }) => Promise<{ result: DraftResultSnapshot; prompt?: ProjectPromptPreview; plan?: string } | undefined>
+  onRun: (input: ActionInput) => Promise<{ jobId: string; runId?: string } | undefined>
   onSendAgentNote: (note: string, branch?: string) => Promise<boolean>
   onStartAutopilot: (input: { workspaceId: string; projectName: string; target: TargetLevel; releaseBranch?: string }) => Promise<void>
   onStopAutopilot: () => Promise<void>
@@ -38,7 +45,7 @@ type Props = {
   onListAgentModels: (agentProvider: AgentProvider, cwd?: string) => Promise<string[]>
 }
 
-export function FlowWorkspace({ details, project, activeAction, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels }: Props) {
+export function FlowWorkspace({ details, project, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels }: Props) {
   const { language, text, t } = useLanguage()
   // Compatibility-only planner hint for legacy roadmap/prompt export.
   // Yellow/Green is no longer a user goal or a completion gate.
@@ -53,28 +60,39 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
   const [baselineIntentDialog, setBaselineIntentDialog] = useState<{ mode: 'prepare' | 'decision'; resume: 'auto' | 'continue' | 'restart'; plan: BaselineIntentPlan; decision?: BaselineDecision }>()
   const [draftPromptPreview, setDraftPromptPreview] = useState<ProjectPromptPreview>()
   // Draft completion is resolved by runId from workspace state, not by watching
-  // file mtime/size. The user dismisses a finished Draft once per run; the ack
-  // map keys by project so switching projects does not hide another project's
-  // fresh result. Above that, only projects where the user actually launched a
-  // Draft this session (intent.proofMode === 'DRAFT') route the completion
-  // banner: a verified Baseline never produces workspace.draftResult, and the
-  // guard keeps that routing explicit. Everything below is renderer-local (not
-  // persisted); after a restart a Draft result is still reachable via the
-  // artifact paths on the card and in the run output.
+  // file mtime/size. The launch marker lives in the flow hook (it survives
+  // FlowWorkspace remounts across tabs), and the ack map keys by workspace AND
+  // project so two workspaces sharing a project name never hide each other's
+  // result. The completion banner is fresh only for the exact run the user
+  // launched (marker.runId match), never for a leftover earlier result. After
+  // acknowledge the persistent "последний Draft" card stays reachable.
   const [acknowledgedDraftRunIds, setAcknowledgedDraftRunIds] = useState<Record<string, string>>({})
-  const [launchedDraftProjects, setLaunchedDraftProjects] = useState<Set<string>>(new Set())
+  const draftRefKey = `${details.workspace.id}::${project.name}`
   const draftResult = details.draftResult
-  const draftResultFresh = Boolean(draftResult && launchedDraftProjects.has(project.name) && draftResult.runId !== acknowledgedDraftRunIds[project.name])
-  const acknowledgeDraftResult = () => { if (draftResult) setAcknowledgedDraftRunIds((current) => ({ ...current, [project.name]: draftResult.runId })) }
+  const draftLaunchActive = activeAction === 'baseline' && Boolean(draftLaunch)
+  const draftResultFresh = Boolean(draftResult && draftLaunch?.runId && draftResult.runId !== acknowledgedDraftRunIds[draftRefKey] && draftResult.runId === draftLaunch.runId)
+  const acknowledgeDraftResult = () => { if (draftResult) setAcknowledgedDraftRunIds((current) => ({ ...current, [draftRefKey]: draftResult.runId })) }
   const openDraftPrompt = async () => {
     try {
-      const loaded = await onGetCurrentDraftResult()
+      const loaded = await onGetCurrentDraftResult({ workspaceId: details.workspace.id, projectName: project.name, runId: draftResult?.runId })
       if (loaded?.prompt) setDraftPromptPreview(loaded.prompt)
       else window.alert(language === 'ru' ? 'Draft завершился, но prompt artifact не найден. Проверьте артефакты запуска.' : 'Draft finished, but the prompt artifact was not found. Check the run artifacts.')
     } catch (error) {
       window.alert(error instanceof Error ? error.message : String(error))
     }
   }
+  const openDraftPromptRef = useRef(openDraftPrompt)
+  openDraftPromptRef.current = openDraftPrompt
+  // Auto-open the prompt of the run the user explicitly asked to show
+  // ("Создать Draft и показать промпт"), and only for that exact run's
+  // completion. Until the launch marker is bound to a concrete runId (the job
+  // started), an older leftover result must never be auto-opened.
+  useEffect(() => {
+    if (!draftResult || !draftLaunch || !draftResultFresh) return
+    if (!draftLaunch.autoOpen || !draftLaunch.runId) return
+    if (draftResult.runId !== draftLaunch.runId) return
+    void openDraftPromptRef.current()
+  }, [draftLaunch, draftResult, draftResultFresh])
   const [baselineDecisionDismissed, setBaselineDecisionDismissed] = useState(false)
   const run = details.teamState?.projects[project.name]
   const recovery = run?.recovery
@@ -205,7 +223,7 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
     JSON.stringify(Object.entries(intent.policies ?? {}).sort(([left], [right]) => left.localeCompare(right)))
 
 
-  const runBaselineIntent = async (intent: BaselineIntent) => {
+  const runBaselineIntent = async (intent: BaselineIntent, autoOpenPrompt = false) => {
     const pending = baselineIntentDialog
     if (!pending) return
     const policyChanged =
@@ -214,11 +232,18 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
     const effectiveBaselineResume = policyChanged ? 'restart' : pending.resume
     // A Draft launch arms the run-scoped completion banner for this project; a
     // verified Baseline never produces workspace.draftResult, so only Draft
-    // launches may route the banner.
+    // launches may route the banner. The marker is reset first: while the new
+    // job is starting, an older leftover result must not match (fresh banner or
+    // auto-open), then it is bound to the exact runId after the job starts.
     if (intent.proofMode === 'DRAFT') {
-      setLaunchedDraftProjects((current) => new Set(current).add(project.name))
+      onResetDraftLaunch(details.workspace.id, project.name, autoOpenPrompt)
     }
-    await onRun({ action: 'baseline', workspaceId: details.workspace.id, projectName: project.name, target, label, releaseBranch, gateCommand, baselineResume: effectiveBaselineResume, baselineIntent: intent, commitMessage: `chore(deps): save ${project.name} roadmap state` })
+    const started = await onRun({ action: 'baseline', workspaceId: details.workspace.id, projectName: project.name, target, label, releaseBranch, gateCommand, baselineResume: effectiveBaselineResume, baselineIntent: intent, commitMessage: `chore(deps): save ${project.name} roadmap state` })
+    // Bind the launch marker to the exact runId only after the job starts; the
+    // fresh banner and auto-open then match that run, never an older leftover.
+    if (intent.proofMode === 'DRAFT') {
+      onMarkDraftLaunched(details.workspace.id, project.name, started?.runId, autoOpenPrompt)
+    }
     // Completion is delivered through the runId-scoped draft result in
     // workspace details (main.ts imports artifacts/runs/<runId>/draft/*
     // after the planner exits); no file mtime/size watching.
@@ -333,22 +358,26 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
   const humanFreshness = typeof currentLevel?.lagOkPct === 'number' ? `${currentLevel.lagOkPct.toFixed(1)}%` : '—'
   const humanStatusTitle = flowComplete
     ? text('Полезный результат готов', 'Useful result is ready')
-    : activeAction === 'baseline'
-      ? text('Ищем первый проверенный результат', 'Finding the first verified result')
-      : active
-        ? text('DepLoom продолжает работу', 'DepLoom is working')
-        : baselineDecision?.bestIncumbent
-          ? text('Проверенный результат сохранён', 'Verified result is saved')
-          : acceptanceNeedsRemediation
-            ? text('Улучшаем безопасность', 'Improving security')
-            : acceptanceUnknown && completed.has('audit')
-              ? text('Нужен свежий аудит', 'A fresh audit is required')
-              : text('Готовы к следующему шагу', 'Ready for the next step')
+    : draftLaunchActive
+      ? text('Готовим черновой план', 'Preparing a draft plan')
+      : activeAction === 'baseline'
+        ? text('Ищем первый проверенный результат', 'Finding the first verified result')
+        : active
+          ? text('DepLoom продолжает работу', 'DepLoom is working')
+          : baselineDecision?.bestIncumbent
+            ? text('Проверенный результат сохранён', 'Verified result is saved')
+            : acceptanceNeedsRemediation
+              ? text('Улучшаем безопасность', 'Improving security')
+              : acceptanceUnknown && completed.has('audit')
+                ? text('Нужен свежий аудит', 'A fresh audit is required')
+                : text('Готовы к следующему шагу', 'Ready for the next step')
   const humanStatusBody = flowComplete
     ? text('Все обязательные проверки пройдены. Можно остановиться здесь или позже вернуться к оставшимся обновлениям.', 'All required checks passed. You can stop here or return to the remaining upgrades later.')
-    : activeAction === 'baseline'
-      ? text('Пробуем полезные наборы обновлений и физически проверяем проект. Неудачная следующая попытка не должна уничтожать последний доказанный результат.', 'Trying useful upgrade sets and physically verifying the project. A failed next attempt must not destroy the last proven result.')
-      : baselineDecision?.bestIncumbent
+    : draftLaunchActive
+      ? text('Черновой план строится без установки и physical-проверок: инвентаризация → обогащение → публикация промпта. Проект не изменяется.', 'The draft plan is built without installing or physical checks: inventory → enrichment → prompt publication. The project is left untouched.')
+      : activeAction === 'baseline'
+        ? text('Пробуем полезные наборы обновлений и физически проверяем проект. Неудачная следующая попытка не должна уничтожать последний доказанный результат.', 'Trying useful upgrade sets and physically verifying the project. A failed next attempt must not destroy the last proven result.')
+        : baselineDecision?.bestIncumbent
         ? text('Последняя рабочая версия сохранена. Можно продолжать искать улучшение без потери уже проверенного результата.', 'The last working result is preserved. Search can continue without losing what is already verified.')
         : acceptanceNeedsRemediation
           ? text('Текущий результат ещё нельзя принять из-за security policy. DepLoom сосредоточится на минимальном необходимом исправлении.', 'The current result cannot be accepted yet because of security policy. DepLoom will focus on the smallest required remediation.')
@@ -380,26 +409,28 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
           <span>{typeof acceptance?.critical === 'number' || typeof acceptance?.high === 'number' ? `Critical ${acceptance?.critical ?? '?'} · High ${acceptance?.high ?? '?'}` : text('Critical всегда должен быть 0. Для принятия нужен свежий полный аудит.', 'Critical must always be 0. Acceptance requires a fresh complete audit.')}</span></div>
         </div>
         {typeof humanRemainingUpdates === 'number' && humanRemainingUpdates > 0 ? <p className="human-flow-remaining">{text(`Осталось разобрать: ${humanRemainingUpdates}. Они не обнуляют уже проверенный результат.`, `Remaining to address: ${humanRemainingUpdates}. They do not invalidate the already verified result.`)}</p> : null}
+        {draftLaunchActive ? <DraftLiveProgress startedAt={activeRunStartedAt} progress={activeDraftProgress} runId={activeRunId} /> : null}
         <div className="human-flow-actions">
           {!flowComplete && !active && humanPrimaryStage.action ? <button className="button primary" disabled={humanPrimaryStage.action === 'release' && !acceptanceAccepted} onClick={() => void execute(activeIndex, undefined, undefined, humanPrimaryStage.action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}><Play size={16} />{humanPrimaryStage.action === 'baseline' && details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Продолжить работу', 'Continue')}</button> : null}
           {!flowComplete && !active && humanPrimaryStage.action === 'baseline' && (details.baselineRecovery?.available || run?.lastAction === 'baseline') ? <button className="button secondary" onClick={() => { if (window.confirm(text('Начать Baseline заново? Оркестрационный checkpoint будет сброшен, но exact proof/artifact cache с совпадающей identity останется доступен.', 'Restart Baseline? The orchestration checkpoint will be reset, while exact proof/artifact cache with matching identity remains reusable.'))) void execute(activeIndex, undefined, undefined, 'restart') }}><RotateCcw size={16} />{text('Начать заново', 'Start over')}</button> : null}
           {!active && humanPrimaryStage.action === 'baseline' ? <button className="button secondary" onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button> : null}
           {flowComplete && acceptanceAccepted ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} />{text('Продолжить улучшение', 'Continue improving')}</button> : null}
+          {draftResult ? <button className="button secondary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Последний Draft / История', 'Last Draft / History')}</button> : null}
           <button className="button secondary" disabled={!run && !activeAction} onClick={() => void onOpenPath(artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
         </div>
-        {draftResult && draftResultFresh ? <div className="draft-result-card">
+        {draftResult ? <div className={`draft-result-card${draftResultFresh ? ' fresh' : ''}`}>
           <div className="draft-result-heading">
             <div>
-              <strong>{draftResult.status === 'DRAFT_READY' ? text('Draft готов', 'Draft is ready') : text('Draft частичный', 'Draft is partial')}</strong>
-              <span>{draftResult.summary}</span>
+              <strong>{draftResultFresh ? (draftResult.status === 'DRAFT_READY' ? text('Draft готов', 'Draft is ready') : text('Draft частичный', 'Draft is partial')) : text(`Последний Draft · ${draftResult.status}`, `Last Draft · ${draftResult.status}`)}</strong>
+              {draftResultFresh ? <span>{draftResult.summary}</span> : <span>{draftResult.summary || text('Сохранённый результат Draft этого проекта.', 'Saved Draft result for this project.')}</span>}
               <span className="draft-result-meta">run <code>{draftResult.runId}</code> · {draftResult.elapsedMs}ms{typeof draftResult.deadlineSeconds === 'number' ? ` · ${text('deadline', 'deadline')} ${draftResult.deadlineSeconds}s` : ''} · {draftResult.verificationStatus} / {draftResult.authority} / {draftResult.compatibility}</span>
             </div>
           </div>
           <div className="human-flow-actions">
-            <button className="button primary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Показать draft prompt', 'Show draft prompt')}</button>
+            <button className="button primary" onClick={() => void openDraftPrompt()}><FileText size={16} />{draftResultFresh ? text('Показать draft prompt', 'Show draft prompt') : text('Открыть промпт', 'Open prompt')}</button>
             {draftResult.artifacts.plan ? <button className="button secondary" onClick={() => void onOpenPath(draftResult.artifacts.plan)}><FileText size={16} />{text('План', 'Plan')}</button> : null}
             {draftResult.artifacts.manifest ? <button className="button secondary" onClick={() => void onOpenPath(draftResult.artifacts.manifest)}><FileText size={16} />{text('Manifest', 'Manifest')}</button> : null}
-            <button className="button secondary" onClick={acknowledgeDraftResult}>{text('Принято', 'Acknowledge')}</button>
+            {draftResultFresh ? <button className="button secondary" onClick={acknowledgeDraftResult}>{text('Принято', 'Acknowledge')}</button> : null}
           </div>
         </div> : null}
       </section>
@@ -534,5 +565,50 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
       {baselineIntentDialog ? <BaselineIntentDialog mode={baselineIntentDialog.mode} plan={baselineIntentDialog.plan} decision={baselineIntentDialog.decision} onCancel={() => { setBaselineIntentDialog(undefined); if (baselineIntentDialog.mode === 'decision') setBaselineDecisionDismissed(true) }} onSubmit={runBaselineIntent} /> : null}
       {draftPromptPreview ? <PromptPreviewDialog preview={draftPromptPreview} onClose={() => setDraftPromptPreview(undefined)} onOpenPath={onOpenPath} /> : null}
     </section>
+  )
+}
+
+// Live Draft progress: a compact strip of the current planner operation driven
+// by [draft-progress] events from the subprocess (heartbeat = how recently an
+// event arrived; elapsed ticks every second). It is planning-only by design and
+// must never claim physical verification of the project.
+function DraftLiveProgress({ startedAt, progress, runId }: { startedAt?: number; progress?: DraftProgressPayload; runId?: string }) {
+  const { text } = useLanguage()
+  const [elapsedSec, setElapsedSec] = useState(0)
+  useEffect(() => {
+    if (!startedAt) return
+    const tick = () => setElapsedSec(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)))
+    tick()
+    const timer = window.setInterval(tick, 1000)
+    return () => window.clearInterval(timer)
+  }, [startedAt])
+  const stepLabels: Record<string, string> = {
+    inventory: text('Локальная инвентаризация', 'Local inventory'),
+    scan: text('Обогащение зависимостей', 'Dependency enrichment'),
+    solve: text('Планирование targets', 'Targets planning'),
+    finalize: text('Публикация Draft', 'Publishing the Draft'),
+  }
+  const stepLabel = progress?.step ? (stepLabels[progress.step] ?? progress.step) : text('Ожидаем первый результат планировщика…', 'Waiting for the planner…')
+  const heartbeat = progress ? (Date.now() - progress.at > 8000 ? 'stale' : 'live') : 'wait'
+  const progressParts = [
+    progress?.package ? <code key="pkg">{progress.package}</code> : null,
+    progress?.operation ? <span className="draft-live-op" key="op">{progress.operation}</span> : null,
+    typeof progress?.retry === 'number' && progress.retry > 0 ? <span className="draft-live-op" key="retry">retry {progress.retry}</span> : null,
+    typeof progress?.completed === 'number' && typeof progress?.total === 'number' && progress.total > 0
+      ? <span className="draft-live-count" key="count">{progress.completed}/{progress.total}</span>
+      : null,
+  ]
+  return (
+    <div className="draft-live-progress" aria-label={text('Ход работы Draft', 'Draft progress')}>
+      <div className="draft-live-heading">
+        <strong>{stepLabel}</strong>
+        <span>{runId ? <code>{runId.slice(0, 12)}</code> : null}{text(` · ${elapsedSec}s`, ` · ${elapsedSec}s`)}</span>
+      </div>
+      <div className="draft-live-strip">
+        <span className={`draft-live-dot ${heartbeat}`} />
+        {progressParts}
+      </div>
+      <small>{text('Planning-only: install/lifecycle/project checks не выполняются, проект не изменяется.', 'Planning-only: no install/lifecycle/project checks are run, the project is not modified.')}</small>
+    </div>
   )
 }

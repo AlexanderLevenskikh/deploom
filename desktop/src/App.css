@@ -878,6 +878,29 @@ textarea::placeholder {
 .human-flow-remaining { margin: 11px 0 0; color: var(--text-muted); font-size: 11px; }
 .human-flow-actions { margin-top: 17px; display: flex; flex-wrap: wrap; gap: 8px; }
 
+.draft-result-card { margin-top: 14px; padding: 13px 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
+.draft-result-card.fresh { border-color: var(--blue); background: var(--blue-soft); }
+.draft-result-heading { display: grid; gap: 3px; }
+.draft-result-heading strong { font-size: 13px; }
+.draft-result-heading span { color: var(--text-muted); font-size: 11px; }
+.draft-result-heading .draft-result-meta { display: block; margin-top: 3px; color: var(--text-muted); font-size: 10px; }
+.draft-result-heading code { font-size: 10px; }
+
+.draft-live-progress { margin-top: 14px; padding: 11px 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
+.draft-live-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.draft-live-heading strong { font-size: 12px; }
+.draft-live-heading span { color: var(--text-muted); font-size: 10px; }
+.draft-live-heading code { font-size: 10px; }
+.draft-live-strip { margin-top: 8px; display: flex; align-items: center; gap: 9px; flex-wrap: wrap; min-height: 20px; color: var(--text); font-size: 12px; }
+.draft-live-strip code { font-size: 11px; }
+.draft-live-op { color: var(--text-muted); font-size: 11px; }
+.draft-live-count { color: var(--text-muted); font-size: 11px; }
+.draft-live-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-muted); }
+.draft-live-dot.live { background: var(--green); animation: draft-pulse 1.6s ease-in-out infinite; }
+.draft-live-dot.stale { background: var(--amber-soft); }
+.draft-live-progress small { display: block; margin-top: 7px; color: var(--text-muted); font-size: 10px; }
+@keyframes draft-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
 .flow-technical-details { max-width: 980px; margin: 0 auto 20px; border-top: 1px solid var(--border); }
 .flow-technical-details > summary { padding: 11px 2px; color: var(--text-muted); cursor: pointer; font-size: 11px; user-select: none; }
 .flow-technical-details-body { padding-top: 2px; }

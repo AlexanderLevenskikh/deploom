@@ -68,6 +68,8 @@ type AutopilotState = AutopilotPolicyState & {
   infrastructureCounts: Record<string, number>
 }
 
+export type DraftProgressPayload = { runId?: string; project?: string; step?: string; package?: string; operation?: string; completed?: number; total?: number; retry?: number; status?: string; at: number }
+
 const MAX_AUTOPILOT_RECOVERY_CYCLES = 8
 const MAX_AUTOPILOT_INFRA_RETRIES = 3
 function autopilotActionInput(details: WorkspaceDetails, state: AutopilotState, action: FlowAction): ActionInput {
@@ -89,10 +91,33 @@ export function useDependencyFlow() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string>()
   const [baselineDecision, setBaselineDecision] = useState<BaselineDecision>()
-  type ActiveRun = { jobId: string; action: ActionInput['action']; workspaceId?: string; projectName?: string; startedAt: number }
+  type ActiveRun = { jobId: string; action: ActionInput['action']; workspaceId?: string; projectName?: string; runId?: string; startedAt: number }
   type ActiveRunStart = Omit<ActiveRun, 'startedAt'> & { startedAt?: number }
   const [activeRuns, setActiveRuns] = useState<Record<string, ActiveRun>>({})
   const [logs, setLogs] = useState<JobOutput[]>([])
+  const [draftProgress, setDraftProgress] = useState<Record<string, DraftProgressPayload>>({})
+  // Draft-launch markers survive FlowWorkspace remounts (Graph/Dashboard → FLOW)
+  // because they live next to the active-run state. A marker records which run
+  // the user launched, whether its prompt should auto-open on completion, and
+  // is matched by runId so an old result is never presented as the new run's.
+  type DraftLaunchMarker = { workspaceId?: string; projectName: string; runId?: string; autoOpen: boolean; at: number }
+  const [draftLaunches, setDraftLaunches] = useState<Record<string, DraftLaunchMarker>>({})
+  const markDraftLaunched = useCallback((workspaceId: string | undefined, projectName: string, runId?: string, autoOpen?: boolean) => {
+    setDraftLaunches((current) => {
+      const key = `${workspaceId ?? ''}::${projectName ?? ''}`
+      const previous = current[key]
+      return { ...current, [key]: { workspaceId, projectName, runId: runId ?? previous?.runId, autoOpen: autoOpen ?? previous?.autoOpen ?? false, at: Date.now() } }
+    })
+  }, [])
+  // Launching a new Draft deliberately unbinds any previous runId: while the
+  // new job is starting, an older leftover result must not match the marker
+  // (fresh banner or auto-open). The runId is bound once runAction resolves.
+  const resetDraftLaunch = useCallback((workspaceId: string | undefined, projectName: string, autoOpen?: boolean) => {
+    setDraftLaunches((current) => {
+      const key = `${workspaceId ?? ''}::${projectName ?? ''}`
+      return { ...current, [key]: { workspaceId, projectName, runId: undefined, autoOpen: Boolean(autoOpen), at: Date.now() } }
+    })
+  }, [])
   const viewEpochRef = useRef(0)
   const selectedWorkspaceId = payload?.details?.workspace.id
   const selectedProjectName = payload?.details?.workspace.selectedProject ?? payload?.details?.projects[0]?.name
@@ -177,6 +202,22 @@ export function useDependencyFlow() {
     if (!api) return
     const removeOutput = api.onJobOutput((event) => {
       setLogs((current) => [...current.slice(-999), { ...event, receivedAt: Date.now() }])
+      // Live Draft progress is carried as a dedicated JSON line on stdout:
+      // [draft-progress] {"runId": "...", "step": "...", ...}. It is matched by
+      // runId (when present) so a later progress event of the same run updates
+      // the strip regardless of which job context forwarded it.
+      const match = /^\[draft-progress\]\s+(\{.*\})$/s.exec(event.line)
+      if (match) {
+        try {
+          const parsed = JSON.parse(match[1]) as Partial<DraftProgressPayload>
+          if (parsed && typeof parsed === 'object') {
+            const key = typeof parsed.runId === 'string' && parsed.runId ? parsed.runId : event.jobId
+            setDraftProgress((current) => ({ ...current, [key]: { ...parsed, at: Date.now() } }))
+          }
+        } catch {
+          // malformed progress lines stay diagnostic-only
+        }
+      }
     })
     const removeMigrationProgress = api.onMigrationProgressChanged((event) => {
       if (event.workspaceId === selectedWorkspaceId && event.projectName === selectedProjectName) void refresh()
@@ -451,7 +492,7 @@ export function useDependencyFlow() {
     }
     applyWorkspaceResult(await api.updateProjectBranches(input))
   }, [api, applyWorkspaceResult])
-  const runAction = useCallback(async (input: ActionInput) => {
+  const runAction = useCallback(async (input: ActionInput): Promise<{ jobId: string; runId?: string } | undefined> => {
     setContextError(input.workspaceId, input.projectName, undefined)
     const logContext = { workspaceId: input.workspaceId, projectName: input.projectName }
     setLogs((current) => [...current, { jobId: 'system', stream: 'system', ...logContext, line: `Запуск: ${input.action}` }])
@@ -462,15 +503,17 @@ export function useDependencyFlow() {
         setLogs((current) => [...current, { jobId: demoId, stream: 'stdout', workspaceId: input.workspaceId, projectName: input.projectName, line: 'Демонстрационный режим: команда успешно завершена.' }])
         forgetActiveJob(demoId)
       }, 700)
-      return
+      return undefined
     }
     try {
       const result = await api.runAction(input)
-      rememberActiveRun({ jobId: result.jobId, action: input.action, workspaceId: input.workspaceId, projectName: input.projectName })
+      rememberActiveRun({ jobId: result.jobId, action: input.action, workspaceId: input.workspaceId, projectName: input.projectName, runId: result.runId })
+      return { jobId: result.jobId, runId: result.runId }
     } catch (runError) {
       const message = runError instanceof Error ? runError.message : String(runError)
       setLogs((current) => [...current.slice(-999), { jobId: 'system', stream: 'stderr', ...logContext, line: message }])
       setContextError(input.workspaceId, input.projectName, message)
+      return undefined
     }
   }, [api])
 
@@ -523,10 +566,10 @@ export function useDependencyFlow() {
   const pauseJob = useCallback(async () => { if (!api || !activeJobId) return false; return api.pauseJob(activeJobId) }, [activeJobId, api])
   const getHardwareSnapshot = useCallback(async (): Promise<HardwareSnapshot> => { if (!api) throw new Error('Desktop API is unavailable'); return api.getHardwareSnapshot() }, [api])
   const getBaselineIntentPlan = useCallback(async (projectName: string): Promise<BaselineIntentPlan> => { if (!api) return { candidates: [], intent: { schemaVersion: 1, policies: {}, extraIterations: 0, decisionGrantIterations: 0, searchMode: 'AUTO' } }; return api.getBaselineIntentPlan({ workspaceId: selectedWorkspaceId, projectName }) }, [api, selectedWorkspaceId])
-  const getCurrentDraftResult = useCallback(async () => {
+  const getCurrentDraftResult = useCallback(async (input: { workspaceId?: string; projectName: string; runId?: string }) => {
     if (!api) return undefined
     try {
-      return await api.getCurrentDraftResult()
+      return await api.getCurrentDraftResult(input)
     } catch {
       return undefined
     }
@@ -607,12 +650,16 @@ export function useDependencyFlow() {
     if (!details) return undefined
     return details.projects.find((project) => project.name === details.workspace.selectedProject) ?? details.projects[0]
   }, [payload?.details])
+  const activeDraftProgress: DraftProgressPayload | undefined =
+    (selectedActiveRun?.runId ? draftProgress[selectedActiveRun.runId] : undefined)
+    ?? (activeJobId ? draftProgress[activeJobId] : undefined)
+  const selectedDraftLaunch = selectedProjectName ? draftLaunches[contextKey(selectedWorkspaceId, selectedProjectName)] : undefined
   const visibleLogs = useMemo(() => logs.filter((entry) =>
     entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name
   ), [logs, selectedProject?.name, selectedWorkspaceId])
 
   return {
-    payload, loading, error, baselineDecision, activeJobId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject,
+    payload, loading, error, baselineDecision, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch,
     load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, removeProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches,
     runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult, getDependencyGraphSnapshot, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }

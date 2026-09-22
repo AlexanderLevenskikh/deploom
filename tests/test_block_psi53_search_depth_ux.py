@@ -22,12 +22,17 @@ class Psi53ProgressiveControlUxTests(unittest.TestCase):
         self.assertIn("executionMode: nextControlMode === 'AUTONOMOUS' ? 'BACKGROUND' : 'FAST'", self.dialog)
         self.assertNotIn("const [executionMode, setExecutionMode]", self.dialog)
 
-    def test_happy_path_exposes_progressive_semantics_not_yellow_goal(self) -> None:
+    def test_happy_path_exposes_progressive_semantics_and_freshness_goal(self) -> None:
         for sentinel in ("Как работать", "Автономно", "Подтверждать существенное", "Acceptance policy", "Бюджет Baseline / планирования"):
             self.assertIn(sentinel, self.dialog)
-        self.assertNotIn("Желаемая freshness", self.dialog)
-        self.assertNotIn("Preferred freshness", self.dialog)
-        self.assertNotIn("никакого скрытого 80%", self.dialog)
+        # R9: the numeric freshness goal is a first-class product control, part
+        # of the versioned policy hash (not a hidden or hardcoded threshold).
+        self.assertIn("Минимум актуальности", self.dialog)
+        self.assertIn("Minimum lag compliance", self.dialog)
+        self.assertIn("Цель запуска", self.dialog)
+        self.assertIn("targetLevel === 'green' ? 'green' : 'yellow'", self.dialog)
+        self.assertIn("minLagOkPct: boundedInteger(nextMinLagOkPct, 80, 0, 100)", self.dialog)
+        self.assertIn("Входит в policy hash", self.dialog)
 
     def test_search_depth_remains_technical_escape_hatch(self) -> None:
         self.assertIn("Техническая глубина поиска", self.dialog)
@@ -47,6 +52,12 @@ class Psi53ProgressiveControlUxTests(unittest.TestCase):
             "maxKnownHigh !== boundedInteger",
             "searchDepth !== normalizedSearchMode",
             "cohortFingerprint(deferredCohorts)",
+            # R9: the freshness goal participates in the dirty fingerprint and
+            # buildIntent so a changed gate is never silently dropped.
+            "targetLevel !== (plan.intent.targetLevel === 'green' ? 'green' : 'yellow')",
+            "minLagOkPct !== boundedInteger(plan.intent.minLagOkPct, 80, 0, 100)",
+            "nextTargetLevel = targetLevel",
+            "nextMinLagOkPct = minLagOkPct",
         ):
             self.assertIn(sentinel, self.dialog)
         # Critical=0 is a backend/product invariant, not mutable dialog state.

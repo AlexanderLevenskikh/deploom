@@ -72,7 +72,7 @@ type BaselineProofMode = 'VERIFIED' | 'DRAFT'
 type BaselineControlMode = 'AUTONOMOUS' | 'CONFIRM_SIGNIFICANT'
 type BaselineDeferredCohort = { id: string; label: string; packages: string[]; predicate?: string; confidence?: number; authority: 'DIAGNOSTIC_HINT'; deferredAt?: string; decisionId?: string; boundaryPackages?: string[]; warningPackages?: string[] }
 type BaselineCohortAction = { kind: 'DEFER' | 'REACTIVATE'; cohortId: string; label: string; packages: string[]; predicate?: string; confidence?: number; decisionId?: string }
-type BaselineIntent = { schemaVersion: 1 | 2; policies: Record<string, BaselinePackagePolicy>; controlMode?: BaselineControlMode; budgetMinutes?: number; acceptancePolicy?: AcceptancePolicy; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; proofMode?: BaselineProofMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction }
+type BaselineIntent = { schemaVersion: 1 | 2; policies: Record<string, BaselinePackagePolicy>; controlMode?: BaselineControlMode; budgetMinutes?: number; acceptancePolicy?: AcceptancePolicy; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; proofMode?: BaselineProofMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction; targetLevel?: 'yellow' | 'green'; minLagOkPct?: number }
 type BaselineIntentCandidate = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string }
 type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent }
 type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
@@ -424,6 +424,8 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
     executionMode: controlMode === 'AUTONOMOUS' ? 'BACKGROUND' : 'FAST',
     proofMode: raw.proofMode === 'DRAFT' ? 'DRAFT' : 'VERIFIED',
     deferredCohorts,
+    ...(raw.targetLevel === 'green' ? { targetLevel: 'green' as const } : raw.targetLevel === 'yellow' ? { targetLevel: 'yellow' as const } : {}),
+    ...(raw.minLagOkPct !== undefined && raw.minLagOkPct !== null ? { minLagOkPct: Math.max(0, Math.min(100, Math.round(Number(raw.minLagOkPct) || 80))) } : {}),
     ...(cohortAction ? { cohortAction } : {}),
   }
 }
@@ -675,21 +677,65 @@ function readProjects(workspace: WorkspaceRecord): ProjectSpec[] {
 }
 
 // Draft Baseline artifacts. The planner publishes
-// <artifacts>/runs/<runId>/draft/{result.json,plan.json,prompt.md,summary.md}
-// under its settings base (settings_base/artifacts), which for a workspace is
-// .dependency-roadmap/artifacts. These helpers resolve that run-scoped result
-// without the renderer having to stat-watch files or guess at completion.
+// <workspace>/.dependency-roadmap/artifacts/runs/<runId>/draft/{result.json,
+// plan.json,prompt.md,summary.md}. The Desktop passes --artifacts-dir
+// <workspace>/.dependency-roadmap/artifacts when it launches the planner, so
+// the reader MUST resolve the same path regardless of where settings.project.json
+// lives (root-level and .dependency-roadmap settings behave identically).
+// Resolving from the settings file would diverge to <ws>/artifacts whenever
+// the settings live at the workspace root.
 function draftArtifactsRoot(workspace: WorkspaceRecord): string {
-  return join(dirname(resolveSettingsPath(workspace)), 'artifacts')
+  return join(workspace.path, '.dependency-roadmap', 'artifacts')
 }
 
-function readDraftResultArtifact(workspace: WorkspaceRecord, runId: string): DraftResultArtifact | undefined {
-  const manifestPath = join(draftArtifactsRoot(workspace), 'runs', artifactSafeSegment(runId), 'draft', 'result.json')
+function draftManifestPath(workspace: WorkspaceRecord, runId: string): string {
+  return join(draftArtifactsRoot(workspace), 'runs', artifactSafeSegment(runId), 'draft', 'result.json')
+}
+
+function sha256Text(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex')
+}
+
+// Strict run-scoped manifest read. The manifest must belong to the exact run
+// (and, when known, workspace/project), declare schemaVersion 1, reference
+// real sibling artifacts contained in the run directory, and carry plan/prompt
+// hashes that match the files on disk. Anything less makes the result invalid:
+// the UI must never show a foreign, stale or truncated Draft as fresh.
+function readDraftResultArtifact(
+  workspace: WorkspaceRecord,
+  runId: string,
+  expect?: { workspaceId?: string; projectId?: string },
+): DraftResultArtifact | undefined {
+  const manifestPath = draftManifestPath(workspace, runId)
   if (!existsSync(manifestPath)) return undefined
   try {
     const parsed = JSON.parse(readFileSync(manifestPath, 'utf8')) as Partial<DraftResultArtifact>
+    if (parsed.schemaVersion !== 1) return undefined
     if (parsed.status !== 'DRAFT_READY' && parsed.status !== 'DRAFT_PARTIAL') return undefined
-    if (typeof parsed.runId !== 'string' || !parsed.runId) return undefined
+    if (typeof parsed.runId !== 'string' || !parsed.runId || parsed.runId !== runId) return undefined
+    if (expect) {
+      if (expect.workspaceId && typeof parsed.workspaceId === 'string' && parsed.workspaceId && parsed.workspaceId !== expect.workspaceId) return undefined
+      if (expect.projectId && typeof parsed.projectId === 'string' && parsed.projectId && parsed.projectId !== expect.projectId) return undefined
+    }
+    const artifacts = parsed.artifacts
+    if (!artifacts) return undefined
+    const root = draftArtifactsRoot(workspace)
+    for (const kind of ['plan', 'prompt', 'summary'] as const) {
+      const raw = artifacts[kind]
+      if (typeof raw !== 'string' || !raw) return undefined
+      if (!isInside(raw, root)) return undefined
+      if (!existsSync(raw) || !statSync(raw).isFile()) return undefined
+    }
+    const hashes = parsed.hashes
+    if (!hashes) return undefined
+    for (const kind of ['plan', 'prompt'] as const) {
+      const rawHash = hashes[kind]
+      const rawPath = artifacts[kind]
+      if (kind === 'prompt' && typeof rawHash !== 'string') return undefined
+      if (typeof rawPath !== 'string' || !rawPath) return undefined
+      if (typeof rawHash !== 'string' || !rawHash) return undefined
+      if (sha256Text(readFileSync(rawPath, 'utf8')) !== rawHash) return undefined
+    }
     return parsed as DraftResultArtifact
   } catch {
     return undefined
@@ -727,10 +773,32 @@ function draftResultForProject(workspace: WorkspaceRecord, projectName?: string)
   return buildDraftResultSnapshot(artifact)
 }
 
+// A Draft is stale when any project input that feeds the planner changed after
+// the run was generated (package manifest, canonical lockfiles, settings). The
+// manifest carries no per-input content hashes, so mtimes are the honest local
+// signal; Desktop never mutates the run artifact itself.
+function draftInputStaleness(workspace: WorkspaceRecord, project: ProjectSpec, snapshot: DraftResultSnapshot): boolean {
+  const generatedMs = Date.parse(snapshot.generatedAt)
+  if (!Number.isFinite(generatedMs)) return false
+  const settingsPath = resolveSettingsPath(workspace)
+  const candidates = [
+    settingsPath,
+    ...['package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lock', 'Pipfile.lock', 'poetry.lock', 'requirements.txt', 'pyproject.toml']
+      .map((name) => join(project.path, name)),
+  ]
+  return candidates.some((input) => {
+    try {
+      return existsSync(input) && statSync(input).isFile() && statSync(input).mtimeMs > generatedMs
+    } catch {
+      return false
+    }
+  })
+}
+
 // Persist the pointer to the newest completed Draft run (restart-safe) and
 // hand the renderer the exact snapshot produced by that run.
 function importDraftResult(workspace: WorkspaceRecord, projectName: string, runId: string): DraftResultSnapshot | undefined {
-  const artifact = readDraftResultArtifact(workspace, runId)
+  const artifact = readDraftResultArtifact(workspace, runId, { workspaceId: workspace.id, projectId: projectName })
   if (!artifact) return undefined
   const state = loadState()
   const saved = state.workspaces.find((item) => item.id === workspace.id)
@@ -2266,20 +2334,27 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
       const maxExpensiveAttempts = Math.max(2, Math.min(8, Math.ceil(budgetMinutes / 10)))
 
       // Concurrent project Baselines must not race on the workspace's shared
-      // dependency-roadmap.{md,json,html} publication. Baseline evidence and
-      // verification caches stay on their normal exact/project identities; only
-      // human-facing generator outputs are redirected to a project-private sink.
+      // dependency-roadmap.{md,json,html} publication. Verified Baseline
+      // evidence and verification caches stay on their normal exact/project
+      // identities; only human-facing generator outputs are redirected to a
+      // project-private sink. A Draft Baseline publishes ONLY its run-scoped
+      // artifacts (artifacts/runs/<runId>/draft/*) and must never write the
+      // legacy MD/JSON/HTML reports: those outputs feed the Verified UI cache
+      // and writing them would let a planning-only result shadow the last
+      // verified roadmap/dashboard (R5).
       const baselineProjectOutput = baselineProjectOutputDir(workspace, project.name)
-      mkdirSync(baselineProjectOutput, { recursive: true })
-      const baselineOutputArgs = [
-        '--out', join(baselineProjectOutput, 'dependency-roadmap.md'),
-        '--json-out', join(baselineProjectOutput, 'dependency-roadmap.json'),
-        '--html-out', join(baselineProjectOutput, 'dependency-roadmap.html'),
-        // The canonical Baseline history entry is still captured below. The
-        // automatic dashboard snapshot is workspace-global and is deferred to
-        // the normal generate stage to avoid cross-project publication races.
-        '--no-history-snapshot',
-      ]
+      const baselineOutputArgs = proofMode === 'DRAFT'
+        ? []
+        : [
+          '--out', join(baselineProjectOutput, 'dependency-roadmap.md'),
+          '--json-out', join(baselineProjectOutput, 'dependency-roadmap.json'),
+          '--html-out', join(baselineProjectOutput, 'dependency-roadmap.html'),
+          // The canonical Baseline history entry is still captured below. The
+          // automatic dashboard snapshot is workspace-global and is deferred to
+          // the normal generate stage to avoid cross-project publication races.
+          '--no-history-snapshot',
+        ]
+      if (proofMode !== 'DRAFT') mkdirSync(baselineProjectOutput, { recursive: true })
 
       const baselineModeArgs = proofMode === 'DRAFT'
         ? ['--draft-baseline']
@@ -2338,6 +2413,10 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
             DEPLOOM_WORKSPACE_ID: workspace.id,
             DEPLOOM_PROJECT_ID: project.name,
             DEPLOOM_MODE: 'draft',
+            // R9: numeric target criteria become part of the policy snapshot and
+            // hash, so changing the gate really changes the plan and goal.
+            DEPLOOM_BASELINE_TARGET_LEVEL: effectiveIntent.targetLevel ?? 'yellow',
+            DEPLOOM_BASELINE_MIN_LAG_OK_PCT: String(effectiveIntent.minLagOkPct ?? 80),
           } : {}),
         },
       }]
@@ -5879,41 +5958,44 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
     // This is the persistence boundary that makes project switching truly
     // isolated rather than merely filtering renderer state.
     if (job.action === 'baseline' && job.projectName) {
-      // Baseline intentionally writes into a project-private output directory
-      // so concurrent project Baselines cannot race on shared jsonOut/htmlOut.
-      // Snapshot exactly those files; reading the shared configured roadmap
-      // here used to turn a successful Baseline into a false failure whenever
-      // that shared file happened to contain another project.
-      const baselineOutput = baselineProjectOutputDir(job.workspace, job.projectName)
-      if (!snapshotProjectArtifacts(job.workspace, job.projectName, {
-        roadmap: join(baselineOutput, 'dependency-roadmap.json'),
-        dashboard: join(baselineOutput, 'dependency-roadmap.html'),
-      })) {
-        throw new Error(`PROJECT_ARTIFACT_SNAPSHOT_FAILED: private Baseline roadmap для ${job.projectName} не содержит этот проект.`)
-      }
-      // A completed Draft Baseline is a run-scoped planning artifact: import
-      // its manifest (artifacts/runs/<runId>/draft/result.json) into workspace
-      // state and surface it on the job-finished event so the UI can switch
-      // from "watching for files to change" to "showing this run's result".
-      if (job.baselineProofMode === 'DRAFT' && job.runId && job.projectName) {
-        draftResult = importDraftResult(job.workspace, job.projectName, job.runId)
-        if (draftResult) {
-          send('flow:job-output', {
-            jobId: job.id,
-            stream: 'system',
-            workspaceId: job.workspace.id,
-            projectName: job.projectName,
-            line: `Draft результат импортирован: run ${draftResult.runId}, status ${draftResult.status}, ${draftResult.elapsedMs}ms. ${draftResult.summary}`,
-          })
-        } else {
-          send('flow:job-output', {
-            jobId: job.id,
-            stream: 'system',
-            workspaceId: job.workspace.id,
-            projectName: job.projectName,
-            line: `Draft запуск ${job.runId} завершился без result.json; планировщик не опубликовал manifest. Проверьте артефакты запуска.`,
-          })
+      if (job.baselineProofMode === 'DRAFT') {
+        // R1+R5: a Draft Baseline finalizes exclusively through its own
+        // run-scoped artifacts. It never requires -- and never overwrites --
+        // the legacy verified roadmap/dashboard cache, and a missing/invalid
+        // manifest is a typed FAILED result, never a silent exit-0 success.
+        if (!job.runId) {
+          throw new Error(`DRAFT_RUN_ID_MISSING: Draft Baseline запущен без runId; результат не может быть разрешён.`)
         }
+        draftResult = importDraftResult(job.workspace, job.projectName, job.runId)
+        if (!draftResult) {
+          throw new Error(`DRAFT_RESULT_MISSING: Draft запуск ${job.runId} не опубликовал валидный result.json (${draftManifestPath(job.workspace, job.runId)}); результат не считается готовым, а артефакт Draft проверен на принадлежность запуску/проекту и целостность.`)
+        }
+        send('flow:job-output', {
+          jobId: job.id,
+          stream: 'system',
+          workspaceId: job.workspace.id,
+          projectName: job.projectName,
+          line: `Draft результат импортирован: run ${draftResult.runId}, status ${draftResult.status}, ${draftResult.elapsedMs}ms. ${draftResult.summary}`,
+        })
+      } else {
+        // Verified Baseline writes into a project-private output directory so
+        // concurrent project Baselines cannot race on shared jsonOut/htmlOut.
+        // Snapshot exactly those files; reading the shared configured roadmap
+        // here used to turn a successful Baseline into a false failure whenever
+        // that shared file happened to contain another project.
+        const baselineOutput = baselineProjectOutputDir(job.workspace, job.projectName)
+        if (!snapshotProjectArtifacts(job.workspace, job.projectName, {
+          roadmap: join(baselineOutput, 'dependency-roadmap.json'),
+          dashboard: join(baselineOutput, 'dependency-roadmap.html'),
+        })) {
+          throw new Error(`PROJECT_ARTIFACT_SNAPSHOT_FAILED: private Baseline roadmap для ${job.projectName} не содержит этот проект.`)
+        }
+        // Baseline is the end of planning epoch creation, not the beginning of
+        // execution. Only after the new Baseline has been fully generated and
+        // snapshotted do we discard the previous execution epoch. Manual FLOW
+        // therefore lands on Step 3; explicit Autopilot may immediately continue
+        // to agent because its own stage scheduler is still active.
+        await cleanupSupersededMigrationAfterBaseline(job, findProject(job.workspace, job.projectName))
       }
     } else if (job.action === 'generate' && job.projectName) {
       if (!snapshotProjectArtifacts(job.workspace, job.projectName)) {
@@ -5921,14 +6003,6 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
       }
     } else if (job.action === 'generate-all') {
       for (const project of readProjects(job.workspace)) snapshotProjectArtifacts(job.workspace, project.name)
-    }
-    // Baseline is the end of planning epoch creation, not the beginning of
-    // execution. Only after the new Baseline has been fully generated and
-    // snapshotted do we discard the previous execution epoch. Manual FLOW
-    // therefore lands on Step 3; explicit Autopilot may immediately continue
-    // to agent because its own stage scheduler is still active.
-    if (job.action === 'baseline' && job.projectName && job.baselineProofMode !== 'DRAFT') {
-      await cleanupSupersededMigrationAfterBaseline(job, findProject(job.workspace, job.projectName))
     }
     if (job.action === 'agent') await runAutonomousMigrationStage(job)
     if (job.action === 'recover') await runRecoveryAgentLoop(job)
@@ -5993,7 +6067,7 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
   } finally {
     stopOpenCodeServer(job)
     jobs.delete(job.id)
-    send('flow:job-finished', { jobId: job.id, action: job.action, workspaceId: job.workspace.id, projectName: job.projectName, exitCode, error: errorMessage, ...(draftResult ? { draftResult } : {}) })
+    send('flow:job-finished', { jobId: job.id, action: job.action, workspaceId: job.workspace.id, projectName: job.projectName, exitCode, error: errorMessage, ...(job.baselineProofMode === 'DRAFT' && job.runId ? { runId: job.runId } : {}), ...(draftResult ? { draftResult } : {}) })
     // A successful agent job is not necessarily the end of migration while
     // Autopilot is active: the goal-seeker may immediately launch another
     // generate/audit/agent residual cycle. Only manual single-stage runs get a
@@ -6272,16 +6346,23 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('flow:get-current-draft-result', async () => {
-    // Loading a Draft's run artifact (manifest + prompt + plan) for the
-    // currently selected project. Resolution is by runId from trusted state;
-    // the renderer never provides a path.
+  ipcMain.handle('flow:get-current-draft-result', async (_event, raw: { workspaceId?: string; projectName?: string; runId?: string } = {}) => {
+    // Loading a Draft's run artifact (manifest + prompt + plan) for an explicit
+    // workspace/project/run, never for a path or a global selection. Identity
+    // and integrity are verified strictly against the requested run; a foreign,
+    // truncated or stale manifest is not shown as a fresh Draft result.
     const state = loadState()
-    const workspace = findWorkspace(state)
-    const project = readProjects(workspace).find((item) => item.name === workspace.selectedProject) ?? readProjects(workspace)[0]
-    const projectName = project?.name ?? (workspace.selectedProject || readProjects(workspace)[0]?.name)
-    const snapshot = draftResultForProject(workspace, projectName)
-    if (!snapshot) return undefined
+    const workspace = findWorkspace(state, raw.workspaceId)
+    const project = raw.projectName ? findProject(workspace, raw.projectName) : undefined
+    const projectName = project?.name
+    if (!projectName) return undefined
+    const ref = workspace.draftResults?.[projectName]
+    const runId = raw.runId?.trim() ? raw.runId.trim() : ref?.runId
+    if (!runId) return undefined
+    const artifact = readDraftResultArtifact(workspace, runId, { workspaceId: workspace.id, projectId: projectName })
+    if (!artifact) return undefined
+    const snapshot = buildDraftResultSnapshot(artifact)
+    const stale = project ? draftInputStaleness(workspace, project, snapshot) : false
     const promptPath = snapshot.artifacts.prompt
     const planPath = snapshot.artifacts.plan
     let prompt: { path: string; content: string; stale: boolean; mtimeMs: number; size: number; projectName?: string } | undefined
@@ -6290,7 +6371,7 @@ function setupIpc(): void {
         prompt = {
           path: promptPath,
           content: readFileSync(promptPath, 'utf8'),
-          stale: false,
+          stale,
           mtimeMs: statSync(promptPath).mtimeMs,
           size: statSync(promptPath).size,
           projectName,
