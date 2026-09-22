@@ -60,6 +60,7 @@ import sys
 import time
 import tarfile
 import threading
+import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
@@ -1921,6 +1922,16 @@ def as_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def as_float_optional(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    return parsed if parsed > 0 else None
 
 
 def discover_projects(root: Path) -> List[ProjectSpec]:
@@ -3853,8 +3864,14 @@ def _prefetch_registry_metadata(
     *,
     progress_label: str = "",
     max_workers: int = REGISTRY_PREFETCH_PARALLELISM,
+    tolerate: bool = False,
 ) -> None:
-    """Fetch independent packuments concurrently, then reduce deterministically."""
+    """Fetch independent packuments concurrently, then reduce deterministically.
+
+    With ``tolerate=True`` (Draft), a failed registry fetch does not abort the
+    run: the package is marked metadata-unavailable and the canonical loop
+    records current/requested without inventing a target version.
+    """
     names = sorted({
         str(name)
         for name, _kind, spec in dependencies
@@ -3865,7 +3882,16 @@ def _prefetch_registry_metadata(
     workers = max(1, min(int(max_workers), 16, len(names)))
     if workers <= 1:
         for name in names:
-            client.npm_cache[name] = client.fetch_npm_metadata(name)
+            try:
+                client.npm_cache[name] = client.fetch_npm_metadata(name)
+            except RegistryInfrastructureError:
+                if not tolerate:
+                    raise
+                client.npm_cache[name] = None
+                eprint(
+                    f"[warn] {progress_label}: registry metadata unavailable for {name}; "
+                    "Draft records the package as unknown instead of failing"
+                )
         return
 
     started = time.perf_counter()
@@ -3894,6 +3920,15 @@ def _prefetch_registry_metadata(
                 errors[name] = exc
 
     if errors:
+        if tolerate:
+            for name in names:
+                if name not in results and name in errors:
+                    client.npm_cache[name] = None
+                    eprint(
+                        f"[warn] {progress_label}: registry metadata unavailable for {name}; "
+                        "Draft records the package as unknown instead of failing"
+                    )
+            return
         first_name = sorted(errors)[0]
         first_error = errors[first_name]
         raise RegistryInfrastructureError(
@@ -4042,6 +4077,7 @@ def analyze_project(
     include_prerelease: bool,
     max_candidates: int,
     progress_prefix: str = "",
+    tolerate_registry_failure: bool = False,
 ) -> List[DependencyRow]:
     project_started = time.perf_counter()
     pkg_path = project.path / "package.json"
@@ -4065,6 +4101,7 @@ def analyze_project(
         client,
         dependencies,
         progress_label=label,
+        tolerate=tolerate_registry_failure,
     )
     _prefetch_osv_evidence(
         client,
@@ -4166,7 +4203,16 @@ def analyze_project(
             f"[info] {dependency_label}: current={current} ({current_source}); "
             "loading registry metadata"
         )
-        meta = client.fetch_npm_metadata(name)
+        try:
+            meta = client.fetch_npm_metadata(name)
+        except RegistryInfrastructureError:
+            if not tolerate_registry_failure:
+                raise
+            meta = None
+            eprint(
+                f"[warn] {dependency_label}: registry metadata unavailable; "
+                "Draft records the package as unknown instead of failing"
+            )
         if not meta:
             analysis = AnalysisInfo(metadata_available=False, latest_version="registry unavailable", current_vulns="unknown")
             group, reason = classify(name, kind, "unknown", overrides, analysis, profile)
@@ -4247,7 +4293,16 @@ def analyze_project(
             f"[info] {dependency_label}: registry metadata ready; latest={latest}; "
             f"OSV candidates={len(candidates)}"
         )
-        vulns = client.query_osv_versions(name, candidates, progress_label=dependency_label)
+        try:
+            vulns = client.query_osv_versions(name, candidates, progress_label=dependency_label)
+        except VulnerabilityEvidenceUnavailable:
+            if not tolerate_registry_failure:
+                raise
+            eprint(
+                f"[warn] {dependency_label}: OSV evidence unavailable; "
+                "Draft records vulnerability state as unknown instead of failing"
+            )
+            vulns = {}
         current_summary = vuln_summary(vulns.get(current, []))
         min_nc = min_by_vuln(candidates, vulns, "no-critical", target_available)
         min_nh = min_by_vuln(candidates, vulns, "no-high", target_available)
@@ -20436,6 +20491,585 @@ def write_json(
     out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Draft result contract: persisted run-scoped planning artifacts.
+#
+# A successful Python process is not a user-facing result by itself. Draft
+# runs publish an atomic result manifest (result.json), a machine-readable
+# plan (plan.json), a ready agent prompt (prompt.md) and a short summary into
+# `artifacts/runs/<runId>/draft/`. The orchestrator (Desktop) resolves the
+# user-visible result from these artifacts by runId instead of watching file
+# mtimes or process liveness. None of these writes touch the verified
+# roadmap/prompt/proof/checkpoint files.
+# ---------------------------------------------------------------------------
+
+class DraftBudgetExceeded(Exception):
+    def __init__(self, phase: str) -> None:
+        super().__init__(phase)
+        self.phase = phase
+
+
+class DeadlineClock:
+    """Single monotonic deadline for a run.
+
+    ``deadline_seconds=None`` disables enforcement (used by non-draft modes
+    and by tests that drive their own clock). The deadline is created once at
+    run acceptance and is never reset between phases/variants.
+    """
+
+    def __init__(self, deadline_seconds: Optional[float]) -> None:
+        self.deadline_seconds = deadline_seconds
+        self.started = time.monotonic()
+
+    @property
+    def remaining(self) -> Optional[float]:
+        if self.deadline_seconds is None:
+            return None
+        return max(0.0, self.deadline_seconds - (time.monotonic() - self.started))
+
+    def check(self, phase: str) -> None:
+        if self.remaining is not None and self.remaining <= 0:
+            raise DraftBudgetExceeded(phase)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "deadlineSeconds": self.deadline_seconds,
+            "remainingMs": None if self.remaining is None else int(self.remaining * 1000),
+        }
+
+
+def stable_sha256_text(payload: str) -> str:
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _row_metadata_known(row: DependencyRow) -> bool:
+    latest = str(row.latest_version or "").strip()
+    if latest in ("", "—", "unknown", "неизвестно"):
+        return False
+    if "unavailable" in latest.lower() or "недоступн" in latest.lower():
+        return False
+    if row.current_source and "lock" in str(row.current_source).lower() and not str(row.current_version or "").strip():
+        return False
+    return True
+
+
+def policy_snapshot_from_env() -> Dict[str, Any]:
+    """Capture the orchestration policy the run was accepted under.
+
+    The Desktop already passes the intent/acceptance/control environment
+    today; Draft persists a stable snapshot plus its own hash so that later
+    acceptance/audit/release stages can compare policyHash and never silently
+    reuse a plan computed under a different policy.
+    """
+    snapshot: Dict[str, Any] = {
+        "schemaVersion": 1,
+        "intentJson": os.environ.get("DEPLOOM_BASELINE_INTENT_JSON", ""),
+        "acceptancePolicyJson": os.environ.get("DEPLOOM_ACCEPTANCE_POLICY_JSON", ""),
+        "controlMode": os.environ.get("DEPLOOM_BASELINE_CONTROL_MODE", ""),
+        "executionMode": os.environ.get("DEPLOOM_BASELINE_EXECUTION_MODE", ""),
+        "searchMode": os.environ.get("DEPLOOM_BASELINE_SEARCH_MODE", ""),
+        "proofMode": os.environ.get("DEPLOOM_BASELINE_PROOF_MODE", ""),
+        "budgetMinutes": os.environ.get("DEPLOOM_BASELINE_BUDGET_MINUTES", ""),
+        "automaticBudgetSeconds": os.environ.get("DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS", ""),
+        "maxExpensiveAttempts": os.environ.get("DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS", ""),
+        "mode": os.environ.get("DEPLOOM_MODE", "draft"),
+        "draftDeadlineSeconds": os.environ.get("DEPLOOM_DRAFT_DEADLINE_SECONDS", ""),
+        "draftMaxCandidates": os.environ.get("DEPLOOM_DRAFT_MAX_CANDIDATES", ""),
+    }
+    # Pin down the effective policy hash so UI/audit/closure cannot drift from
+    # the planner's decision. Unknown/empty values are included verbatim so a
+    # change between "no policy" and "policy X" also invalidates the hash.
+    return snapshot
+
+
+def draft_policy_hash(snapshot: Optional[Dict[str, Any]] = None) -> str:
+    snapshot = snapshot if snapshot is not None else policy_snapshot_from_env()
+    canonical = json.dumps(snapshot, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return stable_sha256_text(canonical)
+
+
+def draft_input_hash(project: ProjectSpec) -> str:
+    """Hash of the locally read manifest inputs the plan was derived from."""
+    h = hashlib.sha256()
+    for filename in ("package.json", "yarn.lock", "pnpm-lock.yaml", "package-lock.json", "npm-shrinkwrap.json", "package-manager.json"):
+        path = project.path / filename
+        if path.exists():
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            h.update(filename.encode("utf-8"))
+            h.update(b"\0")
+            h.update(data)
+            h.update(b"\0")
+    return h.hexdigest()
+
+
+def _draft_target_for_major(row: DependencyRow) -> str:
+    """Choose the single 'selected variant' target for a Draft row.
+
+    Draft builds one chosen variant. We use the planner's default target as
+    the stable handoff contract (it is what the existing Dashboard exports as
+    "до какой обновить по умолчанию") and keep yellow/green as documented
+    alternatives; rows with no reliable metadata never get an invented version.
+    """
+    if row.scope_excluded:
+        return NO_ACTION
+    if row.planner_deferred:
+        return NO_ACTION
+    default = row.target_default
+    if default and default != NO_ACTION:
+        return default
+    yellow = row.target_yellow
+    return yellow if yellow and yellow != NO_ACTION else NO_ACTION
+
+
+def _draft_row_status(row: DependencyRow, chosen_target: str) -> str:
+    if row.scope_excluded:
+        return "excluded"
+    if row.planner_deferred:
+        return "deferred"
+    if not _row_metadata_known(row):
+        return "unknown-metadata"
+    current = str(row.current_version or "").strip()
+    target = str(chosen_target or "").strip()
+    if target == NO_ACTION or target == "":
+        return "no-target"
+    if current and target and current == target:
+        return "no-change"
+    if str(row.latest_version or "").strip() in ("", "—", "unknown") or "неизвестн" in str(row.latest_version or ""):
+        return "unknown-metadata"
+    if row.current_source and "lock" in str(row.current_source).lower() and not current:
+        return "unknown-metadata"
+    return "proposed"
+
+
+def build_draft_plan(
+    rows_by_project: Dict[str, List[DependencyRow]],
+    projects_by_name: Dict[str, ProjectSpec],
+    health_by_project: Dict[str, ProjectHealth],
+) -> Dict[str, Any]:
+    """Machine-readable Draft plan: proposals, unknowns, conflicts, health."""
+    proposals: List[Dict[str, Any]] = []
+    unknowns: List[Dict[str, Any]] = []
+    conflicts: List[Dict[str, Any]] = []
+    manifests: Dict[str, Any] = {}
+    projects: List[str] = sorted(rows_by_project)
+    totals = {"proposed": 0, "no-change": 0, "deferred": 0, "excluded": 0, "unknown-metadata": 0, "no-target": 0, "total": 0}
+    for project in projects:
+        rows = rows_by_project[project]
+        spec = projects_by_name.get(project)
+        plan_rows: List[Dict[str, Any]] = []
+        for row in rows:
+            target = _draft_target_for_major(row)
+            status = _draft_row_status(row, target)
+            totals[status] = totals.get(status, 0) + 1
+            totals["total"] += 1
+            entry: Dict[str, Any] = {
+                "project": project,
+                "package": row.name,
+                "kind": row.kind,
+                "requestedSpec": row.requested_spec,
+                "current": row.current_version,
+                "target": target if target != NO_ACTION else None,
+                "targetYellow": row.target_yellow if row.target_yellow != NO_ACTION else None,
+                "targetGreen": row.target_green if row.target_green != NO_ACTION else None,
+                "status": status,
+                "reason": row.reason or (row.target_default_reason if row.target_default_reason != NO_ACTION else None),
+                "group": row.group,
+                "latest": row.latest_version,
+                "breakingChanges": list(row.breaking_changes or []),
+                "migrationNotes": list(row.migration_notes or []),
+            }
+            if row.compatibility_cohort or row.compatibility_note:
+                entry["conflict"] = row.compatibility_note or row.compatibility_cohort
+                conflicts.append({"package": row.name, "project": project, "note": row.compatibility_note or row.compatibility_cohort, "cohort": row.compatibility_cohort})
+            plan_rows.append(entry)
+            if status == "unknown-metadata" or not _row_metadata_known(row):
+                unknowns.append({
+                    "package": row.name,
+                    "project": project,
+                    "kind": row.kind,
+                    "requestedSpec": row.requested_spec,
+                    "current": row.current_version,
+                    "reason": "registry metadata unavailable for this package in this Draft run",
+                })
+        if spec:
+            manifests[project] = {
+                "path": str(spec.path),
+                "lockfile": {
+                    "manager": (spec.lockfile_state or {}).get("manager"),
+                    "file": str((spec.lockfile_state or {}).get("lockfile") or ""),
+                    "mode": (spec.lockfile_state or {}).get("mode"),
+                    "present": bool((spec.lockfile_state or {}).get("lockfile")),
+                },
+            }
+        proposals.append({
+            "project": project,
+            "rows": plan_rows,
+            "health": dataclasses.asdict(health_by_project[project]),
+        })
+    return {
+        "schemaVersion": 1,
+        "projects": projects,
+        "proposals": proposals,
+        "unknowns": unknowns,
+        "conflicts": conflicts,
+        "counts": totals,
+        "manifests": manifests,
+    }
+
+
+def build_draft_prompt(
+    run_id: str,
+    workspace_id: str,
+    project_id: str,
+    mode: str,
+    policy_hash: str,
+    plan: Dict[str, Any],
+    projects_by_name: Dict[str, ProjectSpec],
+    language: str = "ru",
+) -> str:
+    """Planning-only agent prompt, fully independent of the Dashboard/DOM.
+
+    The prompt explicitly declares NOT_VERIFIED / PLANNING_ONLY, states the
+    goal and acceptance criteria from the run policy snapshot, lists the exact
+    proposed targets plus keep-current/deferred/unknown rows and instructs the
+    agent what to verify before touching the project. No ProofEnvelope
+    authority is implied.
+    """
+    lines: List[str] = []
+    if language == "ru":
+        lines += [
+            "# IMPORTANT — DRAFT BASELINE / PLANNING ONLY",
+            "",
+            "Этот план НЕ проверен физически. DepLoom сознательно пропустил physical resolver/lifecycle/project verification.",
+            "compatibility = UNKNOWN; authority = PLANNING_ONLY; verificationStatus = NOT_VERIFIED.",
+            "",
+            "Используй предложенный target только как отправную точку. Выполни реальный package-manager install и",
+            "обнаруженные в проекте lint/type/build/test проверки. Сохраняй уже работающий scope, локализуй",
+            "несовместимые когорты и объясни каждое отклонение от предложенного target.",
+            "НЕ заявляй authority ProofEnvelope от DepLoom для этого Draft.",
+            "",
+            f"runId: `{run_id}`", f"workspaceId: `{workspace_id}`", f"projectId: `{project_id}`",
+            f"mode: `{mode}`", f"policyHash: `{policy_hash}`",
+            "",
+        ]
+    else:
+        lines += [
+            "# IMPORTANT — DRAFT BASELINE / PLANNING ONLY",
+            "",
+            "This plan is NOT physically verified. DepLoom deliberately skipped physical resolver/lifecycle/project verification.",
+            "compatibility = UNKNOWN; authority = PLANNING_ONLY; verificationStatus = NOT_VERIFIED.",
+            "",
+            "Treat the proposed targets only as a starting point. Run the real package-manager install and the project's",
+            "discovered lint/type/build/test checks. Preserve already-working scope, localize incompatible cohorts and",
+            "explain every deviation from the proposed target. Do not claim DepLoom ProofEnvelope authority for this Draft.",
+            "",
+            f"runId: `{run_id}`", f"workspaceId: `{workspace_id}`", f"projectId: `{project_id}`",
+            f"mode: `{mode}`", f"policyHash: `{policy_hash}`",
+            "",
+        ]
+
+    for project in plan.get("projects", []):
+        project_plan = next((p for p in plan.get("proposals", []) if p.get("project") == project), None)
+        if not project_plan:
+            continue
+        health = project_plan.get("health") or {}
+        if language == "ru":
+            lines += [f"# {project} — Draft план", ""]
+            lines += [
+                f"- Lag OK: {health.get('lag_ok_pct', '?')}% ({health.get('lag_ok_12m', '?')}/{health.get('total', '?')}), "
+                f"C/H/M/L: {health.get('critical', '?')}/{health.get('high', '?')}/{health.get('moderate', '?')}/{health.get('low', '?')}.",
+                f"- Причина статуса: {health.get('reason', '—')}.",
+                "",
+                "## Что требуется изменить (proposed)",
+                "",
+            ]
+            rows = [r for r in project_plan.get("rows", []) if r.get("status") == "proposed"]
+            if rows:
+                for r in rows:
+                    target = r.get("target") or "уточнить у агента"
+                    extra = ""
+                    if r.get("breakingChanges"):
+                        extra = f" [breaking: {', '.join(r['breakingChanges'][:3])}]"
+                    lines.append(f"- `{r['package']}` ({r.get('kind')}) текущая `{r.get('current')}` → target `{target}`{extra}.")
+            else:
+                lines.append("_Нет строк с предложенным обновлением в этом проекте._")
+            lines.append("")
+            kept = [r for r in project_plan.get("rows", []) if r.get("status") in ("no-change", "deferred", "excluded", "no-target")]
+            if kept:
+                grouped: Dict[str, List[Dict[str, Any]]] = {}
+                for r in kept:
+                    grouped.setdefault(r.get("status", "no-target"), []).append(r)
+                for status in ("no-change", "deferred", "excluded", "no-target"):
+                    items = grouped.get(status)
+                    if not items:
+                        continue
+                    label = {"no-change": "Уже на target / без изменений", "deferred": "Отложено", "excluded": "Исключено из scope", "no-target": "Нет проверяемого target"}[status]
+                    lines.append(f"## {label}")
+                    for r in items:
+                        lines.append(f"- `{r['package']}`: current `{r.get('current')}` — {r.get('reason') or '—'}")
+                    lines.append("")
+        else:
+            lines += [f"# {project} — Draft plan", ""]
+            health_entries = []
+            for key, value in (("lagOkPct", "Lag OK"), ("critical", "Critical"), ("high", "High"), ("moderate", "Moderate"), ("low", "Low")):
+                health_entries.append(f"{value} {health.get(key, '?')}")
+            lines.append(f"- {' · '.join(health_entries)}.")
+            if health.get("reason"):
+                lines.append(f"- Status reason: {health['reason']}.")
+            lines += ["", "## Proposed changes", ""]
+            rows = [r for r in project_plan.get("rows", []) if r.get("status") == "proposed"]
+            if rows:
+                for r in rows:
+                    target = r.get("target") or "clarify with agent"
+                    lines.append(f"- `{r['package']}` ({r.get('kind')}) current `{r.get('current')}` → target `{target}`.")
+            else:
+                lines.append("_No proposed changes in this project._")
+            lines.append("")
+
+    unknowns = plan.get("unknowns") or []
+    conflicts = plan.get("conflicts") or []
+    if language == "ru":
+        lines.append("## Неизвестные/требуют уточнения у агента")
+    else:
+        lines.append("## Unknowns / require agent clarification")
+    lines.append("")
+    if unknowns:
+        for u in unknowns:
+            lines.append(f"- `{u['package']}` (current `{u.get('current') or '—'}`): {u.get('reason') or 'metadata unavailable'}.")
+    else:
+        lines.append("_Нет неизвестных с недоступной metadata._")
+    lines.append("")
+    if language == "ru":
+        lines.append("## Известные конфликты / compatibility-заметки")
+    else:
+        lines.append("## Known conflicts / compatibility notes")
+    lines.append("")
+    if conflicts:
+        for c in conflicts:
+            lines.append(f"- `{c['package']}`: {c.get('note') or '—'}.")
+    else:
+        lines.append("_Конфликты не зафиксированы; physical compatibility остаётся UNKNOWN._")
+    lines.append("")
+    if language == "ru":
+        lines += [
+            "## Обязательные проверки агента",
+            "",
+            "- Перед изменением проверить доступность точного target tarball в настроенном registry/nexus.",
+            "- Для каждой зависимости определить затронутое поведение/конфигурацию и выполнить релевантные проверки до и после обновления.",
+            "- После изменения выполнить install только штатным package manager проекта, focused tests, lint/build/typecheck и свежую проверку OSV/outdated.",
+            "- Не менять исключённые и deferred-строки без отдельного пересогласования scope.",
+            "- После объединения веток перегенерировать roadmap и убедиться, что target совпадает с фактической версией.",
+            "",
+            "## Критерии приёмки (Draft НЕ доказывает их)",
+            "",
+            "- Все строки из раздела «Что требуется изменить» доведены до указанных target или оформлен доказанный blocker.",
+            "- package.json и канонический lockfile согласованы.",
+            "- Регрессионные проверки, обычные тесты, сборка, линтер и typecheck проходят в применимой части.",
+        ]
+    else:
+        lines += [
+            "## Required agent checks",
+            "",
+            "- Before changing anything, verify the exact target tarball is available in the configured registry/nexus.",
+            "- For each dependency determine affected behavior/configuration and run relevant checks before and after the upgrade.",
+            "- After changing, run install with the project's package manager only, focused tests, lint/build/typecheck and a fresh OSV/outdated check.",
+            "- Do not touch excluded and deferred rows without re-negotiating the scope.",
+            "- After merging branches regenerate the roadmap and confirm the target matches the installed version.",
+            "",
+            "## Acceptance criteria (Draft does NOT prove them)",
+            "",
+            "- Every row in 'Proposed changes' is brought to its target or a proven blocker is recorded.",
+            "- package.json and the canonical lockfile are consistent.",
+            "- Regression checks, tests, build, linter and typecheck pass for the applicable part.",
+        ]
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
+
+
+def publish_draft_result(
+    *,
+    run_id: str,
+    workspace_id: str,
+    project_id: str,
+    mode: str,
+    rows_by_project: Dict[str, List[DependencyRow]],
+    projects_by_name: Dict[str, ProjectSpec],
+    health_by_project: Dict[str, ProjectHealth],
+    status: str,
+    partial_reason: Optional[str],
+    deadline: DeadlineClock,
+    settings_snapshot: Optional[Dict[str, Any]] = None,
+    language: str = "ru",
+) -> Dict[str, Any]:
+    """Publish the Draft result set atomically and return its manifest.
+
+    Failures to write are surfaced to the caller (the run is not declared
+    READY); existing verified roadmap/prompt/proof files are never touched.
+    """
+    snapshot = settings_snapshot if settings_snapshot is not None else policy_snapshot_from_env()
+    policy_hash = draft_policy_hash(snapshot)
+    generated_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    plan = build_draft_plan(rows_by_project, projects_by_name, health_by_project)
+    prompt_md = build_draft_prompt(run_id, workspace_id, project_id, mode, policy_hash, plan, projects_by_name, language=language)
+    counts = plan["counts"]
+    proposed = counts.get("proposed", 0)
+    # unknown-metadata and the unknowns list are derived from the same rows;
+    # count unique packages once to avoid double counting.
+    unknown_names = {str(u.get("package", "")).strip() for u in (plan.get("unknowns") or []) if str(u.get("package", "")).strip()}
+    if unknown_names:
+        unknown_count = len(unknown_names)
+    else:
+        unknown_count = counts.get("unknown-metadata", 0)
+    if status == "DRAFT_READY":
+        summary = (
+            f"Черновой план готов: предложено {proposed} обновлений; "
+            f"для {unknown_count} пакетов нужно уточнение."
+        )
+    else:
+        summary = (
+            f"Черновой план частичный: предложено {proposed} обновлений; "
+            f"для {unknown_count} пакетов нужно уточнение. {partial_reason or 'Частичный результат по deadline/ошибке.'}"
+        )
+
+    run_dir = next((p for p in (artifacts_dir_for_draft() or [])), None)
+    # The Draft artifacts live under .dependency-roadmap/artifacts/runs/<runId>/draft
+    # alongside every other run log; the path is derived from the workspace
+    # settings base so a relocation of the workspace keeps artifacts together.
+    draft_dir = _draft_artifacts_dir(run_id)
+    del run_dir
+    plan_json_path = draft_dir / "plan.json"
+    prompt_md_path = draft_dir / "prompt.md"
+    summary_md_path = draft_dir / "summary.md"
+    manifest_path = draft_dir / "result.json"
+
+    plan_json_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_md_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_md_path.parent.mkdir(parents=True, exist_ok=True)
+
+    _atomic_write_text(plan_json_path, json.dumps(plan, ensure_ascii=False, indent=2))
+    _atomic_write_text(prompt_md_path, prompt_md)
+    _atomic_write_text(summary_md_path, summary + "\n")
+
+    manifest: Dict[str, Any] = {
+        "schemaVersion": 1,
+        "status": status,
+        "runId": run_id,
+        "workspaceId": workspace_id,
+        "projectId": project_id,
+        "mode": mode,
+        "generatedAt": generated_at,
+        "elapsedMs": int((time.monotonic() - deadline.started) * 1000),
+        "deadline": deadline.as_dict(),
+        "policyHash": policy_hash,
+        "settings": snapshot,
+        "verificationStatus": "NOT_VERIFIED",
+        "authority": "PLANNING_ONLY",
+        "compatibility": "UNKNOWN",
+        "metadata": {
+            "total": counts.get("total", 0),
+            "unknown": unknown_count,
+            "unknownPackages": [u["package"] for u in (plan.get("unknowns") or [])],
+        },
+        "proposals": {
+            "proposed": counts.get("proposed", 0),
+            "noChange": counts.get("no-change", 0),
+            "deferred": counts.get("deferred", 0),
+            "excluded": counts.get("excluded", 0),
+            "unknown": counts.get("unknown-metadata", 0),
+            "total": counts.get("total", 0),
+        },
+        "summary": summary,
+        "partialReason": partial_reason,
+        "artifacts": {
+            "manifest": str(manifest_path),
+            "plan": str(plan_json_path),
+            "prompt": str(prompt_md_path),
+            "summary": str(summary_md_path),
+        },
+        "hashes": {
+            "plan": stable_sha256_text(plan_json_path.read_text(encoding="utf-8")),
+            "prompt": stable_sha256_text(prompt_md),
+        },
+        "inputHashes": {
+            spec.name: draft_input_hash(spec) for spec in projects_by_name.values()
+        },
+        "projects": plan.get("projects", []),
+    }
+    _atomic_write_text(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2))
+    return manifest
+
+
+# Settings-base for Draft artifacts: resolved once from the merged settings so
+# the publish functions stay decoupled from main()'s locals.
+_ARTIFACTS_BASE_FOR_DRAFT: List[Path] = []
+
+
+def set_draft_artifacts_base(base: Optional[Path]) -> None:
+    global _ARTIFACTS_BASE_FOR_DRAFT
+    _ARTIFACTS_BASE_FOR_DRAFT = [base] if base is not None else []
+
+
+def artifacts_dir_for_draft() -> List[Path]:
+    return list(_ARTIFACTS_BASE_FOR_DRAFT)
+
+
+def _draft_artifacts_dir(run_id: str) -> Path:
+    base = _ARTIFACTS_BASE_FOR_DRAFT[0] if _ARTIFACTS_BASE_FOR_DRAFT else Path(".")
+    return base / "runs" / run_id / "draft"
+
+
+def _publish_draft_and_exit(
+    *,
+    run_id: str,
+    workspace_id: str,
+    project_id: str,
+    mode: str,
+    rows_by_project: Dict[str, List[DependencyRow]],
+    projects_by_name: Dict[str, ProjectSpec],
+    client: "LiveDataClient",
+    deadline_clock: DeadlineClock,
+    status: str,
+    partial_reason: str,
+) -> None:
+    """Publish whatever Draft data was gathered before an abort and exit 0.
+
+    The exit code stays 0 because a DRAFT_PARTIAL result is a legitimate user
+    result: the artifacts (manifest/plan/prompt/summary) exist and the reason
+    for partialness is recorded. The orchestrator must read the manifest by
+    runId rather than treating process exit as success.
+    """
+    del client
+    health_by_project = {
+        project: compute_project_health(rows, project, None)
+        for project, rows in rows_by_project.items()
+    }
+    manifest = publish_draft_result(
+        run_id=run_id,
+        workspace_id=workspace_id,
+        project_id=project_id,
+        mode=mode,
+        rows_by_project=rows_by_project,
+        projects_by_name=projects_by_name,
+        health_by_project=health_by_project,
+        status=status,
+        partial_reason=partial_reason,
+        deadline=deadline_clock,
+    )
+    eprint(f"[done] Draft partial result published: {manifest['summary']}")
+    eprint(f"[info] Draft manifest: {manifest['artifacts']['manifest']}")
+    raise SystemExit(0)
+
+
 def main() -> None:
     configure_utf8_stdio()
     ap = argparse.ArgumentParser(description="Generate live dependency roadmap by project directories with settings.json, project-aware grouping, work-batch suggestions, HTML dashboard, and agent prompt export.")
@@ -20504,10 +21138,44 @@ def main() -> None:
         choices=("validate", "update", "off"),
         help="Validate, refresh when stale, or disable project lockfile sync. Default: validate for --capture-baseline, update for current-checkout generation.",
     )
+    ap.add_argument("--run-id", default="", help="Stable run identifier from the orchestrator (Desktop). Stored in the Draft result manifest.")
+    ap.add_argument("--workspace-id", default="", help="Workspace identifier from the orchestrator. Stored in the Draft result manifest.")
+    ap.add_argument("--project-id", default="", help="Project identifier from the orchestrator. Stored in the Draft result manifest.")
+    ap.add_argument("--mode", default="", choices=("", "draft", "fast", "deep"), help="Product run mode. Draft implies a fast bounded planning-only run.")
+    ap.add_argument(
+        "--draft-deadline-seconds",
+        type=float,
+        help="Hard Draft deadline in seconds (default 15). On expiry the run publishes DRAFT_PARTIAL instead of failing.",
+    )
+    ap.add_argument(
+        "--draft-max-candidates",
+        type=int,
+        help="Candidate version cap for Draft planning (default 3, 0 = all). Keeps the Draft warm-path bounded.",
+    )
     args = ap.parse_args()
     if args.capture_baseline and args.draft_baseline:
         ap.error("--capture-baseline and --draft-baseline are mutually exclusive")
     source_baseline_mode = bool(args.capture_baseline or args.draft_baseline)
+
+    # Run identity and product mode. Draft runs are accepted with a stable
+    # runId/workspaceId/projectId so the user-visible result can be resolved by
+    # run even after app restart, tab/project switching or a missed IPC event.
+    mode = (args.mode or os.environ.get("DEPLOOM_MODE", "") or ("draft" if args.draft_baseline else "verify")).strip().lower()
+    if mode not in ("draft", "fast", "deep", "verify"):
+        mode = "draft" if args.draft_baseline else "verify"
+    run_id = (args.run_id or os.environ.get("DEPLOOM_RUN_ID", "")).strip() or f"run-{uuid.uuid4().hex[:12]}"
+    workspace_id = (args.workspace_id or os.environ.get("DEPLOOM_WORKSPACE_ID", "")).strip()
+    project_id = (args.project_id or os.environ.get("DEPLOOM_PROJECT_ID", "")).strip()
+    draft_deadline_seconds = (
+        args.draft_deadline_seconds
+        if args.draft_deadline_seconds is not None
+        else as_float_optional(os.environ.get("DEPLOOM_DRAFT_DEADLINE_SECONDS"))
+    )
+    if args.draft_baseline and draft_deadline_seconds is None:
+        draft_deadline_seconds = 15.0
+    if args.draft_baseline and args.draft_deadline_seconds is not None:
+        os.environ["DEPLOOM_DRAFT_DEADLINE_SECONDS"] = str(args.draft_deadline_seconds)
+    deadline_clock = DeadlineClock(draft_deadline_seconds if args.draft_baseline else None)
 
     global GENERATION_RESULT_METADATA
     GENERATION_RESULT_METADATA = (
@@ -20572,6 +21240,7 @@ def main() -> None:
     artifacts_dir_value = args.artifacts_dir or settings_get(settings, "artifacts-dir", "artifactsDir", default="artifacts")
     artifacts_dir = resolve_config_path(str(artifacts_dir_value), settings_base, None) if artifacts_dir_value else settings_base / "artifacts"
     assert artifacts_dir is not None
+    set_draft_artifacts_base(artifacts_dir)
 
     out_value = args.out or settings_get(settings, "out")
     json_out_value = args.json_out or settings_get(settings, "json-out", "jsonOut")
@@ -20601,10 +21270,29 @@ def main() -> None:
 
     registry = args.registry or settings_get(settings, "registry", default=NPM_REGISTRY)
     timeout = args.timeout if args.timeout is not None else as_int(settings_get(settings, "timeout"), REQUEST_TIMEOUT)
-    max_candidates = args.max_candidates if args.max_candidates is not None else as_int(settings_get(settings, "max-candidates", "maxCandidates"), 0)
+    configured_candidates = args.max_candidates if args.max_candidates is not None else as_int(settings_get(settings, "max-candidates", "maxCandidates"), 0)
+    if args.draft_baseline:
+        # Draft keeps the candidate space narrow so a warm-path result is
+        # bounded; 0 (all) is allowed via an explicit override/setting.
+        draft_candidates = (
+            args.draft_max_candidates
+            if args.draft_max_candidates is not None
+            else as_int(settings_get(settings, "draft-max-candidates", "draftMaxCandidates"), 3)
+        )
+        if draft_candidates >= 0:
+            configured_candidates = draft_candidates
+        if args.draft_max_candidates is not None:
+            os.environ["DEPLOOM_DRAFT_MAX_CANDIDATES"] = str(args.draft_max_candidates)
+    max_candidates = configured_candidates
     include_prerelease = args.include_prerelease or as_bool(settings_get(settings, "include-prerelease", "includePrerelease"), False)
     use_system_proxy = args.use_system_proxy or as_bool(settings_get(settings, "use-system-proxy", "useSystemProxy"), False)
-    release_intel_enabled = not args.skip_release_intel and as_bool(settings_get(settings, "release-intel-enabled", "releaseIntelEnabled"), True)
+    if args.draft_baseline:
+        # Release-intelligence enrichment (fetching release notes) is a heavy
+        # live step; Draft skips it by default and only runs it when explicitly
+        # enabled so the result is issued on the short deadline.
+        release_intel_enabled = not args.skip_release_intel and as_bool(settings_get(settings, "draft-release-intel-enabled", "draftReleaseIntelEnabled"), False)
+    else:
+        release_intel_enabled = not args.skip_release_intel and as_bool(settings_get(settings, "release-intel-enabled", "releaseIntelEnabled"), True)
     release_intel_max = args.release_intel_max_packages if args.release_intel_max_packages is not None else as_int(settings_get(settings, "release-intel-max-packages", "releaseIntelMaxPackages"), 0)
     history_snapshot_enabled = (
         not args.draft_baseline
@@ -20612,7 +21300,8 @@ def main() -> None:
         and as_bool(settings_get(settings, "history-snapshots-enabled", "historySnapshotsEnabled"), True)
     )
     source_checkout_guard_enabled = (
-        not args.skip_source_checkout_guard
+        not args.draft_baseline
+        and not args.skip_source_checkout_guard
         and as_bool(settings_get(settings, "source-checkout-guard", "sourceCheckoutGuard"), False)
     )
     global_audit_bootstrap_raw = settings_get(settings, "audit-bootstrap", "auditBootstrap", default={})
@@ -20703,13 +21392,17 @@ def main() -> None:
             if project.source_checkout_guard is None
             else project.source_checkout_guard and not args.skip_source_checkout_guard
         )
-        guard_enabled = bool(source_baseline_mode and configured_guard)
+        guard_enabled = bool(
+            args.draft_baseline is False
+            and source_baseline_mode
+            and configured_guard
+        )
         if not guard_enabled:
             project.source_checkout = {
                 "verified": False,
                 "remote": project.git_remote or "origin",
                 "sourceBranch": project.source_branch,
-                "reason": "source checkout guard disabled",
+                "reason": "source checkout guard disabled" if not args.draft_baseline else "Draft: planning-only, no git fetch/switch",
             }
         else:
             current_branch_probe = _git_command(project, ["branch", "--show-current"], check=False)
@@ -20739,37 +21432,60 @@ def main() -> None:
 
         baseline_mode = str(project.lockfile_sync_config.get("baselineMode") or project.lockfile_sync_config.get("mode") or "validate").strip().lower()
         current_mode = str(project.lockfile_sync_config.get("currentMode") or "update").strip().lower()
-        lock_mode = args.lockfile_mode or (baseline_mode if source_baseline_mode else current_mode)
+        if args.draft_baseline:
+            # Draft is planning-only: the project's own lockfile is read (never
+            # written/refreshed). A missing/ambiguous lockfile must not stop a
+            # theoretical plan -- it only lowers precision, which is recorded.
+            lock_mode = "off"
+        else:
+            lock_mode = args.lockfile_mode or (baseline_mode if source_baseline_mode else current_mode)
         try:
             lock_state = ensure_lockfile_consistency(
                 project.path,
                 str(registry),
                 project.lockfile_sync_config,
                 mode=lock_mode,
-                allow_update=not guard_enabled,
+                allow_update=not guard_enabled and not args.draft_baseline,
             )
+            lock_state_dict = lock_state.as_dict()
         except LockfileConsistencyError as exc:
-            eprint(f"[error] {exc}")
-            if not source_baseline_mode:
-                eprint("[hint] current-checkout generation refreshes the project's own lockfile before dashboard analysis")
-            raise SystemExit(2) from None
-        project.lockfile_state = lock_state.as_dict()
-        if lock_state.updated:
+            if args.draft_baseline and getattr(exc, "code", "") in ("LOCKFILE_MISSING", "LOCKFILE_AMBIGUOUS", "LOCKFILE_CONFLICT"):
+                eprint(f"[info] {project.name}: Draft uses manifest-only precision ({exc}); original lockfile left untouched.")
+                lock_state_dict = {
+                    "manager": "",
+                    "lockfile": "",
+                    "declared": "",
+                    "extras": [],
+                    "issues": [{"code": getattr(exc, "code", "LOCKFILE_MISSING"), "message": str(exc)}],
+                    "mode": "off",
+                    "note": str(exc),
+                    "draftManifestOnly": True,
+                }
+            else:
+                eprint(f"[error] {exc}")
+                if not source_baseline_mode:
+                    eprint("[hint] current-checkout generation refreshes the project's own lockfile before dashboard analysis")
+                raise SystemExit(2) from None
+        project.lockfile_state = lock_state_dict
+        lockfile_name = (lock_state_dict.get("lockfile") or "").rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+        lockfile_manager = lock_state_dict.get("manager") or ""
+        lockfile_updated = bool(lock_state_dict.get("updated"))
+        if lockfile_updated:
             eprint(
-                f"[info] project lockfile refreshed: {project.name} manager={lock_state.manager} "
-                f"file={lock_state.lockfile.name}; deduplication={lock_state.deduplication_status}"
+                f"[info] project lockfile refreshed: {project.name} manager={lockfile_manager} "
+                f"file={lockfile_name}; deduplication={lock_state_dict.get('deduplication_status')}"
             )
         else:
             eprint(
-                f"[info] project lockfile verified: {project.name} manager={lock_state.manager} "
-                f"file={lock_state.lockfile.name} mode={lock_mode}"
+                f"[info] project lockfile verified: {project.name} manager={lockfile_manager} "
+                f"file={lockfile_name} mode={lock_mode}"
             )
 
         project.current_audit = {
             "mode": "manual-only",
             "prepared": False,
-            "dashboardLockfile": lock_state.lockfile.name,
-            "dashboardPackageManager": lock_state.manager,
+            "dashboardLockfile": project.lockfile_state.get("lockfile") or "",
+            "dashboardPackageManager": project.lockfile_state.get("manager") or "",
             "toolPath": str(Path(__file__).resolve().parent / "manual_dependency_audit.py"),
             "command": "python manual_dependency_audit.py",
             "workspaceTemplate": ".dependency-roadmap/artifacts/manual-audit-<project>-workspace",
@@ -20777,7 +21493,7 @@ def main() -> None:
         }
         eprint(
             f"[info] vulnerability audit: manual-only for {project.name}; "
-            f"dashboard uses {lock_state.lockfile.name}, never a cross-manager audit lock"
+            f"dashboard uses {project.lockfile_state.get('lockfile') or 'project lockfile'}, never a cross-manager audit lock"
         )
 
     ensure_output_parent(out_path)
@@ -20825,22 +21541,41 @@ def main() -> None:
     else:
         eprint("[info] analysis mode: current checkout compared with the saved baseline; the project-manager lockfile is refreshed before analysis")
     generation_started = time.perf_counter()
-    for i, project in enumerate(projects, start=1):
-        project_prefix = f"[{i}/{len(projects)}]"
-        eprint(f"[info] {project_prefix} {project.name}: {project.path}")
-        rows_by_project[project.name].extend(
-            analyze_project(
-                project,
-                client,
-                overrides,
-                include_prerelease,
-                max_candidates,
-                progress_prefix=project_prefix,
+    try:
+        for i, project in enumerate(projects, start=1):
+            project_prefix = f"[{i}/{len(projects)}]"
+            deadline_clock.check(f"project-scan:{project.name}")
+            eprint(f"[info] {project_prefix} {project.name}: {project.path}")
+            rows_by_project[project.name].extend(
+                analyze_project(
+                    project,
+                    client,
+                    overrides,
+                    include_prerelease,
+                    max_candidates,
+                    progress_prefix=project_prefix,
+                    tolerate_registry_failure=args.draft_baseline,
+                )
             )
-        )
-        eprint(
-            f"[info] {project_prefix} {project.name}: project dependency scan complete; "
-            f"rows={len(rows_by_project[project.name])}"
+            eprint(
+                f"[info] {project_prefix} {project.name}: project dependency scan complete; "
+                f"rows={len(rows_by_project[project.name])}"
+            )
+    except DraftBudgetExceeded as budget_exc:
+        if not args.draft_baseline:
+            raise
+        eprint(f"[info] Draft deadline exceeded during project scan: {budget_exc.phase}")
+        _publish_draft_and_exit(
+            run_id=run_id,
+            workspace_id=workspace_id,
+            project_id=project_id,
+            mode=mode,
+            rows_by_project=rows_by_project,
+            projects_by_name=projects_by_name,
+            client=client,
+            deadline_clock=deadline_clock,
+            status="DRAFT_PARTIAL",
+            partial_reason=f"Draft deadline ({deadline_clock.deadline_seconds}s) exceeded at {budget_exc.phase}; metadata may be incomplete.",
         )
 
     baselines_dir = history_dir / "baselines"
@@ -20854,71 +21589,96 @@ def main() -> None:
 
     target_started = time.perf_counter()
     eprint("[info] target planning started")
-    _apply_baseline_intent_scope(rows_by_project)
-    health_by_project = enrich_project_targets(rows_by_project, planning_baselines)
-    apply_supervisor_scope_expansions(rows_by_project)
-    enforce_storybook_cohort(rows_by_project, client)
-    apply_planner_deferrals(rows_by_project)
-    # BLOCK_W_P0_P1_TYPES_NESTED_FIX_V1
-    # Executable-action feasibility is part of planning, not a post-proof rewrite.
-    # A deprecated @types/* target is either already proven removable against
-    # the exact planned runtime target or conservatively deferred before the
-    # expensive resolver/project proof begins.
-    plan_executable_actions(
-        rows_by_project,
-        client,
-        immutable_targets=False,
-    )
-    # Freeze the executable policy intent before compatibility resolution.
-    # Registry evidence is applied first so peer solving never relies on a
-    # metadata-only target; the solver may then choose registry-backed
-    # fallbacks/companions without resurrecting an infeasible type-stub action.
-    capture_desired_targets(rows_by_project)
-    enrich_registry_target_evidence(rows_by_project, client)
-    if residual_targets_by_project:
-        count = sum(len(targets) for targets in residual_targets_by_project.values())
-        eprint(f"[info] residual stability: loaded {count} previously approved target(s); merged matches are hard-fixed, pending matches are preferred")
-    proven_dependency_envelopes: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    proven_assignments: Dict[str, Dict[str, Dict[str, str]]] = {}
-    if args.draft_baseline:
-        eprint(
-            "[info] Draft Baseline: exact static dependency planning only; "
-            "verificationStatus=NOT_VERIFIED, authority=PLANNING_ONLY, compatibility=UNKNOWN"
-        )
-        resolve_peer_compatibility(
+    try:
+        deadline_clock.check("target-planning")
+        _apply_baseline_intent_scope(rows_by_project)
+        health_by_project = enrich_project_targets(rows_by_project, planning_baselines)
+        apply_supervisor_scope_expansions(rows_by_project)
+        enforce_storybook_cohort(rows_by_project, client)
+        apply_planner_deferrals(rows_by_project)
+        # BLOCK_W_P0_P1_TYPES_NESTED_FIX_V1
+        # Executable-action feasibility is part of planning, not a post-proof rewrite.
+        # A deprecated @types/* target is either already proven removable against
+        # the exact planned runtime target or conservatively deferred before the
+        # expensive resolver/project proof begins.
+        plan_executable_actions(
             rows_by_project,
             client,
-            modes=("yellow", "green", "default"),
-            apply_results=True,
-            residual_targets_by_project=residual_targets_by_project,
+            immutable_targets=False,
         )
-    else:
-        proven_assignments = resolve_peer_compatibility_with_verification(
-            rows_by_project, projects_by_name, client,
-            residual_targets_by_project=residual_targets_by_project,
-            external_evidence_by_project=external_evidence_by_project,
-            progress_path=baseline_progress_path,
-            proof_envelopes_out=proven_dependency_envelopes,
-        )
+        # Freeze the executable policy intent before compatibility resolution.
+        # Registry evidence is applied first so peer solving never relies on a
+        # metadata-only target; the solver may then choose registry-backed
+        # fallbacks/companions without resurrecting an infeasible type-stub action.
+        capture_desired_targets(rows_by_project)
+        enrich_registry_target_evidence(rows_by_project, client)
+        if residual_targets_by_project:
+            count = sum(len(targets) for targets in residual_targets_by_project.values())
+            eprint(f"[info] residual stability: loaded {count} previously approved target(s); merged matches are hard-fixed, pending matches are preferred")
+        proven_dependency_envelopes: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        proven_assignments: Dict[str, Dict[str, Dict[str, str]]] = {}
+        if args.draft_baseline:
+            eprint(
+                "[info] Draft Baseline: exact static dependency planning only; "
+                "verificationStatus=NOT_VERIFIED, authority=PLANNING_ONLY, compatibility=UNKNOWN"
+            )
+            deadline_clock.check("peer-planning")
+            resolve_peer_compatibility(
+                rows_by_project,
+                client,
+                modes=("yellow", "green", "default"),
+                apply_results=True,
+                residual_targets_by_project=residual_targets_by_project,
+            )
+        else:
+            proven_assignments = resolve_peer_compatibility_with_verification(
+                rows_by_project, projects_by_name, client,
+                residual_targets_by_project=residual_targets_by_project,
+                external_evidence_by_project=external_evidence_by_project,
+                progress_path=baseline_progress_path,
+                proof_envelopes_out=proven_dependency_envelopes,
+            )
 
-    enrich_registry_target_evidence(
-        rows_by_project,
-        client,
-        allow_target_mutation=False,
-    )
-    # A late @types action decision may fail the handoff, but may not mutate a
-    # finalized dependency target.
-    plan_executable_actions(
-        rows_by_project,
-        client,
-        immutable_targets=True,
-    )
-    if not args.draft_baseline:
-        assert_proven_assignment_conformance(rows_by_project, proven_assignments)
-    final_peer_issues = validate_final_peer_assignment(rows_by_project, client)
-    if final_peer_issues:
-        raise RuntimeError(
-            "FINAL_BASELINE_COMPATIBILITY_INVALID: " + " | ".join(final_peer_issues[:20])
+        deadline_clock.check("final-targets")
+        enrich_registry_target_evidence(
+            rows_by_project,
+            client,
+            allow_target_mutation=False,
+        )
+        # A late @types action decision may fail the handoff, but may not mutate a
+        # finalized dependency target.
+        plan_executable_actions(
+            rows_by_project,
+            client,
+            immutable_targets=True,
+        )
+        if not args.draft_baseline:
+            assert_proven_assignment_conformance(rows_by_project, proven_assignments)
+        final_peer_issues = validate_final_peer_assignment(rows_by_project, client)
+        if final_peer_issues:
+            if not args.draft_baseline:
+                raise RuntimeError(
+                    "FINAL_BASELINE_COMPATIBILITY_INVALID: " + " | ".join(final_peer_issues[:20])
+                )
+            eprint(
+                "[info] Draft Baseline: final peer validation found issues; "
+                f"detected conflicts are preserved in the partial plan: {' | '.join(final_peer_issues[:20])}"
+            )
+    except DraftBudgetExceeded as budget_exc:
+        if not args.draft_baseline:
+            raise
+        eprint(f"[info] Draft deadline exceeded during planning: {budget_exc.phase}")
+        _publish_draft_and_exit(
+            run_id=run_id,
+            workspace_id=workspace_id,
+            project_id=project_id,
+            mode=mode,
+            rows_by_project=rows_by_project,
+            projects_by_name=projects_by_name,
+            client=client,
+            deadline_clock=deadline_clock,
+            status="DRAFT_PARTIAL",
+            partial_reason=f"Draft deadline ({deadline_clock.deadline_seconds}s) exceeded at {budget_exc.phase}; plan is partial.",
         )
 
     proven_dependency_state_path = (
@@ -20953,6 +21713,26 @@ def main() -> None:
         for project, rows in rows_by_project.items()
     }
     eprint(f"[info] target planning completed in {time.perf_counter() - target_started:.1f}s")
+    draft_manifest: Optional[Dict[str, Any]] = None
+    if args.draft_baseline:
+        deadline_clock.check("draft-plane")
+        draft_manifest = publish_draft_result(
+            run_id=run_id,
+            workspace_id=workspace_id,
+            project_id=project_id,
+            mode=mode,
+            rows_by_project=rows_by_project,
+            projects_by_name=projects_by_name,
+            health_by_project=health_by_project,
+            status="DRAFT_READY",
+            partial_reason=None,
+            deadline=deadline_clock,
+        )
+        eprint(
+            f"[done] Draft result published: status={draft_manifest['status']} "
+            f"summary={draft_manifest['summary']}"
+        )
+        eprint(f"[info] Draft manifest: {draft_manifest['artifacts']['manifest']}")
     enrich_release_intelligence(rows_by_project, client, enabled=release_intel_enabled, max_packages=release_intel_max)
     captured_baselines: Dict[str, Dict[str, Any]] = {}
     if args.capture_baseline:

@@ -54,6 +54,9 @@ export type WorkspaceRecord = {
   selectedProject?: string
   latestPromptPath?: string
   latestPromptPaths?: Record<string, string>
+  // Per-project pointer to the newest completed Draft run whose result.json is
+  // still on disk; rendering re-reads the artifact by runId (restart-safe).
+  draftResults?: Record<string, { runId: string; status: 'DRAFT_READY' | 'DRAFT_PARTIAL'; importedAt: string }>
 }
 
 export type DesktopState = {
@@ -183,6 +186,32 @@ export type WorkspaceDetails = {
   acceptanceVerdict?: AcceptanceVerdict
   migrationProgress?: MigrationProgress
   baselineRecovery?: BaselineRecoveryInfo
+  // The ready-to-handoff Draft Baseline result for the selected project
+  // (planning-only, NOT_VERIFIED). Present only when a Draft run finished and
+  // its artifacts/runs/<runId>/draft/result.json is still resolvable.
+  draftResult?: DraftResultSnapshot
+}
+
+// Compact, typed mirror of the planner's draft result.json contract. The full
+// prompt/plan text is fetched on demand through getCurrentDraftResult().
+export type DraftResultSnapshot = {
+  runId: string
+  status: 'DRAFT_READY' | 'DRAFT_PARTIAL'
+  projectId: string
+  generatedAt: string
+  elapsedMs: number
+  deadlineSeconds?: number
+  remainingMs?: number
+  policyHash: string
+  summary: string
+  partialReason?: string | null
+  verificationStatus: string
+  authority: string
+  compatibility: string
+  metadata: { total: number; unknown: number; unknownPackages: string[] }
+  proposals: Record<string, number>
+  artifacts: { manifest: string; plan: string; prompt: string; summary: string }
+  hashes: { plan: string; prompt: string }
 }
 
 export type BootstrapPayload = {
@@ -219,7 +248,7 @@ export type ActionInput = {
 
 export type JobOutputSource = { kind: 'group' | 'planner'; id: string; label: string }
 export type JobOutput = { jobId: string; stream: 'system' | 'stdout' | 'stderr'; line: string; workspaceId?: string; projectName?: string; source?: JobOutputSource; receivedAt?: number }
-export type JobFinished = { jobId: string; action: FlowAction; workspaceId?: string; projectName?: string; exitCode: number; error?: string }
+export type JobFinished = { jobId: string; action: FlowAction; workspaceId?: string; projectName?: string; exitCode: number; error?: string; draftResult?: DraftResultSnapshot }
 export type DownloadSaved = { path: string; filename: string; workspaceId?: string; projectName?: string; recalculate?: boolean; recalculateProjects?: string[] }
 export type UpdateStatus = { state: 'idle' | 'checking' | 'available' | 'downloading' | 'current' | 'ready' | 'error'; version?: string; percent?: number; message?: string; authRequired?: boolean }
 
@@ -238,8 +267,9 @@ export type DependencyFlowApi = {
   refreshWorkspace: () => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   getBaselineIntentPlan: (input: { workspaceId?: string; projectName: string }) => Promise<BaselineIntentPlan>
   getCurrentProjectPromptPreview: () => Promise<ProjectPromptPreview | undefined>
+  getCurrentDraftResult: () => Promise<{ result: DraftResultSnapshot; prompt?: ProjectPromptPreview; plan?: string } | undefined>
   getDependencyGraphSnapshot: (input: { workspaceId?: string; projectName: string }) => Promise<DependencyGraphSnapshot>
-  runAction: (input: ActionInput) => Promise<{ jobId: string; preview: string[] }>
+  runAction: (input: ActionInput) => Promise<{ jobId: string; runId?: string; preview: string[] }>
   cancelJob: (jobId: string) => Promise<boolean>
   pauseJob: (jobId: string) => Promise<boolean>
   sendAgentNote: (input: { jobId: string; note: string; branch?: string }) => Promise<boolean>

@@ -5,6 +5,7 @@ import argparse
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -35,14 +36,38 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True)
     parser.add_argument("--skip-lockfile", action="store_true")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Explicitly allow replacing an existing fixture directory. Each "
+        "fixture is verified to stay strictly inside --out before removal.",
+    )
     args = parser.parse_args()
 
     output = Path(args.out).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
+    output = output.resolve()
 
     for template in sorted(path for path in TEMPLATES.iterdir() if path.is_dir()):
         target = output / template.name
         if target.exists():
+            if not args.overwrite:
+                print(
+                    f"[refused] {target} already exists. Pass --overwrite to "
+                    f"replace it (verified to stay inside --out).",
+                    file=sys.stderr,
+                )
+                return 2
+            # Boundary guard: the removable prefix must be a direct child of
+            # --out and must not be (or contain) the output root or an FS root.
+            try:
+                target.resolve().relative_to(output)
+            except ValueError:
+                print(f"[error] {target} resolves outside --out {output}.", file=sys.stderr)
+                return 3
+            if target.resolve() == output or target.resolve().parent != output:
+                print(f"[error] refusing to remove {target} (not a direct fixture under --out).", file=sys.stderr)
+                return 3
             shutil.rmtree(target)
         shutil.copytree(template, target)
         # Keep fixture manifests non-discoverable inside the DepLoom source

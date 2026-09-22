@@ -107,6 +107,59 @@ type WorkspaceRecord = {
   selectedProject?: string
   latestPromptPath?: string
   latestPromptPaths?: Record<string, string>
+  // Per-project pointer to the newest completed Draft run whose result.json is
+  // still available on disk. Rendering always re-reads the artifact by runId,
+  // so this stays valid across app restarts and project switching.
+  draftResults?: Record<string, WorkspaceDraftRef>
+}
+
+type WorkspaceDraftRef = { runId: string; status: 'DRAFT_READY' | 'DRAFT_PARTIAL'; importedAt: string }
+
+// Mirror of the planner's artifacts/runs/<runId>/draft/result.json contract
+// (dependency_live_roadmap_generator.py publish_draft_result). The fields the
+// desktop renders are typed; unknown/extra fields are ignored.
+type DraftResultArtifact = {
+  schemaVersion: number
+  status: 'DRAFT_READY' | 'DRAFT_PARTIAL'
+  runId: string
+  workspaceId: string
+  projectId: string
+  mode: string
+  generatedAt: string
+  elapsedMs: number
+  deadline: { deadlineSeconds?: number; remainingMs?: number; phase?: string }
+  policyHash: string
+  summary: string
+  partialReason?: string | null
+  verificationStatus: string
+  authority: string
+  compatibility: string
+  metadata: { total: number; unknown: number; unknownPackages: string[] }
+  proposals: Record<string, number>
+  artifacts: { manifest: string; plan: string; prompt: string; summary: string }
+  hashes: { plan: string; prompt: string }
+  inputHashes: Record<string, string>
+  projects: string[]
+}
+
+type DraftResultSnapshot = {
+  runId: string
+  status: 'DRAFT_READY' | 'DRAFT_PARTIAL'
+  projectId: string
+  generatedAt: string
+  elapsedMs: number
+  deadlineSeconds?: number
+  remainingMs?: number
+  policyHash: string
+  summary: string
+  partialReason?: string | null
+  verificationStatus: string
+  authority: string
+  compatibility: string
+  metadata: { total: number; unknown: number; unknownPackages: string[] }
+  proposals: Record<string, number>
+  artifacts: { manifest: string; plan: string; prompt: string; summary: string }
+  hashes: { plan: string; prompt: string }
 }
 
 type DesktopState = {
@@ -139,6 +192,7 @@ type WorkspaceDetails = {
   acceptanceVerdict?: AcceptanceVerdict
   migrationProgress?: MigrationProgress
   baselineRecovery?: BaselineRecoveryInfo
+  draftResult?: DraftResultSnapshot
 }
 
 type AgentSessionState = { provider: AgentProvider; id: string; interrupted: boolean; updatedAt: string; scopeFingerprint?: string }
@@ -270,6 +324,9 @@ type JobRecord = {
   // Invocation-local authority boundary. Draft Baseline produces planning
   // artifacts only and must never advance the authoritative FLOW state.
   baselineProofMode?: BaselineProofMode
+  // Draft Baseline runId: scopes the planner's artifacts (artifacts/runs) and
+  // lets the desktop resolve the run result without guessing or stat-watching.
+  runId?: string
 }
 
 type UpdateStatus = { state: 'idle' | 'checking' | 'available' | 'downloading' | 'current' | 'ready' | 'error'; version?: string; percent?: number; message?: string; authRequired?: boolean }
@@ -615,6 +672,76 @@ function readProjects(workspace: WorkspaceRecord): ProjectSpec[] {
   } catch {
     return []
   }
+}
+
+// Draft Baseline artifacts. The planner publishes
+// <artifacts>/runs/<runId>/draft/{result.json,plan.json,prompt.md,summary.md}
+// under its settings base (settings_base/artifacts), which for a workspace is
+// .dependency-roadmap/artifacts. These helpers resolve that run-scoped result
+// without the renderer having to stat-watch files or guess at completion.
+function draftArtifactsRoot(workspace: WorkspaceRecord): string {
+  return join(dirname(resolveSettingsPath(workspace)), 'artifacts')
+}
+
+function readDraftResultArtifact(workspace: WorkspaceRecord, runId: string): DraftResultArtifact | undefined {
+  const manifestPath = join(draftArtifactsRoot(workspace), 'runs', artifactSafeSegment(runId), 'draft', 'result.json')
+  if (!existsSync(manifestPath)) return undefined
+  try {
+    const parsed = JSON.parse(readFileSync(manifestPath, 'utf8')) as Partial<DraftResultArtifact>
+    if (parsed.status !== 'DRAFT_READY' && parsed.status !== 'DRAFT_PARTIAL') return undefined
+    if (typeof parsed.runId !== 'string' || !parsed.runId) return undefined
+    return parsed as DraftResultArtifact
+  } catch {
+    return undefined
+  }
+}
+
+function buildDraftResultSnapshot(artifact: DraftResultArtifact): DraftResultSnapshot {
+  return {
+    runId: artifact.runId,
+    status: artifact.status,
+    projectId: artifact.projectId ?? '',
+    generatedAt: artifact.generatedAt ?? '',
+    elapsedMs: artifact.elapsedMs ?? 0,
+    deadlineSeconds: artifact.deadline?.deadlineSeconds,
+    remainingMs: artifact.deadline?.remainingMs,
+    policyHash: artifact.policyHash ?? '',
+    summary: artifact.summary ?? '',
+    partialReason: artifact.partialReason ?? null,
+    verificationStatus: artifact.verificationStatus ?? 'NOT_VERIFIED',
+    authority: artifact.authority ?? 'PLANNING_ONLY',
+    compatibility: artifact.compatibility ?? 'UNKNOWN',
+    metadata: artifact.metadata ?? { total: 0, unknown: 0, unknownPackages: [] },
+    proposals: artifact.proposals ?? {},
+    artifacts: artifact.artifacts ?? { manifest: '', plan: '', prompt: '', summary: '' },
+    hashes: artifact.hashes ?? { plan: '', prompt: '' },
+  }
+}
+
+function draftResultForProject(workspace: WorkspaceRecord, projectName?: string): DraftResultSnapshot | undefined {
+  if (!projectName) return undefined
+  const ref = workspace.draftResults?.[projectName]
+  if (!ref) return undefined
+  const artifact = readDraftResultArtifact(workspace, ref.runId)
+  if (!artifact) return undefined
+  return buildDraftResultSnapshot(artifact)
+}
+
+// Persist the pointer to the newest completed Draft run (restart-safe) and
+// hand the renderer the exact snapshot produced by that run.
+function importDraftResult(workspace: WorkspaceRecord, projectName: string, runId: string): DraftResultSnapshot | undefined {
+  const artifact = readDraftResultArtifact(workspace, runId)
+  if (!artifact) return undefined
+  const state = loadState()
+  const saved = state.workspaces.find((item) => item.id === workspace.id)
+  if (saved) {
+    saved.draftResults = {
+      ...saved.draftResults,
+      [projectName]: { runId, status: artifact.status, importedAt: new Date().toISOString() },
+    }
+    saveState(state)
+  }
+  return buildDraftResultSnapshot(artifact)
 }
 
 function promptPathForProject(workspace: WorkspaceRecord, projectName: string): string | undefined {
@@ -1733,6 +1860,7 @@ async function workspaceDetails(workspace: WorkspaceRecord): Promise<WorkspaceDe
     acceptanceVerdict: project ? readAcceptanceVerdict(workspace, project) : undefined,
     migrationProgress,
     baselineRecovery: baselineRecoveryInfo(workspace, project?.name),
+    draftResult: draftResultForProject(workspace, project?.name),
   }
 }
 
@@ -2106,7 +2234,7 @@ async function executeBaselineWorkerCommand(
   }
 }
 
-function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project: ProjectSpec): CommandSpec[] {
+function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project: ProjectSpec, draftRunId?: string): CommandSpec[] {
   const toolDir = bundledToolDir()
   const settingsPath = resolveSettingsPath(workspace)
   const commonGeneratorArgs = [generatorPath(), '--project-settings', settingsPath, '--only-project', project.name]
@@ -2157,12 +2285,27 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
         ? ['--draft-baseline']
         : ['--capture-baseline', '--baseline-label', input.label?.trim() || `dependency-flow-${new Date().toISOString().slice(0, 10)}`]
 
+      // A Draft is a bounded, run-scoped planning artifact: the planner gets
+      // a stable runId/workspaceId/projectId and publishes
+      // .dependency-roadmap/artifacts/runs/<runId>/draft/* atomically, so the
+      // desktop never has to guess which output belongs to which click. The
+      // artifacts dir is passed explicitly because settings_workspace_base
+      // resolves .dependency-roadmap/settings.project.json to the workspace
+      // root, which would otherwise place artifacts under <ws>/artifacts
+      // instead of the Desktop's .dependency-roadmap/artifacts convention.
+      const effectiveDraftRunId = draftRunId || `run-${randomUUID()}`
+      const draftScopeArgs = proofMode === 'DRAFT'
+        ? ['--run-id', effectiveDraftRunId, '--workspace-id', workspace.id, '--project-id', project.name, '--mode', 'draft', '--artifacts-dir', join(workspace.path, '.dependency-roadmap', 'artifacts')]
+        : []
+
       return [{
         label: proofMode === 'DRAFT' ? 'Расчёт Draft Baseline (без physical verification)' : 'Создание исходного baseline',
         command: 'python',
         cwd: workspace.path,
-        args: [...commonGeneratorArgs, ...baselineOutputArgs, ...baselineModeArgs],
+        args: [...commonGeneratorArgs, ...baselineOutputArgs, ...baselineModeArgs, ...draftScopeArgs],
         useBaselineWorker: proofMode !== 'DRAFT',
+        stallWarningMs: proofMode === 'DRAFT' ? 60_000 : 2 * 60_000,
+        stallAbortMs: proofMode === 'DRAFT' ? 5 * 60_000 : 15 * 60_000,
         env: {
           DEPLOOM_BASELINE_RESUME: input.baselineResume === 'restart' ? 'restart' : input.baselineResume === 'continue' ? 'continue' : 'auto',
           DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE: input.baselineResume === 'continue' ? '1' : '0',
@@ -2188,9 +2331,15 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
           DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS: String(automaticBudgetSeconds),
           DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS: String(maxExpensiveAttempts),
           ...(executionMode === 'BACKGROUND' ? { DEPLOOM_IO_COPY_SLOTS: '1', DEPLOOM_IO_HASH_SLOTS: '1', DEPLOOM_IO_PM_SLOTS: '1' } : {}),
+          // Run-scoped Draft identity (mirrors the --run-id/--mode CLI args so
+          // the planner's policy snapshot and user-visible manifest agree).
+          ...(proofMode === 'DRAFT' ? {
+            DEPLOOM_RUN_ID: effectiveDraftRunId,
+            DEPLOOM_WORKSPACE_ID: workspace.id,
+            DEPLOOM_PROJECT_ID: project.name,
+            DEPLOOM_MODE: 'draft',
+          } : {}),
         },
-        stallWarningMs: 2 * 60_000,
-        stallAbortMs: 15 * 60_000,
       }]
     }
     case 'generate':
@@ -5680,6 +5829,7 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
   let exitCode = 0
   let errorMessage = ''
   let teamStateFinalized = false
+  let draftResult: DraftResultSnapshot | undefined
   try {
     updateTeamState(job, 'running')
     if (job.bestEffortReason) {
@@ -5740,6 +5890,30 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
         dashboard: join(baselineOutput, 'dependency-roadmap.html'),
       })) {
         throw new Error(`PROJECT_ARTIFACT_SNAPSHOT_FAILED: private Baseline roadmap для ${job.projectName} не содержит этот проект.`)
+      }
+      // A completed Draft Baseline is a run-scoped planning artifact: import
+      // its manifest (artifacts/runs/<runId>/draft/result.json) into workspace
+      // state and surface it on the job-finished event so the UI can switch
+      // from "watching for files to change" to "showing this run's result".
+      if (job.baselineProofMode === 'DRAFT' && job.runId && job.projectName) {
+        draftResult = importDraftResult(job.workspace, job.projectName, job.runId)
+        if (draftResult) {
+          send('flow:job-output', {
+            jobId: job.id,
+            stream: 'system',
+            workspaceId: job.workspace.id,
+            projectName: job.projectName,
+            line: `Draft результат импортирован: run ${draftResult.runId}, status ${draftResult.status}, ${draftResult.elapsedMs}ms. ${draftResult.summary}`,
+          })
+        } else {
+          send('flow:job-output', {
+            jobId: job.id,
+            stream: 'system',
+            workspaceId: job.workspace.id,
+            projectName: job.projectName,
+            line: `Draft запуск ${job.runId} завершился без result.json; планировщик не опубликовал manifest. Проверьте артефакты запуска.`,
+          })
+        }
       }
     } else if (job.action === 'generate' && job.projectName) {
       if (!snapshotProjectArtifacts(job.workspace, job.projectName)) {
@@ -5819,7 +5993,7 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
   } finally {
     stopOpenCodeServer(job)
     jobs.delete(job.id)
-    send('flow:job-finished', { jobId: job.id, action: job.action, workspaceId: job.workspace.id, projectName: job.projectName, exitCode, error: errorMessage })
+    send('flow:job-finished', { jobId: job.id, action: job.action, workspaceId: job.workspace.id, projectName: job.projectName, exitCode, error: errorMessage, ...(draftResult ? { draftResult } : {}) })
     // A successful agent job is not necessarily the end of migration while
     // Autopilot is active: the goal-seeker may immediately launch another
     // generate/audit/agent residual cycle. Only manual single-stage runs get a
@@ -6098,6 +6272,45 @@ function setupIpc(): void {
     }
   })
 
+  ipcMain.handle('flow:get-current-draft-result', async () => {
+    // Loading a Draft's run artifact (manifest + prompt + plan) for the
+    // currently selected project. Resolution is by runId from trusted state;
+    // the renderer never provides a path.
+    const state = loadState()
+    const workspace = findWorkspace(state)
+    const project = readProjects(workspace).find((item) => item.name === workspace.selectedProject) ?? readProjects(workspace)[0]
+    const projectName = project?.name ?? (workspace.selectedProject || readProjects(workspace)[0]?.name)
+    const snapshot = draftResultForProject(workspace, projectName)
+    if (!snapshot) return undefined
+    const promptPath = snapshot.artifacts.prompt
+    const planPath = snapshot.artifacts.plan
+    let prompt: { path: string; content: string; stale: boolean; mtimeMs: number; size: number; projectName?: string } | undefined
+    try {
+      if (promptPath && existsSync(promptPath) && statSync(promptPath).isFile() && statSync(promptPath).size <= MAX_PROMPT_PREVIEW_BYTES) {
+        prompt = {
+          path: promptPath,
+          content: readFileSync(promptPath, 'utf8'),
+          stale: false,
+          mtimeMs: statSync(promptPath).mtimeMs,
+          size: statSync(promptPath).size,
+          projectName,
+        }
+      }
+    } catch {
+      prompt = undefined
+    }
+    let plan: string | undefined
+    try {
+      if (planPath && existsSync(planPath) && statSync(planPath).isFile()) {
+        const planText = readFileSync(planPath, 'utf8')
+        if (Buffer.byteLength(planText, 'utf8') <= 1024 * 1024) plan = planText
+      }
+    } catch {
+      plan = undefined
+    }
+    return { result: snapshot, prompt, plan }
+  })
+
   ipcMain.handle('flow:baseline-intent-plan', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
@@ -6140,6 +6353,10 @@ function setupIpc(): void {
     const requestedBaselineProofMode: BaselineProofMode | undefined = input.action === 'baseline'
       ? (input.baselineIntent?.proofMode === 'DRAFT' ? 'DRAFT' : 'VERIFIED')
       : undefined
+    // A Draft Baseline run is identified by its own runId (never the job id):
+    // the planner writes artifacts/runs/<runId> so the result can be resolved
+    // deterministically after completion -- including after an app restart.
+    const draftRunId = requestedBaselineProofMode === 'DRAFT' ? `run-${randomUUID()}` : undefined
     if (requestedBaselineProofMode === 'DRAFT' && input.autopilot) {
       throw new Error('DRAFT_BASELINE_AUTOPILOT_FORBIDDEN: planning-only Draft cannot advance authoritative FLOW automatically.')
     }
@@ -6168,7 +6385,7 @@ function setupIpc(): void {
       }
       input.sourceCommit = source.stdout.trim()
     }
-    const commands = [...await baselineStartCommands(input, project), ...await cleanAgentStartCommands(input, workspace, project), ...actionCommands(input, workspace, project)]
+    const commands = [...await baselineStartCommands(input, project), ...await cleanAgentStartCommands(input, workspace, project), ...actionCommands(input, workspace, project, draftRunId)]
     const job: JobRecord = {
       id: randomUUID(), action: input.action, workspace, projectName: input.action === 'generate-all' ? undefined : project.name, target: input.target, cancelled: false,
       ...(['agent', 'recover'].includes(input.action) ? { agentProvider: workspace.agent, agentNote: input.agentNote?.trim() || undefined } : {}),
@@ -6176,10 +6393,11 @@ function setupIpc(): void {
       ...(input.action === 'release' ? { releaseSourceCommit: input.sourceCommit, releaseGateCommand: input.gateCommand?.trim() || undefined } : {}),
       ...(input.autopilot === true ? { autopilot: true } : {}),
       ...(requestedBaselineProofMode ? { baselineProofMode: requestedBaselineProofMode } : {}),
+      ...(draftRunId ? { runId: draftRunId } : {}),
     }
     jobs.set(job.id, job)
     void executeJob(job, commands)
-    return { jobId: job.id, preview: commands.map((item) => `${item.command} ${item.args.join(' ')}`) }
+    return { jobId: job.id, runId: draftRunId, preview: commands.map((item) => `${item.command} ${item.args.join(' ')}`) }
   })
 
   ipcMain.handle('flow:get-hardware-snapshot', () => hardwareSnapshot())

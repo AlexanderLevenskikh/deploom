@@ -15,6 +15,7 @@ const api = {
   refreshWorkspace: () => ipcRenderer.invoke('flow:refresh-workspace'),
   getBaselineIntentPlan: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:baseline-intent-plan', input),
   getCurrentProjectPromptPreview: () => ipcRenderer.invoke('flow:current-project-prompt-preview'),
+  getCurrentDraftResult: () => ipcRenderer.invoke('flow:get-current-draft-result'),
   getDependencyGraphSnapshot: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:dependency-graph-snapshot', input),
   runAction: (input: unknown) => ipcRenderer.invoke('flow:run-action', input),
   cancelJob: (jobId: string) => ipcRenderer.invoke('flow:cancel-job', jobId),

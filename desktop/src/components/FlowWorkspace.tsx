@@ -9,7 +9,7 @@ import { ModelPicker } from './ModelPicker'
 import { BaselineIntentDialog } from './BaselineIntentDialog'
 import { PromptPreviewDialog } from './PromptPreviewDialog'
 import { freshBaselineIntent, normalizeBaselineIntentPlan } from '../data/baselineIntent'
-import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, FlowAction, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
+import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, DraftResultSnapshot, FlowAction, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
 
 const AUTOPILOT_HELP = {
   ru: '«Продолжить» автономно доводит текущий этап. Автопилот дополнительно проходит весь FLOW до принятого результата: после audit он возвращается в migration только при реальном acceptance blocker, а не ради процента freshness.',
@@ -24,6 +24,7 @@ type Props = {
   baselineDecision?: BaselineDecision
   onClearBaselineDecision: () => void
   onGetBaselineIntentPlan: (projectName: string) => Promise<BaselineIntentPlan>
+  onGetCurrentDraftResult: () => Promise<{ result: DraftResultSnapshot; prompt?: ProjectPromptPreview; plan?: string } | undefined>
   onRun: (input: ActionInput) => Promise<void>
   onSendAgentNote: (note: string, branch?: string) => Promise<boolean>
   onStartAutopilot: (input: { workspaceId: string; projectName: string; target: TargetLevel; releaseBranch?: string }) => Promise<void>
@@ -37,7 +38,7 @@ type Props = {
   onListAgentModels: (agentProvider: AgentProvider, cwd?: string) => Promise<string[]>
 }
 
-export function FlowWorkspace({ details, project, activeAction, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels }: Props) {
+export function FlowWorkspace({ details, project, activeAction, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels }: Props) {
   const { language, text, t } = useLanguage()
   // Compatibility-only planner hint for legacy roadmap/prompt export.
   // Yellow/Green is no longer a user goal or a completion gate.
@@ -50,8 +51,25 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
   const [selectedBranchFailure, setSelectedBranchFailure] = useState<MigrationBranchProgress | null>(null)
   const [selectedStageIndex, setSelectedStageIndex] = useState<number | null>(null)
   const [baselineIntentDialog, setBaselineIntentDialog] = useState<{ mode: 'prepare' | 'decision'; resume: 'auto' | 'continue' | 'restart'; plan: BaselineIntentPlan; decision?: BaselineDecision }>()
-  const [draftPromptWatch, setDraftPromptWatch] = useState<{ projectName: string; beforeMtimeMs?: number; beforeSize?: number; seenRunning: boolean }>()
   const [draftPromptPreview, setDraftPromptPreview] = useState<ProjectPromptPreview>()
+  // Draft completion is resolved by runId from workspace state, not by watching
+  // file mtime/size. The user dismisses a finished Draft once per run; the ack
+  // map keys by project so switching projects does not hide another project's
+  // fresh result. Everything below is renderer-local (not persisted) -- after a
+  // restart the banner simply reappears, which is the safe default.
+  const [acknowledgedDraftRunIds, setAcknowledgedDraftRunIds] = useState<Record<string, string>>({})
+  const draftResult = details.draftResult
+  const draftResultFresh = Boolean(draftResult && draftResult.runId !== acknowledgedDraftRunIds[project.name])
+  const acknowledgeDraftResult = () => { if (draftResult) setAcknowledgedDraftRunIds((current) => ({ ...current, [project.name]: draftResult.runId })) }
+  const openDraftPrompt = async () => {
+    try {
+      const loaded = await onGetCurrentDraftResult()
+      if (loaded?.prompt) setDraftPromptPreview(loaded.prompt)
+      else window.alert(language === 'ru' ? 'Draft завершился, но prompt artifact не найден. Проверьте артефакты запуска.' : 'Draft finished, but the prompt artifact was not found. Check the run artifacts.')
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : String(error))
+    }
+  }
   const [baselineDecisionDismissed, setBaselineDecisionDismissed] = useState(false)
   const run = details.teamState?.projects[project.name]
   const recovery = run?.recovery
@@ -182,39 +200,6 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
     JSON.stringify(Object.entries(intent.policies ?? {}).sort(([left], [right]) => left.localeCompare(right)))
 
 
-  useEffect(() => {
-    if (!draftPromptWatch) return
-    if (draftPromptWatch.projectName !== project.name) {
-      setDraftPromptWatch(undefined)
-      return
-    }
-    if (activeAction === 'baseline') {
-      if (!draftPromptWatch.seenRunning) setDraftPromptWatch({ ...draftPromptWatch, seenRunning: true })
-      return
-    }
-    if (!draftPromptWatch.seenRunning) return
-
-    let cancelled = false
-    void window.dependencyFlow?.getCurrentProjectPromptPreview().then((preview) => {
-      if (cancelled) return
-      const belongsToProject = preview && (!preview.projectName || preview.projectName === draftPromptWatch.projectName)
-      const changed = preview && (
-        draftPromptWatch.beforeMtimeMs === undefined
-        || preview.mtimeMs !== draftPromptWatch.beforeMtimeMs
-        || preview.size !== draftPromptWatch.beforeSize
-      )
-      if (belongsToProject && changed) setDraftPromptPreview(preview)
-      else window.alert(language === 'ru' ? 'Draft завершился, но свежий prompt artifact не найден. Проверьте артефакты запуска.' : 'Draft finished, but a fresh prompt artifact was not found. Check the run artifacts.')
-      setDraftPromptWatch(undefined)
-    }).catch((error) => {
-      if (!cancelled) {
-        setDraftPromptWatch(undefined)
-        window.alert(error instanceof Error ? error.message : String(error))
-      }
-    })
-    return () => { cancelled = true }
-  }, [activeAction, draftPromptWatch, language, project.name])
-
   const runBaselineIntent = async (intent: BaselineIntent) => {
     const pending = baselineIntentDialog
     if (!pending) return
@@ -222,19 +207,10 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
       pending.mode === 'decision' &&
       baselinePolicyIdentity(pending.plan.intent) !== baselinePolicyIdentity(intent)
     const effectiveBaselineResume = policyChanged ? 'restart' : pending.resume
-    let beforeDraftPrompt: ProjectPromptPreview | undefined
-    if (intent.proofMode === 'DRAFT') {
-      try { beforeDraftPrompt = await window.dependencyFlow?.getCurrentProjectPromptPreview() } catch { /* no previous prompt is fine */ }
-    }
     await onRun({ action: 'baseline', workspaceId: details.workspace.id, projectName: project.name, target, label, releaseBranch, gateCommand, baselineResume: effectiveBaselineResume, baselineIntent: intent, commitMessage: `chore(deps): save ${project.name} roadmap state` })
-    if (intent.proofMode === 'DRAFT') {
-      setDraftPromptWatch({
-        projectName: project.name,
-        beforeMtimeMs: beforeDraftPrompt?.mtimeMs,
-        beforeSize: beforeDraftPrompt?.size,
-        seenRunning: false,
-      })
-    }
+    // Completion is delivered through the runId-scoped draft result in
+    // workspace details (main.ts imports artifacts/runs/<runId>/draft/*
+    // after the planner exits); no file mtime/size watching.
     setBaselineIntentDialog(undefined)
     if (pending.mode === 'decision') { setBaselineDecisionDismissed(false); onClearBaselineDecision() }
   }
@@ -400,6 +376,21 @@ export function FlowWorkspace({ details, project, activeAction, autopilotActive,
           {flowComplete && acceptanceAccepted ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} />{text('Продолжить улучшение', 'Continue improving')}</button> : null}
           <button className="button secondary" disabled={!run && !activeAction} onClick={() => void onOpenPath(artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
         </div>
+        {draftResult && draftResultFresh ? <div className="draft-result-card">
+          <div className="draft-result-heading">
+            <div>
+              <strong>{draftResult.status === 'DRAFT_READY' ? text('Draft готов', 'Draft is ready') : text('Draft частичный', 'Draft is partial')}</strong>
+              <span>{draftResult.summary}</span>
+              <span className="draft-result-meta">run <code>{draftResult.runId}</code> · {draftResult.elapsedMs}ms{typeof draftResult.deadlineSeconds === 'number' ? ` · ${text('deadline', 'deadline')} ${draftResult.deadlineSeconds}s` : ''} · {draftResult.verificationStatus} / {draftResult.authority} / {draftResult.compatibility}</span>
+            </div>
+          </div>
+          <div className="human-flow-actions">
+            <button className="button primary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Показать draft prompt', 'Show draft prompt')}</button>
+            {draftResult.artifacts.plan ? <button className="button secondary" onClick={() => void onOpenPath(draftResult.artifacts.plan)}><FileText size={16} />{text('План', 'Plan')}</button> : null}
+            {draftResult.artifacts.manifest ? <button className="button secondary" onClick={() => void onOpenPath(draftResult.artifacts.manifest)}><FileText size={16} />{text('Manifest', 'Manifest')}</button> : null}
+            <button className="button secondary" onClick={acknowledgeDraftResult}>{text('Принято', 'Acknowledge')}</button>
+          </div>
+        </div> : null}
       </section>
 
       <details className="flow-technical-details">

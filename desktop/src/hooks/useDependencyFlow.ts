@@ -523,6 +523,14 @@ export function useDependencyFlow() {
   const pauseJob = useCallback(async () => { if (!api || !activeJobId) return false; return api.pauseJob(activeJobId) }, [activeJobId, api])
   const getHardwareSnapshot = useCallback(async (): Promise<HardwareSnapshot> => { if (!api) throw new Error('Desktop API is unavailable'); return api.getHardwareSnapshot() }, [api])
   const getBaselineIntentPlan = useCallback(async (projectName: string): Promise<BaselineIntentPlan> => { if (!api) return { candidates: [], intent: { schemaVersion: 1, policies: {}, extraIterations: 0, decisionGrantIterations: 0, searchMode: 'AUTO' } }; return api.getBaselineIntentPlan({ workspaceId: selectedWorkspaceId, projectName }) }, [api, selectedWorkspaceId])
+  const getCurrentDraftResult = useCallback(async () => {
+    if (!api) return undefined
+    try {
+      return await api.getCurrentDraftResult()
+    } catch {
+      return undefined
+    }
+  }, [api])
   const getDependencyGraphSnapshot = useCallback(async (projectName: string): Promise<DependencyGraphSnapshot> => {
     if (!api) return { schemaVersion: 1, project: projectName, capturedAt: new Date().toISOString(), packages: [], edges: [], intent: { policies: {}, deferredCohorts: [] }, manifestCoverage: { observed: 0, total: 0, missing: [] }, authorityBoundary: { packageList: 'PROJECT_MANIFEST', relations: 'OBSERVED_LOCAL_MANIFEST', cohorts: 'DIAGNOSTIC_HINT_OR_USER_POLICY', proofAuthority: false } }
     return api.getDependencyGraphSnapshot({ workspaceId: selectedWorkspaceId, projectName })
@@ -606,6 +614,6 @@ export function useDependencyFlow() {
   return {
     payload, loading, error, baselineDecision, activeJobId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject,
     load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, removeProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches,
-    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getDependencyGraphSnapshot, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
+    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult, getDependencyGraphSnapshot, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }
 }
