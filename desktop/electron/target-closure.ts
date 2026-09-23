@@ -45,6 +45,7 @@ export type TargetClosure = {
   critical?: number
   high?: number
   excluded?: number
+  insufficientData?: boolean
   bestEffortReleaseEligible?: boolean
   bestEffortReason?: string
 }
@@ -145,20 +146,30 @@ const scopeLagUnknown = typeof rawHealth.scope_lag_unknown === 'number' ? Math.m
 const goalLagPct = scopeLagPct ?? rawLagOkPct
 const statusMeetsTarget = status !== 'unknown' && STATUS_RANK[status] >= STATUS_RANK[target]
 const criticalClear = critical === undefined || critical === 0
-const reached = target === 'yellow'
+// H4: a status colour is not a measurement. Closing ANY target requires a
+// measured lag share (the generator always writes lag_ok_pct / scope_lag_pct);
+// a roadmap carrying only a colour has no numeric evidence and cannot confirm
+// the goal -- honest UNKNOWN (reached=false with an explanation) instead of a
+// false success based on the colour alone.
+const hasLagEvidence = goalLagPct !== undefined
+// The generator's green status already requires High == 0, so an explicitly
+// non-zero High contradicts a green label and must not be papered over by the
+// legacy colour (a stale/inconsistent report is not a green closure).
+const greenHighClear = high === undefined || high === 0
+const insufficientData = !hasLagEvidence
+const reached = hasLagEvidence && (target === 'yellow'
   ? statusMeetsTarget
     && remainingPackages.length === 0
     && criticalClear
     && highClear
     && securityClear
-    // When the lag share was measured the yellow floor must actually hold;
-    // a roadmap without the field falls back to the old status-based read.
-    && (goalLagPct === undefined || goalLagPct >= yellowPct)
+    && goalLagPct >= yellowPct
   : status === 'green'
     && remainingPackages.length === 0
     && criticalClear
+    && greenHighClear
     && securityClear
-    && (goalLagPct === undefined || goalLagPct >= 100)
+    && goalLagPct >= 100)
   const fixableBlockers = lagBlockers.filter((blocker) => Boolean(blocker.plannedTarget))
   const plannedLagFixes = new Set(fixableBlockers
     .filter((blocker) => !blocker.required || targetCoversMinimum(blocker.plannedTarget, blocker.required))
@@ -227,6 +238,7 @@ const reached = target === 'yellow'
     ...(typeof rawHealth.high === 'number' ? { high: rawHealth.high } : {}),
     ...(securityUnknown !== undefined ? { securityUnknown } : {}),
     ...(typeof rawHealth.excluded === 'number' ? { excluded: rawHealth.excluded } : {}),
+    ...(insufficientData ? { insufficientData: true } : {}),
     ...(bestEffortReleaseEligible ? { bestEffortReleaseEligible, bestEffortReason } : {}),
     remainingPackages,
     lagBlockers,
@@ -312,6 +324,11 @@ export function shouldUseSupervisorSeed(closure: TargetClosure | undefined, targ
 export function targetClosureMessage(closure: TargetClosure): string {
   const labels = { red: 'Красный', yellow: 'Жёлтый', green: 'Зелёный', unknown: 'не рассчитан' } as const
   const targetLabel = closure.target === 'yellow' ? 'Жёлтый' : 'Зелёный'
+  // H4: a roadmap without numeric measurements cannot confirm a goal; say so
+  // instead of implying a plan or label is the proof.
+  if (closure.insufficientData) {
+    return `Цель «${targetLabel}» не достигнута: недостаточно данных — в roadmap есть только цвет (${labels[closure.current]}), но нет численных показателей lag/scope. Сам по себе цвет не является доказательством закрытия цели; пересоберите отчёт (Draft/актуальный roadmap), чтобы получить измеренные значения.`
+  }
   // F2: show the goal over the FULL scope when the generator measured it, so
   // "100% of what we checked" is never presented as "100% of everything".
   const displayPct = closure.scopeLagPct ?? closure.lagOkPct

@@ -41,6 +41,7 @@ import { teamStatePaths } from './state-commit.js'
 import { changedOverrideProjects } from './dashboard-state.js'
 import { forgetScopedPromptPath, rememberScopedPromptPath, roadmapContainsProject, scopedPromptPath } from './project-context.js'
 import { targetClosureFromRoadmap, targetClosureFromRoadmapWithTargets, type ClosureTarget, type TargetClosure } from './target-closure.js'
+import { baselineBudgetOverride } from './baseline-budget.js'
 import { acceptanceVerdictFromManualAudit, dependencyInputIdentity, mergeTargetPolicy, normalizeAcceptancePolicy, type AcceptancePolicy, type AcceptanceVerdict } from './acceptance-policy.js'
 import { summarizeUpdaterError } from './updater-error.js'
 import { flowNotificationContent, type FlowNotificationEvent } from './notifications.js'
@@ -459,6 +460,18 @@ function baselineIntentPath(workspace: WorkspaceRecord, projectName: string): st
 function loadBaselineIntent(workspace: WorkspaceRecord, projectName: string): BaselineIntent {
   try { return normalizeBaselineIntent(JSON.parse(readFileSync(baselineIntentPath(workspace, projectName), 'utf8'))) }
   catch { return normalizeBaselineIntent(undefined) }
+}
+
+// H5: whether the PERSISTED intent carries its own budget in raw form. The
+// normalized intent always defaults budgetMinutes to 30, so a normalized read
+// cannot distinguish "user saved 30" from "user never chose a budget"; only
+// the raw JSON can. A legacy intent with no budget field means "no saved
+// budget" -> the declared FAST/DEEP mode budgets apply.
+function baselineIntentHasPersistedBudgetMinutes(workspace: WorkspaceRecord, projectName: string): boolean {
+  try {
+    const raw = JSON.parse(readFileSync(baselineIntentPath(workspace, projectName), 'utf8')) as { budgetMinutes?: unknown }
+    return Boolean(raw && typeof raw === 'object' && raw.budgetMinutes !== undefined && raw.budgetMinutes !== null)
+  } catch { return false }
 }
 
 function saveBaselineIntent(workspace: WorkspaceRecord, projectName: string, intent: BaselineIntent): void {
@@ -2377,8 +2390,21 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
       const controlMode: BaselineControlMode = effectiveIntent.controlMode === 'CONFIRM_SIGNIFICANT' ? 'CONFIRM_SIGNIFICANT' : 'AUTONOMOUS'
       const executionMode: BaselineExecutionMode = controlMode === 'AUTONOMOUS' ? 'BACKGROUND' : 'FAST'
       const budgetMinutes = Math.max(5, Math.min(240, Math.round(Number(effectiveIntent.budgetMinutes ?? 30) || 30)))
-      const automaticBudgetSeconds = budgetMinutes * 60
-      const maxExpensiveAttempts = Math.max(2, Math.min(8, Math.ceil(budgetMinutes / 10)))
+      // H5: the automatic budget override must not silently replace the
+      // declared FAST/DEEP product-mode budgets (fast=300s/2 attempts,
+      // deep=3600s/12) on a plain default run. Only an explicitly chosen
+      // per-run budget (raw field on this action input) or a saved legacy
+      // budget (raw field in the persisted intent) supplies the flat override;
+      // otherwise the env keys are omitted and the engine keeps its mode
+      // defaults. The informational budgetMinutes env still travels always.
+      const rawInputBudget = (input.baselineIntent && typeof input.baselineIntent === 'object' && 'budgetMinutes' in (input.baselineIntent as Record<string, unknown>))
+        ? Number((input.baselineIntent as Record<string, unknown>).budgetMinutes)
+        : undefined
+      const budgetOverride = baselineBudgetOverride({
+        explicitBudgetMinutes: Number.isFinite(Number(rawInputBudget)) ? rawInputBudget : undefined,
+        persistedHasBudgetMinutes: baselineIntentHasPersistedBudgetMinutes(workspace, project.name),
+        clampedBudgetMinutes: budgetMinutes,
+      })
 
       // Concurrent project Baselines must not race on the workspace's shared
       // dependency-roadmap.{md,json,html} publication. Verified Baseline
@@ -2450,8 +2476,10 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
           DEPLOOM_BASELINE_EXTRA_ITERATIONS: String(effectiveIntent.extraIterations ?? 0),
           DEPLOOM_BASELINE_DECISION_GRANT_ITERATIONS: String(explicitIntent?.decisionGrantIterations ?? 0),
           DEPLOOM_BASELINE_SEARCH_MODE: effectiveIntent.searchMode ?? 'AUTO',
-          DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS: String(automaticBudgetSeconds),
-          DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS: String(maxExpensiveAttempts),
+          ...(budgetOverride.automaticBudgetSeconds !== undefined ? {
+            DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS: String(budgetOverride.automaticBudgetSeconds),
+            DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS: String(budgetOverride.maxExpensiveAttempts),
+          } : {}),
           // T2: the effective target policy (goal level + numeric lag gate)
           // reaches the engine in EVERY baseline mode (Verified AND Draft), not
           // just Draft. The generator pins these into its policy snapshot/hash

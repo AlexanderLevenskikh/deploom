@@ -1,7 +1,7 @@
 {
   "name": "deploom",
   "private": true,
-  "version": "0.2.123",
+  "version": "0.2.124",
   "type": "module",
   "scripts": {
     "dev": "concurrently -k \"vite\" \"tsc -p tsconfig.electron.json --watch --preserveWatchOutput\" \"wait-on tcp:5173 file:dist-electron/main.js && cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron .\"",
@@ -17,6 +17,7 @@
     "check:state-commit": "node scripts/check-state-commit.mjs",
     "check:publication": "node scripts/check-publication.mjs",
     "check:target-closure": "node scripts/check-target-closure.mjs",
+    "check:h5-budget-priority": "node scripts/check-h5-budget-priority.mjs",
     "check:project-settings": "node scripts/check-project-settings.mjs",
     "check:workspace-bootstrap": "node scripts/check-workspace-bootstrap.mjs",
     "check:log-presentation": "node scripts/check-log-presentation.mjs",

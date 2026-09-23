@@ -5108,13 +5108,16 @@ def effective_lag_policy_months(project_name: Optional[str] = None, override: Op
     return effective_acceptance_policy(project_name)["lagPolicyMonths"]
 
 
-def health_yellow_ratio() -> Tuple[int, int]:
+def health_yellow_ratio(project_name: Optional[str] = None) -> Tuple[int, int]:
     """Release-gate ratio for the configured minimum lag-compliant share.
 
     (pct, 100) keeps the same ceil semantics as YELLOW_HEALTH_RATIO=(8, 10)
-    when pct == 80 while letting a user setting change the gate.
+    when pct == 80 while letting a user setting change the gate. H2: the gate
+    follows the PROJECT's own effective policy (per-project map in
+    generate-all), not the shared global default, so a workspace where one
+    project targets 80% and another 90% really gates them differently.
     """
-    pct = max(0, min(100, int(EFFECTIVE_MIN_LAG_OK_PCT)))
+    pct = max(0, min(100, int(effective_acceptance_policy(project_name)["minLagOkPct"])))
     if pct >= 100:
         return (1, 1)
     return (pct, 100)
@@ -5133,9 +5136,14 @@ def health_green_ratio() -> Tuple[int, int]:
     return (1, 1)
 
 
-def health_planning_ratio() -> Tuple[int, int]:
-    """Executable-plan reserve: five points above the user's gate (legacy 85% at the default 80%)."""
-    pct = max(0, min(100, int(EFFECTIVE_MIN_LAG_OK_PCT) + 5))
+def health_planning_ratio(project_name: Optional[str] = None) -> Tuple[int, int]:
+    """Executable-plan reserve: five points above the user's gate (legacy 85% at the default 80%).
+
+    H2: computed from the project's OWN threshold so the planning reserve and
+    the planned-lag projection stay consistent with the gate of the project
+    being planned (90% -> 95% reserve, not 85%).
+    """
+    pct = max(0, min(100, int(effective_acceptance_policy(project_name)["minLagOkPct"]) + 5))
     if pct >= 100:
         return (1, 1)
     return (pct, 100)
@@ -5581,30 +5589,45 @@ def _candidate_satisfies_fast_policy(
     policy = effective_acceptance_policy(project_name)
     max_high = int(policy.get("maxKnownHigh", 1))
     max_critical = int(policy.get("maxKnownCritical", 0))
+    max_moderate = int(policy.get("maxKnownModerate", 20))
+    max_low = int(policy.get("maxKnownLow", 20))
     active = [r for r in rows if not r.scope_excluded and r.name in active_names]
     if not active:
         return True
     for r in active:
         if not _row_security_known(r):
             return False
-        planned = str(
-            candidate_targets.get(r.name) or current_targets.get(r.name) or r.current_version or ""
-        ).strip()
-        counts = parse_vuln_counts(r.current_vulns)
-        if counts.get("C", 0) > max_critical:
-            minimum = str(r.min_no_critical or "").strip()
-            if not has_safe_target(minimum) or not current_meets_target(planned, minimum):
-                return False
-        if counts.get("H", 0) > max_high:
-            minimum = str(r.min_no_high or "").strip()
-            if not has_safe_target(minimum) or not current_meets_target(planned, minimum):
-                return False
-    compliant = 0
-    total = 0
-    for r in active:
-        if not dependency_has_lag_policy_target(r):
+    # H1: the security limits are evaluated over the WHOLE active scope in the
+    # same units as the acceptance policy (aggregated C/H/M/L), not per row --
+    # two packages with H:1 each cannot both hide behind maxKnownHigh=1. A
+    # finding above the policy limit is cleared only with real per-row evidence
+    # (the planner's min_no_* target reached by the candidate's chosen version);
+    # missing evidence leaves the finding in place and the goal unsatisfied.
+    severity_limits = (
+        ("C", max_critical, "min_no_critical"),
+        ("H", max_high, "min_no_high"),
+        ("M", max_moderate, "min_no_vuln"),
+        ("L", max_low, "min_no_vuln"),
+    )
+    for severity, limit, min_field in severity_limits:
+        overstated = [r for r in active if parse_vuln_counts(r.current_vulns).get(severity, 0) > 0]
+        aggregate = sum(parse_vuln_counts(r.current_vulns).get(severity, 0) for r in overstated)
+        if aggregate <= limit:
             continue
-        total += 1
+        for r in overstated:
+            planned = str(
+                candidate_targets.get(r.name) or current_targets.get(r.name) or r.current_version or ""
+            ).strip()
+            minimum = str(getattr(r, min_field) or "").strip()
+            if not has_safe_target(minimum) or not current_meets_target(planned, minimum):
+                return False
+    # H1: the lag goal is computed over the WHOLE active scope. A row without a
+    # discovered lag target is NOT compliant and never drops out of the
+    # denominator: 1 confirmed-compliant package out of 10 is 10% scope
+    # coverage, not 100% of the researched share.
+    total = len(active)
+    compliant = 0
+    for r in active:
         planned = str(
             candidate_targets.get(r.name) or current_targets.get(r.name) or r.current_version or ""
         ).strip()
@@ -5645,8 +5668,8 @@ def compute_project_health(
     # lag_ok / total >= minLagOkPct without float rounding surprises at the
     # boundary. The gate follows the user's effective policy (R9), so changing
     # 80 -> 90 really moves the goal condition.
-    yellow_required = required_ratio_count(total, health_yellow_ratio())
-    yellow_plan_required = required_ratio_count(total, health_planning_ratio())
+    yellow_required = required_ratio_count(total, health_yellow_ratio(project))
+    yellow_plan_required = required_ratio_count(total, health_planning_ratio(project))
     lag_needed_for_yellow = max(0, yellow_required - lag_ok)
     yellow_projected_lag_ok = (
         sum(1 for row in lag_known_rows if dependency_is_lag_ok_after_planned_target(row, "yellow"))
@@ -5700,6 +5723,9 @@ def compute_project_health(
     moderate = totals["M"]
     low = totals["L"]
     unknown = totals["U"] + vuln_unknown_rows
+    # H2: the red/yellow threshold is the project's OWN effective gate (the
+    # per-project map in generate-all), not the shared global default.
+    project_min_pct = int(effective_acceptance_policy(project)["minLagOkPct"])
 
     if critical > 0:
         status = "red"
@@ -5713,9 +5739,9 @@ def compute_project_health(
         else:
             status = "green"
             reason = "нет зависимостей в активном scope"
-    elif lag_pct < float(EFFECTIVE_MIN_LAG_OK_PCT):
+    elif lag_pct < float(project_min_pct):
         status = "red"
-        reason = f"только {lag_pct:.1f}% библиотек соблюдают свою lag-policy (<{EFFECTIVE_MIN_LAG_OK_PCT}%)"
+        reason = f"только {lag_pct:.1f}% библиотек соблюдают свою lag-policy (<{project_min_pct}%)"
     elif lag_bad == 0 and lag_unknown == 0 and critical == 0 and high == 0 and unknown == 0 and _health_ml_clear(moderate, low, project):
         status = "green"
         reason = "0 нарушений lag-policy, 0 C/H, нет неизвестной security, Low+Moderate в пределах policy"
@@ -17087,7 +17113,7 @@ def minimize_yellow_plan_after_compatibility(
         health = health_by_project.get(project)
         if not health or health.status_rank >= TARGET_RANK["yellow"]:
             continue
-        required = required_ratio_count(health.total, health_planning_ratio())
+        required = required_ratio_count(health.total, health_planning_ratio(project))
         projected = projected_lag_ok_count(rows, "yellow", health.removed)
         if projected <= required:
             # The three target modes passed compatibility independently. A red
@@ -21385,16 +21411,20 @@ def draft_input_files_for(
     spec: ProjectSpec,
     settings_sources: Sequence[Path] = (),
     dashboard_state_path: Optional[Path] = None,
+    groups_config_path: Optional[Path] = None,
 ) -> List[str]:
     """G3: the ACTUAL set of files the plan is derived from.
 
     The fixed manifest-set is extended with the resolved settings sources
     (read_merged_settings returns the really loaded project/local files, not
-    fixed relative guesses) and the resolved dashboard-state path. A nested
-    project whose package.json lives at <ws>/frontend therefore hashes the
-    root settings file too, so editing the root settings makes the Draft stale.
-    The result is persisted as the manifest's ``inputFilesByProject`` and the
-    Node reader re-hashes exactly these names (byte-lockstep).
+    fixed relative guesses), the resolved dashboard-state path and the custom
+    groups config (H3: editing custom-groups.json must make a stale Draft
+    stale, because the group overrides change lag thresholds and therefore the
+    plan). A nested project whose package.json lives at <ws>/frontend
+    therefore hashes the root settings file too, so editing the root settings
+    makes the Draft stale. The result is persisted as the manifest's
+    ``inputFilesByProject`` and the Node reader re-hashes exactly these names
+    (byte-lockstep).
     """
     names: List[str] = list(DRAFT_INPUT_FILENAMES)
     seen = set(names)
@@ -21406,11 +21436,13 @@ def draft_input_files_for(
         if name not in seen:
             seen.add(name)
             names.append(name)
-    if dashboard_state_path is not None:
+    for extra in (dashboard_state_path, groups_config_path):
+        if extra is None:
+            continue
         try:
-            name = _draft_input_file_name(spec.path, Path(dashboard_state_path))
+            name = _draft_input_file_name(spec.path, Path(extra))
         except (TypeError, ValueError):
-            name = str(dashboard_state_path)
+            name = str(extra)
         if name not in seen:
             seen.add(name)
             names.append(name)
@@ -22645,7 +22677,7 @@ def main() -> None:
                 # fixed relative guesses, so a nested project whose settings
                 # live at the workspace root stays bound to them.
                 draft_input_files_by_project[project.name] = draft_input_files_for(
-                    project, settings_sources, dashboard_state_path
+                    project, settings_sources, dashboard_state_path, groups_config_path
                 )
                 draft_input_hashes[project.name] = draft_input_hash(project, draft_input_files_by_project[project.name])
                 client.for_project(project.name)

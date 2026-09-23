@@ -272,21 +272,34 @@ console.log(JSON.stringify({{ beforeStale: before.stale, afterStale: after.stale
 class G4SupervisorIsolationTests(unittest.TestCase):
     def test_g4_timed_out_worker_mutations_never_reach_published_rows(self) -> None:
         shared = {"demo": [_row("pkg")]}
+        started = threading.Event()
         proceed = threading.Event()
-        deadline = generator.DeadlineClock(0.2)
+        done = threading.Event()
+        # The old 0.2s deadline fired BEFORE the worker had a chance to start
+        # (the finalize reserve alone eats 1s), so it never proved the
+        # isolation guarantee. Use a deadline whose net budget is positive:
+        # the worker really starts, then the supervisor times it out WHILE it
+        # is still blocked, and its late write must never reach the shared rows.
+        deadline = generator.DeadlineClock(1.3)
 
         def late_mutator(copy_rows: dict) -> None:
             # Simulates a planner that is still working after the deadline:
             # it waits until the main thread already returned the timeout, then
             # writes into its own working copy.
+            started.set()
             proceed.wait(timeout=5)
             copy_rows["demo"][0].current_version = "9.9.9-late-write"
+            done.set()
 
         with self.assertRaises(DraftBudgetExceeded):
             generator.run_supervised_planning("planning", deadline, late_mutator, shared)
+        # The worker really started before the deadline fired.
+        self.assertTrue(started.wait(timeout=5), "worker must have started before the deadline fired")
         before = shared["demo"][0].current_version
         proceed.set()
-        time.sleep(0.3)
+        # The late worker actually finishes AFTER the timeout.
+        self.assertTrue(done.wait(timeout=5), "late worker must finish after the timeout")
+        time.sleep(0.05)
         # The late worker write must not appear in the shared rows that the
         # publish path would read.
         self.assertEqual(before, shared["demo"][0].current_version)
