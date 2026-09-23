@@ -45,6 +45,7 @@ Grouping is heuristic. You can override package/group/reason with --groups-confi
 from __future__ import annotations
 
 import argparse
+import copy
 import html
 import dataclasses
 import datetime as dt
@@ -4478,7 +4479,7 @@ def analyze_project(
         planner_target_green = str(override.get("plannerTargetGreen") or "").strip()
         if scope_excluded and not exclusion_reason:
             exclusion_reason = "исключено из текущего scope без указанной причины"
-        lag_months = normalized_lag_months(override.get("lagMonths", override.get("lagThresholdMonths", 12)))
+        lag_months = effective_lag_policy_months(project.name, override)
         if lag_months != 12:
             notes.append(f"ручная lag-policy: ≤{lag_months} месяцев")
         if subgroup:
@@ -5034,6 +5035,79 @@ EFFECTIVE_MIN_LAG_OK_PCT = 80
 EFFECTIVE_TARGET_LEVEL = "yellow"
 
 
+def _policy_env_json(project_name: Optional[str] = None) -> Dict[str, Any]:
+    """Raw acceptance policy from the environment: per-project map first (so
+    `generate-all` keeps every project's own goal), then the shared JSON.
+
+    The per-project map is the Desktop's generate-all transport
+    (DEPLOOM_ACCEPTANCE_POLICY_BY_PROJECT: {project: policy}); the shared
+    JSON is the single-project path (DEPLOOM_ACCEPTANCE_POLICY_JSON). A map
+    entry wins over the shared policy, the shared policy wins over no policy.
+    """
+    if project_name:
+        by_project_raw = os.environ.get("DEPLOOM_ACCEPTANCE_POLICY_BY_PROJECT", "")
+        if by_project_raw:
+            try:
+                mapping = json.loads(by_project_raw)
+                if isinstance(mapping, dict):
+                    candidate = mapping.get(project_name)
+                    if isinstance(candidate, dict) and candidate:
+                        return candidate
+            except Exception:
+                pass
+    raw = os.environ.get("DEPLOOM_ACCEPTANCE_POLICY_JSON", "")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and parsed:
+                return parsed
+        except Exception:
+            pass
+    return {}
+
+
+def effective_acceptance_policy(project_name: Optional[str] = None) -> Dict[str, Any]:
+    """G1: the normalized, versioned acceptance policy for a project.
+
+    Every planner decision that reads "the current goal" (lag-policy months,
+    green M/L tolerances, fast-stop target limits) goes through this single
+    helper so a per-project policy (generate-all) and a single-project policy
+    cannot drift from each other. Values fall back to the product defaults the
+    Desktop/CLI legacy path used, so an unset policy keeps the old behaviour.
+    """
+    raw = _policy_env_json(project_name)
+    target_level = str(raw.get("targetLevel") or EFFECTIVE_TARGET_LEVEL or "yellow").strip().lower()
+    target_level = target_level if target_level in ("yellow", "green") else "yellow"
+
+    def _int(key: str, default: int) -> int:
+        value = raw.get(key)
+        if value is None or value == "":
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "targetLevel": target_level,
+        "minLagOkPct": _int("minLagOkPct", EFFECTIVE_MIN_LAG_OK_PCT),
+        "lagPolicyMonths": normalized_lag_months(_int("lagPolicyMonths", 12)),
+        "maxKnownCritical": _int("maxKnownCritical", 0),
+        "maxKnownHigh": _int("maxKnownHigh", 1),
+        "maxKnownModerate": _int("maxKnownModerate", 20),
+        "maxKnownLow": _int("maxKnownLow", 20),
+    }
+
+
+def effective_lag_policy_months(project_name: Optional[str] = None, override: Optional[Dict[str, Any]] = None) -> int:
+    """The lag policy month window: per-package override > effective policy > 12."""
+    if isinstance(override, dict):
+        explicit = override.get("lagMonths", override.get("lagThresholdMonths"))
+        if explicit is not None and explicit != "":
+            return normalized_lag_months(explicit)
+    return effective_acceptance_policy(project_name)["lagPolicyMonths"]
+
+
 def health_yellow_ratio() -> Tuple[int, int]:
     """Release-gate ratio for the configured minimum lag-compliant share.
 
@@ -5474,6 +5548,74 @@ def dependency_has_lag_policy_target(row: DependencyRow) -> bool:
     return not row.scope_excluded and has_safe_target(lag_compliance_target_for_row(row))
 
 
+def _health_ml_clear(moderate: int, low: int, project_name: Optional[str] = None) -> bool:
+    """G1: the green gate honours a numeric Moderate/Low policy when the
+    acceptance policy states one (e.g. the product Green preset pins M=0/L=0);
+    otherwise the legacy combined (M+L)<=20 product default applies."""
+    raw = _policy_env_json(project_name)
+    if "maxKnownModerate" in raw or "maxKnownLow" in raw:
+        policy = effective_acceptance_policy(project_name)
+        return moderate <= int(policy["maxKnownModerate"]) and low <= int(policy["maxKnownLow"])
+    return (moderate + low) <= 20
+
+
+def _candidate_satisfies_fast_policy(
+    rows: List[DependencyRow],
+    candidate_targets: Mapping[str, str],
+    current_targets: Mapping[str, str],
+    active_names: Set[str],
+    project_name: Optional[str] = None,
+) -> bool:
+    """G5: does the actual candidate make EVERY active row policy-complete?
+
+    The Fast stop evaluates the real verified candidate against the acceptance
+    policy (security limits on KNOWN findings plus the lag-compliance share),
+    not a planner-score fraction: a candidate that leaves a known Critical
+    finding uncovered, or an unknown-security/unknown-lag row, does not
+    satisfy the goal even when it matches 8/10 desired targets.
+
+    `candidate_targets` maps package -> chosen version (the verified
+    assignment); rows the candidate does not mention keep `current_targets`
+    (their installed version).
+    """
+    policy = effective_acceptance_policy(project_name)
+    max_high = int(policy.get("maxKnownHigh", 1))
+    max_critical = int(policy.get("maxKnownCritical", 0))
+    active = [r for r in rows if not r.scope_excluded and r.name in active_names]
+    if not active:
+        return True
+    for r in active:
+        if not _row_security_known(r):
+            return False
+        planned = str(
+            candidate_targets.get(r.name) or current_targets.get(r.name) or r.current_version or ""
+        ).strip()
+        counts = parse_vuln_counts(r.current_vulns)
+        if counts.get("C", 0) > max_critical:
+            minimum = str(r.min_no_critical or "").strip()
+            if not has_safe_target(minimum) or not current_meets_target(planned, minimum):
+                return False
+        if counts.get("H", 0) > max_high:
+            minimum = str(r.min_no_high or "").strip()
+            if not has_safe_target(minimum) or not current_meets_target(planned, minimum):
+                return False
+    compliant = 0
+    total = 0
+    for r in active:
+        if not dependency_has_lag_policy_target(r):
+            continue
+        total += 1
+        planned = str(
+            candidate_targets.get(r.name) or current_targets.get(r.name) or r.current_version or ""
+        ).strip()
+        target = lag_compliance_target_for_row(r)
+        if has_safe_target(target) and current_meets_target(planned, target):
+            compliant += 1
+    lag_pct = max(0, min(100, int(policy.get("minLagOkPct", 80))))
+    needed = required_ratio_count(total, (lag_pct, 100)) if total else 0
+    return compliant >= needed
+
+
 def compute_project_health(
     rows: List[DependencyRow],
     project: str,
@@ -5574,9 +5716,9 @@ def compute_project_health(
     elif lag_pct < float(EFFECTIVE_MIN_LAG_OK_PCT):
         status = "red"
         reason = f"только {lag_pct:.1f}% библиотек соблюдают свою lag-policy (<{EFFECTIVE_MIN_LAG_OK_PCT}%)"
-    elif lag_bad == 0 and lag_unknown == 0 and critical == 0 and high == 0 and unknown == 0 and (moderate + low) <= 20:
+    elif lag_bad == 0 and lag_unknown == 0 and critical == 0 and high == 0 and unknown == 0 and _health_ml_clear(moderate, low, project):
         status = "green"
-        reason = "0 нарушений lag-policy, 0 C/H, нет неизвестной security, Low+Moderate ≤20"
+        reason = "0 нарушений lag-policy, 0 C/H, нет неизвестной security, Low+Moderate в пределах policy"
     else:
         status = "yellow"
         parts = [f"{lag_pct:.1f}% библиотек соблюдают lag-policy", "0 Critical"]
@@ -11508,20 +11650,28 @@ def resolve_peer_compatibility_with_verification(
 
             def _verified_assignment_satisfies_policy(
                 incumbent: BestVerifiedIncumbent,
-                total: int,
+                _total: int,
             ) -> bool:
-                """F6 FAST: does the verified assignment satisfy the chosen
-                acceptance policy at the planner level? The effective minimum
-                lag compliance for the effective target level (yellow/green) is
-                the gate; security limits are enforced upstream while building
-                the desired assignment, so coverage of that desired end state is
-                the honest planner-level "policy satisfied" signal."""
-                needed = required_ratio_count(
-                    max(1, total),
-                    health_green_ratio() if str(EFFECTIVE_TARGET_LEVEL or "").lower() == "green" else health_yellow_ratio(),
+                """G5 FAST: does the VERIFIED candidate satisfy the acceptance
+                policy (security limits + lag scope) for this project? The gate
+                evaluates the actual assignment against the active rows -- a
+                remaining Critical/High finding or unknown security/lag makes
+                the goal unsatisfied even when the candidate matches most of
+                the desired assignment. Security limits are enforced *here* on
+                the verified result, not only while building the desired
+                assignment, so Fast stop can never claim a goal that still
+                carries a known finding."""
+                assignment = dict(incumbent.assignment or {})
+                current_targets = {
+                    row.name: row.current_version or "" for row in rows
+                }
+                return _candidate_satisfies_fast_policy(
+                    rows,
+                    candidate_targets=assignment,
+                    current_targets=current_targets,
+                    active_names=set(row.name for row in rows if not row.scope_excluded),
+                    project_name=project,
                 )
-                matched = int(round(incumbent.policy_score * max(1, total)))
-                return matched >= needed
 
             def _continue_after_verified_candidate(
                 *,
@@ -21080,6 +21230,51 @@ def run_supervised(phase: str, deadline: Optional[DeadlineClock], fn: Any) -> An
     return box["value"]
 
 
+def run_supervised_planning(
+    phase: str,
+    deadline: Optional[DeadlineClock],
+    fn: Any,
+    rows_by_project: Dict[str, List[DependencyRow]],
+) -> Any:
+    """G4: run a rows-mutating planning pass on an ISOLATED working copy.
+
+    ``run_supervised`` runs the worker against the SHARED rows, so a planner
+    that keeps mutating rows after the timeout corrupts the state the PARTIAL
+    publication reads. Here the worker receives a deep copy; on success the
+    finished copy is spliced back atomically BEFORE the deadline. On
+    ``DraftBudgetExceeded`` the shared rows are untouched -- the late worker
+    only ever writes into its private copy, so the downstream publication reads
+    a consistent pre-deadline snapshot (G4).
+    """
+    if deadline is None or deadline.deadline_seconds is None:
+        return fn(rows_by_project)
+    remaining = deadline.remaining
+    if remaining is None:
+        return fn(rows_by_project)
+    budget = max(0.0, remaining - DRAFT_FINALIZE_RESERVE_SECONDS)
+    if budget <= DRAFT_MIN_NET_BUDGET_SECONDS:
+        raise DraftBudgetExceeded(phase)
+    working = copy.deepcopy(rows_by_project)
+    box: Dict[str, Any] = {}
+
+    def worker() -> None:
+        try:
+            box["value"] = fn(working)
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
+            box["exc"] = exc
+
+    thread = threading.Thread(target=worker, name=f"draft-{phase}", daemon=True)
+    thread.start()
+    thread.join(timeout=budget)
+    if thread.is_alive():
+        raise DraftBudgetExceeded(phase)
+    if "exc" in box:
+        raise box["exc"]
+    rows_by_project.clear()
+    rows_by_project.update(copy.deepcopy(working))
+    return box["value"]
+
+
 def stable_sha256_text(payload: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -21137,6 +21332,15 @@ def policy_snapshot_from_env() -> Dict[str, Any]:
         # the user moves the gate and acceptance/audit/release can compare it.
         "targetLevel": os.environ.get("DEPLOOM_BASELINE_TARGET_LEVEL", "") or EFFECTIVE_TARGET_LEVEL,
         "minLagOkPct": os.environ.get("DEPLOOM_BASELINE_MIN_LAG_OK_PCT", "") or str(EFFECTIVE_MIN_LAG_OK_PCT),
+        # G2: the snapshot carries the complete numeric goal schema: lag window
+        # and the C/H/M/L limits the run was accepted under. Acceptance compares
+        # these against the report.policy snapshot, so a missing field can no
+        # longer pass as "policy present".
+        "lagPolicyMonths": os.environ.get("DEPLOOM_BASELINE_LAG_POLICY_MONTHS", "") or str(effective_acceptance_policy()["lagPolicyMonths"]),
+        "maxKnownCritical": os.environ.get("DEPLOOM_BASELINE_MAX_KNOWN_CRITICAL", "") or str(effective_acceptance_policy()["maxKnownCritical"]),
+        "maxKnownHigh": os.environ.get("DEPLOOM_BASELINE_MAX_KNOWN_HIGH", "") or str(effective_acceptance_policy()["maxKnownHigh"]),
+        "maxKnownModerate": os.environ.get("DEPLOOM_BASELINE_MAX_KNOWN_MODERATE", "") or str(effective_acceptance_policy()["maxKnownModerate"]),
+        "maxKnownLow": os.environ.get("DEPLOOM_BASELINE_MAX_KNOWN_LOW", "") or str(effective_acceptance_policy()["maxKnownLow"]),
     }
     # Pin down the effective policy hash so UI/audit/closure cannot drift from
     # the planner's decision. Unknown/empty values are included verbatim so a
@@ -21150,25 +21354,88 @@ def draft_policy_hash(snapshot: Optional[Dict[str, Any]] = None) -> str:
     return stable_sha256_text(canonical)
 
 
-def draft_input_hash(project: ProjectSpec) -> str:
+DRAFT_INPUT_FILENAMES = (
+    "package.json", "yarn.lock", "pnpm-lock.yaml", "package-lock.json",
+    "npm-shrinkwrap.json", "package-manager.json",
+    ".dependency-roadmap/settings.project.json",
+    ".dependency-roadmap/settings.local.json",
+    ".dependency-roadmap/state/dashboard-state.json",
+)
+
+
+def _draft_input_file_name(project_path: Path, path: Path) -> str:
+    """G3: canonical file identity shared with the Node reader.
+
+    Files inside the project are addressed as project-relative ``./name`` (so
+    a workspace relocation keeps the identity stable); files outside the
+    project (e.g. the workspace-root settings under a nested frontend project)
+    are addressed absolutely, which is the only unambiguous identity for a
+    resolved input that is not under the project.
+    """
+    try:
+        rel = os.path.relpath(str(path), str(project_path))
+    except ValueError:
+        return str(path)
+    if rel == "." or rel.startswith("..") or os.path.isabs(rel):
+        return str(path)
+    return "./" + rel.replace(os.sep, "/")
+
+
+def draft_input_files_for(
+    spec: ProjectSpec,
+    settings_sources: Sequence[Path] = (),
+    dashboard_state_path: Optional[Path] = None,
+) -> List[str]:
+    """G3: the ACTUAL set of files the plan is derived from.
+
+    The fixed manifest-set is extended with the resolved settings sources
+    (read_merged_settings returns the really loaded project/local files, not
+    fixed relative guesses) and the resolved dashboard-state path. A nested
+    project whose package.json lives at <ws>/frontend therefore hashes the
+    root settings file too, so editing the root settings makes the Draft stale.
+    The result is persisted as the manifest's ``inputFilesByProject`` and the
+    Node reader re-hashes exactly these names (byte-lockstep).
+    """
+    names: List[str] = list(DRAFT_INPUT_FILENAMES)
+    seen = set(names)
+    for source in settings_sources:
+        try:
+            name = _draft_input_file_name(spec.path, Path(source))
+        except (TypeError, ValueError):
+            name = str(source)
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    if dashboard_state_path is not None:
+        try:
+            name = _draft_input_file_name(spec.path, Path(dashboard_state_path))
+        except (TypeError, ValueError):
+            name = str(dashboard_state_path)
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def draft_input_hash(project: ProjectSpec, files: Optional[Sequence[str]] = None) -> str:
     """Hash of the locally read manifest inputs the plan was derived from.
 
     F4: the fingerprint is the FULL planner input set, in byte-lockstep with
-    desktop/electron/draft-artifact-reader.ts#DRAFT_INPUT_FILENAMES (same
-    order, same name\\0bytes\\0 framing). Project/local settings and the
-    dashboard policy (exclusions, per-package lag policy) influence what the
-    plan contains, so changing any of them makes a previously generated Draft
-    stale even when the lockfiles are untouched.
+    desktop/electron/draft-artifact-reader.ts (same order, same
+    name\\0bytes\\0 framing) -- either the fixed DRAFT_INPUT_FILENAMES set for
+    legacy parity, or the resolved ``files`` (G3: project-relative settings and
+    dashboard paths that actually exist in the layout, so a nested-project
+    root settings change makes the run stale).
     """
+    names = list(files) if files is not None else list(DRAFT_INPUT_FILENAMES)
     h = hashlib.sha256()
-    for filename in (
-        "package.json", "yarn.lock", "pnpm-lock.yaml", "package-lock.json",
-        "npm-shrinkwrap.json", "package-manager.json",
-        ".dependency-roadmap/settings.project.json",
-        ".dependency-roadmap/settings.local.json",
-        ".dependency-roadmap/state/dashboard-state.json",
-    ):
-        path = project.path / filename
+    for filename in names:
+        if filename.startswith("./"):
+            path = project.path / filename[2:]
+        elif os.path.isabs(filename):
+            path = Path(filename)
+        else:
+            path = project.path / filename
         if path.exists():
             try:
                 data = path.read_bytes()
@@ -21558,6 +21825,7 @@ def publish_draft_result(
     settings_snapshot: Optional[Dict[str, Any]] = None,
     language: str = "ru",
     input_hashes: Optional[Dict[str, str]] = None,
+    input_files_by_project: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, Any]:
     """Publish the Draft result set atomically and return its manifest.
 
@@ -21677,6 +21945,21 @@ def publish_draft_result(
         "inputHashes": input_hashes if input_hashes is not None else {
             spec.name: draft_input_hash(spec) for spec in projects_by_name.values()
         },
+        # G3: the resolved planner-input file names per project (fixed set +
+        # actually-loaded settings sources + dashboard state). The Electron
+        # reader re-hashes exactly these names (byte-lockstep), so a nested
+        # project's root settings edit makes the run stale.
+        "inputFilesByProject": (
+            {
+                project_name: [{"name": name} for name in names]
+                for project_name, names in (input_files_by_project or {}).items()
+            }
+            if input_files_by_project
+            else {
+                spec.name: [{"name": name} for name in draft_input_files_for(spec)]
+                for spec in projects_by_name.values()
+            }
+        ),
         "projects": plan.get("projects", []),
     }
     _atomic_write_text(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2))
@@ -21734,7 +22017,7 @@ def _draft_local_inventory_rows(
             or override.get("excludeReason")
             or ""
         ).strip()
-        lag_months = normalized_lag_months(override.get("lagMonths", override.get("lagThresholdMonths", 12)))
+        lag_months = effective_lag_policy_months(project.name, override)
         rows.append(DependencyRow(
             project=project.name,
             package_dir=str(project.path),
@@ -21777,6 +22060,7 @@ def _publish_draft_and_exit(
     status: str,
     partial_reason: str,
     input_hashes: Optional[Dict[str, str]] = None,
+    input_files_by_project: Optional[Dict[str, List[str]]] = None,
 ) -> None:
     """Publish whatever Draft data was gathered before an abort and exit 0.
 
@@ -21803,6 +22087,7 @@ def _publish_draft_and_exit(
         partial_reason=partial_reason,
         deadline=deadline_clock,
         input_hashes=input_hashes,
+        input_files_by_project=input_files_by_project,
     )
     eprint(f"[done] Draft partial result published: {manifest['summary']}")
     eprint(f"[info] Draft manifest: {manifest['artifacts']['manifest']}")
@@ -21945,6 +22230,16 @@ def main() -> None:
         except (TypeError, ValueError):
             raw_lag_pct = 80
     EFFECTIVE_MIN_LAG_OK_PCT = max(0, min(100, int(raw_lag_pct)))
+    # G1: pin the full effective acceptance policy (lag window + numeric
+    # C/H/M/L limits) so the policy snapshot/hash carries the whole goal the
+    # planner applied -- one value everywhere, including generate-all's
+    # per-project map.
+    eff_policy = effective_acceptance_policy()
+    os.environ["DEPLOOM_BASELINE_LAG_POLICY_MONTHS"] = str(eff_policy["lagPolicyMonths"])
+    os.environ["DEPLOOM_BASELINE_MAX_KNOWN_CRITICAL"] = str(eff_policy["maxKnownCritical"])
+    os.environ["DEPLOOM_BASELINE_MAX_KNOWN_HIGH"] = str(eff_policy["maxKnownHigh"])
+    os.environ["DEPLOOM_BASELINE_MAX_KNOWN_MODERATE"] = str(eff_policy["maxKnownModerate"])
+    os.environ["DEPLOOM_BASELINE_MAX_KNOWN_LOW"] = str(eff_policy["maxKnownLow"])
     if args.draft_baseline:
         os.environ["DEPLOOM_BASELINE_TARGET_LEVEL"] = EFFECTIVE_TARGET_LEVEL
         os.environ["DEPLOOM_BASELINE_MIN_LAG_OK_PCT"] = str(EFFECTIVE_MIN_LAG_OK_PCT)
@@ -22331,6 +22626,7 @@ def main() -> None:
         eprint("[info] analysis mode: current checkout compared with the saved baseline; the project-manager lockfile is refreshed before analysis")
     generation_started = time.perf_counter()
     draft_input_hashes: Dict[str, str] = {}
+    draft_input_files_by_project: Dict[str, List[str]] = {}
     try:
         if args.draft_baseline:
             # T4: gather the local manifest+lockfile inventory for EVERY
@@ -22344,7 +22640,14 @@ def main() -> None:
                 # before any network enrichment. Hashing at publication could
                 # pin a file that changed during the run, attributing the plan
                 # to inputs it was not derived from.
-                draft_input_hashes[project.name] = draft_input_hash(project)
+                # G3: the fingerprint covers the ACTUALLY resolved settings
+                # paths (read_merged_settings sources + dashboard state), not
+                # fixed relative guesses, so a nested project whose settings
+                # live at the workspace root stays bound to them.
+                draft_input_files_by_project[project.name] = draft_input_files_for(
+                    project, settings_sources, dashboard_state_path
+                )
+                draft_input_hashes[project.name] = draft_input_hash(project, draft_input_files_by_project[project.name])
                 client.for_project(project.name)
                 _draft_progress(client, operation="local inventory", package=project.name, step="inventory", completed=i, total=len(projects))
         for i, project in enumerate(projects, start=1):
@@ -22387,6 +22690,7 @@ def main() -> None:
             status="DRAFT_PARTIAL",
             partial_reason=f"Draft deadline ({deadline_clock.deadline_seconds}s) exceeded at {budget_exc.phase}; metadata may be incomplete.",
             input_hashes=draft_input_hashes,
+            input_files_by_project=draft_input_files_by_project,
         )
 
     baselines_dir = history_dir / "baselines"
@@ -22408,12 +22712,16 @@ def main() -> None:
         # as the network phases. A solver or enrichment pass that checks the
         # clock only before/after itself is still bounded by the supervisor,
         # so the whole planning slice cannot outlive the deadline.
-        health_by_project = run_supervised(
+        # G4: rows-mutating passes run on an isolated copy and splice back only
+        # on success, so a worker that outlives the budget never corrupts the
+        # state the PARTIAL publication reads.
+        health_by_project = run_supervised_planning(
             "planning",
             deadline_clock,
-            lambda: enrich_project_targets(rows_by_project, planning_baselines),
+            lambda working: enrich_project_targets(working, planning_baselines),
+            rows_by_project,
         )
-        run_supervised("planning", deadline_clock, lambda: apply_supervisor_scope_expansions(rows_by_project))
+        run_supervised_planning("planning", deadline_clock, lambda working: apply_supervisor_scope_expansions(working), rows_by_project)
         enforce_storybook_cohort(rows_by_project, client)
         apply_planner_deferrals(rows_by_project)
         # BLOCK_W_P0_P1_TYPES_NESTED_FIX_V1
@@ -22421,20 +22729,22 @@ def main() -> None:
         # A deprecated @types/* target is either already proven removable against
         # the exact planned runtime target or conservatively deferred before the
         # expensive resolver/project proof begins.
-        run_supervised(
+        run_supervised_planning(
             "planning",
             deadline_clock,
-            lambda: plan_executable_actions(rows_by_project, client, immutable_targets=False),
+            lambda working: plan_executable_actions(working, client, immutable_targets=False),
+            rows_by_project,
         )
         # Freeze the executable policy intent before compatibility resolution.
         # Registry evidence is applied first so peer solving never relies on a
         # metadata-only target; the solver may then choose registry-backed
         # fallbacks/companions without resurrecting an infeasible type-stub action.
         capture_desired_targets(rows_by_project)
-        run_supervised(
+        run_supervised_planning(
             "planning",
             deadline_clock,
-            lambda: enrich_registry_target_evidence(rows_by_project, client),
+            lambda working: enrich_registry_target_evidence(working, client),
+            rows_by_project,
         )
         if residual_targets_by_project:
             count = sum(len(targets) for targets in residual_targets_by_project.values())
@@ -22450,59 +22760,64 @@ def main() -> None:
             # R2: the first Draft path solves ONE chosen variant ("default"),
             # not the three required by the Verified planning loop, so the run
             # stays bounded and any expiry publishes the rows gathered so far.
-            run_supervised(
+            run_supervised_planning(
                 "planning",
                 deadline_clock,
-                lambda: resolve_peer_compatibility(
-                    rows_by_project,
+                lambda working: resolve_peer_compatibility(
+                    working,
                     client,
                     modes=("default",),
                     apply_results=True,
                     residual_targets_by_project=residual_targets_by_project,
                 ),
+                rows_by_project,
             )
         else:
             # proof_envelopes_out is filled by reference; the function returns
             # the assignments alone.
-            proven_assignments = run_supervised(
+            proven_assignments = run_supervised_planning(
                 "planning",
                 deadline_clock,
-                lambda: resolve_peer_compatibility_with_verification(
-                    rows_by_project, projects_by_name, client,
+                lambda working: resolve_peer_compatibility_with_verification(
+                    working, projects_by_name, client,
                     residual_targets_by_project=residual_targets_by_project,
                     external_evidence_by_project=external_evidence_by_project,
                     progress_path=baseline_progress_path,
                     proof_envelopes_out=proven_dependency_envelopes,
                 ),
+                rows_by_project,
             )
 
         deadline_clock.check("final-targets")
-        run_supervised(
+        run_supervised_planning(
             "planning",
             deadline_clock,
-            lambda: enrich_registry_target_evidence(
-                rows_by_project,
+            lambda working: enrich_registry_target_evidence(
+                working,
                 client,
                 allow_target_mutation=False,
             ),
+            rows_by_project,
         )
         # A late @types action decision may fail the handoff, but may not mutate a
         # finalized dependency target.
-        run_supervised(
+        run_supervised_planning(
             "planning",
             deadline_clock,
-            lambda: plan_executable_actions(
-                rows_by_project,
+            lambda working: plan_executable_actions(
+                working,
                 client,
                 immutable_targets=True,
             ),
+            rows_by_project,
         )
         if not args.draft_baseline:
             assert_proven_assignment_conformance(rows_by_project, proven_assignments)
-        final_peer_issues = run_supervised(
+        final_peer_issues = run_supervised_planning(
             "planning",
             deadline_clock,
-            lambda: validate_final_peer_assignment(rows_by_project, client),
+            lambda working: validate_final_peer_assignment(working, client),
+            rows_by_project,
         )
         if final_peer_issues:
             if not args.draft_baseline:
@@ -22531,7 +22846,10 @@ def main() -> None:
             # F4: the partial plan is bound to the inputs captured at INVENTORY
             # time, not re-hashed at publication (the inputs may have moved in
             # the meantime, which would silently bind the plan to other data).
+            # G3: the resolved input-file list travels with the hash so the
+            # reader re-hashes the same physical files.
             input_hashes=draft_input_hashes,
+            input_files_by_project=draft_input_files_by_project,
         )
 
     proven_dependency_state_path = (
@@ -22585,6 +22903,7 @@ def main() -> None:
                 partial_reason=None,
                 deadline=deadline_clock,
                 input_hashes=draft_input_hashes,
+                input_files_by_project=draft_input_files_by_project,
             )
         except DraftBudgetExceeded as budget_exc:
             eprint(f"[info] Draft deadline exceeded at finalization: {budget_exc.phase}")
@@ -22600,6 +22919,7 @@ def main() -> None:
                 status="DRAFT_PARTIAL",
                 partial_reason=f"Draft deadline ({deadline_clock.deadline_seconds}s) exceeded at {budget_exc.phase}; plan is partial.",
                 input_hashes=draft_input_hashes,
+                input_files_by_project=draft_input_files_by_project,
             )
         eprint(
             f"[done] Draft result published: status={draft_manifest['status']} "

@@ -1958,6 +1958,8 @@ def build_report(
     target_level: str = "yellow",
     min_lag_ok_pct: int = 80,
     max_known_high: int = 1,
+    max_known_moderate: Optional[int] = None,
+    max_known_low: Optional[int] = None,
 ) -> Dict[str, Any]:
     manager = package_manager(project)
     deps = direct_dependencies(project)
@@ -2005,12 +2007,17 @@ def build_report(
         # F1: the goal policy this report is bound to. The release gate rejects
         # evidence produced under a different target/lag/High set, so changing
         # the goal invalidates the previous audit, not just the roadmap.
+        # G2: the snapshot carries the COMPLETE numeric goal schema (lag window
+        # + C/H/M/L limits). The release gate now requires all five core fields
+        # to be present, so a partial { targetLevel } snapshot is UNKNOWN.
         "policy": {
             "targetLevel": target_level if target_level == "green" else "yellow",
             "minLagOkPct": int(min_lag_ok_pct),
             "maxKnownCritical": 0,
             "maxKnownHigh": int(max_known_high),
             "lagPolicyMonths": int(lag_months),
+            **({"maxKnownModerate": int(max_known_moderate)} if max_known_moderate is not None else {}),
+            **({"maxKnownLow": int(max_known_low)} if max_known_low is not None else {}),
         },
         "audit": audit,
         "lag": lag,
@@ -2046,6 +2053,8 @@ def main() -> int:
     parser.add_argument("--target-level", choices=("yellow", "green"), default="yellow")
     parser.add_argument("--min-lag-ok-pct", type=int, default=80)
     parser.add_argument("--max-known-high", type=int, default=1)
+    parser.add_argument("--max-known-moderate", type=int, default=None)
+    parser.add_argument("--max-known-low", type=int, default=None)
     parser.add_argument(
         "--yarn-audit-engine",
         choices=("auto", "yarn-native", "yarn-inventory", "npm-lock-bridge"),
@@ -2076,6 +2085,8 @@ def main() -> int:
         target_level=args.target_level,
         min_lag_ok_pct=args.min_lag_ok_pct,
         max_known_high=args.max_known_high,
+        max_known_moderate=args.max_known_moderate,
+        max_known_low=args.max_known_low,
     )
     md = markdown(report)
     print(md)

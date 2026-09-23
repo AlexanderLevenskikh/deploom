@@ -117,8 +117,8 @@ class ProofHandoffFirewallTests(unittest.TestCase):
         # planning phase; the handoff must still be the VERIFIED resolver (never
         # the unverified planner) and its result must flow into the assignment
         # that is later checked for conformance.
-        self.assertIn("proven_assignments = run_supervised(", main)
-        self.assertIn("lambda: resolve_peer_compatibility_with_verification(", main)
+        self.assertIn("proven_assignments = run_supervised_planning(", main)
+        self.assertIn("lambda working: resolve_peer_compatibility_with_verification(", main)
         self.assertNotIn("minimize_yellow_plan_after_compatibility(", main)
         self.assertIn("allow_target_mutation=False", main)
         self.assertIn("immutable_targets=True", main)

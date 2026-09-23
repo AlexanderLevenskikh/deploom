@@ -455,7 +455,10 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
               <span className="draft-result-meta">run <code>{draftResult.runId}</code> · {draftResult.elapsedMs}ms{typeof draftResult.deadlineSeconds === 'number' ? ` · ${text('deadline', 'deadline')} ${draftResult.deadlineSeconds}s` : ''} · {draftResult.verificationStatus} / {draftResult.authority} / {draftResult.compatibility}</span>
             </div>
           </div>
-          {!draftResultFresh && draftResult.stale ? <div className="resume-notice warning"><strong>{text('Draft устарел', 'Draft is stale')}</strong><span>{draftResult.staleReason || text('Входные файлы или acceptance-политика изменились с момента генерации.', 'Input files or the acceptance policy changed since generation.')}</span></div> : null}
+          {/* G3: the stale warning is shown regardless of fresh/acknowledged —
+              a result that no longer matches today's inputs must never be
+              presented as current, even right after generation. */}
+          {draftResult.stale ? <div className="resume-notice warning"><strong>{text('Draft устарел', 'Draft is stale')}</strong><span>{draftResult.staleReason || text('Входные файлы или acceptance-политика изменились с момента генерации.', 'Input files or the acceptance policy changed since generation.')}</span></div> : null}
           <div className="human-flow-actions">
             <button className="button primary" onClick={() => void openDraftPrompt()}><FileText size={16} />{draftResultFresh ? text('Показать draft prompt', 'Show draft prompt') : text('Открыть промпт', 'Open prompt')}</button>
             {draftResult.artifacts.plan ? <button className="button secondary" onClick={() => void onOpenPath(draftResult.artifacts.plan)}><FileText size={16} />{text('План', 'Plan')}</button> : null}

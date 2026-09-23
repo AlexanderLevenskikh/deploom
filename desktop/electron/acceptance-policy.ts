@@ -235,6 +235,26 @@ export function acceptanceVerdictFromManualAudit(
     if (reportLagMonths !== undefined && reportLagMonths !== currentLagMonths) policyMismatch.push(`lagPolicyMonths=${reportLagMonths}`)
   }
 
+  // G2: the report's policy snapshot must carry the COMPLETE goal schema the
+  // run was accepted under -- target level, lag gate, lag window and the
+  // numeric C/H limits. A snapshot that only says { targetLevel: 'yellow' }
+  // cannot prove the evidence was produced under this goal, so it fails
+  // closed as UNKNOWN instead of being treated as "the policy present".
+  const policySchemaGaps: string[] = []
+  if (reportPolicy) {
+    const mandatoryFields: Array<[keyof Record<string, unknown>, string]> = [
+      ['targetLevel', 'targetLevel'],
+      ['minLagOkPct', 'minLagOkPct'],
+      ['lagPolicyMonths', 'lagPolicyMonths'],
+      ['maxKnownCritical', 'maxKnownCritical'],
+      ['maxKnownHigh', 'maxKnownHigh'],
+    ]
+    for (const [field, label] of mandatoryFields) {
+      const rawField = reportPolicy[field as string]
+      if (rawField === undefined || rawField === null || rawField === '') policySchemaGaps.push(label)
+    }
+  }
+
   // Missing or weak evidence -> UNKNOWN (fail closed, nothing fabricated).
   const unverifiable: string[] = []
   if (!auditComplete) unverifiable.push('Vulnerability audit evidence is incomplete.')
@@ -249,6 +269,7 @@ export function acceptanceVerdictFromManualAudit(
   if (auditLagOkPct === undefined) unverifiable.push('Lag-policy compliance evidence is missing from the audit report (lagOkPct/compliancePct).')
   if (!reportPolicy) unverifiable.push('Audit report has no goal-policy snapshot (report.policy) to bind the evidence to.')
   else if (policyMismatch.length) unverifiable.push(`Audit report was produced under a different goal policy (${policyMismatch.join(', ')}).`)
+  else if (policySchemaGaps.length) unverifiable.push(`Audit report policy snapshot is incomplete (missing ${policySchemaGaps.join(', ')}) and cannot be bound to the current goal.`)
   if (policy.maxKnownModerate !== undefined && moderate === undefined) unverifiable.push('Moderate totals are missing from the audit report (policy demands a numeric Moderate limit).')
   if (policy.maxKnownLow !== undefined && low === undefined) unverifiable.push('Low totals are missing from the audit report (policy demands a numeric Low limit).')
 

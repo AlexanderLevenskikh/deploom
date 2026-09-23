@@ -36,6 +36,7 @@ if (result.ok) {
       projectPath: payload.staleness.projectPath,
       generatedAt: payload.staleness.generatedAt ?? artifact.generatedAt,
       inputHashRecorded: artifact.inputHashes?.[payload.staleness.projectName] ?? payload.staleness.inputHashRecorded,
+      inputFiles: artifact.inputFilesByProject?.[payload.staleness.projectName],
       storedPolicy: payload.staleness.useManifestSettings ? (artifact.settings ?? undefined) : payload.staleness.storedPolicy,
       currentPolicy: payload.staleness.currentPolicy,
     })

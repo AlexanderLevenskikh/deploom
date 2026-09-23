@@ -74,6 +74,10 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     boundedLagMonths(plan.intent.lagPolicyMonths ?? plan.intent.acceptancePolicy?.lagPolicyMonths ?? 12),
   )
   const [busy, setBusy] = useState(false)
+  // G5: product search strategy for verified runs. FAST stops on the first
+  // verified assignment that actually satisfies the acceptance policy; DEEP
+  // keeps improving and preserves the best verified incumbent (legacy default).
+  const [productMode, setProductMode] = useState<'fast' | 'deep'>(plan.intent.productMode ?? 'deep')
   const deferredQuery = useDeferredValue(query)
 
   useEffect(() => {
@@ -86,6 +90,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     setTargetLevel(plan.intent.targetLevel === 'green' ? 'green' : 'yellow')
     setMinLagOkPct(boundedInteger(plan.intent.minLagOkPct, 80, 0, 100))
     setLagPolicyMonths(boundedLagMonths(plan.intent.lagPolicyMonths ?? plan.intent.acceptancePolicy?.lagPolicyMonths ?? 12))
+    setProductMode(plan.intent.productMode ?? 'deep')
   }, [plan])
 
   const visible = useMemo(() => {
@@ -111,8 +116,9 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
       || cohortFingerprint(deferredCohorts) !== cohortFingerprint(plan.intent.deferredCohorts ?? [])
       || targetLevel !== (plan.intent.targetLevel === 'green' ? 'green' : 'yellow')
       || minLagOkPct !== boundedInteger(plan.intent.minLagOkPct, 80, 0, 100)
-      || lagPolicyMonths !== boundedLagMonths(plan.intent.lagPolicyMonths ?? plan.intent.acceptancePolicy?.lagPolicyMonths ?? 12),
-    [budgetMinutes, controlMode, deferredCohorts, lagPolicyMonths, maxKnownHigh, minLagOkPct, plan.intent, policies, searchDepth, targetLevel],
+      || lagPolicyMonths !== boundedLagMonths(plan.intent.lagPolicyMonths ?? plan.intent.acceptancePolicy?.lagPolicyMonths ?? 12)
+      || productMode !== (plan.intent.productMode ?? 'deep'),
+    [budgetMinutes, controlMode, deferredCohorts, lagPolicyMonths, maxKnownHigh, minLagOkPct, plan.intent, policies, productMode, searchDepth, targetLevel],
   )
 
   const buildIntent = ({
@@ -126,6 +132,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     nextTargetLevel = targetLevel,
     nextMinLagOkPct = minLagOkPct,
     nextLagPolicyMonths = lagPolicyMonths,
+    nextProductMode = productMode,
     cohortAction,
   }: {
     extra?: number
@@ -138,6 +145,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     nextTargetLevel?: 'yellow' | 'green'
     nextMinLagOkPct?: number
     nextLagPolicyMonths?: number
+    nextProductMode?: 'fast' | 'deep'
     cohortAction?: BaselineIntent['cohortAction']
   } = {}): BaselineIntent => {
     // F1: the green preset forces the whole numeric goal -- 100% lag
@@ -176,6 +184,9 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
       targetLevel: effectiveTarget,
       minLagOkPct: effectiveLagPct,
       lagPolicyMonths: effectiveLagMonths,
+      // G5: the chosen product search strategy for VERIFIED runs travels with
+      // the intent so the persistence/transport layers can re-apply it.
+      ...(proofMode !== 'DRAFT' ? { productMode: nextProductMode === 'fast' ? 'fast' : 'deep' } : {}),
       ...(cohortAction ? { cohortAction } : {}),
     }
   }
@@ -332,6 +343,16 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
             <span>{text('DepLoom ищет первый physically verified полезный результат, затем улучшает его, пока есть смысл. Acceptance и freshness теперь независимы.', 'DepLoom seeks the first physically verified useful result, then improves it while worthwhile. Acceptance and freshness are now independent.')}</span>
           </div>
           <div className="baseline-run-controls">
+            <div className="baseline-run-control">
+              <span className="baseline-run-control-label">{text('Режим поиска', 'Search strategy')}</span>
+              <div className="baseline-mode-toggle" role="group" aria-label={text('Стратегия поиска Baseline', 'Baseline search strategy')}>
+                <button type="button" className={productMode === 'fast' ? 'active' : ''} aria-pressed={productMode === 'fast'} disabled={busy} onClick={() => setProductMode('fast')}>{text('Fast', 'Fast')}</button>
+                <button type="button" className={productMode === 'deep' ? 'active' : ''} aria-pressed={productMode === 'deep'} disabled={busy} onClick={() => setProductMode('deep')}>{text('Deep', 'Deep')}</button>
+              </div>
+              <small>{productMode === 'fast'
+                ? text('Fast останавливается на первом physically verified кандидате, который реально удовлетворяет Acceptance policy (все известные Critical/High закрыты, lag-цель достигнута). Дедлайн и бюджет строго ограничены.', 'FAST stops on the first physically verified candidate that actually satisfies the acceptance policy (every known Critical/High covered, lag goal met). Deadline and budget are tightly bounded.')
+                : text('Deep продолжает улучшать результат после первого удовлетворяющего кандидата и сохраняет лучший verified incumbent при ошибке/таймауте. Используется по умолчанию.', 'DEEP keeps improving after the first satisfying candidate and preserves the best verified incumbent on error/timeout. This is the default.')}</small>
+            </div>
             <div className="baseline-run-control">
               <span className="baseline-run-control-label">{text('Контроль', 'Control')}</span>
               <div className="baseline-mode-toggle" role="group" aria-label={text('Режим контроля Baseline', 'Baseline control mode')}>

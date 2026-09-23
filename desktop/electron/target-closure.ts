@@ -125,6 +125,16 @@ const critical = typeof rawHealth.critical === 'number' ? rawHealth.critical : u
 // already requires High == 0, so it needs no extra check here.
 const high = typeof rawHealth.high === 'number' ? rawHealth.high : undefined
 const highClear = high === undefined || high <= Math.max(0, Math.trunc(Number.isFinite(maxKnownHigh) ? maxKnownHigh : 1))
+// G2: a goal can never be reached while part of the scope has UNKNOWN security
+// (the generator reports security_unknown when an in-scope dependency has no
+// OSV evidence; older roadmaps carried the same concept as `unknown`). Unknown
+// is evidence of absence, not absence of evidence, so it blocks `reached`:
+// closing a goal means every in-scope dependency is accounted for.
+const rawSecurityUnknown = typeof rawHealth.security_unknown === 'number' ? rawHealth.security_unknown : undefined
+const securityUnknown = rawSecurityUnknown !== undefined
+  ? Math.max(0, Math.trunc(rawSecurityUnknown))
+  : typeof rawHealth.unknown === 'number' ? Math.max(0, Math.trunc(rawHealth.unknown)) : undefined
+const securityClear = securityUnknown === undefined || securityUnknown === 0
 const rawLagOkPct = typeof rawHealth.lag_ok_pct === 'number' ? Math.max(0, Math.min(100, rawHealth.lag_ok_pct)) : undefined
 const scopeTotal = typeof rawHealth.scope_total === 'number' ? Math.max(0, Math.trunc(rawHealth.scope_total)) : undefined
 const scopeLagOk = typeof rawHealth.scope_lag_ok === 'number' ? Math.max(0, Math.trunc(rawHealth.scope_lag_ok)) : undefined
@@ -140,12 +150,14 @@ const reached = target === 'yellow'
     && remainingPackages.length === 0
     && criticalClear
     && highClear
+    && securityClear
     // When the lag share was measured the yellow floor must actually hold;
     // a roadmap without the field falls back to the old status-based read.
     && (goalLagPct === undefined || goalLagPct >= yellowPct)
   : status === 'green'
     && remainingPackages.length === 0
     && criticalClear
+    && securityClear
     && (goalLagPct === undefined || goalLagPct >= 100)
   const fixableBlockers = lagBlockers.filter((blocker) => Boolean(blocker.plannedTarget))
   const plannedLagFixes = new Set(fixableBlockers
@@ -213,6 +225,7 @@ const reached = target === 'yellow'
     ...(uncoveredCriticalPackages.length ? { uncoveredCriticalPackages } : {}),
     ...(typeof rawHealth.critical === 'number' ? { critical: rawHealth.critical } : {}),
     ...(typeof rawHealth.high === 'number' ? { high: rawHealth.high } : {}),
+    ...(securityUnknown !== undefined ? { securityUnknown } : {}),
     ...(typeof rawHealth.excluded === 'number' ? { excluded: rawHealth.excluded } : {}),
     ...(bestEffortReleaseEligible ? { bestEffortReleaseEligible, bestEffortReason } : {}),
     remainingPackages,

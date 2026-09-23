@@ -53,6 +53,11 @@ def _read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _tsc_command() -> list[str]:
+    """Cross-platform tsc invocation: npx.cmd on Windows, npx elsewhere."""
+    return [shutil.which("npx.cmd") or "npx", "tsc", "-p", "tsconfig.electron.json"]
+
+
 class DraftReaderCrossLanguageTests(unittest.TestCase):
     """T1/T5/T8: Python writer -> raw files -> production Node reader."""
 
@@ -69,7 +74,7 @@ class DraftReaderCrossLanguageTests(unittest.TestCase):
             need_compile = True
         if need_compile:
             finished = subprocess.run(
-                ["npx.cmd", "tsc", "-p", "tsconfig.electron.json"],
+                _tsc_command(),
                 cwd=str(ROOT / "desktop"), capture_output=True, text=True,
                 encoding="utf-8", timeout=180,
             )
@@ -427,7 +432,7 @@ class DraftFlowIntegrationPhysicalTests(unittest.TestCase):
         except OSError:
             need_compile = True
         if need_compile:
-            subprocess.run(["npx.cmd", "tsc", "-p", "tsconfig.electron.json"], cwd=str(ROOT / "desktop"),
+            subprocess.run(_tsc_command(), cwd=str(ROOT / "desktop"),
                            capture_output=True, text=True, encoding="utf-8", timeout=180)
 
     def _probe_node(self, workspace_path: Path, run_id: str, expect: dict | None = None) -> dict:

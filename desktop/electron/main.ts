@@ -73,7 +73,7 @@ type BaselineProofMode = 'VERIFIED' | 'DRAFT'
 type BaselineControlMode = 'AUTONOMOUS' | 'CONFIRM_SIGNIFICANT'
 type BaselineDeferredCohort = { id: string; label: string; packages: string[]; predicate?: string; confidence?: number; authority: 'DIAGNOSTIC_HINT'; deferredAt?: string; decisionId?: string; boundaryPackages?: string[]; warningPackages?: string[] }
 type BaselineCohortAction = { kind: 'DEFER' | 'REACTIVATE'; cohortId: string; label: string; packages: string[]; predicate?: string; confidence?: number; decisionId?: string }
-type BaselineIntent = { schemaVersion: 1 | 2; policies: Record<string, BaselinePackagePolicy>; controlMode?: BaselineControlMode; budgetMinutes?: number; acceptancePolicy?: AcceptancePolicy; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; proofMode?: BaselineProofMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction; targetLevel?: 'yellow' | 'green'; minLagOkPct?: number; lagPolicyMonths?: number }
+type BaselineIntent = { schemaVersion: 1 | 2; policies: Record<string, BaselinePackagePolicy>; controlMode?: BaselineControlMode; budgetMinutes?: number; acceptancePolicy?: AcceptancePolicy; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; proofMode?: BaselineProofMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction; targetLevel?: 'yellow' | 'green'; minLagOkPct?: number; lagPolicyMonths?: number; productMode?: 'fast' | 'deep' }
 type BaselineIntentCandidate = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string }
 type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent }
 type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
@@ -146,6 +146,9 @@ type DraftResultSnapshot = {
   // the policy snapshot — so staleness can be verified against reality instead
   // of just mtimes.
   inputHashes?: Record<string, string>
+  // G3: the resolved per-project planner-input file list, re-hashed for
+  // staleness so a nested project stays bound to root-level settings.
+  inputFilesByProject?: Record<string, { name: string; hash?: string }[]>
   settings?: Record<string, unknown>
   // F4: the card staleness, computed the same way as the preview. Separates
   // "a fresh new result of THIS run" from "still matches the current inputs":
@@ -438,6 +441,12 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
     targetLevel: goalLevel,
     minLagOkPct: goalLagPct,
     lagPolicyMonths: goalLagMonths,
+    // G5: product search strategy for VERIFIED runs (Draft always runs the
+    // quick planning-only mode). FAST stops on the first verified assignment
+    // that actually satisfies the acceptance policy; DEEP keeps improving and
+    // preserves the best verified incumbent. Default DEEP keeps legacy
+    // verified behaviour unchanged.
+    ...(raw.productMode === 'fast' || raw.productMode === 'deep' ? { productMode: raw.productMode as 'fast' | 'deep' } : {}),
     ...(cohortAction ? { cohortAction } : {}),
   }
 }
@@ -727,6 +736,7 @@ function buildDraftResultSnapshot(artifact: DraftResultArtifact): DraftResultSna
     artifacts: artifact.artifacts ?? { manifest: '', plan: '', prompt: '', summary: '' },
     hashes: artifact.hashes ?? { plan: '', prompt: '' },
     inputHashes: artifact.inputHashes,
+    inputFilesByProject: artifact.inputFilesByProject,
     settings: artifact.settings,
   }
 }
@@ -767,6 +777,7 @@ function draftInputStaleness(
     projectPath: project.path,
     generatedAt: snapshot.generatedAt,
     inputHashRecorded: snapshot.inputHashes?.[project.name],
+    inputFiles: snapshot.inputFilesByProject?.[project.name],
     storedPolicy: snapshot.settings as Record<string, unknown> | undefined,
     currentPolicy: loadBaselineIntent(workspace, project.name) as Record<string, unknown> | undefined,
   })
@@ -2306,12 +2317,35 @@ async function executeBaselineWorkerCommand(
 // fresh roadmap or audit must see the same target level / numeric lag gate as
 // the baseline run that produced the intent, or regenerate/regenerate-all
 // would drift the goal and the release gate would reject its own plan.
-function goalPolicyEnv(workspace: WorkspaceRecord, projectName: string): Record<string, string> | undefined {
+function goalPolicyEnv(workspace: WorkspaceRecord, projectName: string): Record<string, string> {
   const intent = loadBaselineIntent(workspace, projectName)
+  const acceptancePolicy = intent.acceptancePolicy ?? normalizeAcceptancePolicy(undefined)
   return {
     DEPLOOM_BASELINE_TARGET_LEVEL: intent.targetLevel ?? 'yellow',
     DEPLOOM_BASELINE_MIN_LAG_OK_PCT: String(intent.minLagOkPct ?? 80),
-    DEPLOOM_ACCEPTANCE_POLICY_JSON: JSON.stringify(intent.acceptancePolicy ?? normalizeAcceptancePolicy(undefined)),
+    DEPLOOM_ACCEPTANCE_POLICY_JSON: JSON.stringify(acceptancePolicy),
+    // G1: pin the full numeric goal schema so the planner's policy snapshot
+    // and health gates see the same M/L limits and lag window as the run they
+    // regenerate.
+    ...(acceptancePolicy.lagPolicyMonths !== undefined ? { DEPLOOM_BASELINE_LAG_POLICY_MONTHS: String(acceptancePolicy.lagPolicyMonths) } : {}),
+    ...(acceptancePolicy.maxKnownCritical !== undefined ? { DEPLOOM_BASELINE_MAX_KNOWN_CRITICAL: String(acceptancePolicy.maxKnownCritical) } : {}),
+    ...(acceptancePolicy.maxKnownHigh !== undefined ? { DEPLOOM_BASELINE_MAX_KNOWN_HIGH: String(acceptancePolicy.maxKnownHigh) } : {}),
+    ...(acceptancePolicy.maxKnownModerate !== undefined ? { DEPLOOM_BASELINE_MAX_KNOWN_MODERATE: String(acceptancePolicy.maxKnownModerate) } : {}),
+    ...(acceptancePolicy.maxKnownLow !== undefined ? { DEPLOOM_BASELINE_MAX_KNOWN_LOW: String(acceptancePolicy.maxKnownLow) } : {}),
+  }
+}
+
+// G1: generate-all sends EVERY project its own saved goal policy (lag window,
+// M/L limits, High cap) so one project's stricter goal does not leak into the
+// other projects' planning. The engine's effective_acceptance_policy(project)
+// prefers this per-project map over the shared DEPLOOM_ACCEPTANCE_POLICY_JSON.
+function generateAllPolicyEnv(workspace: WorkspaceRecord): Record<string, string> {
+  const byProject: Record<string, unknown> = {}
+  for (const project of readProjects(workspace)) {
+    byProject[project.name] = loadBaselineIntent(workspace, project.name).acceptancePolicy ?? normalizeAcceptancePolicy(undefined)
+  }
+  return {
+    DEPLOOM_ACCEPTANCE_POLICY_BY_PROJECT: JSON.stringify(byProject),
   }
 }
 
@@ -2433,8 +2467,13 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
             DEPLOOM_RUN_ID: effectiveDraftRunId,
             DEPLOOM_WORKSPACE_ID: workspace.id,
             DEPLOOM_PROJECT_ID: project.name,
-            DEPLOOM_MODE: 'draft',
           } : {}),
+          // G5: the product search mode reaches the engine in EVERY baseline
+          // run. Draft runs are always 'draft' (planning-only); VERIFIED runs
+          // honour the user's fast/deep choice (default deep keeps legacy
+          // verified behaviour). The generator pins it and selects the
+          // anytime budget and the fast-stop rule from it.
+          DEPLOOM_MODE: proofMode === 'DRAFT' ? 'draft' : (effectiveIntent.productMode ?? 'deep'),
         },
       }]
     }
@@ -2455,7 +2494,9 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
         args: [generatorPath(), '--project-settings', settingsPath, '--history-snapshot-label', input.label?.trim() || 'DepLoom: все проекты'],
         stallWarningMs: 2 * 60_000,
         stallAbortMs: 15 * 60_000,
-        env: goalPolicyEnv(workspace, project.name),
+        // G1: each project runs under its OWN saved goal policy via the
+        // per-project map (not one policy for the whole workspace).
+        env: { ...goalPolicyEnv(workspace, project.name), ...generateAllPolicyEnv(workspace) },
       }]
     case 'audit': {
       const slug = project.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-')
@@ -2473,6 +2514,11 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
           '--min-lag-ok-pct', String(auditPolicy.minLagOkPct ?? 80),
           '--max-known-high', String(auditPolicy.maxKnownHigh ?? 1),
           '--lag-months', String(auditPolicy.lagPolicyMonths ?? 12),
+          // G2: numeric Moderate/Low limits are part of the goal schema; the
+          // report.policy snapshot carries them so acceptance can verify the
+          // evidence was produced under the exact green M/L thresholds.
+          ...(auditPolicy.maxKnownModerate !== undefined ? ['--max-known-moderate', String(auditPolicy.maxKnownModerate)] : []),
+          ...(auditPolicy.maxKnownLow !== undefined ? ['--max-known-low', String(auditPolicy.maxKnownLow)] : []),
           '--json-out', join(artifacts, `manual-audit-${slug}.json`), '--md-out', join(artifacts, `manual-audit-${slug}.md`)],
       }]
     }

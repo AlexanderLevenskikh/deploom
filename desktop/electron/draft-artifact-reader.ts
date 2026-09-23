@@ -58,6 +58,8 @@ export type DraftResultArtifact = {
   artifacts?: { manifest: string; plan: string; prompt: string; summary: string }
   hashes?: { plan: string; prompt: string }
   inputHashes?: Record<string, string>
+  /** G3: per-project resolved planner-input files (re-hashed for staleness). */
+  inputFilesByProject?: Record<string, Array<{ name: string; hash?: string }>>
   projects?: unknown[]
 }
 
@@ -100,6 +102,32 @@ export function draftInputHashForProject(projectPath: string): string {
   return hash.digest('hex')
 }
 
+// G3: hash the ACTUAL resolved input files the planner recorded in the
+// manifest (inputFilesByProject). Byte-lockstep framing with the Python side
+// (draft_input_hash): name\0bytes\0 in declaration order. Names starting with
+// './' are project-relative (workspace relocation keeps their identity stable);
+// absolute names (workspace-root settings under a NESTED project layout) are
+// hashed as-is. This makes a nested project bind its Draft to the root
+// settings file, so editing those settings marks the run stale.
+export function draftInputHashFromFiles(projectPath: string, files: ReadonlyArray<{ name: string; hash?: string }>): string {
+  const hash = createHash('sha256')
+  for (const entry of files) {
+    const filename = String(entry?.name ?? '').trim()
+    if (!filename) continue
+    const input = filename.startsWith('./') ? join(projectPath, filename.slice(2)) : isAbsolute(filename) ? filename : join(projectPath, filename)
+    if (!existsSync(input)) continue
+    try {
+      hash.update(Buffer.from(filename, 'utf8'))
+      hash.update(Buffer.from([0]))
+      hash.update(readFileSync(input))
+      hash.update(Buffer.from([0]))
+    } catch {
+      continue
+    }
+  }
+  return hash.digest('hex')
+}
+
 export function baselinePoliciesKey(policies: Record<string, unknown> | undefined | null): string {
   const entries = Object.entries(policies ?? {})
     .filter(([, policy]) => policy === 'keep-current' || policy === 'required')
@@ -112,6 +140,10 @@ export type DraftStalenessFacts = {
   generatedAt?: string
   /** manifests inputHashes[project] captured at read time (T5). */
   inputHashRecorded?: string
+  /** G3: the resolved planner-input file names (manifest.inputFilesByProject),
+   * re-hashed instead of the fixed DRAFT_INPUT_FILENAMES so a nested project
+   * whose settings live outside its own directory stays bound to them. */
+  inputFiles?: { name: string; hash?: string }[]
   /** The policy the run was accepted under (manifest.settings). */
   storedPolicy?: {
     targetLevel?: unknown
@@ -134,46 +166,50 @@ export type DraftStalenessFacts = {
 
 export type DraftStaleness = { stale: boolean; reason?: string }
 
-// The canonical acceptance-policy key the run was accepted under vs. the one
-// the desktop would enforce now. F1 made the acceptance policy the single
-// source of the goal (targetLevel/minLagOkPct/lagPolicyMonths) and the numeric
-// C/H/M/L limits; changing ANY of them invalidates the run (F4 acceptance:
-// High, lagMonths and exclusions must show up as stale, not only target/%).
-function acceptancePolicyKey(value: unknown): string {
-  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
-  const lagMonths = raw.lagPolicyMonths === 3 || raw.lagPolicyMonths === 6 || raw.lagPolicyMonths === 9 || raw.lagPolicyMonths === 12
-    ? raw.lagPolicyMonths
-    : undefined
-  const limit = (field: string): number | undefined => {
-    const parsed = Number(field in raw ? raw[field] : undefined)
-    return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : undefined
+// Numeric acceptance-policy dimensions are compared per-dimension and only
+// when the CURRENT policy communicates them: an absent current value is not
+// evidence of a change (older clients/tests send only level+percentage), while
+// a genuinely changed limit still invalidates the run (F4 acceptance: High,
+// lagMonths and exclusions must show up as stale, not only target/%).
+function policyDimensionValue(raw: unknown): number | undefined {
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : undefined
+}
+
+function acceptancePolicyLimitsDiffer(stored: Record<string, unknown>, current: Record<string, unknown>): boolean {
+  for (const dim of ['lagPolicyMonths', 'maxKnownHigh', 'maxKnownModerate', 'maxKnownLow']) {
+    const currentValue = policyDimensionValue(current[dim])
+    if (currentValue === undefined) continue
+    const storedValue = policyDimensionValue(stored[dim])
+    if (storedValue !== undefined && storedValue !== currentValue) return true
   }
-  return JSON.stringify({
-    targetLevel: raw.targetLevel === 'green' ? 'green' : 'yellow',
-    minLagOkPct: (() => {
-      const parsed = Number(raw.minLagOkPct)
-      return Number.isFinite(parsed) ? Math.max(0, Math.min(100, Math.trunc(parsed))) : undefined
-    })(),
-    ...(lagMonths !== undefined ? { lagPolicyMonths: lagMonths } : {}),
-    ...(limit('maxKnownHigh') !== undefined ? { maxKnownHigh: limit('maxKnownHigh') } : {}),
-    ...(limit('maxKnownModerate') !== undefined ? { maxKnownModerate: limit('maxKnownModerate') } : {}),
-    ...(limit('maxKnownLow') !== undefined ? { maxKnownLow: limit('maxKnownLow') } : {}),
-  })
+  return false
 }
 
 function storedPolicyFromSnapshot(stored: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
   if (!stored) return undefined
-  // F1: the planner pins the full policy in settings.acceptancePolicyJson.
+  const result: Record<string, unknown> = {}
+  // F1: the planner pins the full policy in settings.acceptancePolicyJson; it
+  // is the authoritative goal. G3: the TOP-LEVEL intentJson is a separate
+  // snapshot (policies: keep-current/required) that lives NEXT TO the
+  // acceptance policy -- returning only the acceptancePolicy object used to
+  // discard it, silently skipping the keep-current/required staleness check.
+  // Merge both so neither snapshot is lost.
   const acceptancePolicyJson = typeof stored.acceptancePolicyJson === 'string' ? stored.acceptancePolicyJson.trim() : ''
+  let parsedPolicy: Record<string, unknown> | undefined
   if (acceptancePolicyJson) {
     try {
       const parsed = JSON.parse(acceptancePolicyJson) as unknown
-      if (parsed && typeof parsed === 'object') return parsed as Record<string, unknown>
+      if (parsed && typeof parsed === 'object') parsedPolicy = parsed as Record<string, unknown>
     } catch {
       // unparseable snapshot: fall back to the flat fields below
     }
   }
-  return stored as Record<string, unknown>
+  if (parsedPolicy) Object.assign(result, parsedPolicy)
+  if (stored.intentJson !== undefined) result.intentJson = stored.intentJson
+  // Legacy manifests without an acceptancePolicyJson keep the flat fields.
+  if (result.targetLevel === undefined) Object.assign(result, stored)
+  return result
 }
 
 // A Draft is stale when it no longer describes the project as it is today:
@@ -196,7 +232,13 @@ export function draftResultStaleness(facts: DraftStalenessFacts): DraftStaleness
   if (recorded) {
     let current = ''
     try {
-      current = draftInputHashForProject(facts.projectPath)
+      // G3: when the manifest records the resolved input file list, re-hash
+      // exactly those files (project-relative and absolute) instead of the
+      // fixed relative set, so a nested project's root settings changes are
+      // detected. Legacy manifests without the list keep the fixed set.
+      current = facts.inputFiles && facts.inputFiles.length
+        ? draftInputHashFromFiles(facts.projectPath, facts.inputFiles)
+        : draftInputHashForProject(facts.projectPath)
     } catch {
       current = ''
     }
@@ -236,16 +278,18 @@ export function draftResultStaleness(facts: DraftStalenessFacts): DraftStaleness
     }
     // F4: the whole acceptance policy (lag months + numeric C/H/M/L limits) is
     // part of the staleness decision, not only the level and the percentage.
-    const storedPolicyKey = acceptancePolicyKey(stored)
-    const currentPolicyKey = acceptancePolicyKey(currentMerged)
-    const storedIntentKeyClean = storedIntentKey
+    // G1: the numeric dimensions are compared per-dimension and only when the
+    // CURRENT policy communicates them -- an absent current value is not
+    // evidence of a change (older clients/tests send only level+percentage), so
+    // a run that was accepted under the extended policy surface stays fresh for
+    // them while a genuinely changed limit still invalidates the run.
     if (storedTarget !== currentTarget || (Number.isFinite(storedPct) && storedPct !== currentPct)) {
       reasons.push('цель/процент актуальности изменились с момента генерации')
     }
-    if (storedPolicyKey !== currentPolicyKey) {
+    if (acceptancePolicyLimitsDiffer(stored, currentMerged)) {
       reasons.push('лимиты acceptance-политики (High/Moderate/Low/lag-месяцы) изменились с момента генерации')
     }
-    if (storedIntentKeyClean && storedIntentKeyClean !== baselinePoliciesKey(current.policies)) {
+    if (storedIntentKey && storedIntentKey !== baselinePoliciesKey(current.policies)) {
       reasons.push('политики keep-current/required изменились с момента генерации')
     }
   }
