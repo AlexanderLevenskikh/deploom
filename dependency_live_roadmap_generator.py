@@ -337,15 +337,18 @@ def _baseline_intent_policy(package: str) -> str:
 # BLOCK_VH3_USER_SCOPE_SEMANTICS
 def _apply_baseline_intent_scope(rows_by_project: Mapping[str, Sequence[DependencyRow]]) -> None:
     # "keep-current" is the persisted V-H wire value. Product semantics are
-    # explicit: keep the package current in the real graph, but remove it from
-    # this Baseline's update/health target. This is USER_POLICY, not evidence.
+    # explicit: keep the package at its current version for this Baseline, but
+    # do NOT drop it from the health score. Deferring an update (T3) must not
+    # silently hide an old or vulnerable dependency: keep-current rows stay in
+    # the health denominator and are only deferred from target planning. Only
+    # an explicit user/scope exclusion (with reason and size) removes rows from
+    # the health evaluation.
     for rows in rows_by_project.values():
         for row in rows:
             if _baseline_intent_policy(row.name) != "keep-current":
                 continue
-            row.scope_excluded = True
-            row.exclusion_reason = "исключено пользователем из текущего Baseline"
-            row.exclusion_source = "baseline-intent"
+            row.planner_deferred = True
+            row.planner_deferred_reason = "отложено пользователем: keep-current на текущей версии"
 
 
 def _baseline_env_nonnegative_int(name: str) -> int:
@@ -1069,6 +1072,16 @@ class ProjectHealth:
     green_projected_lag_ok: int = 0
     green_projected_lag_pct: float = 0.0
     green_plan_shortfall: int = 0
+    # T3: honest coverage breakdown — metadata (registry availability) and
+    # security (OSV assessment) are separate dimensions. Unknown is never
+    # treated as zero/healthy; an empty known denominator means "insufficient
+    # data", not 100%.
+    metadata_total: int = 0
+    metadata_known: int = 0
+    security_total: int = 0
+    security_known: int = 0
+    security_unknown: int = 0
+    insufficient_data: bool = False
 
 
 @dataclasses.dataclass
@@ -2198,6 +2211,10 @@ class LiveDataClient:
     def set_draft_run(self, run_id: str) -> None:
         self.run_id = run_id
         self.draft = True
+        # Base for elapsed in every [draft-progress] event (T7). Set here so the
+        # very first event already carries elapsed=0 and each following one a
+        # monotonic delta, independent of the renderer's local clock.
+        self._progress_started_monotonic = time.monotonic()
 
     def for_project(self, project: str) -> "LiveDataClient":
         self._progress_project = project
@@ -2216,6 +2233,14 @@ class LiveDataClient:
         if not self.draft:
             return
         try:
+            started = getattr(self, "_progress_started_monotonic", None)
+            # A measurable slice becomes a percentage only for the work it
+            # measures; it must never claim 100% before the finalize step has
+            # actually published (status present => terminal, may be 100).
+            pct: Optional[int] = None
+            if isinstance(completed, (int, float)) and isinstance(total, (int, float)) and total > 0:
+                raw = completed / total
+                pct = int(round(raw * 100)) if status is not None else min(99, int(round(raw * 100)))
             payload = {
                 "runId": self.run_id or "",
                 "project": getattr(self, "_progress_project", None),
@@ -2226,27 +2251,73 @@ class LiveDataClient:
                 "completed": completed,
                 "total": total,
                 "status": status,
+                "elapsedSec": (time.monotonic() - started) if started else None,
+                "budgetRemainingSec": self.deadline.remaining if self.deadline is not None else None,
+                "pct": pct,
             }
             print(f"[draft-progress] {json.dumps(payload, ensure_ascii=False)}", flush=True)
         except Exception:
             pass
 
-    def _budgeted_timeout(self) -> int:
-        """Effective per-request timeout honouring the run deadline.
+    def _budgeted_timeout(self) -> Union[int, Tuple[float, float]]:
+        """Effective per-request timeout honouring the run deadline (T4).
 
-        Returns a whole-second bound no larger than the remaining budget so a
-        single request cannot outlive the Draft run; raises DraftBudgetExceeded
-        once the budget is already exhausted before the request starts.
+        Returns a fractional (connect, read) bound that never exceeds the
+        remaining budget *minus* the finalization reserve, so a single request
+        cannot outlive the Draft run or eat the publication slice. Sub-second
+        remainders are preserved (no floor-to-1s). Once the budget (or its
+        reserve) is already exhausted the run fails fast with
+        DraftBudgetExceeded instead of waiting out a full TCP timeout.
         """
         if self.deadline is None:
             return self.timeout
-        self.deadline.check("network")
+        self.deadline.check_with_reserve("network")
         remaining = self.deadline.remaining
         if remaining is None:
             return self.timeout
-        if remaining <= 0:
+        budget = max(0.0, remaining - DRAFT_FINALIZE_RESERVE_SECONDS)
+        if budget <= DRAFT_MIN_NET_BUDGET_SECONDS:
             raise DraftBudgetExceeded("network")
-        return max(1, min(int(remaining), self.timeout))
+        read = min(float(self.timeout), budget)
+        connect = min(2.0, float(self.timeout), max(0.2, budget))
+        return (connect, max(DRAFT_MIN_NET_BUDGET_SECONDS, read))
+
+    def _bounded_sleep(self, delay: float) -> None:
+        """Sleep without letting a retry/rate-limit pause outlive the budget."""
+        if self.deadline is None or delay <= 0:
+            time.sleep(max(0.0, delay))
+            return
+        remaining = self.deadline.remaining
+        if remaining is None:
+            time.sleep(delay)
+            return
+        if remaining <= DRAFT_FINALIZE_RESERVE_SECONDS:
+            raise DraftBudgetExceeded("network-retry")
+        time.sleep(min(delay, max(0.0, remaining - DRAFT_FINALIZE_RESERVE_SECONDS)))
+        self.deadline.check("network-retry")
+
+    def _deadline_bounded_read(self, response) -> bytes:
+        """Read a response body fully, aborting as soon as the remaining budget
+        is exhausted (T4). requests' read timeout is not an absolute bound on
+        total transfer time (a slow trickle can extend a request), and
+        iter_content with a large chunk buffers partial reads until the chunk
+        fills or EOF — so the deadline check must run on every socket read.
+        """
+        if self.deadline is None:
+            return response.content
+        chunks: List[bytes] = []
+        for chunk in response.iter_content(chunk_size=1):
+            self.deadline.check_with_reserve("network-read")
+            if chunk:
+                chunks.append(chunk)
+        self.deadline.check_with_reserve("network-read")
+        return b"".join(chunks)
+
+    def _bounded_json(self, response) -> Any:
+        return json.loads(self._deadline_bounded_read(response).decode("utf-8", errors="replace"))
+
+    def _bounded_text(self, response) -> str:
+        return self._deadline_bounded_read(response).decode("utf-8", errors="replace")
 
     @staticmethod
     def _origin_tuple(url: str) -> Tuple[str, str, int]:
@@ -2377,7 +2448,7 @@ class LiveDataClient:
                 response.close()
 
         self.registry_artifact_cache[key] = evidence
-        time.sleep(self.sleep_sec)
+        self._bounded_sleep(self.sleep_sec)
         return dict(evidence)
 
     def registry_version_is_installable(self, pkg: str, meta: Dict[str, Any], version: str) -> bool:
@@ -2479,19 +2550,20 @@ class LiveDataClient:
         for attempt in range(1, REGISTRY_METADATA_MAX_ATTEMPTS + 1):
             try:
                 self.progress(operation="registry metadata", package=pkg, retry=attempt - 1, step="scan")
-                response = self.session.get(url, timeout=self._budgeted_timeout())
+                response = self.session.get(url, timeout=self._budgeted_timeout(), stream=True)
                 status = int(getattr(response, "status_code", 0) or 0)
                 if status == 404:
                     # A real 404 is a deterministic registry fact. Unlike a
                     # timeout/5xx it is safe to memoize as package absence.
+                    response.close()
                     self.npm_cache[pkg] = None
                     return None
                 response.raise_for_status()
-                data = response.json()
+                data = self._bounded_json(response)
                 if not isinstance(data, dict):
                     raise ValueError("registry metadata response is not a JSON object")
                 self.npm_cache[pkg] = data
-                time.sleep(self.sleep_sec)
+                self._bounded_sleep(self.sleep_sec)
                 return data
             except DraftBudgetExceeded:
                 raise
@@ -2518,7 +2590,7 @@ class LiveDataClient:
                     f"[warn] npm metadata transient failure for {pkg}; "
                     f"retry {attempt}/{REGISTRY_METADATA_MAX_ATTEMPTS}: {last_error}"
                 )
-                time.sleep(delay)
+                self._bounded_sleep(delay)
 
         raise RegistryInfrastructureError(
             f"REGISTRY_METADATA_UNAVAILABLE: {pkg}: "
@@ -2548,9 +2620,9 @@ class LiveDataClient:
                 for v in batch
             ]}
             try:
-                r = self.session.post(OSV_QUERY_BATCH, json=payload, timeout=self._budgeted_timeout())
+                r = self.session.post(OSV_QUERY_BATCH, json=payload, timeout=self._budgeted_timeout(), stream=True)
                 r.raise_for_status()
-                data = r.json().get("results", [])
+                data = self._bounded_json(r).get("results", [])
                 for v, item in zip(batch, data):
                     details: List[Dict[str, Any]] = []
                     for ref in item.get("vulns", []) or []:
@@ -2558,7 +2630,7 @@ class LiveDataClient:
                         if vuln_id:
                             details.append(self.fetch_osv_vuln(vuln_id))
                     self.osv_cache[(pkg, v)] = details
-                time.sleep(self.sleep_sec)
+                self._bounded_sleep(self.sleep_sec)
             except DraftBudgetExceeded:
                 raise
             except VulnerabilityEvidenceUnavailable:
@@ -2583,13 +2655,13 @@ class LiveDataClient:
             return self.vuln_detail_cache[vuln_id]
         self.progress(operation="OSV detail", package=vuln_id, step="scan")
         try:
-            r = self.session.get(OSV_VULN.format(id=vuln_id), timeout=self._budgeted_timeout())
+            r = self.session.get(OSV_VULN.format(id=vuln_id), timeout=self._budgeted_timeout(), stream=True)
             r.raise_for_status()
-            data = r.json()
+            data = self._bounded_json(r)
             if not isinstance(data, dict):
                 raise ValueError("OSV vulnerability detail is not an object")
             self.vuln_detail_cache[vuln_id] = data
-            time.sleep(self.sleep_sec)
+            self._bounded_sleep(self.sleep_sec)
             return data
         except DraftBudgetExceeded:
             raise
@@ -2608,11 +2680,11 @@ class LiveDataClient:
             token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
             if token and "github" in url:
                 headers["Authorization"] = f"Bearer {token}"
-            response = self.session.get(url, timeout=self._budgeted_timeout(), headers=headers)
+            response = self.session.get(url, timeout=self._budgeted_timeout(), headers=headers, stream=True)
             response.raise_for_status()
-            text = response.text
+            text = self._bounded_text(response)
             self.text_cache[url] = text
-            time.sleep(self.sleep_sec)
+            self._bounded_sleep(self.sleep_sec)
             return text
         except DraftBudgetExceeded:
             raise
@@ -2631,11 +2703,11 @@ class LiveDataClient:
             token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
             if token and "api.github.com" in url:
                 headers["Authorization"] = f"Bearer {token}"
-            response = self.session.get(url, timeout=self._budgeted_timeout(), headers=headers)
+            response = self.session.get(url, timeout=self._budgeted_timeout(), headers=headers, stream=True)
             response.raise_for_status()
-            data = response.json()
+            data = self._bounded_json(response)
             self.json_cache[url] = data
-            time.sleep(self.sleep_sec)
+            self._bounded_sleep(self.sleep_sec)
             return data
         except DraftBudgetExceeded:
             raise
@@ -2659,6 +2731,8 @@ class LiveDataClient:
             chunks: List[bytes] = []
             total = 0
             for chunk in response.iter_content(chunk_size=64 * 1024):
+                if self.deadline is not None:
+                    self.deadline.check("network-read")
                 if not chunk:
                     continue
                 total += len(chunk)
@@ -2667,7 +2741,7 @@ class LiveDataClient:
                 chunks.append(chunk)
             data = b"".join(chunks)
             self.bytes_cache[url] = data
-            time.sleep(self.sleep_sec)
+            self._bounded_sleep(self.sleep_sec)
             return data
         except Exception as exc:
             if not quiet:
@@ -4848,11 +4922,16 @@ def health_yellow_ratio() -> Tuple[int, int]:
 
 
 def health_green_ratio() -> Tuple[int, int]:
-    """Stricter green closure goal: ten points above the user's yellow gate."""
-    pct = max(0, min(100, int(EFFECTIVE_MIN_LAG_OK_PCT) + 10))
-    if pct >= 100:
-        return (1, 1)
-    return (pct, 100)
+    """Green closure goal: 100% of the explicitly shown freshness criterion.
+
+    The product preset is "Green = every library matches its own lag policy;
+    Critical=0, High=0" (T2). `compute_project_health` already requires
+    lag_bad == 0 (100%) for a green status, so projecting anything less (e.g.
+    the legacy pct+10) would make the green label unreachable or the plan
+    weaker than the status it claims to reach. 100% keeps the projection and
+    the status criterion identical.
+    """
+    return (1, 1)
 
 
 def health_planning_ratio() -> Tuple[int, int]:
@@ -5283,7 +5362,11 @@ def compute_project_health(
     total = len(lag_known_rows) + removed_closed
     lag_ok = sum(1 for r in lag_known_rows if dependency_is_lag_ok(r)) + removed_closed
     lag_bad = total - lag_ok
-    lag_pct = (lag_ok / total * 100.0) if total else 100.0
+    # T3: a zero known denominator is "insufficient data", never 100% of the
+    # scope. When every dependency lacks a lag target the project cannot claim
+    # compliance; the honest number is 0% coverage with a visible reason.
+    insufficient_data = total == 0 and lag_unknown > 0
+    lag_pct = (lag_ok / total * 100.0) if total else (0.0 if insufficient_data else 100.0)
     # -(-a // b) is integer ceil: the smallest lag_ok that still satisfies
     # lag_ok / total >= minLagOkPct without float rounding surprises at the
     # boundary. The gate follows the user's effective policy (R9), so changing
@@ -5331,12 +5414,12 @@ def compute_project_health(
             totals[k] += counts.get(k, 0)
     # An unavailable OSV source is NOT a finding of zero vulnerabilities. Count
     # rows whose vuln state is genuinely unknown so the plan/prompt show honest
-    # coverage instead of implying "no vulnerabilities" (R3).
-    vuln_unknown_rows = sum(
-        1
-        for r in active_rows
-        if str(r.current_vulns or "").strip().lower() in ("unknown", "неизвестно", "—", "registry unavailable", "not assessed")
-    )
+    # coverage instead of implying "no vulnerabilities" (R3/T3).
+    vuln_unknown_rows = sum(1 for r in active_rows if not _row_security_known(r))
+    security_total = len(active_rows)
+    security_known = security_total - vuln_unknown_rows
+    metadata_total = len(active_rows)
+    metadata_known = sum(1 for r in active_rows if _row_metadata_known(r))
 
     critical = totals["C"]
     high = totals["H"]
@@ -5350,19 +5433,25 @@ def compute_project_health(
         if excluded_rows:
             reason += f"; полностью исключено из расчёта: {len(excluded_rows)}"
     elif total == 0:
-        status = "yellow" if lag_unknown else "green"
-        reason = f"lag-policy target неизвестен для {lag_unknown} зависимостей" if lag_unknown else "нет зависимостей в активном scope"
+        if lag_unknown:
+            status = "yellow"
+            reason = f"недостаточно данных: lag-критерий неизвестен для {lag_unknown} зависимостей"
+        else:
+            status = "green"
+            reason = "нет зависимостей в активном scope"
     elif lag_pct < float(EFFECTIVE_MIN_LAG_OK_PCT):
         status = "red"
         reason = f"только {lag_pct:.1f}% библиотек соблюдают свою lag-policy (<{EFFECTIVE_MIN_LAG_OK_PCT}%)"
-    elif lag_bad == 0 and lag_unknown == 0 and critical == 0 and high == 0 and (moderate + low) <= 20:
+    elif lag_bad == 0 and lag_unknown == 0 and critical == 0 and high == 0 and unknown == 0 and (moderate + low) <= 20:
         status = "green"
-        reason = "0 нарушений lag-policy, 0 C/H, Low+Moderate ≤20"
+        reason = "0 нарушений lag-policy, 0 C/H, нет неизвестной security, Low+Moderate ≤20"
     else:
         status = "yellow"
         parts = [f"{lag_pct:.1f}% библиотек соблюдают lag-policy", "0 Critical"]
         if lag_unknown:
             parts.append(f"lag-policy target неизвестен: {lag_unknown}")
+        if unknown:
+            parts.append(f"security неизвестна: {vuln_unknown_rows}")
         if high:
             parts.append(f"High остаются: {high}")
         if moderate or low:
@@ -5398,6 +5487,12 @@ def compute_project_health(
         green_projected_lag_ok=green_projected_lag_ok,
         green_projected_lag_pct=green_projected_lag_pct,
         green_plan_shortfall=green_plan_shortfall,
+        metadata_total=metadata_total,
+        metadata_known=metadata_known,
+        security_total=security_total,
+        security_known=security_known,
+        security_unknown=vuln_unknown_rows,
+        insufficient_data=insufficient_data,
     )
 
 
@@ -20716,6 +20811,15 @@ class DraftBudgetExceeded(Exception):
         self.phase = phase
 
 
+# T4: publication reserve. Network/planning work must stop with at least this
+# much of the deadline left so the run can finalize and publish the manifest
+# instead of being starved between "0 remaining" and the artifact write.
+DRAFT_FINALIZE_RESERVE_SECONDS = float(os.environ.get("DEPLOOM_DRAFT_FINALIZE_RESERVE_SECONDS") or "1.0")
+# Minimum effective per-read budget a network call may get before the run is
+# considered out of time (fractional remainders, not floor+1s).
+DRAFT_MIN_NET_BUDGET_SECONDS = 0.05
+
+
 class DeadlineClock:
     """Single monotonic deadline for a run.
 
@@ -20738,6 +20842,13 @@ class DeadlineClock:
         if self.remaining is not None and self.remaining <= 0:
             raise DraftBudgetExceeded(phase)
 
+    def check_with_reserve(self, phase: str) -> None:
+        """Fail once even the finalization reserve is gone, so heavy work stops
+        before it can consume the publication slice (T4)."""
+        if self.deadline_seconds is not None:
+            if self.remaining <= DRAFT_FINALIZE_RESERVE_SECONDS:
+                raise DraftBudgetExceeded(phase)
+
     def as_dict(self) -> Dict[str, Any]:
         return {
             "deadlineSeconds": self.deadline_seconds,
@@ -20747,6 +20858,21 @@ class DeadlineClock:
 
 def stable_sha256_text(payload: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def stable_sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _row_security_known(row: DependencyRow) -> bool:
+    """A row's vulnerability state is assessed only when current_vulns carries
+    a concrete finding or an explicit zero. Anything that means "we did not get
+    OSV data" is unknown; an unknown is never a finding of zero (T3)."""
+    value = str(row.current_vulns or "").strip().lower()
+    if value in ("", "—"):
+        return False
+    unknown_markers = ("unknown", "неизвестно", "not assessed", "registry unavailable", "недоступн", "unavailable")
+    return not any(marker in value for marker in unknown_markers)
 
 
 def _row_metadata_known(row: DependencyRow) -> bool:
@@ -20820,20 +20946,32 @@ def draft_input_hash(project: ProjectSpec) -> str:
 def _draft_target_for_major(row: DependencyRow) -> str:
     """Choose the single 'selected variant' target for a Draft row.
 
-    Draft builds one chosen variant. We use the planner's default target as
-    the stable handoff contract (it is what the existing Dashboard exports as
-    "до какой обновить по умолчанию") and keep yellow/green as documented
-    alternatives; rows with no reliable metadata never get an invented version.
+    Draft builds one chosen variant. The chosen level is the effective target
+    policy (DEPLOOM_BASELINE_TARGET_LEVEL / --target-level), not the status
+    inferred default: a green run must hand the executor a green plan, and a
+    yellow run the yellow plan, or the label and the plan diverge (T2). The
+    planner's default target remains the stable handoff fallback for rows the
+    chosen level did not plan (e.g. green-only/major-only scenarios); rows with
+    no reliable metadata never get an invented version.
     """
     if row.scope_excluded:
         return NO_ACTION
     if row.planner_deferred:
         return NO_ACTION
+    effective_level = str(EFFECTIVE_TARGET_LEVEL or "yellow").strip().lower()
+    if effective_level == "green":
+        green = row.target_green
+        if green and green != NO_ACTION:
+            return green
+    else:
+        yellow = row.target_yellow
+        if yellow and yellow != NO_ACTION:
+            return yellow
     default = row.target_default
     if default and default != NO_ACTION:
         return default
-    yellow = row.target_yellow
-    return yellow if yellow and yellow != NO_ACTION else NO_ACTION
+    fallback = row.target_green if effective_level == "yellow" else row.target_yellow
+    return fallback if fallback and fallback != NO_ACTION else NO_ACTION
 
 
 def _draft_row_status(row: DependencyRow, chosen_target: str) -> str:
@@ -20867,7 +21005,7 @@ def build_draft_plan(
     conflicts: List[Dict[str, Any]] = []
     manifests: Dict[str, Any] = {}
     projects: List[str] = sorted(rows_by_project)
-    totals = {"proposed": 0, "no-change": 0, "deferred": 0, "excluded": 0, "unknown-metadata": 0, "no-target": 0, "total": 0}
+    totals = {"proposed": 0, "no-change": 0, "deferred": 0, "excluded": 0, "unknown-metadata": 0, "unknown-security": 0, "no-target": 0, "total": 0}
     for project in projects:
         rows = rows_by_project[project]
         spec = projects_by_name.get(project)
@@ -20897,14 +21035,31 @@ def build_draft_plan(
                 entry["conflict"] = row.compatibility_note or row.compatibility_cohort
                 conflicts.append({"package": row.name, "project": project, "note": row.compatibility_note or row.compatibility_cohort, "cohort": row.compatibility_cohort})
             plan_rows.append(entry)
-            if status == "unknown-metadata" or not _row_metadata_known(row):
+            meta_unknown = not _row_metadata_known(row)
+            sec_unknown = not _row_security_known(row)
+            # "unknown-metadata" is already counted via the row status above
+            # (status == "unknown-metadata"); only the security dimension needs
+            # its own independent counter (T3).
+            if sec_unknown:
+                totals["unknown-security"] = totals.get("unknown-security", 0) + 1
+            if meta_unknown or sec_unknown:
+                # T3: metadata (registry availability) and security (OSV) are
+                # separate unknown classes; an unassessed OSV state must reach
+                # the plan/summary/prompt even when the registry metadata is
+                # fine, and vice versa.
+                causes = []
+                if meta_unknown:
+                    causes.append("registry metadata unavailable for this package in this Draft run")
+                if sec_unknown:
+                    causes.append("OSV/security state unknown for this package in this Draft run")
                 unknowns.append({
                     "package": row.name,
                     "project": project,
                     "kind": row.kind,
                     "requestedSpec": row.requested_spec,
                     "current": row.current_version,
-                    "reason": "registry metadata unavailable for this package in this Draft run",
+                    "clarity": "security" if sec_unknown and not meta_unknown else ("metadata" if meta_unknown and not sec_unknown else "both"),
+                    "reason": "; ".join(causes),
                 })
         if spec:
             manifests[project] = {
@@ -21001,10 +21156,14 @@ def build_draft_prompt(
             lag_known = int(health.get("total", 0) or 0)
             lag_unknown = int(health.get("lag_unknown", 0) or 0)
             vuln_unknown = int(health.get("unknown", 0) or 0)
+            metadata_known = int(health.get("metadata_known", 0) or 0)
+            metadata_total = int(health.get("metadata_total", 0) or 0)
             known_lag_total = lag_known + lag_unknown
             if lag_unknown or lag_known == 0:
                 coverage = (lag_known / known_lag_total * 100.0) if known_lag_total else 0.0
                 lag_part = f"Lag OK: {lag_ok}/{max(lag_known, 1)} известных, {lag_unknown} без lag-данных (покрытие {coverage:.0f}%)"
+                if known_lag_total == 0:
+                    lag_part += " — недостаточно данных"
             else:
                 lag_part = f"Lag OK: {health.get('lag_ok_pct', '?')}% ({lag_ok}/{lag_known})"
             vuln_part = (
@@ -21013,6 +21172,7 @@ def build_draft_prompt(
             )
             lines += [
                 f"- {lag_part}, {vuln_part}.",
+                f"- metadata coverage: {metadata_known}/{metadata_total} известных; security coverage: {health.get('security_known', '?')}/{health.get('security_total', '?')} оценённых OSV.",
                 f"- Причина статуса: {health.get('reason', '—')}.",
                 "",
                 "## Что требуется изменить (proposed)",
@@ -21136,7 +21296,12 @@ def build_draft_prompt(
 def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(content, encoding="utf-8")
+    # Explicit LF (newline="\n"): the bytes on disk must be exactly content
+    # encoded as UTF-8 on every platform. The Electron reader hashes raw file
+    # bytes, so Path.write_text's default newline translation (CRLF on
+    # Windows) used to break the plan/prompt hashes for natively produced
+    # Drafts (T1).
+    temporary.write_text(content, encoding="utf-8", newline="\n")
     temporary.replace(path)
 
 
@@ -21154,6 +21319,7 @@ def publish_draft_result(
     deadline: DeadlineClock,
     settings_snapshot: Optional[Dict[str, Any]] = None,
     language: str = "ru",
+    input_hashes: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Publish the Draft result set atomically and return its manifest.
 
@@ -21167,22 +21333,37 @@ def publish_draft_result(
     prompt_md = build_draft_prompt(run_id, workspace_id, project_id, mode, policy_hash, plan, projects_by_name, language=language, snapshot=snapshot)
     counts = plan["counts"]
     proposed = counts.get("proposed", 0)
-    # unknown-metadata and the unknowns list are derived from the same rows;
-    # count unique packages once to avoid double counting.
+    # unknown-metadata, unknown-security and the unknowns list are derived from
+    # the same rows; count unique packages once to avoid double counting.
     unknown_names = {str(u.get("package", "")).strip() for u in (plan.get("unknowns") or []) if str(u.get("package", "")).strip()}
-    if unknown_names:
-        unknown_count = len(unknown_names)
-    else:
-        unknown_count = counts.get("unknown-metadata", 0)
+    unknown_count = len(unknown_names) if unknown_names else counts.get("unknown-metadata", 0) + counts.get("unknown-security", 0)
+    security_unknown_count = counts.get("unknown-security", 0)
+    # Aggregate coverage across projects so the manifest carries an honest
+    # metadata/security coverage split (T3), not just per-project health.
+    proposal_healths = [(p.get("health") or {}) for p in (plan.get("proposals") or [])]
+
+    def _sum_health(key: str) -> int:
+        return sum(int(h.get(key, 0) or 0) for h in proposal_healths)
+
+    metadata_known = _sum_health("metadata_known")
+    metadata_total = _sum_health("metadata_total")
+    security_known = _sum_health("security_known")
+    security_total = _sum_health("security_total")
+    insufficient_data = any(bool(h.get("insufficient_data")) for h in proposal_healths)
     if status == "DRAFT_READY":
         summary = (
             f"Черновой план готов: предложено {proposed} обновлений; "
-            f"для {unknown_count} пакетов нужно уточнение."
+            f"для {unknown_count} пакетов нужно уточнение"
+            + (f" (security неизвестна: {security_unknown_count})" if security_unknown_count else "")
+            + ("; недостаточно данных по lag-policy" if insufficient_data else "")
+            + "."
         )
     else:
         summary = (
             f"Черновой план частичный: предложено {proposed} обновлений; "
-            f"для {unknown_count} пакетов нужно уточнение. {partial_reason or 'Частичный результат по deadline/ошибке.'}"
+            f"для {unknown_count} пакетов нужно уточнение"
+            + (f" (security неизвестна: {security_unknown_count})" if security_unknown_count else "")
+            + (f". {partial_reason or 'Частичный результат по deadline/ошибке.'}")
         )
 
     run_dir = next((p for p in (artifacts_dir_for_draft() or [])), None)
@@ -21223,13 +21404,21 @@ def publish_draft_result(
             "total": counts.get("total", 0),
             "unknown": unknown_count,
             "unknownPackages": [u["package"] for u in (plan.get("unknowns") or [])],
+            # T3: metadata (registry) and security (OSV) coverage split.
+            "metadataKnown": metadata_known,
+            "metadataTotal": metadata_total,
+            "securityKnown": security_known,
+            "securityTotal": security_total,
+            "securityUnknown": security_unknown_count,
+            "insufficientData": insufficient_data,
         },
         "proposals": {
             "proposed": counts.get("proposed", 0),
             "noChange": counts.get("no-change", 0),
             "deferred": counts.get("deferred", 0),
             "excluded": counts.get("excluded", 0),
-            "unknown": counts.get("unknown-metadata", 0),
+            "unknown": unknown_count,
+            "unknownSecurity": security_unknown_count,
             "total": counts.get("total", 0),
         },
         "summary": summary,
@@ -21241,10 +21430,13 @@ def publish_draft_result(
             "summary": str(summary_md_path),
         },
         "hashes": {
-            "plan": stable_sha256_text(plan_json_path.read_text(encoding="utf-8")),
-            "prompt": stable_sha256_text(prompt_md),
+            # Hash the exact bytes on disk (LF, UTF-8, no BOM). The Electron
+            # reader computes the same raw-byte SHA-256, so a natively produced
+            # Windows Draft is accepted by the production reader (T1).
+            "plan": stable_sha256_bytes(plan_json_path.read_bytes()),
+            "prompt": stable_sha256_bytes(prompt_md_path.read_bytes()),
         },
-        "inputHashes": {
+        "inputHashes": input_hashes if input_hashes is not None else {
             spec.name: draft_input_hash(spec) for spec in projects_by_name.values()
         },
         "projects": plan.get("projects", []),
@@ -21346,6 +21538,7 @@ def _publish_draft_and_exit(
     deadline_clock: DeadlineClock,
     status: str,
     partial_reason: str,
+    input_hashes: Optional[Dict[str, str]] = None,
 ) -> None:
     """Publish whatever Draft data was gathered before an abort and exit 0.
 
@@ -21371,6 +21564,7 @@ def _publish_draft_and_exit(
         status=status,
         partial_reason=partial_reason,
         deadline=deadline_clock,
+        input_hashes=input_hashes,
     )
     eprint(f"[done] Draft partial result published: {manifest['summary']}")
     eprint(f"[info] Draft manifest: {manifest['artifacts']['manifest']}")
@@ -21893,19 +22087,29 @@ def main() -> None:
     else:
         eprint("[info] analysis mode: current checkout compared with the saved baseline; the project-manager lockfile is refreshed before analysis")
     generation_started = time.perf_counter()
+    draft_input_hashes: Dict[str, str] = {}
     try:
-        for i, project in enumerate(projects, start=1):
-            project_prefix = f"[{i}/{len(projects)}]"
-            if args.draft_baseline:
-                # R2: the local manifest+lockfile inventory is gathered before
-                # any deadline-sensitive work, so an early expiry still
-                # publishes the complete local dependency list with honest
-                # unknown metadata instead of an empty plan.
+        if args.draft_baseline:
+            # T4: gather the local manifest+lockfile inventory for EVERY
+            # selected project BEFORE the first deadline-sensitive network scan.
+            # If the run expires on project #1, the partial result still carries
+            # the complete local dependency list of all projects (honest unknown
+            # metadata) instead of leaving later projects empty.
+            for i, project in enumerate(projects, start=1):
                 rows_by_project[project.name] = _draft_local_inventory_rows(project, overrides)
+                # T5: fix the input identity at the moment the files were read,
+                # before any network enrichment. Hashing at publication could
+                # pin a file that changed during the run, attributing the plan
+                # to inputs it was not derived from.
+                draft_input_hashes[project.name] = draft_input_hash(project)
                 client.for_project(project.name)
                 _draft_progress(client, operation="local inventory", package=project.name, step="inventory", completed=i, total=len(projects))
+        for i, project in enumerate(projects, start=1):
+            project_prefix = f"[{i}/{len(projects)}]"
             deadline_clock.check(f"project-scan:{project.name}")
             eprint(f"[info] {project_prefix} {project.name}: {project.path}")
+            client.for_project(project.name)
+            _draft_progress(client, operation="dependency scan", package=project.name, step="scan", completed=i - 1, total=len(projects))
             enriched = analyze_project(
                 project,
                 client,
@@ -21919,6 +22123,7 @@ def main() -> None:
             # dependency set enriched with registry/OSV evidence; on an
             # in-scan deadline the inventory rows stay published as-is.
             rows_by_project[project.name] = enriched
+            _draft_progress(client, operation="dependency scan", package=project.name, step="scan", completed=i, total=len(projects))
             eprint(
                 f"[info] {project_prefix} {project.name}: project dependency scan complete; "
                 f"rows={len(rows_by_project[project.name])}"
@@ -21938,6 +22143,7 @@ def main() -> None:
             deadline_clock=deadline_clock,
             status="DRAFT_PARTIAL",
             partial_reason=f"Draft deadline ({deadline_clock.deadline_seconds}s) exceeded at {budget_exc.phase}; metadata may be incomplete.",
+            input_hashes=draft_input_hashes,
         )
 
     baselines_dir = history_dir / "baselines"
@@ -22097,6 +22303,7 @@ def main() -> None:
                 status="DRAFT_READY",
                 partial_reason=None,
                 deadline=deadline_clock,
+                input_hashes=draft_input_hashes,
             )
         except DraftBudgetExceeded as budget_exc:
             eprint(f"[info] Draft deadline exceeded at finalization: {budget_exc.phase}")

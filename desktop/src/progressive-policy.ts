@@ -3,6 +3,10 @@ export type AcceptancePolicy = {
   maxKnownCritical: number
   /** Maximum number of vulnerable package names with High severity. */
   maxKnownHigh: number
+  /** Goal level (T2): part of the acceptance policy, enforced together with
+   * minLagOkPct against the audit's lag compliance when the audit carries it. */
+  targetLevel?: 'yellow' | 'green'
+  minLagOkPct?: number
 }
 
 export type AcceptanceAuditEvidence = {
@@ -31,6 +35,8 @@ export type AcceptanceVerdict = {
 export const DEFAULT_ACCEPTANCE_POLICY: AcceptancePolicy = Object.freeze({
   maxKnownCritical: 0,
   maxKnownHigh: 1,
+  targetLevel: 'yellow',
+  minLagOkPct: 80,
 })
 
 export const MAX_ACCEPTANCE_AUDIT_AGE_MS = 24 * 60 * 60 * 1000
@@ -43,9 +49,15 @@ function boundedCount(value: unknown, fallback: number): number {
 }
 
 export function normalizeAcceptancePolicy(value: Partial<AcceptancePolicy> | undefined): AcceptancePolicy {
+  const rawLagPct = Number(value?.minLagOkPct)
   return {
     maxKnownCritical: 0,
     maxKnownHigh: boundedCount(value?.maxKnownHigh, DEFAULT_ACCEPTANCE_POLICY.maxKnownHigh),
+    targetLevel: value?.targetLevel === 'green' ? 'green' : 'yellow',
+    // 0 is a legitimate goal (no slack at the gate), so Number.isFinite, not `|| 80`.
+    ...(value?.minLagOkPct !== undefined && value?.minLagOkPct !== null && Number.isFinite(rawLagPct)
+      ? { minLagOkPct: Math.max(0, Math.min(100, Math.trunc(rawLagPct))) }
+      : {}),
   }
 }
 

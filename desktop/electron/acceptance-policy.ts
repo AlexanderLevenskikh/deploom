@@ -5,6 +5,10 @@ import { join } from 'node:path'
 export type AcceptancePolicy = {
   maxKnownCritical: number
   maxKnownHigh: number
+  // T2: the goal criteria are part of the acceptance policy too, so a release
+  // gate that claims "green / 100%" actually knows the goal it is enforcing.
+  targetLevel?: 'yellow' | 'green'
+  minLagOkPct?: number
 }
 
 export type AcceptanceVerdict = {
@@ -18,11 +22,17 @@ export type AcceptanceVerdict = {
   highPackages: string[]
   auditGeneratedAt?: string
   auditEngine?: string
+  lagOkPct?: number
   reasons: string[]
   policy: AcceptancePolicy
 }
 
-export const DEFAULT_ACCEPTANCE_POLICY: AcceptancePolicy = Object.freeze({ maxKnownCritical: 0, maxKnownHigh: 1 })
+export const DEFAULT_ACCEPTANCE_POLICY: AcceptancePolicy = Object.freeze({
+  maxKnownCritical: 0,
+  maxKnownHigh: 1,
+  targetLevel: 'yellow',
+  minLagOkPct: 80,
+})
 // BLOCK_ACCEPTANCE_POLICY_CLOSURE_V1
 export const MAX_ACCEPTANCE_AUDIT_AGE_MS = 24 * 60 * 60 * 1000
 export const MAX_ACCEPTANCE_AUDIT_FUTURE_SKEW_MS = 5 * 60 * 1000
@@ -58,11 +68,18 @@ function boundedCount(value: unknown, fallback: number): number {
 
 export function normalizeAcceptancePolicy(value: unknown): AcceptancePolicy {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  const rawLagPct = Number(raw.minLagOkPct)
   return {
     // Critical is a product safety invariant, not a user-tunable tolerance.
     // Persisted legacy values are intentionally ignored.
     maxKnownCritical: 0,
     maxKnownHigh: boundedCount(raw.maxKnownHigh, DEFAULT_ACCEPTANCE_POLICY.maxKnownHigh),
+    targetLevel: raw.targetLevel === 'green' ? 'green' : 'yellow',
+    // 0 is a legitimate user goal, hence Number.isFinite (not `|| 80`): a
+    // zero lag gate must not be silently coerced back to the default.
+    ...(raw.minLagOkPct !== undefined && raw.minLagOkPct !== null && Number.isFinite(rawLagPct)
+      ? { minLagOkPct: Math.max(0, Math.min(100, Math.trunc(rawLagPct))) }
+      : {}),
   }
 }
 
@@ -90,6 +107,16 @@ export function acceptanceVerdictFromManualAudit(
   const packageTotals = audit.packageTotals && typeof audit.packageTotals === 'object' ? audit.packageTotals as Record<string, unknown> : {}
   const critical = count(packageTotals.critical)
   const high = count(packageTotals.high)
+  // T2: the audit payload may carry the lag-policy compliance share. When
+  // present it is checked against the goal criteria (minLagOkPct; green means
+  // 100%). A report that does not carry the field simply cannot prove the
+  // freshness criterion, so no score is fabricated.
+  const auditLagOkPct = typeof audit.lagOkPct === 'number' && Number.isFinite(audit.lagOkPct)
+    ? Math.max(0, Math.min(100, audit.lagOkPct))
+    : typeof audit.compliancePct === 'number' && Number.isFinite(audit.compliancePct)
+      ? Math.max(0, Math.min(100, audit.compliancePct))
+      : undefined
+  const goalLagFloor = policy.targetLevel === 'green' ? 100 : (policy.minLagOkPct ?? 80)
   const reportInputHash = typeof report.dependencyInputHash === 'string' ? report.dependencyInputHash.trim() : ''
   const auditComplete = report.auditComplete === true && audit.complete === true
   const auditAuthorityStrong = auditComplete && authoritativeAuditEvidence(audit)
@@ -123,6 +150,14 @@ export function acceptanceVerdictFromManualAudit(
   else if (auditGeneratedAtMs > nowMs + MAX_ACCEPTANCE_AUDIT_FUTURE_SKEW_MS) reasons.push('Audit report timestamp is too far in the future.')
   else if (nowMs - auditGeneratedAtMs > MAX_ACCEPTANCE_AUDIT_AGE_MS) reasons.push('Vulnerability audit evidence is older than 24 hours.')
 
+  // T2: the fruit criterion is enforced only when the audit payload actually
+  // carries the compliance share; a report without it is not penalized on a
+  // dimension it cannot prove either way (the input-hash freshness check
+  // above already covers evidence age).
+  if (auditLagOkPct !== undefined && auditLagOkPct < goalLagFloor) {
+    reasons.push(`Lag-policy compliance ${auditLagOkPct}% is below the target gate ${goalLagFloor}% (${policy.targetLevel}).`)
+  }
+
   if (reasons.length) {
     return {
       status: 'UNKNOWN', accepted: false, evidenceComplete: false, dependencyEvidenceFresh,
@@ -130,6 +165,7 @@ export function acceptanceVerdictFromManualAudit(
       criticalPackages, highPackages,
       ...(auditGeneratedAt ? { auditGeneratedAt } : {}),
       ...(typeof audit.engine === 'string' ? { auditEngine: audit.engine } : {}),
+      ...(auditLagOkPct !== undefined ? { lagOkPct: auditLagOkPct } : {}),
       reasons, policy,
     }
   }
@@ -147,6 +183,7 @@ export function acceptanceVerdictFromManualAudit(
     highPackages,
     ...(auditGeneratedAt ? { auditGeneratedAt } : {}),
     ...(typeof audit.engine === 'string' ? { auditEngine: audit.engine } : {}),
+    ...(auditLagOkPct !== undefined ? { lagOkPct: auditLagOkPct } : {}),
     reasons: reasons.length ? reasons : ['Complete fresh vulnerability evidence satisfies the configured acceptance policy.'],
     policy,
   }

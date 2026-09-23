@@ -1,6 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
 import updaterPackage from 'electron-updater'
 import { isDeterministicToolFailure } from './baseline-retry.js'
+import { draftArtifactsRoot, draftManifestPath, draftReadFailureText, draftResultStaleness, readDraftResultArtifact, type DraftResultArtifact as ParsedDraftResultArtifact, type DraftReadResult } from './draft-artifact-reader.js'
 import { BASELINE_DECISION_MARKER, extractBaselineDecisionEnvelope } from './migration-baseline-decision.js'
 import { buildDependencyGraphSnapshot } from './dependency-graph.js'
 import { BaselineWorkerPool } from './baseline-worker.js'
@@ -118,29 +119,10 @@ type WorkspaceDraftRef = { runId: string; status: 'DRAFT_READY' | 'DRAFT_PARTIAL
 // Mirror of the planner's artifacts/runs/<runId>/draft/result.json contract
 // (dependency_live_roadmap_generator.py publish_draft_result). The fields the
 // desktop renders are typed; unknown/extra fields are ignored.
-type DraftResultArtifact = {
-  schemaVersion: number
-  status: 'DRAFT_READY' | 'DRAFT_PARTIAL'
-  runId: string
-  workspaceId: string
-  projectId: string
-  mode: string
-  generatedAt: string
-  elapsedMs: number
-  deadline: { deadlineSeconds?: number; remainingMs?: number; phase?: string }
-  policyHash: string
-  summary: string
-  partialReason?: string | null
-  verificationStatus: string
-  authority: string
-  compatibility: string
-  metadata: { total: number; unknown: number; unknownPackages: string[] }
-  proposals: Record<string, number>
-  artifacts: { manifest: string; plan: string; prompt: string; summary: string }
-  hashes: { plan: string; prompt: string }
-  inputHashes: Record<string, string>
-  projects: string[]
-}
+// The Draft artifact shape and its strict reader live in the shared
+// draft-artifact-reader module so Python-written artifacts and the Electron
+// reader share one byte/identity/hash contract (T1/T5).
+type DraftResultArtifact = ParsedDraftResultArtifact
 
 type DraftResultSnapshot = {
   runId: string
@@ -160,6 +142,11 @@ type DraftResultSnapshot = {
   proposals: Record<string, number>
   artifacts: { manifest: string; plan: string; prompt: string; summary: string }
   hashes: { plan: string; prompt: string }
+  // T5: ownership identity captured at read time — per-project input hashes and
+  // the policy snapshot — so staleness can be verified against reality instead
+  // of just mtimes.
+  inputHashes?: Record<string, string>
+  settings?: Record<string, unknown>
 }
 
 type DesktopState = {
@@ -410,6 +397,9 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
     : raw.executionMode === 'FAST' || raw.executionMode === 'AUTOPILOT' ? 'CONFIRM_SIGNIFICANT' : 'AUTONOMOUS'
   const budgetParsed = Number(raw.budgetMinutes ?? 30)
   const budgetMinutes = Number.isFinite(budgetParsed) ? Math.max(5, Math.min(240, Math.round(budgetParsed))) : 30
+  // T2: 0 is a legitimate user goal ("no lag-policy slack at the release
+  // gate"), so it must not be coerced back to the legacy 80 default by `||`.
+  const rawLagPct = Number(raw.minLagOkPct)
   return {
     schemaVersion: 2,
     policies,
@@ -425,7 +415,7 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
     proofMode: raw.proofMode === 'DRAFT' ? 'DRAFT' : 'VERIFIED',
     deferredCohorts,
     ...(raw.targetLevel === 'green' ? { targetLevel: 'green' as const } : raw.targetLevel === 'yellow' ? { targetLevel: 'yellow' as const } : {}),
-    ...(raw.minLagOkPct !== undefined && raw.minLagOkPct !== null ? { minLagOkPct: Math.max(0, Math.min(100, Math.round(Number(raw.minLagOkPct) || 80))) } : {}),
+    ...(raw.minLagOkPct !== undefined && raw.minLagOkPct !== null && Number.isFinite(rawLagPct) ? { minLagOkPct: Math.max(0, Math.min(100, Math.round(rawLagPct))) } : {}),
     ...(cohortAction ? { cohortAction } : {}),
   }
 }
@@ -678,68 +668,15 @@ function readProjects(workspace: WorkspaceRecord): ProjectSpec[] {
 
 // Draft Baseline artifacts. The planner publishes
 // <workspace>/.dependency-roadmap/artifacts/runs/<runId>/draft/{result.json,
-// plan.json,prompt.md,summary.md}. The Desktop passes --artifacts-dir
-// <workspace>/.dependency-roadmap/artifacts when it launches the planner, so
-// the reader MUST resolve the same path regardless of where settings.project.json
-// lives (root-level and .dependency-roadmap settings behave identically).
-// Resolving from the settings file would diverge to <ws>/artifacts whenever
-// the settings live at the workspace root.
-function draftArtifactsRoot(workspace: WorkspaceRecord): string {
-  return join(workspace.path, '.dependency-roadmap', 'artifacts')
-}
-
-function draftManifestPath(workspace: WorkspaceRecord, runId: string): string {
-  return join(draftArtifactsRoot(workspace), 'runs', artifactSafeSegment(runId), 'draft', 'result.json')
-}
-
-function sha256Text(value: string): string {
-  return createHash('sha256').update(value, 'utf8').digest('hex')
-}
-
-// Strict run-scoped manifest read. The manifest must belong to the exact run
-// (and, when known, workspace/project), declare schemaVersion 1, reference
-// real sibling artifacts contained in the run directory, and carry plan/prompt
-// hashes that match the files on disk. Anything less makes the result invalid:
-// the UI must never show a foreign, stale or truncated Draft as fresh.
-function readDraftResultArtifact(
+// plan.json,prompt.md,summary.md}. Path/read implementations live in
+// draft-artifact-reader.ts (the same module the cross-language regression test
+// loads); these thin wrappers keep the Electron call sites stable.
+function draftReadStrict(
   workspace: WorkspaceRecord,
   runId: string,
   expect?: { workspaceId?: string; projectId?: string },
-): DraftResultArtifact | undefined {
-  const manifestPath = draftManifestPath(workspace, runId)
-  if (!existsSync(manifestPath)) return undefined
-  try {
-    const parsed = JSON.parse(readFileSync(manifestPath, 'utf8')) as Partial<DraftResultArtifact>
-    if (parsed.schemaVersion !== 1) return undefined
-    if (parsed.status !== 'DRAFT_READY' && parsed.status !== 'DRAFT_PARTIAL') return undefined
-    if (typeof parsed.runId !== 'string' || !parsed.runId || parsed.runId !== runId) return undefined
-    if (expect) {
-      if (expect.workspaceId && typeof parsed.workspaceId === 'string' && parsed.workspaceId && parsed.workspaceId !== expect.workspaceId) return undefined
-      if (expect.projectId && typeof parsed.projectId === 'string' && parsed.projectId && parsed.projectId !== expect.projectId) return undefined
-    }
-    const artifacts = parsed.artifacts
-    if (!artifacts) return undefined
-    const root = draftArtifactsRoot(workspace)
-    for (const kind of ['plan', 'prompt', 'summary'] as const) {
-      const raw = artifacts[kind]
-      if (typeof raw !== 'string' || !raw) return undefined
-      if (!isInside(raw, root)) return undefined
-      if (!existsSync(raw) || !statSync(raw).isFile()) return undefined
-    }
-    const hashes = parsed.hashes
-    if (!hashes) return undefined
-    for (const kind of ['plan', 'prompt'] as const) {
-      const rawHash = hashes[kind]
-      const rawPath = artifacts[kind]
-      if (kind === 'prompt' && typeof rawHash !== 'string') return undefined
-      if (typeof rawPath !== 'string' || !rawPath) return undefined
-      if (typeof rawHash !== 'string' || !rawHash) return undefined
-      if (sha256Text(readFileSync(rawPath, 'utf8')) !== rawHash) return undefined
-    }
-    return parsed as DraftResultArtifact
-  } catch {
-    return undefined
-  }
+): DraftReadResult {
+  return readDraftResultArtifact(workspace.path, runId, expect)
 }
 
 function buildDraftResultSnapshot(artifact: DraftResultArtifact): DraftResultSnapshot {
@@ -757,10 +694,18 @@ function buildDraftResultSnapshot(artifact: DraftResultArtifact): DraftResultSna
     verificationStatus: artifact.verificationStatus ?? 'NOT_VERIFIED',
     authority: artifact.authority ?? 'PLANNING_ONLY',
     compatibility: artifact.compatibility ?? 'UNKNOWN',
-    metadata: artifact.metadata ?? { total: 0, unknown: 0, unknownPackages: [] },
-    proposals: artifact.proposals ?? {},
+    metadata: {
+      total: typeof artifact.metadata?.total === 'number' ? artifact.metadata.total : 0,
+      unknown: typeof artifact.metadata?.unknown === 'number' ? artifact.metadata.unknown : 0,
+      unknownPackages: Array.isArray(artifact.metadata?.unknownPackages) ? artifact.metadata.unknownPackages : [],
+    },
+    proposals: artifact.proposals && typeof artifact.proposals === 'object'
+      ? Object.fromEntries(Object.entries(artifact.proposals).map(([key, value]) => [key, typeof value === 'number' ? value : 0]))
+      : {},
     artifacts: artifact.artifacts ?? { manifest: '', plan: '', prompt: '', summary: '' },
     hashes: artifact.hashes ?? { plan: '', prompt: '' },
+    inputHashes: artifact.inputHashes,
+    settings: artifact.settings,
   }
 }
 
@@ -768,38 +713,46 @@ function draftResultForProject(workspace: WorkspaceRecord, projectName?: string)
   if (!projectName) return undefined
   const ref = workspace.draftResults?.[projectName]
   if (!ref) return undefined
-  const artifact = readDraftResultArtifact(workspace, ref.runId)
-  if (!artifact) return undefined
-  return buildDraftResultSnapshot(artifact)
+  // Expected identity is enforced here too: a persisted pointer must only ever
+  // resolve to this workspace/project's run (T5).
+  const read = draftReadStrict(workspace, ref.runId, { workspaceId: workspace.id, projectId: projectName })
+  if (!read.ok) return undefined
+  return buildDraftResultSnapshot(read.artifact)
 }
 
-// A Draft is stale when any project input that feeds the planner changed after
-// the run was generated (package manifest, canonical lockfiles, settings). The
-// manifest carries no per-input content hashes, so mtimes are the honest local
-// signal; Desktop never mutates the run artifact itself.
-function draftInputStaleness(workspace: WorkspaceRecord, project: ProjectSpec, snapshot: DraftResultSnapshot): boolean {
-  const generatedMs = Date.parse(snapshot.generatedAt)
-  if (!Number.isFinite(generatedMs)) return false
-  const settingsPath = resolveSettingsPath(workspace)
-  const candidates = [
-    settingsPath,
-    ...['package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lock', 'Pipfile.lock', 'poetry.lock', 'requirements.txt', 'pyproject.toml']
-      .map((name) => join(project.path, name)),
-  ]
-  return candidates.some((input) => {
-    try {
-      return existsSync(input) && statSync(input).isFile() && statSync(input).mtimeMs > generatedMs
-    } catch {
-      return false
-    }
+// A Draft is stale when it no longer describes the project as it is today:
+// invalid generatedAt, planner inputs changed by content (deletion/addition
+// included) via the recorded input hash, or the target policy the user would
+// run now differs from the one the run was accepted under. The pure decision
+// lives in the shared reader module so the cross-language tests can drive it.
+// The historical result may still be opened with an explicit reason, but it is
+// never presented as fresh (T5).
+function draftInputStaleness(
+  workspace: WorkspaceRecord,
+  project: ProjectSpec,
+  snapshot: DraftResultSnapshot,
+): { stale: boolean; reason?: string } {
+  return draftResultStaleness({
+    projectPath: project.path,
+    generatedAt: snapshot.generatedAt,
+    inputHashRecorded: snapshot.inputHashes?.[project.name],
+    storedPolicy: snapshot.settings as Record<string, unknown> | undefined,
+    currentPolicy: loadBaselineIntent(workspace, project.name) as Record<string, unknown> | undefined,
   })
 }
 
 // Persist the pointer to the newest completed Draft run (restart-safe) and
-// hand the renderer the exact snapshot produced by that run.
-function importDraftResult(workspace: WorkspaceRecord, projectName: string, runId: string): DraftResultSnapshot | undefined {
-  const artifact = readDraftResultArtifact(workspace, runId, { workspaceId: workspace.id, projectId: projectName })
-  if (!artifact) return undefined
+// hand the renderer the exact snapshot produced by that run. Returns the read
+// failure reason (T1) so callers can surface a typed error instead of a
+// silent empty success.
+function importDraftResult(
+  workspace: WorkspaceRecord,
+  projectName: string,
+  runId: string,
+): { ok: true; snapshot: DraftResultSnapshot } | { ok: false; code: string; detail: string } {
+  const read = draftReadStrict(workspace, runId, { workspaceId: workspace.id, projectId: projectName })
+  if (!read.ok) return { ok: false, code: read.code, detail: read.detail }
+  const artifact = read.artifact
   const state = loadState()
   const saved = state.workspaces.find((item) => item.id === workspace.id)
   if (saved) {
@@ -809,7 +762,7 @@ function importDraftResult(workspace: WorkspaceRecord, projectName: string, runI
     }
     saveState(state)
   }
-  return buildDraftResultSnapshot(artifact)
+  return { ok: true, snapshot: buildDraftResultSnapshot(artifact) }
 }
 
 function promptPathForProject(workspace: WorkspaceRecord, projectName: string): string | undefined {
@@ -1863,10 +1816,11 @@ function readTargetClosure(workspace: WorkspaceRecord, project: ProjectSpec | un
   try {
     const roadmap = JSON.parse(readFileSync(roadmapPath, 'utf8')) as unknown
     const promptPath = promptPathForProject(workspace, project.name)
-    if (!promptPath || !existsSync(promptPath)) return targetClosureFromRoadmap(roadmap, project.name, target)
+    const minLagOkPct = loadBaselineIntent(workspace, project.name).minLagOkPct ?? 80
+    if (!promptPath || !existsSync(promptPath)) return targetClosureFromRoadmap(roadmap, project.name, target, minLagOkPct)
     const markdown = readFileSync(promptPath, 'utf8')
     const plannedTargets = migrationPlanFromPrompt(markdown, project.name) ? scopeTargetsFromPrompt(markdown, project.name) : {}
-    return targetClosureFromRoadmapWithTargets(roadmap, project.name, target, plannedTargets)
+    return targetClosureFromRoadmapWithTargets(roadmap, project.name, target, plannedTargets, minLagOkPct)
   } catch {
     return undefined
   }
@@ -1888,7 +1842,8 @@ function readAcceptanceVerdict(workspace: WorkspaceRecord, project: ProjectSpec)
 
 function acceptanceRemediationMessage(verdict: AcceptanceVerdict): string {
   const packages = [...new Set([...verdict.criticalPackages, ...verdict.highPackages])].slice(0, 20)
-  return `ACCEPTANCE_REMEDIATION_REQUIRED: Critical=${verdict.critical ?? '?'}, High=${verdict.high ?? '?'}, policy=C<=${verdict.policy.maxKnownCritical}/H<=${verdict.policy.maxKnownHigh}.${packages.length ? ` Vulnerability findings: ${packages.join(', ')}.` : ''} Findings are diagnostic evidence, not authorization to add transitive packages directly: resolve them through the declared/direct-parent dependency graph and keep deterministic solver/verifier authority. ${verdict.reasons.join(' ')}`
+  const goal = verdict.policy.targetLevel === 'green' ? 'green/100%' : `yellow/${verdict.policy.minLagOkPct ?? 80}%`
+  return `ACCEPTANCE_REMEDIATION_REQUIRED: Critical=${verdict.critical ?? '?'}, High=${verdict.high ?? '?'}, goal=${goal}, policy=C<=${verdict.policy.maxKnownCritical}/H<=${verdict.policy.maxKnownHigh}.${packages.length ? ` Vulnerability findings: ${packages.join(', ')}.` : ''} Findings are diagnostic evidence, not authorization to add transitive packages directly: resolve them through the declared/direct-parent dependency graph and keep deterministic solver/verifier authority. ${verdict.reasons.join(' ')}`
 }
 
 async function workspaceDetails(workspace: WorkspaceRecord): Promise<WorkspaceDetails> {
@@ -2405,6 +2360,14 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
           DEPLOOM_BASELINE_SEARCH_MODE: effectiveIntent.searchMode ?? 'AUTO',
           DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS: String(automaticBudgetSeconds),
           DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS: String(maxExpensiveAttempts),
+          // T2: the effective target policy (goal level + numeric lag gate)
+          // reaches the engine in EVERY baseline mode (Verified AND Draft), not
+          // just Draft. The generator pins these into its policy snapshot/hash
+          // and uses them for health gates, the chosen plan variant and the
+          // acceptance criterion, so a green/100 choice really changes the
+          // goal in Verified runs too.
+          DEPLOOM_BASELINE_TARGET_LEVEL: effectiveIntent.targetLevel ?? 'yellow',
+          DEPLOOM_BASELINE_MIN_LAG_OK_PCT: String(effectiveIntent.minLagOkPct ?? 80),
           ...(executionMode === 'BACKGROUND' ? { DEPLOOM_IO_COPY_SLOTS: '1', DEPLOOM_IO_HASH_SLOTS: '1', DEPLOOM_IO_PM_SLOTS: '1' } : {}),
           // Run-scoped Draft identity (mirrors the --run-id/--mode CLI args so
           // the planner's policy snapshot and user-visible manifest agree).
@@ -2413,10 +2376,6 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
             DEPLOOM_WORKSPACE_ID: workspace.id,
             DEPLOOM_PROJECT_ID: project.name,
             DEPLOOM_MODE: 'draft',
-            // R9: numeric target criteria become part of the policy snapshot and
-            // hash, so changing the gate really changes the plan and goal.
-            DEPLOOM_BASELINE_TARGET_LEVEL: effectiveIntent.targetLevel ?? 'yellow',
-            DEPLOOM_BASELINE_MIN_LAG_OK_PCT: String(effectiveIntent.minLagOkPct ?? 80),
           } : {}),
         },
       }]
@@ -5966,10 +5925,11 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
         if (!job.runId) {
           throw new Error(`DRAFT_RUN_ID_MISSING: Draft Baseline запущен без runId; результат не может быть разрешён.`)
         }
-        draftResult = importDraftResult(job.workspace, job.projectName, job.runId)
-        if (!draftResult) {
-          throw new Error(`DRAFT_RESULT_MISSING: Draft запуск ${job.runId} не опубликовал валидный result.json (${draftManifestPath(job.workspace, job.runId)}); результат не считается готовым, а артефакт Draft проверен на принадлежность запуску/проекту и целостность.`)
+        const draftImport = importDraftResult(job.workspace, job.projectName, job.runId)
+        if (!draftImport.ok) {
+          throw new Error(draftReadFailureText(draftImport.code as Parameters<typeof draftReadFailureText>[0], draftImport.detail))
         }
+        draftResult = draftImport.snapshot
         send('flow:job-output', {
           jobId: job.id,
           stream: 'system',
@@ -6359,19 +6319,22 @@ function setupIpc(): void {
     const ref = workspace.draftResults?.[projectName]
     const runId = raw.runId?.trim() ? raw.runId.trim() : ref?.runId
     if (!runId) return undefined
-    const artifact = readDraftResultArtifact(workspace, runId, { workspaceId: workspace.id, projectId: projectName })
-    if (!artifact) return undefined
+    const read = draftReadStrict(workspace, runId, { workspaceId: workspace.id, projectId: projectName })
+    if (!read.ok) return undefined
+    const artifact = read.artifact
     const snapshot = buildDraftResultSnapshot(artifact)
-    const stale = project ? draftInputStaleness(workspace, project, snapshot) : false
+    const staleness = project ? draftInputStaleness(workspace, project, snapshot) : { stale: false as const }
+    const stale = staleness.stale
     const promptPath = snapshot.artifacts.prompt
     const planPath = snapshot.artifacts.plan
-    let prompt: { path: string; content: string; stale: boolean; mtimeMs: number; size: number; projectName?: string } | undefined
+    let prompt: { path: string; content: string; stale: boolean; staleReason?: string; mtimeMs: number; size: number; projectName?: string } | undefined
     try {
       if (promptPath && existsSync(promptPath) && statSync(promptPath).isFile() && statSync(promptPath).size <= MAX_PROMPT_PREVIEW_BYTES) {
         prompt = {
           path: promptPath,
           content: readFileSync(promptPath, 'utf8'),
           stale,
+          staleReason: staleness.reason,
           mtimeMs: statSync(promptPath).mtimeMs,
           size: statSync(promptPath).size,
           projectName,
@@ -6389,7 +6352,7 @@ function setupIpc(): void {
     } catch {
       plan = undefined
     }
-    return { result: snapshot, prompt, plan }
+    return { result: { ...snapshot, stale, staleReason: staleness.reason }, prompt, plan }
   })
 
   ipcMain.handle('flow:baseline-intent-plan', async (_event, input: { workspaceId?: string; projectName: string }) => {

@@ -37,16 +37,26 @@ class BlockVHBaselineIntentTests(unittest.TestCase):
         with patch.dict(os.environ, {"DEPLOOM_BASELINE_INTENT_JSON": raw}, clear=False):
             self.assertIsNone(gen._baseline_human_decision_focus(learned, {"pkg": "0.9.0"}, min_confirmed=3))
 
-    def test_keep_current_is_outside_current_baseline_health_scope(self):
+    def test_keep_current_defers_update_but_stays_in_health_scope(self):
+        # T3: "keep-current" defers the update but must NOT drop the dependency
+        # from health; only an explicit exclusion removes it from the score.
         from types import SimpleNamespace
-        row = SimpleNamespace(name="eslint-plugin-sonarjs", scope_excluded=False, exclusion_reason="", exclusion_source="")
+        row = SimpleNamespace(
+            name="eslint-plugin-sonarjs",
+            scope_excluded=False,
+            planner_deferred=False,
+            planner_deferred_reason="",
+            exclusion_reason="",
+            exclusion_source="",
+        )
         raw = '{"schemaVersion":1,"policies":{"eslint-plugin-sonarjs":"keep-current"}}'
         with patch.dict(os.environ, {"DEPLOOM_BASELINE_INTENT_JSON": raw}, clear=False):
             gen._BASELINE_INTENT_CACHE_RAW = "<unset>"
             gen._apply_baseline_intent_scope({"demo-project": [row]})
-        self.assertTrue(row.scope_excluded)
-        self.assertEqual("baseline-intent", row.exclusion_source)
-        self.assertIn("Baseline", row.exclusion_reason)
+        self.assertFalse(row.scope_excluded)
+        self.assertNotEqual("baseline-intent", row.exclusion_source)
+        self.assertTrue(row.planner_deferred)
+        self.assertIn("keep-current", row.planner_deferred_reason)
 
     def test_user_continuation_credit_is_not_mislabeled_as_proof_credit(self):
         budget = gen.BaselineLivenessBudget(base_iterations=8, max_learning_extensions=16)

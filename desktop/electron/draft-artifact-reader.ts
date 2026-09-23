@@ -1,0 +1,302 @@
+// Draft artifact reader — production read path for run-scoped Draft results.
+//
+// Pure Node (no Electron imports) so the exact same code that main.ts trusts
+// can be loaded by cross-language regression tests: Python writes the Draft
+// artifacts, the compiled dist-electron/draft-artifact-reader.js reads them.
+//
+// The byte contract (T1): Python writes every artifact as UTF-8 with explicit
+// LF newlines (no BOM) and records SHA-256 of the raw file bytes in
+// result.json#hashes. This reader hashes the raw bytes too, so a natively
+// produced Windows Draft (CRLF would have broken the old string-based hash)
+// is accepted. Any single-byte corruption is rejected.
+//
+// The ownership contract (T5): when an expected identity is supplied, missing
+// or mismatched workspace/project/run identity, artifacts that point outside
+// the run's own draft sibling directory, or hash mismatches all fail with a
+// distinguishable code — never a silent undefined.
+
+import { createHash } from 'node:crypto'
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { isAbsolute, join, resolve, relative, sep } from 'node:path'
+
+export type DraftStatus = 'DRAFT_READY' | 'DRAFT_PARTIAL'
+
+export type DraftReadFailureCode =
+  | 'manifest-missing'
+  | 'invalid-json'
+  | 'unsupported-schema'
+  | 'unsupported-status'
+  | 'run-identity'
+  | 'workspace-identity'
+  | 'project-identity'
+  | 'artifact-path'
+  | 'hash-mismatch'
+
+export type DraftReadResult =
+  | { ok: true; artifact: DraftResultArtifact }
+  | { ok: false; code: DraftReadFailureCode; detail: string }
+
+export type DraftResultArtifact = {
+  schemaVersion: number
+  status: DraftStatus
+  runId: string
+  workspaceId?: string
+  projectId?: string
+  mode?: string
+  generatedAt?: string
+  elapsedMs?: number
+  deadline?: { deadlineSeconds?: number; remainingMs?: number; phase?: string }
+  policyHash?: string
+  settings?: Record<string, unknown>
+  summary?: string
+  partialReason?: string | null
+  verificationStatus?: string
+  authority?: string
+  compatibility?: string
+  metadata?: { total?: number; unknown?: number; unknownPackages?: string[] }
+  proposals?: Record<string, unknown>
+  artifacts?: { manifest: string; plan: string; prompt: string; summary: string }
+  hashes?: { plan: string; prompt: string }
+  inputHashes?: Record<string, string>
+  projects?: unknown[]
+}
+
+const DRAFT_SIBLING_NAMES = { plan: 'plan.json', prompt: 'prompt.md', summary: 'summary.md' } as const
+
+export function sha256Bytes(value: string | Buffer): string {
+  return createHash('sha256').update(value).digest('hex')
+}
+
+// Draft input identity, byte-identical to the Python writer (draft_input_hash):
+// SHA-256 over the ordered existing files below as name\0bytes\0. A hash
+// difference also catches deletions and additions, not just content edits (T5).
+export const DRAFT_INPUT_FILENAMES = [
+  'package.json', 'yarn.lock', 'pnpm-lock.yaml', 'package-lock.json',
+  'npm-shrinkwrap.json', 'package-manager.json',
+] as const
+
+export function draftInputHashForProject(projectPath: string): string {
+  const hash = createHash('sha256')
+  for (const filename of DRAFT_INPUT_FILENAMES) {
+    const input = join(projectPath, filename)
+    if (!existsSync(input)) continue
+    try {
+      hash.update(Buffer.from(filename, 'utf8'))
+      hash.update(Buffer.from([0]))
+      hash.update(readFileSync(input))
+      hash.update(Buffer.from([0]))
+    } catch {
+      continue
+    }
+  }
+  return hash.digest('hex')
+}
+
+export function baselinePoliciesKey(policies: Record<string, unknown> | undefined | null): string {
+  const entries = Object.entries(policies ?? {})
+    .filter(([, policy]) => policy === 'keep-current' || policy === 'required')
+    .sort(([a], [b]) => a.localeCompare(b))
+  return JSON.stringify(entries)
+}
+
+export type DraftStalenessFacts = {
+  projectPath: string
+  generatedAt?: string
+  /** manifests inputHashes[project] captured at read time (T5). */
+  inputHashRecorded?: string
+  /** The policy the run was accepted under (manifest.settings). */
+  storedPolicy?: { targetLevel?: unknown; minLagOkPct?: unknown; intentJson?: unknown }
+  /** The policy the user would run now. */
+  currentPolicy?: { targetLevel?: unknown; minLagOkPct?: unknown; policies?: Record<string, unknown> }
+}
+
+export type DraftStaleness = { stale: boolean; reason?: string }
+
+// A Draft is stale when it no longer describes the project as it is today:
+//  - generatedAt is missing/invalid;
+//  - any planner input changed since the run — compared BY CONTENT via the
+//    recorded input hash (deletions and additions are caught too);
+//  - the target policy (level / minimum-lag percentage / intent policies)
+//    differs from the policy the run was accepted under.
+// The historical result may still be opened with an explicit reason, but it is
+// never presented as fresh (T5).
+export function draftResultStaleness(facts: DraftStalenessFacts): DraftStaleness {
+  const reasons: string[] = []
+  if (!Number.isFinite(Date.parse(facts.generatedAt ?? ''))) {
+    reasons.push('в manifest нет корректной даты генерации')
+  }
+
+  const recorded = facts.inputHashRecorded
+  if (recorded) {
+    let current = ''
+    try {
+      current = draftInputHashForProject(facts.projectPath)
+    } catch {
+      current = ''
+    }
+    if (current !== recorded) {
+      reasons.push('package.json/lockfile/settings изменились с момента генерации (включая удаление/добавление)')
+    }
+  } else if (facts.inputHashRecorded !== undefined) {
+    reasons.push('проект не привязан к входным файлам (нет input-идентичности)')
+  }
+
+  const stored = facts.storedPolicy
+  const current = facts.currentPolicy
+  if (stored && current) {
+    const storedTarget = String(stored.targetLevel ?? 'yellow')
+    const currentTarget = String(current.targetLevel ?? 'yellow')
+    const storedPct = Number(String(stored.minLagOkPct ?? '80'))
+    const currentPct = Number(current.minLagOkPct ?? 80)
+    let storedPolicyKey = ''
+    if (typeof stored.intentJson === 'string' && stored.intentJson) {
+      try {
+        const parsed = JSON.parse(stored.intentJson) as { policies?: unknown }
+        if (parsed && typeof parsed === 'object') {
+          storedPolicyKey = baselinePoliciesKey(
+            parsed.policies && typeof parsed.policies === 'object'
+              ? parsed.policies as Record<string, unknown>
+              : {},
+          )
+        }
+      } catch {
+        // unparseable stored intent: fall through, hash check already ran
+      }
+    }
+    if (storedTarget !== currentTarget || (Number.isFinite(storedPct) && storedPct !== currentPct)) {
+      reasons.push('цель/процент актуальности изменились с момента генерации')
+    } else if (storedPolicyKey && storedPolicyKey !== baselinePoliciesKey(current.policies)) {
+      reasons.push('политики keep-current/required изменились с момента генерации')
+    }
+  }
+
+  return { stale: reasons.length > 0, reason: reasons.join('; ') }
+}
+
+export function artifactSafeSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 120) || 'run'
+}
+
+export function draftArtifactsRoot(workspacePath: string): string {
+  return join(workspacePath, '.dependency-roadmap', 'artifacts')
+}
+
+export function draftManifestPath(workspacePath: string, runId: string): string {
+  return join(draftArtifactsRoot(workspacePath), 'runs', artifactSafeSegment(runId), 'draft', 'result.json')
+}
+
+export function draftRunDir(workspacePath: string, runId: string): string {
+  return join(draftArtifactsRoot(workspacePath), 'runs', artifactSafeSegment(runId), 'draft')
+}
+
+// realpathSync.native resolves on Windows with GetFinalPathNameByHandle, which
+// expands 8.3 short-name components (e.g. LEVENS~1 -> levenskikh) that the JS
+// fallback leaves untouched.
+const realpathResolve = realpathSync.native as unknown as (p: string) => string
+
+function canonicalPath(value: string): string {
+  try {
+    return realpathResolve(value)
+  } catch {
+    return resolve(value)
+  }
+}
+
+function isInsideStrict(candidate: string, root: string): boolean {
+  const rootResolved = canonicalPath(root)
+  const candidateResolved = canonicalPath(candidate)
+  if (candidateResolved === rootResolved) return false
+  const rel = relative(rootResolved, candidateResolved)
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel) && !rel.split(sep).includes('..')
+}
+
+/** Read and validate a run-scoped Draft manifest and its sibling artifacts. */
+export function readDraftResultArtifact(
+  workspacePath: string,
+  runId: string,
+  expect?: { workspaceId?: string; projectId?: string },
+): DraftReadResult {
+  const manifestPath = draftManifestPath(workspacePath, runId)
+  if (!existsSync(manifestPath)) return { ok: false, code: 'manifest-missing', detail: manifestPath }
+
+  let parsed: Partial<DraftResultArtifact>
+  try {
+    parsed = JSON.parse(readFileSync(manifestPath, 'utf8')) as Partial<DraftResultArtifact>
+  } catch {
+    return { ok: false, code: 'invalid-json', detail: manifestPath }
+  }
+  if (typeof parsed !== 'object' || parsed === null) return { ok: false, code: 'invalid-json', detail: 'manifest is not an object' }
+  if (parsed.schemaVersion !== 1) return { ok: false, code: 'unsupported-schema', detail: `schemaVersion=${JSON.stringify(parsed.schemaVersion)}` }
+  if (parsed.status !== 'DRAFT_READY' && parsed.status !== 'DRAFT_PARTIAL') {
+    return { ok: false, code: 'unsupported-status', detail: `status=${JSON.stringify(parsed.status)}` }
+  }
+  if (typeof parsed.runId !== 'string' || !parsed.runId) return { ok: false, code: 'run-identity', detail: 'runId is empty' }
+  if (parsed.runId !== runId) return { ok: false, code: 'run-identity', detail: `runId=${parsed.runId} expected=${runId}` }
+  if (expect) {
+    if (expect.workspaceId !== undefined && parsed.workspaceId !== expect.workspaceId) {
+      return { ok: false, code: 'workspace-identity', detail: `workspaceId=${JSON.stringify(parsed.workspaceId)} expected=${expect.workspaceId}` }
+    }
+    if (expect.projectId !== undefined && parsed.projectId !== expect.projectId) {
+      return { ok: false, code: 'project-identity', detail: `projectId=${JSON.stringify(parsed.projectId)} expected=${expect.projectId}` }
+    }
+  }
+
+  const artifacts = parsed.artifacts
+  if (!artifacts || typeof artifacts !== 'object') return { ok: false, code: 'artifact-path', detail: 'artifacts section missing' }
+  const runDir = draftRunDir(workspacePath, runId)
+  for (const kind of ['plan', 'prompt', 'summary'] as const) {
+    const raw = artifacts[kind]
+    const expectedName = DRAFT_SIBLING_NAMES[kind]
+    if (typeof raw !== 'string' || !raw) return { ok: false, code: 'artifact-path', detail: `${kind} path missing` }
+    const expectedPath = join(runDir, expectedName)
+    // Canonicalize (realpath resolves 8.3 short names, case and symlinks) so a
+    // manifest written via a differently-cased or short-named workspace path
+    // still validates against the run directory.
+    if (canonicalPath(raw) !== canonicalPath(expectedPath)) {
+      return { ok: false, code: 'artifact-path', detail: `${kind} must be the run-sibling ${expectedPath}, got ${raw}` }
+    }
+    if (!isInsideStrict(raw, runDir)) return { ok: false, code: 'artifact-path', detail: `${kind} escapes run dir: ${raw}` }
+    if (!existsSync(raw) || !statSync(raw).isFile()) return { ok: false, code: 'artifact-path', detail: `${kind} not a file: ${raw}` }
+  }
+
+  const hashes = parsed.hashes
+  if (!hashes || typeof hashes !== 'object') return { ok: false, code: 'hash-mismatch', detail: 'hashes section missing' }
+  for (const kind of ['plan', 'prompt'] as const) {
+    const rawHash = hashes[kind]
+    const rawPath = artifacts[kind]
+    if (typeof rawHash !== 'string' || !rawHash || typeof rawPath !== 'string' || !rawPath) {
+      return { ok: false, code: 'hash-mismatch', detail: `${kind} hash or path missing` }
+    }
+    if (sha256Bytes(readFileSync(rawPath)) !== rawHash) {
+      return { ok: false, code: 'hash-mismatch', detail: `${kind} bytes do not match manifest hash` }
+    }
+  }
+
+  return { ok: true, artifact: parsed as DraftResultArtifact }
+}
+
+/** User-facing explanation for a failed Draft read (T1: distinct causes). */
+export function draftReadFailureText(code: DraftReadFailureCode, detail: string): string {
+  switch (code) {
+    case 'manifest-missing':
+      return `DRAFT_RESULT_MISSING: result.json для запуска не найден (${detail}).`
+    case 'invalid-json':
+      return `DRAFT_RESULT_INVALID_JSON: manifest не является корректным JSON (${detail}).`
+    case 'unsupported-schema':
+      return `DRAFT_RESULT_UNSUPPORTED_SCHEMA: неожиданный формат manifest (${detail}).`
+    case 'unsupported-status':
+      return `DRAFT_RESULT_UNSUPPORTED_STATUS: неожиданный статус результата (${detail}).`
+    case 'run-identity':
+      return `DRAFT_RESULT_RUN_IDENTITY: запуск не совпадает с ожидаемым (${detail}). Результат не отображается.`
+    case 'workspace-identity':
+      return `DRAFT_RESULT_WORKSPACE_IDENTITY: workspace не совпадает с ожидаемым (${detail}).`
+    case 'project-identity':
+      return `DRAFT_RESULT_PROJECT_IDENTITY: проект не совпадает с ожидаемым (${detail}).`
+    case 'artifact-path':
+      return `DRAFT_RESULT_ARTIFACT_PATH: артефакты принадлежат другому запуску или повреждены (${detail}).`
+    case 'hash-mismatch':
+      return `DRAFT_RESULT_HASH_MISMATCH: файлы результата не совпадают с зафиксированными в manifest (${detail}).`
+    default:
+      return `DRAFT_RESULT_UNKNOWN: не удалось прочитать результат (${detail}).`
+  }
+}

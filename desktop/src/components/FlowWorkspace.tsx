@@ -24,9 +24,10 @@ type Props = {
   activeRunId?: string
   activeRunStartedAt?: number
   activeDraftProgress?: DraftProgressPayload
-  draftLaunch?: { workspaceId?: string; projectName: string; runId?: string; autoOpen: boolean; at: number }
-  onMarkDraftLaunched: (workspaceId: string | undefined, projectName: string, runId?: string, autoOpen?: boolean) => void
-  onResetDraftLaunch: (workspaceId: string | undefined, projectName: string, autoOpen?: boolean) => void
+  draftLaunch?: { workspaceId?: string; projectName: string; runId?: string; autoOpen: boolean; proofMode?: 'DRAFT' | 'VERIFIED'; acknowledgedRunId?: string; at: number }
+  onMarkDraftLaunched: (workspaceId: string | undefined, projectName: string, runId?: string, autoOpen?: boolean, proofMode?: 'DRAFT' | 'VERIFIED') => void
+  onResetDraftLaunch: (workspaceId: string | undefined, projectName: string, autoOpen?: boolean, proofMode?: 'DRAFT' | 'VERIFIED') => void
+  onAcknowledgeDraftRun: (workspaceId: string | undefined, projectName: string, runId?: string) => void
   autopilotActive?: boolean
   baselineDecision?: BaselineDecision
   onClearBaselineDecision: () => void
@@ -45,7 +46,7 @@ type Props = {
   onListAgentModels: (agentProvider: AgentProvider, cwd?: string) => Promise<string[]>
 }
 
-export function FlowWorkspace({ details, project, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels }: Props) {
+export function FlowWorkspace({ details, project, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels }: Props) {
   const { language, text, t } = useLanguage()
   // Compatibility-only planner hint for legacy roadmap/prompt export.
   // Yellow/Green is no longer a user goal or a completion gate.
@@ -64,14 +65,14 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
   // FlowWorkspace remounts across tabs), and the ack map keys by workspace AND
   // project so two workspaces sharing a project name never hide each other's
   // result. The completion banner is fresh only for the exact run the user
-  // launched (marker.runId match), never for a leftover earlier result. After
-  // acknowledge the persistent "последний Draft" card stays reachable.
-  const [acknowledgedDraftRunIds, setAcknowledgedDraftRunIds] = useState<Record<string, string>>({})
-  const draftRefKey = `${details.workspace.id}::${project.name}`
+  // launched (marker.runId match), never for a leftover earlier result; the
+  // acknowledge (dismiss / auto-open) is recorded in the hook too, so a remount
+  // or a fresh details object can never re-open an already consumed preview.
+  // After acknowledge the persistent "последний Draft" card stays reachable.
   const draftResult = details.draftResult
-  const draftLaunchActive = activeAction === 'baseline' && Boolean(draftLaunch)
-  const draftResultFresh = Boolean(draftResult && draftLaunch?.runId && draftResult.runId !== acknowledgedDraftRunIds[draftRefKey] && draftResult.runId === draftLaunch.runId)
-  const acknowledgeDraftResult = () => { if (draftResult) setAcknowledgedDraftRunIds((current) => ({ ...current, [draftRefKey]: draftResult.runId })) }
+  const draftLaunchActive = activeAction === 'baseline' && draftLaunch?.proofMode === 'DRAFT' && (draftLaunch.runId === undefined || draftLaunch.runId === activeRunId)
+  const draftResultFresh = Boolean(draftResult && draftLaunch?.runId && draftLaunch.acknowledgedRunId !== draftResult.runId && draftResult.runId === draftLaunch.runId)
+  const acknowledgeDraftResult = () => { if (draftResult) onAcknowledgeDraftRun(details.workspace.id, project.name, draftResult.runId) }
   const openDraftPrompt = async () => {
     try {
       const loaded = await onGetCurrentDraftResult({ workspaceId: details.workspace.id, projectName: project.name, runId: draftResult?.runId })
@@ -220,7 +221,16 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
   }
 
   const baselinePolicyIdentity = (intent: BaselineIntent) =>
-    JSON.stringify(Object.entries(intent.policies ?? {}).sort(([left], [right]) => left.localeCompare(right)))
+    JSON.stringify([
+      Object.entries(intent.policies ?? {}).sort(([left], [right]) => left.localeCompare(right)),
+      // T2: the goal criteria are part of the intent identity. Changing the
+      // target level or the numeric lag gate must invalidate a pending
+      // "continue" resume just like a policy change, or the resumed run would
+      // silently keep the old goal.
+      intent.targetLevel ?? 'yellow',
+      intent.minLagOkPct ?? 80,
+      intent.acceptancePolicy ?? null,
+    ])
 
 
   const runBaselineIntent = async (intent: BaselineIntent, autoOpenPrompt = false) => {
@@ -230,19 +240,22 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
       pending.mode === 'decision' &&
       baselinePolicyIdentity(pending.plan.intent) !== baselinePolicyIdentity(intent)
     const effectiveBaselineResume = policyChanged ? 'restart' : pending.resume
-    // A Draft launch arms the run-scoped completion banner for this project; a
-    // verified Baseline never produces workspace.draftResult, so only Draft
-    // launches may route the banner. The marker is reset first: while the new
-    // job is starting, an older leftover result must not match (fresh banner or
-    // auto-open), then it is bound to the exact runId after the job starts.
-    if (intent.proofMode === 'DRAFT') {
-      onResetDraftLaunch(details.workspace.id, project.name, autoOpenPrompt)
-    }
-    const started = await onRun({ action: 'baseline', workspaceId: details.workspace.id, projectName: project.name, target, label, releaseBranch, gateCommand, baselineResume: effectiveBaselineResume, baselineIntent: intent, commitMessage: `chore(deps): save ${project.name} roadmap state` })
+    const effectiveTarget: TargetLevel = intent.targetLevel === 'green' ? 'green' : 'yellow'
+    // Any new baseline start invalidates the previous launch marker: while
+    // this job runs, an older Draft's banner must not stay "fresh", and a
+    // Verified run must never inherit the Draft banner/progress strip. For a
+    // Draft launch the marker is then re-armed with autoOpen and bound to the
+    // exact runId only after the job actually started (ack).
+    onResetDraftLaunch(details.workspace.id, project.name, intent.proofMode === 'DRAFT' ? autoOpenPrompt : false, intent.proofMode)
+    const started = await onRun({ action: 'baseline', workspaceId: details.workspace.id, projectName: project.name, target: effectiveTarget, label, releaseBranch, gateCommand, baselineResume: effectiveBaselineResume, baselineIntent: intent, commitMessage: `chore(deps): save ${project.name} roadmap state` })
+    // A failed start must not arm the completion banner or close the intent
+    // dialog: runAction already surfaced the error to the user, and the marker
+    // stays unbound (runId undefined) so no old result can match it later.
+    if (!started) return
     // Bind the launch marker to the exact runId only after the job starts; the
     // fresh banner and auto-open then match that run, never an older leftover.
     if (intent.proofMode === 'DRAFT') {
-      onMarkDraftLaunched(details.workspace.id, project.name, started?.runId, autoOpenPrompt)
+      onMarkDraftLaunched(details.workspace.id, project.name, started.runId, autoOpenPrompt, 'DRAFT')
     }
     // Completion is delivered through the runId-scoped draft result in
     // workspace details (main.ts imports artifacts/runs/<runId>/draft/*
@@ -570,18 +583,19 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
 
 // Live Draft progress: a compact strip of the current planner operation driven
 // by [draft-progress] events from the subprocess (heartbeat = how recently an
-// event arrived; elapsed ticks every second). It is planning-only by design and
-// must never claim physical verification of the project.
+// event arrived; the backend sends elapsed/budget/percent on every event). It
+// is planning-only by design and must never claim physical verification.
 function DraftLiveProgress({ startedAt, progress, runId }: { startedAt?: number; progress?: DraftProgressPayload; runId?: string }) {
   const { text } = useLanguage()
   const [elapsedSec, setElapsedSec] = useState(0)
   useEffect(() => {
-    if (!startedAt) return
-    const tick = () => setElapsedSec(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)))
+    const base = progress?.elapsedSec ?? startedAt
+    if (typeof base !== 'number') { setElapsedSec(0); return }
+    const tick = () => setElapsedSec(Math.max(0, Math.floor((progress?.elapsedSec ?? Date.now() - (startedAt ?? Date.now())) / 1000)))
     tick()
     const timer = window.setInterval(tick, 1000)
     return () => window.clearInterval(timer)
-  }, [startedAt])
+  }, [startedAt, progress?.elapsedSec, progress?.runId])
   const stepLabels: Record<string, string> = {
     inventory: text('Локальная инвентаризация', 'Local inventory'),
     scan: text('Обогащение зависимостей', 'Dependency enrichment'),
@@ -589,7 +603,12 @@ function DraftLiveProgress({ startedAt, progress, runId }: { startedAt?: number;
     finalize: text('Публикация Draft', 'Publishing the Draft'),
   }
   const stepLabel = progress?.step ? (stepLabels[progress.step] ?? progress.step) : text('Ожидаем первый результат планировщика…', 'Waiting for the planner…')
+  const backendElapsed = typeof progress?.elapsedSec === 'number' ? Math.max(0, Math.floor(progress.elapsedSec)) : elapsedSec
   const heartbeat = progress ? (Date.now() - progress.at > 8000 ? 'stale' : 'live') : 'wait'
+  const staleNote = heartbeat === 'stale'
+    ? text('планировщик молчит (нет событий — неизвестно, сколько ещё), поэтому время и бюджет могут быть неточными', 'planner is silent (no events — unknown how much is left), so time and budget may be inexact')
+    : undefined
+  const pct = typeof progress?.pct === 'number' ? Math.max(0, Math.min(100, progress.pct)) : undefined
   const progressParts = [
     progress?.package ? <code key="pkg">{progress.package}</code> : null,
     progress?.operation ? <span className="draft-live-op" key="op">{progress.operation}</span> : null,
@@ -597,17 +616,27 @@ function DraftLiveProgress({ startedAt, progress, runId }: { startedAt?: number;
     typeof progress?.completed === 'number' && typeof progress?.total === 'number' && progress.total > 0
       ? <span className="draft-live-count" key="count">{progress.completed}/{progress.total}</span>
       : null,
+    typeof progress?.budgetRemainingSec === 'number'
+      ? <span className="draft-live-budget" key="budget" title={text('Остаток бюджета запуска (без резерва на публикацию)', 'Remaining run budget (net of the publication reserve)')}>{text('бюджет', 'budget')} {progress.budgetRemainingSec.toFixed(0)}s</span>
+      : null,
   ]
   return (
     <div className="draft-live-progress" aria-label={text('Ход работы Draft', 'Draft progress')}>
       <div className="draft-live-heading">
         <strong>{stepLabel}</strong>
-        <span>{runId ? <code>{runId.slice(0, 12)}</code> : null}{text(` · ${elapsedSec}s`, ` · ${elapsedSec}s`)}</span>
+        <span>{runId ? <code>{runId.slice(0, 12)}</code> : null}{text(` · ${backendElapsed}s`, ` · ${backendElapsed}s`)}</span>
       </div>
       <div className="draft-live-strip">
         <span className={`draft-live-dot ${heartbeat}`} />
         {progressParts}
       </div>
+      {typeof pct === 'number' ? (
+        <div className="draft-live-meter" aria-label={text(`Прогресс ${pct}%`, `Progress ${pct}%`)}>
+          <div className="draft-live-meter-fill" style={{ width: `${pct}%` }} />
+          <span>{pct}%</span>
+        </div>
+      ) : null}
+      {staleNote ? <small className="draft-live-stale">{staleNote}</small> : null}
       <small>{text('Planning-only: install/lifecycle/project checks не выполняются, проект не изменяется.', 'Planning-only: no install/lifecycle/project checks are run, the project is not modified.')}</small>
     </div>
   )

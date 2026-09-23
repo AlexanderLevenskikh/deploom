@@ -1,15 +1,19 @@
 from pathlib import Path
 import ast
+import json
 import os
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 import dependency_live_roadmap_generator as roadmap
 
 ROOT = Path(__file__).resolve().parents[1]
 GENERATOR = (ROOT / "dependency_live_roadmap_generator.py").read_text(encoding="utf-8")
 DESKTOP_MAIN = (ROOT / "desktop" / "electron" / "main.ts").read_text(encoding="utf-8")
+DRAFT_READER = (ROOT / "desktop" / "electron" / "draft-artifact-reader.ts").read_text(encoding="utf-8")
 DIALOG = (ROOT / "desktop" / "src" / "components" / "BaselineIntentDialog.tsx").read_text(encoding="utf-8")
 TYPES = (ROOT / "desktop" / "src" / "types.ts").read_text(encoding="utf-8")
 
@@ -72,10 +76,12 @@ def test_desktop_draft_is_invocation_local_and_does_not_advance_flow() -> None:
     assert "DRAFT_BASELINE_AUTOPILOT_FORBIDDEN" in DESKTOP_MAIN
     # Draft finalizes exclusively through its run-scoped artifacts: the import
     # is scoped to the exact run/project and a missing manifest is a typed
-    # FAILED result instead of a silent exit-0 success (R1).
+    # FAILED result instead of a silent exit-0 success (R1/T1).
     assert "if (job.baselineProofMode === 'DRAFT')" in DESKTOP_MAIN
     assert "importDraftResult(job.workspace, job.projectName, job.runId)" in DESKTOP_MAIN
-    assert "DRAFT_RESULT_MISSING" in DESKTOP_MAIN
+    assert "importDraftResult" in DESKTOP_MAIN
+    assert "draftReadFailureText" in DESKTOP_MAIN
+    assert "DRAFT_RESULT_MISSING" in DRAFT_READER
     assert "DRAFT_RUN_ID_MISSING" in DESKTOP_MAIN
     # The verified snapshot path stays separate: Draft never snapshots legacy
     # roadmap outputs into the shared verified UI cache (R5).
@@ -86,11 +92,15 @@ def test_desktop_draft_is_invocation_local_and_does_not_advance_flow() -> None:
 
 def test_desktop_draft_writer_and_reader_resolve_the_same_artifact_root() -> None:
     # R6: writer passes --artifacts-dir <ws>/.dependency-roadmap/artifacts and
-    # the reader must resolve the SAME path, regardless of where
-    # settings.project.json lives (root-level vs .dependency-roadmap).
+    # the reader (production module used by main.ts) must resolve the SAME
+    # path, regardless of where settings.project.json lives (root-level vs
+    # .dependency-roadmap). Both sides are the `.dependency-roadmap/artifacts`
+    # convention spelled identically in the two languages.
     assert "'--artifacts-dir', join(workspace.path, '.dependency-roadmap', 'artifacts')" in DESKTOP_MAIN
-    assert "return join(workspace.path, '.dependency-roadmap', 'artifacts')" in DESKTOP_MAIN
-    assert "function draftManifestPath" in DESKTOP_MAIN
+    assert "join(workspacePath, '.dependency-roadmap', 'artifacts')" in DRAFT_READER
+    assert "draftArtifactsRoot" in DESKTOP_MAIN
+    assert "draftManifestPath" in DRAFT_READER
+    assert "draftReadStrict(workspace" in DESKTOP_MAIN
 
 
 def test_generator_draft_skips_legacy_roadmap_writes() -> None:
@@ -313,9 +323,11 @@ def test_draft_manifest_and_command_line_contract_is_run_scoped() -> None:
 def test_r9_numeric_target_policy_changes_health_gate_and_hash() -> None:
     """R9: the user's freshness goal is effective, not a label.
 
-    80 -> 90 moves the real yellow gate (and the green/planning closures), the
+    80 -> 90 moves the real yellow gate (and the planning closure) and the
     policy hash and the prompt's numeric goal; the old hardcoded-80 contract is
-    gone from the planner.
+    gone from the planner. Green always closes at 100% (T2): the green label
+    == "every library matches its own lag policy", identical to the actual
+    green status criterion (lag_bad == 0), so the projection is not softer.
     """
     from unittest import mock
 
@@ -325,7 +337,7 @@ def test_r9_numeric_target_policy_changes_health_gate_and_hash() -> None:
     with mock.patch.object(roadmap, "EFFECTIVE_MIN_LAG_OK_PCT", 80):
         assert _ratio(10, roadmap.health_yellow_ratio()[0] / roadmap.health_yellow_ratio()[1] * 100) == 8
         assert roadmap.required_ratio_count(10, roadmap.health_yellow_ratio()) == 8
-        assert roadmap.required_ratio_count(10, roadmap.health_green_ratio()) == 9
+        assert roadmap.required_ratio_count(10, roadmap.health_green_ratio()) == 10
         assert roadmap.required_ratio_count(10, roadmap.health_planning_ratio()) == 9
     with mock.patch.object(roadmap, "EFFECTIVE_MIN_LAG_OK_PCT", 90):
         assert roadmap.required_ratio_count(10, roadmap.health_yellow_ratio()) == 9
@@ -388,9 +400,11 @@ def test_r9_numeric_target_policy_changes_health_gate_and_hash() -> None:
 
 
 def test_r9_green_closure_is_honest_not_partial_as_success() -> None:
-    """Green closure (gate + 10) is an independent, honest projection: it is
-    never reported as reached just because the run published (even though the
-    plan carries both yellow and green projections for every row)."""
+    """Green closure (100% of every library's own lag policy, T2) is an
+    independent, honest projection: it is never reported as reached just
+    because the run published (even though the plan carries both yellow and
+    green projections for every row)."""
+
     health = roadmap.compute_project_health([_make_row(
         current_version="1.0.0",
         min_lag_12m="2.0.0",
@@ -398,12 +412,267 @@ def test_r9_green_closure_is_honest_not_partial_as_success() -> None:
         min_lag_6m=roadmap.NO_ACTION,
         min_lag_3m=roadmap.NO_ACTION,
     )], "tiny-basic", None)
-    # Default 80% gate: 1/1 is known, so yellow gate (80%) is already met but
-    # green closure (90%) is not; the green shortfall must be visible instead of
-    # being collapsed into yellow or into the run's partial status.
+    # Default 80% gate: this row is 0/1 compliant, so the yellow gate (80%) is
+    # still unmet and the green closure (100%) is unmet too; both shortfalls
+    # must be visible instead of being collapsed into the run's partial status.
     assert health.green_required == 1
     assert health.green_projected_lag_ok == 0
     assert health.green_plan_shortfall == 1
     assert health.lag_needed_for_yellow == 1
     assert "green_required" in roadmap.dataclasses.asdict(health)
     assert "green_projected_lag_ok" in roadmap.dataclasses.asdict(health)
+
+
+def _lag_ok_row(**overrides):
+    base = dict(
+        project="tiny-basic", package_dir="C:/projects/tiny-basic", name="uuid",
+        kind="runtime", requested_spec="10.0.0", current_version="10.0.0",
+        current_source="package-lock.json", latest_version="10.2.0", current_vulns="0",
+        min_no_critical="10.2.0", min_no_high="10.2.0", min_no_vuln="10.2.0",
+        min_lag_12m="10.0.0", min_lag_9m="10.0.0", min_lag_6m="10.0.0", min_lag_3m="10.0.0",
+        group=2, reason="runtime/API hygiene", notes="",
+    )
+    base.update(overrides)
+    return roadmap.DependencyRow(**base)
+
+
+def test_t3_green_requires_known_security() -> None:
+    # A row whose OSV state is unknown must not produce a green verdict: unknown
+    # is never treated as zero/healthy (T3).
+    h = roadmap.compute_project_health([_lag_ok_row(current_vulns="unknown")], "tiny-basic", None)
+    assert h.total == 1
+    assert h.lag_bad_12m == 0
+    assert h.unknown == 1
+    assert h.security_unknown == 1
+    assert h.status != "green"
+    assert "security неизвестна" in h.reason
+    assessed = roadmap.compute_project_health([_lag_ok_row(current_vulns="0")], "tiny-basic", None)
+    assert assessed.status == "green"
+    assert assessed.security_unknown == 0
+
+
+def test_t3_unknown_security_with_known_metadata_reaches_plan_and_prompt() -> None:
+    row = _lag_ok_row(current_vulns="unknown")
+    health = roadmap.compute_project_health([row], "tiny-basic", None)
+    plan = roadmap.build_draft_plan({"tiny-basic": [row]}, {}, {"tiny-basic": health})
+    assert plan["counts"]["unknown-security"] == 1
+    entry = next(u for u in plan["unknowns"] if u["package"] == "uuid")
+    assert entry["clarity"] == "security"
+    assert "OSV" in entry["reason"]
+    prompt = roadmap.build_draft_prompt(
+        "run-t3", "ws", "tiny-basic", "draft", "hash",
+        plan, {}, language="ru", snapshot={"targetLevel": "yellow", "minLagOkPct": "80"},
+    )
+    assert "security coverage" in prompt
+    assert "уязвимости неизвестны" in prompt
+    assert "OSV" in prompt
+
+
+def test_t3_empty_known_denominator_is_insufficient_data_not_100() -> None:
+    row = _make_row()  # registry unavailable + unknown lag/vuln
+    h = roadmap.compute_project_health([row], "tiny-basic", None)
+    assert h.total == 0
+    assert h.lag_unknown == 1
+    assert h.insufficient_data is True
+    assert h.lag_ok_pct == 0.0
+    assert h.status == "yellow"
+    assert "недостаточно данных" in h.reason
+    plan = roadmap.build_draft_plan({"tiny-basic": [row]}, {}, {"tiny-basic": h})
+    prompt = roadmap.build_draft_prompt(
+        "run-t3", "ws", "tiny-basic", "draft", "hash",
+        plan, {}, language="ru", snapshot={"targetLevel": "yellow", "minLagOkPct": "80"},
+    )
+    assert "недостаточно данных" in prompt
+
+
+def test_t3_keep_current_stays_in_health_but_explicit_exclude_removes() -> None:
+    keep = _lag_ok_row(name="is-number", current_vulns="unknown")
+    normal = _lag_ok_row(name="uuid")
+    rows = [keep, normal]
+    with mock.patch.dict(os.environ, {"DEPLOOM_BASELINE_INTENT_JSON": json.dumps(
+        {"schemaVersion": 1, "policies": {"is-number": "keep-current"}})}, clear=False):
+        roadmap._BASELINE_INTENT_CACHE_RAW = "<unset>"
+        roadmap._apply_baseline_intent_scope({"tiny-basic": rows})
+    # keep-current defers the update but stays inside the health score (T3).
+    assert not keep.scope_excluded
+    assert keep.planner_deferred
+    h = roadmap.compute_project_health(rows, "tiny-basic", None)
+    assert h.excluded == 0
+    assert h.total == 2
+    assert h.metadata_total == 2
+    assert h.security_total == 2
+    assert h.security_unknown == 1
+    # Explicit exclusion has a reason/size and does remove the row from the score.
+    leftout = _lag_ok_row(name="leftout")
+    leftout.scope_excluded = True
+    leftout.exclusion_reason = "пользователь исключил: отдельный реестр"
+    leftout.exclusion_source = "user"
+    h2 = roadmap.compute_project_health(rows + [leftout], "tiny-basic", None)
+    assert h2.excluded == 1
+    assert h2.total == 2
+    assert h2.metadata_total == 2
+    assert h2.security_total == 2
+
+
+def test_t3_critical_never_green_even_when_lag_compliant() -> None:
+    h = roadmap.compute_project_health([_lag_ok_row(current_vulns="C:1")], "tiny-basic", None)
+    assert h.status == "red"
+    assert "Critical" in h.reason
+    high2 = roadmap.compute_project_health([_lag_ok_row(current_vulns="H:2")], "tiny-basic", None)
+    assert high2.status != "green"
+    high1 = roadmap.compute_project_health([_lag_ok_row(current_vulns="H:1")], "tiny-basic", None)
+    assert high1.status != "green"
+
+
+class DraftDeadlineHardBoundTests(unittest.TestCase):
+    """T4: the Draft deadline is an absolute monotonic bound, not a hint.
+
+    These run real HTTP (no mocks) against a local server, mirroring the
+    validator's slow-trickle reproduction.
+    """
+
+    def _trickle_client(self, port: int, deadline_seconds: float):
+        client = roadmap.LiveDataClient(
+            f"http://127.0.0.1:{port}", timeout=30, batch_size=1, sleep_sec=0.001,
+            use_system_proxy=False,
+        )
+        client.set_deadline(roadmap.DeadlineClock(deadline_seconds))
+        return client
+
+    def test_slow_trickle_metadata_is_aborted_by_the_deadline(self) -> None:
+        import threading
+        import http.server
+        import socketserver
+
+        body = json.dumps({
+            "name": "uuid", "dist-tags": {"latest": "10.0.0"},
+            "versions": {"10.0.0": {"name": "uuid", "version": "10.0.0"}},
+        }).encode("utf-8")
+        # 24 bytes x 150ms = ~3.6s natural transfer. The per-byte read timeout
+        # (1s) is never hit, so only the monotonic deadline can stop the read.
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    for byte in body:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.15)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *args):  # noqa: N802
+                pass
+
+        with socketserver.TCPServer(("127.0.0.1", 0), _Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            started = time.monotonic()
+            try:
+                with self.assertRaises(roadmap.DraftBudgetExceeded):
+                    self._trickle_client(server.server_address[1], 2.0).fetch_npm_metadata("uuid")
+            finally:
+                server.shutdown()
+                server.server_close()
+            elapsed = time.monotonic() - started
+        # deadline 2.0s with a 1.0s finalize reserve: the slow trickle must be
+        # cut off well before the natural ~3.6s transfer (and not return a
+        # "success" that silently overran the budget).
+        self.assertLess(elapsed, 2.5, f"trickle must abort at the deadline, took {elapsed:.2f}s")
+
+    def test_budgeted_timeout_is_fractional_and_reserves_finalization(self) -> None:
+        client = roadmap.LiveDataClient("http://registry.invalid", timeout=30, batch_size=1, sleep_sec=0, use_system_proxy=False)
+        client.set_deadline(roadmap.DeadlineClock(9.5))
+        connect, read = client._budgeted_timeout()
+        # Fractional remainders are preserved (no floor-to-1s) and the
+        # publication reserve is withheld from network work.
+        self.assertGreater(read, 8.0)
+        self.assertLessEqual(read, 9.5 - 1.0 + 1e-9)
+        self.assertLess(connect, 9.5)
+        # Less than the reserve left -> the call must fail fast instead of
+        # starting a request that would eat the publication slice.
+        tiny = roadmap.LiveDataClient("http://registry.invalid", timeout=30, batch_size=1, sleep_sec=0, use_system_proxy=False)
+        tiny.set_deadline(roadmap.DeadlineClock(0.2))
+        with self.assertRaises(roadmap.DraftBudgetExceeded):
+            tiny._budgeted_timeout()
+        # Bounded sleep cannot outlive the remaining budget either.
+        sleeper = roadmap.LiveDataClient("http://registry.invalid", timeout=30, batch_size=1, sleep_sec=0, use_system_proxy=False)
+        sleeper.set_deadline(roadmap.DeadlineClock(5.0))
+        sleeper._bounded_sleep(60.0)
+        self.assertGreaterEqual(sleeper.deadline.remaining, 1.0 - 0.5)
+
+
+def _row_with_variants(**overrides):
+    base = dict(
+        project="tiny-basic", package_dir="C:/projects/tiny-basic", name="uuid",
+        kind="runtime", requested_spec="10.0.0", current_version="10.0.0",
+        current_source="package-lock.json", latest_version="10.2.0", current_vulns="0",
+        min_no_critical="10.2.0", min_no_high="10.2.0", min_no_vuln="10.2.0",
+        min_lag_12m="10.0.0", min_lag_9m="10.0.0", min_lag_6m="10.0.0", min_lag_3m="10.0.0",
+        group=2, reason="runtime/API hygiene", notes="",
+    )
+    base.update(overrides)
+    return roadmap.DependencyRow(**base)
+
+
+def test_t2_draft_target_follows_effective_target_level() -> None:
+    """T2: the chosen goal level selects the plan variant.
+
+    Green and yellow planners can legitimately pick different targets; the
+    effective level (DEPLOOM_BASELINE_TARGET_LEVEL / --target-level) must pick
+    which one becomes the executor handoff. The old code always took
+    target_default/yellow, so a "green" run could hand out a yellow plan.
+    """
+    from unittest import mock
+
+    row = _row_with_variants(
+        target_default="10.1.0",
+        target_yellow="10.1.0",
+        target_green="10.2.0",
+    )
+    with mock.patch.object(roadmap, "EFFECTIVE_TARGET_LEVEL", "green"):
+        assert roadmap._draft_target_for_major(row) == "10.2.0"
+    with mock.patch.object(roadmap, "EFFECTIVE_TARGET_LEVEL", "yellow"):
+        assert roadmap._draft_target_for_major(row) == "10.1.0"
+    # Fallback: when the chosen level planned nothing, the default (legacy
+    # handoff) and then the other variant still resolve.
+    no_green = _row_with_variants(target_default=roadmap.NO_ACTION, target_yellow="10.3.0", target_green=roadmap.NO_ACTION)
+    with mock.patch.object(roadmap, "EFFECTIVE_TARGET_LEVEL", "green"):
+        assert roadmap._draft_target_for_major(no_green) == "10.3.0"
+    # Deferred / excluded rows stay inert regardless of the level.
+    deferred = _row_with_variants(target_green="10.2.0", planner_deferred=True)
+    with mock.patch.object(roadmap, "EFFECTIVE_TARGET_LEVEL", "green"):
+        assert roadmap._draft_target_for_major(deferred) == roadmap.NO_ACTION
+
+
+def test_t2_zero_percent_goal_is_not_coerced_to_default() -> None:
+    """T2: 0% is a legitimate goal ("no lag-policy slack at the gate").
+
+    One lag-compliant library out of ten must satisfy a 0% gate; the old
+    `int(raw) or 80`-style coercion would silently demand the 80% default.
+    """
+    from unittest import mock
+
+    with mock.patch.object(roadmap, "EFFECTIVE_MIN_LAG_OK_PCT", 0):
+        assert roadmap.required_ratio_count(10, roadmap.health_yellow_ratio()) == 0
+        assert roadmap.required_ratio_count(10, roadmap.health_green_ratio()) == 10
+        health = roadmap.compute_project_health([_lag_ok_row()] + [_lag_hard_row() for _ in range(9)], "tiny-basic", None)
+        assert health.lag_ok_12m == 1
+        assert health.lag_needed_for_yellow == 0
+
+
+def _lag_hard_row(**overrides):
+    base = dict(
+        project="tiny-basic", package_dir="C:/projects/tiny-basic", name="uuid",
+        kind="runtime", requested_spec="9.0.0", current_version="9.0.0",
+        current_source="package-lock.json", latest_version="9.9.0", current_vulns="0",
+        min_no_critical="9.9.0", min_no_high="9.9.0", min_no_vuln="9.9.0",
+        min_lag_12m="9.9.0", min_lag_9m="9.9.0", min_lag_6m="9.9.0", min_lag_3m="9.9.0",
+        group=2, reason="runtime/API hygiene", notes="",
+    )
+    base.update(overrides)
+    return roadmap.DependencyRow(**base)

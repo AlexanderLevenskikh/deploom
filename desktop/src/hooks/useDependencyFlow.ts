@@ -68,7 +68,7 @@ type AutopilotState = AutopilotPolicyState & {
   infrastructureCounts: Record<string, number>
 }
 
-export type DraftProgressPayload = { runId?: string; project?: string; step?: string; package?: string; operation?: string; completed?: number; total?: number; retry?: number; status?: string; at: number }
+export type DraftProgressPayload = { runId?: string; project?: string; step?: string; package?: string; operation?: string; completed?: number; total?: number; retry?: number; status?: string; elapsedSec?: number; budgetRemainingSec?: number; pct?: number; at: number }
 
 const MAX_AUTOPILOT_RECOVERY_CYCLES = 8
 const MAX_AUTOPILOT_INFRA_RETRIES = 3
@@ -98,24 +98,38 @@ export function useDependencyFlow() {
   const [draftProgress, setDraftProgress] = useState<Record<string, DraftProgressPayload>>({})
   // Draft-launch markers survive FlowWorkspace remounts (Graph/Dashboard → FLOW)
   // because they live next to the active-run state. A marker records which run
-  // the user launched, whether its prompt should auto-open on completion, and
-  // is matched by runId so an old result is never presented as the new run's.
-  type DraftLaunchMarker = { workspaceId?: string; projectName: string; runId?: string; autoOpen: boolean; at: number }
+  // the user launched, whether its prompt should auto-open on completion, its
+  // proof mode (a Verified run must never inherit a Draft banner), the runId it
+  // was bound to, and the runId the user already acknowledged (banner dismiss /
+  // auto-open are one-shot per run, surviving remounts). It is matched by
+  // runId so an old result is never presented as the new run's.
+  type DraftLaunchMarker = { workspaceId?: string; projectName: string; runId?: string; autoOpen: boolean; proofMode?: 'DRAFT' | 'VERIFIED'; acknowledgedRunId?: string; at: number }
   const [draftLaunches, setDraftLaunches] = useState<Record<string, DraftLaunchMarker>>({})
-  const markDraftLaunched = useCallback((workspaceId: string | undefined, projectName: string, runId?: string, autoOpen?: boolean) => {
+  const markDraftLaunched = useCallback((workspaceId: string | undefined, projectName: string, runId?: string, autoOpen?: boolean, proofMode?: 'DRAFT' | 'VERIFIED') => {
     setDraftLaunches((current) => {
       const key = `${workspaceId ?? ''}::${projectName ?? ''}`
       const previous = current[key]
-      return { ...current, [key]: { workspaceId, projectName, runId: runId ?? previous?.runId, autoOpen: autoOpen ?? previous?.autoOpen ?? false, at: Date.now() } }
+      return { ...current, [key]: { workspaceId, projectName, runId: runId ?? previous?.runId, autoOpen: autoOpen ?? previous?.autoOpen ?? false, proofMode: proofMode ?? previous?.proofMode, acknowledgedRunId: previous?.acknowledgedRunId, at: Date.now() } }
     })
   }, [])
-  // Launching a new Draft deliberately unbinds any previous runId: while the
-  // new job is starting, an older leftover result must not match the marker
-  // (fresh banner or auto-open). The runId is bound once runAction resolves.
-  const resetDraftLaunch = useCallback((workspaceId: string | undefined, projectName: string, autoOpen?: boolean) => {
+  // Launching a new baseline deliberately unbinds any previous runId and proof
+  // mode: while the new job is starting, an older leftover result must not
+  // match the marker (fresh banner or auto-open), and a Verified run must not
+  // claim to be a Draft. The runId is bound once runAction resolves.
+  const resetDraftLaunch = useCallback((workspaceId: string | undefined, projectName: string, autoOpen?: boolean, proofMode?: 'DRAFT' | 'VERIFIED') => {
     setDraftLaunches((current) => {
       const key = `${workspaceId ?? ''}::${projectName ?? ''}`
-      return { ...current, [key]: { workspaceId, projectName, runId: undefined, autoOpen: Boolean(autoOpen), at: Date.now() } }
+      return { ...current, [key]: { workspaceId, projectName, runId: undefined, autoOpen: Boolean(autoOpen), proofMode, acknowledgedRunId: undefined, at: Date.now() } }
+    })
+  }, [])
+  // One-shot per run, surviving remounts: after the user dismisses the fresh
+  // Draft banner (or it auto-opened), the same runId is never presented again.
+  const acknowledgeDraftRun = useCallback((workspaceId: string | undefined, projectName: string, runId: string | undefined) => {
+    if (!runId) return
+    setDraftLaunches((current) => {
+      const key = `${workspaceId ?? ''}::${projectName ?? ''}`
+      const previous = current[key]
+      return previous ? { ...current, [key]: { ...previous, acknowledgedRunId: runId } } : current
     })
   }, [])
   const viewEpochRef = useRef(0)
@@ -659,7 +673,7 @@ export function useDependencyFlow() {
   ), [logs, selectedProject?.name, selectedWorkspaceId])
 
   return {
-    payload, loading, error, baselineDecision, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch,
+    payload, loading, error, baselineDecision, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch, acknowledgeDraftRun,
     load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, removeProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches,
     runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult, getDependencyGraphSnapshot, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }

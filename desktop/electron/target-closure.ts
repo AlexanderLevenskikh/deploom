@@ -23,6 +23,7 @@ export type TargetClosure = {
   lagOkPct?: number
   lagOk?: number
   total?: number
+  minLagOkPct?: number
   remainingPackages: string[]
   lagBlockers: LagBlocker[]
   neededForYellow?: number
@@ -57,7 +58,11 @@ function targetCoversMinimum(target: unknown, minimum: unknown): boolean {
   return true
 }
 
-export function targetClosureFromRoadmap(value: unknown, project: string, target: ClosureTarget): TargetClosure {
+// T2: the yellow release gate is the user's effective lag-compliance percent,
+// not a hard-coded 80. `minLagOkPct` (0..100) threads the loadBaselineIntent
+// value through the caller; green always closes at 100% (the generator's
+// green status already means lag_bad == 0).
+export function targetClosureFromRoadmap(value: unknown, project: string, target: ClosureTarget, minLagOkPct = 80): TargetClosure {
   const roadmap = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   const healthByProject = roadmap.project_health && typeof roadmap.project_health === 'object' ? roadmap.project_health as Record<string, unknown> : {}
   const rawHealth = healthByProject[project] && typeof healthByProject[project] === 'object' ? healthByProject[project] as Record<string, unknown> : {}
@@ -114,7 +119,8 @@ export function targetClosureFromRoadmap(value: unknown, project: string, target
   })
   const lagOk = typeof rawHealth.lag_ok_12m === 'number' ? rawHealth.lag_ok_12m : undefined
   const total = typeof rawHealth.total === 'number' ? rawHealth.total : undefined
-  const yellowThreshold = total !== undefined ? Math.ceil(total * 0.8) : undefined
+  const yellowPct = Math.max(0, Math.min(100, Number.isFinite(minLagOkPct) ? minLagOkPct : 80))
+  const yellowThreshold = target === 'yellow' && total !== undefined ? Math.ceil((total * yellowPct) / 100) : undefined
   const projectedLagOk = target === 'yellow' && typeof rawHealth.yellow_projected_lag_ok === 'number'
     ? rawHealth.yellow_projected_lag_ok
     : undefined
@@ -148,6 +154,7 @@ export function targetClosureFromRoadmap(value: unknown, project: string, target
     reached,
     target,
     current: status,
+    ...(target === 'yellow' ? { minLagOkPct: yellowPct } : {}),
     ...(typeof rawHealth.lag_ok_pct === 'number' ? { lagOkPct: rawHealth.lag_ok_pct } : {}),
     ...(typeof rawHealth.lag_ok_12m === 'number' ? { lagOk: rawHealth.lag_ok_12m } : {}),
     ...(typeof rawHealth.total === 'number' ? { total: rawHealth.total } : {}),
@@ -171,6 +178,7 @@ export function targetClosureFromRoadmapWithTargets(
   project: string,
   target: ClosureTarget,
   plannedTargets: Readonly<Record<string, string>>,
+  minLagOkPct = 80,
 ): TargetClosure {
   const entries = Object.entries(plannedTargets).filter(([, version]) => Boolean(semverParts(version)))
   if (!entries.length || !value || typeof value !== 'object') return targetClosureFromRoadmap(value, project, target)
@@ -203,7 +211,7 @@ export function targetClosureFromRoadmapWithTargets(
     ...roadmap,
     projects: { ...projects, [project]: rows },
     project_health: { ...healthByProject, [project]: health },
-  }, project, target)
+  }, project, target, minLagOkPct)
 }
 
 // Splits blockers by the only distinction that changes what the user should
@@ -245,7 +253,7 @@ export function targetClosureMessage(closure: TargetClosure): string {
   const targetLabel = closure.target === 'yellow' ? 'Жёлтый' : 'Зелёный'
   const percent = typeof closure.lagOkPct === 'number' ? ` · ${closure.lagOkPct.toFixed(1)}%` : ''
   const fraction = typeof closure.lagOk === 'number' && typeof closure.total === 'number' ? ` (${closure.lagOk} из ${closure.total})` : ''
-  const threshold = closure.target === 'yellow' ? ' Для жёлтого требуется не менее 80% и отсутствие Critical.' : ' Для зелёного должны быть выполнены все критерии зелёного уровня.'
+  const threshold = closure.target === 'yellow' ? ` Для жёлтого требуется не менее ${closure.minLagOkPct ?? 80}% и отсутствие Critical.` : ' Для зелёного должны быть выполнены все критерии зелёного уровня.'
   const { fixable, stuck } = splitLagBlockers(closure)
   const short = (list: LagBlocker[], limit = 6) => `${list.slice(0, limit).map((blocker) => blocker.package).join(', ')}${list.length > limit ? `, ещё ${list.length - limit}` : ''}`
   // The whole point of this message is that the user should not have to guess
