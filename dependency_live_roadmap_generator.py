@@ -5630,19 +5630,17 @@ def _candidate_satisfies_fast_policy(
         ("L", max_low),
     )
     for severity, limit in severity_limits:
-        overstated = [r for r in active if parse_vuln_counts(r.current_vulns).get(severity, 0) > 0]
-        aggregate = sum(parse_vuln_counts(r.current_vulns).get(severity, 0) for r in overstated)
-        if aggregate <= limit:
-            continue
-        # N2/N3: judge the EXACT version each verified candidate chose (its own
-        # OSV evidence) and sum only what REMAINS after the candidate's fixes.
-        # A version-comparison shortcut cannot prove safety (a new version may
-        # reintroduce a finding), and no evidence for the exact version is
-        # unknown -> the Fast stop must not claim the goal. Counting remaining
-        # findings (not "every overstated package must be fully clean") lets a
-        # partial fix that leaves exactly the allowed High satisfy the policy.
+        # B1: EVERY active package's EXACT chosen version is the subject for
+        # each severity, including packages whose CURRENT version carries zero
+        # findings. The old "current aggregate <= limit -> continue" skip meant
+        # a verified candidate could bump a clean package onto a vulnerable
+        # version (or onto a version with no OSV evidence) without the gate
+        # noticing. Missing evidence for the exact version is unknown -> Fast
+        # must not claim the goal. N3 is preserved: a partial fix that leaves
+        # exactly the allowed remaining findings (remaining <= limit) still
+        # satisfies the policy.
         remaining = 0
-        for r in overstated:
+        for r in active:
             planned = str(
                 candidate_targets.get(r.name) or current_targets.get(r.name) or r.current_version or ""
             ).strip()

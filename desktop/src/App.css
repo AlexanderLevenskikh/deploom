@@ -11,8 +11,8 @@
 .notification-toggle input { margin: 0; accent-color: var(--blue); }
 .button { min-height: 32px; border-radius: 5px; border: 1px solid var(--border-strong); padding: 0 12px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; cursor: pointer; background: #fff; font-size: 12px; font-weight: 600; white-space: nowrap; }
 .button:hover:not(:disabled) { background: var(--surface-hover); }
-.button.primary { border-color: var(--blue); background: var(--blue); color: #fff; }
-.button.primary:hover:not(:disabled) { background: var(--blue-hover); }
+.button.primary { border-color: var(--blue-fill, var(--blue)); background: var(--blue-fill, var(--blue)); color: #fff; }
+.button.primary:hover:not(:disabled) { background: var(--blue-fill-hover, var(--blue-hover)); }
 .button.secondary { background: #fff; }
 .button.wide { width: 100%; }
 .button:disabled, .icon-button:disabled { opacity: .5; cursor: not-allowed; }

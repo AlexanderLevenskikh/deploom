@@ -1,13 +1,21 @@
 // Dev-only harness (not referenced by index.html, never part of the prod
 // bundle): mounts BaselineIntentDialog against a synthetic 77/200-package plan
-// so the N6 (footer clipping) and N7 (restart flow) fixes can be verified in a
-// real browser DOM. Reachable only at /e2e-harness.html under the vite dev
-// server; `vite build` uses index.html as its sole input.
+// so the N6 (footer clipping), N7 (restart flow) and B2 (CTA visibility) checks
+// can be verified in a real browser DOM. Reachable only at /e2e-harness.html
+// under the vite dev server; `vite build` uses index.html as its sole input.
+//
+// B2: the harness loads the SAME base theme as the production shell (index.css
+// first, then App.css) because `.button.primary` colours come from CSS
+// variables defined in index.css -- without it the CTA renders as white text on
+// a transparent background and the "footer is in the viewport" check is
+// meaningless. The RU/EN toggle and the __harnessStyles probe make the visual
+// audit reproducible.
 import { createRoot } from 'react-dom/client'
 import { useState } from 'react'
 import type { BaselineIntentPlan } from '../types'
-import { LanguageProvider } from '../i18n'
+import { LanguageProvider, useLanguage } from '../i18n'
 import { BaselineIntentDialog } from '../components/BaselineIntentDialog'
+import '../index.css'
 import '../App.css'
 
 function makePlan(count: number): BaselineIntentPlan {
@@ -34,6 +42,17 @@ function makePlan(count: number): BaselineIntentPlan {
 
 type Resume = 'auto' | 'continue' | 'restart'
 
+function LangToggle() {
+  const { language, setLanguage } = useLanguage()
+  return (
+    <div className="controls" style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+      <span style={{ alignSelf: 'center', color: '#9fb4d0' }}>Language:</span>
+      <button type="button" data-lang="en" className={language === 'en' ? 'active' : ''} onClick={() => setLanguage('en')}>EN</button>
+      <button type="button" data-lang="ru" className={language === 'ru' ? 'active' : ''} onClick={() => setLanguage('ru')}>RU</button>
+    </div>
+  )
+}
+
 function Harness() {
   const [plan, setPlan] = useState<{ plan: BaselineIntentPlan; resume: Resume } | undefined>(undefined)
   const [log, setLog] = useState<string[]>([])
@@ -41,6 +60,7 @@ function Harness() {
 
   return (
     <LanguageProvider>
+      <LangToggle />
       <div
         onClick={(event) => {
           const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-open]')
@@ -84,7 +104,32 @@ createRoot(document.getElementById('dialog-root') as HTMLElement).render(<Harnes
 declare global {
   interface Window {
     __harnessState?: () => string
+    __harnessStyles?: () => {
+      language: string
+      primary: { background: string; color: string; top: number; bottom: number; width: number; height: number }
+      viewport: { width: number; height: number }
+    }
   }
 }
 
 window.__harnessState = () => document.getElementById('harness-state')?.textContent ?? ''
+
+window.__harnessStyles = () => {
+  const button = document.querySelector<HTMLElement>('.baseline-intent-actions .button.primary')
+  const lang = document.documentElement.lang
+  if (!button) return { language: lang, primary: null as never, viewport: { width: window.innerWidth, height: window.innerHeight } }
+  const style = getComputedStyle(button)
+  const rect = button.getBoundingClientRect()
+  return {
+    language: lang,
+    primary: {
+      background: style.backgroundColor,
+      color: style.color,
+      top: Math.round(rect.top),
+      bottom: Math.round(rect.bottom),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    },
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+  }
+}

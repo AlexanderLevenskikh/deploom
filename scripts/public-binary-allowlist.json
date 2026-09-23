@@ -5,5 +5,8 @@
   ".playwright-mcp/flow-after-tab-return.png": "db797faf786e2cb36d1abeaf3e9c6d83c16f86d655d97c6d667f31c221aad369",
   ".playwright-mcp/r10-flow-live.png": "efab9464bdf3cc6a1661cc062718acbf23ea1345727453d86011ae1764333a95",
   "assets/revalidation-7-dialog-fixed.png": "2c64827858792f1f411757d14ea900bdba3b72fd9372bd4dfdf6c5cc49651dd2",
-  "assets/revalidation-7-dialog-restart-banner.png": "1da222971b75b46703270dde18e8339a2a7f14584cc9160c0a7f32eac306b96a"
+  "assets/revalidation-7-dialog-restart-banner.png": "1da222971b75b46703270dde18e8339a2a7f14584cc9160c0a7f32eac306b96a",
+  "assets/revalidation-8-dialog-cta-en.png": "37e3544d35baa1475e0aeb5c09a28bc0ab72291d3175db8101221be03170fe79",
+  "assets/revalidation-8-dialog-cta-ru.png": "1c54bc38867b2832e7f96e58c7ad7befc704e30c5bf72431aae05b6fa5377a68",
+  "assets/revalidation-8-dialog-cta-minwindow.png": "25f33eff3fb8fe2b8d98cfb7d5ce5a6cda9e4e245cceec48c13c9f18a5f66fc3"
 }

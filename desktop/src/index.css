@@ -15,6 +15,8 @@
   --blue: #1769e0;
   --blue-hover: #0f5bc7;
   --blue-soft: #eef5ff;
+  --blue-fill: #1769e0;
+  --blue-fill-hover: #0f5bc7;
   --green: #16853b;
   --green-soft: #edf8f0;
   --amber: #c67a00;
@@ -47,6 +49,8 @@ html[data-theme='dark'] {
   --blue: #6ea8ff;
   --blue-hover: #8bb8ff;
   --blue-soft: #172b50;
+  --blue-fill: #1769e0;
+  --blue-fill-hover: #0f5bc7;
   --green: #62d384;
   --green-soft: #163524;
   --amber: #f1b54d;
@@ -68,6 +72,8 @@ html[data-theme='dark'] {
     --blue: #6ea8ff;
     --blue-hover: #8bb8ff;
     --blue-soft: #172b50;
+    --blue-fill: #1769e0;
+    --blue-fill-hover: #0f5bc7;
     --green: #62d384;
     --green-soft: #163524;
     --amber: #f1b54d;
