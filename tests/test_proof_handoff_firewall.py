@@ -113,10 +113,12 @@ class ProofHandoffFirewallTests(unittest.TestCase):
     def test_production_handoff_contract_is_structurally_fail_closed(self) -> None:
         source = (ROOT / "dependency_live_roadmap_generator.py").read_text(encoding="utf-8")
         main = source[source.index("def main() -> None:"):]
-        self.assertIn(
-            "proven_assignments = resolve_peer_compatibility_with_verification(",
-            main,
-        )
+        # F3: the verified resolver is invoked inside the deadline-supervised
+        # planning phase; the handoff must still be the VERIFIED resolver (never
+        # the unverified planner) and its result must flow into the assignment
+        # that is later checked for conformance.
+        self.assertIn("proven_assignments = run_supervised(", main)
+        self.assertIn("lambda: resolve_peer_compatibility_with_verification(", main)
         self.assertNotIn("minimize_yellow_plan_after_compatibility(", main)
         self.assertIn("allow_target_mutation=False", main)
         self.assertIn("immutable_targets=True", main)

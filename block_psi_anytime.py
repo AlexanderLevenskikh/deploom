@@ -14,6 +14,9 @@ class BaselineCompletionStatus(str, Enum):
     VERIFIED_GOOD_ENOUGH = "VERIFIED_GOOD_ENOUGH"
     VERIFIED_TARGET_COMPLETE = "VERIFIED_TARGET_COMPLETE"
     VERIFIED_PARTIAL_SCOPE = "VERIFIED_PARTIAL_SCOPE"
+    # F6 FAST: expensive search stopped at the FIRST verified assignment that
+    # satisfies the chosen acceptance policy (its own small budget).
+    VERIFIED_POLICY_SATISFIED_FAST = "VERIFIED_POLICY_SATISFIED_FAST"
     SEARCH_BUDGET_EXHAUSTED_WITH_INCUMBENT = "SEARCH_BUDGET_EXHAUSTED_WITH_INCUMBENT"
     SEARCH_BUDGET_EXHAUSTED_NO_INCUMBENT = "SEARCH_BUDGET_EXHAUSTED_NO_INCUMBENT"
     USER_STOPPED_WITH_INCUMBENT = "USER_STOPPED_WITH_INCUMBENT"
@@ -89,6 +92,13 @@ class AutomaticBudgetPolicy:
     stagnation_rejections: int = 3
     pre_incumbent_minimization_probes: int = 2
     pre_incumbent_minimization_seconds: float = 300
+    # F6: the product search strategy, distinct from the transport --mode flag.
+    #   "fast" -> stop the expensive search at the FIRST verified assignment
+    #            that satisfies the chosen acceptance policy, with its own small
+    #            attempt/wall-clock budget;
+    #   "deep" -> keep improving within a larger budget and always preserve the
+    #            best already-proven result (incumbent) on error/timeout.
+    strategy: str = "deep"
 
 @dataclass
 class BaselineAnytimeState:
@@ -193,6 +203,17 @@ class BaselineAnytimeState:
         return (BaselineCompletionStatus.VERIFIED_TARGET_COMPLETE
                 if self.incumbent.assignment_identity == desired_identity
                 else BaselineCompletionStatus.VERIFIED_GOOD_ENOUGH)
+
+    def fast_policy_satisfied(self, satisfied: bool) -> Optional[BaselineCompletionStatus]:
+        """F6 FAST: the expensive search stops at the first verified assignment
+        that satisfies the chosen acceptance policy. DEEP (and the legacy
+        verify path) never stops here: they keep improving within their budget
+        and preserve the best already-proven incumbent on error/timeout."""
+        if self.policy.strategy != "fast":
+            return None
+        if not satisfied or self.incumbent is None:
+            return None
+        return BaselineCompletionStatus.VERIFIED_POLICY_SATISFIED_FAST
 
     def continuation_payload(self, *, project: str, mode: str, iteration: int,
                              reason: ContinuationReason) -> dict[str, object]:

@@ -70,9 +70,17 @@ export function sha256Bytes(value: string | Buffer): string {
 // Draft input identity, byte-identical to the Python writer (draft_input_hash):
 // SHA-256 over the ordered existing files below as name\0bytes\0. A hash
 // difference also catches deletions and additions, not just content edits (T5).
+// F4: the fingerprint is the FULL planner input set, not only the lockfiles:
+// project/local settings and the dashboard policy (exclusions, per-package lag
+// policy) all influence what the plan contains, so changing any of them makes
+// a previously generated Draft stale. The cryptographic framing and file order
+// MUST stay in lockstep with dependency_live_roadmap_generator.draft_input_hash.
 export const DRAFT_INPUT_FILENAMES = [
   'package.json', 'yarn.lock', 'pnpm-lock.yaml', 'package-lock.json',
   'npm-shrinkwrap.json', 'package-manager.json',
+  '.dependency-roadmap/settings.project.json',
+  '.dependency-roadmap/settings.local.json',
+  '.dependency-roadmap/state/dashboard-state.json',
 ] as const
 
 export function draftInputHashForProject(projectPath: string): string {
@@ -105,19 +113,77 @@ export type DraftStalenessFacts = {
   /** manifests inputHashes[project] captured at read time (T5). */
   inputHashRecorded?: string
   /** The policy the run was accepted under (manifest.settings). */
-  storedPolicy?: { targetLevel?: unknown; minLagOkPct?: unknown; intentJson?: unknown }
+  storedPolicy?: {
+    targetLevel?: unknown
+    minLagOkPct?: unknown
+    lagPolicyMonths?: unknown
+    intentJson?: unknown
+    /** F1/F4: the FULL acceptance policy as captured by the planner. */
+    acceptancePolicyJson?: unknown
+  }
   /** The policy the user would run now. */
-  currentPolicy?: { targetLevel?: unknown; minLagOkPct?: unknown; policies?: Record<string, unknown> }
+  currentPolicy?: {
+    targetLevel?: unknown
+    minLagOkPct?: unknown
+    lagPolicyMonths?: unknown
+    policies?: Record<string, unknown>
+    /** F1: the merged acceptance policy the desktop currently enforces. */
+    acceptancePolicy?: Record<string, unknown>
+  }
 }
 
 export type DraftStaleness = { stale: boolean; reason?: string }
+
+// The canonical acceptance-policy key the run was accepted under vs. the one
+// the desktop would enforce now. F1 made the acceptance policy the single
+// source of the goal (targetLevel/minLagOkPct/lagPolicyMonths) and the numeric
+// C/H/M/L limits; changing ANY of them invalidates the run (F4 acceptance:
+// High, lagMonths and exclusions must show up as stale, not only target/%).
+function acceptancePolicyKey(value: unknown): string {
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  const lagMonths = raw.lagPolicyMonths === 3 || raw.lagPolicyMonths === 6 || raw.lagPolicyMonths === 9 || raw.lagPolicyMonths === 12
+    ? raw.lagPolicyMonths
+    : undefined
+  const limit = (field: string): number | undefined => {
+    const parsed = Number(field in raw ? raw[field] : undefined)
+    return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : undefined
+  }
+  return JSON.stringify({
+    targetLevel: raw.targetLevel === 'green' ? 'green' : 'yellow',
+    minLagOkPct: (() => {
+      const parsed = Number(raw.minLagOkPct)
+      return Number.isFinite(parsed) ? Math.max(0, Math.min(100, Math.trunc(parsed))) : undefined
+    })(),
+    ...(lagMonths !== undefined ? { lagPolicyMonths: lagMonths } : {}),
+    ...(limit('maxKnownHigh') !== undefined ? { maxKnownHigh: limit('maxKnownHigh') } : {}),
+    ...(limit('maxKnownModerate') !== undefined ? { maxKnownModerate: limit('maxKnownModerate') } : {}),
+    ...(limit('maxKnownLow') !== undefined ? { maxKnownLow: limit('maxKnownLow') } : {}),
+  })
+}
+
+function storedPolicyFromSnapshot(stored: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!stored) return undefined
+  // F1: the planner pins the full policy in settings.acceptancePolicyJson.
+  const acceptancePolicyJson = typeof stored.acceptancePolicyJson === 'string' ? stored.acceptancePolicyJson.trim() : ''
+  if (acceptancePolicyJson) {
+    try {
+      const parsed = JSON.parse(acceptancePolicyJson) as unknown
+      if (parsed && typeof parsed === 'object') return parsed as Record<string, unknown>
+    } catch {
+      // unparseable snapshot: fall back to the flat fields below
+    }
+  }
+  return stored as Record<string, unknown>
+}
 
 // A Draft is stale when it no longer describes the project as it is today:
 //  - generatedAt is missing/invalid;
 //  - any planner input changed since the run — compared BY CONTENT via the
 //    recorded input hash (deletions and additions are caught too);
-//  - the target policy (level / minimum-lag percentage / intent policies)
-//    differs from the policy the run was accepted under.
+//  - the input identity is missing entirely (F4: an unbound result is
+//    UNCHECKED, never fresh);
+//  - the target policy (level / minimum-lag percentage / lag months / numeric
+//    C-H-M-L limits / intent policies) differs from the run's.
 // The historical result may still be opened with an explicit reason, but it is
 // never presented as fresh (T5).
 export function draftResultStaleness(facts: DraftStalenessFacts): DraftStaleness {
@@ -137,23 +203,28 @@ export function draftResultStaleness(facts: DraftStalenessFacts): DraftStaleness
     if (current !== recorded) {
       reasons.push('package.json/lockfile/settings изменились с момента генерации (включая удаление/добавление)')
     }
-  } else if (facts.inputHashRecorded !== undefined) {
+  } else {
+    // F4: a run that never recorded its input identity can never prove it
+    // still describes the project, so it is unchecked, not fresh.
     reasons.push('проект не привязан к входным файлам (нет input-идентичности)')
   }
 
-  const stored = facts.storedPolicy
+  const stored = storedPolicyFromSnapshot(facts.storedPolicy as Record<string, unknown> | undefined)
   const current = facts.currentPolicy
   if (stored && current) {
+    const currentMerged = (current.acceptancePolicy && typeof current.acceptancePolicy === 'object'
+      ? current.acceptancePolicy
+      : current) as Record<string, unknown>
     const storedTarget = String(stored.targetLevel ?? 'yellow')
-    const currentTarget = String(current.targetLevel ?? 'yellow')
+    const currentTarget = String(currentMerged.targetLevel ?? 'yellow')
     const storedPct = Number(String(stored.minLagOkPct ?? '80'))
-    const currentPct = Number(current.minLagOkPct ?? 80)
-    let storedPolicyKey = ''
+    const currentPct = Number(currentMerged.minLagOkPct ?? 80)
+    let storedIntentKey = ''
     if (typeof stored.intentJson === 'string' && stored.intentJson) {
       try {
         const parsed = JSON.parse(stored.intentJson) as { policies?: unknown }
         if (parsed && typeof parsed === 'object') {
-          storedPolicyKey = baselinePoliciesKey(
+          storedIntentKey = baselinePoliciesKey(
             parsed.policies && typeof parsed.policies === 'object'
               ? parsed.policies as Record<string, unknown>
               : {},
@@ -163,9 +234,18 @@ export function draftResultStaleness(facts: DraftStalenessFacts): DraftStaleness
         // unparseable stored intent: fall through, hash check already ran
       }
     }
+    // F4: the whole acceptance policy (lag months + numeric C/H/M/L limits) is
+    // part of the staleness decision, not only the level and the percentage.
+    const storedPolicyKey = acceptancePolicyKey(stored)
+    const currentPolicyKey = acceptancePolicyKey(currentMerged)
+    const storedIntentKeyClean = storedIntentKey
     if (storedTarget !== currentTarget || (Number.isFinite(storedPct) && storedPct !== currentPct)) {
       reasons.push('цель/процент актуальности изменились с момента генерации')
-    } else if (storedPolicyKey && storedPolicyKey !== baselinePoliciesKey(current.policies)) {
+    }
+    if (storedPolicyKey !== currentPolicyKey) {
+      reasons.push('лимиты acceptance-политики (High/Moderate/Low/lag-месяцы) изменились с момента генерации')
+    }
+    if (storedIntentKeyClean && storedIntentKeyClean !== baselinePoliciesKey(current.policies)) {
       reasons.push('политики keep-current/required изменились с момента генерации')
     }
   }

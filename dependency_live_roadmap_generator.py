@@ -413,14 +413,29 @@ def _baseline_hot_worker_continuation() -> bool:
     ).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _baseline_max_expensive_attempts(default: int) -> int:
+def _baseline_product_mode() -> str:
+    """Effective product search mode (draft | fast | deep | verify), pinned
+    into the environment by main() so the anytime-budget strategy selectors see
+    the same value regardless of which execution code path reads them."""
+    return (os.environ.get("DEPLOOM_MODE") or "verify").strip().lower()
+
+
+def _baseline_max_expensive_attempts(default: int, *, product_mode: Optional[str] = None) -> int:
     raw = _baseline_env_nonnegative_int("DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS")
     if raw:
         return max(1, raw)
-    mode = _baseline_execution_mode()
-    if mode == "FAST":
+    mode = (product_mode or _baseline_product_mode())
+    # F6: the product search strategy owns its attempt budget. FAST stops the
+    # expensive search after a couple of candidates; DEEP gets a larger budget
+    # to keep improving while preserving the best verified incumbent.
+    if mode == "fast":
         return 2
-    if mode == "AUTOPILOT":
+    if mode == "deep":
+        return max(4, min(12, max(1, int(default)) * 2))
+    exec_mode = _baseline_execution_mode()
+    if exec_mode == "FAST":
+        return 2
+    if exec_mode == "AUTOPILOT":
         return min(max(1, int(default)), 4)
     return max(1, int(default))
 
@@ -444,9 +459,17 @@ def _baseline_preseal_screening_enabled(*, has_incumbent: bool) -> bool:
     return bool(not has_incumbent and _baseline_execution_mode() in {"FAST", "AUTOPILOT"} and _baseline_search_mode() != BaselineSearchMode.EXHAUSTIVE)
 
 
-def _baseline_automatic_budget_seconds() -> int:
+def _baseline_automatic_budget_seconds(product_mode: Optional[str] = None) -> int:
     raw = _baseline_env_nonnegative_int("DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS")
-    return raw or 15 * 60
+    if raw:
+        return raw
+    mode = (product_mode or _baseline_product_mode())
+    # F6: FAST is its own small budget; DEEP is the large improvement budget.
+    if mode == "fast":
+        return 5 * 60
+    if mode == "deep":
+        return 60 * 60
+    return 15 * 60
 
 
 def _baseline_human_decision_focus(
@@ -1082,6 +1105,15 @@ class ProjectHealth:
     security_known: int = 0
     security_unknown: int = 0
     insufficient_data: bool = False
+    # F2: the researched share (lag_ok_pct over `total`) is a separate metric
+    # from the GOAL over the WHOLE active scope. Unknown rows are never
+    # compliant and never drop out of the denominator of the goal; these
+    # scope_* fields let closure/acceptance/UI say "10% of all packages"
+    # instead of "100% of the ones we managed to check".
+    scope_total: int = 0
+    scope_lag_ok: int = 0
+    scope_lag_unknown: int = 0
+    scope_lag_pct: float = 0.0
 
 
 @dataclasses.dataclass
@@ -2204,9 +2236,28 @@ class LiveDataClient:
         self.run_id: Optional[str] = None
         self.draft = False
         self._progress_project: Optional[str] = None
+        # F5: an independent progress heartbeat. progress() may be called from
+        # the main thread, from run_supervised workers and from the heartbeat
+        # thread, so the whole emit is serialized; the heartbeat stops as soon
+        # as the run's terminal (finalize) event has been emitted.
+        self._progress_lock = threading.Lock()
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._draft_terminal = False
 
     def set_deadline(self, deadline: Optional["DeadlineClock"]) -> None:
         self.deadline = deadline
+
+    def _supervised(self, fn: Any) -> Any:
+        """Run one network header phase under the absolute run deadline.
+
+        ``requests`` cannot bound the total time spent waiting for a header
+        block (its read timeout applies per socket recv, so a server dripping
+        header bytes one at a time can keep the call alive past the whole
+        budget). In deadline mode the call runs in a worker under the
+        supervisor; without a deadline it runs inline with zero overhead.
+        """
+        return run_supervised("network", self.deadline, fn)
 
     def set_draft_run(self, run_id: str) -> None:
         self.run_id = run_id
@@ -2215,6 +2266,43 @@ class LiveDataClient:
         # very first event already carries elapsed=0 and each following one a
         # monotonic delta, independent of the renderer's local clock.
         self._progress_started_monotonic = time.monotonic()
+        self._draft_terminal = False
+        self._heartbeat_stop.clear()
+        # F5: start the independent heartbeat daemon. It emits a minimal
+        # [draft-progress] line every DRAFT_PROGRESS_HEARTBEAT_SECONDS while the
+        # run is live, so the Desktop's monotonic timer and live/stale
+        # indication keep working even when a single blocking operation
+        # (headers drip, CPU solve) produces no ordinary progress event.
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, name="draft-progress-heartbeat", daemon=True,
+        )
+        self._heartbeat_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop.wait(DRAFT_PROGRESS_HEARTBEAT_SECONDS):
+            if self._draft_terminal:
+                return
+            started = getattr(self, "_progress_started_monotonic", None)
+            self._emit_payload({
+                "runId": self.run_id or "",
+                "project": getattr(self, "_progress_project", None),
+                "heartbeat": True,
+                "elapsedSec": (time.monotonic() - started) if started else None,
+                "budgetRemainingSec": self.deadline.remaining if self.deadline is not None else None,
+            })
+
+    def mark_draft_terminal(self) -> None:
+        """Freeze progress: after the terminal (finalize) event the heartbeat
+        must not keep emitting, and elapsed/budget are no longer extended."""
+        self._draft_terminal = True
+        self._heartbeat_stop.set()
+
+    def _emit_payload(self, payload: Dict[str, Any]) -> None:
+        try:
+            with self._progress_lock:
+                print(f"[draft-progress] {json.dumps(payload, ensure_ascii=False)}", flush=True)
+        except Exception:
+            pass
 
     def for_project(self, project: str) -> "LiveDataClient":
         self._progress_project = project
@@ -2232,32 +2320,33 @@ class LiveDataClient:
     ) -> None:
         if not self.draft:
             return
-        try:
-            started = getattr(self, "_progress_started_monotonic", None)
-            # A measurable slice becomes a percentage only for the work it
-            # measures; it must never claim 100% before the finalize step has
-            # actually published (status present => terminal, may be 100).
-            pct: Optional[int] = None
-            if isinstance(completed, (int, float)) and isinstance(total, (int, float)) and total > 0:
-                raw = completed / total
-                pct = int(round(raw * 100)) if status is not None else min(99, int(round(raw * 100)))
-            payload = {
-                "runId": self.run_id or "",
-                "project": getattr(self, "_progress_project", None),
-                "step": step,
-                "package": package,
-                "operation": operation,
-                "retry": retry,
-                "completed": completed,
-                "total": total,
-                "status": status,
-                "elapsedSec": (time.monotonic() - started) if started else None,
-                "budgetRemainingSec": self.deadline.remaining if self.deadline is not None else None,
-                "pct": pct,
-            }
-            print(f"[draft-progress] {json.dumps(payload, ensure_ascii=False)}", flush=True)
-        except Exception:
-            pass
+        # A measurable slice becomes a percentage only for the work it
+        # measures; it must never claim 100% before the finalize step has
+        # actually published (status present => terminal, may be 100).
+        pct: Optional[int] = None
+        if isinstance(completed, (int, float)) and isinstance(total, (int, float)) and total > 0:
+            raw = completed / total
+            pct = int(round(raw * 100)) if status is not None else min(99, int(round(raw * 100)))
+        started = getattr(self, "_progress_started_monotonic", None)
+        payload = {
+            "runId": self.run_id or "",
+            "project": getattr(self, "_progress_project", None),
+            "step": step,
+            "package": package,
+            "operation": operation,
+            "retry": retry,
+            "completed": completed,
+            "total": total,
+            "status": status,
+            "elapsedSec": (time.monotonic() - started) if started else None,
+            "budgetRemainingSec": self.deadline.remaining if self.deadline is not None else None,
+            "pct": pct,
+        }
+        if status is not None:
+            # F5: the terminal event freezes the heartbeat so nothing emits
+            # after the run's result has been published.
+            self.mark_draft_terminal()
+        self._emit_payload(payload)
 
     def _budgeted_timeout(self) -> Union[int, Tuple[float, float]]:
         """Effective per-request timeout honouring the run deadline (T4).
@@ -2403,12 +2492,14 @@ class LiveDataClient:
 
         response = None
         try:
-            response = self.session.get(
-                tarball_url,
-                timeout=self._budgeted_timeout(),
-                stream=True,
-                headers={"Range": "bytes=0-0", "Accept": "application/octet-stream"},
-                allow_redirects=True,
+            response = self._supervised(
+                lambda tarball_url=tarball_url: self.session.get(
+                    tarball_url,
+                    timeout=self._budgeted_timeout(),
+                    stream=True,
+                    headers={"Range": "bytes=0-0", "Accept": "application/octet-stream"},
+                    allow_redirects=True,
+                )
             )
             evidence["httpStatus"] = int(response.status_code)
             evidence["finalUrl"] = str(response.url or tarball_url)
@@ -2550,7 +2641,9 @@ class LiveDataClient:
         for attempt in range(1, REGISTRY_METADATA_MAX_ATTEMPTS + 1):
             try:
                 self.progress(operation="registry metadata", package=pkg, retry=attempt - 1, step="scan")
-                response = self.session.get(url, timeout=self._budgeted_timeout(), stream=True)
+                response = self._supervised(
+                    lambda url=url: self.session.get(url, timeout=self._budgeted_timeout(), stream=True)
+                )
                 status = int(getattr(response, "status_code", 0) or 0)
                 if status == 404:
                     # A real 404 is a deterministic registry fact. Unlike a
@@ -2620,7 +2713,9 @@ class LiveDataClient:
                 for v in batch
             ]}
             try:
-                r = self.session.post(OSV_QUERY_BATCH, json=payload, timeout=self._budgeted_timeout(), stream=True)
+                r = self._supervised(
+                    lambda payload=payload: self.session.post(OSV_QUERY_BATCH, json=payload, timeout=self._budgeted_timeout(), stream=True)
+                )
                 r.raise_for_status()
                 data = self._bounded_json(r).get("results", [])
                 for v, item in zip(batch, data):
@@ -2655,7 +2750,9 @@ class LiveDataClient:
             return self.vuln_detail_cache[vuln_id]
         self.progress(operation="OSV detail", package=vuln_id, step="scan")
         try:
-            r = self.session.get(OSV_VULN.format(id=vuln_id), timeout=self._budgeted_timeout(), stream=True)
+            r = self._supervised(
+                lambda vuln_id=vuln_id: self.session.get(OSV_VULN.format(id=vuln_id), timeout=self._budgeted_timeout(), stream=True)
+            )
             r.raise_for_status()
             data = self._bounded_json(r)
             if not isinstance(data, dict):
@@ -2680,7 +2777,9 @@ class LiveDataClient:
             token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
             if token and "github" in url:
                 headers["Authorization"] = f"Bearer {token}"
-            response = self.session.get(url, timeout=self._budgeted_timeout(), headers=headers, stream=True)
+            response = self._supervised(
+                lambda url=url, headers=headers: self.session.get(url, timeout=self._budgeted_timeout(), headers=headers, stream=True)
+            )
             response.raise_for_status()
             text = self._bounded_text(response)
             self.text_cache[url] = text
@@ -2703,7 +2802,9 @@ class LiveDataClient:
             token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
             if token and "api.github.com" in url:
                 headers["Authorization"] = f"Bearer {token}"
-            response = self.session.get(url, timeout=self._budgeted_timeout(), headers=headers, stream=True)
+            response = self._supervised(
+                lambda url=url, headers=headers: self.session.get(url, timeout=self._budgeted_timeout(), headers=headers, stream=True)
+            )
             response.raise_for_status()
             data = self._bounded_json(response)
             self.json_cache[url] = data
@@ -2723,31 +2824,55 @@ class LiveDataClient:
             return self.bytes_cache[url]
         self.progress(operation="fetch data", step="scan")
         try:
-            response = self.session.get(url, timeout=self._budgeted_timeout(), stream=True)
+            response = self._supervised(
+                lambda url=url: self.session.get(url, timeout=self._budgeted_timeout(), stream=True)
+            )
             response.raise_for_status()
             content_length = int(response.headers.get("Content-Length") or 0)
             if content_length and content_length > max_bytes:
                 raise ValueError(f"response too large: {content_length} bytes")
+            # F3: binary bodies (registry tarballs/type evidence) must respect
+            # the same absolute deadline as JSON/text: read byte-by-byte with a
+            # budget check on every socket read, so a slow trickle cannot hold
+            # a full 64KiB chunk open past the deadline.
+            data = self._bounded_read_max(response, max_bytes)
+            self.bytes_cache[url] = data
+            self._bounded_sleep(self.sleep_sec)
+            return data
+        except DraftBudgetExceeded:
+            raise
+        except Exception as exc:
+            if not quiet:
+                eprint(f"[warn] bytes unavailable {url}: {exc}")
+            self.bytes_cache[url] = None
+            return None
+
+    def _bounded_read_max(self, response, max_bytes: int) -> bytes:
+        """Read a binary body byte-by-byte under the run deadline, enforcing
+        the caller's size limit incrementally."""
+        if self.deadline is None:
             chunks: List[bytes] = []
             total = 0
             for chunk in response.iter_content(chunk_size=64 * 1024):
-                if self.deadline is not None:
-                    self.deadline.check("network-read")
                 if not chunk:
                     continue
                 total += len(chunk)
                 if total > max_bytes:
                     raise ValueError(f"response exceeded {max_bytes} bytes")
                 chunks.append(chunk)
-            data = b"".join(chunks)
-            self.bytes_cache[url] = data
-            self._bounded_sleep(self.sleep_sec)
-            return data
-        except Exception as exc:
-            if not quiet:
-                eprint(f"[warn] bytes unavailable {url}: {exc}")
-            self.bytes_cache[url] = None
-            return None
+            return b"".join(chunks)
+        chunks: List[bytes] = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=1):
+            self.deadline.check_with_reserve("network-read")
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"response exceeded {max_bytes} bytes")
+            chunks.append(chunk)
+        self.deadline.check_with_reserve("network-read")
+        return b"".join(chunks)
 
     def fetch_release_intelligence(self, package: str, meta: Dict[str, Any], current: str, target: str) -> ReleaseIntelligence:
         cache_key = (package, current, target)
@@ -5362,6 +5487,13 @@ def compute_project_health(
     total = len(lag_known_rows) + removed_closed
     lag_ok = sum(1 for r in lag_known_rows if dependency_is_lag_ok(r)) + removed_closed
     lag_bad = total - lag_ok
+    # F2: the researched share (lag_ok_pct over `total`) is a separate metric
+    # from the GOAL over the WHOLE active scope. Unknown rows are never
+    # compliant and never drop out of the goal denominator.
+    scope_total = len(active_rows)
+    scope_lag_ok = sum(1 for r in active_rows if dependency_is_lag_ok(r))
+    scope_lag_unknown = max(0, scope_total - len(lag_known_rows))
+    scope_lag_pct = (scope_lag_ok / scope_total * 100.0) if scope_total else (0.0 if (scope_total == 0 and lag_unknown > 0) else 100.0)
     # T3: a zero known denominator is "insufficient data", never 100% of the
     # scope. When every dependency lacks a lag target the project cannot claim
     # compliance; the honest number is 0% coverage with a visible reason.
@@ -5493,6 +5625,10 @@ def compute_project_health(
         security_known=security_known,
         security_unknown=vuln_unknown_rows,
         insufficient_data=insufficient_data,
+        scope_total=scope_total,
+        scope_lag_ok=scope_lag_ok,
+        scope_lag_unknown=scope_lag_unknown,
+        scope_lag_pct=scope_lag_pct,
     )
 
 
@@ -11057,10 +11193,16 @@ def resolve_peer_compatibility_with_verification(
             )
             requested_search_mode = _baseline_search_mode()
             effective_search_mode = _baseline_effective_search_mode()
+            # F6: the product search strategy drives the anytime budget and the
+            # stop rule. FAST gets its own small budget and stops at the first
+            # verified policy-satisfying assignment; DEEP gets the large
+            # improvement budget and preserves the best verified incumbent.
+            product_strategy = "fast" if _baseline_product_mode() == "fast" else "deep"
             anytime = BaselineAnytimeState(
                 policy=AutomaticBudgetPolicy(
                     wall_clock_seconds=_baseline_automatic_budget_seconds(),
                     max_expensive_attempts=_baseline_max_expensive_attempts(config.max_iterations),
+                    strategy=product_strategy,
                 ),
                 search_mode=effective_search_mode,
             )
@@ -11364,6 +11506,23 @@ def resolve_peer_compatibility_with_verification(
                 )
                 return completion
 
+            def _verified_assignment_satisfies_policy(
+                incumbent: BestVerifiedIncumbent,
+                total: int,
+            ) -> bool:
+                """F6 FAST: does the verified assignment satisfy the chosen
+                acceptance policy at the planner level? The effective minimum
+                lag compliance for the effective target level (yellow/green) is
+                the gate; security limits are enforced upstream while building
+                the desired assignment, so coverage of that desired end state is
+                the honest planner-level "policy satisfied" signal."""
+                needed = required_ratio_count(
+                    max(1, total),
+                    health_green_ratio() if str(EFFECTIVE_TARGET_LEVEL or "").lower() == "green" else health_yellow_ratio(),
+                )
+                matched = int(round(incumbent.policy_score * max(1, total)))
+                return matched >= needed
+
             def _continue_after_verified_candidate(
                 *,
                 identity: str,
@@ -11386,6 +11545,23 @@ def resolve_peer_compatibility_with_verification(
                             if baseline_keep_current
                             else BaselineCompletionStatus.VERIFIED_TARGET_COMPLETE
                         ),
+                    )
+                    return False
+
+                # F6 FAST: the chosen policy is already satisfied by a VERIFIED
+                # assignment -- stop the expensive search HERE (first satisfying
+                # result), with its own small budget already enforced by the
+                # anytime policy. DEEP never stops here: it keeps improving and
+                # preserves the best verified incumbent on error/timeout.
+                fast_stop = anytime.fast_policy_satisfied(
+                    _verified_assignment_satisfies_policy(
+                        incumbent, max(1, len(desired_assignment))
+                    )
+                )
+                if fast_stop is not None:
+                    _finalize_verified_incumbent(
+                        "progressive-fast-policy-satisfied",
+                        completion_status=fast_stop,
                     )
                     return False
 
@@ -20819,6 +20995,14 @@ DRAFT_FINALIZE_RESERVE_SECONDS = float(os.environ.get("DEPLOOM_DRAFT_FINALIZE_RE
 # considered out of time (fractional remainders, not floor+1s).
 DRAFT_MIN_NET_BUDGET_SECONDS = 0.05
 
+# F5: cadence of the independent Draft progress heartbeat. The planner emits
+# ordinary [draft-progress] lines only at operation boundaries (a long header
+# drip or a CPU-heavy planning step produces none), so a dedicated daemon emits
+# a heartbeat on its own timer to keep the Desktop's monotonic elapsed and the
+# live/stale indicator honest while the main thread is blocked in work that
+# cannot emit progress.
+DRAFT_PROGRESS_HEARTBEAT_SECONDS = float(os.environ.get("DEPLOOM_DRAFT_PROGRESS_HEARTBEAT_SECONDS") or "2.0")
+
 
 class DeadlineClock:
     """Single monotonic deadline for a run.
@@ -20854,6 +21038,46 @@ class DeadlineClock:
             "deadlineSeconds": self.deadline_seconds,
             "remainingMs": None if self.remaining is None else int(self.remaining * 1000),
         }
+
+
+def run_supervised(phase: str, deadline: Optional[DeadlineClock], fn: Any) -> Any:
+    """Run ``fn`` under an absolute budget (deadline mode only).
+
+    ``requests`` blocks inside urllib3 until the WHOLE header block has
+    arrived, so neither the (connect, read) timeout pair nor the per-byte body
+    checks can bound the total header transfer when a server drips header
+    bytes. The same is true for a CPU-heavy planning step that checks the clock
+    only before/after itself. ``run_supervised`` runs ``fn`` in a daemon worker
+    with the supervisor bounded by the remaining budget (minus the publication
+    reserve); on expiry the caller sees DraftBudgetExceeded instead of waiting
+    out the operation. A worker that outlives the budget keeps running in the
+    background, but the Draft flow publishes the partial artifact and exits the
+    process immediately afterwards, so it cannot write anything else.
+    """
+    if deadline is None or deadline.deadline_seconds is None:
+        return fn()
+    remaining = deadline.remaining
+    if remaining is None:
+        return fn()
+    budget = max(0.0, remaining - DRAFT_FINALIZE_RESERVE_SECONDS)
+    if budget <= DRAFT_MIN_NET_BUDGET_SECONDS:
+        raise DraftBudgetExceeded(phase)
+    box: Dict[str, Any] = {}
+
+    def worker() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the caller
+            box["exc"] = exc
+
+    thread = threading.Thread(target=worker, name=f"draft-{phase}", daemon=True)
+    thread.start()
+    thread.join(timeout=budget)
+    if thread.is_alive():
+        raise DraftBudgetExceeded(phase)
+    if "exc" in box:
+        raise box["exc"]
+    return box["value"]
 
 
 def stable_sha256_text(payload: str) -> str:
@@ -20927,9 +21151,23 @@ def draft_policy_hash(snapshot: Optional[Dict[str, Any]] = None) -> str:
 
 
 def draft_input_hash(project: ProjectSpec) -> str:
-    """Hash of the locally read manifest inputs the plan was derived from."""
+    """Hash of the locally read manifest inputs the plan was derived from.
+
+    F4: the fingerprint is the FULL planner input set, in byte-lockstep with
+    desktop/electron/draft-artifact-reader.ts#DRAFT_INPUT_FILENAMES (same
+    order, same name\\0bytes\\0 framing). Project/local settings and the
+    dashboard policy (exclusions, per-package lag policy) influence what the
+    plan contains, so changing any of them makes a previously generated Draft
+    stale even when the lockfiles are untouched.
+    """
     h = hashlib.sha256()
-    for filename in ("package.json", "yarn.lock", "pnpm-lock.yaml", "package-lock.json", "npm-shrinkwrap.json", "package-manager.json"):
+    for filename in (
+        "package.json", "yarn.lock", "pnpm-lock.yaml", "package-lock.json",
+        "npm-shrinkwrap.json", "package-manager.json",
+        ".dependency-roadmap/settings.project.json",
+        ".dependency-roadmap/settings.local.json",
+        ".dependency-roadmap/state/dashboard-state.json",
+    ):
         path = project.path / filename
         if path.exists():
             try:
@@ -21674,6 +21912,11 @@ def main() -> None:
     mode = (args.mode or os.environ.get("DEPLOOM_MODE", "") or ("draft" if args.draft_baseline else "verify")).strip().lower()
     if mode not in ("draft", "fast", "deep", "verify"):
         mode = "draft" if args.draft_baseline else "verify"
+    # Pin the effective product mode so downstream strategy selectors
+    # (_baseline_product_mode / anytime budget + stop rule) see one value
+    # regardless of code path (F6: mode is a real search strategy, not just a
+    # manifest field).
+    os.environ["DEPLOOM_MODE"] = mode
     run_id = (args.run_id or os.environ.get("DEPLOOM_RUN_ID", "")).strip() or f"run-{uuid.uuid4().hex[:12]}"
     workspace_id = (args.workspace_id or os.environ.get("DEPLOOM_WORKSPACE_ID", "")).strip()
     project_id = (args.project_id or os.environ.get("DEPLOOM_PROJECT_ID", "")).strip()
@@ -22023,7 +22266,7 @@ def main() -> None:
         project.current_audit = {
             "mode": "manual-only",
             "prepared": False,
-            "dashboardLockfile": project.lockfile_state.get("lockfile") or "",
+            "dashboardLockfile": lockfile_name,
             "dashboardPackageManager": project.lockfile_state.get("manager") or "",
             "toolPath": str(Path(__file__).resolve().parent / "manual_dependency_audit.py"),
             "command": "python manual_dependency_audit.py",
@@ -22161,8 +22404,16 @@ def main() -> None:
     try:
         deadline_clock.check("target-planning")
         _apply_baseline_intent_scope(rows_by_project)
-        health_by_project = enrich_project_targets(rows_by_project, planning_baselines)
-        apply_supervisor_scope_expansions(rows_by_project)
+        # F3: CPU-heavy planning steps are bounded by the same absolute budget
+        # as the network phases. A solver or enrichment pass that checks the
+        # clock only before/after itself is still bounded by the supervisor,
+        # so the whole planning slice cannot outlive the deadline.
+        health_by_project = run_supervised(
+            "planning",
+            deadline_clock,
+            lambda: enrich_project_targets(rows_by_project, planning_baselines),
+        )
+        run_supervised("planning", deadline_clock, lambda: apply_supervisor_scope_expansions(rows_by_project))
         enforce_storybook_cohort(rows_by_project, client)
         apply_planner_deferrals(rows_by_project)
         # BLOCK_W_P0_P1_TYPES_NESTED_FIX_V1
@@ -22170,17 +22421,21 @@ def main() -> None:
         # A deprecated @types/* target is either already proven removable against
         # the exact planned runtime target or conservatively deferred before the
         # expensive resolver/project proof begins.
-        plan_executable_actions(
-            rows_by_project,
-            client,
-            immutable_targets=False,
+        run_supervised(
+            "planning",
+            deadline_clock,
+            lambda: plan_executable_actions(rows_by_project, client, immutable_targets=False),
         )
         # Freeze the executable policy intent before compatibility resolution.
         # Registry evidence is applied first so peer solving never relies on a
         # metadata-only target; the solver may then choose registry-backed
         # fallbacks/companions without resurrecting an infeasible type-stub action.
         capture_desired_targets(rows_by_project)
-        enrich_registry_target_evidence(rows_by_project, client)
+        run_supervised(
+            "planning",
+            deadline_clock,
+            lambda: enrich_registry_target_evidence(rows_by_project, client),
+        )
         if residual_targets_by_project:
             count = sum(len(targets) for targets in residual_targets_by_project.values())
             eprint(f"[info] residual stability: loaded {count} previously approved target(s); merged matches are hard-fixed, pending matches are preferred")
@@ -22195,38 +22450,60 @@ def main() -> None:
             # R2: the first Draft path solves ONE chosen variant ("default"),
             # not the three required by the Verified planning loop, so the run
             # stays bounded and any expiry publishes the rows gathered so far.
-            resolve_peer_compatibility(
-                rows_by_project,
-                client,
-                modes=("default",),
-                apply_results=True,
-                residual_targets_by_project=residual_targets_by_project,
+            run_supervised(
+                "planning",
+                deadline_clock,
+                lambda: resolve_peer_compatibility(
+                    rows_by_project,
+                    client,
+                    modes=("default",),
+                    apply_results=True,
+                    residual_targets_by_project=residual_targets_by_project,
+                ),
             )
         else:
-            proven_assignments = resolve_peer_compatibility_with_verification(
-                rows_by_project, projects_by_name, client,
-                residual_targets_by_project=residual_targets_by_project,
-                external_evidence_by_project=external_evidence_by_project,
-                progress_path=baseline_progress_path,
-                proof_envelopes_out=proven_dependency_envelopes,
+            # proof_envelopes_out is filled by reference; the function returns
+            # the assignments alone.
+            proven_assignments = run_supervised(
+                "planning",
+                deadline_clock,
+                lambda: resolve_peer_compatibility_with_verification(
+                    rows_by_project, projects_by_name, client,
+                    residual_targets_by_project=residual_targets_by_project,
+                    external_evidence_by_project=external_evidence_by_project,
+                    progress_path=baseline_progress_path,
+                    proof_envelopes_out=proven_dependency_envelopes,
+                ),
             )
 
         deadline_clock.check("final-targets")
-        enrich_registry_target_evidence(
-            rows_by_project,
-            client,
-            allow_target_mutation=False,
+        run_supervised(
+            "planning",
+            deadline_clock,
+            lambda: enrich_registry_target_evidence(
+                rows_by_project,
+                client,
+                allow_target_mutation=False,
+            ),
         )
         # A late @types action decision may fail the handoff, but may not mutate a
         # finalized dependency target.
-        plan_executable_actions(
-            rows_by_project,
-            client,
-            immutable_targets=True,
+        run_supervised(
+            "planning",
+            deadline_clock,
+            lambda: plan_executable_actions(
+                rows_by_project,
+                client,
+                immutable_targets=True,
+            ),
         )
         if not args.draft_baseline:
             assert_proven_assignment_conformance(rows_by_project, proven_assignments)
-        final_peer_issues = validate_final_peer_assignment(rows_by_project, client)
+        final_peer_issues = run_supervised(
+            "planning",
+            deadline_clock,
+            lambda: validate_final_peer_assignment(rows_by_project, client),
+        )
         if final_peer_issues:
             if not args.draft_baseline:
                 raise RuntimeError(
@@ -22251,6 +22528,10 @@ def main() -> None:
             deadline_clock=deadline_clock,
             status="DRAFT_PARTIAL",
             partial_reason=f"Draft deadline ({deadline_clock.deadline_seconds}s) exceeded at {budget_exc.phase}; plan is partial.",
+            # F4: the partial plan is bound to the inputs captured at INVENTORY
+            # time, not re-hashed at publication (the inputs may have moved in
+            # the meantime, which would silently bind the plan to other data).
+            input_hashes=draft_input_hashes,
         )
 
     proven_dependency_state_path = (
@@ -22318,6 +22599,7 @@ def main() -> None:
                 deadline_clock=deadline_clock,
                 status="DRAFT_PARTIAL",
                 partial_reason=f"Draft deadline ({deadline_clock.deadline_seconds}s) exceeded at {budget_exc.phase}; plan is partial.",
+                input_hashes=draft_input_hashes,
             )
         eprint(
             f"[done] Draft result published: status={draft_manifest['status']} "

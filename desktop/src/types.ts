@@ -7,11 +7,11 @@ export type BaselineSearchMode = 'AUTO' | 'BOUNDED_IMPROVEMENT' | 'EXHAUSTIVE'
 export type BaselineExecutionMode = 'FAST' | 'AUTOPILOT' | 'BACKGROUND'
 export type BaselineProofMode = 'VERIFIED' | 'DRAFT'
 export type BaselineControlMode = 'AUTONOMOUS' | 'CONFIRM_SIGNIFICANT'
-export type AcceptancePolicy = { maxKnownCritical: number; maxKnownHigh: number; targetLevel?: 'yellow' | 'green'; minLagOkPct?: number }
-export type AcceptanceVerdict = { status: 'ACCEPTED' | 'REMEDIATION_REQUIRED' | 'UNKNOWN'; accepted: boolean; evidenceComplete: boolean; dependencyEvidenceFresh: boolean; critical?: number; high?: number; criticalPackages: string[]; highPackages: string[]; auditGeneratedAt?: string; auditEngine?: string; reasons: string[]; policy: AcceptancePolicy }
+export type AcceptancePolicy = { maxKnownCritical: number; maxKnownHigh: number; targetLevel?: 'yellow' | 'green'; minLagOkPct?: number; maxKnownModerate?: number; maxKnownLow?: number; lagPolicyMonths?: number }
+export type AcceptanceVerdict = { status: 'ACCEPTED' | 'REMEDIATION_REQUIRED' | 'UNKNOWN'; accepted: boolean; evidenceComplete: boolean; dependencyEvidenceFresh: boolean; critical?: number; high?: number; moderate?: number; low?: number; criticalPackages: string[]; highPackages: string[]; moderatePackages?: string[]; lowPackages?: string[]; auditGeneratedAt?: string; auditEngine?: string; lagOkPct?: number; lagOk?: number; lagUnknown?: number; lagTotal?: number; reasons: string[]; policy: AcceptancePolicy }
 export type BaselineDeferredCohort = { id: string; label: string; packages: string[]; predicate?: string; confidence?: number; authority: 'DIAGNOSTIC_HINT'; deferredAt?: string; decisionId?: string; boundaryPackages?: string[]; warningPackages?: string[] }
 export type BaselineCohortAction = { kind: 'DEFER' | 'REACTIVATE'; cohortId: string; label: string; packages: string[]; predicate?: string; confidence?: number; decisionId?: string }
-export type BaselineIntent = { schemaVersion: 1 | 2; policies: Record<string, BaselinePackagePolicy>; controlMode?: BaselineControlMode; budgetMinutes?: number; acceptancePolicy?: AcceptancePolicy; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; proofMode?: BaselineProofMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction; autoOpenPrompt?: boolean; targetLevel?: 'yellow' | 'green'; minLagOkPct?: number }
+export type BaselineIntent = { schemaVersion: 1 | 2; policies: Record<string, BaselinePackagePolicy>; controlMode?: BaselineControlMode; budgetMinutes?: number; acceptancePolicy?: AcceptancePolicy; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; proofMode?: BaselineProofMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction; autoOpenPrompt?: boolean; targetLevel?: 'yellow' | 'green'; minLagOkPct?: number; lagPolicyMonths?: number }
 export type BaselineIntentCandidate = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string }
 export type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent }
 export type BaselineCohortSuggestion = { id: string; label: string; predicate: string; subjects: string[]; packages: string[]; blockedPackages: string[]; warningPackages: string[]; boundaryPackages: string[]; confidence: number; reasons: string[]; decisionId: string; expandedFrom?: string; authority: 'DIAGNOSTIC_HINT' }
@@ -24,7 +24,7 @@ export type DependencyGraphSnapshot = { schemaVersion: 1; project: string; captu
 
 export type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
 export type BaselineRecoveryInfo = { available: boolean; mode?: 'yellow' | 'green'; status?: string; phase?: string; updatedAt?: string; generation?: number; iteration?: number; lastAssignment?: string; lastPredicate?: string; learnedConstraints?: number; exactExclusions?: number; reason?: string }
-export type ProjectPromptPreview = { path: string; content: string; stale: boolean; mtimeMs: number; size: number; projectName?: string }
+export type ProjectPromptPreview = { path: string; content: string; stale: boolean; staleReason?: string; mtimeMs: number; size: number; projectName?: string }
 
 export type ProjectLevel = { status: 'red' | 'yellow' | 'green'; lagOkPct?: number; remainingYellow?: number; remainingGreen?: number; measuredAt?: string }
 
@@ -184,6 +184,9 @@ export type WorkspaceDetails = {
   projectLevels: Record<string, ProjectLevel>
   targetClosure?: TargetClosure
   acceptanceVerdict?: AcceptanceVerdict
+  // F1: the persisted goal, so stage actions/autopilot/generate use the saved
+  // target instead of a hard-coded 'yellow'.
+  baselineIntent?: { targetLevel?: 'yellow' | 'green'; minLagOkPct?: number; lagPolicyMonths?: number }
   migrationProgress?: MigrationProgress
   baselineRecovery?: BaselineRecoveryInfo
   // The ready-to-handoff Draft Baseline result for the selected project
@@ -212,6 +215,12 @@ export type DraftResultSnapshot = {
   proposals: Record<string, number>
   artifacts: { manifest: string; plan: string; prompt: string; summary: string }
   hashes: { plan: string; prompt: string }
+  // F4: whether the LAST Draft for this project still matches the current
+  // planner inputs and acceptance policy (computed over the recorded identity,
+  // not mtimes). A fresh run of THIS session is not stale; an old saved result
+  // whose inputs moved is.
+  stale?: boolean
+  staleReason?: string
 }
 
 export type BootstrapPayload = {

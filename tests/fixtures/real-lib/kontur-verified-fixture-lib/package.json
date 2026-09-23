@@ -1,0 +1,7 @@
+{
+  "name": "kontur-verified-fixture-lib",
+  "version": "1.0.0",
+  "description": "Offline vendored library for F6 real-resource fixtures (packed with `npm pack`, installed via `file:` tarball).",
+  "main": "index.js",
+  "license": "MIT"
+}

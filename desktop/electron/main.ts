@@ -41,7 +41,7 @@ import { teamStatePaths } from './state-commit.js'
 import { changedOverrideProjects } from './dashboard-state.js'
 import { forgetScopedPromptPath, rememberScopedPromptPath, roadmapContainsProject, scopedPromptPath } from './project-context.js'
 import { targetClosureFromRoadmap, targetClosureFromRoadmapWithTargets, type ClosureTarget, type TargetClosure } from './target-closure.js'
-import { acceptanceVerdictFromManualAudit, dependencyInputIdentity, normalizeAcceptancePolicy, type AcceptancePolicy, type AcceptanceVerdict } from './acceptance-policy.js'
+import { acceptanceVerdictFromManualAudit, dependencyInputIdentity, mergeTargetPolicy, normalizeAcceptancePolicy, type AcceptancePolicy, type AcceptanceVerdict } from './acceptance-policy.js'
 import { summarizeUpdaterError } from './updater-error.js'
 import { flowNotificationContent, type FlowNotificationEvent } from './notifications.js'
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
@@ -73,7 +73,7 @@ type BaselineProofMode = 'VERIFIED' | 'DRAFT'
 type BaselineControlMode = 'AUTONOMOUS' | 'CONFIRM_SIGNIFICANT'
 type BaselineDeferredCohort = { id: string; label: string; packages: string[]; predicate?: string; confidence?: number; authority: 'DIAGNOSTIC_HINT'; deferredAt?: string; decisionId?: string; boundaryPackages?: string[]; warningPackages?: string[] }
 type BaselineCohortAction = { kind: 'DEFER' | 'REACTIVATE'; cohortId: string; label: string; packages: string[]; predicate?: string; confidence?: number; decisionId?: string }
-type BaselineIntent = { schemaVersion: 1 | 2; policies: Record<string, BaselinePackagePolicy>; controlMode?: BaselineControlMode; budgetMinutes?: number; acceptancePolicy?: AcceptancePolicy; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; proofMode?: BaselineProofMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction; targetLevel?: 'yellow' | 'green'; minLagOkPct?: number }
+type BaselineIntent = { schemaVersion: 1 | 2; policies: Record<string, BaselinePackagePolicy>; controlMode?: BaselineControlMode; budgetMinutes?: number; acceptancePolicy?: AcceptancePolicy; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; proofMode?: BaselineProofMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction; targetLevel?: 'yellow' | 'green'; minLagOkPct?: number; lagPolicyMonths?: number }
 type BaselineIntentCandidate = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string }
 type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent }
 type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
@@ -147,6 +147,11 @@ type DraftResultSnapshot = {
   // of just mtimes.
   inputHashes?: Record<string, string>
   settings?: Record<string, unknown>
+  // F4: the card staleness, computed the same way as the preview. Separates
+  // "a fresh new result of THIS run" from "still matches the current inputs":
+  // a just-produced run is fresh even when an OLDER result was already stale.
+  stale?: boolean
+  staleReason?: string
 }
 
 type DesktopState = {
@@ -177,6 +182,9 @@ type WorkspaceDetails = {
   projectLevels: Record<string, ProjectLevel>
   targetClosure?: TargetClosure
   acceptanceVerdict?: AcceptanceVerdict
+  // F1: the persisted goal exposed to the renderer so stage actions, autopilot
+  // and generate use the saved target instead of a hard-coded 'yellow'.
+  baselineIntent?: { targetLevel?: 'yellow' | 'green'; minLagOkPct?: number; lagPolicyMonths?: number }
   migrationProgress?: MigrationProgress
   baselineRecovery?: BaselineRecoveryInfo
   draftResult?: DraftResultSnapshot
@@ -399,13 +407,26 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
   const budgetMinutes = Number.isFinite(budgetParsed) ? Math.max(5, Math.min(240, Math.round(budgetParsed))) : 30
   // T2: 0 is a legitimate user goal ("no lag-policy slack at the release
   // gate"), so it must not be coerced back to the legacy 80 default by `||`.
-  const rawLagPct = Number(raw.minLagOkPct)
+  // F1: a single normalized TargetPolicy. The dialog persists the goal on the
+  // top level (targetLevel/minLagOkPct/lagPolicyMonths) and the acceptance
+  // limits inside acceptancePolicy; readers like readAcceptanceVerdict only
+  // look at acceptancePolicy. mergeTargetPolicy merges them (top-level wins,
+  // legacy nested values migrate from older intents) and the result is
+  // mirrored back to the flat fields for legacy readers.
+  const acceptancePolicy = mergeTargetPolicy(raw.acceptancePolicy, {
+    targetLevel: raw.targetLevel,
+    minLagOkPct: raw.minLagOkPct,
+    lagPolicyMonths: raw.lagPolicyMonths,
+  })
+  const goalLevel = acceptancePolicy.targetLevel ?? 'yellow'
+  const goalLagPct = acceptancePolicy.minLagOkPct ?? 80
+  const goalLagMonths = acceptancePolicy.lagPolicyMonths ?? 12
   return {
     schemaVersion: 2,
     policies,
     controlMode,
     budgetMinutes,
-    acceptancePolicy: normalizeAcceptancePolicy(raw.acceptancePolicy),
+    acceptancePolicy,
     extraIterations: Math.max(0, Math.floor(Number(raw.extraIterations ?? 0) || 0)),
     decisionGrantIterations: Math.max(0, Math.floor(Number(raw.decisionGrantIterations ?? 0) || 0)),
     searchMode: raw.searchMode === 'EXHAUSTIVE' || raw.searchMode === 'BOUNDED_IMPROVEMENT' ? raw.searchMode : 'AUTO',
@@ -414,8 +435,9 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
     executionMode: controlMode === 'AUTONOMOUS' ? 'BACKGROUND' : 'FAST',
     proofMode: raw.proofMode === 'DRAFT' ? 'DRAFT' : 'VERIFIED',
     deferredCohorts,
-    ...(raw.targetLevel === 'green' ? { targetLevel: 'green' as const } : raw.targetLevel === 'yellow' ? { targetLevel: 'yellow' as const } : {}),
-    ...(raw.minLagOkPct !== undefined && raw.minLagOkPct !== null && Number.isFinite(rawLagPct) ? { minLagOkPct: Math.max(0, Math.min(100, Math.round(rawLagPct))) } : {}),
+    targetLevel: goalLevel,
+    minLagOkPct: goalLagPct,
+    lagPolicyMonths: goalLagMonths,
     ...(cohortAction ? { cohortAction } : {}),
   }
 }
@@ -717,7 +739,16 @@ function draftResultForProject(workspace: WorkspaceRecord, projectName?: string)
   // resolve to this workspace/project's run (T5).
   const read = draftReadStrict(workspace, ref.runId, { workspaceId: workspace.id, projectId: projectName })
   if (!read.ok) return undefined
-  return buildDraftResultSnapshot(read.artifact)
+  const snapshot = buildDraftResultSnapshot(read.artifact)
+  // F4: the card shows whether the LAST Draft for this project still matches
+  // today's inputs/policy, so a stale result is never presented as fresh even
+  // when nothing new ran since it was generated.
+  const project = readProjects(workspace).find((item) => item.name === projectName)
+  if (project) {
+    const staleness = draftInputStaleness(workspace, project, snapshot)
+    return { ...snapshot, stale: staleness.stale, staleReason: staleness.reason }
+  }
+  return snapshot
 }
 
 // A Draft is stale when it no longer describes the project as it is today:
@@ -1816,11 +1847,17 @@ function readTargetClosure(workspace: WorkspaceRecord, project: ProjectSpec | un
   try {
     const roadmap = JSON.parse(readFileSync(roadmapPath, 'utf8')) as unknown
     const promptPath = promptPathForProject(workspace, project.name)
-    const minLagOkPct = loadBaselineIntent(workspace, project.name).minLagOkPct ?? 80
-    if (!promptPath || !existsSync(promptPath)) return targetClosureFromRoadmap(roadmap, project.name, target, minLagOkPct)
+    // F2: the closure enforces the SAME security limit as the acceptance
+    // verdict (single-source TargetPolicy), so the stored policy's maxKnownHigh
+    // threads into reached and the UI cannot show a goal as reached while
+    // acceptance still blocks the release on High > limit.
+    const intent = loadBaselineIntent(workspace, project.name)
+    const minLagOkPct = intent.minLagOkPct ?? 80
+    const maxKnownHigh = intent.acceptancePolicy?.maxKnownHigh ?? 1
+    if (!promptPath || !existsSync(promptPath)) return targetClosureFromRoadmap(roadmap, project.name, target, minLagOkPct, maxKnownHigh)
     const markdown = readFileSync(promptPath, 'utf8')
     const plannedTargets = migrationPlanFromPrompt(markdown, project.name) ? scopeTargetsFromPrompt(markdown, project.name) : {}
-    return targetClosureFromRoadmapWithTargets(roadmap, project.name, target, plannedTargets, minLagOkPct)
+    return targetClosureFromRoadmapWithTargets(roadmap, project.name, target, plannedTargets, minLagOkPct, maxKnownHigh)
   } catch {
     return undefined
   }
@@ -1838,6 +1875,13 @@ function readAcceptanceVerdict(workspace: WorkspaceRecord, project: ProjectSpec)
   try { report = existsSync(reportPath) ? JSON.parse(readFileSync(reportPath, 'utf8')) as unknown : undefined } catch { report = undefined }
   const policy = loadBaselineIntent(workspace, project.name).acceptancePolicy
   return acceptanceVerdictFromManualAudit(report, identity.hash, policy)
+}
+
+function baselineIntentSnapshot(workspace: WorkspaceRecord, projectName: string): { targetLevel?: 'yellow' | 'green'; minLagOkPct?: number; lagPolicyMonths?: number } | undefined {
+  try {
+    const intent = loadBaselineIntent(workspace, projectName)
+    return { targetLevel: intent.targetLevel, minLagOkPct: intent.minLagOkPct, lagPolicyMonths: intent.lagPolicyMonths }
+  } catch { return undefined }
 }
 
 function acceptanceRemediationMessage(verdict: AcceptanceVerdict): string {
@@ -1881,6 +1925,7 @@ async function workspaceDetails(workspace: WorkspaceRecord): Promise<WorkspaceDe
     projectLevels: readProjectLevels(workspace),
     targetClosure: readTargetClosure(workspace, project, savedTarget === 'green' ? 'green' : 'yellow'),
     acceptanceVerdict: project ? readAcceptanceVerdict(workspace, project) : undefined,
+    baselineIntent: project ? baselineIntentSnapshot(workspace, project.name) : undefined,
     migrationProgress,
     baselineRecovery: baselineRecoveryInfo(workspace, project?.name),
     draftResult: draftResultForProject(workspace, project?.name),
@@ -2257,6 +2302,19 @@ async function executeBaselineWorkerCommand(
   }
 }
 
+// F1: the saved goal policy re-applied to non-baseline generator jobs. A
+// fresh roadmap or audit must see the same target level / numeric lag gate as
+// the baseline run that produced the intent, or regenerate/regenerate-all
+// would drift the goal and the release gate would reject its own plan.
+function goalPolicyEnv(workspace: WorkspaceRecord, projectName: string): Record<string, string> | undefined {
+  const intent = loadBaselineIntent(workspace, projectName)
+  return {
+    DEPLOOM_BASELINE_TARGET_LEVEL: intent.targetLevel ?? 'yellow',
+    DEPLOOM_BASELINE_MIN_LAG_OK_PCT: String(intent.minLagOkPct ?? 80),
+    DEPLOOM_ACCEPTANCE_POLICY_JSON: JSON.stringify(intent.acceptancePolicy ?? normalizeAcceptancePolicy(undefined)),
+  }
+}
+
 function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project: ProjectSpec, draftRunId?: string): CommandSpec[] {
   const toolDir = bundledToolDir()
   const settingsPath = resolveSettingsPath(workspace)
@@ -2386,6 +2444,10 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
         args: [...commonGeneratorArgs, '--history-snapshot-label', input.label?.trim() || 'DepLoom: после итерации'],
         stallWarningMs: 2 * 60_000,
         stallAbortMs: 15 * 60_000,
+        // F1: a regeneration must re-apply the saved goal policy, or a
+        // fresh roadmap would silently fall back to the engine default and
+        // drift from the target the release gate still enforces.
+        env: goalPolicyEnv(workspace, project.name),
       }]
     case 'generate-all':
       return [{
@@ -2393,10 +2455,13 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
         args: [generatorPath(), '--project-settings', settingsPath, '--history-snapshot-label', input.label?.trim() || 'DepLoom: все проекты'],
         stallWarningMs: 2 * 60_000,
         stallAbortMs: 15 * 60_000,
+        env: goalPolicyEnv(workspace, project.name),
       }]
     case 'audit': {
       const slug = project.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-')
       const artifacts = artifactPath(workspace, 'artifactsDir', '.dependency-roadmap/artifacts')
+      const intent = loadBaselineIntent(workspace, project.name)
+      const auditPolicy = intent.acceptancePolicy ?? normalizeAcceptancePolicy(undefined)
       return [{
         label: 'Независимый audit', command: 'python', cwd: workspace.path,
         args: [join(toolDir, 'manual_dependency_audit.py'), '--project-dir', project.path, '--project-name', project.name,
@@ -2404,6 +2469,10 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
           '--audit-workspace', join(artifacts, `manual-audit-${slug}-workspace`),
           // Release acceptance requires canonical Yarn graph authority. For npm/pnpm this option is accepted but ignored.
           '--yarn-audit-engine', 'yarn-inventory',
+          '--target-level', auditPolicy.targetLevel ?? 'yellow',
+          '--min-lag-ok-pct', String(auditPolicy.minLagOkPct ?? 80),
+          '--max-known-high', String(auditPolicy.maxKnownHigh ?? 1),
+          '--lag-months', String(auditPolicy.lagPolicyMonths ?? 12),
           '--json-out', join(artifacts, `manual-audit-${slug}.json`), '--md-out', join(artifacts, `manual-audit-${slug}.md`)],
       }]
     }

@@ -267,7 +267,49 @@ def test_draft_publish_writes_run_scoped_artifacts_atomically() -> None:
             roadmap.set_draft_artifacts_base(None)
 
 
-def test_generator_tolerates_offline_registry_in_draft_mode() -> None:
+def test_draft_publish_binds_manifest_to_inventory_input_hashes_not_recompute() -> None:
+    """F4: a partial/ready publish must record the INVENTORY-time identity the
+    plan was derived from, never re-hash the inputs at publication time.
+    Otherwise a manifest/package.json/settings edit landing between inventory
+    and publish would silently bind the plan to other data."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        project = roadmap.ProjectSpec(name="tiny-basic", path=base / "proj", source_branch="main")
+        project.path.mkdir(parents=True)
+        (project.path / "package.json").write_text('{"name":"proj","version":"1.0.0"}', encoding="utf-8")
+        (project.path / "package-lock.json").write_text("{}", encoding="utf-8")
+        (project.path / ".dependency-roadmap").mkdir(parents=True, exist_ok=True)
+        (project.path / ".dependency-roadmap" / "settings.project.json").write_text(
+            '{"projects":[{"name":"proj","path":"."}]}', encoding="utf-8")
+        inventory_hash = roadmap.draft_input_hash(project)
+        # Inputs move AFTER inventory, before publish (lockfile edited).
+        (project.path / "package-lock.json").write_text('{"changed": true}', encoding="utf-8")
+        changed_hash = roadmap.draft_input_hash(project)
+        assert inventory_hash != changed_hash
+
+        roadmap.set_draft_artifacts_base(base)
+        try:
+            row = _make_row()
+            manifest = roadmap.publish_draft_result(
+                run_id="run-f4-inventory",
+                workspace_id="ws-test",
+                project_id="tiny-basic",
+                mode="draft",
+                rows_by_project={"tiny-basic": [row]},
+                projects_by_name={},
+                health_by_project={"tiny-basic": _make_health()},
+                status="DRAFT_READY",
+                partial_reason=None,
+                deadline=roadmap.DeadlineClock(None),
+                input_hashes={"tiny-basic": inventory_hash},
+            )
+            # The manifest carries the identity captured BEFORE the input moved:
+            # the reader compares against today's files and reports stale,
+            # instead of the writer silently re-binding the plan to new data.
+            assert manifest["inputHashes"]["tiny-basic"] == inventory_hash
+            assert manifest["inputHashes"]["tiny-basic"] != changed_hash
+        finally:
+            roadmap.set_draft_artifacts_base(None)
     from unittest import mock
 
     class _BrokenClient:
@@ -388,7 +430,7 @@ def test_r9_numeric_target_policy_changes_health_gate_and_hash() -> None:
     # The old source contract forbidding freshness controls is inverted: the
     # dialog now owns the numeric goal and the desktop threads it to the engine.
     assert "Минимум актуальности" in DIALOG
-    assert "minLagOkPct: boundedInteger(nextMinLagOkPct, 80, 0, 100)" in DIALOG
+    assert "boundedInteger(nextMinLagOkPct, 80, 0, 100)" in DIALOG
     assert "targetLevel === 'green' ? 'green' : 'yellow'" in DIALOG
     assert "DEPLOOM_BASELINE_TARGET_LEVEL: effectiveIntent.targetLevel" in DESKTOP_MAIN
     assert "DEPLOOM_BASELINE_MIN_LAG_OK_PCT: String(effectiveIntent.minLagOkPct" in DESKTOP_MAIN
@@ -605,6 +647,103 @@ class DraftDeadlineHardBoundTests(unittest.TestCase):
         sleeper._bounded_sleep(60.0)
         self.assertGreaterEqual(sleeper.deadline.remaining, 1.0 - 0.5)
 
+    def test_header_trickle_is_aborted_by_the_deadline(self) -> None:
+        import threading
+        import http.server
+        import socketserver
+
+        # A server that drips the RESPONSE HEADER BLOCK byte-by-byte (the
+        # validator reproduction). Natural transfer ~50 x 0.1 = ~5s; the per-recv
+        # read timeout never fires because every recv returns quickly. Only an
+        # absolute bound on the header phase can stop this within the budget.
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4\r\nConnection: close\r\n\r\n"
+                self.wfile.write(raw[:2])
+                self.wfile.flush()
+                try:
+                    for byte in raw[2:]:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.1)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *args):  # noqa: N802
+                pass
+
+        with socketserver.ThreadingTCPServer(("127.0.0.1", 0), _Handler) as server:
+            server.daemon_threads = True
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            started = time.monotonic()
+            try:
+                with self.assertRaises(roadmap.DraftBudgetExceeded):
+                    self._trickle_client(server.server_address[1], 2.0).fetch_npm_metadata("uuid")
+            finally:
+                server.shutdown()
+                server.server_close()
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.6, f"header trickle must abort at the deadline, took {elapsed:.2f}s")
+
+    def test_fetch_bytes_binary_trickle_keeps_deadline_semantics(self) -> None:
+        import threading
+        import http.server
+        import socketserver
+
+        # fetch_bytes is used for registry tarballs/type evidence. A binary
+        # body dripped one byte at a time must abort the run with
+        # DraftBudgetExceeded (not be swallowed into a silent None).
+        body = b"\x1f\x8b\x08\x00" * 7  # 28 bytes
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    for byte in body:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.12)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *args):  # noqa: N802
+                pass
+
+        with socketserver.ThreadingTCPServer(("127.0.0.1", 0), _Handler) as server:
+            server.daemon_threads = True
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            started = time.monotonic()
+            try:
+                client = self._trickle_client(server.server_address[1], 2.0)
+                with self.assertRaises(roadmap.DraftBudgetExceeded):
+                    client.fetch_bytes(f"http://127.0.0.1:{server.server_address[1]}/pkg/-/pkg-1.0.0.tgz")
+            finally:
+                server.shutdown()
+                server.server_close()
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.6, f"binary trickle must abort at the deadline, took {elapsed:.2f}s")
+
+    def test_supervised_worker_is_an_absolute_bound_for_uninterruptible_work(self) -> None:
+        # The supervisor bounds CPU-heavy planning the same way it bounds the
+        # network header phase: a function that never checks the clock itself
+        # still cannot outlive the remaining budget.
+        started = time.monotonic()
+        with self.assertRaises(roadmap.DraftBudgetExceeded):
+            roadmap.run_supervised("planning", roadmap.DeadlineClock(2.0), lambda: time.sleep(60))
+        self.assertLess(time.monotonic() - started, 2.6)
+        # Without a deadline the same fn runs inline (zero overhead).
+        self.assertTrue(roadmap.run_supervised("planning", None, lambda: True))
+        # Worker exceptions are re-raised, preserving DraftBudgetExceeded
+        # raised inside the worker (e.g. by per-byte checks).
+        with self.assertRaises(ValueError):
+            roadmap.run_supervised("network", roadmap.DeadlineClock(60.0), lambda: (_ for _ in ()).throw(ValueError("boom")))
+        with self.assertRaises(roadmap.DraftBudgetExceeded):
+            roadmap.run_supervised("network", roadmap.DeadlineClock(60.0), lambda: (_ for _ in ()).throw(roadmap.DraftBudgetExceeded("network-read")))
+
 
 def _row_with_variants(**overrides):
     base = dict(
@@ -676,3 +815,67 @@ def _lag_hard_row(**overrides):
     )
     base.update(overrides)
     return roadmap.DependencyRow(**base)
+
+
+class DraftProgressHeartbeatTests(unittest.TestCase):
+    """F5: the Draft progress heartbeat runs independently of blocking work,
+    stops at the terminal finalize event, and stage percentages never claim a
+    terminal 100 before the run has actually published."""
+
+    @staticmethod
+    def _parse(buffer) -> list:
+        return [json.loads(line.replace("[draft-progress] ", "", 1)) for line in buffer.splitlines() if "[draft-progress]" in line]
+
+    def test_f5_heartbeat_emits_between_events_and_stops_at_terminal(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        buffer = io.StringIO()
+        client = roadmap.LiveDataClient("https://registry.example/", 15, 8, 0.0)
+        old_heartbeat = roadmap.DRAFT_PROGRESS_HEARTBEAT_SECONDS
+        roadmap.DRAFT_PROGRESS_HEARTBEAT_SECONDS = 0.05
+        try:
+            client.set_draft_run("run-f5-hb")
+            with redirect_stdout(buffer):
+                time.sleep(0.18)
+                while buffer.getvalue().count("[draft-progress]") < 2:
+                    time.sleep(0.02)
+                before_terminal = buffer.getvalue()
+                client.progress(step="finalize", operation="publish draft", status="DRAFT_READY", completed=10, total=10)
+                client.mark_draft_terminal()
+                time.sleep(0.22)
+                after_terminal = buffer.getvalue()
+            lines = self._parse(before_terminal)
+            heartbeat_lines = [line for line in lines if line.get("heartbeat") is True]
+            self.assertGreaterEqual(len(heartbeat_lines), 1, before_terminal)
+            self.assertTrue(all("runId" in line and "elapsedSec" in line for line in heartbeat_lines))
+            after_lines = self._parse(after_terminal)
+            terminal_lines = [line for line in after_lines if line.get("status") == "DRAFT_READY"]
+            self.assertTrue(terminal_lines, after_terminal)
+            self.assertEqual(terminal_lines[0].get("pct"), 100)
+            self.assertEqual(after_terminal.count("[draft-progress]"),
+                             before_terminal.count("[draft-progress]") + 1,
+                             "heartbeat must stop after the terminal finalize event")
+        finally:
+            roadmap.DRAFT_PROGRESS_HEARTBEAT_SECONDS = old_heartbeat
+            client.mark_draft_terminal()
+
+    def test_f5_stage_percent_is_capped_and_terminal_only_with_status(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        buffer = io.StringIO()
+        client = roadmap.LiveDataClient("https://registry.example/", 15, 8, 0.0)
+        try:
+            client.set_draft_run("run-f5-pct")
+            with redirect_stdout(buffer):
+                client.progress(step="scan", completed=10, total=10)
+                client.progress(step="scan", completed=1, total=1)
+                client.progress(step="finalize", operation="publish draft", completed=10, total=10, status="DRAFT_PARTIAL")
+                client.mark_draft_terminal()
+            lines = self._parse(buffer.getvalue())
+            self.assertIsNone(lines[0].get("status"))
+            self.assertEqual(lines[0].get("pct"), 99, "a full measured stage must not claim a terminal 100")
+            self.assertEqual(lines[1].get("pct"), 99)
+            self.assertEqual(lines[2].get("status"), "DRAFT_PARTIAL")
+            self.assertEqual(lines[2].get("pct"), 100, "terminal 100 is allowed only on the finalize/publish event")
+        finally:
+            client.mark_draft_terminal()

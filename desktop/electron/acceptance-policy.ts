@@ -5,10 +5,18 @@ import { join } from 'node:path'
 export type AcceptancePolicy = {
   maxKnownCritical: number
   maxKnownHigh: number
-  // T2: the goal criteria are part of the acceptance policy too, so a release
+  // The goal criteria are part of the acceptance policy too, so a release
   // gate that claims "green / 100%" actually knows the goal it is enforcing.
   targetLevel?: 'yellow' | 'green'
   minLagOkPct?: number
+  // Numeric Moderate/Low tolerances (F1): the green preset pins them at 0 so
+  // "green" cannot silently tolerate known M/L findings without the gate
+  // knowing about it. Optional: when absent, M/L is not a release criterion.
+  maxKnownModerate?: number
+  maxKnownLow?: number
+  // The publish-date lag threshold (in months) the audit is bound to. Defaults
+  // to 12 (the product's standard lag policy) at the use site.
+  lagPolicyMonths?: number
 }
 
 export type AcceptanceVerdict = {
@@ -18,11 +26,18 @@ export type AcceptanceVerdict = {
   dependencyEvidenceFresh: boolean
   critical?: number
   high?: number
+  moderate?: number
+  low?: number
   criticalPackages: string[]
   highPackages: string[]
+  moderatePackages?: string[]
+  lowPackages?: string[]
   auditGeneratedAt?: string
   auditEngine?: string
   lagOkPct?: number
+  lagOk?: number
+  lagUnknown?: number
+  lagTotal?: number
   reasons: string[]
   policy: AcceptancePolicy
 }
@@ -32,6 +47,7 @@ export const DEFAULT_ACCEPTANCE_POLICY: AcceptancePolicy = Object.freeze({
   maxKnownHigh: 1,
   targetLevel: 'yellow',
   minLagOkPct: 80,
+  lagPolicyMonths: 12,
 })
 // BLOCK_ACCEPTANCE_POLICY_CLOSURE_V1
 export const MAX_ACCEPTANCE_AUDIT_AGE_MS = 24 * 60 * 60 * 1000
@@ -66,6 +82,20 @@ function boundedCount(value: unknown, fallback: number): number {
   return Math.max(0, Math.min(99, Math.trunc(parsed)))
 }
 
+function optionalBoundedCount(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return undefined
+  return Math.max(0, Math.min(99, Math.trunc(parsed)))
+}
+
+function optionalBoundedLagPct(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return undefined
+  return Math.max(0, Math.min(100, Math.trunc(parsed)))
+}
+
 export function normalizeAcceptancePolicy(value: unknown): AcceptancePolicy {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   const rawLagPct = Number(raw.minLagOkPct)
@@ -80,6 +110,43 @@ export function normalizeAcceptancePolicy(value: unknown): AcceptancePolicy {
     ...(raw.minLagOkPct !== undefined && raw.minLagOkPct !== null && Number.isFinite(rawLagPct)
       ? { minLagOkPct: Math.max(0, Math.min(100, Math.trunc(rawLagPct))) }
       : {}),
+    ...(optionalBoundedCount(raw.maxKnownModerate) !== undefined ? { maxKnownModerate: optionalBoundedCount(raw.maxKnownModerate)! } : {}),
+    ...(optionalBoundedCount(raw.maxKnownLow) !== undefined ? { maxKnownLow: optionalBoundedCount(raw.maxKnownLow)! } : {}),
+    // Lag threshold is a bounded product choice (3/6/9/12 months); anything
+    // else falls back to the product default instead of persisting garbage.
+    ...(raw.lagPolicyMonths === 3 || raw.lagPolicyMonths === 6 || raw.lagPolicyMonths === 9 || raw.lagPolicyMonths === 12
+      ? { lagPolicyMonths: raw.lagPolicyMonths as number }
+      : {}),
+  }
+}
+
+// F1: merge the flat top-level goal fields (the dialog's canonical storage for
+// the target level / lag gate) into the nested acceptancePolicy, which is the
+// object readAcceptanceVerdict actually enforces. This is THE single merge
+// used by production normalizeBaselineIntent and by the cross-language smoke
+// tests, so "UI green100 reaches acceptance as green100" is one function, not
+// an accident of two call sites drifting apart. Legacy intents with the goal
+// only inside acceptancePolicy (or only on the top level) migrate here.
+export function mergeTargetPolicy(
+  acceptancePolicyValue: unknown,
+  topLevel: { targetLevel?: unknown; minLagOkPct?: unknown; lagPolicyMonths?: unknown } = {},
+): AcceptancePolicy {
+  const policy = normalizeAcceptancePolicy(acceptancePolicyValue)
+  const rawLag = Number(topLevel.minLagOkPct)
+  const goalLevel: 'yellow' | 'green' =
+    topLevel.targetLevel === 'green' ? 'green' : topLevel.targetLevel === 'yellow' ? 'yellow' : (policy.targetLevel ?? 'yellow')
+  const goalLagPct = Number.isFinite(rawLag)
+    ? Math.max(0, Math.min(100, Math.trunc(rawLag)))
+    : (policy.minLagOkPct ?? 80)
+  const rawLagMonths = topLevel.lagPolicyMonths
+  const goalLagMonths = rawLagMonths === 3 || rawLagMonths === 6 || rawLagMonths === 9 || rawLagMonths === 12
+    ? rawLagMonths
+    : (policy.lagPolicyMonths ?? 12)
+  return {
+    ...policy,
+    targetLevel: goalLevel,
+    minLagOkPct: goalLagPct,
+    ...(goalLagMonths ? { lagPolicyMonths: goalLagMonths as number } : {}),
   }
 }
 
@@ -107,10 +174,12 @@ export function acceptanceVerdictFromManualAudit(
   const packageTotals = audit.packageTotals && typeof audit.packageTotals === 'object' ? audit.packageTotals as Record<string, unknown> : {}
   const critical = count(packageTotals.critical)
   const high = count(packageTotals.high)
-  // T2: the audit payload may carry the lag-policy compliance share. When
-  // present it is checked against the goal criteria (minLagOkPct; green means
-  // 100%). A report that does not carry the field simply cannot prove the
-  // freshness criterion, so no score is fabricated.
+  const moderate = count(packageTotals.moderate)
+  const low = count(packageTotals.low)
+  // F1: the lag-policy compliance share is a mandatory acceptance criterion.
+  // When the audit payload does not carry it (lagOkPct/compliancePct), the
+  // report simply cannot prove the freshness goal, so no score is fabricated
+  // and the verdict is UNKNOWN rather than a silent pass.
   const auditLagOkPct = typeof audit.lagOkPct === 'number' && Number.isFinite(audit.lagOkPct)
     ? Math.max(0, Math.min(100, audit.lagOkPct))
     : typeof audit.compliancePct === 'number' && Number.isFinite(audit.compliancePct)
@@ -122,7 +191,7 @@ export function acceptanceVerdictFromManualAudit(
   const auditAuthorityStrong = auditComplete && authoritativeAuditEvidence(audit)
   const packageDetails = audit.packageDetails && typeof audit.packageDetails === 'object' ? audit.packageDetails as Record<string, unknown> : {}
   const packages = audit.packages && typeof audit.packages === 'object' ? audit.packages as Record<string, unknown> : {}
-  const severityPackages = (severity: 'critical' | 'high'): string[] => {
+  const severityPackages = (severity: 'critical' | 'high' | 'moderate' | 'low'): string[] => {
     const fromDetails = Object.entries(packageDetails).flatMap(([name, raw]) => {
       if (!raw || typeof raw !== 'object') return []
       return String((raw as Record<string, unknown>).severity ?? '').toLowerCase() === severity ? [name] : []
@@ -135,56 +204,111 @@ export function acceptanceVerdictFromManualAudit(
   }
   const criticalPackages = severityPackages('critical')
   const highPackages = severityPackages('high')
+  const moderatePackages = severityPackages('moderate')
+  const lowPackages = severityPackages('low')
   const dependencyEvidenceFresh = Boolean(reportInputHash && currentDependencyInputHash && reportInputHash === currentDependencyInputHash)
   const auditGeneratedAt = typeof report.generatedAt === 'string' ? report.generatedAt.trim() : ''
   const auditGeneratedAtMs = auditGeneratedAt ? Date.parse(auditGeneratedAt) : Number.NaN
-  const reasons: string[] = []
+  const lagOk = typeof audit.lagOk === 'number' && Number.isFinite(audit.lagOk) ? Math.max(0, Math.trunc(audit.lagOk)) : undefined
+  const lagUnknown = typeof audit.lagUnknown === 'number' && Number.isFinite(audit.lagUnknown) ? Math.max(0, Math.trunc(audit.lagUnknown)) : undefined
+  const lagTotal = typeof audit.lagTotal === 'number' && Number.isFinite(audit.lagTotal) ? Math.max(0, Math.trunc(audit.lagTotal)) : undefined
 
-  if (!auditComplete) reasons.push('Vulnerability audit evidence is incomplete.')
-  else if (!auditAuthorityStrong) reasons.push('Vulnerability audit graph is not authoritative for release acceptance.')
-  if (critical === undefined || high === undefined) reasons.push('Vulnerable-package Critical/High totals are unknown.')
-  if (!reportInputHash) reasons.push('Audit report is not bound to dependencyInputHash.')
-  else if (!dependencyEvidenceFresh) reasons.push('package.json/lockfile inputs changed after the audit.')
-  if (!auditGeneratedAt) reasons.push('Audit report generatedAt is missing.')
-  else if (!Number.isFinite(auditGeneratedAtMs)) reasons.push('Audit report generatedAt is invalid.')
-  else if (auditGeneratedAtMs > nowMs + MAX_ACCEPTANCE_AUDIT_FUTURE_SKEW_MS) reasons.push('Audit report timestamp is too far in the future.')
-  else if (nowMs - auditGeneratedAtMs > MAX_ACCEPTANCE_AUDIT_AGE_MS) reasons.push('Vulnerability audit evidence is older than 24 hours.')
-
-  // T2: the fruit criterion is enforced only when the audit payload actually
-  // carries the compliance share; a report without it is not penalized on a
-  // dimension it cannot prove either way (the input-hash freshness check
-  // above already covers evidence age).
-  if (auditLagOkPct !== undefined && auditLagOkPct < goalLagFloor) {
-    reasons.push(`Lag-policy compliance ${auditLagOkPct}% is below the target gate ${goalLagFloor}% (${policy.targetLevel}).`)
+  // F1: the audit report must be bound to the exact goal policy it was
+  // produced under (same dependency inputs via hash AND same target/lag/High
+  // limits). Without a matching policy snapshot the lag+security evidence
+  // cannot vouch for the current goal, even when it is fresh and complete.
+  const reportPolicy = report.policy && typeof report.policy === 'object' ? report.policy as Record<string, unknown> : undefined
+  const policyMismatch: string[] = []
+  if (reportPolicy) {
+    const reportTarget = reportPolicy.targetLevel === 'green' ? 'green' : 'yellow'
+    if (reportTarget !== (policy.targetLevel ?? 'yellow')) policyMismatch.push(`targetLevel=${reportTarget}`)
+    const reportLag = optionalBoundedLagPct(reportPolicy.minLagOkPct)
+    if (reportLag !== undefined && reportLag !== (policy.minLagOkPct ?? 80)) policyMismatch.push(`minLagOkPct=${reportLag}`)
+    const reportHigh = optionalBoundedCount(reportPolicy.maxKnownHigh)
+    if (reportHigh !== undefined && reportHigh !== policy.maxKnownHigh) policyMismatch.push(`maxKnownHigh=${reportHigh}`)
+    const reportModerate = optionalBoundedCount(reportPolicy.maxKnownModerate)
+    if (reportModerate !== undefined && reportModerate !== policy.maxKnownModerate) policyMismatch.push(`maxKnownModerate=${reportModerate}`)
+    const reportLow = optionalBoundedCount(reportPolicy.maxKnownLow)
+    if (reportLow !== undefined && reportLow !== policy.maxKnownLow) policyMismatch.push(`maxKnownLow=${reportLow}`)
+    const reportLagMonths = reportPolicy.lagPolicyMonths
+    const currentLagMonths = policy.lagPolicyMonths ?? 12
+    if (reportLagMonths !== undefined && reportLagMonths !== currentLagMonths) policyMismatch.push(`lagPolicyMonths=${reportLagMonths}`)
   }
 
-  if (reasons.length) {
+  // Missing or weak evidence -> UNKNOWN (fail closed, nothing fabricated).
+  const unverifiable: string[] = []
+  if (!auditComplete) unverifiable.push('Vulnerability audit evidence is incomplete.')
+  else if (!auditAuthorityStrong) unverifiable.push('Vulnerability audit graph is not authoritative for release acceptance.')
+  if (critical === undefined || high === undefined) unverifiable.push('Vulnerable-package Critical/High totals are unknown.')
+  if (!reportInputHash) unverifiable.push('Audit report is not bound to dependencyInputHash.')
+  else if (!dependencyEvidenceFresh) unverifiable.push('package.json/lockfile inputs changed after the audit.')
+  if (!auditGeneratedAt) unverifiable.push('Audit report generatedAt is missing.')
+  else if (!Number.isFinite(auditGeneratedAtMs)) unverifiable.push('Audit report generatedAt is invalid.')
+  else if (auditGeneratedAtMs > nowMs + MAX_ACCEPTANCE_AUDIT_FUTURE_SKEW_MS) unverifiable.push('Audit report timestamp is too far in the future.')
+  else if (nowMs - auditGeneratedAtMs > MAX_ACCEPTANCE_AUDIT_AGE_MS) unverifiable.push('Vulnerability audit evidence is older than 24 hours.')
+  if (auditLagOkPct === undefined) unverifiable.push('Lag-policy compliance evidence is missing from the audit report (lagOkPct/compliancePct).')
+  if (!reportPolicy) unverifiable.push('Audit report has no goal-policy snapshot (report.policy) to bind the evidence to.')
+  else if (policyMismatch.length) unverifiable.push(`Audit report was produced under a different goal policy (${policyMismatch.join(', ')}).`)
+  if (policy.maxKnownModerate !== undefined && moderate === undefined) unverifiable.push('Moderate totals are missing from the audit report (policy demands a numeric Moderate limit).')
+  if (policy.maxKnownLow !== undefined && low === undefined) unverifiable.push('Low totals are missing from the audit report (policy demands a numeric Low limit).')
+
+  if (unverifiable.length) {
     return {
       status: 'UNKNOWN', accepted: false, evidenceComplete: false, dependencyEvidenceFresh,
       ...(critical !== undefined ? { critical } : {}), ...(high !== undefined ? { high } : {}),
+      ...(moderate !== undefined ? { moderate } : {}), ...(low !== undefined ? { low } : {}),
       criticalPackages, highPackages,
+      ...(moderatePackages.length ? { moderatePackages } : {}), ...(lowPackages.length ? { lowPackages } : {}),
       ...(auditGeneratedAt ? { auditGeneratedAt } : {}),
       ...(typeof audit.engine === 'string' ? { auditEngine: audit.engine } : {}),
       ...(auditLagOkPct !== undefined ? { lagOkPct: auditLagOkPct } : {}),
-      reasons, policy,
+      ...(lagOk !== undefined ? { lagOk } : {}), ...(lagUnknown !== undefined ? { lagUnknown } : {}), ...(lagTotal !== undefined ? { lagTotal } : {}),
+      reasons: unverifiable, policy,
     }
   }
 
-  if ((critical as number) > policy.maxKnownCritical) reasons.push(`Critical=${critical} exceeds ${policy.maxKnownCritical}.`)
-  if ((high as number) > policy.maxKnownHigh) reasons.push(`High=${high} exceeds ${policy.maxKnownHigh}.`)
+  // Known, verifiable failures of the configured goal -> REMEDIATION_REQUIRED.
+  const gates: string[] = []
+  if (policy.targetLevel === 'green' && (policy.maxKnownHigh ?? 1) > 0) {
+    gates.push(`Green goal requires High=0 but the policy allows High>${policy.maxKnownHigh}.`)
+  }
+  if ((critical as number) > policy.maxKnownCritical) gates.push(`Critical=${critical} exceeds ${policy.maxKnownCritical}.`)
+  if ((high as number) > policy.maxKnownHigh) gates.push(`High=${high} exceeds ${policy.maxKnownHigh}.`)
+  if (policy.maxKnownModerate !== undefined && moderate !== undefined && moderate > policy.maxKnownModerate) {
+    gates.push(`Moderate=${moderate} exceeds ${policy.maxKnownModerate}.`)
+  }
+  if (policy.maxKnownLow !== undefined && low !== undefined && low > policy.maxKnownLow) {
+    gates.push(`Low=${low} exceeds ${policy.maxKnownLow}.`)
+  }
+  if (auditLagOkPct !== undefined && auditLagOkPct < goalLagFloor) {
+    gates.push(`Lag-policy compliance ${auditLagOkPct}% is below the target gate ${goalLagFloor}% (${policy.targetLevel}).`)
+  }
+
+  if (gates.length) {
+    return {
+      status: 'REMEDIATION_REQUIRED', accepted: false, evidenceComplete: true, dependencyEvidenceFresh: true,
+      critical, high,
+      ...(moderate !== undefined ? { moderate } : {}), ...(low !== undefined ? { low } : {}),
+      criticalPackages, highPackages,
+      ...(moderatePackages.length ? { moderatePackages } : {}), ...(lowPackages.length ? { lowPackages } : {}),
+      ...(auditGeneratedAt ? { auditGeneratedAt } : {}),
+      ...(typeof audit.engine === 'string' ? { auditEngine: audit.engine } : {}),
+      ...(auditLagOkPct !== undefined ? { lagOkPct: auditLagOkPct } : {}),
+      ...(lagOk !== undefined ? { lagOk } : {}), ...(lagUnknown !== undefined ? { lagUnknown } : {}), ...(lagTotal !== undefined ? { lagTotal } : {}),
+      reasons: gates, policy,
+    }
+  }
   return {
-    status: reasons.length ? 'REMEDIATION_REQUIRED' : 'ACCEPTED',
-    accepted: reasons.length === 0,
-    evidenceComplete: true,
-    dependencyEvidenceFresh: true,
-    critical,
-    high,
-    criticalPackages,
-    highPackages,
+    status: 'ACCEPTED', accepted: true, evidenceComplete: true, dependencyEvidenceFresh: true,
+    critical, high,
+    ...(moderate !== undefined ? { moderate } : {}), ...(low !== undefined ? { low } : {}),
+    criticalPackages, highPackages,
+    ...(moderatePackages.length ? { moderatePackages } : {}), ...(lowPackages.length ? { lowPackages } : {}),
     ...(auditGeneratedAt ? { auditGeneratedAt } : {}),
     ...(typeof audit.engine === 'string' ? { auditEngine: audit.engine } : {}),
     ...(auditLagOkPct !== undefined ? { lagOkPct: auditLagOkPct } : {}),
-    reasons: reasons.length ? reasons : ['Complete fresh vulnerability evidence satisfies the configured acceptance policy.'],
+    ...(lagOk !== undefined ? { lagOk } : {}), ...(lagUnknown !== undefined ? { lagUnknown } : {}), ...(lagTotal !== undefined ? { lagTotal } : {}),
+    reasons: ['Complete fresh vulnerability and lag evidence satisfies the configured acceptance policy.'],
     policy,
   }
 }

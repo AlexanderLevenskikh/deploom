@@ -28,6 +28,11 @@ function boundedInteger(value: unknown, fallback: number, min: number, max: numb
   return Math.max(min, Math.min(max, Math.round(parsed)))
 }
 
+function boundedLagMonths(value: unknown): number {
+  const parsed = Number(value)
+  return parsed === 3 || parsed === 6 || parsed === 9 || parsed === 12 ? parsed : 12
+}
+
 function normalizedSearchMode(value: BaselineIntent['searchMode']): BaselineSearchMode {
   return value === 'EXHAUSTIVE' ? 'EXHAUSTIVE' : 'AUTO'
 }
@@ -65,6 +70,9 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
   const [deferredCohorts, setDeferredCohorts] = useState<DeferredCohort[]>([...(plan.intent.deferredCohorts ?? [])])
   const [targetLevel, setTargetLevel] = useState<'yellow' | 'green'>(plan.intent.targetLevel === 'green' ? 'green' : 'yellow')
   const [minLagOkPct, setMinLagOkPct] = useState(boundedInteger(plan.intent.minLagOkPct, 80, 0, 100))
+  const [lagPolicyMonths, setLagPolicyMonths] = useState<number>(
+    boundedLagMonths(plan.intent.lagPolicyMonths ?? plan.intent.acceptancePolicy?.lagPolicyMonths ?? 12),
+  )
   const [busy, setBusy] = useState(false)
   const deferredQuery = useDeferredValue(query)
 
@@ -77,6 +85,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     setDeferredCohorts([...(plan.intent.deferredCohorts ?? [])])
     setTargetLevel(plan.intent.targetLevel === 'green' ? 'green' : 'yellow')
     setMinLagOkPct(boundedInteger(plan.intent.minLagOkPct, 80, 0, 100))
+    setLagPolicyMonths(boundedLagMonths(plan.intent.lagPolicyMonths ?? plan.intent.acceptancePolicy?.lagPolicyMonths ?? 12))
   }, [plan])
 
   const visible = useMemo(() => {
@@ -101,8 +110,9 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
       || searchDepth !== normalizedSearchMode(plan.intent.searchMode)
       || cohortFingerprint(deferredCohorts) !== cohortFingerprint(plan.intent.deferredCohorts ?? [])
       || targetLevel !== (plan.intent.targetLevel === 'green' ? 'green' : 'yellow')
-      || minLagOkPct !== boundedInteger(plan.intent.minLagOkPct, 80, 0, 100),
-    [budgetMinutes, controlMode, deferredCohorts, maxKnownHigh, minLagOkPct, plan.intent, policies, searchDepth, targetLevel],
+      || minLagOkPct !== boundedInteger(plan.intent.minLagOkPct, 80, 0, 100)
+      || lagPolicyMonths !== boundedLagMonths(plan.intent.lagPolicyMonths ?? plan.intent.acceptancePolicy?.lagPolicyMonths ?? 12),
+    [budgetMinutes, controlMode, deferredCohorts, lagPolicyMonths, maxKnownHigh, minLagOkPct, plan.intent, policies, searchDepth, targetLevel],
   )
 
   const buildIntent = ({
@@ -115,6 +125,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     nextDeferredCohorts = deferredCohorts,
     nextTargetLevel = targetLevel,
     nextMinLagOkPct = minLagOkPct,
+    nextLagPolicyMonths = lagPolicyMonths,
     cohortAction,
   }: {
     extra?: number
@@ -126,16 +137,32 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     nextDeferredCohorts?: DeferredCohort[]
     nextTargetLevel?: 'yellow' | 'green'
     nextMinLagOkPct?: number
+    nextLagPolicyMonths?: number
     cohortAction?: BaselineIntent['cohortAction']
   } = {}): BaselineIntent => {
+    // F1: the green preset forces the whole numeric goal -- 100% lag
+    // compliance, High=0 and Moderate/Low=0 -- and overrides whatever the
+    // sliders currently show, so "green" can never be saved with H=1 or an
+    // 80% freshness caveat the release gate must then silently reinterpret.
+    const effectiveTarget = nextTargetLevel === 'green' ? 'green' : 'yellow'
+    const effectiveLagPct = nextTargetLevel === 'green' ? 100 : boundedInteger(nextMinLagOkPct, 80, 0, 100)
+    const effectiveHigh = nextTargetLevel === 'green' ? 0 : boundedInteger(maxKnownHigh, 1, 0, 99)
+    const effectiveLagMonths = boundedLagMonths(nextLagPolicyMonths)
     return {
       schemaVersion: 2,
       policies: Object.fromEntries(Object.entries(nextPolicies).filter(([, value]) => value !== 'auto')),
       controlMode: nextControlMode,
       budgetMinutes: boundedInteger(budgetMinutes, 30, 5, 240),
+      // The acceptancePolicy is the single canonical home of the TargetPolicy:
+      // readAcceptanceVerdict reads only this nested object, so the goal must
+      // be part of it (not just a top-level mirror).
       acceptancePolicy: {
         maxKnownCritical: 0,
-        maxKnownHigh: boundedInteger(maxKnownHigh, 1, 0, 99),
+        maxKnownHigh: effectiveHigh,
+        targetLevel: effectiveTarget,
+        minLagOkPct: effectiveLagPct,
+        lagPolicyMonths: effectiveLagMonths,
+        ...(effectiveTarget === 'green' ? { maxKnownModerate: 0, maxKnownLow: 0 } : {}),
       },
       extraIterations: Math.max(0, Number(plan.intent.extraIterations ?? 0) + extra),
       decisionGrantIterations: grant,
@@ -144,10 +171,11 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
       executionMode: nextControlMode === 'AUTONOMOUS' ? 'BACKGROUND' : 'FAST',
       proofMode,
       deferredCohorts: reconcileDeferredCohorts(nextDeferredCohorts, nextPolicies),
-      // R9: the numeric target policy. These are part of the versioned policy
-      // hash, so acceptance/audit can prove the run aimed at the same goal.
-      ...(nextTargetLevel === 'green' ? { targetLevel: nextTargetLevel } : {}),
-      minLagOkPct: boundedInteger(nextMinLagOkPct, 80, 0, 100),
+      // Top-level mirrors of the canonical policy for legacy readers and the
+      // R9 policy-hash identity; only these objects participate in the hash.
+      targetLevel: effectiveTarget,
+      minLagOkPct: effectiveLagPct,
+      lagPolicyMonths: effectiveLagMonths,
       ...(cohortAction ? { cohortAction } : {}),
     }
   }
@@ -322,17 +350,26 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
             <div className="baseline-run-control">
               <span className="baseline-run-control-label">{text('Acceptance policy', 'Acceptance policy')}</span>
               <div className="baseline-critical-fixed"><span>Critical</span><strong>0</strong><small>{text('обязательно', 'required')}</small></div>
-              <label>High ≤ <input type="number" min={0} max={99} value={maxKnownHigh} disabled={busy} onChange={(event) => setMaxKnownHigh(boundedInteger(event.target.value, 1, 0, 99))} /></label>
-              <small>{text('Critical всегда должен быть 0. Допуск High можно настроить. Неполный или устаревший аудит никогда не считается безопасным.', 'Critical must always be 0. High tolerance is configurable. Incomplete or stale audit evidence is never accepted.')}</small>
+              <label>High ≤ <input type="number" min={0} max={99} value={targetLevel === 'green' ? 0 : maxKnownHigh} disabled={busy || targetLevel === 'green'} onChange={(event) => setMaxKnownHigh(boundedInteger(event.target.value, 1, 0, 99))} /></label>
+              <small>{targetLevel === 'green'
+                ? text('Цель Green всегда требует High=0 (и Moderate/Low=0): зелёный пресет задаёт все лимиты численно, их нельзя ослабить. Critical всегда должен быть 0.', 'The Green goal always requires High=0 (and Moderate/Low=0): the green preset sets every limit numerically and they cannot be relaxed. Critical must always be 0.')
+                : text('Critical всегда должен быть 0. Допуск High можно настроить. Неполный или устаревший аудит никогда не считается безопасным.', 'Critical must always be 0. High tolerance is configurable. Incomplete or stale audit evidence is never accepted.')}</small>
             </div>
             <div className="baseline-run-control">
               <span className="baseline-run-control-label">{text('Цель запуска', 'Run goal')}</span>
               <div className="baseline-mode-toggle" role="group" aria-label={text('Целевой уровень Result', 'Result target level')}>
                 <button type="button" className={targetLevel === 'yellow' ? 'active' : ''} aria-pressed={targetLevel === 'yellow'} disabled={busy} onClick={() => setTargetLevel('yellow')}>{text('Жёлтый', 'Yellow')}</button>
-                <button type="button" className={targetLevel === 'green' ? 'active' : ''} aria-pressed={targetLevel === 'green'} disabled={busy} onClick={() => setTargetLevel('green')}>{text('Зелёный', 'Green')}</button>
+                <button type="button" className={targetLevel === 'green' ? 'active' : ''} aria-pressed={targetLevel === 'green'} disabled={busy} onClick={() => { setTargetLevel('green'); setMinLagOkPct(100) }}>{text('Зелёный', 'Green')}</button>
               </div>
-              <label>{text('Минимум актуальности', 'Minimum lag compliance')} <input type="range" min={0} max={100} step={5} value={minLagOkPct} disabled={busy} onChange={(event) => setMinLagOkPct(boundedInteger(event.target.value, 80, 0, 100))} /> <strong>{minLagOkPct}%</strong></label>
-              <small>{text('Сколько библиотек должны соблюдать lag-policy, чтобы цель считалась достигнутой. Входит в policy hash: изменение сдвигает реальные пороги плана и приёмки.', 'Share of libraries that must satisfy the lag policy for the goal to count as met. It is part of the policy hash: changing it moves the real plan and acceptance thresholds.')}</small>
+              <label>{text('Минимум актуальности', 'Minimum lag compliance')} <input type="range" min={0} max={100} step={5} value={targetLevel === 'green' ? 100 : minLagOkPct} disabled={busy || targetLevel === 'green'} onChange={(event) => setMinLagOkPct(boundedInteger(event.target.value, 80, 0, 100))} /> <strong>{targetLevel === 'green' ? 100 : minLagOkPct}%</strong></label>
+              <div className="baseline-mode-toggle" role="group" aria-label={text('Lag-порог', 'Lag threshold')}>
+                {[3, 6, 9, 12].map((months) => (
+                  <button key={months} type="button" className={lagPolicyMonths === months ? 'active' : ''} aria-pressed={lagPolicyMonths === months} disabled={busy} onClick={() => setLagPolicyMonths(boundedLagMonths(String(months)))}>{months} {text('мес', 'mo')}</button>
+                ))}
+              </div>
+              <small>{targetLevel === 'green'
+                ? text('Цель Green: 100% библиотек без нарушений lag-политики за выбранный период, C=0/H=0/M=0/L=0, известных и неизвестных вместе. Входит в policy hash: изменение сдвигает реальные пороги плана и приёмки.', 'Green goal: 100% of libraries satisfying the lag policy within the chosen window, C=0/H=0/M=0/L=0, known and unknown together. Part of the policy hash: changing it moves the real plan and acceptance thresholds.')
+                : text('Сколько библиотек должны соблюдать lag-policy, чтобы цель считалась достигнутой. Входит в policy hash: изменение сдвигает реальные пороги плана и приёмки.', 'Share of libraries that must satisfy the lag policy for the goal to count as met. It is part of the policy hash: changing it moves the real plan and acceptance thresholds.')}</small>
             </div>
           </div>
           <details className="baseline-advanced-actions">

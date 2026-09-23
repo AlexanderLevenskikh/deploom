@@ -2,11 +2,13 @@ import fs from 'node:fs'
 
 const main = fs.readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8')
 const flow = fs.readFileSync(new URL('../src/components/FlowWorkspace.tsx', import.meta.url), 'utf8')
+const hook = fs.readFileSync(new URL('../src/hooks/useDependencyFlow.ts', import.meta.url), 'utf8')
 const dialog = fs.readFileSync(new URL('../src/components/BaselineIntentDialog.tsx', import.meta.url), 'utf8')
 const audit = fs.readFileSync(new URL('../../manual_dependency_audit.py', import.meta.url), 'utf8')
 const acceptance = fs.readFileSync(new URL('../electron/acceptance-policy.ts', import.meta.url), 'utf8')
 const policy = fs.readFileSync(new URL('../src/autopilot-policy.ts', import.meta.url), 'utf8')
 const recovery = fs.readFileSync(new URL('../electron/flow-recovery.ts', import.meta.url), 'utf8')
+const generator = fs.readFileSync(new URL('../../dependency_live_roadmap_generator.py', import.meta.url), 'utf8')
 const ci = fs.readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8')
 
 const has = (source, needle, label) => { if (!source.includes(needle)) throw new Error(`${label}: missing ${JSON.stringify(needle)}`) }
@@ -36,7 +38,7 @@ for (const forbidden of [
 ]) lacks(main, forbidden, 'old mandatory Yellow orchestration')
 
 for (const sentinel of [
-  "const target: TargetLevel = 'yellow'",
+  "const target: TargetLevel = details.baselineIntent?.targetLevel === 'green' ? 'green' : 'yellow'",
   "text('Acceptance', 'Acceptance')",
   "text('Freshness', 'Freshness')",
   "text('Результат принят', 'Result accepted')",
@@ -53,6 +55,25 @@ lacks(dialog, 'preferredFreshnessPct', 'unimplemented freshness target must not 
 has(dialog, "text('Бюджет Baseline / планирования', 'Baseline / planning budget')", 'honest planning budget')
 has(dialog, "controlMode === 'AUTONOMOUS'", 'autonomous control mode')
 has(dialog, "controlMode === 'CONFIRM_SIGNIFICANT'", 'confirm significant mode')
+
+// F5: the Draft auto-open is consumed by runId only after the prompt content
+// was confirmed delivered, so a remount / fresh details never re-opens a run.
+has(flow, "openDraftPromptRef.current().then((confirmed) => {", 'one-shot auto-open waits for confirmed receipt')
+has(flow, "if (confirmed) onAcknowledgeDraftRun(details.workspace.id, project.name, draftResult.runId)", 'auto-open consumes by runId after receipt')
+// F5: the live strip keeps a monotonic elapsed + predictable live/stale
+// independent of backend events, and retained measured stage counters.
+has(flow, 'setNowTick', 'independent 1s progress re-render')
+has(flow, 'anchorSec + sinceLastEventMs / 1000', 'monotonic elapsed extends from the last backend event')
+has(flow, "current.step === progress.step", 'stage counters retained across events of the same stage')
+has(flow, 'Прогресс этапа', 'stage percent is explicitly a stage percent')
+// F5: the backend emits an independent draft-progress heartbeat and freezes it
+// at the terminal finalize event; stage percent never claims a terminal 100.
+has(generator, '_heartbeat_loop', 'backend heartbeat loop')
+has(generator, 'DRAFT_PROGRESS_HEARTBEAT_SECONDS', 'configurable heartbeat cadence')
+has(generator, 'mark_draft_terminal', 'terminal freezes the heartbeat')
+has(generator, 'min(99, int(round(raw * 100)))', 'stage percent capped below terminal 100')
+// F5: the acknowledged-runId marker lives in the hook and survives remounts.
+has(hook, 'acknowledgedRunId', 'one-shot ack survives remount (hook-owned marker)')
 has(policy, "if (!verdict || verdict.status === 'UNKNOWN') return undefined", 'fail-closed autopilot')
 has(policy, "if (verdict.accepted)", 'accepted completion')
 has(policy, "return 'agent'", 'security remediation re-entry')

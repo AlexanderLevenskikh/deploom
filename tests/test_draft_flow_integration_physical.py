@@ -17,12 +17,31 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 GENERATOR = ROOT / "dependency_live_roadmap_generator.py"
 RENDERER_TS = ROOT / "desktop" / "electron" / "draft-artifact-reader.ts"
 READER_ASSET = ROOT / "desktop" / "dist-electron" / "draft-artifact-reader.js"
 PROBE = ROOT / "tests" / "draft_reader_probe.mjs"
+VENDOR_LIB = ROOT / "tests" / "fixtures" / "real-lib" / "kontur-verified-fixture-lib"
+REAL_LIB_TGZ = "kontur-verified-fixture-lib-1.0.0.tgz"
+
+import manual_dependency_audit as audit
+
+NODE_VERDICT_SCRIPT = """\
+import { readFileSync } from 'node:fs'
+import { pathToFileURL } from 'node:url'
+const [distPath, reportPath, projectPath, policyArg] = process.argv.slice(2)
+const { acceptanceVerdictFromManualAudit, dependencyInputIdentity } = await import(pathToFileURL(distPath).href)
+const report = JSON.parse(readFileSync(reportPath, 'utf8'))
+const policy = policyArg ? JSON.parse(policyArg) : undefined
+const identity = dependencyInputIdentity(projectPath)
+const verdict = acceptanceVerdictFromManualAudit(report, identity.hash, policy)
+console.log(JSON.stringify({ status: verdict.status, accepted: verdict.accepted, reasons: verdict.reasons }))
+"""
 
 
 def _write(path: Path, text: str) -> None:
@@ -259,6 +278,138 @@ class DraftReaderCrossLanguageTests(unittest.TestCase):
         self.assertTrue(partial["ok"])
         self.assertIs(partial["staleness"]["stale"], False, partial["staleness"])
 
+    def test_f4_staleness_covers_settings_dashboard_and_missing_identity(self) -> None:
+        """F4: the staleness decision is bound to the FULL planner input set,
+        not only the lockfiles:
+        - project settings edits and dashboard-state additions/deletions flip
+          the fingerprint even when package.json/lockfile are untouched;
+        - a run without a recorded input identity is never fresh;
+        - changing the acceptance policy limits (High / lag months) flips it;
+        - the historical result stays readable with an explicit reason."""
+        ws, run_ready, _ = self._make_workspace_with_drafts()
+        settings_rel = Path(".dependency-roadmap") / "settings.project.json"
+        settings_path = ws / settings_rel
+        dashboard_rel = Path(".dependency-roadmap") / "state" / "dashboard-state.json"
+        dashboard_path = ws / dashboard_rel
+        manifest_path = self._manifest(ws, run_ready)
+
+        def staleness(**overrides):
+            payload = {
+                "projectPath": str(ws),
+                "projectName": "t1",
+                "useManifestSettings": True,
+                "currentPolicy": {"targetLevel": "yellow", "minLagOkPct": 80, "policies": {}},
+            }
+            payload.update(overrides)
+            return payload
+
+        # Baseline: untouched -> fresh (the fingerprint covers the settings that
+        # existed at run time too).
+        fresh = self._probe(ws, run_ready, {"workspaceId": "ws-t1", "projectId": "t1"}, staleness=staleness())
+        self.assertTrue(fresh["ok"])
+        self.assertIs(fresh["staleness"]["stale"], False, fresh["staleness"])
+
+        # Project settings edit -> stale (lockfiles untouched).
+        original_settings_bytes = settings_path.read_text(encoding="utf-8")
+        original_settings = _read_json(settings_path)
+        _write(settings_path, json.dumps({**original_settings, "hintField": 1}, indent=2))
+        self.addCleanup(lambda: settings_path.write_text(original_settings_bytes, encoding="utf-8", newline="\n"))
+        changed_settings = self._probe(ws, run_ready, {"workspaceId": "ws-t1", "projectId": "t1"}, staleness=staleness())
+        self.assertIs(changed_settings["staleness"]["stale"], True, changed_settings["staleness"])
+        self.assertIn("package.json/lockfile", changed_settings["staleness"]["reason"])
+
+        # Restore, then ADD a settings.local.json that did not exist at run
+        # time -> stale (ADDITIONS count exactly like deletions do).
+        settings_path.write_text(original_settings_bytes, encoding="utf-8", newline="\n")
+        local_rel = Path(".dependency-roadmap") / "settings.local.json"
+        local_path = ws / local_rel
+        _write(local_path, json.dumps({"localOnly": True}, indent=2))
+        self.addCleanup(lambda: local_path.unlink(missing_ok=True))
+        added_settings = self._probe(ws, run_ready, {"workspaceId": "ws-t1", "projectId": "t1"}, staleness=staleness())
+        self.assertIs(added_settings["staleness"]["stale"], True, added_settings["staleness"])
+        self.assertIn("package.json/lockfile", added_settings["staleness"]["reason"])
+
+        # Remove it again: the fingerprint is byte-exact, so the run is fresh
+        # once more (identity covers the CURRENT input set).
+        local_path.unlink()
+        restored = self._probe(ws, run_ready, {"workspaceId": "ws-t1", "projectId": "t1"}, staleness=staleness())
+        self.assertIs(restored["staleness"]["stale"], False, restored["staleness"])
+
+        # The planner seeds an EMPTY dashboard-state as a convenience when none
+        # exists, and the fingerprint binds the run to it: real planning
+        # decisions written there (exclusions / per-package lag) make the run
+        # stale, restoring the run-time bytes makes it fresh again.
+        original_dashboard_bytes = dashboard_path.read_bytes()
+        self.addCleanup(lambda: dashboard_path.write_bytes(original_dashboard_bytes))
+        _write(dashboard_path, json.dumps({"schemaVersion": 2, "overrides": []}, indent=2))
+        edited_dashboard = self._probe(ws, run_ready, {"workspaceId": "ws-t1", "projectId": "t1"}, staleness=staleness())
+        self.assertIs(edited_dashboard["staleness"]["stale"], True, edited_dashboard["staleness"])
+        dashboard_path.write_bytes(original_dashboard_bytes)
+        dashboard_restored = self._probe(ws, run_ready, {"workspaceId": "ws-t1", "projectId": "t1"}, staleness=staleness())
+        self.assertIs(dashboard_restored["staleness"]["stale"], False, dashboard_restored["staleness"])
+
+        # Acceptance policy limit change (High 1 -> 2) -> stale via the FULL
+        # policy key, even though targetLevel/minLagOkPct are unchanged.
+        high_changed = self._probe(
+            ws, run_ready, {"workspaceId": "ws-t1", "projectId": "t1"},
+            staleness=staleness(
+                useManifestSettings=False,
+                storedPolicy={
+                    "targetLevel": "yellow", "minLagOkPct": "80",
+                    "acceptancePolicyJson": json.dumps({
+                        "targetLevel": "yellow", "minLagOkPct": 80, "maxKnownHigh": 1, "lagPolicyMonths": 3,
+                    }),
+                },
+                currentPolicy={"targetLevel": "yellow", "minLagOkPct": 80, "maxKnownHigh": 2, "lagPolicyMonths": 3},
+            ),
+        )
+        self.assertIs(high_changed["staleness"]["stale"], True, high_changed["staleness"])
+        self.assertIn("лимиты acceptance-политики", high_changed["staleness"]["reason"])
+
+        # Lag months change (3 -> 6) -> stale, same full-policy key.
+        lag_changed = self._probe(
+            ws, run_ready, {"workspaceId": "ws-t1", "projectId": "t1"},
+            staleness=staleness(
+                useManifestSettings=False,
+                storedPolicy={
+                    "targetLevel": "yellow", "minLagOkPct": "80",
+                    "acceptancePolicyJson": json.dumps({
+                        "targetLevel": "yellow", "minLagOkPct": 80, "maxKnownHigh": 1, "lagPolicyMonths": 3,
+                    }),
+                },
+                currentPolicy={"targetLevel": "yellow", "minLagOkPct": 80, "maxKnownHigh": 1, "lagPolicyMonths": 6},
+            ),
+        )
+        self.assertIs(lag_changed["staleness"]["stale"], True, lag_changed["staleness"])
+        self.assertIn("лимиты acceptance-политики", lag_changed["staleness"]["reason"])
+
+        # Identical full policy -> not stale.
+        same_policy = self._probe(
+            ws, run_ready, {"workspaceId": "ws-t1", "projectId": "t1"},
+            staleness=staleness(
+                useManifestSettings=False,
+                storedPolicy={
+                    "targetLevel": "yellow", "minLagOkPct": "80", "intentJson": "",
+                    "acceptancePolicyJson": json.dumps({
+                        "targetLevel": "yellow", "minLagOkPct": 80, "maxKnownHigh": 1, "lagPolicyMonths": 3,
+                    }),
+                },
+                currentPolicy={"targetLevel": "yellow", "minLagOkPct": 80, "maxKnownHigh": 1, "lagPolicyMonths": 3},
+            ),
+        )
+        self.assertIs(same_policy["staleness"]["stale"], False, same_policy["staleness"])
+
+        # DELETE the recorded input identity from the manifest: the result is
+        # readable but never fresh.
+        manifest = _read_json(manifest_path)
+        manifest.pop("inputHashes", None)
+        _write(manifest_path, json.dumps(manifest, indent=2))
+        self.addCleanup(lambda: _write(manifest_path, json.dumps(manifest, indent=2)))
+        no_identity = self._probe(ws, run_ready, {"workspaceId": "ws-t1", "projectId": "t1"}, staleness=staleness())
+        self.assertTrue(no_identity["ok"], no_identity)
+        self.assertIs(no_identity["staleness"]["stale"], True, no_identity["staleness"])
+        self.assertIn("input-идентичности", no_identity["staleness"]["reason"])
+
 
 class DraftFlowIntegrationPhysicalTests(unittest.TestCase):
     """Full-chain generator runs; no mocks for the publish path."""
@@ -309,6 +460,56 @@ class DraftFlowIntegrationPhysicalTests(unittest.TestCase):
                     "packages": {"": {"name": name, "version": "1.0.0", "dependencies": {p: s for p, s in deps}},
                                  "node_modules/" + deps[0][0]: {"version": deps[0][1].strip("^")}}}
             _write(ws / "package-lock.json", json.dumps(lock, indent=2))
+        _write(ws / ".dependency-roadmap" / "settings.project.json",
+               json.dumps({"projects": [{"name": name, "path": ".", "sourceBranch": "main"}]}))
+        return ws
+
+    def _pack_real_lib(self, ws: Path) -> None:
+        """Vendor the real F6 library into ws/vendor via offline `npm pack`."""
+        vendor = ws / "vendor"
+        vendor.mkdir(parents=True, exist_ok=True)
+        packed = subprocess.run(
+            ["npm.cmd", "pack", str(VENDOR_LIB), "--offline"],
+            cwd=str(vendor), capture_output=True, text=True, encoding="utf-8", timeout=120,
+        )
+        if packed.returncode != 0 or not (vendor / REAL_LIB_TGZ).is_file():
+            raise AssertionError(f"npm pack of real lib failed: {packed.stdout} {packed.stderr}")
+
+    def _npm_fixture_real_lib(self, name: str, lib_manifest_spec: str) -> Path:
+        """F6 real-resource fixture: a REAL vendored npm package (local tarball)
+        with a REAL build.js that requires it. The installed candidate is always
+        1.0.0; lib_manifest_spec controls compatibility (file:1.0.0 == compatible,
+        '^2.0.0' == incompatible) so the compatible/incompatible candidates are
+        real and controllable, exactly as F6 requires."""
+        ws = self._tmp / name / "ws"
+        self._pack_real_lib(ws)
+        _write(ws / "package.json", json.dumps({
+            "name": name,
+            "version": "1.0.0",
+            "scripts": {
+                "test": "node build.js test",
+                "build": "node build.js build",
+            },
+            "dependencies": {
+                "kontur-verified-fixture-lib": lib_manifest_spec,
+            },
+        }, indent=2))
+        _write(ws / "build.js", (
+            "const assert = require('node:assert');\n"
+            "const { hasSatisfyingPatch, isEven } = require('kontur-verified-fixture-lib');\n"
+            "const mode = process.argv[2] || 'test';\n"
+            "assert.strictEqual(require('node:path').basename(process.cwd()), 'ws');\n"
+            "assert.strictEqual(hasSatisfyingPatch('1.0.5', '^1.0.0'), true);\n"
+            "assert.strictEqual(hasSatisfyingPatch('2.0.0', '^1.0.0'), false);\n"
+            "assert.strictEqual(isEven(4), true);\n"
+            "console.log('REAL_LIB_' + mode + '_OK:' + JSON.stringify({ even: isEven(4) }));\n"
+        ))
+        lock_packages = {
+            "": {"name": name, "version": "1.0.0", "dependencies": {"kontur-verified-fixture-lib": lib_manifest_spec}},
+            "node_modules/kontur-verified-fixture-lib": {"version": "1.0.0", "resolved": "file:vendor/" + REAL_LIB_TGZ},
+        }
+        lock = {"name": name, "version": "1.0.0", "lockfileVersion": 3, "requires": True, "packages": lock_packages}
+        _write(ws / "package-lock.json", json.dumps(lock, indent=2))
         _write(ws / ".dependency-roadmap" / "settings.project.json",
                json.dumps({"projects": [{"name": name, "path": ".", "sourceBranch": "main"}]}))
         return ws
@@ -428,6 +629,178 @@ class DraftFlowIntegrationPhysicalTests(unittest.TestCase):
             encoding="utf-8", timeout=120)
         self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
         self.assertIn("SMOKE_test_OK", finished.stdout)
+
+    def test_f6_real_library_compatible_candidate_real_install_build_test_and_draft(self) -> None:
+        # F6 real-resource fixture: the build.js genuinely REQUIRES and USES a
+        # real installed npm package (vendored local tarball), and the plan the
+        # generator drafts from that real manifest/lockfile matches it.
+        ws = self._npm_fixture_real_lib("real-compat", "file:vendor/" + REAL_LIB_TGZ)
+        installed = subprocess.run(
+            ["npm.cmd", "install", "--no-audit", "--no-fund", "--offline"],
+            cwd=str(ws), capture_output=True, text=True, encoding="utf-8", timeout=180)
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+        tested = subprocess.run(
+            ["npm.cmd", "test"], cwd=str(ws), capture_output=True, text=True,
+            encoding="utf-8", timeout=120)
+        self.assertEqual(tested.returncode, 0, tested.stdout + tested.stderr)
+        self.assertIn("REAL_LIB_test_OK", tested.stdout)
+
+        result = self._run_generator(
+            ws, "real-compat",
+            ["--run-id", "run-f6-compat", "--workspace-id", "ws-f6", "--project-id", "real-compat",
+             "--mode", "draft", "--draft-deadline-seconds", "0.05"],
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        draft = ws / ".dependency-roadmap" / "artifacts" / "runs" / "run-f6-compat" / "draft"
+        manifest = _read_json(draft / "result.json")
+        self.assertIn(manifest["status"], ("DRAFT_PARTIAL", "DRAFT_READY"))
+        prompt = (draft / "prompt.md").read_text(encoding="utf-8")
+        self.assertIn("kontur-verified-fixture-lib", prompt)
+
+    def test_f6_real_incompatible_candidate_real_pm_refuses_and_draft_plans_update(self) -> None:
+        # Incompatible candidate: manifest wants ^2.0.0, the REAL installed lib
+        # is 1.0.0. The REAL package manager refuses to install it, and the
+        # (planning-only, no install) Draft must still plan the update to the
+        # real target spec for the real-named package.
+        ws = self._npm_fixture_real_lib("real-incompat", "^2.0.0")
+        refused = subprocess.run(
+            ["npm.cmd", "install", "--no-audit", "--no-fund", "--offline"],
+            cwd=str(ws), capture_output=True, text=True, encoding="utf-8", timeout=180)
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+
+        result = self._run_generator(
+            ws, "real-incompat",
+            ["--run-id", "run-f6-incompat", "--workspace-id", "ws-f6i", "--project-id", "real-incompat",
+             "--mode", "draft", "--draft-deadline-seconds", "0.05"],
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        draft = ws / ".dependency-roadmap" / "artifacts" / "runs" / "run-f6-incompat" / "draft"
+        manifest = _read_json(draft / "result.json")
+        self.assertIn(manifest["status"], ("DRAFT_PARTIAL", "DRAFT_READY"))
+        plan_text = (draft / "plan.json").read_text(encoding="utf-8")
+        self.assertIn("kontur-verified-fixture-lib", plan_text)
+        self.assertIn("^2.0.0", plan_text)
+
+    def test_f6_two_run_policy_chain_verdicts_really_differ_for_real_candidate(self) -> None:
+        # F6: the two-run policy chain must compare the INHERENT verdict for the
+        # candidate, not just settings/hash/prompt text. Same real candidate,
+        # real producer report, production Node verdict per run's real published
+        # policy: yellow80 accepts (80% gate met), green90 remediates (80 < 90).
+        ws = self._npm_fixture_real_lib("real-verdict", "file:vendor/" + REAL_LIB_TGZ)
+        run80 = self._run_generator(
+            ws, "real-verdict",
+            ["--run-id", "run-f6-v80", "--workspace-id", "ws-f6v", "--project-id", "real-verdict",
+             "--mode", "draft", "--min-lag-ok-pct", "80", "--target-level", "yellow"],
+        )
+        run90 = self._run_generator(
+            ws, "real-verdict",
+            ["--run-id", "run-f6-v90", "--workspace-id", "ws-f6v", "--project-id", "real-verdict",
+             "--mode", "draft", "--min-lag-ok-pct", "90", "--target-level", "green"],
+        )
+        self.assertEqual(run80.returncode, 0, run80.stdout + run80.stderr)
+        self.assertEqual(run90.returncode, 0, run90.stdout + run90.stderr)
+        roots = ws / ".dependency-roadmap" / "artifacts" / "runs"
+        manifest80 = _read_json(roots / "run-f6-v80" / "draft" / "result.json")
+        manifest90 = _read_json(roots / "run-f6-v90" / "draft" / "result.json")
+        self.assertEqual(manifest80["settings"]["targetLevel"], "yellow")
+        self.assertEqual(manifest80["settings"]["minLagOkPct"], "80")
+        self.assertEqual(manifest90["settings"]["targetLevel"], "green")
+        self.assertEqual(manifest90["settings"]["minLagOkPct"], "90")
+
+        # Real acceptance evidence: 8 of 10 lag rows known-fresh (80% -- inside
+        # the yellow80 gate, below the green90 gate); the security totals are
+        # clean. ENERGY: real producer + real file + real Node reader. Each
+        # report is produced under ITS run's own real goal policy, because the
+        # reader fails closed when intent != report policy (F1).
+        deploy_dir = Path(tempfile.mkdtemp(prefix="deploom-f6v-"))
+        self.addCleanup(shutil.rmtree, deploy_dir, True)
+
+        def produce_report(target_level, min_lag_ok_pct, max_known_high) -> dict:
+            with (
+                mock.patch.object(audit, "run_audit", return_value={
+                    "engine": "npm-native", "command": ["npm", "audit", "--json"], "exitCode": 0,
+                    "complete": True, "packages": {},
+                    "totals": {"critical": 0, "high": 0, "moderate": 0, "low": 0, "unknown": 0},
+                    "packageTotals": {"critical": 0, "high": 0, "moderate": 0, "low": 0, "unknown": 0},
+                    "notes": [],
+                }),
+                mock.patch.object(audit, "check_lag", return_value=[
+                    {"section": "dependencies", "name": f"real-{i}", "spec": "^1.0.0", "current": "1.0.0",
+                     "source": "package.json", "policyMonths": 3, "status": "ok",
+                     "latest": "1.0.0", "currentPublishedAt": "2023-01-01T00:00:00+00:00",
+                     "latestPublishedAt": "2024-01-01T00:00:00+00:00", "error": ""}
+                    for i in range(8)
+                ] + [
+                    {"section": "dependencies", "name": f"ghost-{i}", "spec": "^1.0.0", "current": "",
+                     "source": "package.json", "policyMonths": 3, "status": "error",
+                     "latest": "", "currentPublishedAt": "", "latestPublishedAt": "", "error": "no-registry"}
+                    for i in range(2)
+                ]),
+            ):
+                return audit.build_report(
+                    ws, "real-verdict", registry="https://registry.npmjs.org/", lag_months=3,
+                    target_level=target_level, min_lag_ok_pct=min_lag_ok_pct, max_known_high=max_known_high,
+                )
+
+        script = deploy_dir / "verdict.mjs"
+        script.write_text(NODE_VERDICT_SCRIPT, encoding="utf-8")
+        dist = str(ROOT / "desktop" / "dist-electron" / "acceptance-policy.js").replace("\\", "/")
+
+        def node_verdict(report: dict, policy: dict) -> dict:
+            report_path = deploy_dir / f"f6-audit-{policy['targetLevel']}-{policy['minLagOkPct']}.json"
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            done = subprocess.run(
+                ["node", str(script), dist, str(report_path), str(ws), json.dumps(policy)],
+                capture_output=True, text=True, encoding="utf-8", timeout=60)
+            if done.returncode != 0:
+                raise AssertionError(f"node verdict failed: {done.stdout}\n{done.stderr}")
+            return json.loads(done.stdout.strip().splitlines()[-1])
+
+        report80 = produce_report("yellow", 80, 1)
+        verdict80 = node_verdict(report80, {"targetLevel": "yellow", "minLagOkPct": 80, "maxKnownHigh": 1, "lagPolicyMonths": 3})
+        report90 = produce_report("green", 90, 0)
+        verdict90 = node_verdict(report90, {"targetLevel": "green", "minLagOkPct": 90, "maxKnownHigh": 0, "lagPolicyMonths": 3})
+        self.assertEqual("ACCEPTED", verdict80["status"], verdict80["reasons"])
+        self.assertEqual("REMEDIATION_REQUIRED", verdict90["status"], verdict90["reasons"])
+        self.assertNotEqual(verdict80["status"], verdict90["status"])
+
+    def test_f6_fast_deep_are_real_strategies_not_transport_flags(self) -> None:
+        # The manifest reflects the REAL mode, and the helper the ANYTIME budget
+        # is created from (same env main() pins) yields genuinely different
+        # Fast/Deep budgets through the real module functions.
+        ws = self._npm_fixture_real_lib("real-mode", "file:vendor/" + REAL_LIB_TGZ)
+        for mode, run_id in (("fast", "run-f6-fast"), ("deep", "run-f6-deep")):
+            result = self._run_generator(
+                ws, "real-mode",
+                ["--run-id", run_id, "--workspace-id", "ws-f6m", "--project-id", "real-mode",
+                 "--mode", mode, "--draft-deadline-seconds", "0.05"],
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            manifest = _read_json(ws / ".dependency-roadmap" / "artifacts" / "runs" / run_id / "draft" / "result.json")
+            self.assertEqual(manifest["mode"], mode)
+        driver = (
+            "import os, sys\n"
+            "sys.path.insert(0, r'" + str(ROOT) + "')\n"
+            "import dependency_live_roadmap_generator as g\n"
+            "for mode in ('fast', 'deep', 'verify'):\n"
+            "    os.environ['DEPLOOM_MODE'] = mode\n"
+            "    print(mode, g._baseline_max_expensive_attempts(8), g._baseline_automatic_budget_seconds())\n"
+        )
+        driver_path = self._tmp / "mode-budget-driver.py"
+        driver_path.write_text(driver, encoding="utf-8")
+        done = subprocess.run(
+            [sys.executable, str(driver_path)], capture_output=True, text=True,
+            encoding="utf-8", timeout=60)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        rows: dict[str, tuple[str, str]] = {}
+        for line in done.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[0] in ("fast", "deep", "verify"):
+                rows[parts[0]] = (parts[1], parts[2])
+        # fast/deep own their budgets (F6); verify keeps the legacy
+        # executionMode mapping (unset => FAST => 2), already locked by
+        # test_block_phi_execution_modes.py.
+        self.assertEqual({"fast": ("2", "300"), "deep": ("12", "3600"), "verify": ("2", "900")}, rows)
 
 
 if __name__ == "__main__":

@@ -66,6 +66,90 @@ class DependencyRoadmapTests(unittest.TestCase):
         self.assertFalse(roadmap.dependency_needs_lag_update(excluded))
         self.assertFalse(roadmap.dependency_is_lag_ok_after_planned_target(excluded, "yellow"))
 
+    def test_f2_scope_goal_counts_unknown_rows_in_the_goal_denominator(self) -> None:
+        # One dependency whose lag policy is known and satisfied plus nine with
+        # no lag evidence at all. The researched share is 100%, but the GOAL
+        # (yellow80 at the release gate) is judged over the WHOLE active scope:
+        # 1 of 10 = 10%, with the nine unknown rows never compliant and never
+        # dropping out of the denominator.
+        known_ok = self.make_row(
+            name="known-ok",
+            current_version="1.2.0",
+            current_vulns="0",
+            min_lag_12m="1.2.0",
+            min_lag_9m="1.2.0",
+            min_lag_6m="1.2.0",
+            min_lag_3m="1.2.0",
+            lag_threshold_months=12,
+            target_default=roadmap.NO_ACTION,
+            target_yellow=roadmap.NO_ACTION,
+            target_green=roadmap.NO_ACTION,
+        )
+        unknown_rows = [
+            self.make_row(
+                name=f"lag-unknown-{index}",
+                current_version="1.0.0",
+                current_vulns="0",
+                min_lag_12m="—",
+                min_lag_9m="—",
+                min_lag_6m="—",
+                min_lag_3m="—",
+                lag_threshold_months=12,
+                target_default=roadmap.NO_ACTION,
+                target_yellow=roadmap.NO_ACTION,
+                target_green=roadmap.NO_ACTION,
+            )
+            for index in range(9)
+        ]
+        rows = [known_ok, *unknown_rows]
+        health = roadmap.compute_project_health(rows, "Demo")
+        # The researched share stays honest and separate from the goal.
+        self.assertEqual(1, health.total)
+        self.assertEqual(1, health.lag_ok_12m)
+        self.assertAlmostEqual(100.0, health.lag_ok_pct, places=1)
+        self.assertEqual(9, health.lag_unknown)
+        # The goal denominator is the FULL scope.
+        self.assertEqual(10, health.scope_total)
+        self.assertEqual(1, health.scope_lag_ok)
+        self.assertEqual(9, health.scope_lag_unknown)
+        self.assertAlmostEqual(10.0, health.scope_lag_pct, places=1)
+        self.assertEqual("yellow", health.status)
+        # The serialized shape must carry the scope fields so the desktop
+        # closure can read them from project_health.
+        serialized = roadmap.dataclasses.asdict(health)
+        self.assertEqual(10, serialized["scope_total"])
+        self.assertEqual(1, serialized["scope_lag_ok"])
+        self.assertEqual(9, serialized["scope_lag_unknown"])
+        self.assertAlmostEqual(10.0, serialized["scope_lag_pct"], places=1)
+
+    def test_f2_scope_goal_is_zero_when_every_dependency_is_unknown(self) -> None:
+        # All ten rows have no lag evidence: insufficient data must NOT read as
+        # 100% compliance of the whole scope (and not as 0% only in `total`).
+        unknown_rows = [
+            self.make_row(
+                name=f"all-unknown-{index}",
+                current_version="1.0.0",
+                current_vulns="0",
+                min_lag_12m="—",
+                min_lag_9m="—",
+                min_lag_6m="—",
+                min_lag_3m="—",
+                lag_threshold_months=12,
+                target_default=roadmap.NO_ACTION,
+                target_yellow=roadmap.NO_ACTION,
+                target_green=roadmap.NO_ACTION,
+            )
+            for index in range(10)
+        ]
+        health = roadmap.compute_project_health(unknown_rows, "Demo")
+        self.assertTrue(health.insufficient_data)
+        self.assertEqual(0, health.total)
+        self.assertAlmostEqual(0.0, health.lag_ok_pct, places=1)
+        self.assertEqual(10, health.scope_total)
+        self.assertEqual(10, health.scope_lag_unknown)
+        self.assertAlmostEqual(0.0, health.scope_lag_pct, places=1)
+        self.assertEqual("yellow", health.status)
+
     def test_yellow_projection_does_not_count_excluded_dependency_as_success(self) -> None:
         fresh = [
             self.make_row(

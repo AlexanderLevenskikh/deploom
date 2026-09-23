@@ -31,7 +31,7 @@ class Psi53ProgressiveControlUxTests(unittest.TestCase):
         self.assertIn("Minimum lag compliance", self.dialog)
         self.assertIn("Цель запуска", self.dialog)
         self.assertIn("targetLevel === 'green' ? 'green' : 'yellow'", self.dialog)
-        self.assertIn("minLagOkPct: boundedInteger(nextMinLagOkPct, 80, 0, 100)", self.dialog)
+        self.assertIn("boundedInteger(nextMinLagOkPct, 80, 0, 100)", self.dialog)
         self.assertIn("Входит в policy hash", self.dialog)
 
     def test_search_depth_remains_technical_escape_hatch(self) -> None:

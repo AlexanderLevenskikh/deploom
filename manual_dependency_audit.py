@@ -1955,11 +1955,43 @@ def build_report(
     audit_workspace: Optional[Path] = None,
     project_dir_display: Optional[str] = None,
     yarn_audit_engine: str = "auto",
+    target_level: str = "yellow",
+    min_lag_ok_pct: int = 80,
+    max_known_high: int = 1,
 ) -> Dict[str, Any]:
     manager = package_manager(project)
     deps = direct_dependencies(project)
     policies = load_lag_policies(dashboard_state, project_name)
     dependency_input_hash, dependency_input_files = dependency_input_identity(project)
+    audit = run_audit(
+        project,
+        manager,
+        registry,
+        audit_workspace=audit_workspace,
+        yarn_audit_engine=yarn_audit_engine,
+    )
+    lag = check_lag(
+        project,
+        deps,
+        registry,
+        lag_months,
+        policies,
+        (audit_workspace / "npm-metadata-cache.json") if audit_workspace else None,
+    )
+    # F1: the lag-policy compliance share is part of the acceptance evidence.
+    # Unknown rows are never compliant and never drop out of the denominator,
+    # so a report saying "1 of 1 lag-ok" over a scope of 10 packages carries
+    # lagOkPct=10, not 100. This is the number the release gate enforces.
+    lag_ok = sum(1 for item in lag if item.get("status") == "ok")
+    lag_lagging = sum(1 for item in lag if item.get("status") == "lagging")
+    lag_unknown = sum(1 for item in lag if item.get("status") != "ok" and item.get("status") != "lagging")
+    lag_total = len(lag)
+    lag_ok_pct = (lag_ok / lag_total * 100.0) if lag_total else 100.0
+    audit["lagOkPct"] = round(lag_ok_pct, 1)
+    audit["lagOk"] = lag_ok
+    audit["lagLagging"] = lag_lagging
+    audit["lagUnknown"] = lag_unknown
+    audit["lagTotal"] = lag_total
     report = {
         "schemaVersion": 2,
         "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -1970,24 +2002,21 @@ def build_report(
         "registry": registry,
         "packageManager": manager,
         "directDeclarations": len(deps),
-        "audit": run_audit(
-            project,
-            manager,
-            registry,
-            audit_workspace=audit_workspace,
-            yarn_audit_engine=yarn_audit_engine,
-        ),
-        "lag": check_lag(
-            project,
-            deps,
-            registry,
-            lag_months,
-            policies,
-            (audit_workspace / "npm-metadata-cache.json") if audit_workspace else None,
-        ),
+        # F1: the goal policy this report is bound to. The release gate rejects
+        # evidence produced under a different target/lag/High set, so changing
+        # the goal invalidates the previous audit, not just the roadmap.
+        "policy": {
+            "targetLevel": target_level if target_level == "green" else "yellow",
+            "minLagOkPct": int(min_lag_ok_pct),
+            "maxKnownCritical": 0,
+            "maxKnownHigh": int(max_known_high),
+            "lagPolicyMonths": int(lag_months),
+        },
+        "audit": audit,
+        "lag": lag,
     }
     report["auditComplete"] = bool(report["audit"].get("complete"))
-    report["lagComplete"] = all(item.get("status") != "unknown" for item in report["lag"])
+    report["lagComplete"] = lag_unknown == 0
     report["complete"] = report["auditComplete"] and report["lagComplete"]
     return report
 
@@ -2012,6 +2041,11 @@ def main() -> int:
     parser.add_argument("--lag-months", type=int, default=12, choices=(3, 6, 9, 12))
     parser.add_argument("--dashboard-state", help="Optional dashboard-state.json with per-package lagMonths")
     parser.add_argument("--audit-workspace", help="Optional persistent workspace for raw audit evidence and guarded npm-lock fallback artifacts")
+    # F1: the goal policy the report will be bound to (embedded in report.policy
+    # so the release gate can prove the evidence matches the current goal).
+    parser.add_argument("--target-level", choices=("yellow", "green"), default="yellow")
+    parser.add_argument("--min-lag-ok-pct", type=int, default=80)
+    parser.add_argument("--max-known-high", type=int, default=1)
     parser.add_argument(
         "--yarn-audit-engine",
         choices=("auto", "yarn-native", "yarn-inventory", "npm-lock-bridge"),
@@ -2039,6 +2073,9 @@ def main() -> int:
         dashboard_state,
         audit_workspace,
         yarn_audit_engine=args.yarn_audit_engine,
+        target_level=args.target_level,
+        min_lag_ok_pct=args.min_lag_ok_pct,
+        max_known_high=args.max_known_high,
     )
     md = markdown(report)
     print(md)

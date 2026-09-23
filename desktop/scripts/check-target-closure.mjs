@@ -199,4 +199,48 @@ const sufficientCoverage = scopeExpansionCoverage(expansionClosure, [
   { package: "stylelint", target: "16.26.0" },
 ]);
 if (sufficientCoverage.covered !== 6) throw new Error("Complete goal-closing proposal must cover all six lag rows");
+
+// F2: the High-limit that gates Yellow comes from the released policy
+// (maxKnownHigh), not from an arbitrary "high > 0 => yellow" colour read.
+// 80% yellow, no planned actions, High=2: reached at the default limit of 1?
+// No. Reached when the policy explicitly allows High<=2? Yes.
+const highLimit = {
+  project_health: { Demo: { status: "yellow", lag_ok_pct: 80, high: 2 } },
+  projects: { Demo: [] },
+};
+if (targetClosureFromRoadmap(highLimit, "Demo", "yellow").reached) {
+  throw new Error("Yellow goal closed with High>maxKnownHigh(1): " + JSON.stringify(targetClosureFromRoadmap(highLimit, "Demo", "yellow")));
+}
+if (!targetClosureFromRoadmap(highLimit, "Demo", "yellow", 80, 2).reached) {
+  throw new Error("Yellow goal must close when the policy explicitly allows High<=2: " + JSON.stringify(targetClosureFromRoadmap(highLimit, "Demo", "yellow", 80, 2)));
+}
+// The limit must be the policy's, not the generator's colour: High=1 with
+// default limit 1 stays closable, High=0 (green policy) must not close yellow.
+if (!targetClosureFromRoadmap({ ...structuredClone(highLimit), project_health: { Demo: { status: "yellow", lag_ok_pct: 80, high: 1 } } }, "Demo", "yellow").reached) {
+  throw new Error("High=1 must not block a Yellow goal whose policy allows High<=1");
+}
+if (targetClosureFromRoadmap({ ...structuredClone(highLimit), project_health: { Demo: { status: "yellow", lag_ok_pct: 80, high: 1 } } }, "Demo", "yellow", 80, 0).reached) {
+  throw new Error("High=1 must block Yellow when the policy allows High<=0");
+}
+
+// F2: the goal percentage is the FULL scope (1 known-ok row + 9 unknown rows
+// over the whole active set), so 100% of the researched share is still 10% of
+// the scope and must NOT close a Yellow80 goal.
+const scopeClosure = targetClosureFromRoadmap({
+  project_health: {
+    Demo: {
+      status: "yellow", lag_ok_pct: 100, lag_ok_12m: 1, total: 1, lag_unknown: 9,
+      scope_total: 10, scope_lag_ok: 1, scope_lag_unknown: 9, scope_lag_pct: 10,
+    },
+  },
+  projects: { Demo: [] },
+}, "Demo", "yellow");
+if (scopeClosure.reached) throw new Error(`10% of the full scope must not close Yellow80: ${JSON.stringify(scopeClosure)}`);
+if (scopeClosure.scopeLagPct !== 10 || scopeClosure.scopeTotal !== 10 || scopeClosure.scopeLagUnknown !== 9) {
+  throw new Error(`Scope numbers were not carried: ${JSON.stringify(scopeClosure)}`);
+}
+if (!targetClosureMessage(scopeClosure).includes("10.0%") || !targetClosureMessage(scopeClosure).includes("ещё 9 зависимостей с неизвестными данными")) {
+  throw new Error(`Scope message must say 10% and name the unknowns: ${targetClosureMessage(scopeClosure)}`);
+}
+
 console.log("Target closure gate OK");

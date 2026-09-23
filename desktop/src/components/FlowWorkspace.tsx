@@ -48,9 +48,10 @@ type Props = {
 
 export function FlowWorkspace({ details, project, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels }: Props) {
   const { language, text, t } = useLanguage()
-  // Compatibility-only planner hint for legacy roadmap/prompt export.
-  // Yellow/Green is no longer a user goal or a completion gate.
-  const target: TargetLevel = 'yellow'
+  // The persisted goal drives stage actions and autopilot: a green target set
+  // in the Baseline dialog must survive into generate/release instead of
+  // being reset to a hard-coded yellow on the next step (F1).
+  const target: TargetLevel = details.baselineIntent?.targetLevel === 'green' ? 'green' : 'yellow'
   const [label, setLabel] = useState('')
   const [releaseBranch, setReleaseBranch] = useState(project.git?.releaseBranch || 'libs-release')
   const [gateCommand, setGateCommand] = useState('')
@@ -73,13 +74,21 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
   const draftLaunchActive = activeAction === 'baseline' && draftLaunch?.proofMode === 'DRAFT' && (draftLaunch.runId === undefined || draftLaunch.runId === activeRunId)
   const draftResultFresh = Boolean(draftResult && draftLaunch?.runId && draftLaunch.acknowledgedRunId !== draftResult.runId && draftResult.runId === draftLaunch.runId)
   const acknowledgeDraftResult = () => { if (draftResult) onAcknowledgeDraftRun(details.workspace.id, project.name, draftResult.runId) }
-  const openDraftPrompt = async () => {
+  // Returns true only when the prompt content was confirmed delivered to the
+  // dialog; the caller (auto-open) uses that to consume the run's one-shot
+  // freshness, never before receipt.
+  const openDraftPrompt = async (): Promise<boolean> => {
     try {
       const loaded = await onGetCurrentDraftResult({ workspaceId: details.workspace.id, projectName: project.name, runId: draftResult?.runId })
-      if (loaded?.prompt) setDraftPromptPreview(loaded.prompt)
-      else window.alert(language === 'ru' ? 'Draft завершился, но prompt artifact не найден. Проверьте артефакты запуска.' : 'Draft finished, but the prompt artifact was not found. Check the run artifacts.')
+      if (loaded?.prompt) {
+        setDraftPromptPreview(loaded.prompt)
+        return true
+      }
+      window.alert(language === 'ru' ? 'Draft завершился, но prompt artifact не найден. Проверьте артефакты запуска.' : 'Draft finished, but the prompt artifact was not found. Check the run artifacts.')
+      return false
     } catch (error) {
       window.alert(error instanceof Error ? error.message : String(error))
+      return false
     }
   }
   const openDraftPromptRef = useRef(openDraftPrompt)
@@ -87,12 +96,19 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
   // Auto-open the prompt of the run the user explicitly asked to show
   // ("Создать Draft и показать промпт"), and only for that exact run's
   // completion. Until the launch marker is bound to a concrete runId (the job
-  // started), an older leftover result must never be auto-opened.
+  // started), an older leftover result must never be auto-opened. F5: the
+  // auto-open consumes the run's freshness by runId only AFTER the prompt
+  // content was confirmed delivered (openDraftPrompt resolved true), so a
+  // remount, a new details object or a Dashboard→FLOW switch can never re-open
+  // an already shown run; the manual "Принято" button and the persistent
+  // "последний Draft" card remain reachable.
   useEffect(() => {
     if (!draftResult || !draftLaunch || !draftResultFresh) return
     if (!draftLaunch.autoOpen || !draftLaunch.runId) return
     if (draftResult.runId !== draftLaunch.runId) return
-    void openDraftPromptRef.current()
+    void openDraftPromptRef.current().then((confirmed) => {
+      if (confirmed) onAcknowledgeDraftRun(details.workspace.id, project.name, draftResult.runId)
+    })
   }, [draftLaunch, draftResult, draftResultFresh])
   const [baselineDecisionDismissed, setBaselineDecisionDismissed] = useState(false)
   const run = details.teamState?.projects[project.name]
@@ -439,6 +455,7 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
               <span className="draft-result-meta">run <code>{draftResult.runId}</code> · {draftResult.elapsedMs}ms{typeof draftResult.deadlineSeconds === 'number' ? ` · ${text('deadline', 'deadline')} ${draftResult.deadlineSeconds}s` : ''} · {draftResult.verificationStatus} / {draftResult.authority} / {draftResult.compatibility}</span>
             </div>
           </div>
+          {!draftResultFresh && draftResult.stale ? <div className="resume-notice warning"><strong>{text('Draft устарел', 'Draft is stale')}</strong><span>{draftResult.staleReason || text('Входные файлы или acceptance-политика изменились с момента генерации.', 'Input files or the acceptance policy changed since generation.')}</span></div> : null}
           <div className="human-flow-actions">
             <button className="button primary" onClick={() => void openDraftPrompt()}><FileText size={16} />{draftResultFresh ? text('Показать draft prompt', 'Show draft prompt') : text('Открыть промпт', 'Open prompt')}</button>
             {draftResult.artifacts.plan ? <button className="button secondary" onClick={() => void onOpenPath(draftResult.artifacts.plan)}><FileText size={16} />{text('План', 'Plan')}</button> : null}
@@ -582,20 +599,45 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
 }
 
 // Live Draft progress: a compact strip of the current planner operation driven
-// by [draft-progress] events from the subprocess (heartbeat = how recently an
-// event arrived; the backend sends elapsed/budget/percent on every event). It
-// is planning-only by design and must never claim physical verification.
+// by [draft-progress] events from the subprocess. F5 contracts:
+//  - elapsed is computed MONOTONICALLY from the last backend event
+//    (backend elapsedSec + local time since the event), and a 1s local timer
+//    re-renders it even while the planner emits nothing, so a long blocked
+//    network header or a CPU-heavy planning step does not freeze the clock;
+//  - the live/stale indicator therefore flips predictably ~8s after the last
+//    event, independent of unrelated rerenders;
+//  - measured stage counters (completed/total/pct) are retained across events
+//    OF THE SAME stage instead of being nulled by the next partial event; a
+//    stage change resets them (the percent is explicitly a stage percent, and
+//    a terminal 100 can only come from the backend finalize event);
+//  - budget continuation ticks down from the last backend value between
+//    events instead of freezing.
+// It is planning-only by design and must never claim physical verification.
 function DraftLiveProgress({ startedAt, progress, runId }: { startedAt?: number; progress?: DraftProgressPayload; runId?: string }) {
   const { text } = useLanguage()
-  const [elapsedSec, setElapsedSec] = useState(0)
+  const [, setNowTick] = useState(0)
+  // A fixed local cadence re-renders the strip while the backend is silent: the
+  // monotonic clock, live/stale dot and budget continuation must not depend on
+  // unrelated rerenders (F5).
   useEffect(() => {
-    const base = progress?.elapsedSec ?? startedAt
-    if (typeof base !== 'number') { setElapsedSec(0); return }
-    const tick = () => setElapsedSec(Math.max(0, Math.floor((progress?.elapsedSec ?? Date.now() - (startedAt ?? Date.now())) / 1000)))
-    tick()
-    const timer = window.setInterval(tick, 1000)
+    const timer = window.setInterval(() => setNowTick((value) => value + 1), 1000)
     return () => window.clearInterval(timer)
-  }, [startedAt, progress?.elapsedSec, progress?.runId])
+  }, [])
+  // Retained measured stage counters: later events that carry only
+  // operation/retry must not null the count (F5). A stage move resets them so
+  // a scan's percent is never shown as the solve's.
+  const [stageCounters, setStageCounters] = useState<{ step?: string; completed?: number; total?: number; pct?: number } | undefined>(undefined)
+  useEffect(() => {
+    if (!progress) return
+    setStageCounters((current) => {
+      const next = current && (typeof progress.step !== 'string' || current.step === progress.step) ? { ...current } : {}
+      if (typeof progress.step === 'string') next.step = progress.step
+      if (typeof progress.completed === 'number') next.completed = progress.completed
+      if (typeof progress.total === 'number') next.total = progress.total
+      if (typeof progress.pct === 'number') next.pct = progress.pct
+      return Object.keys(next).length ? next : undefined
+    })
+  }, [progress])
   const stepLabels: Record<string, string> = {
     inventory: text('Локальная инвентаризация', 'Local inventory'),
     scan: text('Обогащение зависимостей', 'Dependency enrichment'),
@@ -603,41 +645,56 @@ function DraftLiveProgress({ startedAt, progress, runId }: { startedAt?: number;
     finalize: text('Публикация Draft', 'Publishing the Draft'),
   }
   const stepLabel = progress?.step ? (stepLabels[progress.step] ?? progress.step) : text('Ожидаем первый результат планировщика…', 'Waiting for the planner…')
-  const backendElapsed = typeof progress?.elapsedSec === 'number' ? Math.max(0, Math.floor(progress.elapsedSec)) : elapsedSec
+  // Monotonic elapsed, seconds: anchored to the backend measurement of the
+  // last event and extended locally since it arrived (F5). Before any event the
+  // process start time is the anchor; units are always seconds (the backend
+  // sends seconds; the launch marker is a millisecond epoch).
+  const anchorSec = typeof progress?.elapsedSec === 'number' ? Math.max(0, progress.elapsedSec) : 0
+  const sinceLastEventMs = progress ? Math.max(0, Date.now() - progress.at) : 0
+  const runningSec = progress
+    ? anchorSec + sinceLastEventMs / 1000
+    : typeof startedAt === 'number' && Number.isFinite(startedAt) ? Math.max(0, (Date.now() - startedAt) / 1000) : 0
+  const shownSec = Math.floor(runningSec)
   const heartbeat = progress ? (Date.now() - progress.at > 8000 ? 'stale' : 'live') : 'wait'
   const staleNote = heartbeat === 'stale'
     ? text('планировщик молчит (нет событий — неизвестно, сколько ещё), поэтому время и бюджет могут быть неточными', 'planner is silent (no events — unknown how much is left), so time and budget may be inexact')
     : undefined
-  const pct = typeof progress?.pct === 'number' ? Math.max(0, Math.min(100, progress.pct)) : undefined
+  const counters = stageCounters
+  const stagePct = typeof counters?.pct === 'number' ? Math.max(0, Math.min(100, counters.pct)) : undefined
+  // Budget continuation: the backend reports the remaining time at event time;
+  // between events it ticks down locally so it is not frozen (F5).
+  const budgetNow = typeof progress?.budgetRemainingSec === 'number'
+    ? Math.max(0, progress.budgetRemainingSec - sinceLastEventMs / 1000)
+    : undefined
   const progressParts = [
     progress?.package ? <code key="pkg">{progress.package}</code> : null,
     progress?.operation ? <span className="draft-live-op" key="op">{progress.operation}</span> : null,
     typeof progress?.retry === 'number' && progress.retry > 0 ? <span className="draft-live-op" key="retry">retry {progress.retry}</span> : null,
-    typeof progress?.completed === 'number' && typeof progress?.total === 'number' && progress.total > 0
-      ? <span className="draft-live-count" key="count">{progress.completed}/{progress.total}</span>
+    typeof counters?.completed === 'number' && typeof counters?.total === 'number' && counters.total > 0
+      ? <span className="draft-live-count" key="count">{counters.completed}/{counters.total}</span>
       : null,
-    typeof progress?.budgetRemainingSec === 'number'
-      ? <span className="draft-live-budget" key="budget" title={text('Остаток бюджета запуска (без резерва на публикацию)', 'Remaining run budget (net of the publication reserve)')}>{text('бюджет', 'budget')} {progress.budgetRemainingSec.toFixed(0)}s</span>
+    typeof budgetNow === 'number'
+      ? <span className="draft-live-budget" key="budget" title={text('Остаток бюджета запуска (без резерва на публикацию)', 'Remaining run budget (net of the publication reserve)')}>{text('бюджет', 'budget')} {budgetNow.toFixed(0)}s</span>
       : null,
   ]
   return (
     <div className="draft-live-progress" aria-label={text('Ход работы Draft', 'Draft progress')}>
       <div className="draft-live-heading">
         <strong>{stepLabel}</strong>
-        <span>{runId ? <code>{runId.slice(0, 12)}</code> : null}{text(` · ${backendElapsed}s`, ` · ${backendElapsed}s`)}</span>
+        <span>{runId ? <code>{runId.slice(0, 12)}</code> : null}{text(` · ${shownSec}s`, ` · ${shownSec}s`)}</span>
       </div>
       <div className="draft-live-strip">
         <span className={`draft-live-dot ${heartbeat}`} />
         {progressParts}
       </div>
-      {typeof pct === 'number' ? (
-        <div className="draft-live-meter" aria-label={text(`Прогресс ${pct}%`, `Progress ${pct}%`)}>
-          <div className="draft-live-meter-fill" style={{ width: `${pct}%` }} />
-          <span>{pct}%</span>
+      {typeof stagePct === 'number' ? (
+        <div className="draft-live-meter" aria-label={text(`Прогресс этапа ${stagePct}%`, `Stage progress ${stagePct}%`)}>
+          <div className="draft-live-meter-fill" style={{ width: `${stagePct}%` }} />
+          <span>{stagePct}%</span>
         </div>
       ) : null}
       {staleNote ? <small className="draft-live-stale">{staleNote}</small> : null}
-      <small>{text('Planning-only: install/lifecycle/project checks не выполняются, проект не изменяется.', 'Planning-only: no install/lifecycle/project checks are run, the project is not modified.')}</small>
+      <small>{stagePct !== undefined && !progress?.status ? text('Проценты относятся только к текущему этапу; 100% завершения — только когда результат опубликован.', 'Percentages refer to the current stage only; 100% completion only when the result is published.') : ''}{text(' Planning-only: install/lifecycle/project checks не выполняются, проект не изменяется.', ' Planning-only: no install/lifecycle/project checks are run, the project is not modified.')}</small>
     </div>
   )
 }

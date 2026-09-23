@@ -55,7 +55,7 @@ export function PromptPreviewDialog({ preview, onClose, onOpenPath }: Props) {
 
         <pre data-testid="draft-prompt-preview" style={{ margin: 0, maxHeight: '56vh', overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word', padding: '16px', borderRadius: '10px', border: '1px solid var(--border, rgba(127, 127, 127, .3))', background: 'var(--panel, rgba(0, 0, 0, .08))', fontSize: '12px', lineHeight: 1.55 }}>{preview.content}</pre>
 
-        {preview.stale ? <div className="resume-notice warning"><strong>{text('Prompt помечен как stale', 'Prompt is marked stale')}</strong><span>{text('Draft всё равно показан как planning artifact, но не используйте его как verified evidence.', 'The Draft is still shown as a planning artifact, but do not treat it as verified evidence.')}</span></div> : null}
+        {preview.stale ? <div className="resume-notice warning"><strong>{text('Prompt помечен как stale', 'Prompt is marked stale')}</strong><span>{preview.staleReason ? ` ${preview.staleReason}` : ''} {text('Draft всё равно показан как planning artifact, но не используйте его как verified evidence.', 'The Draft is still shown as a planning artifact, but do not treat it as verified evidence.')}</span></div> : null}
 
         <footer className="baseline-intent-actions">
           <span className="baseline-intent-apply-hint" title={preview.path}>{preview.path}</span>

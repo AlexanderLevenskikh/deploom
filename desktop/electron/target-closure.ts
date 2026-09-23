@@ -24,6 +24,15 @@ export type TargetClosure = {
   lagOk?: number
   total?: number
   minLagOkPct?: number
+  // F2: the goal is judged on the FULL active scope (known + unknown rows in
+  // the denominator), not only the researched share. Unknown rows are never
+  // compliant and never drop out of the denominator; these fields carry the
+  // scope numbers so the UI can say "10% of the whole scope" instead of
+  // "100% of the packages we managed to check".
+  scopeTotal?: number
+  scopeLagOk?: number
+  scopeLagPct?: number
+  scopeLagUnknown?: number
   remainingPackages: string[]
   lagBlockers: LagBlocker[]
   neededForYellow?: number
@@ -62,7 +71,7 @@ function targetCoversMinimum(target: unknown, minimum: unknown): boolean {
 // not a hard-coded 80. `minLagOkPct` (0..100) threads the loadBaselineIntent
 // value through the caller; green always closes at 100% (the generator's
 // green status already means lag_bad == 0).
-export function targetClosureFromRoadmap(value: unknown, project: string, target: ClosureTarget, minLagOkPct = 80): TargetClosure {
+export function targetClosureFromRoadmap(value: unknown, project: string, target: ClosureTarget, minLagOkPct = 80, maxKnownHigh = 1): TargetClosure {
   const roadmap = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   const healthByProject = roadmap.project_health && typeof roadmap.project_health === 'object' ? roadmap.project_health as Record<string, unknown> : {}
   const rawHealth = healthByProject[project] && typeof healthByProject[project] === 'object' ? healthByProject[project] as Record<string, unknown> : {}
@@ -101,7 +110,43 @@ export function targetClosureFromRoadmap(value: unknown, project: string, target
       ...(typeof blocker.note === 'string' && blocker.note ? { note: blocker.note } : {}),
     }]
   })
-  const reached = status !== 'unknown' && STATUS_RANK[status] >= STATUS_RANK[target] && remainingPackages.length === 0
+// F1/F2: `reached` is recomputed by the CURRENT numeric criteria, not by the
+// roadmap's legacy status colour. Yellow requires the effective lag-compliant
+// share (over the full scope when the generator measured it, falling back to
+// the researched share on older roadmaps) to meet the user's minLagOkPct AND
+// zero Critical AND an empty plan; green requires the generator's green status
+// plus 100% scope compliance and zero Critical. So a yellow90 goal with 8/10
+// can never be "reached" at the same time as planCanReachYellow=false.
+const yellowPct = Math.max(0, Math.min(100, Number.isFinite(minLagOkPct) ? minLagOkPct : 80))
+const critical = typeof rawHealth.critical === 'number' ? rawHealth.critical : undefined
+// F2: the High-limit is the policy one (maxKnownHigh threads from the saved
+// intent), not an arbitrary "high > 0 => yellow" colour read. A yellow goal is
+// reached only when High <= maxKnownHigh (default 1); green's generator status
+// already requires High == 0, so it needs no extra check here.
+const high = typeof rawHealth.high === 'number' ? rawHealth.high : undefined
+const highClear = high === undefined || high <= Math.max(0, Math.trunc(Number.isFinite(maxKnownHigh) ? maxKnownHigh : 1))
+const rawLagOkPct = typeof rawHealth.lag_ok_pct === 'number' ? Math.max(0, Math.min(100, rawHealth.lag_ok_pct)) : undefined
+const scopeTotal = typeof rawHealth.scope_total === 'number' ? Math.max(0, Math.trunc(rawHealth.scope_total)) : undefined
+const scopeLagOk = typeof rawHealth.scope_lag_ok === 'number' ? Math.max(0, Math.trunc(rawHealth.scope_lag_ok)) : undefined
+const scopeLagPct = typeof rawHealth.scope_lag_pct === 'number' ? Math.max(0, Math.min(100, rawHealth.scope_lag_pct)) : undefined
+const scopeLagUnknown = typeof rawHealth.scope_lag_unknown === 'number' ? Math.max(0, Math.trunc(rawHealth.scope_lag_unknown)) : undefined
+// The goal percentage: full scope when measured, otherwise the researched
+// share (older roadmaps without scope fields).
+const goalLagPct = scopeLagPct ?? rawLagOkPct
+const statusMeetsTarget = status !== 'unknown' && STATUS_RANK[status] >= STATUS_RANK[target]
+const criticalClear = critical === undefined || critical === 0
+const reached = target === 'yellow'
+  ? statusMeetsTarget
+    && remainingPackages.length === 0
+    && criticalClear
+    && highClear
+    // When the lag share was measured the yellow floor must actually hold;
+    // a roadmap without the field falls back to the old status-based read.
+    && (goalLagPct === undefined || goalLagPct >= yellowPct)
+  : status === 'green'
+    && remainingPackages.length === 0
+    && criticalClear
+    && (goalLagPct === undefined || goalLagPct >= 100)
   const fixableBlockers = lagBlockers.filter((blocker) => Boolean(blocker.plannedTarget))
   const plannedLagFixes = new Set(fixableBlockers
     .filter((blocker) => !blocker.required || targetCoversMinimum(blocker.plannedTarget, blocker.required))
@@ -119,7 +164,6 @@ export function targetClosureFromRoadmap(value: unknown, project: string, target
   })
   const lagOk = typeof rawHealth.lag_ok_12m === 'number' ? rawHealth.lag_ok_12m : undefined
   const total = typeof rawHealth.total === 'number' ? rawHealth.total : undefined
-  const yellowPct = Math.max(0, Math.min(100, Number.isFinite(minLagOkPct) ? minLagOkPct : 80))
   const yellowThreshold = target === 'yellow' && total !== undefined ? Math.ceil((total * yellowPct) / 100) : undefined
   const projectedLagOk = target === 'yellow' && typeof rawHealth.yellow_projected_lag_ok === 'number'
     ? rawHealth.yellow_projected_lag_ok
@@ -129,7 +173,6 @@ export function targetClosureFromRoadmap(value: unknown, project: string, target
     : lagOk !== undefined && total !== undefined ? Math.min(total, lagOk + plannedLagFixes) : undefined
   const maxLagOkPctAfterPlan = maxLagOkAfterPlan !== undefined && total ? (maxLagOkAfterPlan * 100) / total : undefined
   const neededBeyondCurrentPlan = yellowThreshold !== undefined && maxLagOkAfterPlan !== undefined ? Math.max(0, yellowThreshold - maxLagOkAfterPlan) : undefined
-  const critical = typeof rawHealth.critical === 'number' ? rawHealth.critical : undefined
   const criticalPackages = criticalRows.map((row) => row.package)
   const uncoveredCriticalPackages = criticalRows.filter((row) => !row.covered).map((row) => row.package)
   if ((critical ?? 0) > 0 && !criticalRows.length) uncoveredCriticalPackages.push('неизвестный Critical source')
@@ -158,6 +201,10 @@ export function targetClosureFromRoadmap(value: unknown, project: string, target
     ...(typeof rawHealth.lag_ok_pct === 'number' ? { lagOkPct: rawHealth.lag_ok_pct } : {}),
     ...(typeof rawHealth.lag_ok_12m === 'number' ? { lagOk: rawHealth.lag_ok_12m } : {}),
     ...(typeof rawHealth.total === 'number' ? { total: rawHealth.total } : {}),
+    ...(scopeTotal !== undefined ? { scopeTotal } : {}),
+    ...(scopeLagOk !== undefined ? { scopeLagOk } : {}),
+    ...(scopeLagPct !== undefined ? { scopeLagPct } : {}),
+    ...(scopeLagUnknown !== undefined ? { scopeLagUnknown } : {}),
     ...(typeof rawHealth.lag_needed_for_yellow === 'number' ? { neededForYellow: rawHealth.lag_needed_for_yellow } : {}),
     ...(plannedLagFixes ? { plannedLagFixes } : {}),
     ...(maxLagOkPctAfterPlan !== undefined ? { maxLagOkPctAfterPlan } : {}),
@@ -179,9 +226,10 @@ export function targetClosureFromRoadmapWithTargets(
   target: ClosureTarget,
   plannedTargets: Readonly<Record<string, string>>,
   minLagOkPct = 80,
+  maxKnownHigh = 1,
 ): TargetClosure {
   const entries = Object.entries(plannedTargets).filter(([, version]) => Boolean(semverParts(version)))
-  if (!entries.length || !value || typeof value !== 'object') return targetClosureFromRoadmap(value, project, target)
+  if (!entries.length || !value || typeof value !== 'object') return targetClosureFromRoadmap(value, project, target, minLagOkPct, maxKnownHigh)
   const roadmap = value as Record<string, unknown>
   const projects = roadmap.projects && typeof roadmap.projects === 'object' ? roadmap.projects as Record<string, unknown> : {}
   const sourceRows = Array.isArray(projects[project]) ? projects[project] as unknown[] : []
@@ -211,7 +259,7 @@ export function targetClosureFromRoadmapWithTargets(
     ...roadmap,
     projects: { ...projects, [project]: rows },
     project_health: { ...healthByProject, [project]: health },
-  }, project, target, minLagOkPct)
+  }, project, target, minLagOkPct, maxKnownHigh)
 }
 
 // Splits blockers by the only distinction that changes what the user should
@@ -251,9 +299,17 @@ export function shouldUseSupervisorSeed(closure: TargetClosure | undefined, targ
 export function targetClosureMessage(closure: TargetClosure): string {
   const labels = { red: 'Красный', yellow: 'Жёлтый', green: 'Зелёный', unknown: 'не рассчитан' } as const
   const targetLabel = closure.target === 'yellow' ? 'Жёлтый' : 'Зелёный'
-  const percent = typeof closure.lagOkPct === 'number' ? ` · ${closure.lagOkPct.toFixed(1)}%` : ''
-  const fraction = typeof closure.lagOk === 'number' && typeof closure.total === 'number' ? ` (${closure.lagOk} из ${closure.total})` : ''
+  // F2: show the goal over the FULL scope when the generator measured it, so
+  // "100% of what we checked" is never presented as "100% of everything".
+  const displayPct = closure.scopeLagPct ?? closure.lagOkPct
+  const percent = typeof displayPct === 'number' ? ` · ${displayPct.toFixed(1)}%` : ''
+  const fraction = closure.scopeTotal !== undefined && closure.scopeLagOk !== undefined
+    ? ` (${closure.scopeLagOk} из ${closure.scopeTotal})`
+    : typeof closure.lagOk === 'number' && typeof closure.total === 'number' ? ` (${closure.lagOk} из ${closure.total})` : ''
   const threshold = closure.target === 'yellow' ? ` Для жёлтого требуется не менее ${closure.minLagOkPct ?? 80}% и отсутствие Critical.` : ' Для зелёного должны быть выполнены все критерии зелёного уровня.'
+  const scopeUnknown = closure.scopeLagUnknown && closure.scopeLagUnknown > 0
+    ? ` В общем scope ещё ${closure.scopeLagUnknown} зависимостей с неизвестными данными — они не считаются выполненными.`
+    : ''
   const { fixable, stuck } = splitLagBlockers(closure)
   const short = (list: LagBlocker[], limit = 6) => `${list.slice(0, limit).map((blocker) => blocker.package).join(', ')}${list.length > limit ? `, ещё ${list.length - limit}` : ''}`
   // The whole point of this message is that the user should not have to guess
@@ -283,5 +339,5 @@ export function targetClosureMessage(closure: TargetClosure): string {
   const next = planCanStillHelp
     ? ' Дальше: выгрузите свежий prompt из Dashboard и прогоните миграцию по оставшимся действиям.'
     : ' Дальше: закрыть цель текущим планом нельзя — исключите объективно заблокированные пакеты с причиной или заведите отдельную задачу на их обновление, затем пересоберите отчёт.'
-  return `Цель «${targetLabel}» не достигнута: ${labels[closure.current]}${percent}${fraction}.${threshold}${need}${lagCapacity}${criticalCapacity}${fixableText}${stuckText}${remaining}${next}`
+  return `Цель «${targetLabel}» не достигнута: ${labels[closure.current]}${percent}${fraction}.${threshold}${scopeUnknown}${need}${lagCapacity}${criticalCapacity}${fixableText}${stuckText}${remaining}${next}`
 }

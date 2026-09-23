@@ -107,6 +107,26 @@ class BlockPhiExecutionModeTests(unittest.TestCase):
             "VERIFIED_PARTIAL_SCOPE",
         )
 
+    def test_f6_product_mode_owns_fast_deep_budgets(self):
+        # F6: --mode fast/deep is a real search strategy with its OWN budget,
+        # independent of the legacy executionMode transport flag.
+        with patch.dict(
+            os.environ,
+            {"DEPLOOM_BASELINE_EXECUTION_MODE": "BACKGROUND", "DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS": ""},
+            clear=False,
+        ):
+            self.assertEqual(generator._baseline_max_expensive_attempts(8, product_mode="fast"), 2)
+            self.assertEqual(generator._baseline_max_expensive_attempts(8, product_mode="deep"), 12)
+            self.assertEqual(generator._baseline_automatic_budget_seconds(product_mode="fast"), 5 * 60)
+            self.assertEqual(generator._baseline_automatic_budget_seconds(product_mode="deep"), 60 * 60)
+        # Explicit env budget still wins over the strategy default.
+        with patch.dict(
+            os.environ, {"DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS": "5"}, clear=False,
+        ):
+            self.assertEqual(generator._baseline_max_expensive_attempts(8, product_mode="fast"), 5)
+        with patch.dict(os.environ, {"DEPLOOM_MODE": ""}, clear=False):
+            self.assertEqual(generator._baseline_product_mode(), "verify")
+
 
 if __name__ == "__main__":
     unittest.main()

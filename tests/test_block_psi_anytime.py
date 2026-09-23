@@ -150,6 +150,58 @@ class BlockPsiAnytimeTests(unittest.TestCase):
         self.assertTrue(state.update_incumbent(incumbent("desired", 0)))
         self.assertEqual("desired", state.incumbent.assignment_identity)
 
+    def test_f6_fast_stops_at_first_policy_satisfying_and_deep_does_not(self) -> None:
+        # FAST: the expensive search stops at the FIRST verified assignment
+        # that satisfies the chosen policy (its own contract), with a dedicated
+        # completion status.
+        fast = BaselineAnytimeState(
+            policy=AutomaticBudgetPolicy(strategy="fast", max_expensive_attempts=2)
+        )
+        self.assertTrue(fast.update_incumbent(incumbent("first-pass", 1)))
+        self.assertEqual(
+            BaselineCompletionStatus.VERIFIED_POLICY_SATISFIED_FAST,
+            fast.fast_policy_satisfied(True),
+        )
+        # DEEP never stops at policy-satisfaction: it keeps improving within the
+        # larger budget (preserving the best incumbent on error/timeout).
+        deep = BaselineAnytimeState(policy=AutomaticBudgetPolicy(strategy="deep"))
+        deep.update_incumbent(incumbent("best", 1))
+        self.assertIsNone(deep.fast_policy_satisfied(True))
+        # Unmet policy or missing incumbent never stops FAST either.
+        unmet = BaselineAnytimeState(policy=AutomaticBudgetPolicy(strategy="fast"))
+        unmet.update_incumbent(incumbent("partial", 2))
+        self.assertIsNone(unmet.fast_policy_satisfied(False))
+        self.assertIsNone(BaselineAnytimeState(policy=AutomaticBudgetPolicy(strategy="fast")).fast_policy_satisfied(True))
+
+    def test_f6_deep_preserves_best_incumbent_when_budget_exhausts(self) -> None:
+        # DEEP: on error/timeout the best already-proven result survives; the
+        # budget-exhausted completion is explicit and the incumbent is intact.
+        clock = FakeClock()
+        state = BaselineAnytimeState(
+            policy=AutomaticBudgetPolicy(strategy="deep", wall_clock_seconds=300, max_expensive_attempts=2),
+            clock=clock,
+        )
+        state.update_incumbent(incumbent("best-deep", 1))
+        state.observe_candidate(duration_seconds=30, passed=False, predicate="x")
+        clock.now = 301
+        self.assertEqual(ContinuationReason.AUTOMATIC_BUDGET_EXHAUSTED, state.automatic_continuation_reason())
+        self.assertEqual("best-deep", state.incumbent.assignment_identity)
+        self.assertEqual(BaselineCompletionStatus.VERIFIED_GOOD_ENOUGH, state.completion_status("desired"))
+
+    def test_f6_fast_budget_is_small_and_deep_budget_is_large(self) -> None:
+        # F6: the product mode owns the anytime budget, so FAST and DEEP really
+        # perform a different number of operations before stopping.
+        fast = BaselineAnytimeState(
+            policy=AutomaticBudgetPolicy(strategy="fast", wall_clock_seconds=300, max_expensive_attempts=2)
+        )
+        deep = BaselineAnytimeState(
+            policy=AutomaticBudgetPolicy(strategy="deep", wall_clock_seconds=3600, max_expensive_attempts=12)
+        )
+        self.assertEqual(2, fast.policy.max_expensive_attempts)
+        self.assertEqual(300, fast.policy.wall_clock_seconds)
+        self.assertEqual(12, deep.policy.max_expensive_attempts)
+        self.assertEqual(3600, deep.policy.wall_clock_seconds)
+
 
 if __name__ == "__main__":
     unittest.main()
