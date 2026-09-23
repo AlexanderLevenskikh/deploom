@@ -3,5 +3,7 @@
   "desktop/build/icon.png": "432d5be2db2b0607483fb690624bcef91cd601ca40dbbde1472049515b30b6cf",
   "docs/images/dependency-flow-01-first-start.png": "2dfb3aae1494f74c37fa980c331427bc2ff074c022e2860144f5d7b2cf8e68ad",
   ".playwright-mcp/flow-after-tab-return.png": "db797faf786e2cb36d1abeaf3e9c6d83c16f86d655d97c6d667f31c221aad369",
-  ".playwright-mcp/r10-flow-live.png": "efab9464bdf3cc6a1661cc062718acbf23ea1345727453d86011ae1764333a95"
+  ".playwright-mcp/r10-flow-live.png": "efab9464bdf3cc6a1661cc062718acbf23ea1345727453d86011ae1764333a95",
+  "assets/revalidation-7-dialog-fixed.png": "2c64827858792f1f411757d14ea900bdba3b72fd9372bd4dfdf6c5cc49651dd2",
+  "assets/revalidation-7-dialog-restart-banner.png": "1da222971b75b46703270dde18e8339a2a7f14584cc9160c0a7f32eac306b96a"
 }
