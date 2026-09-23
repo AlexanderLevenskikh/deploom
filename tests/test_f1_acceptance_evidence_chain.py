@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import manual_dependency_audit as audit
+from tests._electron_dist import ensure_dist_electron
 
 NODE_VERDICT_SCRIPT = """\
 import { readFileSync } from 'node:fs'
@@ -69,6 +70,13 @@ def fake_lag(*counts: int) -> list:
 
 
 class F1AcceptanceEvidenceChainTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        # The verdict.mjs probes import the COMPILED production reader module
+        # (desktop/dist-electron/acceptance-policy.js). It is gitignored, so
+        # build it once when missing/stale (toolchain unavailable -> SkipTest).
+        ensure_dist_electron()
+
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="f1-chain-"))
         self.project = self.tmp / "project"

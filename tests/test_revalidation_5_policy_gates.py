@@ -27,8 +27,7 @@ if str(ROOT) not in sys.path:
 
 import dependency_live_roadmap_generator as generator
 from dependency_live_roadmap_generator import DependencyRow, ProjectSpec, DraftBudgetExceeded, compute_project_health
-
-RENDERER_TS = ROOT / "desktop" / "electron" / "draft-artifact-reader.ts"
+from tests._electron_dist import ensure_dist_electron
 
 
 def _write(path: Path, text: str) -> None:
@@ -79,18 +78,9 @@ class NodeDriver:
 
     def __init__(self, tmp: Path) -> None:
         self.tmp = tmp
-        (ROOT / "desktop" / "dist-electron").mkdir(parents=True, exist_ok=True)
-        try:
-            need = not (ROOT / "desktop" / "dist-electron" / "acceptance-policy.js").is_file() \
-                or RENDERER_TS.stat().st_mtime_ns > (ROOT / "desktop" / "dist-electron" / "acceptance-policy.js").stat().st_mtime_ns
-        except OSError:
-            need = True
-        if need:
-            done = subprocess.run([shutil.which("npx.cmd") or "npx", "tsc", "-p", "tsconfig.electron.json"],
-                                  cwd=str(ROOT / "desktop"),
-                                  capture_output=True, text=True, encoding="utf-8", timeout=180)
-            if done.returncode != 0:
-                raise AssertionError(f"tsc electron failed: {done.stderr[-800:]}")
+        # Probe the COMPILED production modules; build once when missing/stale
+        # (toolchain unavailable -> SkipTest so a Node-less env skips, not fails).
+        ensure_dist_electron()
 
     def run(self, script: str) -> dict:
         target = self.tmp / f"probe-{abs(hash(script))}.mjs"

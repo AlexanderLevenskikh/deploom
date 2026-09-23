@@ -23,13 +23,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 GENERATOR = ROOT / "dependency_live_roadmap_generator.py"
-RENDERER_TS = ROOT / "desktop" / "electron" / "draft-artifact-reader.ts"
 READER_ASSET = ROOT / "desktop" / "dist-electron" / "draft-artifact-reader.js"
 PROBE = ROOT / "tests" / "draft_reader_probe.mjs"
 VENDOR_LIB = ROOT / "tests" / "fixtures" / "real-lib" / "kontur-verified-fixture-lib"
 REAL_LIB_TGZ = "kontur-verified-fixture-lib-1.0.0.tgz"
 
 import manual_dependency_audit as audit
+from tests._electron_dist import ensure_dist_electron
 
 NODE_VERDICT_SCRIPT = """\
 import { readFileSync } from 'node:fs'
@@ -53,9 +53,9 @@ def _read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _tsc_command() -> list[str]:
-    """Cross-platform tsc invocation: npx.cmd on Windows, npx elsewhere."""
-    return [shutil.which("npx.cmd") or "npx", "tsc", "-p", "tsconfig.electron.json"]
+def _npm_command() -> list[str]:
+    """Cross-platform npm invocation: npm.cmd on Windows, npm elsewhere."""
+    return [shutil.which("npm.cmd") or "npm"]
 
 
 class DraftReaderCrossLanguageTests(unittest.TestCase):
@@ -67,20 +67,11 @@ class DraftReaderCrossLanguageTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        compiled = (READER_ASSET,)
-        try:
-            need_compile = not READER_ASSET.is_file() or RENDERER_TS.stat().st_mtime_ns > READER_ASSET.stat().st_mtime_ns
-        except OSError:
-            need_compile = True
-        if need_compile:
-            finished = subprocess.run(
-                _tsc_command(),
-                cwd=str(ROOT / "desktop"), capture_output=True, text=True,
-                encoding="utf-8", timeout=180,
-            )
-            if finished.returncode != 0:
-                raise unittest.SkipTest(f"tsc electron unavailable: {finished.stderr[-500:]}")
-        for asset in compiled:
+        # T1/T5/T8 probe the COMPILED production reader module
+        # (desktop/dist-electron/draft-artifact-reader.js). It is gitignored,
+        # so build it once when missing/stale (toolchain unavailable -> SkipTest).
+        ensure_dist_electron()
+        for asset in (READER_ASSET,):
             if not Path(asset).is_file():
                 raise unittest.SkipTest(f"reader asset missing: {asset}")
 
@@ -426,14 +417,8 @@ class DraftFlowIntegrationPhysicalTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         # The two-run policy test probes both manifests through the production
-        # Node reader; compile it once if the .ts is newer than the artifact.
-        try:
-            need_compile = not READER_ASSET.is_file() or RENDERER_TS.stat().st_mtime_ns > READER_ASSET.stat().st_mtime_ns
-        except OSError:
-            need_compile = True
-        if need_compile:
-            subprocess.run(_tsc_command(), cwd=str(ROOT / "desktop"),
-                           capture_output=True, text=True, encoding="utf-8", timeout=180)
+        # Node reader; compile it once if missing/stale.
+        ensure_dist_electron()
 
     def _probe_node(self, workspace_path: Path, run_id: str, expect: dict | None = None) -> dict:
         payload_path = self._tmp / f"probe-{run_id}.json"
@@ -474,7 +459,7 @@ class DraftFlowIntegrationPhysicalTests(unittest.TestCase):
         vendor = ws / "vendor"
         vendor.mkdir(parents=True, exist_ok=True)
         packed = subprocess.run(
-            ["npm.cmd", "pack", str(VENDOR_LIB), "--offline"],
+            _npm_command() + ["pack", str(VENDOR_LIB), "--offline"],
             cwd=str(vendor), capture_output=True, text=True, encoding="utf-8", timeout=120,
         )
         if packed.returncode != 0 or not (vendor / REAL_LIB_TGZ).is_file():
@@ -630,7 +615,7 @@ class DraftFlowIntegrationPhysicalTests(unittest.TestCase):
     def test_real_npm_test_smoke_on_fixture_with_scripts(self) -> None:
         ws = self._npm_fixture("smoke-npm", [("is-number", "^7.0.0")])
         finished = subprocess.run(
-            ["npm.cmd", "test"], cwd=str(ws), capture_output=True, text=True,
+            _npm_command() + ["test"], cwd=str(ws), capture_output=True, text=True,
             encoding="utf-8", timeout=120)
         self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
         self.assertIn("SMOKE_test_OK", finished.stdout)
@@ -641,11 +626,11 @@ class DraftFlowIntegrationPhysicalTests(unittest.TestCase):
         # generator drafts from that real manifest/lockfile matches it.
         ws = self._npm_fixture_real_lib("real-compat", "file:vendor/" + REAL_LIB_TGZ)
         installed = subprocess.run(
-            ["npm.cmd", "install", "--no-audit", "--no-fund", "--offline"],
+            _npm_command() + ["install", "--no-audit", "--no-fund", "--offline"],
             cwd=str(ws), capture_output=True, text=True, encoding="utf-8", timeout=180)
         self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
         tested = subprocess.run(
-            ["npm.cmd", "test"], cwd=str(ws), capture_output=True, text=True,
+            _npm_command() + ["test"], cwd=str(ws), capture_output=True, text=True,
             encoding="utf-8", timeout=120)
         self.assertEqual(tested.returncode, 0, tested.stdout + tested.stderr)
         self.assertIn("REAL_LIB_test_OK", tested.stdout)
@@ -669,7 +654,7 @@ class DraftFlowIntegrationPhysicalTests(unittest.TestCase):
         # real target spec for the real-named package.
         ws = self._npm_fixture_real_lib("real-incompat", "^2.0.0")
         refused = subprocess.run(
-            ["npm.cmd", "install", "--no-audit", "--no-fund", "--offline"],
+            _npm_command() + ["install", "--no-audit", "--no-fund", "--offline"],
             cwd=str(ws), capture_output=True, text=True, encoding="utf-8", timeout=180)
         self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
 
