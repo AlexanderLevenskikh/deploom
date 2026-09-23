@@ -132,10 +132,18 @@ const highClear = high === undefined || high <= Math.max(0, Math.trunc(Number.is
 // OSV evidence; older roadmaps carried the same concept as `unknown`). Unknown
 // is evidence of absence, not absence of evidence, so it blocks `reached`:
 // closing a goal means every in-scope dependency is accounted for.
-const rawSecurityUnknown = typeof rawHealth.security_unknown === 'number' ? rawHealth.security_unknown : undefined
-const securityUnknown = rawSecurityUnknown !== undefined
-  ? Math.max(0, Math.trunc(rawSecurityUnknown))
-  : typeof rawHealth.unknown === 'number' ? Math.max(0, Math.trunc(rawHealth.unknown)) : undefined
+const rawSecurityUnknown = typeof rawHealth.security_unknown === 'number' ? Math.max(0, Math.trunc(rawHealth.security_unknown)) : undefined
+const rawUnknown = typeof rawHealth.unknown === 'number' ? Math.max(0, Math.trunc(rawHealth.unknown)) : undefined
+const rawSecurityUnrated = typeof rawHealth.security_unrated === 'number' ? Math.max(0, Math.trunc(rawHealth.security_unrated)) : undefined
+// C1: an unrated finding (U) and an unassessed OSV state are the SAME truth
+// for closure: security is not fully accounted. `security_unknown` alone is
+// therefore not authoritative over the aggregate `unknown` (a generator from
+// before the U-dimension may report security_unknown=0 while unknown>0), and
+// `security_unrated` is an explicit third reading. Any of them >0 clears the
+// full-coverage claim; missing on ALL three is insufficientData.
+const securityUnknown = (rawSecurityUnknown !== undefined || rawUnknown !== undefined || rawSecurityUnrated !== undefined)
+  ? Math.max(rawSecurityUnknown ?? 0, rawUnknown ?? 0, rawSecurityUnrated ?? 0)
+  : undefined
 const securityClear = securityUnknown === undefined || securityUnknown === 0
 const rawLagOkPct = typeof rawHealth.lag_ok_pct === 'number' ? Math.max(0, Math.min(100, rawHealth.lag_ok_pct)) : undefined
 const scopeTotal = typeof rawHealth.scope_total === 'number' ? Math.max(0, Math.trunc(rawHealth.scope_total)) : undefined

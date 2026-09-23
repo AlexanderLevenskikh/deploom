@@ -1110,6 +1110,12 @@ class ProjectHealth:
     security_total: int = 0
     security_known: int = 0
     security_unknown: int = 0
+    # C1: rows whose OSV entry reports a finding WITHOUT a severity rating (U).
+    # They are assessed (not "OSV unavailable") but their finding cannot be
+    # compared to any C/H/M/L limit, so they are NOT security coverage. Kept
+    # separate so the report can name the reason without conflating it with an
+    # unassessed OSV state.
+    security_unrated: int = 0
     insufficient_data: bool = False
     # F2: the researched share (lag_ok_pct over `total`) is a separate metric
     # from the GOAL over the WHOLE active scope. Unknown rows are never
@@ -5628,6 +5634,12 @@ def _candidate_satisfies_fast_policy(
         ("H", max_high),
         ("M", max_moderate),
         ("L", max_low),
+        # C1: U is a DETECTED finding without a severity rating. It cannot be
+        # compared to any C/H/M/L limit, so the only honest limit is zero: a
+        # package whose exact chosen version carries U>0 does not confirm the
+        # goal (same traversal and None/unknown semantics as the rated
+        # dimensions, so B1/N2/N3 stay intact).
+        ("U", 0),
     )
     for severity, limit in severity_limits:
         # B1: EVERY active package's EXACT chosen version is the subject for
@@ -5747,6 +5759,11 @@ def compute_project_health(
     # rows whose vuln state is genuinely unknown so the plan/prompt show honest
     # coverage instead of implying "no vulnerabilities" (R3/T3).
     vuln_unknown_rows = sum(1 for r in active_rows if not _row_security_known(r))
+    # C1: a detected finding without a severity rating (U) is a DISTINCT state
+    # from an unassessed OSV row. Both mean "security is not fully accounted"
+    # for closure, but they must be reported separately and never double count
+    # the aggregate `unknown` (which already sums U findings + unassessed rows).
+    security_unrated_rows = sum(1 for r in active_rows if _row_has_unrated_vulns(r))
     security_total = len(active_rows)
     security_known = security_total - vuln_unknown_rows
     metadata_total = len(active_rows)
@@ -5792,8 +5809,10 @@ def compute_project_health(
         parts = [f"{scope_lag_pct:.1f}% активного scope соблюдают lag-policy", "0 Critical"]
         if lag_unknown:
             parts.append(f"lag-policy target неизвестен: {lag_unknown}")
-        if unknown:
+        if vuln_unknown_rows:
             parts.append(f"security неизвестна: {vuln_unknown_rows}")
+        if security_unrated_rows:
+            parts.append(f"уязвимости без оценки серьёзности: {security_unrated_rows}")
         if high:
             parts.append(f"High остаются: {high}")
         if moderate or low:
@@ -5833,7 +5852,8 @@ def compute_project_health(
         metadata_known=metadata_known,
         security_total=security_total,
         security_known=security_known,
-        security_unknown=vuln_unknown_rows,
+        security_unknown=vuln_unknown_rows + security_unrated_rows,
+        security_unrated=security_unrated_rows,
         insufficient_data=insufficient_data,
         scope_total=scope_total,
         scope_lag_ok=scope_lag_ok,
@@ -21354,6 +21374,21 @@ def stable_sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _summary_has_unrated_vulns(summary: Optional[str]) -> bool:
+    """C1: a detected finding without a severity rating (U) is evidence of a
+    vulnerability whose impact was never classified -- it is NOT a proven zero.
+    This is the single definition shared by the Fast gate (for the EXACT chosen
+    version) and by health/Draft (for the installed version)."""
+    return bool(summary is not None and parse_vuln_counts(summary).get("U", 0) > 0)
+
+
+def _row_has_unrated_vulns(row: DependencyRow) -> bool:
+    """C1: does the CURRENT version carry a vulnerability without a severity
+    rating? Distinct from `_row_security_known` (OSV assessed at all) and from
+    a proven zero (`0` summary): all three states must stay separate."""
+    return _summary_has_unrated_vulns(row.current_vulns)
+
+
 def _row_security_known(row: DependencyRow) -> bool:
     """A row's vulnerability state is assessed only when current_vulns carries
     a concrete finding or an explicit zero. Anything that means "we did not get
@@ -21619,12 +21654,14 @@ def build_draft_plan(
             plan_rows.append(entry)
             meta_unknown = not _row_metadata_known(row)
             sec_unknown = not _row_security_known(row)
-            # "unknown-metadata" is already counted via the row status above
-            # (status == "unknown-metadata"); only the security dimension needs
-            # its own independent counter (T3).
-            if sec_unknown:
+            sec_unrated = _row_has_unrated_vulns(row)
+            # C1: an unassessed OSV state AND a detected finding without a
+            # severity rating (U) both mean the security counter cannot confirm
+            # coverage; they share the unknown-security counter but keep
+            # distinct machine-readable reasons (a U row is still ASSESSED).
+            if sec_unknown or sec_unrated:
                 totals["unknown-security"] = totals.get("unknown-security", 0) + 1
-            if meta_unknown or sec_unknown:
+            if meta_unknown or sec_unknown or sec_unrated:
                 # T3: metadata (registry availability) and security (OSV) are
                 # separate unknown classes; an unassessed OSV state must reach
                 # the plan/summary/prompt even when the registry metadata is
@@ -21634,13 +21671,16 @@ def build_draft_plan(
                     causes.append("registry metadata unavailable for this package in this Draft run")
                 if sec_unknown:
                     causes.append("OSV/security state unknown for this package in this Draft run")
+                if sec_unrated:
+                    causes.append("уязвимость без оценки серьёзности (U) для этого пакета в этом Draft run")
+                sec_blocked = sec_unknown or sec_unrated
                 unknowns.append({
                     "package": row.name,
                     "project": project,
                     "kind": row.kind,
                     "requestedSpec": row.requested_spec,
                     "current": row.current_version,
-                    "clarity": "security" if sec_unknown and not meta_unknown else ("metadata" if meta_unknown and not sec_unknown else "both"),
+                    "clarity": "security" if sec_blocked and not meta_unknown else ("metadata" if meta_unknown and not sec_blocked else "both"),
                     "reason": "; ".join(causes),
                 })
         if spec:
