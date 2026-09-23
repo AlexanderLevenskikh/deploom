@@ -43,6 +43,7 @@ import { forgetScopedPromptPath, rememberScopedPromptPath, roadmapContainsProjec
 import { targetClosureFromRoadmap, targetClosureFromRoadmapWithTargets, type ClosureTarget, type TargetClosure } from './target-closure.js'
 import { baselineBudgetOverride } from './baseline-budget.js'
 import { acceptanceVerdictFromManualAudit, dependencyInputIdentity, mergeTargetPolicy, normalizeAcceptancePolicy, type AcceptancePolicy, type AcceptanceVerdict } from './acceptance-policy.js'
+import { normalizeBudgetField } from './baseline-intent.js'
 import { summarizeUpdaterError } from './updater-error.js'
 import { flowNotificationContent, type FlowNotificationEvent } from './notifications.js'
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
@@ -407,8 +408,7 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
   const controlMode: BaselineControlMode = raw.controlMode === 'AUTONOMOUS' || raw.controlMode === 'CONFIRM_SIGNIFICANT'
     ? raw.controlMode
     : raw.executionMode === 'FAST' || raw.executionMode === 'AUTOPILOT' ? 'CONFIRM_SIGNIFICANT' : 'AUTONOMOUS'
-  const budgetParsed = Number(raw.budgetMinutes ?? 30)
-  const budgetMinutes = Number.isFinite(budgetParsed) ? Math.max(5, Math.min(240, Math.round(budgetParsed))) : 30
+  const budgetField = normalizeBudgetField(raw)
   // T2: 0 is a legitimate user goal ("no lag-policy slack at the release
   // gate"), so it must not be coerced back to the legacy 80 default by `||`.
   // F1: a single normalized TargetPolicy. The dialog persists the goal on the
@@ -429,7 +429,7 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
     schemaVersion: 2,
     policies,
     controlMode,
-    budgetMinutes,
+    ...budgetField,
     acceptancePolicy,
     extraIterations: Math.max(0, Math.floor(Number(raw.extraIterations ?? 0) || 0)),
     decisionGrantIterations: Math.max(0, Math.floor(Number(raw.decisionGrantIterations ?? 0) || 0)),
@@ -462,15 +462,16 @@ function loadBaselineIntent(workspace: WorkspaceRecord, projectName: string): Ba
   catch { return normalizeBaselineIntent(undefined) }
 }
 
-// H5: whether the PERSISTED intent carries its own budget in raw form. The
+// N1: whether the PERSISTED intent carries an explicitly chosen budget. The
 // normalized intent always defaults budgetMinutes to 30, so a normalized read
 // cannot distinguish "user saved 30" from "user never chose a budget"; only
-// the raw JSON can. A legacy intent with no budget field means "no saved
-// budget" -> the declared FAST/DEEP mode budgets apply.
+// the raw JSON carries the explicitness. A saved implicit default must NEVER
+// become a "saved legacy budget" (shared normalizeBudgetField handles the
+// explicit-flag / v1-migration / non-default-30 migration rules).
 function baselineIntentHasPersistedBudgetMinutes(workspace: WorkspaceRecord, projectName: string): boolean {
   try {
-    const raw = JSON.parse(readFileSync(baselineIntentPath(workspace, projectName), 'utf8')) as { budgetMinutes?: unknown }
-    return Boolean(raw && typeof raw === 'object' && raw.budgetMinutes !== undefined && raw.budgetMinutes !== null)
+    const raw = JSON.parse(readFileSync(baselineIntentPath(workspace, projectName), 'utf8'))
+    return normalizeBudgetField(raw).budgetMinutesExplicit
   } catch { return false }
 }
 
@@ -2397,11 +2398,14 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
       // budget (raw field in the persisted intent) supplies the flat override;
       // otherwise the env keys are omitted and the engine keeps its mode
       // defaults. The informational budgetMinutes env still travels always.
-      const rawInputBudget = (input.baselineIntent && typeof input.baselineIntent === 'object' && 'budgetMinutes' in (input.baselineIntent as Record<string, unknown>))
-        ? Number((input.baselineIntent as Record<string, unknown>).budgetMinutes)
-        : undefined
+      // N1: an explicit override exists only when the RAW input (or the saved
+      // intent) really carries a user-chosen budget; an untouched dialog field
+      // must not replace the declared FAST/DEEP mode budgets.
+      const rawInputExplicit = (input.baselineIntent && typeof input.baselineIntent === 'object')
+        ? normalizeBudgetField(input.baselineIntent).budgetMinutesExplicit
+        : false
       const budgetOverride = baselineBudgetOverride({
-        explicitBudgetMinutes: Number.isFinite(Number(rawInputBudget)) ? rawInputBudget : undefined,
+        explicitBudgetMinutes: rawInputExplicit ? budgetMinutes : undefined,
         persistedHasBudgetMinutes: baselineIntentHasPersistedBudgetMinutes(workspace, project.name),
         clampedBudgetMinutes: budgetMinutes,
       })

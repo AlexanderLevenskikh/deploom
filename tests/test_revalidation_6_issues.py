@@ -41,7 +41,7 @@ def _js(value: str) -> str:
 
 def _row(name: str, *, vulns: str = "C:0;H:0;M:0;L:0", current: str = "1.0.0",
          min12: str = "1.0.0", min_critical: str = "1.0.0", min_high: str = "1.0.0",
-         min_vuln: str = "1.0.0") -> DependencyRow:
+         min_vuln: str = "1.0.0", evidence: dict | None = None) -> DependencyRow:
     return DependencyRow(
         project="app",
         package_dir=".",
@@ -65,6 +65,7 @@ def _row(name: str, *, vulns: str = "C:0;H:0;M:0;L:0", current: str = "1.0.0",
         lag_threshold_months=12,
         scope_excluded=False,
         exclusion_reason="",
+        vuln_evidence_by_version=evidence if evidence is not None else {},
     )
 
 
@@ -132,11 +133,13 @@ class H1FastPolicyScopeTests(unittest.TestCase):
         self.assertFalse(self._gate(rows, {}), "1/10 confirmed scope must not satisfy an 80% yellow goal")
 
     def test_h1_positive_when_every_finding_is_cleared(self) -> None:
-        # Two H:1 rows BOTH cleared by the candidate (evidence: min_no_high
-        # reached by the planned version) -> aggregate drops to 0 -> satisfied.
+        # Two H:1 rows BOTH cleared by the candidate (per-version OSV evidence
+        # for the exact planned version shows H:0) -> aggregate drops to 0.
         rows = [
-            _row("a", vulns="C:0;H:1;M:0;L:0", current="0.5.0", min_high="1.0.0"),
-            _row("b", vulns="C:0;H:1;M:0;L:0", current="0.5.0", min_high="1.0.0"),
+            _row("a", vulns="C:0;H:1;M:0;L:0", current="0.5.0", min_high="1.0.0",
+                 evidence={"1.0.0": "C:0;H:0;M:0;L:0"}),
+            _row("b", vulns="C:0;H:1;M:0;L:0", current="0.5.0", min_high="1.0.0",
+                 evidence={"1.0.0": "C:0;H:0;M:0;L:0"}),
         ]
         self.assertTrue(self._gate(rows, {"a": "1.0.0", "b": "1.0.0"}))
 
@@ -282,12 +285,12 @@ console.log(JSON.stringify({{ reached: closure.reached, insufficientData: closur
         self.assertIn("недостаточно данных", out["message"])
 
     def test_h4_measured_roadmap_still_reaches_when_legit(self) -> None:
-        out = self._closure({"project_health": {"demo": {"status": "yellow", "lag_ok_pct": 80}}, "projects": {"demo": []}}, target="yellow")
+        out = self._closure({"project_health": {"demo": {"status": "yellow", "lag_ok_pct": 80, "critical": 0, "high": 0, "security_unknown": 0}}, "projects": {"demo": []}}, target="yellow")
         self.assertTrue(out["reached"], "a measured 80% yellow must still close")
 
     def test_h4_green_does_not_ignore_explicit_nonzero_high(self) -> None:
         out = self._closure({
-            "project_health": {"demo": {"status": "green", "lag_ok_pct": 100, "high": 2}},
+            "project_health": {"demo": {"status": "green", "lag_ok_pct": 100, "high": 2, "critical": 0, "security_unknown": 0}},
             "projects": {"demo": []},
         })
         self.assertFalse(out["reached"], "green with an explicitly non-zero High must not be reached")

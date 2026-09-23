@@ -1,11 +1,13 @@
 import { AlertTriangle, Search, ShieldCheck, X } from 'lucide-react'
 import { useDeferredValue, useEffect, useMemo, useState } from 'react'
 import { useLanguage } from '../i18n'
+import { attemptsForMinutes, handleDialogBudget } from '../../electron/baseline-intent'
 import type { BaselineControlMode, BaselineDecision, BaselineIntent, BaselineIntentPlan, BaselinePackagePolicy, BaselineProofMode, BaselineSearchMode } from '../types'
 import { QuickSelect } from './QuickSelect'
 
 type Props = {
   mode: 'prepare' | 'decision'
+  resume?: 'auto' | 'continue' | 'restart'
   plan: BaselineIntentPlan
   decision?: BaselineDecision
   onCancel: () => void
@@ -58,13 +60,16 @@ function reconcileDeferredCohorts(cohorts: DeferredCohort[], policies: Record<st
     .filter((cohort) => cohort.packages.length > 0)
 }
 
-export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit }: Props) {
+export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, onSubmit }: Props) {
   const { text } = useLanguage()
   const [query, setQuery] = useState('')
   const [kind, setKind] = useState<'all' | 'runtime' | 'dev' | 'peer'>('all')
   const [policies, setPolicies] = useState<Record<string, BaselinePackagePolicy>>({ ...plan.intent.policies })
   const [controlMode, setControlMode] = useState<BaselineControlMode>(normalizedControlMode(plan.intent))
   const [budgetMinutes, setBudgetMinutes] = useState(boundedInteger(plan.intent.budgetMinutes, 30, 5, 240))
+  // N1: an untouched budget field is NOT an explicit user choice. Only editing
+  // the minutes (or reopening an explicitly saved intent) carries the override.
+  const [budgetEdited, setBudgetEdited] = useState(false)
   const [maxKnownHigh, setMaxKnownHigh] = useState(boundedInteger(plan.intent.acceptancePolicy?.maxKnownHigh, 1, 0, 99))
   const [searchDepth, setSearchDepth] = useState<BaselineSearchMode>(normalizedSearchMode(plan.intent.searchMode))
   const [deferredCohorts, setDeferredCohorts] = useState<DeferredCohort[]>([...(plan.intent.deferredCohorts ?? [])])
@@ -91,6 +96,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
     setMinLagOkPct(boundedInteger(plan.intent.minLagOkPct, 80, 0, 100))
     setLagPolicyMonths(boundedLagMonths(plan.intent.lagPolicyMonths ?? plan.intent.acceptancePolicy?.lagPolicyMonths ?? 12))
     setProductMode(plan.intent.productMode ?? 'deep')
+    setBudgetEdited(false)
   }, [plan])
 
   const visible = useMemo(() => {
@@ -110,6 +116,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
   const dirty = useMemo(
     () => policyFingerprint(policies) !== policyFingerprint(plan.intent.policies)
       || controlMode !== normalizedControlMode(plan.intent)
+      || budgetEdited !== Boolean(plan.intent.budgetMinutesExplicit)
       || budgetMinutes !== boundedInteger(plan.intent.budgetMinutes, 30, 5, 240)
       || maxKnownHigh !== boundedInteger(plan.intent.acceptancePolicy?.maxKnownHigh, 1, 0, 99)
       || searchDepth !== normalizedSearchMode(plan.intent.searchMode)
@@ -118,7 +125,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
       || minLagOkPct !== boundedInteger(plan.intent.minLagOkPct, 80, 0, 100)
       || lagPolicyMonths !== boundedLagMonths(plan.intent.lagPolicyMonths ?? plan.intent.acceptancePolicy?.lagPolicyMonths ?? 12)
       || productMode !== (plan.intent.productMode ?? 'deep'),
-    [budgetMinutes, controlMode, deferredCohorts, lagPolicyMonths, maxKnownHigh, minLagOkPct, plan.intent, policies, productMode, searchDepth, targetLevel],
+    [budgetMinutes, budgetEdited, controlMode, deferredCohorts, lagPolicyMonths, maxKnownHigh, minLagOkPct, plan.intent, policies, productMode, searchDepth, targetLevel],
   )
 
   const buildIntent = ({
@@ -160,7 +167,15 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
       schemaVersion: 2,
       policies: Object.fromEntries(Object.entries(nextPolicies).filter(([, value]) => value !== 'auto')),
       controlMode: nextControlMode,
-      budgetMinutes: boundedInteger(budgetMinutes, 30, 5, 240),
+      // N1: only a genuinely chosen budget travels as an explicit override.
+      // An untouched field (or a default that was never saved as a user
+      // choice) carries NOTHING, so the Desktop/engine keep the mode budgets.
+      ...handleDialogBudget({
+        edited: budgetEdited,
+        planExplicit: Boolean(plan.intent.budgetMinutesExplicit),
+        shownMinutes: budgetMinutes,
+        planBudgetMinutes: plan.intent.budgetMinutes,
+      }),
       // The acceptancePolicy is the single canonical home of the TargetPolicy:
       // readAcceptanceVerdict reads only this nested object, so the goal must
       // be part of it (not just a top-level mirror).
@@ -337,6 +352,9 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
           <button type="button" className="icon-button" aria-label={text('Закрыть без применения', 'Close without applying')} onClick={requestCancel}><X size={17} /></button>
         </header>
 
+        {resume === 'restart' ? <div className="resume-notice baseline-restart-notice"><strong>{text('Baseline будет начат заново', 'Baseline will be restarted')}</strong><span>{text('После запуска оркестрационный checkpoint будет сброшен; exact proof/artifact cache с совпадающей identity останется доступен. Здесь можно применить состав Baseline или сразу запустить.', 'After you start, the orchestration checkpoint will be reset, while the exact proof/artifact cache with matching identity stays reusable. Apply the Baseline scope here or start right away.')}</span></div> : null}
+
+        <div className="baseline-intent-scroll">
         <div className="baseline-fast-flow">
           <div>
             <strong>{text('Как работать', 'How to run')}</strong>
@@ -352,6 +370,15 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
               <small>{productMode === 'fast'
                 ? text('Fast останавливается на первом physically verified кандидате, который реально удовлетворяет Acceptance policy (все известные Critical/High закрыты, lag-цель достигнута). Дедлайн и бюджет строго ограничены.', 'FAST stops on the first physically verified candidate that actually satisfies the acceptance policy (every known Critical/High covered, lag goal met). Deadline and budget are tightly bounded.')
                 : text('Deep продолжает улучшать результат после первого удовлетворяющего кандидата и сохраняет лучший verified incumbent при ошибке/таймауте. Используется по умолчанию.', 'DEEP keeps improving after the first satisfying candidate and preserves the best verified incumbent on error/timeout. This is the default.')}</small>
+              {budgetEdited || Boolean(plan.intent.budgetMinutesExplicit) ? (
+                <small className="baseline-budget-applied">
+                  {text(`Применяемый лимит: ${boundedInteger(budgetMinutes, 30, 5, 240)} мин (${boundedInteger(budgetMinutes, 30, 5, 240) * 60} с · ${attemptsForMinutes(budgetMinutes)} дорогих попыток)`, `Applied budget: ${boundedInteger(budgetMinutes, 30, 5, 240)} min (${boundedInteger(budgetMinutes, 30, 5, 240) * 60}s · ${attemptsForMinutes(budgetMinutes)} expensive attempts)`)}
+                </small>
+              ) : (
+                <small className="baseline-budget-applied">
+                  {text('Без выбора бюджета применяются режимные лимиты: Fast 300 с / 2 попытки, Deep 3600 с / 12.', 'Without a chosen budget the mode limits apply: Fast 300s/2 attempts, Deep 3600s/12.')}
+                </small>
+              )}
             </div>
             <div className="baseline-run-control">
               <span className="baseline-run-control-label">{text('Контроль', 'Control')}</span>
@@ -365,7 +392,7 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
             </div>
             <div className="baseline-run-control">
               <span className="baseline-run-control-label">{text('Бюджет Baseline / планирования', 'Baseline / planning budget')}</span>
-              <label>{text('Минуты', 'Minutes')}<input type="number" min={5} max={240} step={5} value={budgetMinutes} disabled={busy} onChange={(event) => setBudgetMinutes(boundedInteger(event.target.value, 30, 5, 240))} /></label>
+              <label>{text('Минуты', 'Minutes')}<input type="number" min={5} max={240} step={5} value={budgetMinutes} disabled={busy} onChange={(event) => { setBudgetEdited(true); setBudgetMinutes(boundedInteger(event.target.value, 30, 5, 240)) }} /></label>
               <small>{text('Ограничивает дорогой поиск и physical verification на этапе Baseline. Это не таймер всего FLOW.', 'Bounds expensive search and physical verification during Baseline. It is not a timer for the whole FLOW.')}</small>
             </div>
             <div className="baseline-run-control">
@@ -499,12 +526,13 @@ export function BaselineIntentDialog({ mode, plan, decision, onCancel, onSubmit 
             )
           })}
         </div>
+        </div>
 
         <footer className="baseline-intent-actions">
           <span className="baseline-intent-apply-hint">{dirty ? text('Есть неприменённые изменения', 'There are unapplied changes') : text('Scope готов', 'Scope is ready')}</span>
           <button type="button" className="button secondary" disabled={busy} onClick={requestCancel}>{mode === 'decision' ? text('Оставить на паузе', 'Keep paused') : text('Отмена', 'Cancel')}</button>
           {mode === 'prepare' ? <button type="button" className="button secondary" disabled={busy} onClick={() => buildDraft(true)} title={text('Без install/lifecycle/project checks. После завершения сразу откроется готовый prompt; Dashboard не требуется.', 'No install/lifecycle/project checks. The ready prompt opens immediately after completion; Dashboard is not required.')}>{text('Создать Draft и показать промпт', 'Create Draft and show prompt')}</button> : null}
-          {mode === 'prepare' ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{controlMode === 'AUTONOMOUS' ? text('Запустить автономно', 'Start autonomously') : text('Запустить Baseline', 'Start Baseline')}</button> : null}
+          {mode === 'prepare' ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{resume === 'restart' ? text('Начать заново и запустить', 'Restart and start') : controlMode === 'AUTONOMOUS' ? text('Запустить автономно', 'Start autonomously') : text('Запустить Baseline', 'Start Baseline')}</button> : null}
           {mode === 'decision' && !suggestedCohort?.packages.length && decision?.package ? <button type="button" className="button primary" disabled={busy} onClick={keepFocusAndContinue}>{text(`Пока оставить ${decision.package} current`, `Keep ${decision.package} current for now`)}</button> : null}
           {mode === 'decision' && !suggestedCohort?.packages.length && !decision?.package ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{text('Применить scope и продолжить', 'Apply scope and continue')}</button> : null}
           {mode === 'decision' ? (

@@ -46,7 +46,8 @@ def _js(value: str) -> str:
 
 
 def _row(name: str, *, vulns: str = "C:0;H:0;M:0;L:0", current: str = "1.0.0",
-         latest: str = "1.0.0", min12: str = "1.0.0", current_source: str = "lock") -> DependencyRow:
+         latest: str = "1.0.0", min12: str = "1.0.0", current_source: str = "lock",
+         evidence: dict | None = None) -> DependencyRow:
     return DependencyRow(
         project="demo",
         package_dir=".",
@@ -70,6 +71,7 @@ def _row(name: str, *, vulns: str = "C:0;H:0;M:0;L:0", current: str = "1.0.0",
         lag_threshold_months=12,
         scope_excluded=False,
         exclusion_reason="",
+        vuln_evidence_by_version=evidence if evidence is not None else {},
     )
 
 
@@ -331,7 +333,8 @@ class G5FastStopPolicyTests(unittest.TestCase):
         self.assertTrue(satisfied)
 
     def test_g5_fast_stop_satisfied_when_candidate_covers_critical(self) -> None:
-        vuln = _row("vuln", vulns="C:1;H:0;M:0;L:0", current="0.5.0")
+        vuln = _row("vuln", vulns="C:1;H:0;M:0;L:0", current="0.5.0",
+                    evidence={"1.0.0": "C:0;H:0;M:0;L:0"})
         satisfied = generator._candidate_satisfies_fast_policy(
             rows=[vuln],
             candidate_targets={"vuln": "1.0.0"},

@@ -54,6 +54,9 @@ export function normalizeBaselineIntentPlan(plan: BaselineIntentPlan): BaselineI
       policies: { ...(raw.policies ?? {}) },
       controlMode,
       budgetMinutes: normalizeBudgetMinutes(raw.budgetMinutes, 30),
+      // N1: preserve whether the saved intent carried a user-chosen budget so
+      // the dialog/Action do not turn an implicit default into an override.
+      ...(raw.budgetMinutesExplicit === true ? { budgetMinutesExplicit: true } : {}),
       acceptancePolicy: normalizeAcceptancePolicy(raw.acceptancePolicy),
       extraIterations: Math.max(0, Number(raw.extraIterations ?? 0) || 0),
       decisionGrantIterations: 0,

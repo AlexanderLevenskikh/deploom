@@ -46,6 +46,7 @@ export type TargetClosure = {
   high?: number
   excluded?: number
   insufficientData?: boolean
+  missingEvidence?: string[]
   bestEffortReleaseEligible?: boolean
   bestEffortReason?: string
 }
@@ -145,7 +146,7 @@ const scopeLagUnknown = typeof rawHealth.scope_lag_unknown === 'number' ? Math.m
 // share (older roadmaps without scope fields).
 const goalLagPct = scopeLagPct ?? rawLagOkPct
 const statusMeetsTarget = status !== 'unknown' && STATUS_RANK[status] >= STATUS_RANK[target]
-const criticalClear = critical === undefined || critical === 0
+const criticalClear = critical === 0
 // H4: a status colour is not a measurement. Closing ANY target requires a
 // measured lag share (the generator always writes lag_ok_pct / scope_lag_pct);
 // a roadmap carrying only a colour has no numeric evidence and cannot confirm
@@ -155,9 +156,19 @@ const hasLagEvidence = goalLagPct !== undefined
 // The generator's green status already requires High == 0, so an explicitly
 // non-zero High contradicts a green label and must not be papered over by the
 // legacy colour (a stale/inconsistent report is not a green closure).
-const greenHighClear = high === undefined || high === 0
-const insufficientData = !hasLagEvidence
-const reached = hasLagEvidence && (target === 'yellow'
+const greenHighClear = high === 0
+// N5: a colour is not proof of no security findings either. Reaching a goal
+// requires numeric Critical/High evidence AND confirmed security coverage by
+// scope; every missing mandatory field is insufficientData with a clear list
+// of what is missing. Legacy/partial roadmaps may still be displayed, but a
+// goal can never be "reached" on colour alone.
+const missingEvidence: string[] = []
+if (!hasLagEvidence) missingEvidence.push('численные показатели lag/scope')
+if (critical === undefined) missingEvidence.push('Critical')
+if (high === undefined) missingEvidence.push('High')
+if (securityUnknown === undefined) missingEvidence.push('покрытие security по scope')
+const insufficientData = missingEvidence.length > 0
+const reached = hasLagEvidence && !insufficientData && (target === 'yellow'
   ? statusMeetsTarget
     && remainingPackages.length === 0
     && criticalClear
@@ -238,7 +249,7 @@ const reached = hasLagEvidence && (target === 'yellow'
     ...(typeof rawHealth.high === 'number' ? { high: rawHealth.high } : {}),
     ...(securityUnknown !== undefined ? { securityUnknown } : {}),
     ...(typeof rawHealth.excluded === 'number' ? { excluded: rawHealth.excluded } : {}),
-    ...(insufficientData ? { insufficientData: true } : {}),
+    ...(insufficientData ? { insufficientData: true, missingEvidence } : {}),
     ...(bestEffortReleaseEligible ? { bestEffortReleaseEligible, bestEffortReason } : {}),
     remainingPackages,
     lagBlockers,
@@ -324,10 +335,13 @@ export function shouldUseSupervisorSeed(closure: TargetClosure | undefined, targ
 export function targetClosureMessage(closure: TargetClosure): string {
   const labels = { red: 'Красный', yellow: 'Жёлтый', green: 'Зелёный', unknown: 'не рассчитан' } as const
   const targetLabel = closure.target === 'yellow' ? 'Жёлтый' : 'Зелёный'
-  // H4: a roadmap without numeric measurements cannot confirm a goal; say so
-  // instead of implying a plan or label is the proof.
+  // H4/N5: a roadmap without the numeric measurements cannot confirm a goal;
+  // say what exactly is missing instead of implying a plan or colour is proof.
   if (closure.insufficientData) {
-    return `Цель «${targetLabel}» не достигнута: недостаточно данных — в roadmap есть только цвет (${labels[closure.current]}), но нет численных показателей lag/scope. Сам по себе цвет не является доказательством закрытия цели; пересоберите отчёт (Draft/актуальный roadmap), чтобы получить измеренные значения.`
+    const missing = closure.missingEvidence?.length
+      ? `отсутствуют: ${closure.missingEvidence.join(', ')}. `
+      : `в roadmap есть только цвет (${labels[closure.current]}), но нет измеренных показателей. `
+    return `Цель «${targetLabel}» не достигнута: недостаточно данных — ${missing}Сам по себе цвет не является доказательством закрытия цели; пересоберите отчёт (Draft/актуальный roadmap), чтобы получить измеренные значения.`
   }
   // F2: show the goal over the FULL scope when the generator measured it, so
   // "100% of what we checked" is never presented as "100% of everything".

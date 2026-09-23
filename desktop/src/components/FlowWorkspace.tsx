@@ -218,6 +218,8 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
         ...fresh,
         controlMode: loaded.intent.controlMode ?? fresh.controlMode,
         budgetMinutes: loaded.intent.budgetMinutes ?? fresh.budgetMinutes,
+        // N1: a saved implicit default must not become an explicit override.
+        budgetMinutesExplicit: loaded.intent.budgetMinutesExplicit === true ? true : undefined,
         acceptancePolicy: loaded.intent.acceptancePolicy ?? fresh.acceptancePolicy,
       } } : loaded
       setBaselineIntentDialog({ mode, resume, plan, decision })
@@ -303,6 +305,12 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
     const resumeAgent = stage.action === 'agent' && (resumeOverride ?? canResumeAgent)
     const skipBaselineModeConfirmation = stage.action === 'baseline'
     if (stage.confirmationKey && !skipBaselineModeConfirmation && !window.confirm(t(stage.confirmationKey))) return
+    // N7: an explicit "start over" must bypass the decision branch, or the
+    // dialog would open on the pending decision and "restart" would stay dead.
+    if (stage.action === 'baseline' && baselineResume === 'restart') {
+      await openBaselineIntentDialog('prepare', 'restart')
+      return
+    }
     if (stage.action === 'baseline' && baselineDecision) {
       setBaselineDecisionDismissed(false)
       await openBaselineIntentDialog('decision', 'continue', baselineDecision)
@@ -595,7 +603,7 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
         </div>
       </details>
       {selectedBranchFailure?.runtime?.phase === 'failed' ? <BranchFailureModal branch={selectedBranchFailure} onClose={() => setSelectedBranchFailure(null)} /> : null}
-      {baselineIntentDialog ? <BaselineIntentDialog mode={baselineIntentDialog.mode} plan={baselineIntentDialog.plan} decision={baselineIntentDialog.decision} onCancel={() => { setBaselineIntentDialog(undefined); if (baselineIntentDialog.mode === 'decision') setBaselineDecisionDismissed(true) }} onSubmit={runBaselineIntent} /> : null}
+      {baselineIntentDialog ? <BaselineIntentDialog mode={baselineIntentDialog.mode} resume={baselineIntentDialog.resume} plan={baselineIntentDialog.plan} decision={baselineIntentDialog.decision} onCancel={() => { setBaselineIntentDialog(undefined); if (baselineIntentDialog.mode === 'decision') setBaselineDecisionDismissed(true) }} onSubmit={runBaselineIntent} /> : null}
       {draftPromptPreview ? <PromptPreviewDialog preview={draftPromptPreview} onClose={() => setDraftPromptPreview(undefined)} onOpenPath={onOpenPath} /> : null}
     </section>
   )

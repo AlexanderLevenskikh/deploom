@@ -1,15 +1,15 @@
 import { scopeExpansionCoverage, shouldUseSupervisorSeed, splitLagBlockers, targetClosureFromRoadmap, targetClosureFromRoadmapWithTargets, targetClosureMessage } from "../dist-electron/target-closure.js";
 
 const red = targetClosureFromRoadmap({
-  project_health: { Demo: { status: "red", lag_ok_pct: 57.9, lag_ok_12m: 44, total: 76 } },
+  project_health: { Demo: { status: "red", lag_ok_pct: 57.9, lag_ok_12m: 44, total: 76, critical: 0, high: 0, security_unknown: 0 } },
   projects: { Demo: [{ name: "missing-a", target_yellow: "2.0.0" }, { name: "excluded", target_yellow: "3.0.0", scope_excluded: true }] },
 }, "Demo", "yellow");
 if (red.reached || red.remainingPackages.join(",") !== "missing-a") throw new Error(`Red target was accepted: ${JSON.stringify(red)}`);
 if (!targetClosureMessage(red).includes("57.9%") || !targetClosureMessage(red).includes("missing-a")) throw new Error(`Closure message is incomplete: ${targetClosureMessage(red)}`);
 
-const yellow = targetClosureFromRoadmap({ project_health: { Demo: { status: "yellow", lag_ok_pct: 80 } }, projects: { Demo: [] } }, "Demo", "yellow");
+const yellow = targetClosureFromRoadmap({ project_health: { Demo: { status: "yellow", lag_ok_pct: 80, critical: 0, high: 0, security_unknown: 0 } }, projects: { Demo: [] } }, "Demo", "yellow");
 if (!yellow.reached) throw new Error(`Yellow target was rejected: ${JSON.stringify(yellow)}`);
-const green = targetClosureFromRoadmap({ project_health: { Demo: { status: "yellow", lag_ok_pct: 100 } }, projects: { Demo: [] } }, "Demo", "green");
+const green = targetClosureFromRoadmap({ project_health: { Demo: { status: "yellow", lag_ok_pct: 100, critical: 0, high: 0, security_unknown: 0 } }, projects: { Demo: [] } }, "Demo", "green");
 if (green.reached) throw new Error(`Yellow status was accepted as green: ${JSON.stringify(green)}`);
 // Modelled on the real checkout-form case that motivated this: 79.2% with one
 // package the plan can still fix (jsdom) and several group-4 platform packages
@@ -19,7 +19,7 @@ const blocked = targetClosureFromRoadmap({
   project_health: {
     Demo: {
       status: "red", lag_ok_pct: 79.17, lag_ok_12m: 57, total: 72,
-      lag_needed_for_yellow: 1, critical: 0, high: 2, excluded: 2,
+      lag_needed_for_yellow: 1, critical: 0, high: 2, security_unknown: 0, excluded: 2,
       lag_blockers: [
         { package: "jsdom", current: "19.0.0", required: "27.0.0", plannedTarget: "27.1.0", group: 5 },
         { package: "react", current: "18.2.0", required: "19.0.1", plannedTarget: "", group: 4 },
@@ -45,7 +45,7 @@ for (const fragment of ["не хватает 1", "jsdom", "react", "нет targe
 const exhausted = targetClosureFromRoadmap({
   project_health: {
     Demo: {
-      status: "red", lag_ok_pct: 77.8, lag_ok_12m: 56, total: 72, lag_needed_for_yellow: 2,
+      status: "red", lag_ok_pct: 77.8, lag_ok_12m: 56, total: 72, lag_needed_for_yellow: 2, critical: 0, high: 0, security_unknown: 0,
       lag_blockers: [{ package: "react", current: "18.2.0", required: "19.0.1", plannedTarget: "", group: 4 }],
     },
   },
@@ -60,7 +60,7 @@ if (!exhaustedMessage.includes("закрыть цель текущим план�
 const insufficient = targetClosureFromRoadmap({
   project_health: {
     Demo: {
-      status: "red", lag_ok_pct: 71.2, lag_ok_12m: 52, total: 73, lag_needed_for_yellow: 7, critical: 1,
+      status: "red", lag_ok_pct: 71.2, lag_ok_12m: 52, total: 73, lag_needed_for_yellow: 7, critical: 1, high: 0, security_unknown: 0,
       lag_blockers: [
         { package: "postcss-scss", plannedTarget: "4.0.7" },
         { package: "react", plannedTarget: "" },
@@ -76,7 +76,7 @@ if (!targetClosureMessage(insufficient).includes("максимум 72.6%") || !t
 const staleRoadmap = {
   project_health: {
     Demo: {
-      status: 'red', lag_ok_pct: 72.6, lag_ok_12m: 53, total: 73, lag_needed_for_yellow: 6, critical: 1, yellow_projected_lag_ok: 53,
+      status: 'red', lag_ok_pct: 72.6, lag_ok_12m: 53, total: 73, lag_needed_for_yellow: 6, critical: 1, high: 0, security_unknown: 0, yellow_projected_lag_ok: 53,
       lag_blockers: [
         { package: 'vitest', current: '0.30.1', required: '3.2.5', plannedTargetYellow: '' },
         { package: 'vite', current: '4.3.9', required: '5.4.20', plannedTargetYellow: '' },
@@ -105,7 +105,7 @@ if (promptAware.planCanReachYellow !== true || promptAware.neededBeyondCurrentPl
 const exactProjection = targetClosureFromRoadmap({
   project_health: {
     Demo: {
-      status: "red", lag_ok_pct: 70, lag_ok_12m: 7, total: 10, lag_needed_for_yellow: 1,
+      status: "red", lag_ok_pct: 70, lag_ok_12m: 7, total: 10, lag_needed_for_yellow: 1, critical: 0, high: 0, security_unknown: 0,
       yellow_projected_lag_ok: 7,
       lag_blockers: [{ package: "companion", current: "1.0.0", required: "3.0.0", plannedTargetYellow: "2.0.0" }],
     },
@@ -120,12 +120,12 @@ if (shouldUseSupervisorSeed(yellow, "yellow", true)) throw new Error("A reached 
 // Critical is an independent Yellow gate. A plan is sufficient only when its
 // exact target reaches min_no_critical for every currently Critical package.
 const criticalCovered = targetClosureFromRoadmap({
-  project_health: { Demo: { status: "red", lag_ok_pct: 80, lag_ok_12m: 8, total: 10, lag_needed_for_yellow: 0, critical: 1 } },
+  project_health: { Demo: { status: "red", lag_ok_pct: 80, lag_ok_12m: 8, total: 10, lag_needed_for_yellow: 0, critical: 1, high: 0, security_unknown: 0 } },
   projects: { Demo: [{ name: "vitest", current_vulns: "C:1", min_no_critical: "3.2.5", target_yellow: "3.2.6" }] },
 }, "Demo", "yellow");
 if (criticalCovered.planCanReachYellow !== true || criticalCovered.uncoveredCriticalPackages?.length) throw new Error(`Covered Critical target rejected: ${JSON.stringify(criticalCovered)}`);
 const criticalUncovered = targetClosureFromRoadmap({
-  project_health: { Demo: { status: "red", lag_ok_pct: 80, lag_ok_12m: 8, total: 10, lag_needed_for_yellow: 0, critical: 1 } },
+  project_health: { Demo: { status: "red", lag_ok_pct: 80, lag_ok_12m: 8, total: 10, lag_needed_for_yellow: 0, critical: 1, high: 0, security_unknown: 0 } },
   projects: { Demo: [{ name: "vitest", current_vulns: "C:1", min_no_critical: "3.2.5", target_yellow: "—" }] },
 }, "Demo", "yellow");
 if (criticalUncovered.planCanReachYellow !== false || criticalUncovered.uncoveredCriticalPackages?.[0] !== "vitest") throw new Error(`Uncovered Critical target accepted: ${JSON.stringify(criticalUncovered)}`);
@@ -138,7 +138,7 @@ if (!targetClosureMessage(criticalUncovered).includes("не устраняет C
 const modeRoadmap = {
   project_health: {
     Demo: {
-      status: "red", lag_ok_pct: 70, lag_ok_12m: 7, total: 10, lag_needed_for_yellow: 1,
+      status: "red", lag_ok_pct: 70, lag_ok_12m: 7, total: 10, lag_needed_for_yellow: 1, critical: 0, high: 0, security_unknown: 0,
       lag_blockers: [{ package: "only-yellow", current: "1.0.0", required: "2.0.0", plannedTarget: "", plannedTargetYellow: "2.1.0", plannedTargetGreen: "" }],
     },
   },
@@ -205,7 +205,7 @@ if (sufficientCoverage.covered !== 6) throw new Error("Complete goal-closing pro
 // 80% yellow, no planned actions, High=2: reached at the default limit of 1?
 // No. Reached when the policy explicitly allows High<=2? Yes.
 const highLimit = {
-  project_health: { Demo: { status: "yellow", lag_ok_pct: 80, high: 2 } },
+  project_health: { Demo: { status: "yellow", lag_ok_pct: 80, high: 2, critical: 0, security_unknown: 0 } },
   projects: { Demo: [] },
 };
 if (targetClosureFromRoadmap(highLimit, "Demo", "yellow").reached) {
@@ -216,10 +216,10 @@ if (!targetClosureFromRoadmap(highLimit, "Demo", "yellow", 80, 2).reached) {
 }
 // The limit must be the policy's, not the generator's colour: High=1 with
 // default limit 1 stays closable, High=0 (green policy) must not close yellow.
-if (!targetClosureFromRoadmap({ ...structuredClone(highLimit), project_health: { Demo: { status: "yellow", lag_ok_pct: 80, high: 1 } } }, "Demo", "yellow").reached) {
+if (!targetClosureFromRoadmap({ ...structuredClone(highLimit), project_health: { Demo: { status: "yellow", lag_ok_pct: 80, high: 1, critical: 0, security_unknown: 0 } } }, "Demo", "yellow").reached) {
   throw new Error("High=1 must not block a Yellow goal whose policy allows High<=1");
 }
-if (targetClosureFromRoadmap({ ...structuredClone(highLimit), project_health: { Demo: { status: "yellow", lag_ok_pct: 80, high: 1 } } }, "Demo", "yellow", 80, 0).reached) {
+if (targetClosureFromRoadmap({ ...structuredClone(highLimit), project_health: { Demo: { status: "yellow", lag_ok_pct: 80, high: 1, critical: 0, security_unknown: 0 } } }, "Demo", "yellow", 80, 0).reached) {
   throw new Error("High=1 must block Yellow when the policy allows High<=0");
 }
 
@@ -231,6 +231,7 @@ const scopeClosure = targetClosureFromRoadmap({
     Demo: {
       status: "yellow", lag_ok_pct: 100, lag_ok_12m: 1, total: 1, lag_unknown: 9,
       scope_total: 10, scope_lag_ok: 1, scope_lag_unknown: 9, scope_lag_pct: 10,
+      critical: 0, high: 0, security_unknown: 0,
     },
   },
   projects: { Demo: [] },
@@ -242,5 +243,16 @@ if (scopeClosure.scopeLagPct !== 10 || scopeClosure.scopeTotal !== 10 || scopeCl
 if (!targetClosureMessage(scopeClosure).includes("10.0%") || !targetClosureMessage(scopeClosure).includes("ещё 9 зависимостей с неизвестными данными")) {
   throw new Error(`Scope message must say 10% and name the unknowns: ${targetClosureMessage(scopeClosure)}`);
 }
+
+// N5: a colour is not security evidence. Numeric Critical/High and the
+// security coverage are mandatory for a goal to be closable; missing any of
+// them is insufficientData that NAMES what is missing.
+const colourOnly = targetClosureFromRoadmap({
+  project_health: { Demo: { status: "yellow", lag_ok_pct: 80 } },
+  projects: { Demo: [] },
+}, "Demo", "yellow");
+if (colourOnly.reached) throw new Error(`A colour-only roadmap must not close Yellow: ${JSON.stringify(colourOnly)}`);
+const colourMessage = targetClosureMessage(colourOnly);
+if (!colourMessage.includes("недостаточно данных") || !colourMessage.includes("Critical")) throw new Error(`Missing security evidence must be named: ${colourMessage}`);
 
 console.log("Target closure gate OK");

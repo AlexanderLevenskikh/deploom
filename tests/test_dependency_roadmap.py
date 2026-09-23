@@ -113,7 +113,9 @@ class DependencyRoadmapTests(unittest.TestCase):
         self.assertEqual(1, health.scope_lag_ok)
         self.assertEqual(9, health.scope_lag_unknown)
         self.assertAlmostEqual(10.0, health.scope_lag_pct, places=1)
-        self.assertEqual("yellow", health.status)
+        # 10% of the FULL scope is below the 80% goal: measured red, not a
+        # reached yellow (N4: status is judged on the whole active scope).
+        self.assertEqual("red", health.status)
         # The serialized shape must carry the scope fields so the desktop
         # closure can read them from project_health.
         serialized = roadmap.dataclasses.asdict(health)
@@ -387,11 +389,15 @@ class DependencyRoadmapTests(unittest.TestCase):
 
         health = roadmap.enrich_project_targets({"Demo": [*known_ok_rows, *unknown_rows]})["Demo"]
 
-        self.assertEqual("yellow", health.status)
+        self.assertEqual("red", health.status)
         self.assertEqual(4, health.total)
         self.assertEqual(4, health.lag_ok_12m)
         self.assertEqual(100.0, health.lag_ok_pct)
         self.assertEqual(2, health.lag_unknown)
+        # N4: with 4/6 of the FULL scope compliant (66.7%) the 80% goal is not
+        # reached -- the status follows the scope, the researched share stays
+        # a diagnostic and the unknown rows never become "failed".
+        self.assertAlmostEqual(66.7, health.scope_lag_pct, places=1)
         self.assertEqual(
             [],
             [row.name for row in known_ok_rows + unknown_rows if roadmap.target_is_action(row.target_yellow)],

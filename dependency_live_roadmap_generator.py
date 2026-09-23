@@ -1002,6 +1002,11 @@ class DependencyRow:
     planned_action_default: str = ""
     planned_action_yellow: str = ""
     planned_action_green: str = ""
+    # N2: per-version OSV evidence (version -> "C:2, H:1" style summary) so the
+    # Fast stop evaluates the EXACT chosen version's own findings, never a
+    # version-comparison shortcut (a newer version can be vulnerable again).
+    # In-memory only: row_json drops it so published artifacts do not bloat.
+    vuln_evidence_by_version: Dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -4705,6 +4710,7 @@ def analyze_project(
             reason=reason,
             notes="; ".join(notes),
             registry_artifacts=registry_artifacts,
+            vuln_evidence_by_version={v: vuln_summary(entries) for v, entries in (vulns or {}).items()},
         ))
         eprint(
             f"[info] {dependency_label}: done in {time.perf_counter() - dependency_started:.1f}s; "
@@ -5567,6 +5573,23 @@ def _health_ml_clear(moderate: int, low: int, project_name: Optional[str] = None
     return (moderate + low) <= 20
 
 
+def _severity_at_candidate_version(row: DependencyRow, planned: str, severity: str) -> Optional[int]:
+    """N2: the finding count for the EXACT version the candidate chose, from the
+    row's own per-version OSV evidence. `current_vulns` is the measurement for
+    exactly the installed version; anything else needs the evidence map. No
+    evidence for the exact version => None (unknown), never a comparison-based
+    "safe" conclusion."""
+    if not _row_security_known(row):
+        return None
+    if planned and planned == str(row.current_version or "").strip():
+        return parse_vuln_counts(row.current_vulns).get(severity, 0)
+    if planned and row.vuln_evidence_by_version:
+        summary = row.vuln_evidence_by_version.get(planned)
+        if summary is not None:
+            return parse_vuln_counts(summary).get(severity, 0)
+    return None
+
+
 def _candidate_satisfies_fast_policy(
     rows: List[DependencyRow],
     candidate_targets: Mapping[str, str],
@@ -5599,28 +5622,36 @@ def _candidate_satisfies_fast_policy(
             return False
     # H1: the security limits are evaluated over the WHOLE active scope in the
     # same units as the acceptance policy (aggregated C/H/M/L), not per row --
-    # two packages with H:1 each cannot both hide behind maxKnownHigh=1. A
-    # finding above the policy limit is cleared only with real per-row evidence
-    # (the planner's min_no_* target reached by the candidate's chosen version);
-    # missing evidence leaves the finding in place and the goal unsatisfied.
+    # two packages with H:1 each cannot both hide behind maxKnownHigh=1.
     severity_limits = (
-        ("C", max_critical, "min_no_critical"),
-        ("H", max_high, "min_no_high"),
-        ("M", max_moderate, "min_no_vuln"),
-        ("L", max_low, "min_no_vuln"),
+        ("C", max_critical),
+        ("H", max_high),
+        ("M", max_moderate),
+        ("L", max_low),
     )
-    for severity, limit, min_field in severity_limits:
+    for severity, limit in severity_limits:
         overstated = [r for r in active if parse_vuln_counts(r.current_vulns).get(severity, 0) > 0]
         aggregate = sum(parse_vuln_counts(r.current_vulns).get(severity, 0) for r in overstated)
         if aggregate <= limit:
             continue
+        # N2/N3: judge the EXACT version each verified candidate chose (its own
+        # OSV evidence) and sum only what REMAINS after the candidate's fixes.
+        # A version-comparison shortcut cannot prove safety (a new version may
+        # reintroduce a finding), and no evidence for the exact version is
+        # unknown -> the Fast stop must not claim the goal. Counting remaining
+        # findings (not "every overstated package must be fully clean") lets a
+        # partial fix that leaves exactly the allowed High satisfy the policy.
+        remaining = 0
         for r in overstated:
             planned = str(
                 candidate_targets.get(r.name) or current_targets.get(r.name) or r.current_version or ""
             ).strip()
-            minimum = str(getattr(r, min_field) or "").strip()
-            if not has_safe_target(minimum) or not current_meets_target(planned, minimum):
+            exact = _severity_at_candidate_version(r, planned, severity)
+            if exact is None:
                 return False
+            remaining += exact
+        if remaining > limit:
+            return False
     # H1: the lag goal is computed over the WHOLE active scope. A row without a
     # discovered lag target is NOT compliant and never drops out of the
     # denominator: 1 confirmed-compliant package out of 10 is 10% scope
@@ -5668,21 +5699,26 @@ def compute_project_health(
     # lag_ok / total >= minLagOkPct without float rounding surprises at the
     # boundary. The gate follows the user's effective policy (R9), so changing
     # 80 -> 90 really moves the goal condition.
-    yellow_required = required_ratio_count(total, health_yellow_ratio(project))
-    yellow_plan_required = required_ratio_count(total, health_planning_ratio(project))
-    lag_needed_for_yellow = max(0, yellow_required - lag_ok)
+    # N4: the target status, needed-compliant count and projections are judged
+    # on the FULL active scope -- unknown-lag rows are not compliant and never
+    # drop out of the goal denominator (`total`/`lag_ok_pct` above stay as the
+    # separate researched-share diagnostic). The Fast gate, health, closure and
+    # report therefore speak in the same scope units.
+    yellow_required = required_ratio_count(scope_total, health_yellow_ratio(project))
+    yellow_plan_required = required_ratio_count(scope_total, health_planning_ratio(project))
+    lag_needed_for_yellow = max(0, yellow_required - scope_lag_ok)
     yellow_projected_lag_ok = (
-        sum(1 for row in lag_known_rows if dependency_is_lag_ok_after_planned_target(row, "yellow"))
+        sum(1 for row in active_rows if dependency_is_lag_ok_after_planned_target(row, "yellow"))
         + removed_closed
     )
-    yellow_projected_lag_pct = (yellow_projected_lag_ok / total * 100.0) if total else 100.0
+    yellow_projected_lag_pct = (yellow_projected_lag_ok / scope_total * 100.0) if scope_total else 100.0
     yellow_plan_shortfall = max(0, yellow_plan_required - yellow_projected_lag_ok)
-    green_required = required_ratio_count(total, health_green_ratio())
+    green_required = required_ratio_count(scope_total, health_green_ratio())
     green_projected_lag_ok = (
-        sum(1 for row in lag_known_rows if dependency_is_lag_ok_after_planned_target(row, "green"))
+        sum(1 for row in active_rows if dependency_is_lag_ok_after_planned_target(row, "green"))
         + removed_closed
     )
-    green_projected_lag_pct = (green_projected_lag_ok / total * 100.0) if total else 100.0
+    green_projected_lag_pct = (green_projected_lag_ok / scope_total * 100.0) if scope_total else 100.0
     green_plan_shortfall = max(0, green_required - green_projected_lag_ok)
     lag_blockers = [
         {
@@ -5739,15 +5775,23 @@ def compute_project_health(
         else:
             status = "green"
             reason = "нет зависимостей в активном scope"
-    elif lag_pct < float(project_min_pct):
+    elif scope_lag_pct < float(project_min_pct):
+        # N4: the goal is judged over the WHOLE scope (unknown rows are not
+        # compliant and never drop out). 1 known-ok row out of 10 is 10% of the
+        # scope -> red at an 80% gate, even though the researched share is 100%.
         status = "red"
-        reason = f"только {lag_pct:.1f}% библиотек соблюдают свою lag-policy (<{project_min_pct}%)"
+        reason = (
+            f"только {scope_lag_pct:.1f}% активного scope соблюдают lag-policy; "
+            f"lag неизвестен для {lag_unknown} зависимостей (<{project_min_pct}%)"
+            if lag_unknown
+            else f"только {scope_lag_pct:.1f}% активного scope соблюдают lag-policy (<{project_min_pct}%)"
+        )
     elif lag_bad == 0 and lag_unknown == 0 and critical == 0 and high == 0 and unknown == 0 and _health_ml_clear(moderate, low, project):
         status = "green"
         reason = "0 нарушений lag-policy, 0 C/H, нет неизвестной security, Low+Moderate в пределах policy"
     else:
         status = "yellow"
-        parts = [f"{lag_pct:.1f}% библиотек соблюдают lag-policy", "0 Critical"]
+        parts = [f"{scope_lag_pct:.1f}% активного scope соблюдают lag-policy", "0 Critical"]
         if lag_unknown:
             parts.append(f"lag-policy target неизвестен: {lag_unknown}")
         if unknown:
@@ -18659,7 +18703,7 @@ function applyFilters(){
   const healthValues = Object.values(liveProjectHealth);
   const projection = project ? liveProjectHealth[project] : (healthValues.length === 1 ? healthValues[0] : null);
   const projectionText = onlyTargetRows && projection
-    ? ` · прогноз проекта: ${projection.yellow_projected_lag_pct.toFixed(1)}% (${projection.yellow_projected_lag_ok}/${projection.total})` +
+    ? ` · прогноз проекта: ${projection.yellow_projected_lag_pct.toFixed(1)}% (${projection.yellow_projected_lag_ok}/${projection.scope_total ?? projection.total})` +
       (projection.yellow_plan_shortfall ? ` · до запаса 85% не хватает ${projection.yellow_plan_shortfall}` : ' · запас 85% соблюдён')
     : '';
   document.getElementById('visibleCounter').textContent = onlyTargetRows
@@ -21097,6 +21141,9 @@ applyFilters();
 
 def row_json(r: DependencyRow) -> Dict[str, Any]:
     item = dataclasses.asdict(r)
+    # N2: per-version OSV evidence is in-memory verification context, not a
+    # publication field; drop it so published artifacts stay lean.
+    item.pop("vuln_evidence_by_version", None)
     item["vulnerability_work_note"] = vulnerability_work_note(r)
     item["yellow_effort_score"] = row_update_effort_score(r, r.target_yellow) if target_is_action(r.target_yellow) else None
     item["green_effort_score"] = row_update_effort_score(r, r.target_green) if target_is_action(r.target_green) else None
