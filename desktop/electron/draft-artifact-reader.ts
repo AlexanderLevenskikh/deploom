@@ -190,8 +190,8 @@ export function draftRunDir(workspacePath: string, runId: string): string {
 }
 
 // realpathSync.native resolves on Windows with GetFinalPathNameByHandle, which
-// expands 8.3 short-name components (e.g. LEVENS~1 -> levenskikh) that the JS
-// fallback leaves untouched.
+// expands 8.3 short-name components (e.g. a ~1-suffixed user-folder alias) that
+// the JS fallback leaves untouched.
 const realpathResolve = realpathSync.native as unknown as (p: string) => string
 
 function canonicalPath(value: string): string {
