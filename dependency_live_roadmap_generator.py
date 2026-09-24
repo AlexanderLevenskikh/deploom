@@ -21236,6 +21236,36 @@ DRAFT_FINALIZE_RESERVE_SECONDS = float(os.environ.get("DEPLOOM_DRAFT_FINALIZE_RE
 # considered out of time (fractional remainders, not floor+1s).
 DRAFT_MIN_NET_BUDGET_SECONDS = 0.05
 
+# Draft default-deadline auto-scaling (C2): when the orchestrator does NOT pin
+# an explicit --draft-deadline-seconds / DEPLOOM_DRAFT_DEADLINE_SECONDS, the
+# default deadline scales with the dependency count. The old hard-coded 15s
+# floor is not schedulable for a real project (60-80 deps, each needing a
+# multi-MB registry JSON read from the corporate Nexus): every Draft expired
+# inside the first metadata body reads and reported the WHOLE dependency set as
+# "registry unavailable" even though the registry was reachable and healthy.
+# An explicit deadline stays honored verbatim; the scaled value is floored at
+# the base so a tiny project keeps a sane minimum, and capped so a single huge
+# project cannot turn a "quick plan" into an unbounded run.
+DRAFT_DEADLINE_BASE_SECONDS = float(os.environ.get("DEPLOOM_DRAFT_DEADLINE_BASE_SECONDS") or "15.0")
+DRAFT_DEADLINE_PER_PACKAGE_SECONDS = float(os.environ.get("DEPLOOM_DRAFT_DEADLINE_PER_PACKAGE_SECONDS") or "1.5")
+DRAFT_DEADLINE_MAX_SECONDS = float(os.environ.get("DEPLOOM_DRAFT_DEADLINE_MAX_SECONDS") or "300.0")
+
+
+def scale_draft_deadline_seconds(
+    total_packages: int,
+    base: float = DRAFT_DEADLINE_BASE_SECONDS,
+    per_package: float = DRAFT_DEADLINE_PER_PACKAGE_SECONDS,
+    max_seconds: float = DRAFT_DEADLINE_MAX_SECONDS,
+) -> float:
+    """Default Draft deadline proportional to the dependency count.
+
+    N registry metadata documents (often multi-MB at a corporate registry) need
+    roughly ``per_package`` seconds each on top of a fixed base. The result is
+    floored at ``base`` and capped at ``max_seconds``.
+    """
+    scaled = base + per_package * max(0, int(total_packages))
+    return min(max_seconds, max(base, scaled))
+
 # F5: cadence of the independent Draft progress heartbeat. The planner emits
 # ordinary [draft-progress] lines only at operation boundaries (a long header
 # drip or a CPU-heavy planning step produces none), so a dedicated daemon emits
@@ -22322,12 +22352,18 @@ def main() -> None:
     run_id = (args.run_id or os.environ.get("DEPLOOM_RUN_ID", "")).strip() or f"run-{uuid.uuid4().hex[:12]}"
     workspace_id = (args.workspace_id or os.environ.get("DEPLOOM_WORKSPACE_ID", "")).strip()
     project_id = (args.project_id or os.environ.get("DEPLOOM_PROJECT_ID", "")).strip()
+    draft_deadline_explicit = (
+        args.draft_deadline_seconds is not None
+        or bool((os.environ.get("DEPLOOM_DRAFT_DEADLINE_SECONDS") or "").strip())
+    )
     draft_deadline_seconds = (
         args.draft_deadline_seconds
         if args.draft_deadline_seconds is not None
         else as_float_optional(os.environ.get("DEPLOOM_DRAFT_DEADLINE_SECONDS"))
     )
     if args.draft_baseline and draft_deadline_seconds is None:
+        # Provisional floor; auto-scaled to the real dependency count right
+        # after the local inventory when no explicit deadline was given (C2).
         draft_deadline_seconds = 15.0
     if args.draft_baseline and args.draft_deadline_seconds is not None:
         os.environ["DEPLOOM_DRAFT_DEADLINE_SECONDS"] = str(args.draft_deadline_seconds)
@@ -22767,6 +22803,22 @@ def main() -> None:
                 draft_input_hashes[project.name] = draft_input_hash(project, draft_input_files_by_project[project.name])
                 client.for_project(project.name)
                 _draft_progress(client, operation="local inventory", package=project.name, step="inventory", completed=i, total=len(projects))
+        # C2: scale the Draft default deadline to the real dependency count
+        # from the local inventory (only when the orchestrator did not pin an
+        # explicit deadline). A healthy registry read of N deps needs more than
+        # the 15s provisional floor: without this a real project expired inside
+        # the first metadata body reads and the WHOLE dependency set was
+        # reported "registry unavailable" despite a reachable Nexus.
+        if args.draft_baseline and not draft_deadline_explicit:
+            total_packages = sum(len(rows) for rows in rows_by_project.values())
+            scaled = scale_draft_deadline_seconds(total_packages)
+            if deadline_clock.deadline_seconds is None or abs(deadline_clock.deadline_seconds - scaled) > 1e-9:
+                eprint(
+                    f"[info] Draft deadline auto-scaled to {scaled:.0f}s for {total_packages} package(s); "
+                    "explicit deadline not set"
+                )
+                deadline_clock.deadline_seconds = scaled
+                os.environ["DEPLOOM_DRAFT_DEADLINE_SECONDS"] = str(scaled)
         for i, project in enumerate(projects, start=1):
             project_prefix = f"[{i}/{len(projects)}]"
             deadline_clock.check(f"project-scan:{project.name}")
