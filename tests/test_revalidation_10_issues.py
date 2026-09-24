@@ -1,6 +1,6 @@
 """Revalidation #10 (C2): the Draft deadline must fit a healthy registry read.
 
-Root cause found in production diagnostics (run-5fadef80 / partner-form):
+Root cause found in production diagnostics (run-5fadef80 / a real 76-dependency project):
 Nexus responded in ~1s and WAS reachable, but the Draft run died with
 "deadline (15.0s) exceeded at network-read" after fetching ZERO metadata
 documents out of 76. A hard-coded 15s default is not schedulable when every
@@ -138,7 +138,7 @@ class DraftDeadlineUnitTests(unittest.TestCase):
     """C2: pure scaling contract for the auto-scaled default deadline."""
 
     def test_scale_draft_deadline_grows_with_package_count(self):
-        # The production repro workload (partner-form, 76 deps) must not stay at
+        # The production repro workload (76 deps) must not stay at
         # the 15s floor that expired during the first metadata body reads.
         self.assertEqual(roadmap.scale_draft_deadline_seconds(76), 15.0 + 1.5 * 76)
         self.assertEqual(roadmap.scale_draft_deadline_seconds(3), 15.0 + 1.5 * 3)
