@@ -1017,6 +1017,11 @@ class DependencyRow:
     # (registry request raised) / "osv-unavailable" (metadata OK, OSV failed).
     # Pending/interrupted rows are derived from draft_scan_state instead.
     draft_unknown: str = ""
+    # R12: an explicitly bounded candidate search (draft-max-candidates / max-candidates)
+    # left versions outside the covered evidence network. Such a row is never a
+    # proven "no target" -- the honest status is `candidate-search-truncated`.
+    candidate_search_truncated: bool = False
+    candidate_search_truncated_note: str = ""
 
 
 @dataclasses.dataclass
@@ -3658,6 +3663,12 @@ def min_by_vuln(
     is_available: Optional[Callable[[str], bool]] = None,
 ) -> str:
     for v in candidates:
+        if v not in vulns_by_version:
+            # R12: a version with NO OSV evidence is UNKNOWN, never clean.
+            # Treating a missing entry as "no findings" could invent a safe
+            # target for a version the evidence network never queried (e.g.
+            # a version hidden beyond an explicit candidate limit).
+            continue
         vulns = vulns_by_version.get(v, [])
         ranks = [severity_rank(x) for x in vulns]
         matches = False
@@ -4681,22 +4692,40 @@ def analyze_project(
             continue
 
         metadata_latest = latest_version(meta)
-        candidates, cap_note = versions_from_current(meta, current, include_prerelease, max_candidates)
-        if cap_note:
-            notes.append(cap_note)
-        structural_candidates, registry_candidate_notes = client.registry_structural_candidates(meta, candidates)
+        # R12: the SEARCH space for lag/safety targets is always the FULL
+        # locally-available version range (versions >= current in the packument
+        # this run already read). Truncating the list to the first N versions
+        # BEFORE min_by_lag hid fresh versions and silently produced
+        # "no installable target" for dependencies whose first N versions are
+        # equally old (53/63 lag blockers on the production 77-package run).
+        search_versions, _ = versions_from_current(meta, current, include_prerelease, 0)
+        structural_candidates, registry_candidate_notes = client.registry_structural_candidates(meta, search_versions)
         if registry_candidate_notes:
             notes.append(
                 "registry artifact policy excluded metadata-only/foreign versions: "
                 + "; ".join(registry_candidate_notes[:6])
                 + (f"; +{len(registry_candidate_notes) - 6} more" if len(registry_candidate_notes) > 6 else "")
             )
-        candidates = structural_candidates
-        if current not in candidates:
+        search_versions = structural_candidates
+        if current not in search_versions:
             # The currently installed version remains valid baseline evidence
             # even when Nexus no longer exposes its tarball. It must not be used
             # as proof that a *new* target can be installed.
-            candidates = [current] + candidates
+            search_versions = [current] + search_versions
+
+        client_draft = bool(getattr(client, "draft", False))
+        if client_draft:
+            # Draft analyzes against the full range; the bounded legacy list is
+            # only the OSV evidence network (see below), so a limit can never
+            # erase a lag target the metadata proves exists.
+            candidates = list(search_versions)
+        else:
+            candidates, cap_note = versions_from_current(meta, current, include_prerelease, max_candidates)
+            if cap_note:
+                notes.append(cap_note)
+            candidates, _ = client.registry_structural_candidates(meta, candidates)
+            if current not in candidates:
+                candidates = [current] + candidates
 
         latest = client.latest_installable_version(
             name,
@@ -4738,12 +4767,47 @@ def analyze_project(
                 return False
             return True
 
+        # R12: lag minima are computed over the FULL search range. The OSV
+        # evidence network is the bounded slice (current + first-N + latest +
+        # every lag minimum) -- it covers exactly the versions that can become
+        # targets, while the expensive OSV batch stays bounded under an
+        # explicit candidate limit. min_by_vuln walks the full range but treats
+        # evidence-less versions as UNKNOWN (never clean), so a hidden safe
+        # version is reported as an unproven search, not invented and not
+        # silently "no findings".
+        min_12 = min_by_lag(meta, search_versions, 12, latest_override=latest, is_available=target_available)
+        min_9 = min_by_lag(meta, search_versions, 9, latest_override=latest, is_available=target_available)
+        min_6 = min_by_lag(meta, search_versions, 6, latest_override=latest, is_available=target_available)
+        min_3 = min_by_lag(meta, search_versions, 3, latest_override=latest, is_available=target_available)
+        osv_candidates: List[str] = [current]
+        if max_candidates > 0:
+            osv_candidates += [v for v in search_versions[:max_candidates] if v != current]
+        else:
+            osv_candidates += [v for v in search_versions if v != current]
+        for extra in (latest, min_12, min_9, min_6, min_3):
+            if extra and extra != NO_ACTION and extra not in osv_candidates:
+                osv_candidates.append(extra)
         eprint(
             f"[info] {dependency_label}: registry metadata ready; latest={latest}; "
-            f"OSV candidates={len(candidates)}"
+            f"OSV candidates={len(osv_candidates)} (search space={len(search_versions)})"
         )
+        candidate_search_truncated = False
+        candidate_search_truncated_note = ""
+        if max_candidates > 0:
+            covered = set(osv_candidates)
+            uncovered = [v for v in search_versions if v not in covered]
+            if uncovered:
+                candidate_search_truncated = True
+                candidate_search_truncated_note = (
+                    f"candidate search truncated: лимит max_candidates={max_candidates} покрыл "
+                    f"{len(covered)} версий из {len(search_versions)} (вне покрытия: "
+                    + ", ".join(uncovered[:5])
+                    + (f"; +{len(uncovered) - 5} ещё" if len(uncovered) > 5 else "")
+                    + "); безопасный target среди покрытых не доказан — нужен полный OSV-запрос"
+                )
+                notes.append(candidate_search_truncated_note)
         try:
-            vulns = client.query_osv_versions(name, candidates, progress_label=dependency_label)
+            vulns = client.query_osv_versions(name, osv_candidates, progress_label=dependency_label)
         except VulnerabilityEvidenceUnavailable:
             if not tolerate_registry_failure:
                 raise
@@ -4764,13 +4828,9 @@ def analyze_project(
             notes.append("OSV evidence недоступен: уязвимости неизвестны, safe target по уязвимостям не вычислялся")
         else:
             current_summary = vuln_summary(vulns.get(current, []))
-            min_nc = min_by_vuln(candidates, vulns, "no-critical", target_available)
-            min_nh = min_by_vuln(candidates, vulns, "no-high", target_available)
-            min_nv = min_by_vuln(candidates, vulns, "no-vuln", target_available)
-        min_12 = min_by_lag(meta, candidates, 12, latest_override=latest, is_available=target_available)
-        min_9 = min_by_lag(meta, candidates, 9, latest_override=latest, is_available=target_available)
-        min_6 = min_by_lag(meta, candidates, 6, latest_override=latest, is_available=target_available)
-        min_3 = min_by_lag(meta, candidates, 3, latest_override=latest, is_available=target_available)
+            min_nc = min_by_vuln(search_versions, vulns, "no-critical", target_available)
+            min_nh = min_by_vuln(search_versions, vulns, "no-high", target_available)
+            min_nv = min_by_vuln(search_versions, vulns, "no-vuln", target_available)
         registry_artifacts: Dict[str, Dict[str, Any]] = {}
         for candidate_target in {latest, min_nc, min_nh, min_nv, min_12, min_9, min_6, min_3}:
             if not target_is_action(candidate_target):
@@ -4823,6 +4883,8 @@ def analyze_project(
             vuln_evidence_by_version={v: vuln_summary(entries) for v, entries in (vulns or {}).items()},
             draft_scan_state="done",
             draft_unknown="osv-unavailable" if vulns is None else "",
+            candidate_search_truncated=candidate_search_truncated,
+            candidate_search_truncated_note=candidate_search_truncated_note,
         )
         if getattr(client, "draft", False):
             _apply_draft_theoretical_targets(full_row)
@@ -21744,7 +21806,27 @@ def _draft_target_for_major(row: DependencyRow) -> str:
     return fallback if fallback and fallback != NO_ACTION else NO_ACTION
 
 
+def _draft_policy_satisfied(row: DependencyRow) -> bool:
+    """R12: a row already satisfies the Draft policy when its security is
+    assessed with no Critical/High (an unrated U finding is NOT "clean") and
+    it meets the lag-compliance target -- i.e. no action is actually needed.
+    """
+    if not _row_security_known(row):
+        return False
+    if not dependency_is_lag_ok(row):
+        return False
+    counts = parse_vuln_counts(row.current_vulns)
+    return not any(counts.get(k, 0) for k in ("C", "H", "U"))
+
+
 def _draft_row_status(row: DependencyRow, chosen_target: str) -> str:
+    # R12 status taxonomy: ok (already policy-compliant, no action needed),
+    # proposed (concrete target), blocked (theoretical target blocked by a
+    # concrete peer/registry condition), candidate-search-truncated (an explicit
+    # candidate limit hid versions from the evidence network), no-target (no
+    # safe target on the FULL data -- with the planner's real reason), and
+    # unknown-security (OSV unassessed OR an unrated U finding). Metadata-unknown
+    # rows stay "unknown-metadata".
     if row.scope_excluded:
         return "excluded"
     if row.planner_deferred:
@@ -21754,6 +21836,14 @@ def _draft_row_status(row: DependencyRow, chosen_target: str) -> str:
     current = str(row.current_version or "").strip()
     target = str(chosen_target or "").strip()
     if target == NO_ACTION or target == "":
+        if not _row_security_known(row) or _row_has_unrated_vulns(row):
+            return "unknown-security"
+        if _draft_policy_satisfied(row):
+            return "ok"
+        if getattr(row, "candidate_search_truncated", False):
+            return "candidate-search-truncated"
+        if row.compatibility_cohort or row.compatibility_note:
+            return "blocked"
         return "no-target"
     if current and target and current == target:
         return "no-change"
@@ -21762,6 +21852,29 @@ def _draft_row_status(row: DependencyRow, chosen_target: str) -> str:
     if row.current_source and "lock" in str(row.current_source).lower() and not current:
         return "unknown-metadata"
     return "proposed"
+
+
+def _draft_no_target_reason(row: DependencyRow) -> str:
+    """R12: the real planner reason for a row with no chosen target.
+
+    Never reuses `row.reason` (the display-group cause, e.g. "runtime/API
+    hygiene"); it names the exact policy dimension whose safe target was not
+    found, so the prompt can tell "no lag-satisfying version exists" apart
+    from "the candidate limit hid it" and "security state is unknown".
+    """
+    causes: List[str] = []
+    if dependency_needs_lag_update(row):
+        lag = lag_update_target_for_row(row)
+        if not has_safe_target(lag):
+            causes.append(f"lag update required, но {row.min_lag_12m}")
+    counts = parse_vuln_counts(row.current_vulns)
+    if counts.get("C", 0) > 0:
+        causes.append(f"Critical присутствует; min_no_critical={row.min_no_critical}")
+    if counts.get("H", 0) > 0 and not causes:
+        causes.append(f"High присутствует; min_no_high={row.min_no_high}")
+    if not causes:
+        causes.append("нет policy-driven target по доступным данным")
+    return "; ".join(causes)
 
 
 def build_draft_plan(
@@ -21775,7 +21888,7 @@ def build_draft_plan(
     conflicts: List[Dict[str, Any]] = []
     manifests: Dict[str, Any] = {}
     projects: List[str] = sorted(rows_by_project)
-    totals = {"proposed": 0, "no-change": 0, "deferred": 0, "excluded": 0, "unknown-metadata": 0, "unknown-security": 0, "no-target": 0,
+    totals = {"proposed": 0, "no-change": 0, "ok": 0, "blocked": 0, "deferred": 0, "excluded": 0, "unknown-metadata": 0, "unknown-security": 0, "no-target": 0, "candidate-search-truncated": 0,
               "not-attempted": 0, "interrupted": 0, "registry-failed": 0, "osv-unavailable": 0, "unrated": 0, "total": 0}
     scan: Dict[str, Dict[str, int]] = {}
     for project in projects:
@@ -21810,6 +21923,17 @@ def build_draft_plan(
             status = _draft_row_status(row, target)
             totals[status] = totals.get(status, 0) + 1
             totals["total"] += 1
+            target_reason = row.reason if row.reason else (
+                row.target_default_reason if row.target_default_reason != NO_ACTION else None
+            )
+            if status in ("no-target", "candidate-search-truncated", "blocked"):
+                # R12: no-target rows must state the REAL planner reason, never
+                # the display-group cause; a truncated search names the limit.
+                target_reason = (
+                    row.candidate_search_truncated_note
+                    if status == "candidate-search-truncated" and row.candidate_search_truncated_note
+                    else _draft_no_target_reason(row)
+                )
             entry: Dict[str, Any] = {
                 "project": project,
                 "package": row.name,
@@ -21820,11 +21944,12 @@ def build_draft_plan(
                 "targetYellow": row.target_yellow if row.target_yellow != NO_ACTION else None,
                 "targetGreen": row.target_green if row.target_green != NO_ACTION else None,
                 "status": status,
-                "reason": row.reason or (row.target_default_reason if row.target_default_reason != NO_ACTION else None),
+                "reason": target_reason,
                 "group": row.group,
                 "latest": row.latest_version,
                 "scanState": state,
                 "draftUnknown": row.draft_unknown,
+                "candidateSearchTruncated": row.candidate_search_truncated,
                 "breakingChanges": list(row.breaking_changes or []),
                 "migrationNotes": list(row.migration_notes or []),
             }
@@ -21839,13 +21964,18 @@ def build_draft_plan(
             # severity rating (U) both mean the security counter cannot confirm
             # coverage; they share the unknown-security counter but keep
             # distinct machine-readable reasons (a U row is still ASSESSED).
-            if sec_unknown or sec_unrated:
+            # R12: the counter is attractive -- a row whose STATUS already is
+            # "unknown-security" was counted above, so only target-bearing rows
+            # with a security uncertainty add here (no double counting).
+            if (sec_unknown or sec_unrated) and status != "unknown-security":
                 totals["unknown-security"] = totals.get("unknown-security", 0) + 1
-            if meta_unknown or sec_unknown or sec_unrated:
+            if meta_unknown or sec_unknown or sec_unrated or row.candidate_search_truncated:
                 # T3: metadata (registry availability) and security (OSV) are
                 # separate unknown classes; an unassessed OSV state must reach
                 # the plan/summary/prompt even when the registry metadata is
-                # fine, and vice versa.
+                # fine, and vice versa. R12: a truncated search is a THIRD
+                # unknown class -- the limit hid versions, so absence of a safe
+                # target among the covered set is not a proven absence.
                 causes = []
                 if meta_unknown:
                     causes.append(_draft_metadata_unknown_reason(row))
@@ -21853,14 +21983,22 @@ def build_draft_plan(
                     causes.append("OSV/security state unknown for this package in this Draft run")
                 if sec_unrated:
                     causes.append("уязвимость без оценки серьёзности (U) для этого пакета в этом Draft run")
+                if row.candidate_search_truncated:
+                    causes.append(
+                        row.candidate_search_truncated_note
+                        or "candidate search truncated: лимит кандидатов скрыл версии за пределами evidence network"
+                    )
                 sec_blocked = sec_unknown or sec_unrated
+                tr_blocked = row.candidate_search_truncated
                 unknowns.append({
                     "package": row.name,
                     "project": project,
                     "kind": row.kind,
                     "requestedSpec": row.requested_spec,
                     "current": row.current_version,
-                    "clarity": "security" if sec_blocked and not meta_unknown else ("metadata" if meta_unknown and not sec_blocked else "both"),
+                    "clarity": "security" if sec_blocked and not (meta_unknown or tr_blocked)
+                    else ("metadata" if meta_unknown and not (sec_blocked or tr_blocked)
+                          else ("truncated" if tr_blocked and not (meta_unknown or sec_blocked) else "both")),
                     "reason": "; ".join(causes),
                 })
             # R11: per-cause partiality counters so the manifest/prompt/UI can
@@ -21888,10 +22026,34 @@ def build_draft_plan(
                     "present": bool((spec.lockfile_state or {}).get("lockfile")),
                 },
             }
+        # R12: post-plan projections. `health_by_project` is computed by
+        # compute_project_health BEFORE enrichment/planning mutates targets, so
+        # its yellow/green projected-lag-OK can disagree with the published
+        # plan. Recompute the projections from the FINAL planned targets and
+        # publish them alongside (postPlan*) so the prompt/goal check speaks
+        # about the plan that was actually written.
+        post_health = dataclasses.asdict(health_by_project[project])
+        active_rows = [r for r in rows if not r.scope_excluded]
+        scope_total = len(active_rows)
+        post_yellow = sum(1 for r in active_rows if dependency_is_lag_ok_after_planned_target(r, "yellow"))
+        post_green = sum(1 for r in active_rows if dependency_is_lag_ok_after_planned_target(r, "green"))
+        yellow_required = int(post_health.get("yellow_required") or post_health.get("yellow_plan_required") or 0)
+        green_required = int(post_health.get("green_required") or 0)
+        post_yellow_shortfall = max(0, yellow_required - post_yellow)
+        post_green_shortfall = max(0, green_required - post_green)
+        post_health["postPlanLagOk"] = post_yellow
+        post_health["postPlanLagOkPct"] = (post_yellow / scope_total * 100.0) if scope_total else 100.0
+        post_health["postPlanShortfall"] = post_yellow_shortfall
+        post_health["yellow_projected_lag_ok"] = post_yellow
+        post_health["yellow_projected_lag_pct"] = (post_yellow / scope_total * 100.0) if scope_total else 100.0
+        post_health["yellow_plan_shortfall"] = post_yellow_shortfall
+        post_health["green_projected_lag_ok"] = post_green
+        post_health["green_projected_lag_pct"] = (post_green / scope_total * 100.0) if scope_total else 100.0
+        post_health["green_plan_shortfall"] = post_green_shortfall
         proposals.append({
             "project": project,
             "rows": plan_rows,
-            "health": dataclasses.asdict(health_by_project[project]),
+            "health": post_health,
         })
     return {
         "schemaVersion": 1,
@@ -22013,6 +22175,35 @@ def build_draft_prompt(
                 f"- {scan_part}.",
                 f"- Причина статуса: {health.get('reason', '—')}.",
                 "",
+            ]
+            # R12: the goal block speaks in post-plan projections recomputed
+            # from the FINAL planned targets (build_draft_plan.postPlan*), never
+            # the pre-plan health numbers: current lag-OK, the target the run
+            # must reach (required), the projected lag-OK after the plan, the
+            # resulting shortfall and the Critical/High blockers that drive it.
+            scope_total = int(health.get("metadata_total", 0) or 0)
+            current_ok = int(health.get("lag_ok_12m", 0) or 0)
+            required = int(health.get("yellow_plan_required", 0) or 0)
+            if not required:
+                required = int(health.get("postPlanShortfall", 0) or 0) + int(health.get("postPlanLagOk", 0) or 0)
+            projected = int(health.get("postPlanLagOk", 0) or 0)
+            shortfall = int(health.get("postPlanShortfall", 0) or 0)
+            crit_h = (int(health.get("critical", 0) or 0), int(health.get("high", 0) or 0))
+            goal_lines = [
+                "## Цель (projected по этому плану)",
+                "",
+                f"- Актуально сейчас: {current_ok}/{scope_total}; требуется по политике: {required}/{scope_total} ({min_lag_pct}%).",
+                f"- Projected после плана: {projected}/{scope_total} ({health.get('postPlanLagOkPct', '?')}%); shortfall: {shortfall}.",
+            ]
+            if crit_h[0] or crit_h[1]:
+                goal_lines.append(f"- C/H блокеры: Critical {crit_h[0]}, High {crit_h[1]}; предложенные target убирают те, что закрыты в proposed.")
+            if shortfall > 0:
+                goal_lines.append(
+                    "- Shortfall не закрыт предложенными target: ниже перечислены no-target/blocked/unknown строки (не «нет проверяемого target»)."
+                )
+            goal_lines.append("")
+            lines += goal_lines
+            lines += [
                 "## Что требуется изменить (proposed)",
                 "",
             ]
@@ -22027,16 +22218,26 @@ def build_draft_prompt(
             else:
                 lines.append("_Нет строк с предложенным обновлением в этом проекте._")
             lines.append("")
-            kept = [r for r in project_plan.get("rows", []) if r.get("status") in ("no-change", "deferred", "excluded", "no-target")]
+            kept = [r for r in project_plan.get("rows", []) if r.get("status") in
+                    ("no-change", "ok", "deferred", "excluded", "no-target", "blocked", "candidate-search-truncated", "unknown-security")]
             if kept:
                 grouped: Dict[str, List[Dict[str, Any]]] = {}
                 for r in kept:
                     grouped.setdefault(r.get("status", "no-target"), []).append(r)
-                for status in ("no-change", "deferred", "excluded", "no-target"):
+                for status in ("no-change", "ok", "deferred", "excluded", "blocked", "candidate-search-truncated", "unknown-security", "no-target"):
                     items = grouped.get(status)
                     if not items:
                         continue
-                    label = {"no-change": "Уже на target / без изменений", "deferred": "Отложено", "excluded": "Исключено из scope", "no-target": "Нет проверяемого target"}[status]
+                    label = {
+                        "no-change": "Уже на target / без изменений",
+                        "ok": "Уже удовлетворяют политике (ok)",
+                        "deferred": "Отложено",
+                        "excluded": "Исключено из scope",
+                        "blocked": "Target заблокирован (blocked)",
+                        "candidate-search-truncated": "Поиск кандидатов усечён (лимит)",
+                        "unknown-security": "Security неизвестна / без оценки (U)",
+                        "no-target": "Нет безопасного target по полным данным",
+                    }[status]
                     lines.append(f"## {label}")
                     for r in items:
                         lines.append(f"- `{r['package']}`: current `{r.get('current')}` — {r.get('reason') or '—'}")
@@ -22081,6 +22282,20 @@ def build_draft_prompt(
             lines.append(f"- {scan_part}.")
             if health.get("reason"):
                 lines.append(f"- Status reason: {health['reason']}.")
+            lines += ["", "## Goal (projected by this plan)", ""]
+            scope_total = int(health.get("metadata_total", 0) or 0)
+            current_ok = int(health.get("lag_ok_12m", 0) or 0)
+            required = int(health.get("yellow_plan_required", 0) or 0)
+            if not required:
+                required = int(health.get("postPlanShortfall", 0) or 0) + int(health.get("postPlanLagOk", 0) or 0)
+            projected = int(health.get("postPlanLagOk", 0) or 0)
+            shortfall = int(health.get("postPlanShortfall", 0) or 0)
+            lines.append(f"- Currently lag-OK: {current_ok}/{scope_total}; policy requires {required}/{scope_total} ({min_lag_pct}%).")
+            lines.append(f"- Projected after plan: {projected}/{scope_total} ({health.get('postPlanLagOkPct', '?')}%); shortfall: {shortfall}.")
+            crit_h = (int(health.get("critical", 0) or 0), int(health.get("high", 0) or 0))
+            if crit_h[0] or crit_h[1]:
+                lines.append(f"- C/H blockers: Critical {crit_h[0]}, High {crit_h[1]}.")
+            lines.append("")
             lines += ["", "## Proposed changes", ""]
             rows = [r for r in project_plan.get("rows", []) if r.get("status") == "proposed"]
             if rows:
@@ -22090,6 +22305,30 @@ def build_draft_prompt(
             else:
                 lines.append("_No proposed changes in this project._")
             lines.append("")
+            kept_en = [r for r in project_plan.get("rows", []) if r.get("status") in
+                       ("no-change", "ok", "deferred", "excluded", "no-target", "blocked", "candidate-search-truncated", "unknown-security")]
+            if kept_en:
+                grouped_en: Dict[str, List[Dict[str, Any]]] = {}
+                for r in kept_en:
+                    grouped_en.setdefault(r.get("status", "no-target"), []).append(r)
+                for status in ("no-change", "ok", "deferred", "excluded", "blocked", "candidate-search-truncated", "unknown-security", "no-target"):
+                    items = grouped_en.get(status)
+                    if not items:
+                        continue
+                    label_en = {
+                        "no-change": "Already at target / no change",
+                        "ok": "Already policy-compliant (ok)",
+                        "deferred": "Deferred",
+                        "excluded": "Excluded from scope",
+                        "blocked": "Target blocked",
+                        "candidate-search-truncated": "Candidate search truncated (limit)",
+                        "unknown-security": "Security unknown / unrated (U)",
+                        "no-target": "No safe target on full data",
+                    }[status]
+                    lines.append(f"## {label_en}")
+                    for r in items:
+                        lines.append(f"- `{r['package']}`: current `{r.get('current')}` — {r.get('reason') or '—'}")
+                    lines.append("")
 
     unknowns = plan.get("unknowns") or []
     conflicts = plan.get("conflicts") or []
@@ -22192,9 +22431,24 @@ def publish_draft_result(
     prompt_md = build_draft_prompt(run_id, workspace_id, project_id, mode, policy_hash, plan, projects_by_name, language=language, snapshot=snapshot)
     counts = plan["counts"]
     proposed = counts.get("proposed", 0)
-    # unknown-metadata, unknown-security and the unknowns list are derived from
-    # the same rows; count unique packages once to avoid double counting.
-    unknown_names = {str(u.get("package", "")).strip() for u in (plan.get("unknowns") or []) if str(u.get("package", "")).strip()}
+    # R12: `unknown`/`unknownPackages` list packages whose plan genuinely needs
+    # agent clarification -- no chosen target because metadata/security is
+    # unassessed, the search was truncated, or the target is blocked. Rows that
+    # ARE proposed (a concrete target was published) stay actionable even when
+    # their per-row evidence carries a truncation caveat; they must not be
+    # reported as "needs clarification" (previously the whole unknowns list was
+    # used and 61 actionable truncated rows inflated the counter).
+    clarification_statuses = {"unknown-metadata", "unknown-security", "candidate-search-truncated", "blocked", "no-target"}
+    clarification_names: List[str] = []
+    truncated_rows = 0
+    for project_rows in rows_by_project.values():
+        for row in project_rows:
+            if getattr(row, "candidate_search_truncated", False):
+                truncated_rows += 1
+            if _draft_row_status(row, _draft_target_for_major(row)) in clarification_statuses:
+                if row.name not in clarification_names:
+                    clarification_names.append(row.name)
+    unknown_names = set(clarification_names)
     unknown_count = len(unknown_names) if unknown_names else counts.get("unknown-metadata", 0) + counts.get("unknown-security", 0)
     security_unknown_count = counts.get("unknown-security", 0)
     # Aggregate coverage across projects so the manifest carries an honest
@@ -22229,6 +22483,18 @@ def publish_draft_result(
     if osv_unknown:
         pending_notes.append(f"OSV недоступен: {osv_unknown}")
     pending_text = ("; ожидают: " + ", ".join(pending_notes)) if pending_notes else ""
+    candidate_truncated = truncated_rows
+    candidate_truncated_targetless = counts.get("candidate-search-truncated", 0)
+    no_target = counts.get("no-target", 0)
+    blocked = counts.get("blocked", 0)
+    shortfall_parts: List[str] = []
+    if candidate_truncated:
+        shortfall_parts.append(f"поиск кандидатов усечён: {candidate_truncated} строк")
+    if no_target:
+        shortfall_parts.append(f"без безопасного target: {no_target}")
+    if blocked:
+        shortfall_parts.append(f"target заблокирован: {blocked}")
+    shortfall_text = ("; " + ", ".join(shortfall_parts)) if shortfall_parts else ""
     if status == "DRAFT_READY":
         summary = (
             f"Черновой план готов: обработано {processed}/{processed_total} зависимостей; "
@@ -22237,6 +22503,7 @@ def publish_draft_result(
             f"для {unknown_count} пакетов нужно уточнение"
             + (f" (security неизвестна: {security_unknown_count})" if security_unknown_count else "")
             + ("; недостаточно данных по lag-policy" if insufficient_data else "")
+            + shortfall_text
             + "."
         )
     else:
@@ -22287,7 +22554,7 @@ def publish_draft_result(
         "metadata": {
             "total": counts.get("total", 0),
             "unknown": unknown_count,
-            "unknownPackages": [u["package"] for u in (plan.get("unknowns") or [])],
+            "unknownPackages": clarification_names,
             # T3: metadata (registry) and security (OSV) coverage split.
             "metadataKnown": metadata_known,
             "metadataTotal": metadata_total,
@@ -22305,14 +22572,32 @@ def publish_draft_result(
             "interrupted": interrupted,
             "registryFailed": registry_failed,
             "osvUnknown": osv_unknown,
+            # R12: why the plan may still be short of its goal. A truncated
+            # candidate search and a no-target row are DIFFERENT honest causes;
+            # `candidateTruncated` counts every row whose search was bounded
+            # while `candidateTruncatedTargetless` counts those left without a
+            # target by it. The projected lag-OK/shortfall are post-plan
+            # (computed from the final planned targets in build_draft_plan).
+            "noTarget": counts.get("no-target", 0),
+            "candidateTruncated": truncated_rows,
+            "candidateTruncatedTargetless": candidate_truncated_targetless,
+            "blocked": counts.get("blocked", 0),
+            "ok": counts.get("ok", 0),
+            "postPlanLagOk": _sum_health("postPlanLagOk"),
+            "postPlanLagOkPct": round(_sum_health("postPlanLagOkPct"), 1),
+            "postPlanShortfall": _sum_health("postPlanShortfall"),
         },
         "proposals": {
             "proposed": counts.get("proposed", 0),
             "noChange": counts.get("no-change", 0),
+            "ok": counts.get("ok", 0),
+            "blocked": counts.get("blocked", 0),
+            "candidateTruncated": counts.get("candidate-search-truncated", 0),
             "deferred": counts.get("deferred", 0),
             "excluded": counts.get("excluded", 0),
             "unknown": unknown_count,
             "unknownSecurity": security_unknown_count,
+            "noTarget": counts.get("no-target", 0),
             "total": counts.get("total", 0),
         },
         "summary": summary,

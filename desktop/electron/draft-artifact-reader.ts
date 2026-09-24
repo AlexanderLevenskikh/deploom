@@ -70,6 +70,17 @@ export type DraftResultArtifact = {
     securityKnown?: number
     securityTotal?: number
     securityUnknown?: number
+    /** R12: honest causes for a goal shortfall — an explicit candidate limit
+     * (candidateTruncated) is never the same as a proven no-target, and the
+     * projected figures are post-plan (recomputed from final planned targets). */
+    noTarget?: number
+    candidateTruncated?: number
+    candidateTruncatedTargetless?: number
+    blocked?: number
+    ok?: number
+    postPlanLagOk?: number
+    postPlanLagOkPct?: number
+    postPlanShortfall?: number
   }
   proposals?: Record<string, unknown>
   artifacts?: { manifest: string; plan: string; prompt: string; summary: string }

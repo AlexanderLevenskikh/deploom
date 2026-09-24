@@ -474,6 +474,19 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
                   return parts || text('частичный результат', 'partial result')
                 })()
               }</span> : null}
+              {(() => {
+                // R12: honest goal-shortfall chips — a truncated candidate
+                // search and a proven no-target are different causes, and the
+                // projected lag-OK/shortfall is post-plan (final targets).
+                const parts = [
+                  typeof draftResult.metadata.postPlanLagOk === 'number' && typeof draftResult.metadata.postPlanShortfall === 'number'
+                    ? text(`projected lag-OK ${draftResult.metadata.postPlanLagOk}/${draftResult.metadata.postPlanShortfall + draftResult.metadata.postPlanLagOk} · shortfall ${draftResult.metadata.postPlanShortfall}`, `projected lag-OK ${draftResult.metadata.postPlanLagOk}/${draftResult.metadata.postPlanShortfall + draftResult.metadata.postPlanLagOk} · shortfall ${draftResult.metadata.postPlanShortfall}`) : '',
+                  typeof draftResult.metadata.candidateTruncated === 'number' && draftResult.metadata.candidateTruncated > 0 ? text(`поиск кандидатов усечён ${draftResult.metadata.candidateTruncated}`, `candidate search truncated ${draftResult.metadata.candidateTruncated}`) : '',
+                  typeof draftResult.metadata.noTarget === 'number' && draftResult.metadata.noTarget > 0 ? text(`без безопасного target ${draftResult.metadata.noTarget}`, `no safe target ${draftResult.metadata.noTarget}`) : '',
+                  typeof draftResult.metadata.blocked === 'number' && draftResult.metadata.blocked > 0 ? text(`target заблокирован ${draftResult.metadata.blocked}`, `target blocked ${draftResult.metadata.blocked}`) : '',
+                ].filter(Boolean).join(' · ')
+                return parts ? <span className="draft-result-meta">{parts}</span> : null
+              })()}
             </div>
           </div>
           {/* G3: the stale warning is shown regardless of fresh/acknowledged —

@@ -223,6 +223,17 @@ export type DraftResultSnapshot = {
     osvUnknown?: number
     metadataKnown?: number
     metadataTotal?: number
+    securityKnown?: number
+    securityTotal?: number
+    securityUnknown?: number
+    noTarget?: number
+    candidateTruncated?: number
+    candidateTruncatedTargetless?: number
+    blocked?: number
+    ok?: number
+    postPlanLagOk?: number
+    postPlanLagOkPct?: number
+    postPlanShortfall?: number
   }
   proposals: Record<string, number>
   artifacts: { manifest: string; plan: string; prompt: string; summary: string }
