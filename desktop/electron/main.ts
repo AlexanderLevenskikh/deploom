@@ -140,7 +140,19 @@ type DraftResultSnapshot = {
   verificationStatus: string
   authority: string
   compatibility: string
-  metadata: { total: number; unknown: number; unknownPackages: string[] }
+  metadata: {
+    total: number
+    unknown: number
+    unknownPackages: string[]
+    processed?: number
+    processedTotal?: number
+    pending?: number
+    interrupted?: number
+    registryFailed?: number
+    osvUnknown?: number
+    metadataKnown?: number
+    metadataTotal?: number
+  }
   proposals: Record<string, number>
   artifacts: { manifest: string; plan: string; prompt: string; summary: string }
   hashes: { plan: string; prompt: string }
@@ -743,6 +755,14 @@ function buildDraftResultSnapshot(artifact: DraftResultArtifact): DraftResultSna
       total: typeof artifact.metadata?.total === 'number' ? artifact.metadata.total : 0,
       unknown: typeof artifact.metadata?.unknown === 'number' ? artifact.metadata.unknown : 0,
       unknownPackages: Array.isArray(artifact.metadata?.unknownPackages) ? artifact.metadata.unknownPackages : [],
+      processed: typeof artifact.metadata?.processed === 'number' ? artifact.metadata.processed : undefined,
+      processedTotal: typeof artifact.metadata?.processedTotal === 'number' ? artifact.metadata.processedTotal : undefined,
+      pending: typeof artifact.metadata?.pending === 'number' ? artifact.metadata.pending : undefined,
+      interrupted: typeof artifact.metadata?.interrupted === 'number' ? artifact.metadata.interrupted : undefined,
+      registryFailed: typeof artifact.metadata?.registryFailed === 'number' ? artifact.metadata.registryFailed : undefined,
+      osvUnknown: typeof artifact.metadata?.osvUnknown === 'number' ? artifact.metadata.osvUnknown : undefined,
+      metadataKnown: typeof artifact.metadata?.metadataKnown === 'number' ? artifact.metadata.metadataKnown : undefined,
+      metadataTotal: typeof artifact.metadata?.metadataTotal === 'number' ? artifact.metadata.metadataTotal : undefined,
     },
     proposals: artifact.proposals && typeof artifact.proposals === 'object'
       ? Object.fromEntries(Object.entries(artifact.proposals).map(([key, value]) => [key, typeof value === 'number' ? value : 0]))

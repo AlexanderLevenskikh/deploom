@@ -213,8 +213,8 @@ from verification_experiment_registry import (
 # BLOCK_Y_FULL_OBSERVABILITY_V1
 
 NPM_REGISTRY = "https://registry.npmjs.org"
-OSV_QUERY_BATCH = "https://api.osv.dev/v1/querybatch"
-OSV_VULN = "https://api.osv.dev/v1/vulns/{id}"
+OSV_QUERY_BATCH = os.environ.get("DEPLOOM_OSV_QUERY_BATCH") or "https://api.osv.dev/v1/querybatch"
+OSV_VULN = os.environ.get("DEPLOOM_OSV_VULN") or "https://api.osv.dev/v1/vulns/{id}"
 
 # Per-process report authority marker. The generator is a single-shot CLI; this
 # is intentionally reset by main() for every invocation and consumed only by
@@ -1007,6 +1007,16 @@ class DependencyRow:
     # version-comparison shortcut (a newer version can be vulnerable again).
     # In-memory only: row_json drops it so published artifacts do not bloat.
     vuln_evidence_by_version: Dict[str, str] = dataclasses.field(default_factory=dict)
+    # R11: per-row Draft scan lifecycle state, so a deadline-aborted scan can
+    # publish exactly what was already proven without inventing a half-row:
+    # "pending"  = inventory row whose registry request was never attempted,
+    # "attempted"= registry request was in flight when the run expired,
+    # "done"     = the dependency was fully enriched (any outcome).
+    draft_scan_state: str = "pending"
+    # R11: why data is missing for a DONE row: "" (none) / "registry-failed"
+    # (registry request raised) / "osv-unavailable" (metadata OK, OSV failed).
+    # Pending/interrupted rows are derived from draft_scan_state instead.
+    draft_unknown: str = ""
 
 
 @dataclasses.dataclass
@@ -2260,6 +2270,17 @@ class LiveDataClient:
     def set_deadline(self, deadline: Optional["DeadlineClock"]) -> None:
         self.deadline = deadline
 
+    def _draft_planning_only(self) -> bool:
+        """True when the client serves a planning-only Draft (R11).
+
+        In Draft every tarball/type/runtime probe is deferred to the agent:
+        targets are theoretical registry-metadata candidates marked
+        PLANNING_ONLY, so the run stays fast enough to cover the whole
+        dependency set within one bounded budget. The foreign-registry ban and
+        the honest OSV-unavailable behavior are preserved.
+        """
+        return bool(getattr(self, "draft", False))
+
     def _supervised(self, fn: Any) -> Any:
         """Run one network header phase under the absolute run deadline.
 
@@ -2402,17 +2423,49 @@ class LiveDataClient:
         is exhausted (T4). requests' read timeout is not an absolute bound on
         total transfer time (a slow trickle can extend a request), and
         iter_content with a large chunk buffers partial reads until the chunk
-        fills or EOF — so the deadline check must run on every socket read.
+        fills or EOF — so the whole body read runs under the supervisor, which
+        is the absolute cutoff for both slow-dripping bodies and headers. The
+        body itself is read in fast multi-KiB chunks: a per-byte loop was the
+        measured CPU cost (~0.46s per MiB even without the network) on the
+        multi-MB registry JSONs of real projects (R11).
         """
         if self.deadline is None:
             return response.content
-        chunks: List[bytes] = []
-        for chunk in response.iter_content(chunk_size=1):
-            self.deadline.check_with_reserve("network-read")
-            if chunk:
-                chunks.append(chunk)
-        self.deadline.check_with_reserve("network-read")
-        return b"".join(chunks)
+
+        def _read_all() -> bytes:
+            chunks: List[bytes] = []
+            for chunk in response.iter_content(chunk_size=65536):
+                if chunk:
+                    chunks.append(chunk)
+            return b"".join(chunks)
+
+        try:
+            return run_supervised("network-read", self.deadline, _read_all)
+        except DraftBudgetExceeded:
+            # The daemon read-worker may still be slurping the body after the
+            # supervisor aborted. Abort the underlying socket NOW so the peer's
+            # dribbling handler unblocks immediately. The BufferedReader
+            # (raw._fp.fp) must NOT be closed directly: the worker's blocked
+            # read() holds its lock for the whole natural transfer, so
+            # .close() would block here for the same duration. Closing the
+            # SocketIO (fp.raw) drops the socket without waiting on the reader.
+            raw = getattr(response, "raw", None)
+            if raw is not None:
+                try:
+                    fp = getattr(raw, "_fp", None)
+                    if fp is not None:
+                        nested = getattr(fp, "fp", None)
+                        if nested is not None:
+                            socketio = getattr(nested, "raw", None)
+                            if socketio is not None and hasattr(socketio, "close"):
+                                socketio.close()
+                            else:
+                                nested.close()
+                        else:
+                            fp.close()
+                except Exception:  # noqa: BLE001 - best effort teardown
+                    pass
+            raise
 
     def _bounded_json(self, response) -> Any:
         return json.loads(self._deadline_bounded_read(response).decode("utf-8", errors="replace"))
@@ -2478,6 +2531,25 @@ class LiveDataClient:
         key = (pkg, version)
         if key in self.registry_artifact_cache:
             return dict(self.registry_artifact_cache[key])
+
+        if self._draft_planning_only():
+            # Draft: theoretical target only. Physical availability is NOT
+            # probed here; the agent must verify the exact tarball before use
+            # (the Draft prompt always says so). Explicitly not "available" so
+            # verified consumers never mistake a planning hint for proof.
+            tarball_url = self.registry_tarball_url(meta, version)
+            planning_evidence: Dict[str, Any] = {
+                "package": pkg,
+                "version": version,
+                "registry": self.registry,
+                "tarballUrl": tarball_url,
+                "status": "planning-only",
+                "httpStatus": None,
+                "finalUrl": "",
+                "error": "physical availability not probed in Draft (PLANNING_ONLY)",
+            }
+            self.registry_artifact_cache[key] = dict(planning_evidence)
+            return planning_evidence
 
         self.progress(operation=f"artifact probe {version}", package=pkg, step="scan")
         tarball_url = self.registry_tarball_url(meta, version)
@@ -2555,6 +2627,11 @@ class LiveDataClient:
         return dict(evidence)
 
     def registry_version_is_installable(self, pkg: str, meta: Dict[str, Any], version: str) -> bool:
+        if self._draft_planning_only():
+            # Draft: metadata-listed versions are treated as theoretical
+            # candidates (PLANNING_ONLY); the agent verifies actual
+            # installability when applying the plan.
+            return True
         return self.registry_version_artifact(pkg, meta, version).get("status") == "available"
 
     def registry_structural_candidates(self, meta: Dict[str, Any], versions: Iterable[str]) -> Tuple[List[str], List[str]]:
@@ -2615,6 +2692,10 @@ class LiveDataClient:
 
     def registry_version_type_declarations_ok(self, pkg: str, meta: Dict[str, Any], version: str) -> Optional[str]:
         """Return a blocker when promised declarations are absent from tarball."""
+        if self._draft_planning_only():
+            # Draft: no tarball is pulled; type-declaration state stays
+            # PLANNING_ONLY and is verified by the agent.
+            return None
         key = (pkg, version)
         if key in self.registry_types_cache:
             return self.registry_types_cache[key]
@@ -2625,6 +2706,8 @@ class LiveDataClient:
 
     def registry_version_runtime_entrypoint_ok(self, pkg: str, meta: Dict[str, Any], version: str) -> Optional[str]:
         """Return a blocker for a reachable but structurally broken publish."""
+        if self._draft_planning_only():
+            return None
         key = (pkg, version)
         if key in self.registry_runtime_entrypoint_cache:
             return self.registry_runtime_entrypoint_cache[key]
@@ -2635,6 +2718,10 @@ class LiveDataClient:
 
     def registry_version_provides_own_types(self, pkg: str, meta: Dict[str, Any], version: str) -> bool:
         """Prove that an exact runtime version really ships usable declarations."""
+        if self._draft_planning_only():
+            # Draft: assume the metadata-listed runtime version is type-capable;
+            # absence of own declarations is verified by the agent.
+            return True
         key = (pkg, version)
         if key in self.registry_self_types_cache:
             return bool(self.registry_self_types_cache[key])
@@ -4405,6 +4492,7 @@ def analyze_project(
     max_candidates: int,
     progress_prefix: str = "",
     tolerate_registry_failure: bool = False,
+    draft_sink: Optional[List[DependencyRow]] = None,
 ) -> List[DependencyRow]:
     project_started = time.perf_counter()
     pkg_path = project.path / "package.json"
@@ -4461,6 +4549,13 @@ def analyze_project(
         )
         dependency_started = time.perf_counter()
         dependency_label = f"{progress_prefix} [dependency {dependency_index}/{len(dependencies)}] {name}".strip()
+        if draft_sink is not None:
+            # R11: mark the inventory row in-flight BEFORE any network work so a
+            # mid-request expiry publishes it as "interrupted" instead of
+            # "not attempted" (and never as a half-enriched row).
+            sink_idx = _draft_sink_index_for(draft_sink, name, kind)
+            if sink_idx >= 0:
+                draft_sink[sink_idx].draft_scan_state = "attempted"
         intent_policy = _baseline_intent_policy(name)
         if intent_policy == "keep-current":
             eprint(f"[info] {dependency_label}: excluded from this Baseline update/health scope by USER_POLICY; metadata analysis may still run because the package remains in the real manifest/package-manager graph")
@@ -4529,7 +4624,7 @@ def analyze_project(
         if is_non_registry_spec(spec):
             analysis = AnalysisInfo(metadata_available=False, non_registry=True, latest_version="internal/non-registry", current_vulns="unknown")
             group, reason = classify(name, kind, "unknown", overrides, analysis, profile)
-            rows.append(DependencyRow(
+            non_registry_row = DependencyRow(
                 **base_kwargs,
                 latest_version="internal/non-registry",
                 current_vulns="unknown",
@@ -4537,7 +4632,11 @@ def analyze_project(
                 min_lag_12m="—", min_lag_9m="—", min_lag_6m="—", min_lag_3m="—",
                 group=group, reason=reason,
                 notes="; ".join(notes + ["non-registry spec; проверить внутренний registry/advisory"]),
-            ))
+                draft_scan_state="done",
+            )
+            if draft_sink is not None:
+                _commit_draft_row(draft_sink, non_registry_row)
+            rows.append(non_registry_row)
             eprint(
                 f"[info] {dependency_label}: done in {time.perf_counter() - dependency_started:.1f}s; "
                 "source=non-registry"
@@ -4561,7 +4660,7 @@ def analyze_project(
         if not meta:
             analysis = AnalysisInfo(metadata_available=False, latest_version="registry unavailable", current_vulns="unknown")
             group, reason = classify(name, kind, "unknown", overrides, analysis, profile)
-            rows.append(DependencyRow(
+            unavailable_row = DependencyRow(
                 **base_kwargs,
                 latest_version="registry unavailable",
                 current_vulns="unknown",
@@ -4569,7 +4668,12 @@ def analyze_project(
                 min_lag_12m="неизвестно", min_lag_9m="неизвестно", min_lag_6m="неизвестно", min_lag_3m="неизвестно",
                 group=group, reason=reason,
                 notes="; ".join(notes + ["package unavailable in configured npm registry"]),
-            ))
+                draft_scan_state="done",
+                draft_unknown="registry-failed",
+            )
+            if draft_sink is not None:
+                _commit_draft_row(draft_sink, unavailable_row)
+            rows.append(unavailable_row)
             eprint(
                 f"[info] {dependency_label}: done in {time.perf_counter() - dependency_started:.1f}s; "
                 "registry metadata unavailable"
@@ -4701,7 +4805,7 @@ def analyze_project(
 
         if current_summary not in ("0", "unknown", "неизвестно", "—"):
             notes.append(f"текущий dependency risk: {current_summary}")
-        rows.append(DependencyRow(
+        full_row = DependencyRow(
             **base_kwargs,
             latest_version=latest,
             current_vulns=current_summary,
@@ -4717,7 +4821,14 @@ def analyze_project(
             notes="; ".join(notes),
             registry_artifacts=registry_artifacts,
             vuln_evidence_by_version={v: vuln_summary(entries) for v, entries in (vulns or {}).items()},
-        ))
+            draft_scan_state="done",
+            draft_unknown="osv-unavailable" if vulns is None else "",
+        )
+        if getattr(client, "draft", False):
+            _apply_draft_theoretical_targets(full_row)
+        if draft_sink is not None:
+            _commit_draft_row(draft_sink, full_row)
+        rows.append(full_row)
         eprint(
             f"[info] {dependency_label}: done in {time.perf_counter() - dependency_started:.1f}s; "
             f"current={current}; latest={latest}; vulnerabilities={current_summary}; group={group}"
@@ -6835,6 +6946,11 @@ def _candidate_registry_installable(
     helper independently testable with legacy fixtures that predate explicit
     tarball evidence. Alternative/fallback candidates are never trusted this way.
     """
+    if client._draft_planning_only():
+        # R11: Draft is planning-only — physical installability is deferred to
+        # the agent, so every candidate present in the registry metadata is
+        # acceptable (planning-only evidence must never read as unavailable).
+        return True
     if version == row.current_version:
         return True
     if trusted_target == version and target_is_action(trusted_target):
@@ -17109,6 +17225,13 @@ def enrich_registry_target_evidence(
                     evidence = client.registry_version_artifact(row.name, meta, target)
                 row.registry_artifacts[target] = evidence
                 if evidence.get("status") not in {"available", "current-installed"}:
+                    # R11: Draft is planning-only — the registry METADATA is the
+                    # evidence and physical tarball/type/runtime probes are
+                    # explicitly deferred. planning-only must never look like a
+                    # target drift, or a full Draft would abort with
+                    # FINAL_PROVEN_ASSIGNMENT_REGISTRY_DRIFT for every update.
+                    if client._draft_planning_only() and evidence.get("status") == "planning-only":
+                        continue
                     blocker = (
                         f"REGISTRY_TARGET_UNAVAILABLE: {row.name}@{target}; status={evidence.get('status')}; "
                         f"configured registry={client.registry}; {evidence.get('error') or 'tarball probe failed'}"
@@ -21652,12 +21775,37 @@ def build_draft_plan(
     conflicts: List[Dict[str, Any]] = []
     manifests: Dict[str, Any] = {}
     projects: List[str] = sorted(rows_by_project)
-    totals = {"proposed": 0, "no-change": 0, "deferred": 0, "excluded": 0, "unknown-metadata": 0, "unknown-security": 0, "no-target": 0, "total": 0}
+    totals = {"proposed": 0, "no-change": 0, "deferred": 0, "excluded": 0, "unknown-metadata": 0, "unknown-security": 0, "no-target": 0,
+              "not-attempted": 0, "interrupted": 0, "registry-failed": 0, "osv-unavailable": 0, "unrated": 0, "total": 0}
+    scan: Dict[str, Dict[str, int]] = {}
     for project in projects:
         rows = rows_by_project[project]
         spec = projects_by_name.get(project)
         plan_rows: List[Dict[str, Any]] = []
+        scan_counts: Dict[str, int] = {
+            "processed": 0, "pending": 0, "interrupted": 0,
+            "registry-failed": 0, "osv-unavailable": 0, "unrated": 0,
+            "metadataKnown": 0, "metadataTotal": 0, "total": 0,
+        }
         for row in rows:
+            state = str(row.draft_scan_state or "")
+            if state == "done":
+                scan_counts["processed"] += 1
+            elif state == "attempted":
+                scan_counts["interrupted"] += 1
+            else:
+                scan_counts["pending"] += 1
+            if row.draft_unknown == "registry-failed":
+                scan_counts["registry-failed"] += 1
+            elif row.draft_unknown == "osv-unavailable":
+                scan_counts["osv-unavailable"] += 1
+            if _row_has_unrated_vulns(row):
+                scan_counts["unrated"] += 1
+            if _row_metadata_known(row):
+                scan_counts["metadataKnown"] += 1
+            if not row.scope_excluded:
+                scan_counts["metadataTotal"] += 1
+            scan_counts["total"] += 1
             target = _draft_target_for_major(row)
             status = _draft_row_status(row, target)
             totals[status] = totals.get(status, 0) + 1
@@ -21675,6 +21823,8 @@ def build_draft_plan(
                 "reason": row.reason or (row.target_default_reason if row.target_default_reason != NO_ACTION else None),
                 "group": row.group,
                 "latest": row.latest_version,
+                "scanState": state,
+                "draftUnknown": row.draft_unknown,
                 "breakingChanges": list(row.breaking_changes or []),
                 "migrationNotes": list(row.migration_notes or []),
             }
@@ -21698,7 +21848,7 @@ def build_draft_plan(
                 # fine, and vice versa.
                 causes = []
                 if meta_unknown:
-                    causes.append("registry metadata unavailable for this package in this Draft run")
+                    causes.append(_draft_metadata_unknown_reason(row))
                 if sec_unknown:
                     causes.append("OSV/security state unknown for this package in this Draft run")
                 if sec_unrated:
@@ -21713,6 +21863,21 @@ def build_draft_plan(
                     "clarity": "security" if sec_blocked and not meta_unknown else ("metadata" if meta_unknown and not sec_blocked else "both"),
                     "reason": "; ".join(causes),
                 })
+            # R11: per-cause partiality counters so the manifest/prompt/UI can
+            # show exactly how many packages waited, were interrupted, failed
+            # the registry request, missed OSV, or carried an unrated finding.
+            if meta_unknown:
+                if state == "pending":
+                    totals["not-attempted"] = totals.get("not-attempted", 0) + 1
+                elif state == "attempted":
+                    totals["interrupted"] = totals.get("interrupted", 0) + 1
+            if row.draft_unknown == "registry-failed":
+                totals["registry-failed"] = totals.get("registry-failed", 0) + 1
+            elif row.draft_unknown == "osv-unavailable":
+                totals["osv-unavailable"] = totals.get("osv-unavailable", 0) + 1
+            if sec_unrated:
+                totals["unrated"] = totals.get("unrated", 0) + 1
+        scan[project] = scan_counts
         if spec:
             manifests[project] = {
                 "path": str(spec.path),
@@ -21736,6 +21901,7 @@ def build_draft_plan(
         "conflicts": conflicts,
         "counts": totals,
         "manifests": manifests,
+        "scan": scan,
     }
 
 
@@ -21822,9 +21988,29 @@ def build_draft_prompt(
                 f"C/H/M/L: {health.get('critical', '?')}/{health.get('high', '?')}/{health.get('moderate', '?')}/{health.get('low', '?')}"
                 + (f", уязвимости неизвестны для {vuln_unknown} пакет(ов)" if vuln_unknown else "")
             )
+            scan_counts = (plan.get("scan") or {}).get(project) or {}
+            processed = int(scan_counts.get("processed", 0) or 0)
+            scan_total = int(scan_counts.get("total", 0) or 0)
+            pending = int(scan_counts.get("pending", 0) or 0)
+            interrupted = int(scan_counts.get("interrupted", 0) or 0)
+            reg_failed = int(scan_counts.get("registry-failed", 0) or 0)
+            osv_unknown = int(scan_counts.get("osv-unavailable", 0) or 0)
+            scan_part = f"Обработано {processed}/{scan_total}"
+            scan_causes = []
+            if pending:
+                scan_causes.append(f"не начаты: {pending}")
+            if interrupted:
+                scan_causes.append(f"прерваны deadline: {interrupted}")
+            if reg_failed:
+                scan_causes.append(f"registry failed: {reg_failed}")
+            if osv_unknown:
+                scan_causes.append(f"OSV недоступен: {osv_unknown}")
+            if scan_causes:
+                scan_part += " (" + ", ".join(scan_causes) + ")"
             lines += [
                 f"- {lag_part}, {vuln_part}.",
                 f"- metadata coverage: {metadata_known}/{metadata_total} известных; security coverage: {health.get('security_known', '?')}/{health.get('security_total', '?')} оценённых OSV.",
+                f"- {scan_part}.",
                 f"- Причина статуса: {health.get('reason', '—')}.",
                 "",
                 "## Что требуется изменить (proposed)",
@@ -21873,6 +22059,26 @@ def build_draft_prompt(
             if vuln_unknown:
                 health_entries.append(f"vulnerabilities unknown for {vuln_unknown} package(s)")
             lines.append(f"- {' · '.join(health_entries)}.")
+            scan_counts = (plan.get("scan") or {}).get(project) or {}
+            processed = int(scan_counts.get("processed", 0) or 0)
+            scan_total = int(scan_counts.get("total", 0) or 0)
+            pending = int(scan_counts.get("pending", 0) or 0)
+            interrupted = int(scan_counts.get("interrupted", 0) or 0)
+            reg_failed = int(scan_counts.get("registry-failed", 0) or 0)
+            osv_unknown = int(scan_counts.get("osv-unavailable", 0) or 0)
+            scan_part = f"Processed {processed}/{scan_total}"
+            scan_causes = []
+            if pending:
+                scan_causes.append(f"not started: {pending}")
+            if interrupted:
+                scan_causes.append(f"interrupted by deadline: {interrupted}")
+            if reg_failed:
+                scan_causes.append(f"registry failed: {reg_failed}")
+            if osv_unknown:
+                scan_causes.append(f"OSV unavailable: {osv_unknown}")
+            if scan_causes:
+                scan_part += " (" + ", ".join(scan_causes) + ")"
+            lines.append(f"- {scan_part}.")
             if health.get("reason"):
                 lines.append(f"- Status reason: {health['reason']}.")
             lines += ["", "## Proposed changes", ""]
@@ -22003,9 +22209,31 @@ def publish_draft_result(
     security_known = _sum_health("security_known")
     security_total = _sum_health("security_total")
     insufficient_data = any(bool(h.get("insufficient_data")) for h in proposal_healths)
+    # R11: lifecycle counters shared by the summary and the manifest so the
+    # partiality is visible as "how much was really done", not as a blanket
+    # "registry unavailable".
+    scan_counts = _draft_scan_status_counts(rows_by_project)
+    processed = scan_counts["processed"]
+    processed_total = scan_counts["total"]
+    pending = scan_counts["pending"]
+    interrupted = scan_counts["interrupted"]
+    registry_failed = scan_counts["registry-failed"]
+    osv_unknown = scan_counts["osv-unavailable"]
+    pending_notes: List[str] = []
+    if pending:
+        pending_notes.append(f"не обработаны до дедлайна: {pending}")
+    if interrupted:
+        pending_notes.append(f"прерваны deadline: {interrupted}")
+    if registry_failed:
+        pending_notes.append(f"registry failed: {registry_failed}")
+    if osv_unknown:
+        pending_notes.append(f"OSV недоступен: {osv_unknown}")
+    pending_text = ("; ожидают: " + ", ".join(pending_notes)) if pending_notes else ""
     if status == "DRAFT_READY":
         summary = (
-            f"Черновой план готов: предложено {proposed} обновлений; "
+            f"Черновой план готов: обработано {processed}/{processed_total} зависимостей; "
+            f"метаданные известны для {metadata_known}/{metadata_total} пакетов; "
+            f"предложено {proposed} обновлений; "
             f"для {unknown_count} пакетов нужно уточнение"
             + (f" (security неизвестна: {security_unknown_count})" if security_unknown_count else "")
             + ("; недостаточно данных по lag-policy" if insufficient_data else "")
@@ -22013,9 +22241,12 @@ def publish_draft_result(
         )
     else:
         summary = (
-            f"Черновой план частичный: предложено {proposed} обновлений; "
+            f"Черновой план частичный: обработано {processed}/{processed_total} зависимостей; "
+            f"метаданные известны для {metadata_known}/{metadata_total} пакетов; "
+            f"предложено {proposed} обновлений; "
             f"для {unknown_count} пакетов нужно уточнение"
             + (f" (security неизвестна: {security_unknown_count})" if security_unknown_count else "")
+            + pending_text
             + (f". {partial_reason or 'Частичный результат по deadline/ошибке.'}")
         )
 
@@ -22064,6 +22295,16 @@ def publish_draft_result(
             "securityTotal": security_total,
             "securityUnknown": security_unknown_count,
             "insufficientData": insufficient_data,
+            # R11: Draft scan lifecycle — how much was actually processed vs.
+            # waiting, interrupted, failed or missing OSV. A partial run must
+            # report processed>0 instead of pretending a reachable registry
+            # was unavailable for every package.
+            "processed": processed,
+            "processedTotal": processed_total,
+            "pending": pending,
+            "interrupted": interrupted,
+            "registryFailed": registry_failed,
+            "osvUnknown": osv_unknown,
         },
         "proposals": {
             "proposed": counts.get("proposed", 0),
@@ -22125,6 +22366,126 @@ def set_draft_artifacts_base(base: Optional[Path]) -> None:
 
 def artifacts_dir_for_draft() -> List[Path]:
     return list(_ARTIFACTS_BASE_FOR_DRAFT)
+
+
+def _draft_sink_index_for(rows: List[DependencyRow], name: str, kind: str) -> int:
+    """Stable identity for the Draft scan sink: the (package, kind) pair used
+    by both the inventory and the enrichment loop (R11). Keeps the published
+    order equal to the dependency enumeration order."""
+    for idx, row in enumerate(rows):
+        if row.name == name and row.kind == kind:
+            return idx
+    return -1
+
+
+def _commit_draft_row(sink: List[DependencyRow], row: DependencyRow) -> None:
+    """Atomically publish one fully-enriched row into the Draft snapshot.
+
+    The replacement is whole-row: a half-enriched DependencyRow never enters
+    the sink, and once a row is committed a late in-flight network worker
+    cannot mutate it (the worker only owns a private copy of the fetched body;
+    row mutations happen exclusively in the main scan thread) (R11).
+    """
+    idx = _draft_sink_index_for(sink, row.name, row.kind)
+    if idx >= 0:
+        sink[idx] = row
+    else:
+        sink.append(row)
+
+
+def _apply_draft_theoretical_targets(row: DependencyRow) -> None:
+    """Set metadata-only PLANNING_ONLY targets on a fully-enriched row.
+
+    Draft must publish what each completed package would need even when the
+    run expires mid-scan, without waiting for the (resetting) greedy planner
+    that never runs on the aborted path. Foreign-registry versions are already
+    excluded by the structural candidate pass; physical availability is NOT
+    claimed here (the prompt requires the agent to verify it) (R11).
+    """
+    if not _row_metadata_known(row):
+        return
+    if row.scope_excluded or row.planner_deferred:
+        return
+    counts = parse_vuln_counts(row.current_vulns)
+    yellow = NO_ACTION
+    green = NO_ACTION
+    if counts.get("C", 0) > 0:
+        yellow = row.min_no_critical if has_safe_target(row.min_no_critical) else "нет safe target без Critical / risk register"
+    if counts.get("C", 0) > 0 or counts.get("H", 0) > 0:
+        green = row.min_no_high if has_safe_target(row.min_no_high) else "нет safe target без C/H / risk register"
+    if dependency_needs_lag_update(row):
+        lag_target = lag_update_target_for_row(row)
+        if has_safe_target(lag_target):
+            if not target_is_action(yellow):
+                yellow = lag_target
+            if not target_is_action(green):
+                green = lag_target
+        else:
+            if not target_is_action(yellow):
+                yellow = "нет safe target / risk register"
+            if not target_is_action(green):
+                green = "нет safe target / risk register"
+    if not target_is_action(yellow) and counts.get("M", 0) > 0 and has_safe_target(row.min_no_vuln):
+        yellow = row.min_no_vuln
+    if not target_is_action(green) and counts.get("M", 0) > 0 and has_safe_target(row.min_no_vuln):
+        green = row.min_no_vuln
+    default_target = yellow if target_is_action(yellow) else (green if target_is_action(green) else NO_ACTION)
+    planning_note = "теоретическая цель из registry metadata (PLANNING_ONLY); требует физической проверки агентом"
+    no_action_note = "теоретическая цель не требуется (PLANNING_ONLY)"
+    row.target_yellow = yellow
+    row.target_yellow_reason = planning_note if target_is_action(yellow) else no_action_note
+    row.target_green = green
+    row.target_green_reason = planning_note if target_is_action(green) else no_action_note
+    row.target_default = default_target
+    row.target_default_reason = planning_note if target_is_action(default_target) else no_action_note
+
+
+def _draft_metadata_unknown_reason(row: DependencyRow) -> str:
+    """Per-row reason for unknown registry metadata.
+
+    The reason distinguishes rows the scan never reached from rows whose
+    request failed or was interrupted, so a partial plan never claims a
+    reachable registry was unavailable for work that was simply not done (R11).
+    """
+    state = str(row.draft_scan_state or "")
+    if state == "pending":
+        return "package was not reached before the Draft deadline (registry request was not attempted)"
+    if state == "attempted":
+        return "registry request was in flight when the Draft deadline expired (metadata read interrupted)"
+    if row.draft_unknown == "registry-failed":
+        return "registry metadata request failed for this package in this Draft run"
+    return "registry metadata unavailable for this package in this Draft run"
+
+
+def _draft_scan_status_counts(
+    rows_by_project: Dict[str, List[DependencyRow]],
+) -> Dict[str, int]:
+    """Aggregate Draft scan lifecycle counters across all projects.
+
+    ``processed`` counts fully-enriched dependencies (any outcome, including
+    registry-failed rows that were attempted); ``pending`` counts inventory
+    rows the scan never reached; ``interrupted`` counts rows whose request was
+    in flight when the run expired (R11).
+    """
+    counts = {"processed": 0, "pending": 0, "interrupted": 0, "total": 0,
+              "registry-failed": 0, "osv-unavailable": 0, "unrated": 0}
+    for rows in rows_by_project.values():
+        for row in rows:
+            counts["total"] += 1
+            state = str(row.draft_scan_state or "")
+            if state == "done":
+                counts["processed"] += 1
+            elif state == "attempted":
+                counts["interrupted"] += 1
+            else:
+                counts["pending"] += 1
+            if row.draft_unknown == "registry-failed":
+                counts["registry-failed"] += 1
+            elif row.draft_unknown == "osv-unavailable":
+                counts["osv-unavailable"] += 1
+            if _row_has_unrated_vulns(row):
+                counts["unrated"] += 1
+    return counts
 
 
 def _draft_local_inventory_rows(
@@ -22833,6 +23194,7 @@ def main() -> None:
                 max_candidates,
                 progress_prefix=project_prefix,
                 tolerate_registry_failure=args.draft_baseline,
+                draft_sink=rows_by_project[project.name] if args.draft_baseline else None,
             )
             # Analyze replaces the pre-network inventory with the same full
             # dependency set enriched with registry/OSV evidence; on an

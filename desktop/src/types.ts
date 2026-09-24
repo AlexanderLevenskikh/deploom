@@ -211,7 +211,19 @@ export type DraftResultSnapshot = {
   verificationStatus: string
   authority: string
   compatibility: string
-  metadata: { total: number; unknown: number; unknownPackages: string[] }
+  metadata: {
+    total: number
+    unknown: number
+    unknownPackages: string[]
+    processed?: number
+    processedTotal?: number
+    pending?: number
+    interrupted?: number
+    registryFailed?: number
+    osvUnknown?: number
+    metadataKnown?: number
+    metadataTotal?: number
+  }
   proposals: Record<string, number>
   artifacts: { manifest: string; plan: string; prompt: string; summary: string }
   hashes: { plan: string; prompt: string }

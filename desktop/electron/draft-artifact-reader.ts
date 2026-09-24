@@ -53,7 +53,24 @@ export type DraftResultArtifact = {
   verificationStatus?: string
   authority?: string
   compatibility?: string
-  metadata?: { total?: number; unknown?: number; unknownPackages?: string[] }
+  metadata?: {
+    total?: number
+    unknown?: number
+    unknownPackages?: string[]
+    /** R11: Draft scan lifecycle — how much was actually processed before a
+     * deadline/error vs. waiting, interrupted, failed or missing OSV. */
+    processed?: number
+    processedTotal?: number
+    pending?: number
+    interrupted?: number
+    registryFailed?: number
+    osvUnknown?: number
+    metadataKnown?: number
+    metadataTotal?: number
+    securityKnown?: number
+    securityTotal?: number
+    securityUnknown?: number
+  }
   proposals?: Record<string, unknown>
   artifacts?: { manifest: string; plan: string; prompt: string; summary: string }
   hashes?: { plan: string; prompt: string }

@@ -461,6 +461,19 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
               <strong>{draftResultFresh ? (draftResult.status === 'DRAFT_READY' ? text('Draft готов', 'Draft is ready') : text('Draft частичный', 'Draft is partial')) : text(`Последний Draft · ${draftResult.status}`, `Last Draft · ${draftResult.status}`)}</strong>
               {draftResultFresh ? <span>{draftResult.summary}</span> : <span>{draftResult.summary || text('Сохранённый результат Draft этого проекта.', 'Saved Draft result for this project.')}</span>}
               <span className="draft-result-meta">run <code>{draftResult.runId}</code> · {draftResult.elapsedMs}ms{typeof draftResult.deadlineSeconds === 'number' ? ` · ${text('deadline', 'deadline')} ${draftResult.deadlineSeconds}s` : ''} · {draftResult.verificationStatus} / {draftResult.authority} / {draftResult.compatibility}</span>
+              {draftResult.status === 'DRAFT_PARTIAL' && typeof draftResult.metadata.processed === 'number' ? <span className="draft-result-meta">{
+                (() => {
+                  const parts = [
+                    text(`обработано ${draftResult.metadata.processed}/${draftResult.metadata.processedTotal ?? draftResult.metadata.total}`, `processed ${draftResult.metadata.processed}/${draftResult.metadata.processedTotal ?? draftResult.metadata.total}`),
+                    typeof draftResult.metadata.metadataKnown === 'number' ? text(`метаданные ${draftResult.metadata.metadataKnown}/${draftResult.metadata.metadataTotal ?? draftResult.metadata.total}`, `metadata ${draftResult.metadata.metadataKnown}/${draftResult.metadata.metadataTotal ?? draftResult.metadata.total}`) : '',
+                    typeof draftResult.metadata.pending === 'number' && draftResult.metadata.pending > 0 ? text(`не начаты ${draftResult.metadata.pending}`, `not started ${draftResult.metadata.pending}`) : '',
+                    typeof draftResult.metadata.interrupted === 'number' && draftResult.metadata.interrupted > 0 ? text(`прерваны deadline ${draftResult.metadata.interrupted}`, `interrupted ${draftResult.metadata.interrupted}`) : '',
+                    typeof draftResult.metadata.registryFailed === 'number' && draftResult.metadata.registryFailed > 0 ? text(`registry failed ${draftResult.metadata.registryFailed}`, `registry failed ${draftResult.metadata.registryFailed}`) : '',
+                    typeof draftResult.metadata.osvUnknown === 'number' && draftResult.metadata.osvUnknown > 0 ? text(`OSV недоступен ${draftResult.metadata.osvUnknown}`, `OSV unavailable ${draftResult.metadata.osvUnknown}`) : '',
+                  ].filter(Boolean).join(' · ')
+                  return parts || text('частичный результат', 'partial result')
+                })()
+              }</span> : null}
             </div>
           </div>
           {/* G3: the stale warning is shown regardless of fresh/acknowledged —
