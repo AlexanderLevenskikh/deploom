@@ -229,12 +229,54 @@ export type DraftResultSnapshot = {
     noTarget?: number
     candidateTruncated?: number
     candidateTruncatedTargetless?: number
+    candidateTruncatedProposed?: number
     blocked?: number
     ok?: number
     postPlanLagOk?: number
     postPlanLagOkPct?: number
+    postPlanScopeTotal?: number
+    // F1: the policy gate (user's minLagOkPct) and the +5 p.p. planning
+    // reserve are SEPARATE required counts and SEPARATE shortfalls; the
+    // published postPlanShortfall is the POLICY one.
+    postPlanPolicyRequired?: number
+    postPlanReserveRequired?: number
+    postPlanPolicyShortfall?: number
+    postPlanReserveShortfall?: number
     postPlanShortfall?: number
+    // F3: projected security on the EXACT chosen/kept versions + coverage and
+    // the feasibility verdict (feasible | unknown | blocked).
+    postPlanCritical?: number
+    postPlanHigh?: number
+    postPlanSecurityKnown?: number
+    postPlanSecurityUnknown?: number
+    postPlanSecurityTotal?: number
+    postPlanGoal?: string
   }
+  // F2: per-project post-plan numbers (sizes and policies differ); the
+  // renderer prefers this view for the selected project.
+  perProject?: Record<string, {
+    postPlanLagOk?: number
+    postPlanLagOkPct?: number
+    postPlanScopeTotal?: number
+    postPlanPolicyRequired?: number
+    postPlanReserveRequired?: number
+    postPlanPolicyShortfall?: number
+    postPlanReserveShortfall?: number
+    postPlanCritical?: number
+    postPlanHigh?: number
+    postPlanSecurityKnown?: number
+    postPlanSecurityUnknown?: number
+    postPlanSecurityTotal?: number
+    postPlanGoal?: string
+    noTarget?: number
+    candidateTruncated?: number
+    candidateTruncatedTargetless?: number
+    candidateTruncatedProposed?: number
+    blocked?: number
+    ok?: number
+    proposed?: number
+    scopeTotal?: number
+  }>
   proposals: Record<string, number>
   artifacts: { manifest: string; plan: string; prompt: string; summary: string }
   hashes: { plan: string; prompt: string }

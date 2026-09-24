@@ -1105,6 +1105,11 @@ class ProjectHealth:
     # How many more dependencies must become lag-compliant to reach the
     # configured yellow gate (0 when already there).
     lag_needed_for_yellow: int = 0
+    # F1: the pure policy gate -- the smallest lag-OK count that satisfies the
+    # USER's minLagOkPct over the whole active scope (e.g. 61/76 at 80%).
+    # `yellow_plan_required` is the +5 p.p. executable-plan RESERVE on top
+    # (65/76); the two must never be conflated or the prompt signs 85% as 80%.
+    yellow_required: int = 0
     # Installed health stays anchored to the effective gate. Planning is
     # projected separately after compatibility/registry narrowing.
     yellow_plan_required: int = 0
@@ -6013,6 +6018,7 @@ def compute_project_health(
         removed=removed_closed,
         lag_blockers=lag_blockers,
         lag_needed_for_yellow=lag_needed_for_yellow,
+        yellow_required=yellow_required,
         yellow_plan_required=yellow_plan_required,
         yellow_projected_lag_ok=yellow_projected_lag_ok,
         yellow_projected_lag_pct=yellow_projected_lag_pct,
@@ -21604,15 +21610,23 @@ def _row_has_unrated_vulns(row: DependencyRow) -> bool:
     return _summary_has_unrated_vulns(row.current_vulns)
 
 
-def _row_security_known(row: DependencyRow) -> bool:
-    """A row's vulnerability state is assessed only when current_vulns carries
-    a concrete finding or an explicit zero. Anything that means "we did not get
-    OSV data" is unknown; an unknown is never a finding of zero (T3)."""
-    value = str(row.current_vulns or "").strip().lower()
+def _summary_security_known(summary: Optional[str]) -> bool:
+    """Whether an OSV summary string is an ASSESSED state (explicit findings
+    or an explicit zero). Anything that means "we did not get OSV data" is
+    unknown; an unknown is never a finding of zero (T3/F3). Shared by the row
+    check and the post-plan exact-target projection."""
+    value = str(summary or "").strip().lower()
     if value in ("", "—"):
         return False
     unknown_markers = ("unknown", "неизвестно", "not assessed", "registry unavailable", "недоступн", "unavailable")
     return not any(marker in value for marker in unknown_markers)
+
+
+def _row_security_known(row: DependencyRow) -> bool:
+    """A row's vulnerability state is assessed only when current_vulns carries
+    a concrete finding or an explicit zero. Anything that means "we did not get
+    OSV data" is unknown; an unknown is never a finding of zero (T3)."""
+    return _summary_security_known(row.current_vulns)
 
 
 def _row_metadata_known(row: DependencyRow) -> bool:
@@ -21806,6 +21820,56 @@ def _draft_target_for_major(row: DependencyRow) -> str:
     return fallback if fallback and fallback != NO_ACTION else NO_ACTION
 
 
+def _post_plan_version(row: DependencyRow, target: str) -> str:
+    """The exact version a row occupies after the Draft plan is applied: the
+    chosen plan target when the target is a real action, otherwise the current
+    version (an ok/no-change row stays put; a targetless row does not move)."""
+    version = str(row.current_version or "").strip()
+    tv = str(target or "").strip()
+    if tv and tv != NO_ACTION:
+        version = tv
+    return version
+
+
+def _projected_row_security(row: DependencyRow, target: str) -> Tuple[int, int, bool]:
+    """Projected (Critical, High, security_known) for the row AT the exact
+    post-plan version (F3).
+
+    The decision uses ONLY the OSV evidence for that exact version
+    (`_severity_at_candidate_version`): the current version uses current_vulns,
+    any other version uses `vuln_evidence_by_version`, and a version with NO
+    evidence is UNKNOWN (never clean). A target we cannot certify is never
+    advertised as a safe target."""
+    post_version = _post_plan_version(row, target)
+    crit = _severity_at_candidate_version(row, post_version, "C")
+    high = _severity_at_candidate_version(row, post_version, "H")
+    if crit is None or high is None:
+        return 0, 0, False
+    return int(crit), int(high), True
+
+
+def _draft_goal_verdict(
+    post_yellow: int,
+    policy_required: int,
+    projected_critical: int,
+    projected_high: int,
+    security_unknown: int,
+    policy: Dict[str, Any],
+) -> str:
+    """Feasibility of the target level for the plan that was actually written:
+    `blocked` when the projected lag is below the policy gate OR a projected
+    C/H exceeds the configured limits; `unknown` when every numeric limit is
+    met but some post-plan version has no OSV evidence (absence of evidence is
+    NOT a clean bill); `feasible` only when lag + security are provable (F3)."""
+    max_c = int(policy.get("maxKnownCritical", 0) or 0)
+    max_h = int(policy.get("maxKnownHigh", 1) or 0)
+    if post_yellow < policy_required or projected_critical > max_c or projected_high > max_h:
+        return "blocked"
+    if security_unknown > 0:
+        return "unknown"
+    return "feasible"
+
+
 def _draft_policy_satisfied(row: DependencyRow) -> bool:
     """R12: a row already satisfies the Draft policy when its security is
     assessed with no Critical/High (an unrated U finding is NOT "clean") and
@@ -21969,13 +22033,19 @@ def build_draft_plan(
             # with a security uncertainty add here (no double counting).
             if (sec_unknown or sec_unrated) and status != "unknown-security":
                 totals["unknown-security"] = totals.get("unknown-security", 0) + 1
-            if meta_unknown or sec_unknown or sec_unrated or row.candidate_search_truncated:
+            if meta_unknown or sec_unknown or sec_unrated or status in ("unknown-metadata", "unknown-security", "candidate-search-truncated", "blocked", "no-target"):
                 # T3: metadata (registry availability) and security (OSV) are
                 # separate unknown classes; an unassessed OSV state must reach
                 # the plan/summary/prompt even when the registry metadata is
                 # fine, and vice versa. R12: a truncated search is a THIRD
                 # unknown class -- the limit hid versions, so absence of a safe
                 # target among the covered set is not a proven absence.
+                # F4: a truncation CAVEAT on an actionable PROPOSED row is NOT
+                # a clarification -- only rows without a provable target (or
+                # with unassessed security) belong in the "needs clarification"
+                # list. The caveat survives as the row's candidateSearchTruncated
+                # flag, the candidateTruncated/candidateTruncatedTargetless/
+                # candidateTruncatedProposed counters and a prompt notе.
                 causes = []
                 if meta_unknown:
                     causes.append(_draft_metadata_unknown_reason(row))
@@ -22032,21 +22102,69 @@ def build_draft_plan(
         # plan. Recompute the projections from the FINAL planned targets and
         # publish them alongside (postPlan*) so the prompt/goal check speaks
         # about the plan that was actually written.
+        # F1: the policy gate (user's minLagOkPct, e.g. 61/76 at 80%) and the
+        # +5 p.p. executable-plan RESERVE (65/76) are SEPARATE thresholds with
+        # separate shortfalls -- `postPlanShortfall` is always the policy one,
+        # never the reserve masquerading as the gate.
         post_health = dataclasses.asdict(health_by_project[project])
         active_rows = [r for r in rows if not r.scope_excluded]
         scope_total = len(active_rows)
         post_yellow = sum(1 for r in active_rows if dependency_is_lag_ok_after_planned_target(r, "yellow"))
         post_green = sum(1 for r in active_rows if dependency_is_lag_ok_after_planned_target(r, "green"))
-        yellow_required = int(post_health.get("yellow_required") or post_health.get("yellow_plan_required") or 0)
+        policy_required = int(post_health.get("yellow_required") or 0)
+        reserve_required = int(post_health.get("yellow_plan_required") or 0)
+        if not policy_required and reserve_required:
+            # Legacy health object (computed before ProjectHealth.yellow_required
+            # existed): the reserve was user gate + 5 p.p.; keep parity.
+            policy_required = reserve_required
+        if not reserve_required:
+            reserve_required = policy_required
         green_required = int(post_health.get("green_required") or 0)
-        post_yellow_shortfall = max(0, yellow_required - post_yellow)
+        post_policy_shortfall = max(0, policy_required - post_yellow)
+        post_reserve_shortfall = max(0, reserve_required - post_yellow)
         post_green_shortfall = max(0, green_required - post_green)
+        # F3: post-plan SECURITY projection on the exact chosen/kept versions.
+        # Absence of OSV evidence for any post-plan version is coverage-unknown
+        # (never clean), so the feasibility verdict can state "provable target".
+        project_policy = effective_acceptance_policy(project)
+        sec_critical = 0
+        sec_high = 0
+        sec_known = 0
+        sec_unknown = 0
+        for r in active_rows:
+            crit, high, known = _projected_row_security(r, _draft_target_for_major(r))
+            sec_critical += crit
+            sec_high += high
+            if known:
+                sec_known += 1
+            else:
+                sec_unknown += 1
+        max_critical = int(project_policy.get("maxKnownCritical", 0) or 0)
+        max_high = int(project_policy.get("maxKnownHigh", 1) or 0)
+        goal_verdict = _draft_goal_verdict(post_yellow, policy_required, sec_critical, sec_high, sec_unknown, project_policy)
+        truncated_proposed = sum(
+            1 for er in plan_rows if er.get("status") == "proposed" and er.get("candidateSearchTruncated")
+        )
+        post_health["postPlanScopeTotal"] = scope_total
+        post_health["postPlanPolicyRequired"] = policy_required
+        post_health["postPlanReserveRequired"] = reserve_required
+        post_health["postPlanPolicyShortfall"] = post_policy_shortfall
+        post_health["postPlanReserveShortfall"] = post_reserve_shortfall
+        post_health["postPlanCritical"] = sec_critical
+        post_health["postPlanHigh"] = sec_high
+        post_health["postPlanSecurityKnown"] = sec_known
+        post_health["postPlanSecurityUnknown"] = sec_unknown
+        post_health["postPlanSecurityTotal"] = scope_total
+        post_health["postPlanGoal"] = goal_verdict
+        post_health["postPlanPolicyMaxCritical"] = max_critical
+        post_health["postPlanPolicyMaxHigh"] = max_high
+        post_health["postPlanTruncatedProposed"] = truncated_proposed
         post_health["postPlanLagOk"] = post_yellow
         post_health["postPlanLagOkPct"] = (post_yellow / scope_total * 100.0) if scope_total else 100.0
-        post_health["postPlanShortfall"] = post_yellow_shortfall
+        post_health["postPlanShortfall"] = post_policy_shortfall
         post_health["yellow_projected_lag_ok"] = post_yellow
         post_health["yellow_projected_lag_pct"] = (post_yellow / scope_total * 100.0) if scope_total else 100.0
-        post_health["yellow_plan_shortfall"] = post_yellow_shortfall
+        post_health["yellow_plan_shortfall"] = post_reserve_shortfall
         post_health["green_projected_lag_ok"] = post_green
         post_health["green_projected_lag_pct"] = (post_green / scope_total * 100.0) if scope_total else 100.0
         post_health["green_plan_shortfall"] = post_green_shortfall
@@ -22178,26 +22296,60 @@ def build_draft_prompt(
             ]
             # R12: the goal block speaks in post-plan projections recomputed
             # from the FINAL planned targets (build_draft_plan.postPlan*), never
-            # the pre-plan health numbers: current lag-OK, the target the run
-            # must reach (required), the projected lag-OK after the plan, the
-            # resulting shortfall and the Critical/High blockers that drive it.
-            scope_total = int(health.get("metadata_total", 0) or 0)
+            # the pre-plan health numbers: current lag-OK, the required count
+            # from the USER's policy gate, the projected lag-OK after the plan,
+            # the resulting shortfalls and the Critical/High blockers.
+            # F1: the policy gate (61/76 at 80%) is never replaced by the +5 p.p.
+            # planning reserve (65/76) -- the reserve, when present, is labeled
+            # as such next to the policy numbers.
+            # F3: projected C/H are computed on the EXACT chosen/kept versions
+            # and the goal verdict (feasible/unknown/blocked) is stated; the old
+            # blanket "proposed targets fix the C/H" claim is gone.
+            scope_total = int(health.get("postPlanScopeTotal", 0) or health.get("metadata_total", 0) or 0)
             current_ok = int(health.get("lag_ok_12m", 0) or 0)
-            required = int(health.get("yellow_plan_required", 0) or 0)
-            if not required:
-                required = int(health.get("postPlanShortfall", 0) or 0) + int(health.get("postPlanLagOk", 0) or 0)
+            policy_required = int(health.get("postPlanPolicyRequired", 0) or 0)
+            if not policy_required:
+                policy_required = int(health.get("postPlanLagOk", 0) or 0) + int(health.get("postPlanPolicyShortfall", 0) or 0)
+            reserve_required = int(health.get("postPlanReserveRequired", 0) or 0)
             projected = int(health.get("postPlanLagOk", 0) or 0)
-            shortfall = int(health.get("postPlanShortfall", 0) or 0)
-            crit_h = (int(health.get("critical", 0) or 0), int(health.get("high", 0) or 0))
+            policy_shortfall = int(health.get("postPlanPolicyShortfall", 0) or 0)
+            reserve_shortfall = int(health.get("postPlanReserveShortfall", 0) or 0)
+            sec_crit = int(health.get("postPlanCritical", 0) or 0)
+            sec_high = int(health.get("postPlanHigh", 0) or 0)
+            sec_known = int(health.get("postPlanSecurityKnown", 0) or 0)
+            sec_unknown = int(health.get("postPlanSecurityUnknown", 0) or 0)
+            goal = str(health.get("postPlanGoal") or "")
+            reserve_note = (
+                f"; плановый запас (политика +5 п.п.): {reserve_required}/{scope_total}"
+                if reserve_required and reserve_required != policy_required
+                else ""
+            )
             goal_lines = [
                 "## Цель (projected по этому плану)",
                 "",
-                f"- Актуально сейчас: {current_ok}/{scope_total}; требуется по политике: {required}/{scope_total} ({min_lag_pct}%).",
-                f"- Projected после плана: {projected}/{scope_total} ({health.get('postPlanLagOkPct', '?')}%); shortfall: {shortfall}.",
+                f"- Актуально сейчас: {current_ok}/{scope_total}; требуется по политике: {policy_required}/{scope_total} ({min_lag_pct}%){reserve_note}.",
+                "- Projected после плана: {projected}/{scope_total} ({pct}%); shortfall: {policy_shortfall} (по политике{reserve_short}).".format(
+                    projected=projected, scope_total=scope_total, pct=round(float(health.get('postPlanLagOkPct', 0) or 0), 1),
+                    policy_shortfall=policy_shortfall,
+                    reserve_short=f", запас: {reserve_shortfall}" if reserve_shortfall else ""),
             ]
-            if crit_h[0] or crit_h[1]:
-                goal_lines.append(f"- C/H блокеры: Critical {crit_h[0]}, High {crit_h[1]}; предложенные target убирают те, что закрыты в proposed.")
-            if shortfall > 0:
+            if sec_known or sec_unknown:
+                goal_lines.append(
+                    "- Security projected на выбранных версиях: Critical {crit} / High {high}; "
+                    "OSV-покрытие целей: {known}/{scope}{unknown_part}.".format(
+                        crit=sec_crit, high=sec_high, known=sec_known, scope=scope_total,
+                        unknown_part=f", без OSV-данных: {sec_unknown}" if sec_unknown else "")
+                )
+            goal_labels = {
+                "feasible": "достижима по lag-критерию и security-лимитам на этих target",
+                "unknown": "НЕ подтверждена: OSV-покрытие части версий неизвестно — требуется запрос OSV/уточнение",
+                "blocked": "НЕ достижима этим планом"
+                + (f" (shortfall по политике: {policy_shortfall})" if policy_shortfall else "")
+                + (" (Critical/High вне лимита)" if sec_crit or sec_high else ""),
+            }
+            if goal:
+                goal_lines.append(f"- Оценка достижимости цели: {goal_labels.get(goal, goal)}.")
+            if policy_shortfall > 0:
                 goal_lines.append(
                     "- Shortfall не закрыт предложенными target: ниже перечислены no-target/blocked/unknown строки (не «нет проверяемого target»)."
                 )
@@ -22215,6 +22367,9 @@ def build_draft_prompt(
                     if r.get("breakingChanges"):
                         extra = f" [breaking: {', '.join(r['breakingChanges'][:3])}]"
                     lines.append(f"- `{r['package']}` ({r.get('kind')}) текущая `{r.get('current')}` → target `{target}`{extra}.")
+                truncated_proposed = sum(1 for r in rows if r.get("candidateSearchTruncated"))
+                if truncated_proposed:
+                    lines.append(f"_Примечание: поиск кандидатов ограничен лимитом для {truncated_proposed} из {len(rows)} proposed строк — target требует проверки tarball/registry._")
             else:
                 lines.append("_Нет строк с предложенным обновлением в этом проекте._")
             lines.append("")
@@ -22234,7 +22389,7 @@ def build_draft_prompt(
                         "deferred": "Отложено",
                         "excluded": "Исключено из scope",
                         "blocked": "Target заблокирован (blocked)",
-                        "candidate-search-truncated": "Поиск кандидатов усечён (лимит)",
+                        "candidate-search-truncated": "Поиск кандидатов усечён (лимит кандидатов)",
                         "unknown-security": "Security неизвестна / без оценки (U)",
                         "no-target": "Нет безопасного target по полным данным",
                     }[status]
@@ -22283,18 +22438,44 @@ def build_draft_prompt(
             if health.get("reason"):
                 lines.append(f"- Status reason: {health['reason']}.")
             lines += ["", "## Goal (projected by this plan)", ""]
-            scope_total = int(health.get("metadata_total", 0) or 0)
+            scope_total = int(health.get("postPlanScopeTotal", 0) or health.get("metadata_total", 0) or 0)
             current_ok = int(health.get("lag_ok_12m", 0) or 0)
-            required = int(health.get("yellow_plan_required", 0) or 0)
-            if not required:
-                required = int(health.get("postPlanShortfall", 0) or 0) + int(health.get("postPlanLagOk", 0) or 0)
+            policy_required = int(health.get("postPlanPolicyRequired", 0) or 0)
+            if not policy_required:
+                policy_required = int(health.get("postPlanLagOk", 0) or 0) + int(health.get("postPlanPolicyShortfall", 0) or 0)
+            reserve_required = int(health.get("postPlanReserveRequired", 0) or 0)
             projected = int(health.get("postPlanLagOk", 0) or 0)
-            shortfall = int(health.get("postPlanShortfall", 0) or 0)
-            lines.append(f"- Currently lag-OK: {current_ok}/{scope_total}; policy requires {required}/{scope_total} ({min_lag_pct}%).")
-            lines.append(f"- Projected after plan: {projected}/{scope_total} ({health.get('postPlanLagOkPct', '?')}%); shortfall: {shortfall}.")
-            crit_h = (int(health.get("critical", 0) or 0), int(health.get("high", 0) or 0))
-            if crit_h[0] or crit_h[1]:
-                lines.append(f"- C/H blockers: Critical {crit_h[0]}, High {crit_h[1]}.")
+            policy_shortfall = int(health.get("postPlanPolicyShortfall", 0) or 0)
+            reserve_shortfall = int(health.get("postPlanReserveShortfall", 0) or 0)
+            sec_crit = int(health.get("postPlanCritical", 0) or 0)
+            sec_high = int(health.get("postPlanHigh", 0) or 0)
+            sec_known = int(health.get("postPlanSecurityKnown", 0) or 0)
+            sec_unknown = int(health.get("postPlanSecurityUnknown", 0) or 0)
+            goal = str(health.get("postPlanGoal") or "")
+            reserve_note_en = (
+                f"; planning reserve (+5pp): {reserve_required}/{scope_total}"
+                if reserve_required and reserve_required != policy_required
+                else ""
+            )
+            lines.append(f"- Currently lag-OK: {current_ok}/{scope_total}; policy requires {policy_required}/{scope_total} ({min_lag_pct}%){reserve_note_en}.")
+            lines.append(
+                f"- Projected after plan: {projected}/{scope_total} ({round(float(health.get('postPlanLagOkPct', 0) or 0), 1)}%); shortfall: {policy_shortfall} (policy" +
+                (f"; reserve: {reserve_shortfall}" if reserve_shortfall else "") + ")."
+            )
+            if sec_known or sec_unknown:
+                lines.append(
+                    f"- Security projected on the chosen versions: Critical {sec_crit} / High {sec_high}; OSV coverage of targets: {sec_known}/{scope_total}" +
+                    (f"; without OSV data: {sec_unknown}" if sec_unknown else "") + "."
+                )
+            goal_labels_en = {
+                "feasible": "reachable under the lag criterion and security limits on these targets",
+                "unknown": "NOT confirmed: OSV coverage of some versions is unknown - request OSV/clarification first",
+                "blocked": "NOT reachable by this plan" +
+                (f" (policy shortfall: {policy_shortfall})" if policy_shortfall else "") +
+                (" (Critical/High beyond the limit)" if sec_crit or sec_high else ""),
+            }
+            if goal:
+                lines.append(f"- Goal feasibility: {goal_labels_en.get(goal, goal)}.")
             lines.append("")
             lines += ["", "## Proposed changes", ""]
             rows = [r for r in project_plan.get("rows", []) if r.get("status") == "proposed"]
@@ -22302,6 +22483,9 @@ def build_draft_prompt(
                 for r in rows:
                     target = r.get("target") or "clarify with agent"
                     lines.append(f"- `{r['package']}` ({r.get('kind')}) current `{r.get('current')}` → target `{target}`.")
+                truncated_proposed = sum(1 for r in rows if r.get("candidateSearchTruncated"))
+                if truncated_proposed:
+                    lines.append(f"_Note: candidate search was limited for {truncated_proposed} of {len(rows)} proposed rows - verify the target tarball/registry._")
             else:
                 lines.append("_No proposed changes in this project._")
             lines.append("")
@@ -22402,6 +22586,50 @@ def _atomic_write_text(path: Path, content: str) -> None:
     temporary.replace(path)
 
 
+def _draft_aggregate_goal(proposal_healths: List[Dict[str, Any]]) -> str:
+    """Feasibility verdict across projects: any `blocked` project blocks the
+    aggregate, otherwise any `unknown` makes it unknown, else `feasible`."""
+    verdicts = [str(h.get("postPlanGoal") or "") for h in proposal_healths if h.get("postPlanGoal")]
+    if not verdicts:
+        return ""
+    if "blocked" in verdicts:
+        return "blocked"
+    if "unknown" in verdicts:
+        return "unknown"
+    return "feasible"
+
+
+def _sum_health(healths: List[Dict[str, Any]], key: str) -> int:
+    return sum(int(h.get(key, 0) or 0) for h in healths)
+
+
+def draft_post_plan_aggregate(proposal_healths: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Cross-project post-plan aggregate (F2).
+
+    The share is a WEIGHTED one -- sum(projectedLagOk) / sum(scopeTotal) --
+    never the sum of per-project percentages (two projects at 50% must NOT
+    read as 100%). Each project keeps its OWN numbers in `per_project`."""
+    ok = _sum_health(proposal_healths, "postPlanLagOk")
+    scope = _sum_health(proposal_healths, "postPlanScopeTotal")
+    return {
+        "postPlanLagOk": ok,
+        "postPlanLagOkPct": round((ok / scope * 100.0) if scope else 100.0, 1),
+        "postPlanScopeTotal": scope,
+        "postPlanPolicyRequired": _sum_health(proposal_healths, "postPlanPolicyRequired"),
+        "postPlanReserveRequired": _sum_health(proposal_healths, "postPlanReserveRequired"),
+        "postPlanPolicyShortfall": _sum_health(proposal_healths, "postPlanPolicyShortfall"),
+        "postPlanReserveShortfall": _sum_health(proposal_healths, "postPlanReserveShortfall"),
+        "postPlanShortfall": _sum_health(proposal_healths, "postPlanPolicyShortfall"),
+        "postPlanCritical": _sum_health(proposal_healths, "postPlanCritical"),
+        "postPlanHigh": _sum_health(proposal_healths, "postPlanHigh"),
+        "postPlanSecurityKnown": _sum_health(proposal_healths, "postPlanSecurityKnown"),
+        "postPlanSecurityUnknown": _sum_health(proposal_healths, "postPlanSecurityUnknown"),
+        "postPlanSecurityTotal": _sum_health(proposal_healths, "postPlanSecurityTotal"),
+        "postPlanGoal": _draft_aggregate_goal(proposal_healths),
+        "candidateTruncatedProposed": _sum_health(proposal_healths, "postPlanTruncatedProposed"),
+    }
+
+
 def publish_draft_result(
     *,
     run_id: str,
@@ -22455,14 +22683,73 @@ def publish_draft_result(
     # metadata/security coverage split (T3), not just per-project health.
     proposal_healths = [(p.get("health") or {}) for p in (plan.get("proposals") or [])]
 
-    def _sum_health(key: str) -> int:
-        return sum(int(h.get(key, 0) or 0) for h in proposal_healths)
-
-    metadata_known = _sum_health("metadata_known")
-    metadata_total = _sum_health("metadata_total")
-    security_known = _sum_health("security_known")
-    security_total = _sum_health("security_total")
+    metadata_known = _sum_health(proposal_healths, "metadata_known")
+    metadata_total = _sum_health(proposal_healths, "metadata_total")
+    security_known = _sum_health(proposal_healths, "security_known")
+    security_total = _sum_health(proposal_healths, "security_total")
     insufficient_data = any(bool(h.get("insufficient_data")) for h in proposal_healths)
+    # F2: the cross-project aggregate is a WEIGHTED share --
+    # sum(projectedLagOk) / sum(scopeTotal) -- never the sum of per-project
+    # percentages (two projects at 50% must NOT read as 100%).
+    post_agg = draft_post_plan_aggregate(proposal_healths)
+    post_plan_ok = int(post_agg["postPlanLagOk"])
+    post_plan_scope = int(post_agg["postPlanScopeTotal"])
+    post_plan_pct = float(post_agg["postPlanLagOkPct"])
+    post_policy_required = int(post_agg["postPlanPolicyRequired"])
+    post_reserve_required = int(post_agg["postPlanReserveRequired"])
+    post_policy_shortfall = int(post_agg["postPlanPolicyShortfall"])
+    post_reserve_shortfall = int(post_agg["postPlanReserveShortfall"])
+    post_plan_critical = int(post_agg["postPlanCritical"])
+    post_plan_high = int(post_agg["postPlanHigh"])
+    post_sec_known = int(post_agg["postPlanSecurityKnown"])
+    post_sec_unknown = int(post_agg["postPlanSecurityUnknown"])
+    post_sec_total = int(post_agg["postPlanSecurityTotal"])
+    post_goal = str(post_agg["postPlanGoal"] or "")
+    truncated_proposed = int(post_agg["candidateTruncatedProposed"])
+    # F2: every project keeps its OWN numbers (sizes/policies differ). The
+    # Desktop prefers this per-project view for the selected project and falls
+    # back to the (single-project) aggregate only when it is absent.
+    per_project: Dict[str, Dict[str, Any]] = {}
+    for _proposal in (plan.get("proposals") or []):
+        _name = str(_proposal.get("project") or "")
+        if not _name:
+            continue
+        _h = _proposal.get("health") or {}
+        _counts: Dict[str, int] = {}
+        _truncated_flag_total = 0
+        for _row_entry in (_proposal.get("rows") or []):
+            _status = _row_entry.get("status")
+            if _status:
+                _counts[_status] = _counts.get(_status, 0) + 1
+            if _row_entry.get("candidateSearchTruncated"):
+                _truncated_flag_total += 1
+        per_project[_name] = {
+            "postPlanLagOk": int(_h.get("postPlanLagOk") or 0),
+            "postPlanLagOkPct": round(float(_h.get("postPlanLagOkPct") or 0), 1),
+            "postPlanScopeTotal": int(_h.get("postPlanScopeTotal") or 0),
+            "postPlanPolicyRequired": int(_h.get("postPlanPolicyRequired") or 0),
+            "postPlanReserveRequired": int(_h.get("postPlanReserveRequired") or 0),
+            "postPlanPolicyShortfall": int(_h.get("postPlanPolicyShortfall") or 0),
+            "postPlanReserveShortfall": int(_h.get("postPlanReserveShortfall") or 0),
+            "postPlanCritical": int(_h.get("postPlanCritical") or 0),
+            "postPlanHigh": int(_h.get("postPlanHigh") or 0),
+            "postPlanSecurityKnown": int(_h.get("postPlanSecurityKnown") or 0),
+            "postPlanSecurityUnknown": int(_h.get("postPlanSecurityUnknown") or 0),
+            "postPlanSecurityTotal": int(_h.get("postPlanSecurityTotal") or 0),
+            "postPlanGoal": _h.get("postPlanGoal") or "",
+            "noTarget": _counts.get("no-target", 0),
+            # Consistent with the aggregate: `candidateTruncated` counts every row
+            # whose candidate search was truncated (flag), `...Targetless` only
+            # those left WITHOUT a target, `...Proposed` those with a concrete
+            # proposed target (actionable despite the caveat).
+            "candidateTruncated": _truncated_flag_total,
+            "candidateTruncatedTargetless": _counts.get("candidate-search-truncated", 0),
+            "candidateTruncatedProposed": int(_h.get("postPlanTruncatedProposed") or 0),
+            "blocked": _counts.get("blocked", 0),
+            "ok": _counts.get("ok", 0),
+            "proposed": _counts.get("proposed", 0),
+            "scopeTotal": int(_h.get("scope_total") or 0),
+        }
     # R11: lifecycle counters shared by the summary and the manifest so the
     # partiality is visible as "how much was really done", not as a blanket
     # "registry unavailable".
@@ -22495,11 +22782,30 @@ def publish_draft_result(
     if blocked:
         shortfall_parts.append(f"target заблокирован: {blocked}")
     shortfall_text = ("; " + ", ".join(shortfall_parts)) if shortfall_parts else ""
+    # F2/F3: honest post-plan figures in the summary -- projected lag-OK over
+    # the whole active scope, the projected C/H on the exact chosen versions
+    # and the goal feasibility verdict. A plan is never implied to "fix" the
+    # C/H just because a target was proposed.
+    goal_caption = {
+        "feasible": "цель достижима планом",
+        "unknown": "достижимость цели не подтверждена (неполное OSV-покрытие)",
+        "blocked": "цель НЕ достижима этим планом",
+    }.get(post_goal or "", "")
+    post_plan_caption = f"projected lag-OK {post_plan_ok}/{post_plan_scope} ({post_plan_pct}%"
+    if post_policy_shortfall > 0 or post_reserve_shortfall > 0:
+        post_plan_caption += f"; shortfall по политике {post_policy_shortfall}"
+        if post_reserve_shortfall:
+            post_plan_caption += f", по запасу {post_reserve_shortfall}"
+    post_plan_caption += ")"
+    if post_plan_critical or post_plan_high:
+        post_plan_caption += f"; projected C/H на целях: {post_plan_critical}/{post_plan_high}"
+    if goal_caption:
+        post_plan_caption += f"; {goal_caption}"
     if status == "DRAFT_READY":
         summary = (
             f"Черновой план готов: обработано {processed}/{processed_total} зависимостей; "
             f"метаданные известны для {metadata_known}/{metadata_total} пакетов; "
-            f"предложено {proposed} обновлений; "
+            f"предложено {proposed} обновлений; {post_plan_caption}; "
             f"для {unknown_count} пакетов нужно уточнение"
             + (f" (security неизвестна: {security_unknown_count})" if security_unknown_count else "")
             + ("; недостаточно данных по lag-policy" if insufficient_data else "")
@@ -22576,16 +22882,37 @@ def publish_draft_result(
             # candidate search and a no-target row are DIFFERENT honest causes;
             # `candidateTruncated` counts every row whose search was bounded
             # while `candidateTruncatedTargetless` counts those left without a
-            # target by it. The projected lag-OK/shortfall are post-plan
-            # (computed from the final planned targets in build_draft_plan).
+            # target by it (F4: `candidateTruncatedProposed` counts the
+            # actionable proposed rows that carry only a coverage CAVEAT, never
+            # a "needs clarification" state). The projected lag-OK/shortfall
+            # are post-plan (computed from the final planned targets in
+            # build_draft_plan).
+            # F1: `postPlanShortfall` is the POLICY gate shortfall (61-based),
+            # the +5 p.p. reserve is `postPlanReserveShortfall` (65-based).
+            # F3: `postPlanCritical`/`postPlanHigh` are projected on the EXACT
+            # chosen/kept versions and `postPlanGoal` is the feasibility
+            # verdict (feasible/unknown/blocked); a plan with an open C/H on a
+            # target is never implied to reach the goal.
             "noTarget": counts.get("no-target", 0),
             "candidateTruncated": truncated_rows,
             "candidateTruncatedTargetless": candidate_truncated_targetless,
+            "candidateTruncatedProposed": truncated_proposed,
             "blocked": counts.get("blocked", 0),
             "ok": counts.get("ok", 0),
-            "postPlanLagOk": _sum_health("postPlanLagOk"),
-            "postPlanLagOkPct": round(_sum_health("postPlanLagOkPct"), 1),
-            "postPlanShortfall": _sum_health("postPlanShortfall"),
+            "postPlanLagOk": post_plan_ok,
+            "postPlanLagOkPct": post_plan_pct,
+            "postPlanScopeTotal": post_plan_scope,
+            "postPlanPolicyRequired": post_policy_required,
+            "postPlanReserveRequired": post_reserve_required,
+            "postPlanPolicyShortfall": post_policy_shortfall,
+            "postPlanReserveShortfall": post_reserve_shortfall,
+            "postPlanShortfall": post_policy_shortfall,
+            "postPlanCritical": post_plan_critical,
+            "postPlanHigh": post_plan_high,
+            "postPlanSecurityKnown": post_sec_known,
+            "postPlanSecurityUnknown": post_sec_unknown,
+            "postPlanSecurityTotal": post_sec_total,
+            "postPlanGoal": post_goal,
         },
         "proposals": {
             "proposed": counts.get("proposed", 0),
@@ -22600,6 +22927,9 @@ def publish_draft_result(
             "noTarget": counts.get("no-target", 0),
             "total": counts.get("total", 0),
         },
+        # F2: per-project post-plan numbers (sizes and policies differ); the
+        # Desktop prefers this view for the selected project.
+        "perProject": per_project,
         "summary": summary,
         "partialReason": partial_reason,
         "artifacts": {

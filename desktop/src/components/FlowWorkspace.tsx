@@ -475,15 +475,57 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
                 })()
               }</span> : null}
               {(() => {
-                // R12: honest goal-shortfall chips — a truncated candidate
-                // search and a proven no-target are different causes, and the
-                // projected lag-OK/shortfall is post-plan (final targets).
+                // R12/F2: honest goal chips. The denominator is the WHOLE
+                // active scope (74/76), never ok/(ok+shortfall) which would
+                // render 74/74. F1 separates the policy gate shortfall from the
+                // +5 p.p. reserve; F3 shows projected C/H on the exact chosen
+                // versions + goal feasibility instead of implying a plan fixes
+                // the findings. F4 keeps a truncation caveat visible without
+                // presenting actionable proposed rows as blockers.
+                const meta = draftResult.metadata
+                const lagRu: string[] = []
+                const lagEn: string[] = []
+                if (typeof meta.postPlanLagOk === 'number') {
+                  const denomScope = (typeof meta.postPlanScopeTotal === 'number' && meta.postPlanScopeTotal > 0) ? meta.postPlanScopeTotal : undefined
+                  const denom = denomScope !== undefined
+                    ? `${meta.postPlanLagOk}/${denomScope}`
+                    : (typeof meta.postPlanShortfall === 'number' ? `${meta.postPlanLagOk}/${meta.postPlanLagOk + meta.postPlanShortfall}` : `${meta.postPlanLagOk}`)
+                  const pct = typeof meta.postPlanLagOkPct === 'number' ? ` (${meta.postPlanLagOkPct}%)` : ''
+                  const tailRu: string[] = []
+                  const tailEn: string[] = []
+                  if (typeof meta.postPlanPolicyShortfall === 'number' && meta.postPlanPolicyShortfall > 0) {
+                    tailRu.push(`shortfall по политике ${meta.postPlanPolicyShortfall}`)
+                    tailEn.push(`policy shortfall ${meta.postPlanPolicyShortfall}`)
+                  }
+                  if (typeof meta.postPlanReserveShortfall === 'number' && meta.postPlanReserveShortfall > 0) {
+                    tailRu.push(`по запасу ${meta.postPlanReserveShortfall}`)
+                    tailEn.push(`reserve ${meta.postPlanReserveShortfall}`)
+                  }
+                  lagRu.push(`projected lag-OK ${denom}${pct}` + (tailRu.length ? ' · ' + tailRu.join(' · ') : ''))
+                  lagEn.push(`projected lag-OK ${denom}${pct}` + (tailEn.length ? ' · ' + tailEn.join(' · ') : ''))
+                }
+                if (typeof meta.postPlanCritical === 'number' || typeof meta.postPlanHigh === 'number') {
+                  lagRu.push(`projected C/H на целях: ${meta.postPlanCritical ?? 0}/${meta.postPlanHigh ?? 0}`)
+                  lagEn.push(`projected C/H on targets: ${meta.postPlanCritical ?? 0}/${meta.postPlanHigh ?? 0}`)
+                }
+                if (typeof meta.postPlanSecurityUnknown === 'number' && meta.postPlanSecurityUnknown > 0) {
+                  lagRu.push(`целей без OSV: ${meta.postPlanSecurityUnknown}`)
+                  lagEn.push(`targets without OSV: ${meta.postPlanSecurityUnknown}`)
+                }
+                if (meta.postPlanGoal) {
+                  const goalRu = ({ feasible: 'цель достижима', unknown: 'цель не подтверждена (OSV)', blocked: 'цель НЕ достижима этим планом' } as Record<string, string>)[meta.postPlanGoal]
+                  const goalEn = ({ feasible: 'goal reachable', unknown: 'goal not confirmed (OSV)', blocked: 'goal NOT reachable by this plan' } as Record<string, string>)[meta.postPlanGoal]
+                  lagRu.push(goalRu ?? meta.postPlanGoal)
+                  lagEn.push(goalEn ?? meta.postPlanGoal)
+                }
                 const parts = [
-                  typeof draftResult.metadata.postPlanLagOk === 'number' && typeof draftResult.metadata.postPlanShortfall === 'number'
-                    ? text(`projected lag-OK ${draftResult.metadata.postPlanLagOk}/${draftResult.metadata.postPlanShortfall + draftResult.metadata.postPlanLagOk} · shortfall ${draftResult.metadata.postPlanShortfall}`, `projected lag-OK ${draftResult.metadata.postPlanLagOk}/${draftResult.metadata.postPlanShortfall + draftResult.metadata.postPlanLagOk} · shortfall ${draftResult.metadata.postPlanShortfall}`) : '',
-                  typeof draftResult.metadata.candidateTruncated === 'number' && draftResult.metadata.candidateTruncated > 0 ? text(`поиск кандидатов усечён ${draftResult.metadata.candidateTruncated}`, `candidate search truncated ${draftResult.metadata.candidateTruncated}`) : '',
-                  typeof draftResult.metadata.noTarget === 'number' && draftResult.metadata.noTarget > 0 ? text(`без безопасного target ${draftResult.metadata.noTarget}`, `no safe target ${draftResult.metadata.noTarget}`) : '',
-                  typeof draftResult.metadata.blocked === 'number' && draftResult.metadata.blocked > 0 ? text(`target заблокирован ${draftResult.metadata.blocked}`, `target blocked ${draftResult.metadata.blocked}`) : '',
+                  lagRu.length || lagEn.length ? text(lagRu.join(' · '), lagEn.join(' · ')) : '',
+                  typeof meta.candidateTruncated === 'number' && meta.candidateTruncated > 0 ? text(
+                    `поиск кандидатов усечён ${meta.candidateTruncated}${typeof meta.candidateTruncatedTargetless === 'number' && meta.candidateTruncatedTargetless > 0 ? ` (без target: ${meta.candidateTruncatedTargetless})` : ''}`,
+                    `candidate search truncated ${meta.candidateTruncated}${typeof meta.candidateTruncatedTargetless === 'number' && meta.candidateTruncatedTargetless > 0 ? ` (targetless: ${meta.candidateTruncatedTargetless})` : ''}`,
+                  ) : '',
+                  typeof meta.noTarget === 'number' && meta.noTarget > 0 ? text(`без безопасного target ${meta.noTarget}`, `no safe target ${meta.noTarget}`) : '',
+                  typeof meta.blocked === 'number' && meta.blocked > 0 ? text(`target заблокирован ${meta.blocked}`, `target blocked ${meta.blocked}`) : '',
                 ].filter(Boolean).join(' · ')
                 return parts ? <span className="draft-result-meta">{parts}</span> : null
               })()}

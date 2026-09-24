@@ -152,7 +152,58 @@ type DraftResultSnapshot = {
     osvUnknown?: number
     metadataKnown?: number
     metadataTotal?: number
+    securityKnown?: number
+    securityTotal?: number
+    securityUnknown?: number
+    noTarget?: number
+    candidateTruncated?: number
+    candidateTruncatedTargetless?: number
+    candidateTruncatedProposed?: number
+    blocked?: number
+    ok?: number
+    postPlanLagOk?: number
+    postPlanLagOkPct?: number
+    postPlanScopeTotal?: number
+    // F1: policy gate vs +5 p.p. planning reserve are separate required counts
+    // and separate shortfalls; postPlanShortfall is the POLICY one.
+    postPlanPolicyRequired?: number
+    postPlanReserveRequired?: number
+    postPlanPolicyShortfall?: number
+    postPlanReserveShortfall?: number
+    postPlanShortfall?: number
+    // F3: projected security on the exact chosen/kept versions + feasibility.
+    postPlanCritical?: number
+    postPlanHigh?: number
+    postPlanSecurityKnown?: number
+    postPlanSecurityUnknown?: number
+    postPlanSecurityTotal?: number
+    postPlanGoal?: string
   }
+  // F2: per-project post-plan numbers (sizes and policies differ); the
+  // renderer prefers this view for the selected project.
+  perProject?: Record<string, {
+    postPlanLagOk?: number
+    postPlanLagOkPct?: number
+    postPlanScopeTotal?: number
+    postPlanPolicyRequired?: number
+    postPlanReserveRequired?: number
+    postPlanPolicyShortfall?: number
+    postPlanReserveShortfall?: number
+    postPlanCritical?: number
+    postPlanHigh?: number
+    postPlanSecurityKnown?: number
+    postPlanSecurityUnknown?: number
+    postPlanSecurityTotal?: number
+    postPlanGoal?: string
+    noTarget?: number
+    candidateTruncated?: number
+    candidateTruncatedTargetless?: number
+    candidateTruncatedProposed?: number
+    blocked?: number
+    ok?: number
+    proposed?: number
+    scopeTotal?: number
+  }>
   proposals: Record<string, number>
   artifacts: { manifest: string; plan: string; prompt: string; summary: string }
   hashes: { plan: string; prompt: string }
@@ -736,7 +787,18 @@ function draftReadStrict(
   return readDraftResultArtifact(workspace.path, runId, expect)
 }
 
-function buildDraftResultSnapshot(artifact: DraftResultArtifact): DraftResultSnapshot {
+function buildDraftResultSnapshot(artifact: DraftResultArtifact, projectName?: string): DraftResultSnapshot {
+  const meta = artifact.metadata ?? {}
+  // F2: a multi-project run keeps per-project numbers; the renderer sees the
+  // SELECTED project's own values and falls back to the (single-project)
+  // aggregate metadata when the per-project view is absent.
+  const perProject = projectName && artifact.perProject && artifact.perProject[projectName] &&
+    typeof artifact.perProject[projectName] === 'object'
+    ? artifact.perProject[projectName] as Record<string, unknown>
+    : undefined
+  const src: Record<string, unknown> = perProject ?? meta
+  const pickNumber = (value: unknown): number | undefined =>
+    typeof value === 'number' ? value : undefined
   return {
     runId: artifact.runId,
     status: artifact.status,
@@ -755,14 +817,37 @@ function buildDraftResultSnapshot(artifact: DraftResultArtifact): DraftResultSna
       total: typeof artifact.metadata?.total === 'number' ? artifact.metadata.total : 0,
       unknown: typeof artifact.metadata?.unknown === 'number' ? artifact.metadata.unknown : 0,
       unknownPackages: Array.isArray(artifact.metadata?.unknownPackages) ? artifact.metadata.unknownPackages : [],
-      processed: typeof artifact.metadata?.processed === 'number' ? artifact.metadata.processed : undefined,
-      processedTotal: typeof artifact.metadata?.processedTotal === 'number' ? artifact.metadata.processedTotal : undefined,
-      pending: typeof artifact.metadata?.pending === 'number' ? artifact.metadata.pending : undefined,
-      interrupted: typeof artifact.metadata?.interrupted === 'number' ? artifact.metadata.interrupted : undefined,
-      registryFailed: typeof artifact.metadata?.registryFailed === 'number' ? artifact.metadata.registryFailed : undefined,
-      osvUnknown: typeof artifact.metadata?.osvUnknown === 'number' ? artifact.metadata.osvUnknown : undefined,
-      metadataKnown: typeof artifact.metadata?.metadataKnown === 'number' ? artifact.metadata.metadataKnown : undefined,
-      metadataTotal: typeof artifact.metadata?.metadataTotal === 'number' ? artifact.metadata.metadataTotal : undefined,
+      processed: pickNumber(meta.processed),
+      processedTotal: pickNumber(meta.processedTotal),
+      pending: pickNumber(meta.pending),
+      interrupted: pickNumber(meta.interrupted),
+      registryFailed: pickNumber(meta.registryFailed),
+      osvUnknown: pickNumber(meta.osvUnknown),
+      metadataKnown: pickNumber(meta.metadataKnown),
+      metadataTotal: pickNumber(meta.metadataTotal),
+      securityKnown: pickNumber(meta.securityKnown),
+      securityTotal: pickNumber(meta.securityTotal),
+      securityUnknown: pickNumber(meta.securityUnknown),
+      noTarget: pickNumber(src.noTarget),
+      candidateTruncated: pickNumber(src.candidateTruncated),
+      candidateTruncatedTargetless: pickNumber(src.candidateTruncatedTargetless),
+      candidateTruncatedProposed: pickNumber(src.candidateTruncatedProposed),
+      blocked: pickNumber(src.blocked),
+      ok: pickNumber(src.ok),
+      postPlanLagOk: pickNumber(src.postPlanLagOk),
+      postPlanLagOkPct: pickNumber(src.postPlanLagOkPct),
+      postPlanScopeTotal: pickNumber(src.postPlanScopeTotal),
+      postPlanPolicyRequired: pickNumber(src.postPlanPolicyRequired),
+      postPlanReserveRequired: pickNumber(src.postPlanReserveRequired),
+      postPlanPolicyShortfall: pickNumber(src.postPlanPolicyShortfall),
+      postPlanReserveShortfall: pickNumber(src.postPlanReserveShortfall),
+      postPlanShortfall: pickNumber(src.postPlanShortfall),
+      postPlanCritical: pickNumber(src.postPlanCritical),
+      postPlanHigh: pickNumber(src.postPlanHigh),
+      postPlanSecurityKnown: pickNumber(src.postPlanSecurityKnown),
+      postPlanSecurityUnknown: pickNumber(src.postPlanSecurityUnknown),
+      postPlanSecurityTotal: pickNumber(src.postPlanSecurityTotal),
+      postPlanGoal: typeof src.postPlanGoal === 'string' ? src.postPlanGoal : undefined,
     },
     proposals: artifact.proposals && typeof artifact.proposals === 'object'
       ? Object.fromEntries(Object.entries(artifact.proposals).map(([key, value]) => [key, typeof value === 'number' ? value : 0]))
@@ -783,7 +868,7 @@ function draftResultForProject(workspace: WorkspaceRecord, projectName?: string)
   // resolve to this workspace/project's run (T5).
   const read = draftReadStrict(workspace, ref.runId, { workspaceId: workspace.id, projectId: projectName })
   if (!read.ok) return undefined
-  const snapshot = buildDraftResultSnapshot(read.artifact)
+  const snapshot = buildDraftResultSnapshot(read.artifact, projectName)
   // F4: the card shows whether the LAST Draft for this project still matches
   // today's inputs/policy, so a stale result is never presented as fresh even
   // when nothing new ran since it was generated.
@@ -838,7 +923,7 @@ function importDraftResult(
     }
     saveState(state)
   }
-  return { ok: true, snapshot: buildDraftResultSnapshot(artifact) }
+  return { ok: true, snapshot: buildDraftResultSnapshot(artifact, projectName) }
 }
 
 function promptPathForProject(workspace: WorkspaceRecord, projectName: string): string | undefined {

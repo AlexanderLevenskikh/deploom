@@ -348,5 +348,265 @@ class DraftCandidateScopeTests(unittest.TestCase):
         self.assertIn("candidate search", unknown_reasons.get("crit-pkg2", ""), unknown_reasons)
 
 
+class DraftGoalHonestyTests(unittest.TestCase):
+    """R12 follow-up audit (F1-F4): Draft goal numbers must be HONEST.
+
+    F1: the policy gate (user's minLagOkPct: 61/76 at 80%) is never replaced by
+    the +5 p.p. planning reserve (65/76); the two have separate required counts
+    and separate shortfalls in plan.json/result.json/prompt.
+    F2: the cross-project share is sum(projectedLagOk)/sum(scopeTotal), never a
+    sum of per-project percentages; each project keeps its OWN numbers.
+    F3: post-plan SECURITY is projected on the EXACT chosen/kept versions
+    (Critical/High + goalFeasible/unknown/blocked); a target without OSV
+    evidence is UNKNOWN, never clean.
+    F4: a truncation CAVEAT on an actionable proposed row is NOT a
+    clarification -- only targetless/unassessed rows enter "needs
+    clarification" (plan.unknowns / manifest metadata.unknown).
+    """
+
+    def setUp(self) -> None:
+        self._tmp = Path(tempfile.mkdtemp(prefix="deploom-r12b-"))
+        self.addCleanup(shutil.rmtree, self._tmp, True)
+
+    def _fixture(self, name: str, deps, registry: str) -> Path:
+        ws = self._tmp / name
+        _write(ws / ".dependency-roadmap" / "settings.project.json",
+               json.dumps({"registry": registry,
+                           "projects": [{"name": name, "path": ".", "sourceBranch": "main"}]}))
+        package_deps = {pkg: f"^{current}" for pkg, current, _latest in deps}
+        lock_packages = {
+            "": {"name": name, "version": "1.0.0", "dependencies": package_deps},
+        }
+        for pkg, current, _latest in deps:
+            lock_packages[f"node_modules/{pkg}"] = {"version": current}
+        lock = {"name": name, "version": "1.0.0", "lockfileVersion": 3, "requires": True, "packages": lock_packages}
+        _write(ws / "package.json", json.dumps({"name": name, "version": "1.0.0", "dependencies": package_deps}, indent=2))
+        _write(ws / "package-lock.json", json.dumps(lock, indent=2))
+        return ws
+
+    def _run(self, ws: Path, project: str, args: list[str], osv_base: str, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+        run_env = os.environ.copy()
+        run_env.pop("DEPLOOM_DRAFT_DEADLINE_SECONDS", None)
+        run_env["PYTHONIOENCODING"] = "utf-8"
+        run_env["DEPLOOM_OSV_QUERY_BATCH"] = f"{osv_base}/osv/querybatch"
+        run_env["DEPLOOM_OSV_VULN"] = f"{osv_base}/osv/vulns/{{id}}"
+        cmd = [
+            sys.executable, str(GENERATOR),
+            "--project-settings", str(ws / ".dependency-roadmap" / "settings.project.json"),
+            "--only-project", project, "--draft-baseline",
+            "--artifacts-dir", str(ws / ".dependency-roadmap" / "artifacts"),
+            *args,
+        ]
+        return subprocess.run(cmd, cwd=str(ws), env=run_env, capture_output=True, text=True,
+                              encoding="utf-8", timeout=timeout)
+
+    def _plan(self, ws: Path, run_id: str):
+        return _read_json(ws / ".dependency-roadmap" / "artifacts" / "runs" / run_id / "draft" / "plan.json")
+
+    def _manifest(self, ws: Path, run_id: str):
+        return _read_json(ws / ".dependency-roadmap" / "artifacts" / "runs" / run_id / "draft" / "result.json")
+
+    def _prompt(self, ws: Path, run_id: str) -> str:
+        return (ws / ".dependency-roadmap" / "artifacts" / "runs" / run_id / "draft" / "prompt.md").read_text(encoding="utf-8")
+
+    def test_policy_gate_not_replaced_by_planning_reserve_on_76_rows(self):
+        """F1: with 76 active rows, 80% gate = 61/76, +5 p.p. reserve = 65/76.
+        The plan (74 projected lag-OK) satisfies the POLICY gate; the required
+        numbers and shortfalls must stay separate and the prompt must label
+        61/76 as the policy requirement and 65/76 as the reserve -- never sign
+        the reserve as the policy percentage (65/76 (80%))."""
+        base_versions = [f"1.0.{i}" for i in range(5)]
+        fresh_times = {v: "2026-08-01T00:00:00Z" for v in base_versions}
+        healthy = [(f"h-{i:02d}", "1.0.2", "1.0.4") for i in range(74)]
+        stale = [("s-00", "1.0.0", "1.0.0"), ("s-01", "1.0.0", "1.0.0")]
+        deps = healthy + stale
+        versions_map = {pkg: list(base_versions) for pkg, _c, _l in deps}
+        # The two stale rows live in a packument with no newer version at all:
+        # no lag target can exist, so they are honest no-target rows (and never
+        # report a truncated search -- the whole range is covered).
+        versions_map["s-00"] = ["1.0.0"]
+        versions_map["s-01"] = ["1.0.0"]
+        times = {pkg: dict(fresh_times) for pkg, _c, _l in deps}
+        # The stale rows carry NO publish dates at all: their latest version is
+        # unknown, so no lag boundary can be computed and no theoretical target
+        # exists -- they stay honest no-target rows.
+        times["s-00"] = {}
+        times["s-01"] = {}
+        with _MockRegistry(deps, versions_map, times=times) as reg:
+            ws = self._fixture("f1-76", deps, registry=reg.url)
+            result = self._run(ws, "f1-76",
+                               ["--run-id", "run-r12b-f1", "--workspace-id", "ws-r12b", "--project-id", "f1-76",
+                                "--mode", "draft", "--draft-deadline-seconds", "150"],
+                               osv_base=reg.url)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        plan = self._plan(ws, "run-r12b-f1")
+        health = plan["proposals"][0]["health"]
+        self.assertEqual(health["postPlanScopeTotal"], 76, health)
+        self.assertEqual(health["postPlanPolicyRequired"], 61, health)
+        self.assertEqual(health["postPlanReserveRequired"], 65, health)
+        self.assertEqual(health["postPlanLagOk"], 74, health)
+        self.assertEqual(health["postPlanPolicyShortfall"], 0, health)
+        self.assertEqual(health["postPlanReserveShortfall"], 0, health)
+        self.assertEqual(plan["counts"]["no-target"], 2, plan["counts"])
+        prompt = self._prompt(ws, "run-r12b-f1")
+        self.assertIn("61/76 (80%)", prompt,
+                      "the prompt must state the USER policy gate, never the reserve")
+        self.assertNotIn("65/76 (80%)", prompt,
+                         "the +5 p.p. reserve must never be signed as the policy percentage")
+        self.assertIn("плановый запас", prompt)
+        self.assertIn("97.4", prompt)
+        self.assertIn("shortfall: 0", prompt)
+        manifest = self._manifest(ws, "run-r12b-f1")
+        meta = manifest["metadata"]
+        self.assertEqual(meta["postPlanPolicyRequired"], 61, meta)
+        self.assertEqual(meta["postPlanReserveRequired"], 65, meta)
+        self.assertEqual(meta["postPlanLagOk"], 74, meta)
+        self.assertEqual(meta["postPlanScopeTotal"], 76, meta)
+        self.assertEqual(meta["postPlanLagOkPct"], 97.4, meta)
+        self.assertEqual(meta["postPlanPolicyShortfall"], 0, meta)
+        self.assertEqual(meta["postPlanReserveShortfall"], 0, meta)
+        self.assertEqual(meta["postPlanGoal"], "feasible", meta)
+        self.assertEqual(manifest["perProject"]["f1-76"]["postPlanPolicyRequired"], 61, manifest["perProject"])
+
+    def test_aggregate_share_uses_summed_denominator_not_sum_of_percentages(self):
+        """F2: two projects with different sizes/policies -- the aggregate share
+        is sum(projectedLagOk) / sum(scopeTotal), never the sum of the per-project
+        percentages (8/10 + 25/50 = 33/60 = 55.0%, not 80 + 50 = 130)."""
+        healths = [
+            {"postPlanLagOk": 8, "postPlanScopeTotal": 10, "postPlanPolicyRequired": 8,
+             "postPlanReserveRequired": 9, "postPlanPolicyShortfall": 0, "postPlanReserveShortfall": 0,
+             "postPlanCritical": 0, "postPlanHigh": 0, "postPlanSecurityKnown": 10,
+             "postPlanSecurityUnknown": 0, "postPlanSecurityTotal": 10, "postPlanGoal": "feasible",
+             "postPlanTruncatedProposed": 0},
+            {"postPlanLagOk": 25, "postPlanScopeTotal": 50, "postPlanPolicyRequired": 25,
+             "postPlanReserveRequired": 28, "postPlanPolicyShortfall": 0, "postPlanReserveShortfall": 0,
+             "postPlanCritical": 0, "postPlanHigh": 0, "postPlanSecurityKnown": 50,
+             "postPlanSecurityUnknown": 0, "postPlanSecurityTotal": 50, "postPlanGoal": "feasible",
+             "postPlanTruncatedProposed": 0},
+        ]
+        aggregate = roadmap.draft_post_plan_aggregate(healths)
+        self.assertEqual(aggregate["postPlanLagOk"], 33)
+        self.assertEqual(aggregate["postPlanScopeTotal"], 60)
+        self.assertEqual(aggregate["postPlanLagOkPct"], 55.0,
+                         "the aggregate must be the weighted share, not a sum of percentages")
+
+    @staticmethod
+    def _synthetic_row(name, current="1.0.0", latest="1.0.9", vulns="0", min_lag="1.0.9",
+                       target_yellow="1.0.9", evidence=None, truncated=False):
+        row = roadmap.DependencyRow(
+            project="proj", package_dir="proj", name=name, kind="runtime",
+            requested_spec="^1.0.0", current_version=current, current_source="package-lock.json",
+            latest_version=latest, current_vulns=vulns,
+            min_no_critical="1.0.9", min_no_high="1.0.9", min_no_vuln="1.0.9",
+            min_lag_12m=min_lag, min_lag_9m=min_lag, min_lag_6m=min_lag, min_lag_3m=min_lag,
+            group=0, reason="", notes="", draft_scan_state="done",
+            candidate_search_truncated=truncated,
+        )
+        row.target_yellow = target_yellow
+        row.target_green = target_yellow
+        row.target_default = target_yellow
+        row.vuln_evidence_by_version = dict(evidence or {})
+        return row
+
+    def _plan_for(self, rows):
+        health = roadmap.compute_project_health(rows, "proj")
+        spec = roadmap.ProjectSpec(name="proj", path=Path("proj"))
+        return roadmap.build_draft_plan(
+            {"proj": rows}, {"proj": spec}, {"proj": health}
+        )
+
+    def test_projected_security_shows_target_fixes_current_critical(self):
+        """F3: a current Critical eliminated by the exact chosen target must
+        project Critical=0 and keep the goal FEASIBLE."""
+        row = self._synthetic_row("fixme", current="1.0.0", vulns="C:1",
+                                  evidence={"1.0.9": "0"})
+        plan = self._plan_for([row])
+        health = plan["proposals"][0]["health"]
+        self.assertEqual(plan["proposals"][0]["rows"][0]["status"], "proposed", plan)
+        self.assertEqual(health["critical"], 1, health)
+        self.assertEqual(health["postPlanCritical"], 0, health)
+        self.assertEqual(health["postPlanHigh"], 0, health)
+        self.assertEqual(health["postPlanGoal"], "feasible", health)
+
+    def test_target_reintroducing_critical_blocks_the_goal(self):
+        """F3: a chosen target whose EXACT version again carries a Critical must
+        project Critical=1 and mark the goal BLOCKED -- a proposed target never
+        implies the C/H is fixed."""
+        row = self._synthetic_row("recrit", current="1.0.0", vulns="0",
+                                  evidence={"1.0.9": "C:1"})
+        plan = self._plan_for([row])
+        health = plan["proposals"][0]["health"]
+        self.assertEqual(health["critical"], 0, health)
+        self.assertEqual(health["postPlanCritical"], 1, health)
+        self.assertEqual(health["postPlanGoal"], "blocked", health)
+
+    def test_missing_osv_for_exact_target_is_unknown_not_safe(self):
+        """F3: a target without OSV evidence is coverage-UNKNOWN (never clean),
+        so the goal is UNKNOWN, not feasible."""
+        row = self._synthetic_row("noosv", current="1.0.0", vulns="0", evidence={})
+        plan = self._plan_for([row])
+        health = plan["proposals"][0]["health"]
+        self.assertEqual(health["postPlanSecurityUnknown"], 1, health)
+        self.assertEqual(health["postPlanGoal"], "unknown", health)
+        self.assertNotEqual(health["postPlanGoal"], "feasible", health)
+
+    def test_policy_gate_counts_are_split_into_policy_and_reserve_shortfalls(self):
+        """F1: when projected lag-OK sits between the policy gate and the
+        reserve (62 >= 61 but < 65), the POLICY shortfall is 0 while the RESERVE
+        shortfall is > 0 -- the old code reported a shortfall against the
+        reserve as if it were the gate."""
+        row = self._synthetic_row("mid", current="1.0.0", vulns="0",
+                                  evidence={"1.0.9": "0"})
+        plan = self._plan_for([row])
+        health = plan["proposals"][0]["health"]
+        self.assertEqual(health["postPlanPolicyRequired"], 1, health)
+        self.assertEqual(health["postPlanReserveRequired"], 1, health)
+        self.assertEqual(health["postPlanPolicyShortfall"], 0, health)
+        self.assertEqual(health["postPlanReserveShortfall"], 0, health)
+
+    def test_truncated_proposed_row_is_both_actionable_and_not_a_clarification(self):
+        """F4: a truncation CAVEAT on a row with a concrete target and known
+        security is NOT a 'needs clarification' state -- the row stays proposed,
+        carries the caveat, and does NOT enter plan.unknowns / manifest.unknown.
+        The counters separate it: candidateTruncated=1 (covered versions
+        bounded), candidateTruncatedProposed=1 (still actionable),
+        candidateTruncatedTargetless=0."""
+        versions = [f"1.0.{i}" for i in range(11)]
+        old = {v for i, v in enumerate(versions) if i <= 6}
+        fresh = {v for i, v in enumerate(versions) if i > 6}
+        times = {"f4-pkg": {**{v: "2023-05-01T00:00:00Z" for v in old},
+                            **{v: "2026-08-01T00:00:00Z" for v in fresh}}}
+        deps = [("f4-pkg", "1.0.0", "1.0.10")]
+        with _MockRegistry(deps, {"f4-pkg": versions}, times=times) as reg:
+            ws = self._fixture("f4-caveat", deps, registry=reg.url)
+            result = self._run(ws, "f4-caveat",
+                               ["--run-id", "run-r12b-f4", "--workspace-id", "ws-r12b", "--project-id", "f4-caveat",
+                                "--mode", "draft", "--draft-deadline-seconds", "30",
+                                "--draft-max-candidates", "3"],
+                               osv_base=reg.url)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        plan = self._plan(ws, "run-r12b-f4")
+        rows = plan["proposals"][0]["rows"]
+        self.assertEqual(len(rows), 1, rows)
+        row = rows[0]
+        self.assertEqual(row["status"], "proposed", row)
+        self.assertTrue(row["candidateSearchTruncated"], row)
+        self.assertIn("1.0.7", str(row["target"]), row)
+        self.assertEqual(plan["unknowns"], [],
+                         "an actionable proposed row with a truncation caveat is not a clarification")
+        self.assertEqual(plan["proposals"][0]["health"]["postPlanTruncatedProposed"], 1, plan)
+        manifest = self._manifest(ws, "run-r12b-f4")
+        meta = manifest["metadata"]
+        self.assertEqual(meta["candidateTruncated"], 1, meta)
+        self.assertEqual(meta["candidateTruncatedTargetless"], 0, meta)
+        self.assertEqual(meta["candidateTruncatedProposed"], 1, meta)
+        self.assertEqual(meta["unknown"], 0, meta)
+        prompt = self._prompt(ws, "run-r12b-f4")
+        self.assertNotIn("`f4-pkg`", prompt.split("## Неизвестные/требуют уточнения у агента")[1]
+                         if "## Неизвестные/требуют уточнения у агента" in prompt else "",
+                         "the clarification section must not list an actionable proposed row")
+        self.assertIn("Примечание: поиск кандидатов ограничен лимитом", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()
