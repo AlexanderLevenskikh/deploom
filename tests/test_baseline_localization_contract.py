@@ -103,10 +103,14 @@ class BaselineLocalizationContractTests(unittest.TestCase):
         )
 
         # A candidate that survives screening must still execute the complete
-        # configured ProjectProof using the full exact direct assignment.
+        # configured ProjectProof using the full exact direct assignment. The
+        # candidate config is budget-wrapped (FAST wall-clock deadline) but the
+        # materialized assignment must stay the full verification_assignment.
         self.assertIn(
             "project_result = verify_assignment(\n"
-            "                                spec.path, verification_assignment, config=config, run_project_checks=True",
+            "                                spec.path, verification_assignment,\n"
+            "                                config=_with_candidate_deadline(config, candidate_phase_deadline),\n"
+            "                                run_project_checks=True",
             source,
         )
 

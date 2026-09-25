@@ -1,6 +1,6 @@
 # Draft Modes: Revalidation #12 — честная scope-проекция цели (policy-гейт vs плановый запас, post-plan security, goal verdict) + не скрываемые candidate-версии (R12)
 
-Дата: 2026-09-24. Целевая версия: v0.2.130. Статус: **все пункты закрыты (исходные R12 + аудит F1–F4), полный набор проверок зелёный** (Python 1029 OK skipped=4, Desktop build, 45/45 check-скриптов, oxlint 0 errors, public-sanitization OK, CI и Release v0.2.130 зелёные после фикса VERSION BOM).
+Дата: 2026-09-24. Целевая версия: v0.2.130. Статус: **все пункты закрыты (исходные R12 + аудит F1–F4 + аудит F5), полный набор проверок зелёный** (Python, Desktop build, 45/45 check-скриптов, oxlint 0 errors, public-sanitization OK, CI и Release v0.2.130 зелёные после фикса VERSION BOM).
 
 ## Проблема (R12, исходная)
 
@@ -69,7 +69,32 @@
 
 Итог: lag-критерий план закрывает (74 ≥ 65 ≥ 61), но вердикт цели честный — **blocked**: на выбранных версиях остаются 3 High при лимите maxKnownHigh=1 (F3). В отличие от предыдущего отчёта, достижимость yellow НЕ заявляется без проверки security на точных target. 1 Critical уходит на выбранных версиях, 5 High → 3; остаток High и отсутствие OSV-данных у 1 пакета — отдельные задачи, видны в prompt/UI как блокеры и «целей без OSV».
 
-## Регрессия
+## Аудит приёмки (review R12) — F5: postPlanGoal для зелёной цели (targetLevel=green)
+
+| Id | Приоритет | Замечание аудита | Фикс |
+|---|---|---|---|
+| F5 | P1 | `build_draft_plan` считает и `post_yellow`, и `post_green`, но вердикт всегда строился по yellow: `_draft_goal_verdict(post_yellow, yellow_required, …)` с `maxKnownHigh=1`. Для запуска `targetLevel=green` числа `postPlanGoal`, `postPlanLagOk`, `postPlanPolicyRequired`, shortfall, prompt и UI представляли yellow-проекцию как цель green (8/10 → feasible, H:1 → feasible), а `_draft_target_for_major` отдавал агенту green-цели — цифры цели и фактический список изменений расходились | Вердикт и все postPlan* считаются для ВЫБРАННОГО уровня из политики запуска. Green — собственная грань статуса: 100% scope provably lag-OK, C=0, H=0 и M/L-лимиты green status (`_health_ml_clear`); `maxKnownHigh=1` yellow ни при каких условиях не разрешает H для green. Неполные OSV **или lag-данные** → `unknown`, никогда `feasible`. Проекция lag строится на тех же точных версиях, что попадают в `proposed` (`_row_lag_ok_at_chosen_assignment` через `_draft_target_for_major`, который теперь читает per-project `targetLevel` политики, а не shared global). Диагностика жёлтого/зелёного вариантов сохранена: `postPlanLagOkYellow/Green` (+Pct) и `postPlanYellowShortfall/GreenShortfall`. Prompt/UI/сводка подписывают `targetLevel` рядом с вердиктом; для green «требуется N/N (100%)». `DRAFT_READY` остаётся статусом сканирования |
+
+## Failing-first (F5)
+
+6 новых тестов в `DraftGoalHonestyTests`:
+- **F5a (юнит, воспр. №1)**: green 10 активных, 8 projected lag-OK, C/H=0, 2 строки без назначаемого target → `postPlanGoal=blocked`, `required=10`, `lagOk=8`, `shortfall=2`, уровень green, diagnostic `postPlanLagOkYellow=Green=8`; строки без target — `no-target`, НЕ projected lag-OK;
+- **F5b (юнит, воспр. №2)**: 1/1 lag-OK, H:1, тот же лимит `maxKnownHigh=1` → green `blocked`, yellow на тех же строках `feasible`;
+- **F5c (юнит)**: 100% lag + C/H=0 + полный OSV → `feasible` (required 6/6); нет OSV-данных у exact target → `unknown`; M=25 за лимитом → `blocked`;
+- **F5d (юнит, парный)**: одни и те же строки, разные выбранные targets: yellow → target 1.0.9 (proposed, projection 10) и green → target 1.0.5 (proposed, projection 8); verdict/required меняются по уровню, проекция ровно по `proposed`;
+- **F5e (юнит, prompt)**: RU «Заголовок (уровень: green)», «требуется по политике: 10/10 (100%)», «Оценка достижимости цели (green): НЕ достижима этим планом»; EN «level: green», «policy requires 10/10 (100%)», «Goal feasibility (green): NOT reachable by this plan»; в обоих нет «достижима»-формулировки yellow;
+- **F5f (subprocess, end-to-end)**: `--target-level green`, 76 строк (74 здоровых + 2 без lag-данных) → manifest/per-project/postPlanTargetLevel=green, required 76, projected 74, `postPlanGoal=unknown` (2 строки без lag-данных непроверяемы для green closure — «неполные OSV/lag-данные → unknown»), prompt/summary с «уровень: green» и «(100%)».
+
+**До фикса** эти сценарии давали yellow-вердикты (8/10 → feasible, H:1 → feasible) и required/проекцию по yellow. **После фикса**: 13/13 DraftGoalHonestyTests + 5 исходных R12 + 26 contract = 51 тест зелёные (жёлтая ветка R12 не изменена).
+
+## Регрессия (F5 + финальный R12)
+
+- Python: полный набор **1029 тестов OK** (skipped=4) + R12/contract набор: 51 тест OK (5 исходных R12 + 13 DraftGoalHonestyTests (7 F1–F4 + 6 F5) + 26 test_draft_baseline_contract); yellow-семантика R12 не изменена (F1-фикстура по-прежнему даёт 61/65/74/0/0).
+- Desktop: `npm run build` ОК, 45/45 check-скриптов, oxlint 0 errors (10 warnings — все до изменений); типы metadata/perProject расширены `postPlanTargetLevel`/`postPlanModerate`/`postPlanLow`, чип вердикта подписывает уровень.
+- `scripts/check-public-sanitization.py`: OK.
+- CI/Release: v0.2.130 уже зелёные (после фикса VERSION BOM); F5-изменения пойдут следующим коммитом/релизом.
+
+## Регрессия (R12, исходная)
 
 - Python: **1029 тестов OK** (skipped=4) — включая все старые Draft/C1/T3/T4/C2/peer-наборы и R12-набор (12 тестов: 5 исходных + 7 F1–F4).
 - Desktop: `npm run build` ОК, 45/45 check-скриптов, oxlint 0 errors (10 warnings — все до изменений).

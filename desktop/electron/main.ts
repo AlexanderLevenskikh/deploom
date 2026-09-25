@@ -164,6 +164,7 @@ type DraftResultSnapshot = {
     postPlanLagOk?: number
     postPlanLagOkPct?: number
     postPlanScopeTotal?: number
+    postPlanTargetLevel?: string
     // F1: policy gate vs +5 p.p. planning reserve are separate required counts
     // and separate shortfalls; postPlanShortfall is the POLICY one.
     postPlanPolicyRequired?: number
@@ -174,6 +175,8 @@ type DraftResultSnapshot = {
     // F3: projected security on the exact chosen/kept versions + feasibility.
     postPlanCritical?: number
     postPlanHigh?: number
+    postPlanModerate?: number
+    postPlanLow?: number
     postPlanSecurityKnown?: number
     postPlanSecurityUnknown?: number
     postPlanSecurityTotal?: number
@@ -185,12 +188,15 @@ type DraftResultSnapshot = {
     postPlanLagOk?: number
     postPlanLagOkPct?: number
     postPlanScopeTotal?: number
+    postPlanTargetLevel?: string
     postPlanPolicyRequired?: number
     postPlanReserveRequired?: number
     postPlanPolicyShortfall?: number
     postPlanReserveShortfall?: number
     postPlanCritical?: number
     postPlanHigh?: number
+    postPlanModerate?: number
+    postPlanLow?: number
     postPlanSecurityKnown?: number
     postPlanSecurityUnknown?: number
     postPlanSecurityTotal?: number
@@ -837,6 +843,7 @@ function buildDraftResultSnapshot(artifact: DraftResultArtifact, projectName?: s
       postPlanLagOk: pickNumber(src.postPlanLagOk),
       postPlanLagOkPct: pickNumber(src.postPlanLagOkPct),
       postPlanScopeTotal: pickNumber(src.postPlanScopeTotal),
+      postPlanTargetLevel: typeof src.postPlanTargetLevel === 'string' ? src.postPlanTargetLevel : undefined,
       postPlanPolicyRequired: pickNumber(src.postPlanPolicyRequired),
       postPlanReserveRequired: pickNumber(src.postPlanReserveRequired),
       postPlanPolicyShortfall: pickNumber(src.postPlanPolicyShortfall),
@@ -844,6 +851,8 @@ function buildDraftResultSnapshot(artifact: DraftResultArtifact, projectName?: s
       postPlanShortfall: pickNumber(src.postPlanShortfall),
       postPlanCritical: pickNumber(src.postPlanCritical),
       postPlanHigh: pickNumber(src.postPlanHigh),
+      postPlanModerate: pickNumber(src.postPlanModerate),
+      postPlanLow: pickNumber(src.postPlanLow),
       postPlanSecurityKnown: pickNumber(src.postPlanSecurityKnown),
       postPlanSecurityUnknown: pickNumber(src.postPlanSecurityUnknown),
       postPlanSecurityTotal: pickNumber(src.postPlanSecurityTotal),

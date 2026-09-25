@@ -235,6 +235,7 @@ export type DraftResultSnapshot = {
     postPlanLagOk?: number
     postPlanLagOkPct?: number
     postPlanScopeTotal?: number
+    postPlanTargetLevel?: string
     // F1: the policy gate (user's minLagOkPct) and the +5 p.p. planning
     // reserve are SEPARATE required counts and SEPARATE shortfalls; the
     // published postPlanShortfall is the POLICY one.
@@ -247,6 +248,8 @@ export type DraftResultSnapshot = {
     // the feasibility verdict (feasible | unknown | blocked).
     postPlanCritical?: number
     postPlanHigh?: number
+    postPlanModerate?: number
+    postPlanLow?: number
     postPlanSecurityKnown?: number
     postPlanSecurityUnknown?: number
     postPlanSecurityTotal?: number
@@ -258,12 +261,15 @@ export type DraftResultSnapshot = {
     postPlanLagOk?: number
     postPlanLagOkPct?: number
     postPlanScopeTotal?: number
+    postPlanTargetLevel?: string
     postPlanPolicyRequired?: number
     postPlanReserveRequired?: number
     postPlanPolicyShortfall?: number
     postPlanReserveShortfall?: number
     postPlanCritical?: number
     postPlanHigh?: number
+    postPlanModerate?: number
+    postPlanLow?: number
     postPlanSecurityKnown?: number
     postPlanSecurityUnknown?: number
     postPlanSecurityTotal?: number

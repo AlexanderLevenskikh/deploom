@@ -473,6 +473,50 @@ def _baseline_automatic_budget_seconds(product_mode: Optional[str] = None) -> in
     return 15 * 60
 
 
+def _baseline_budget_source(product_mode: Optional[str] = None) -> str:
+    """Where the effective wall-clock / attempt budget came from.
+
+    P1 Verified Baseline Fast: the terminal envelope must say whether the
+    budget was an explicit env override or the product-mode default, so users
+    can distinguish 'we used your override' from 'this is just the FAST policy'.
+    """
+    if _baseline_env_nonnegative_int("DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS"):
+        return "env:DEPLOOM_BASELINE_AUTOMATIC_BUDGET_SECONDS"
+    if _baseline_env_nonnegative_int("DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS"):
+        return "env:DEPLOOM_BASELINE_MAX_EXPENSIVE_ATTEMPTS"
+    mode = (product_mode or _baseline_product_mode())
+    return f"product-default:{mode}"
+
+
+def _candidate_budget_deadline(anytime: Any) -> Optional[float]:
+    """Absolute monotonic deadline bounding ALL phases of the current candidate.
+
+    FAST declares a small wall-clock budget; without propagation the verifier
+    would give every phase its own 600s/attempt timeout and one candidate could
+    legally run ~1800s (observed 904s). DEEP keeps its large per-phase timeouts.
+    """
+    if anytime.policy.strategy != "fast":
+        return None
+    remaining = max(0.0, anytime.policy.wall_clock_seconds - anytime.elapsed_seconds)
+    return time.monotonic() + max(1.0, remaining)
+
+
+def _with_candidate_deadline(config: Any, deadline: Optional[float]) -> Any:
+    if deadline is None:
+        return config
+    return dataclasses.replace(config, budget_phase_deadline=deadline)
+
+
+def _first_failed_exit_code(result: Any) -> int:
+    failures = getattr(result, "project_failures", ()) or ()
+    if failures:
+        try:
+            return max(-1, int(getattr(failures[0], "exit_code", -1) or -1))
+        except (TypeError, ValueError):
+            return -1
+    return -1
+
+
 def _baseline_human_decision_focus(
     learned_constraints: Sequence[Mapping[str, str]],
     current_versions: Mapping[str, str],
@@ -9177,6 +9221,8 @@ class BaselineConstraintVerificationError(RuntimeError):
         terminal_status: BaselineTerminalStatus | str | None = None,
         terminal_source: str = "",
         stop_code: str = "",
+        failure_context: Optional[Mapping[str, str]] = None,
+        check_evidence: Optional[Mapping[str, str]] = None,
     ) -> None:
         super().__init__(message)
         self.terminal_status = (
@@ -9186,6 +9232,11 @@ class BaselineConstraintVerificationError(RuntimeError):
         )
         self.terminal_source = str(terminal_source or "")
         self.stop_code = str(stop_code or "")
+        # BLOCK_PSI_VERIFIED_BASELINE_FAST_BUDGET_V1
+        # Structured context so the failure envelope is not empty: which
+        # project/mode/iteration/assignment/phase/command stopped the run.
+        self.failure_context = dict(failure_context or {})
+        self.check_evidence = dict(check_evidence or {})
 
 
 def _baseline_terminal_error(
@@ -9194,13 +9245,121 @@ def _baseline_terminal_error(
     message: str,
     *,
     source: str,
+    project: str = "",
+    mode: str = "",
+    iteration: str = "",
+    assignment: str = "",
+    phase: str = "",
+    command: str = "",
+    predicate: str = "",
+    exit_code: str = "",
+    elapsed_seconds: str = "",
+    output_tail: str = "",
+    exhaustive_authorized: Optional[bool] = None,
+    continuation_reason: str = "",
 ) -> BaselineConstraintVerificationError:
+    context: Dict[str, str] = {}
+    for key, value in (
+        ("project", project),
+        ("mode", mode),
+        ("iteration", iteration),
+        ("assignment", assignment),
+        ("phase", phase),
+        ("command", command),
+    ):
+        if value:
+            context[key] = str(value)
+    if exhaustive_authorized is not None:
+        context["exhaustiveAuthorized"] = "true" if exhaustive_authorized else "false"
+    if continuation_reason:
+        context["continuationReason"] = str(continuation_reason)
+    evidence: Dict[str, str] = {}
+    for key, value in (
+        ("phase", phase),
+        ("command", command),
+        ("predicate", predicate),
+        ("exitCode", exit_code),
+        ("elapsedSeconds", elapsed_seconds),
+        ("outputTail", output_tail),
+    ):
+        if value:
+            evidence[key] = str(value)
     return BaselineConstraintVerificationError(
         f"{stop_code}: terminalStatus={status.value}; terminalSource={source}; {message}",
         terminal_status=status,
         terminal_source=source,
         stop_code=stop_code,
+        failure_context=context,
+        check_evidence=evidence,
     )
+
+
+class BaselineBudgetExceededCutoff(BaselineConstraintVerificationError):
+    """A candidate phase hit the shared wall-clock budget and was not verified.
+
+    This is DIFFERENT from UNSAT: it proves only that one candidate could not
+    be verified within the declared budget. The existing baseline is preserved
+    and the envelope carries phase/command/predicate evidence.
+    """
+
+    def __init__(
+        self,
+        *,
+        project: str,
+        mode: str,
+        iteration: str,
+        assignment: str,
+        phase: str,
+        command: str,
+        predicate: str = "",
+        elapsed_seconds: str = "",
+        output_tail: str = "",
+        budget_source: str = "",
+        wall_clock_seconds: float = 0,
+        exhaustive_authorized: Optional[bool] = None,
+    ) -> None:
+        summary = (
+            f"проверка типов кандидата не прошла: "
+            f"command={command or 'n/a'}; exitCode=n/a; "
+            f"phase={phase or 'n/a'}; predicate={predicate or 'n/a'}; "
+            f"elapsedSeconds={elapsed_seconds or 'n/a'}"
+        )
+        budget_clause = (
+            f"wallClockSeconds={wall_clock_seconds:g}; budgetSource={budget_source or 'product-default'}"
+            if wall_clock_seconds
+            else ""
+        )
+        message = (
+            f"BASELINE_BUDGET_EXHAUSTED (BASELINE_VERIFICATION_PLATEAU): "
+            f"{project}/{mode}: budget-exhausted-after-one-candidate: {summary}; "
+            f"{budget_clause}; это доказывает только остановку попытки по бюджету, "
+            f"а не отсутствие решения; прежняя зависимая база (baseline) сохранена."
+        )
+        super().__init__(
+            message,
+            terminal_status=BaselineTerminalStatus.PLATEAU,
+            terminal_source="solve-and-verify-budget-cutoff",
+            stop_code="BASELINE_VERIFICATION_PLATEAU",
+            failure_context={
+                "project": project,
+                "mode": mode,
+                "iteration": str(iteration),
+                "assignment": assignment,
+                "phase": phase,
+                "command": command,
+                "continuationReason": "AUTOMATIC_BUDGET_EXHAUSTED",
+                **({
+                    "exhaustiveAuthorized": "true" if exhaustive_authorized else "false"
+                } if exhaustive_authorized is not None else {}),
+            },
+            check_evidence={
+                "phase": phase,
+                "command": command,
+                "predicate": predicate,
+                "elapsedSeconds": elapsed_seconds,
+                **(dict(outputTail=output_tail) if output_tail else {}),
+            },
+        )
 
 
 def _terminal_status_for_exact_solver(status: str) -> BaselineTerminalStatus:
@@ -11620,6 +11779,7 @@ def resolve_peer_compatibility_with_verification(
                 ),
                 search_mode=effective_search_mode,
             )
+            anytime.budget_source = _baseline_budget_source()
             liveness.anytime = anytime
             if _baseline_background_autonomous():
                 # Legacy field means no human budget boundary here; Ψ.5
@@ -12037,6 +12197,13 @@ def resolve_peer_compatibility_with_verification(
             ):
                 iteration += 1
                 candidate_started = time.monotonic()
+                candidate_phase_deadline = _candidate_budget_deadline(anytime)
+                anytime.candidate_phase_deadline_seconds = max(
+                    0.0,
+                    (candidate_phase_deadline - time.monotonic())
+                    if candidate_phase_deadline is not None
+                    else 0.0,
+                )
                 revoked_clauses = _drop_uncertified_generalized_clauses(
                     learned[project][mode],
                     certified_clause_domains,
@@ -12348,7 +12515,9 @@ def resolve_peer_compatibility_with_verification(
                     result = verify_assignment(
                         spec.path,
                         verification_assignment,
-                        config=resolver_bridge_config,
+                        config=_with_candidate_deadline(
+                            resolver_bridge_config, candidate_phase_deadline
+                        ),
                         run_project_checks=False,
                         remove_packages=removals,
                         progress=lambda message: (
@@ -12374,6 +12543,24 @@ def resolve_peer_compatibility_with_verification(
                     eprint(
                         f"[info] {project}: Baseline verify {mode}: reused exact ResolverTrialKey "
                         f"{resolver_trial_key[:12]} (display assignment={fingerprint})"
+                    )
+
+                if result.kind == "budget":
+                    anytime.last_failed_check_phase = "resolver"
+                    anytime.last_failed_check_command = result.command
+                    anytime.last_failed_check_output_tail = (
+                        _sanitized_baseline_failure_tail(result.output)
+                    )
+                    raise BaselineBudgetExceededCutoff(
+                        project=project, mode=mode, iteration=iteration,
+                        assignment=fingerprint, phase="resolver",
+                        command=result.command,
+                        predicate=anytime.repeated_predicate,
+                        elapsed_seconds=f"{time.monotonic() - candidate_started:.3f}",
+                        output_tail=_sanitized_baseline_failure_tail(result.output),
+                        budget_source=anytime.budget_source,
+                        wall_clock_seconds=anytime.policy.wall_clock_seconds,
+                        exhaustive_authorized=anytime.exhaustive_authorized,
                     )
 
                 if result.kind == "infrastructure":
@@ -12464,7 +12651,9 @@ def resolve_peer_compatibility_with_verification(
                             screen_result = verify_assignment(
                                 spec.path,
                                 verification_assignment,
-                                config=screen_config,
+                                config=_with_candidate_deadline(
+                                    screen_config, candidate_phase_deadline
+                                ),
                                 run_project_checks=True,
                                 remove_packages=removals,
                                 progress=lambda message: (
@@ -12500,6 +12689,27 @@ def resolve_peer_compatibility_with_verification(
                                 project_observation_cache.setdefault(
                                     screen_observation_key, []
                                 ).append(screen_result)
+                            if screen_result.kind == "budget":
+                                anytime.last_failed_check_phase = "adaptive-screen"
+                                anytime.last_failed_check_command = screen_command
+                                anytime.last_failed_check_output_tail = (
+                                    _sanitized_baseline_failure_tail(screen_result.output)
+                                )
+                                raise BaselineBudgetExceededCutoff(
+                                    project=project, mode=mode, iteration=iteration,
+                                    assignment=fingerprint, phase="adaptive-screen",
+                                    command=screen_command,
+                                    predicate=anytime.repeated_predicate,
+                                    elapsed_seconds=(
+                                        f"{time.monotonic() - candidate_started:.3f}"
+                                    ),
+                                    output_tail=_sanitized_baseline_failure_tail(
+                                        screen_result.output
+                                    ),
+                                    budget_source=anytime.budget_source,
+                                    wall_clock_seconds=anytime.policy.wall_clock_seconds,
+                                    exhaustive_authorized=anytime.exhaustive_authorized,
+                                )
                             if screen_result.kind == "infrastructure":
                                 raise BaselineConstraintVerificationError(
                                     f"BASELINE_VERIFY_INFRA_ERROR: "
@@ -12553,7 +12763,9 @@ def resolve_peer_compatibility_with_verification(
                         # proven introduced structural regression.
                         if project_result is None:
                             project_result = verify_assignment(
-                                spec.path, verification_assignment, config=config, run_project_checks=True, remove_packages=removals,
+                                spec.path, verification_assignment,
+                                config=_with_candidate_deadline(config, candidate_phase_deadline),
+                                run_project_checks=True, remove_packages=removals,
                                 progress=lambda message: (progress_reporter.emit(project, mode, "project-preflight", iteration=iteration, assignment=fingerprint, message=message), eprint(f"[info] {project}: {message}")),
                                 progress_label=f"Baseline {mode} iteration {iteration} project preflight {fingerprint}",
                             )
@@ -12577,6 +12789,25 @@ def resolve_peer_compatibility_with_verification(
                             eprint(
                                 f"[info] {project}: Baseline project preflight reused exact ProjectTrialKey "
                                 f"{project_cache_key[:12]} (display assignment={fingerprint})"
+                            )
+                        if project_result.kind == "budget":
+                            anytime.last_failed_check_phase = "project-preflight"
+                            anytime.last_failed_check_command = project_result.command
+                            anytime.last_failed_check_output_tail = (
+                                _sanitized_baseline_failure_tail(project_result.output)
+                            )
+                            raise BaselineBudgetExceededCutoff(
+                                project=project, mode=mode, iteration=iteration,
+                                assignment=fingerprint, phase="project-preflight",
+                                command=project_result.command,
+                                predicate=anytime.repeated_predicate,
+                                elapsed_seconds=f"{time.monotonic() - candidate_started:.3f}",
+                                output_tail=_sanitized_baseline_failure_tail(
+                                    project_result.output
+                                ),
+                                budget_source=anytime.budget_source,
+                                wall_clock_seconds=anytime.policy.wall_clock_seconds,
+                                exhaustive_authorized=anytime.exhaustive_authorized,
                             )
                         if project_result.kind == "infrastructure":
                             raise BaselineConstraintVerificationError(
@@ -13238,7 +13469,8 @@ def resolve_peer_compatibility_with_verification(
                                 required=required_confirmations,
                             )
                         confirmation = verify_assignment(
-                            spec.path, verification_assignment, config=confirmation_config,
+                            spec.path, verification_assignment,
+                            config=_with_candidate_deadline(confirmation_config, candidate_phase_deadline),
                             run_project_checks=confirmation_project_checks, remove_packages=removals,
                             progress=lambda message: (
                                 progress_reporter.emit(
@@ -13256,6 +13488,28 @@ def resolve_peer_compatibility_with_verification(
                             project_observation_cache.setdefault(
                                 confirmation_key, []
                             ).append(confirmation)
+                    if confirmation.kind == "budget":
+                        anytime.last_failed_check_phase = "exact-confirmation"
+                        anytime.last_failed_check_command = confirmation.command
+                        anytime.last_failed_check_exit_code = _first_failed_exit_code(
+                            confirmation
+                        )
+                        anytime.last_failed_check_output_tail = (
+                            _sanitized_baseline_failure_tail(confirmation.output)
+                        )
+                        raise BaselineBudgetExceededCutoff(
+                            project=project, mode=mode, iteration=iteration,
+                            assignment=fingerprint, phase="exact-confirmation",
+                            command=confirmation.command,
+                            predicate=anytime.repeated_predicate,
+                            elapsed_seconds=f"{time.monotonic() - candidate_started:.3f}",
+                            output_tail=_sanitized_baseline_failure_tail(
+                                confirmation.output
+                            ),
+                            budget_source=anytime.budget_source,
+                            wall_clock_seconds=anytime.policy.wall_clock_seconds,
+                            exhaustive_authorized=anytime.exhaustive_authorized,
+                        )
                     if confirmation.kind in {"infrastructure", "unknown"}:
                         raise BaselineConstraintVerificationError(
                             f"BASELINE_VERIFY_INCONCLUSIVE_CONFIRMATION: {project}/{mode}: "
@@ -13312,6 +13566,16 @@ def resolve_peer_compatibility_with_verification(
                     failure_predicate = (
                         "|".join(sorted(expected_structural))
                         if expected_structural else (observed_signature or expected_signature)
+                    )
+                    anytime.last_failed_check_phase = "exact-confirmation"
+                    anytime.last_failed_check_command = getattr(
+                        confirmation, "command", ""
+                    ) or ""
+                    anytime.last_failed_check_exit_code = _first_failed_exit_code(
+                        confirmation
+                    )
+                    anytime.last_failed_check_output_tail = (
+                        _sanitized_baseline_failure_tail(confirmation.output)
                     )
                     stagnated = anytime.observe_candidate(
                         duration_seconds=time.monotonic() - candidate_started,
@@ -17032,11 +17296,46 @@ def resolve_peer_compatibility_with_verification(
                     if hard_exhausted
                     else "BASELINE_VERIFICATION_PLATEAU"
                 )
+                # BLOCK_PSI_VERIFIED_BASELINE_FAST_BUDGET_V1
+                # Distinguish "the wall-clock/attempt budget ran out" from a
+                # base-iteration plateau: the former is an honest
+                # budget-exhausted-after-one-candidate outcome (this proves only
+                # that the attempted candidate(s) failed, never global
+                # unsatisfiability), the latter is the classic no-progress
+                # plateau. The stop code stays BASELINE_VERIFICATION_PLATEAU so
+                # existing non-retry gating is preserved; only the reason and
+                # the message become precise.
+                budget_exhausted = (
+                    continuation_reason
+                    == ContinuationReason.AUTOMATIC_BUDGET_EXHAUSTED
+                )
                 stop_reason = (
                     "absolute-hard-safety-ceiling"
                     if hard_exhausted
-                    else "soft-budget-ended-without-fresh-authoritative-progress"
+                    else (
+                        "budget-exhausted-after-one-candidate"
+                        if budget_exhausted and anytime.expensive_attempts >= 1
+                        else (
+                            "budget-exhausted"
+                            if budget_exhausted
+                            else "soft-budget-ended-without-fresh-authoritative-progress"
+                        )
+                    )
                 )
+                last_check_command = anytime.last_failed_check_command or ""
+                last_check_exit = anytime.last_failed_check_exit_code
+                last_check_phase = anytime.last_failed_check_phase or "n/a"
+                last_check_predicate = anytime.repeated_predicate or "n/a"
+                budget_details = dict(summary, **{
+                    "budgetSource": anytime.budget_source,
+                    "wallClockSeconds": anytime.policy.wall_clock_seconds,
+                    "maxExpensiveAttempts": anytime.policy.max_expensive_attempts,
+                    "elapsedSeconds": round(anytime.elapsed_seconds, 3),
+                    "candidatePhaseDeadlineSeconds": anytime.candidate_phase_deadline_seconds,
+                    "lastFailedCheckPhase": last_check_phase,
+                    "lastFailedCheckCommand": last_check_command,
+                    "lastFailedCheckExitCode": last_check_exit,
+                })
                 progress_reporter.emit(
                     project,
                     mode,
@@ -17050,8 +17349,50 @@ def resolve_peer_compatibility_with_verification(
                     uniqueConfirmedFailedAssignments=len(
                         confirmed_failed_assignments
                     ),
-                    details=summary,
+                    details=budget_details,
                 )
+                if budget_exhausted and not hard_exhausted:
+                    raise _baseline_terminal_error(
+                        terminal_status,
+                        stop_code,
+                        f"{project}/{mode}: {stop_reason}: проверка типов кандидата не прошла: "
+                        f"command={last_check_command or 'n/a'}; "
+                        f"exitCode={last_check_exit}; "
+                        f"predicate={last_check_predicate}; "
+                        f"elapsedSeconds={anytime.elapsed_seconds:.3f}; "
+                        f"no resolver-green assignment was verified within the declared budget "
+                        f"(wallClockSeconds={anytime.policy.wall_clock_seconds:g}; "
+                        f"maxExpensiveAttempts={anytime.policy.max_expensive_attempts}; "
+                        f"budgetSource={anytime.budget_source or 'product-default'}); "
+                        f"attemptedCandidate={last_fingerprint or 'none'}; "
+                        f"baseIterations={summary['baseIterations']}, "
+                        f"allowedIterations={summary['allowedIterations']}, "
+                        f"hardIterations={summary['hardIterations']}, "
+                        f"learnedConstraints={summary['learnedConstraints']}, "
+                        f"exactExclusions={summary['exactExclusions']}, "
+                        f"uniqueConfirmedFailedAssignments={len(confirmed_failed_assignments)}; "
+                        f"это доказывает только отказ проверенных попыток, а не "
+                        f"отсутствие решения; прежняя зависимая база (baseline) сохранена; "
+                        f"для продолжения нужен новый/больший бюджет",
+                        source="solve-and-verify",
+                        project=project,
+                        mode=mode,
+                        iteration=str(iteration),
+                        assignment=last_fingerprint,
+                        phase=last_check_phase,
+                        command=last_check_command,
+                        predicate=last_check_predicate,
+                        exit_code=str(last_check_exit),
+                        elapsed_seconds=f"{anytime.elapsed_seconds:.3f}",
+                        output_tail=(
+                            _sanitized_baseline_failure_tail(
+                                anytime.last_failed_check_output_tail
+                            )
+                            if anytime.last_failed_check_output_tail else ""
+                        ),
+                        exhaustive_authorized=anytime.exhaustive_authorized,
+                        continuation_reason=continuation_reason.value,
+                    )
                 raise _baseline_terminal_error(
                     terminal_status,
                     stop_code,
@@ -21804,7 +22145,12 @@ def _draft_target_for_major(row: DependencyRow) -> str:
         return NO_ACTION
     if row.planner_deferred:
         return NO_ACTION
-    effective_level = str(EFFECTIVE_TARGET_LEVEL or "yellow").strip().lower()
+    # F5: the chosen level is the row's OWN project acceptance policy
+    # (`targetLevel`), which for the CLI equals --target-level and for a
+    # generate-all run is the per-project value -- never a shared global, or a
+    # green-policy run would keep handing out yellow targets (diverging goal
+    # numbers from the actual `proposed` list).
+    effective_level = str(effective_acceptance_policy(row.project).get("targetLevel") or "yellow").strip().lower()
     if effective_level == "green":
         green = row.target_green
         if green and green != NO_ACTION:
@@ -21820,6 +22166,25 @@ def _draft_target_for_major(row: DependencyRow) -> str:
     return fallback if fallback and fallback != NO_ACTION else NO_ACTION
 
 
+def _row_lag_ok_at_chosen_assignment(row: DependencyRow) -> bool:
+    """F5: is the row lag-OK at the EXACT version the plan hands the executor?
+
+    The chosen assignment is `_draft_target_for_major` -- the same version that
+    lands in `proposed`/kept plan rows for the chosen target level. Projecting
+    green closure with the strict `target_green` would diverge from the list of
+    changes (a row `_draft_target_for_major` falls back to another target for)
+    and would let goal numbers and the actual change list disagree.
+    """
+    if row.scope_excluded:
+        return False
+    target = _draft_target_for_major(row)
+    post_version = _post_plan_version(row, target)
+    lag_target = lag_compliance_target_for_row(row)
+    if not has_safe_target(lag_target):
+        return False
+    return current_meets_target(post_version, lag_target)
+
+
 def _post_plan_version(row: DependencyRow, target: str) -> str:
     """The exact version a row occupies after the Draft plan is applied: the
     chosen plan target when the target is a real action, otherwise the current
@@ -21831,39 +22196,72 @@ def _post_plan_version(row: DependencyRow, target: str) -> str:
     return version
 
 
-def _projected_row_security(row: DependencyRow, target: str) -> Tuple[int, int, bool]:
-    """Projected (Critical, High, security_known) for the row AT the exact
-    post-plan version (F3).
+def _projected_row_security_full(row: DependencyRow, target: str) -> Tuple[int, int, int, int, bool]:
+    """Projected (Critical, High, Moderate, Low, security_known) for the row AT
+    the exact post-plan version (F3/F5).
 
     The decision uses ONLY the OSV evidence for that exact version
     (`_severity_at_candidate_version`): the current version uses current_vulns,
     any other version uses `vuln_evidence_by_version`, and a version with NO
     evidence is UNKNOWN (never clean). A target we cannot certify is never
-    advertised as a safe target."""
+    advertised as a safe target.
+    """
     post_version = _post_plan_version(row, target)
     crit = _severity_at_candidate_version(row, post_version, "C")
     high = _severity_at_candidate_version(row, post_version, "H")
-    if crit is None or high is None:
-        return 0, 0, False
-    return int(crit), int(high), True
+    moderate = _severity_at_candidate_version(row, post_version, "M")
+    low = _severity_at_candidate_version(row, post_version, "L")
+    if crit is None or high is None or moderate is None or low is None:
+        return 0, 0, 0, 0, False
+    return int(crit), int(high), int(moderate), int(low), True
+
+
+def _projected_row_security(row: DependencyRow, target: str) -> Tuple[int, int, bool]:
+    """Projected (Critical, High, security_known) for the row AT the exact
+    post-plan version (F3). Convenience wrapper over the full projection."""
+    crit, high, _moderate, _low, known = _projected_row_security_full(row, target)
+    return int(crit), int(high), bool(known)
 
 
 def _draft_goal_verdict(
-    post_yellow: int,
+    projected_lag_ok: int,
     policy_required: int,
     projected_critical: int,
     projected_high: int,
     security_unknown: int,
     policy: Dict[str, Any],
+    *,
+    target_level: str = "yellow",
+    projected_moderate: int = 0,
+    projected_low: int = 0,
+    lag_unknown: int = 0,
+    project_name: Optional[str] = None,
 ) -> str:
-    """Feasibility of the target level for the plan that was actually written:
-    `blocked` when the projected lag is below the policy gate OR a projected
-    C/H exceeds the configured limits; `unknown` when every numeric limit is
-    met but some post-plan version has no OSV evidence (absence of evidence is
-    NOT a clean bill); `feasible` only when lag + security are provable (F3)."""
+    """Feasibility of the CHOSEN target level for the plan that was actually
+    written (F5).
+
+    Yellow keeps the R12 semantics: `blocked` when the projected lag is below
+    the policy gate OR a projected C/H exceeds the configured limits; `unknown`
+    when every numeric limit is met but some post-plan version has no OSV
+    evidence (absence of evidence is NOT a clean bill); `feasible` only when
+    lag + security are provable (F3).
+
+    Green is its own gate (the same one as the green STATUS): 100% of the
+    scope provably lag-OK, C=0, H=0 and the M/L limits of the green
+    acceptance/status -- the yellow `maxKnownHigh=1` is never a license for
+    green. Incomplete OSV or lag data => `unknown`, never `feasible`."""
+    level = str(target_level or "yellow").strip().lower()
+    if level == "green":
+        if security_unknown > 0 or lag_unknown > 0:
+            return "unknown"
+        if projected_lag_ok < policy_required or projected_critical > 0 or projected_high > 0:
+            return "blocked"
+        if not _health_ml_clear(projected_moderate, projected_low, project_name):
+            return "blocked"
+        return "feasible"
     max_c = int(policy.get("maxKnownCritical", 0) or 0)
     max_h = int(policy.get("maxKnownHigh", 1) or 0)
-    if post_yellow < policy_required or projected_critical > max_c or projected_high > max_h:
+    if projected_lag_ok < policy_required or projected_critical > max_c or projected_high > max_h:
         return "blocked"
     if security_unknown > 0:
         return "unknown"
@@ -22123,35 +22521,74 @@ def build_draft_plan(
         post_policy_shortfall = max(0, policy_required - post_yellow)
         post_reserve_shortfall = max(0, reserve_required - post_yellow)
         post_green_shortfall = max(0, green_required - post_green)
-        # F3: post-plan SECURITY projection on the exact chosen/kept versions.
-        # Absence of OSV evidence for any post-plan version is coverage-unknown
-        # (never clean), so the feasibility verdict can state "provable target".
         project_policy = effective_acceptance_policy(project)
+        target_level = str(project_policy.get("targetLevel") or "yellow").strip().lower()
+        # F5: projected lag, required counts, shortfalls and the goal verdict
+        # must describe the plan for the CHOSEN target level
+        # (--target-level / the acceptance policy), never always yellow. For
+        # green the projection is the share that reaches its OWN lag target at
+        # the EXACT assigned versions (`proposed`), green requires 100% of the
+        # scope and C/H=0 with the M/L limits of the green status -- the yellow
+        # maxKnownHigh=1 is never a license for green. Yellow keeps the exact
+        # R12 semantics (post_yellow, policy gate 61/76 at 80%).
+        if target_level == "green":
+            chosen_lag = sum(1 for r in active_rows if _row_lag_ok_at_chosen_assignment(r))
+            chosen_required = green_required
+            chosen_reserve_required = 0
+            chosen_reserve_shortfall = 0
+            chosen_shortfall = max(0, green_required - chosen_lag)
+        else:
+            chosen_lag = post_yellow
+            chosen_required = policy_required
+            chosen_reserve_required = reserve_required
+            chosen_reserve_shortfall = post_reserve_shortfall
+            chosen_shortfall = post_policy_shortfall
+        # F3/F5: post-plan SECURITY projection on the exact chosen/kept versions
+        # (the same version assignments that reach `proposed` for the chosen
+        # level). Absence of OSV evidence for any post-plan version is
+        # coverage-unknown (never clean), so the feasibility verdict can state
+        # "provable target"; rows whose lag compliance cannot be proven (no
+        # safe lag target) are counted separately -- green closure demands
+        # 100% PROVABLE lag-OK.
         sec_critical = 0
         sec_high = 0
+        sec_moderate = 0
+        sec_low = 0
         sec_known = 0
         sec_unknown = 0
+        lag_unprovable = 0
         for r in active_rows:
-            crit, high, known = _projected_row_security(r, _draft_target_for_major(r))
+            crit, high, moderate, low, known = _projected_row_security_full(r, _draft_target_for_major(r))
             sec_critical += crit
             sec_high += high
+            sec_moderate += moderate
+            sec_low += low
             if known:
                 sec_known += 1
             else:
                 sec_unknown += 1
-        max_critical = int(project_policy.get("maxKnownCritical", 0) or 0)
-        max_high = int(project_policy.get("maxKnownHigh", 1) or 0)
-        goal_verdict = _draft_goal_verdict(post_yellow, policy_required, sec_critical, sec_high, sec_unknown, project_policy)
+            if not dependency_has_lag_policy_target(r):
+                lag_unprovable += 1
+        max_critical = 0 if target_level == "green" else int(project_policy.get("maxKnownCritical", 0) or 0)
+        max_high = 0 if target_level == "green" else int(project_policy.get("maxKnownHigh", 1) or 0)
+        goal_verdict = _draft_goal_verdict(
+            chosen_lag, chosen_required, sec_critical, sec_high, sec_unknown, project_policy,
+            target_level=target_level, projected_moderate=sec_moderate, projected_low=sec_low,
+            lag_unknown=lag_unprovable, project_name=project,
+        )
         truncated_proposed = sum(
             1 for er in plan_rows if er.get("status") == "proposed" and er.get("candidateSearchTruncated")
         )
         post_health["postPlanScopeTotal"] = scope_total
-        post_health["postPlanPolicyRequired"] = policy_required
-        post_health["postPlanReserveRequired"] = reserve_required
-        post_health["postPlanPolicyShortfall"] = post_policy_shortfall
-        post_health["postPlanReserveShortfall"] = post_reserve_shortfall
+        post_health["postPlanTargetLevel"] = target_level
+        post_health["postPlanPolicyRequired"] = chosen_required
+        post_health["postPlanReserveRequired"] = chosen_reserve_required
+        post_health["postPlanPolicyShortfall"] = chosen_shortfall
+        post_health["postPlanReserveShortfall"] = chosen_reserve_shortfall
         post_health["postPlanCritical"] = sec_critical
         post_health["postPlanHigh"] = sec_high
+        post_health["postPlanModerate"] = sec_moderate
+        post_health["postPlanLow"] = sec_low
         post_health["postPlanSecurityKnown"] = sec_known
         post_health["postPlanSecurityUnknown"] = sec_unknown
         post_health["postPlanSecurityTotal"] = scope_total
@@ -22159,9 +22596,17 @@ def build_draft_plan(
         post_health["postPlanPolicyMaxCritical"] = max_critical
         post_health["postPlanPolicyMaxHigh"] = max_high
         post_health["postPlanTruncatedProposed"] = truncated_proposed
-        post_health["postPlanLagOk"] = post_yellow
-        post_health["postPlanLagOkPct"] = (post_yellow / scope_total * 100.0) if scope_total else 100.0
-        post_health["postPlanShortfall"] = post_policy_shortfall
+        post_health["postPlanLagOk"] = chosen_lag
+        post_health["postPlanLagOkPct"] = round((chosen_lag / scope_total * 100.0) if scope_total else 100.0, 1)
+        post_health["postPlanShortfall"] = chosen_shortfall
+        # F5: keep the OTHER level visible as diagnostics -- the chosen-level
+        # numbers above drive the goal fields and the prompt/UI.
+        post_health["postPlanLagOkYellow"] = post_yellow
+        post_health["postPlanLagOkPctYellow"] = round((post_yellow / scope_total * 100.0) if scope_total else 100.0, 1)
+        post_health["postPlanLagOkGreen"] = post_green
+        post_health["postPlanLagOkPctGreen"] = round((post_green / scope_total * 100.0) if scope_total else 100.0, 1)
+        post_health["postPlanYellowShortfall"] = post_policy_shortfall
+        post_health["postPlanGreenShortfall"] = post_green_shortfall
         post_health["yellow_projected_lag_ok"] = post_yellow
         post_health["yellow_projected_lag_pct"] = (post_yellow / scope_total * 100.0) if scope_total else 100.0
         post_health["yellow_plan_shortfall"] = post_reserve_shortfall
@@ -22319,15 +22764,19 @@ def build_draft_prompt(
             sec_known = int(health.get("postPlanSecurityKnown", 0) or 0)
             sec_unknown = int(health.get("postPlanSecurityUnknown", 0) or 0)
             goal = str(health.get("postPlanGoal") or "")
+            # F5: the goal block labels the CHOSEN target level and, for green,
+            # the required share is 100% (not the yellow minLagOkPct).
+            chosen_level = str(health.get("postPlanTargetLevel") or "yellow").strip().lower()
+            required_pct_label = "100" if chosen_level == "green" else min_lag_pct
             reserve_note = (
                 f"; плановый запас (политика +5 п.п.): {reserve_required}/{scope_total}"
                 if reserve_required and reserve_required != policy_required
                 else ""
             )
             goal_lines = [
-                "## Цель (projected по этому плану)",
+                f"## Цель (projected по этому плану, уровень: {chosen_level})",
                 "",
-                f"- Актуально сейчас: {current_ok}/{scope_total}; требуется по политике: {policy_required}/{scope_total} ({min_lag_pct}%){reserve_note}.",
+                f"- Актуально сейчас: {current_ok}/{scope_total}; требуется по политике: {policy_required}/{scope_total} ({required_pct_label}%){reserve_note}.",
                 "- Projected после плана: {projected}/{scope_total} ({pct}%); shortfall: {policy_shortfall} (по политике{reserve_short}).".format(
                     projected=projected, scope_total=scope_total, pct=round(float(health.get('postPlanLagOkPct', 0) or 0), 1),
                     policy_shortfall=policy_shortfall,
@@ -22342,13 +22791,13 @@ def build_draft_prompt(
                 )
             goal_labels = {
                 "feasible": "достижима по lag-критерию и security-лимитам на этих target",
-                "unknown": "НЕ подтверждена: OSV-покрытие части версий неизвестно — требуется запрос OSV/уточнение",
+                "unknown": "НЕ подтверждена: неполное OSV/lag-покрытие — требуется запрос OSV/уточнение",
                 "blocked": "НЕ достижима этим планом"
                 + (f" (shortfall по политике: {policy_shortfall})" if policy_shortfall else "")
                 + (" (Critical/High вне лимита)" if sec_crit or sec_high else ""),
             }
             if goal:
-                goal_lines.append(f"- Оценка достижимости цели: {goal_labels.get(goal, goal)}.")
+                goal_lines.append(f"- Оценка достижимости цели ({chosen_level}): {goal_labels.get(goal, goal)}.")
             if policy_shortfall > 0:
                 goal_lines.append(
                     "- Shortfall не закрыт предложенными target: ниже перечислены no-target/blocked/unknown строки (не «нет проверяемого target»)."
@@ -22437,7 +22886,8 @@ def build_draft_prompt(
             lines.append(f"- {scan_part}.")
             if health.get("reason"):
                 lines.append(f"- Status reason: {health['reason']}.")
-            lines += ["", "## Goal (projected by this plan)", ""]
+            chosen_level = str(health.get("postPlanTargetLevel") or "yellow").strip().lower()
+            lines += [f"## Goal (projected by this plan, level: {chosen_level})", ""]
             scope_total = int(health.get("postPlanScopeTotal", 0) or health.get("metadata_total", 0) or 0)
             current_ok = int(health.get("lag_ok_12m", 0) or 0)
             policy_required = int(health.get("postPlanPolicyRequired", 0) or 0)
@@ -22452,12 +22902,13 @@ def build_draft_prompt(
             sec_known = int(health.get("postPlanSecurityKnown", 0) or 0)
             sec_unknown = int(health.get("postPlanSecurityUnknown", 0) or 0)
             goal = str(health.get("postPlanGoal") or "")
+            required_pct_label = "100" if chosen_level == "green" else min_lag_pct
             reserve_note_en = (
                 f"; planning reserve (+5pp): {reserve_required}/{scope_total}"
                 if reserve_required and reserve_required != policy_required
                 else ""
             )
-            lines.append(f"- Currently lag-OK: {current_ok}/{scope_total}; policy requires {policy_required}/{scope_total} ({min_lag_pct}%){reserve_note_en}.")
+            lines.append(f"- Currently lag-OK: {current_ok}/{scope_total}; policy requires {policy_required}/{scope_total} ({required_pct_label}%){reserve_note_en}.")
             lines.append(
                 f"- Projected after plan: {projected}/{scope_total} ({round(float(health.get('postPlanLagOkPct', 0) or 0), 1)}%); shortfall: {policy_shortfall} (policy" +
                 (f"; reserve: {reserve_shortfall}" if reserve_shortfall else "") + ")."
@@ -22469,13 +22920,13 @@ def build_draft_prompt(
                 )
             goal_labels_en = {
                 "feasible": "reachable under the lag criterion and security limits on these targets",
-                "unknown": "NOT confirmed: OSV coverage of some versions is unknown - request OSV/clarification first",
+                "unknown": "NOT confirmed: OSV/lag coverage is incomplete - request OSV/clarification first",
                 "blocked": "NOT reachable by this plan" +
                 (f" (policy shortfall: {policy_shortfall})" if policy_shortfall else "") +
                 (" (Critical/High beyond the limit)" if sec_crit or sec_high else ""),
             }
             if goal:
-                lines.append(f"- Goal feasibility: {goal_labels_en.get(goal, goal)}.")
+                lines.append(f"- Goal feasibility ({chosen_level}): {goal_labels_en.get(goal, goal)}.")
             lines.append("")
             lines += ["", "## Proposed changes", ""]
             rows = [r for r in project_plan.get("rows", []) if r.get("status") == "proposed"]
@@ -22609,12 +23060,14 @@ def draft_post_plan_aggregate(proposal_healths: List[Dict[str, Any]]) -> Dict[st
     The share is a WEIGHTED one -- sum(projectedLagOk) / sum(scopeTotal) --
     never the sum of per-project percentages (two projects at 50% must NOT
     read as 100%). Each project keeps its OWN numbers in `per_project`."""
+    levels = {str(h.get("postPlanTargetLevel") or "yellow").strip().lower() for h in proposal_healths if h.get("postPlanScopeTotal")}
     ok = _sum_health(proposal_healths, "postPlanLagOk")
     scope = _sum_health(proposal_healths, "postPlanScopeTotal")
     return {
         "postPlanLagOk": ok,
         "postPlanLagOkPct": round((ok / scope * 100.0) if scope else 100.0, 1),
         "postPlanScopeTotal": scope,
+        "postPlanTargetLevel": (levels.pop() if len(levels) == 1 else "mixed") if levels else "yellow",
         "postPlanPolicyRequired": _sum_health(proposal_healths, "postPlanPolicyRequired"),
         "postPlanReserveRequired": _sum_health(proposal_healths, "postPlanReserveRequired"),
         "postPlanPolicyShortfall": _sum_health(proposal_healths, "postPlanPolicyShortfall"),
@@ -22622,6 +23075,8 @@ def draft_post_plan_aggregate(proposal_healths: List[Dict[str, Any]]) -> Dict[st
         "postPlanShortfall": _sum_health(proposal_healths, "postPlanPolicyShortfall"),
         "postPlanCritical": _sum_health(proposal_healths, "postPlanCritical"),
         "postPlanHigh": _sum_health(proposal_healths, "postPlanHigh"),
+        "postPlanModerate": _sum_health(proposal_healths, "postPlanModerate"),
+        "postPlanLow": _sum_health(proposal_healths, "postPlanLow"),
         "postPlanSecurityKnown": _sum_health(proposal_healths, "postPlanSecurityKnown"),
         "postPlanSecurityUnknown": _sum_health(proposal_healths, "postPlanSecurityUnknown"),
         "postPlanSecurityTotal": _sum_health(proposal_healths, "postPlanSecurityTotal"),
@@ -22701,10 +23156,13 @@ def publish_draft_result(
     post_reserve_shortfall = int(post_agg["postPlanReserveShortfall"])
     post_plan_critical = int(post_agg["postPlanCritical"])
     post_plan_high = int(post_agg["postPlanHigh"])
+    post_plan_moderate = int(post_agg["postPlanModerate"])
+    post_plan_low = int(post_agg["postPlanLow"])
     post_sec_known = int(post_agg["postPlanSecurityKnown"])
     post_sec_unknown = int(post_agg["postPlanSecurityUnknown"])
     post_sec_total = int(post_agg["postPlanSecurityTotal"])
     post_goal = str(post_agg["postPlanGoal"] or "")
+    post_plan_target_level = str(post_agg["postPlanTargetLevel"] or "yellow")
     truncated_proposed = int(post_agg["candidateTruncatedProposed"])
     # F2: every project keeps its OWN numbers (sizes/policies differ). The
     # Desktop prefers this per-project view for the selected project and falls
@@ -22727,12 +23185,15 @@ def publish_draft_result(
             "postPlanLagOk": int(_h.get("postPlanLagOk") or 0),
             "postPlanLagOkPct": round(float(_h.get("postPlanLagOkPct") or 0), 1),
             "postPlanScopeTotal": int(_h.get("postPlanScopeTotal") or 0),
+            "postPlanTargetLevel": str(_h.get("postPlanTargetLevel") or "yellow").strip().lower(),
             "postPlanPolicyRequired": int(_h.get("postPlanPolicyRequired") or 0),
             "postPlanReserveRequired": int(_h.get("postPlanReserveRequired") or 0),
             "postPlanPolicyShortfall": int(_h.get("postPlanPolicyShortfall") or 0),
             "postPlanReserveShortfall": int(_h.get("postPlanReserveShortfall") or 0),
             "postPlanCritical": int(_h.get("postPlanCritical") or 0),
             "postPlanHigh": int(_h.get("postPlanHigh") or 0),
+            "postPlanModerate": int(_h.get("postPlanModerate") or 0),
+            "postPlanLow": int(_h.get("postPlanLow") or 0),
             "postPlanSecurityKnown": int(_h.get("postPlanSecurityKnown") or 0),
             "postPlanSecurityUnknown": int(_h.get("postPlanSecurityUnknown") or 0),
             "postPlanSecurityTotal": int(_h.get("postPlanSecurityTotal") or 0),
@@ -22797,6 +23258,10 @@ def publish_draft_result(
         if post_reserve_shortfall:
             post_plan_caption += f", по запасу {post_reserve_shortfall}"
     post_plan_caption += ")"
+    # F5: the summary names the CHOSEN target level the projection/verdict
+    # belong to (green is its own 100%/C=0/H=0 gate, not the yellow one).
+    if post_plan_target_level and post_plan_target_level != "mixed":
+        post_plan_caption += f", уровень: {post_plan_target_level}"
     if post_plan_critical or post_plan_high:
         post_plan_caption += f"; projected C/H на целях: {post_plan_critical}/{post_plan_high}"
     if goal_caption:
@@ -22902,6 +23367,7 @@ def publish_draft_result(
             "postPlanLagOk": post_plan_ok,
             "postPlanLagOkPct": post_plan_pct,
             "postPlanScopeTotal": post_plan_scope,
+            "postPlanTargetLevel": post_plan_target_level,
             "postPlanPolicyRequired": post_policy_required,
             "postPlanReserveRequired": post_reserve_required,
             "postPlanPolicyShortfall": post_policy_shortfall,
@@ -22909,6 +23375,8 @@ def publish_draft_result(
             "postPlanShortfall": post_policy_shortfall,
             "postPlanCritical": post_plan_critical,
             "postPlanHigh": post_plan_high,
+            "postPlanModerate": post_plan_moderate,
+            "postPlanLow": post_plan_low,
             "postPlanSecurityKnown": post_sec_known,
             "postPlanSecurityUnknown": post_sec_unknown,
             "postPlanSecurityTotal": post_sec_total,
@@ -24174,7 +24642,12 @@ def _report_domain_failure(exc: BaseException, *, expected: bool) -> int:
     The traceback still exists -- it goes to a diagnostic artifact. What the
     user sees first is what stopped, where, and what happens next.
     """
-    failure = build_failure(exc, expected=expected)
+    failure = build_failure(
+        exc,
+        expected=expected,
+        context=dict(getattr(exc, "failure_context", None) or {}),
+        check_evidence=dict(getattr(exc, "check_evidence", None) or {}),
+    )
     artifact = write_diagnostic_artifact(exc, failure)
     if artifact:
         failure = dataclasses.replace(failure, diagnostic_artifact=artifact)

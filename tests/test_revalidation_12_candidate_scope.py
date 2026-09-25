@@ -607,6 +607,257 @@ class DraftGoalHonestyTests(unittest.TestCase):
                          "the clarification section must not list an actionable proposed row")
         self.assertIn("Примечание: поиск кандидатов ограничен лимитом", prompt)
 
+    # ---- F5: the post-plan goal must speak in the CHOSEN target level ----
+    # Pre-fix the verdict always ran `_draft_goal_verdict(post_yellow,
+    # yellow_required, ...)` so a targetLevel=green run got the YELLOW gate
+    # (80% / maxKnownHigh=1) and could print "цель достижима" while the plan
+    # never reached 100% lag / H=0. These tests pin the green gate: 100% of
+    # the scope provably lag-OK, C=0/H=0 and the M/L limits of the green
+    # status; incomplete OSV/lag data => unknown, never feasible.
+
+    def _policy_ctx(self, policy):
+        saved = os.environ.get("DEPLOOM_ACCEPTANCE_POLICY_JSON")
+        if policy is None:
+            os.environ.pop("DEPLOOM_ACCEPTANCE_POLICY_JSON", None)
+        else:
+            os.environ["DEPLOOM_ACCEPTANCE_POLICY_JSON"] = json.dumps(policy)
+
+        def _restore():
+            if saved is None:
+                os.environ.pop("DEPLOOM_ACCEPTANCE_POLICY_JSON", None)
+            else:
+                os.environ["DEPLOOM_ACCEPTANCE_POLICY_JSON"] = saved
+
+        self.addCleanup(_restore)
+
+    def test_green_goal_uses_hundred_percent_gate_not_yellow(self):
+        """F5 repro #1: targetLevel=green, 10 active, 8 projected lag-OK, C/H=0
+        -> BLOCKED with required=10, projected=8, shortfall=2 (once the yellow
+        default gate silently called the same plan feasible). The 2 non-lag-OK
+        rows have no assignable target at all, so the green projection cannot
+        count them."""
+        self._policy_ctx({"targetLevel": "green"})
+        rows = []
+        for i in range(8):
+            rows.append(self._synthetic_row(f"ok{i}", current="1.0.9", evidence={"1.0.9": "0"}))
+        for i in range(2):
+            lag = self._synthetic_row(f"lag{i}", current="1.0.0")
+            lag.target_yellow = roadmap.NO_ACTION
+            lag.target_green = roadmap.NO_ACTION
+            lag.target_default = roadmap.NO_ACTION
+            rows.append(lag)
+        plan = self._plan_for(rows)
+        health = plan["proposals"][0]["health"]
+        self.assertEqual(health["postPlanTargetLevel"], "green", health)
+        self.assertEqual(health["postPlanScopeTotal"], 10, health)
+        self.assertEqual(health["postPlanLagOk"], 8, health)
+        self.assertEqual(health["postPlanPolicyRequired"], 10, health)
+        self.assertEqual(health["postPlanPolicyShortfall"], 2, health)
+        self.assertEqual(health["postPlanShortfall"], 2, health)
+        self.assertEqual(health["postPlanGoal"], "blocked", health)
+        self.assertNotEqual(health["postPlanGoal"], "feasible", health)
+        # the rows without a target are no-target, never projected lag-OK
+        self.assertEqual([r["status"] for r in plan["proposals"][0]["rows"] if r["package"].startswith("lag")],
+                         ["no-target", "no-target"], plan["proposals"][0]["rows"])
+        # diagnostic variants keep the other level visible
+        self.assertEqual(health["postPlanLagOkYellow"], 8, health)
+        self.assertEqual(health["postPlanLagOkGreen"], 8, health)
+
+    def test_green_goal_rejects_high_one_that_yellow_allows(self):
+        """F5 repro #2: a 1/1 lag-OK scope with H:1 is BLOCKED for green (green
+        requires H=0) even under the same configured maxKnownHigh=1 that makes
+        the yellow verdict FEASIBLE."""
+        self._policy_ctx({"targetLevel": "green", "maxKnownHigh": 1})
+        row = self._synthetic_row("oneh", current="1.0.9", vulns="H:1",
+                                  evidence={"1.0.9": "H:1"})
+        plan = self._plan_for([row])
+        health = plan["proposals"][0]["health"]
+        self.assertEqual(health["postPlanLagOk"], 1, health)
+        self.assertEqual(health["postPlanHigh"], 1, health)
+        self.assertEqual(health["postPlanGoal"], "blocked", health)
+        self._policy_ctx({"targetLevel": "yellow", "maxKnownHigh": 1})
+        plan_y = self._plan_for([row])
+        health_y = plan_y["proposals"][0]["health"]
+        self.assertEqual(health_y["postPlanHigh"], 1, health_y)
+        self.assertEqual(health_y["postPlanGoal"], "feasible", health_y)
+
+    def test_green_goal_feasible_unknown_and_ml_blocked(self):
+        """F5 severity gate: 100% lag + C/H=0 + full OSV => feasible; missing
+        OSV evidence => UNKNOWN (never feasible); M beyond the green M/L limits
+        => BLOCKED."""
+        self._policy_ctx({"targetLevel": "green"})
+        rows = [self._synthetic_row(f"g{i}", current="1.0.9", evidence={"1.0.9": "0"}) for i in range(6)]
+        plan = self._plan_for(rows)
+        health = plan["proposals"][0]["health"]
+        self.assertEqual(health["postPlanLagOk"], 6, health)
+        self.assertEqual(health["postPlanPolicyRequired"], 6, health)
+        self.assertEqual(health["postPlanGoal"], "feasible", health)
+        noosv = self._synthetic_row("noosvg", current="1.0.0", evidence={})
+        plan_u = self._plan_for([noosv])
+        health_u = plan_u["proposals"][0]["health"]
+        self.assertEqual(health_u["postPlanGoal"], "unknown", health_u)
+        self.assertNotEqual(health_u["postPlanGoal"], "feasible", health_u)
+        ml = self._synthetic_row("mlowg", current="1.0.9", vulns="M:25",
+                                 evidence={"1.0.9": "M:25"})
+        plan_m = self._plan_for([ml])
+        health_m = plan_m["proposals"][0]["health"]
+        self.assertEqual(health_m["postPlanModerate"], 25, health_m)
+        self.assertEqual(health_m["postPlanGoal"], "blocked", health_m)
+
+    def test_yellow_and_green_pair_on_identical_rows(self):
+        """F5: on identical rows the projection follows the CHOSEN level's
+        `proposed` assignment -- the same 2 lagging rows get target 1.0.9 for
+        yellow (lag-OK, projected) vs target 1.0.5 for green (not lag-OK), so
+        postPlanLagOk is 10 vs 8 and the verdict/required flip with the level."""
+        rows = []
+        for i in range(8):
+            rows.append(self._synthetic_row(f"ok{i}", current="1.0.9", evidence={"1.0.9": "0"}))
+        for i in range(2):
+            lag = self._synthetic_row(f"lag{i}", current="1.0.0", target_yellow="1.0.9",
+                                      evidence={"1.0.5": "0", "1.0.9": "0"})
+            lag.target_green = "1.0.5"
+            lag.target_default = "1.0.9"
+            rows.append(lag)
+        self._policy_ctx({"targetLevel": "green"})
+        plan_g = self._plan_for(rows)
+        health_g = plan_g["proposals"][0]["health"]
+        self.assertEqual(health_g["postPlanLagOk"], 8, health_g)
+        self.assertEqual(health_g["postPlanPolicyRequired"], 10, health_g)
+        self.assertEqual(health_g["postPlanGoal"], "blocked", health_g)
+        lag_targets_g = [r["target"] for r in plan_g["proposals"][0]["rows"] if r["package"].startswith("lag")]
+        self.assertEqual(lag_targets_g, ["1.0.5", "1.0.5"], plan_g["proposals"][0]["rows"])
+        self.assertEqual([r["status"] for r in plan_g["proposals"][0]["rows"] if r["package"].startswith("lag")],
+                         ["proposed", "proposed"], plan_g["proposals"][0]["rows"])
+        self._policy_ctx({"targetLevel": "yellow"})
+        plan_y = self._plan_for(rows)
+        health_y = plan_y["proposals"][0]["health"]
+        self.assertEqual(health_y["postPlanLagOk"], 10, health_y)
+        self.assertEqual(health_y["postPlanPolicyRequired"], 8, health_y)
+        self.assertEqual(health_y["postPlanGoal"], "feasible", health_y)
+        lag_targets_y = [r["target"] for r in plan_y["proposals"][0]["rows"] if r["package"].startswith("lag")]
+        self.assertEqual(lag_targets_y, ["1.0.9", "1.0.9"], plan_y["proposals"][0]["rows"])
+        self.assertEqual([r["status"] for r in plan_y["proposals"][0]["rows"] if r["package"].startswith("lag")],
+                         ["proposed", "proposed"], plan_y["proposals"][0]["rows"])
+
+    def test_green_target_level_subprocess_uses_green_gate(self):
+        """F5 integration: `--target-level green` runs the whole pipeline with
+        the GREEN gate -- 100% required (76/76), the projection on the same
+        assigned versions (74) and an honest verdict. The 2 rows without lag
+        data are UNPROVABLE for green closure, so the verdict is UNKNOWN
+        (never feaasible/yellow); the manifest, per-project view, RU prompt and
+        summary all carry targetLevel=green."""
+        base_versions = [f"1.0.{i}" for i in range(5)]
+        fresh_times = {v: "2026-08-01T00:00:00Z" for v in base_versions}
+        healthy = [(f"h-{i:02d}", "1.0.2", "1.0.4") for i in range(74)]
+        stale = [("s-00", "1.0.0", "1.0.0"), ("s-01", "1.0.0", "1.0.0")]
+        deps = healthy + stale
+        versions_map = {pkg: list(base_versions) for pkg, _c, _l in deps}
+        versions_map["s-00"] = ["1.0.0"]
+        versions_map["s-01"] = ["1.0.0"]
+        times = {pkg: dict(fresh_times) for pkg, _c, _l in deps}
+        times["s-00"] = {}
+        times["s-01"] = {}
+        with _MockRegistry(deps, versions_map, times=times) as reg:
+            ws = self._fixture("f5-green", deps, registry=reg.url)
+            result = self._run(ws, "f5-green",
+                               ["--run-id", "run-r12b-f5", "--workspace-id", "ws-r12b", "--project-id", "f5-green",
+                                "--mode", "draft", "--draft-deadline-seconds", "150",
+                                "--target-level", "green"],
+                               osv_base=reg.url)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        plan = self._plan(ws, "run-r12b-f5")
+        health = plan["proposals"][0]["health"]
+        self.assertEqual(health["postPlanTargetLevel"], "green", health)
+        self.assertEqual(health["postPlanLagOk"], 74, health)
+        self.assertEqual(health["postPlanPolicyRequired"], 76, health)
+        self.assertEqual(health["postPlanPolicyShortfall"], 2, health)
+        self.assertEqual(health["postPlanGoal"], "unknown", health)
+        self.assertNotEqual(health["postPlanGoal"], "feasible", health)
+        manifest = self._manifest(ws, "run-r12b-f5")
+        meta = manifest["metadata"]
+        self.assertEqual(meta["postPlanTargetLevel"], "green", meta)
+        self.assertEqual(meta["postPlanPolicyRequired"], 76, meta)
+        self.assertEqual(meta["postPlanLagOk"], 74, meta)
+        self.assertEqual(meta["postPlanGoal"], "unknown", meta)
+        self.assertEqual(manifest["perProject"]["f5-green"]["postPlanTargetLevel"], "green", manifest["perProject"])
+        prompt = self._prompt(ws, "run-r12b-f5")
+        self.assertIn("уровень: green", prompt)
+        self.assertIn("требуется по политике: 76/76 (100%)", prompt)
+        self.assertNotIn("достижима по lag-критерию", prompt)
+        summary = (ws / ".dependency-roadmap" / "artifacts" / "runs" / "run-r12b-f5" / "draft" / "summary.md").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn("уровень: green", summary)
+
+    def test_generate_all_keeps_per_project_target_levels(self):
+        """F5: in a generate-all run every project keeps its OWN targetLevel --
+        the projection/verdict follow the project's policy (yellow vs green) and
+        the cross-project aggregate reports level "mixed"."""
+        ry = self._synthetic_row("y-ok", current="1.0.9", evidence={"1.0.9": "0"})
+        ry.project = "proj-yellow"
+        rg = self._synthetic_row("g-ok", current="1.0.9", evidence={"1.0.9": "0"})
+        rg.project = "proj-green"
+        saved = os.environ.get("DEPLOOM_ACCEPTANCE_POLICY_BY_PROJECT")
+        os.environ["DEPLOOM_ACCEPTANCE_POLICY_BY_PROJECT"] = json.dumps({
+            "proj-yellow": {"targetLevel": "yellow"},
+            "proj-green": {"targetLevel": "green"},
+        })
+
+        def _restore_map():
+            if saved is None:
+                os.environ.pop("DEPLOOM_ACCEPTANCE_POLICY_BY_PROJECT", None)
+            else:
+                os.environ["DEPLOOM_ACCEPTANCE_POLICY_BY_PROJECT"] = saved
+
+        self.addCleanup(_restore_map)
+        rows_by = {"proj-yellow": [ry], "proj-green": [rg]}
+        health = {n: roadmap.compute_project_health(rs, n) for n, rs in rows_by.items()}
+        specs = {n: roadmap.ProjectSpec(name=n, path=Path(n)) for n in rows_by}
+        plan = roadmap.build_draft_plan(rows_by, specs, health)
+        by_name = {p["project"]: p["health"] for p in plan["proposals"]}
+        hy = by_name["proj-yellow"]
+        hg = by_name["proj-green"]
+        self.assertEqual(hy["postPlanTargetLevel"], "yellow", hy)
+        self.assertEqual(hg["postPlanTargetLevel"], "green", hg)
+        self.assertEqual(hg["postPlanPolicyRequired"], 1, hg)
+        self.assertEqual(hg["postPlanLagOk"], 1, hg)
+        self.assertEqual(hg["postPlanGoal"], "feasible", hg)
+        aggregate = roadmap.draft_post_plan_aggregate([hy, hg])
+        self.assertEqual(aggregate["postPlanTargetLevel"], "mixed", aggregate)
+        self.assertEqual(aggregate["postPlanGoal"], "feasible", aggregate)
+
+    def test_green_prompt_labels_level_and_does_not_claim_feasible(self):
+        """F5: the RU/EN prompt names the CHOSEN level next to the verdict,
+        shows the 100% required share and never prints the yellow "reachable"
+        wording for a green-blocked plan."""
+        self._policy_ctx({"targetLevel": "green"})
+        rows = [self._synthetic_row(f"ok{i}", current="1.0.9", evidence={"1.0.9": "0"}) for i in range(8)]
+        for i in range(2):
+            lag = self._synthetic_row(f"lag{i}", current="1.0.0")
+            lag.target_yellow = roadmap.NO_ACTION
+            lag.target_green = roadmap.NO_ACTION
+            lag.target_default = roadmap.NO_ACTION
+            rows.append(lag)
+        plan = self._plan_for(rows)
+        spec = roadmap.ProjectSpec(name="proj", path=Path("proj"))
+        snapshot = {"targetLevel": "green", "minLagOkPct": "80"}
+        prompt = roadmap.build_draft_prompt(
+            "run-f5", "ws-f5", "proj", "draft", "hash", plan, {"proj": spec},
+            language="ru", snapshot=snapshot,
+        )
+        self.assertIn("## Цель (projected по этому плану, уровень: green)", prompt)
+        self.assertIn("требуется по политике: 10/10 (100%)", prompt)
+        self.assertIn("(shortfall по политике: 2)", prompt)
+        self.assertIn("Оценка достижимости цели (green): НЕ достижима этим планом", prompt)
+        self.assertNotIn("достижима по lag-критерию", prompt)
+        prompt_en = roadmap.build_draft_prompt(
+            "run-f5", "ws-f5", "proj", "draft", "hash", plan, {"proj": spec},
+            language="en", snapshot=snapshot,
+        )
+        self.assertIn("## Goal (projected by this plan, level: green)", prompt_en)
+        self.assertIn("policy requires 10/10 (100%)", prompt_en)
+        self.assertIn("Goal feasibility (green): NOT reachable by this plan", prompt_en)
+        self.assertNotIn("reachable under the lag criterion", prompt_en)
+
 
 if __name__ == "__main__":
     unittest.main()

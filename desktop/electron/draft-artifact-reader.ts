@@ -85,6 +85,7 @@ export type DraftResultArtifact = {
      * reserve are SEPARATE required counts and SEPARATE shortfalls; the
      * aggregate postPlanShortfall is the POLICY one, never the reserve. */
     postPlanScopeTotal?: number
+    postPlanTargetLevel?: string
     postPlanPolicyRequired?: number
     postPlanReserveRequired?: number
     postPlanPolicyShortfall?: number
@@ -94,6 +95,8 @@ export type DraftResultArtifact = {
      * the feasibility verdict (feasible | unknown | blocked). */
     postPlanCritical?: number
     postPlanHigh?: number
+    postPlanModerate?: number
+    postPlanLow?: number
     postPlanSecurityKnown?: number
     postPlanSecurityUnknown?: number
     postPlanSecurityTotal?: number
@@ -107,12 +110,15 @@ export type DraftResultArtifact = {
     postPlanLagOk?: number
     postPlanLagOkPct?: number
     postPlanScopeTotal?: number
+    postPlanTargetLevel?: string
     postPlanPolicyRequired?: number
     postPlanReserveRequired?: number
     postPlanPolicyShortfall?: number
     postPlanReserveShortfall?: number
     postPlanCritical?: number
     postPlanHigh?: number
+    postPlanModerate?: number
+    postPlanLow?: number
     postPlanSecurityKnown?: number
     postPlanSecurityUnknown?: number
     postPlanSecurityTotal?: number

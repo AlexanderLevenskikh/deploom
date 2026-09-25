@@ -174,6 +174,14 @@ class BaselineVerifyConfig:
     # it controls whether already-proven resolver bytes are copied for a known
     # later lifecycle consumer.
     resolver_seed_publication_hint: str = ""
+    # BLOCK_PSI_VERIFIED_BASELINE_FAST_BUDGET_V1
+    # Absolute monotonic wall-clock deadline shared by ALL phases of one
+    # expensive candidate (resolver install, lifecycle, adaptive screen, project
+    # checks, exact confirmation). When set, every phase timeout is clamped to
+    # the remaining seconds so a single candidate cannot consume unbounded time
+    # across phases on top of the anytime budget. `None`/`0` = legacy per-phase
+    # timeouts only. Performance policy only; never part of proof identity.
+    budget_phase_deadline: Optional[float] = None
 
     @staticmethod
     def from_mapping(value: Optional[Mapping[str, object]], *, fallback_commands: Sequence[str] = ()) -> "BaselineVerifyConfig":
@@ -212,6 +220,11 @@ class BaselineVerifyConfig:
             ),
             project_checks=mode,
             commands=commands,
+            budget_phase_deadline=(
+                float(raw.get("budgetPhaseDeadline", raw.get("budget_phase_deadline")))
+                if raw.get("budgetPhaseDeadline", raw.get("budget_phase_deadline")) is not None
+                else None
+            ),
         )
 
 
@@ -297,7 +310,7 @@ class BaselineProjectFailure:
 @dataclasses.dataclass
 class BaselineVerifyResult:
     ok: bool
-    kind: str  # passed | dependency | preparation | project | infrastructure | unknown
+    kind: str  # passed | dependency | preparation | project | infrastructure | unknown | budget
     summary: str
     command: str = ""
     output: str = ""
@@ -318,6 +331,61 @@ class BaselineVerifyResult:
 
 class AssignmentMaterializationError(RuntimeError):
     """Raised when the solver assignment cannot be represented by package.json."""
+
+
+class BaselineCandidateBudgetExceeded(RuntimeError):
+    """A candidate phase hit the shared wall-clock budget deadline.
+
+    Unlike a plain phase timeout (which is infrastructure), this means the
+    whole candidate ran out of the FAST/anytime wall-clock budget, so no proof
+    may be published and the outcome is an honest budget-exhausted stop.
+    """
+
+    def __init__(self, phase: str, progress_label: str, seconds: int) -> None:
+        super().__init__(
+            f"BASELINE_BUDGET_EXHAUSTED: phase={phase}; "
+            f"candidate could not be verified within the remaining wall-clock "
+            f"budget ({max(0, int(seconds))}s; {progress_label})"
+        )
+        self.phase = phase
+        self.progress_label = progress_label
+        self.seconds = max(0, int(seconds))
+
+
+def _budget_deadline_hit(config: "BaselineVerifyConfig") -> bool:
+    return bool(
+        config.budget_phase_deadline
+        and time.monotonic() >= config.budget_phase_deadline
+    )
+
+
+def _clamped_phase_seconds(
+    *,
+    attempt_remaining_seconds: float,
+    budget_remaining_seconds: Optional[float],
+    timeout_seconds: int,
+    attempt_timeout_seconds: int,
+    progress_label: str,
+) -> int:
+    """Per-phase timeout for one expensive candidate.
+
+    When a shared wall-clock budget deadline is present, its remaining seconds
+    bind the phase: a hung check is killed at deadline+cleanup instead of
+    consuming the per-phase timeout. `budget_remaining_seconds <= 0` means the
+    candidate has no time left at all and raises `BaselineCandidateBudgetExceeded`
+    (an honest budget outcome), while an exhausted per-attempt deadline raises a
+    plain `subprocess.TimeoutExpired` (infrastructure).
+    """
+    remaining = int(attempt_remaining_seconds)
+    if budget_remaining_seconds is not None:
+        if budget_remaining_seconds <= 0:
+            raise BaselineCandidateBudgetExceeded(
+                progress_label, progress_label, int(budget_remaining_seconds)
+            )
+        remaining = min(remaining, int(budget_remaining_seconds))
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(progress_label, attempt_timeout_seconds)
+    return max(1, min(timeout_seconds, remaining))
 
 
 class ObservedResolutionError(RuntimeError):
@@ -2477,16 +2545,32 @@ def verify_assignment(
         emit_verification_event(telemetry_path, name, **payload)
 
     def phase_timeout() -> int:
-        remaining = int(attempt_deadline - time.monotonic())
-        if remaining <= 0:
-            raise subprocess.TimeoutExpired(progress_label, config.attempt_timeout_seconds)
-        return max(1, min(config.timeout_seconds, remaining))
+        now = time.monotonic()
+        return _clamped_phase_seconds(
+            attempt_remaining_seconds=attempt_deadline - now,
+            budget_remaining_seconds=(
+                config.budget_phase_deadline - now
+                if config.budget_phase_deadline
+                else None
+            ),
+            timeout_seconds=config.timeout_seconds,
+            attempt_timeout_seconds=config.attempt_timeout_seconds,
+            progress_label=progress_label,
+        )
 
     def snapshot_copy_timeout() -> int:
-        remaining = int(attempt_deadline - time.monotonic())
-        if remaining <= 0:
-            raise subprocess.TimeoutExpired(progress_label, config.attempt_timeout_seconds)
-        return max(1, min(config.snapshot_copy_timeout_seconds, remaining))
+        now = time.monotonic()
+        return _clamped_phase_seconds(
+            attempt_remaining_seconds=attempt_deadline - now,
+            budget_remaining_seconds=(
+                config.budget_phase_deadline - now
+                if config.budget_phase_deadline
+                else None
+            ),
+            timeout_seconds=config.snapshot_copy_timeout_seconds,
+            attempt_timeout_seconds=config.attempt_timeout_seconds,
+            progress_label=progress_label,
+        )
 
     def phase_progress(phase: str) -> ProgressCallback:
         return lambda message: _emit_progress(progress, f"{progress_label}: {phase}: {message}")
@@ -2928,7 +3012,17 @@ def verify_assignment(
                     progress_label="package-manager resolver install",
                     progress_interval_seconds=config.progress_interval_seconds,
                 )
+            except BaselineCandidateBudgetExceeded as exc:
+                return BaselineVerifyResult(
+                    False, "budget", str(exc), command=" ".join(argv)
+                )
             except subprocess.TimeoutExpired as exc:
+                if _budget_deadline_hit(config):
+                    return BaselineVerifyResult(
+                        False, "budget",
+                        f"BASELINE_BUDGET_EXHAUSTED: resolver-install: the wall-clock budget was reached while the package manager was still running: {exc}",
+                        command=" ".join(argv),
+                    )
                 return BaselineVerifyResult(False, "infrastructure", f"package-manager verification timed out: {exc}", command=" ".join(argv))
             except OSError as exc:
                 return BaselineVerifyResult(False, "infrastructure", f"package-manager launch failed: {exc}", command=" ".join(argv))
@@ -3475,7 +3569,17 @@ def verify_assignment(
                         progress_label="package-manager lifecycle install",
                         progress_interval_seconds=config.progress_interval_seconds,
                     )
+                except BaselineCandidateBudgetExceeded as exc:
+                    return BaselineVerifyResult(
+                        False, "budget", str(exc), command=" ".join(full_argv)
+                    )
                 except (OSError, subprocess.TimeoutExpired) as exc:
+                    if isinstance(exc, subprocess.TimeoutExpired) and _budget_deadline_hit(config):
+                        return BaselineVerifyResult(
+                            False, "budget",
+                            f"BASELINE_BUDGET_EXHAUSTED: lifecycle-install: the wall-clock budget was reached while installing: {exc}",
+                            command=" ".join(full_argv),
+                        )
                     return BaselineVerifyResult(False, "infrastructure", f"project-preflight install failed: {exc}", command=" ".join(full_argv))
                 preparation_publication_allowed = _durable_proof_publication_allowed(full_result)
                 preparation_classified = (
@@ -4047,6 +4151,10 @@ def verify_assignment(
                             project_publication_allowed
                             and _durable_proof_publication_allowed(check_result)
                         )
+                    except BaselineCandidateBudgetExceeded as exc:
+                        return BaselineVerifyResult(
+                            False, "budget", str(exc), command=command
+                        )
                     except (OSError, subprocess.TimeoutExpired) as exc:
                         emit_observability_event(
                             "verify.failure-classification",
@@ -4058,10 +4166,17 @@ def verify_assignment(
                             ),
                             kind="infrastructure",
                         )
+                        budget_cutoff = isinstance(exc, subprocess.TimeoutExpired) and _budget_deadline_hit(config)
                         if clone_isolation == "ntfs-junction-guarded":
                             cleanup_guarded_clone(command_root)
                             _evict_prepared_workspace_snapshot(
                                 proof_identity.preparation_proof_key, project_dir
+                            )
+                        if budget_cutoff:
+                            return BaselineVerifyResult(
+                                False, "budget",
+                                f"BASELINE_BUDGET_EXHAUSTED: project-check: the wall-clock budget was reached while the command was still running: {exc}",
+                                command=command,
                             )
                         return BaselineVerifyResult(False, "infrastructure", f"project check launch failed: {exc}", command=command)
 

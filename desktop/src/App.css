@@ -104,7 +104,7 @@
 .flow-complete h3 { margin: 2px 0 0; font-size: 17px; }
 .flow-complete p { max-width: 420px; margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .flow-complete > strong { margin-bottom: 8px; font-size: 12px; }
-.resume-notice { margin-top: 12px; padding: 10px; display: flex; flex-direction: column; gap: 3px; border-left: 3px solid var(--blue); background: var(--blue-soft); font-size: 10px; }.resume-notice.warning { border-left-color: var(--amber); background: var(--amber-soft); }.resume-notice.danger { border-left-color: var(--red); background: var(--red-soft); }.resume-notice span { color: var(--muted); line-height: 1.4; }
+.resume-notice { margin-top: 12px; padding: 10px; display: flex; flex-direction: column; gap: 3px; border-left: 3px solid var(--blue); background: var(--blue-soft); font-size: 10px; }.resume-notice.warning { border-left-color: var(--amber); background: var(--amber-soft); }.resume-notice.danger { border-left-color: var(--red); background: var(--red-soft); }.resume-notice span { color: var(--muted); line-height: 1.4; }.resume-notice .resume-message { color: inherit; font-weight: 600; }
 .confirmation { margin-top: 12px; padding: 10px; display: flex; align-items: center; gap: 9px; border: 1px solid #f0c36e; background: var(--amber-soft); color: #78500a; font-size: 11px; }
 .stage-actions { margin-top: 16px; display: flex; justify-content: flex-end; gap: 8px; }
 .autopilot-actions { margin-top: 8px; display: flex; align-items: center; justify-content: flex-end; gap: 5px; }

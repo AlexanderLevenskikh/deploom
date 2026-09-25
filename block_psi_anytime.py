@@ -120,6 +120,16 @@ class BaselineAnytimeState:
     desired_identity: str = ""
     continuation_reason: Optional[ContinuationReason] = None
     exhaustive_authorized: bool = False
+    # BLOCK_PSI_VERIFIED_BASELINE_FAST_BUDGET_V1
+    # Metadata recorded by the generator so a terminal failure can say where the
+    # time/attempt budget came from and which phase actually stopped, instead of
+    # an opaque "plateau" with empty envelope fields.
+    budget_source: str = ""
+    candidate_phase_deadline_seconds: float = 0
+    last_failed_check_phase: str = ""
+    last_failed_check_command: str = ""
+    last_failed_check_exit_code: int = -1
+    last_failed_check_output_tail: str = ""
 
     def __post_init__(self) -> None:
         self.started_at = self.clock()
@@ -244,6 +254,11 @@ class BaselineAnytimeState:
             "observedCandidateDurationSeconds": self.candidate_duration_ewma_seconds,
             "exhaustiveAuthorized": self.exhaustive_authorized,
             "continuationReason": self.continuation_reason.value if self.continuation_reason else "",
+            "budgetSource": self.budget_source,
+            "candidatePhaseDeadlineSeconds": round(self.candidate_phase_deadline_seconds, 3),
+            "lastFailedCheckPhase": self.last_failed_check_phase,
+            "lastFailedCheckCommand": self.last_failed_check_command,
+            "lastFailedCheckExitCode": self.last_failed_check_exit_code,
             "bestVerifiedIncumbent": self.incumbent.to_json() if self.incumbent else None,
             "desiredAssignment": dict(self.desired_assignment), "desiredAssignmentIdentity": self.desired_identity,
         }

@@ -110,6 +110,18 @@ _CATEGORY_RULES: tuple[tuple[str, str, str, str], ...] = (
         "The package manager cannot resolve this dependency combination.",
     ),
     (
+        r"BASELINE_BUDGET_EXHAUSTED|budget-exhausted-after-one-candidate"
+        r"|wall-clock budget|time budget consumed",
+        "BUDGET_EXHAUSTED",
+        "user-action-required",
+        "The wall-clock / attempt budget was consumed before a compatible "
+        "assignment was verified. This proves only that the attempted candidate "
+        "failed within the budget, not that the project is unresolvable; the "
+        "previous baseline is preserved. Deepening the search depth (EXHAUSTIVE) "
+        "does not add time -- resume with a larger explicit budget or new "
+        "evidence.",
+    ),
+    (
         r"PROJECT_[A-Z_]+|project check|lint|tsc|type error",
         "PROJECT_INCOMPATIBLE",
         "not-retryable",
@@ -152,6 +164,16 @@ class DeploomFailure:
     root_cause: str = ""
     proof_impact: str = ""
     diagnostic_artifact: str = ""
+    # BLOCK_PSI_VERIFIED_BASELINE_FAST_BUDGET_V1
+    # The last failed check evidence (candidate project check / confirmation)
+    # so the user-facing envelope and the diagnostic artifact say WHICH command
+    # failed, with which exit code, on which predicate, and how long it ran.
+    check_phase: str = ""
+    check_command: str = ""
+    check_exit_code: str = ""
+    check_predicate: str = ""
+    check_elapsed_seconds: str = ""
+    check_log: str = ""
 
     def to_envelope(self) -> dict[str, object]:
         return {
@@ -170,6 +192,11 @@ class DeploomFailure:
             "rootCause": self.root_cause,
             "proofImpact": self.proof_impact,
             "recoveryAction": self.recovery_action,
+            "checkPhase": self.check_phase,
+            "checkCommand": self.check_command,
+            "checkExitCode": self.check_exit_code,
+            "checkPredicate": self.check_predicate,
+            "checkElapsedSeconds": self.check_elapsed_seconds,
             "diagnosticArtifact": self.diagnostic_artifact,
             "occurredAt": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
@@ -192,6 +219,14 @@ class DeploomFailure:
             lines.append(f"Cause: {self.root_cause}")
         if self.proof_impact:
             lines.append(f"Proof impact: {self.proof_impact}")
+        if self.check_command:
+            lines.append(
+                "Candidate check failed: "
+                f"{self.check_command} (exit {self.check_exit_code or 'n/a'}, "
+                f"phase={self.check_phase or 'n/a'}, "
+                f"predicate={self.check_predicate or 'n/a'}, "
+                f"elapsed={self.check_elapsed_seconds or 'n/a'}s)"
+            )
         lines.append(f"Recovery: {self.recovery_action}")
         if self.diagnostic_artifact:
             lines.append("")
@@ -253,8 +288,10 @@ def build_failure(
     expected: bool = True,
     context: Optional[Mapping[str, str]] = None,
     diagnostic_artifact: str = "",
+    check_evidence: Optional[Mapping[str, str]] = None,
 ) -> DeploomFailure:
     context = dict(context or {})
+    evidence = dict(check_evidence or {})
     category, retryability, recovery = classify_failure(exc, expected=expected)
     message = str(exc) or type(exc).__name__
     proof_impact = (
@@ -269,6 +306,29 @@ def build_failure(
         }
         else ""
     )
+    # BLOCK_PSI_VERIFIED_BASELINE_FAST_BUDGET_V1
+    # The recommendation must match the actual stop reason and the already
+    # granted authorization: EXHAUSTIVE permits deeper search, it never grants
+    # a new wall-clock budget. Disambiguate the "more iterations" permission
+    # from the "deeper localization mode" and never promise a continuation
+    # without new budget.
+    if category in {"BUDGET_EXHAUSTED", "SEARCH_LIMIT"}:
+        continuation = context.get("continuationReason", "")
+        exhaustive_authorized = str(context.get("exhaustiveAuthorized", "")).lower() in {
+            "1", "true", "yes"
+        }
+        if continuation == "AUTOMATIC_BUDGET_EXHAUSTED" and exhaustive_authorized:
+            recovery += (
+                " Exhaustive authorization is already granted and permits "
+                "deeper search, but it does not extend the wall-clock budget: "
+                "a new or larger explicit budget is required before continuing."
+            )
+        elif continuation == "AUTOMATIC_BUDGET_EXHAUSTED":
+            recovery += (
+                " Choosing EXHAUSTIVE changes the localization depth, not the "
+                "time budget: resume with a larger explicit budget or new "
+                "evidence."
+            )
     return DeploomFailure(
         code=_extract_code(message) or type(exc).__name__,
         category=category,
@@ -285,6 +345,12 @@ def build_failure(
         root_cause=message[:2000],
         proof_impact=proof_impact,
         diagnostic_artifact=diagnostic_artifact,
+        check_phase=evidence.get("phase", ""),
+        check_command=evidence.get("command", ""),
+        check_exit_code=evidence.get("exitCode", ""),
+        check_predicate=evidence.get("predicate", ""),
+        check_elapsed_seconds=evidence.get("elapsedSeconds", ""),
+        check_log=_bounded_check_log(evidence),
     )
 
 
@@ -308,6 +374,8 @@ def write_diagnostic_artifact(
         payload["traceback"] = "".join(
             traceback.format_exception(type(exc), exc, exc.__traceback__)
         )
+        if failure.check_log:
+            payload["checkLog"] = failure.check_log
         path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
@@ -316,3 +384,41 @@ def write_diagnostic_artifact(
     except OSError:
         # Failing to write diagnostics must never replace the real failure.
         return ""
+
+
+_SECRET_HEAD_PATTERN = re.compile(
+    r"(?i)(?P<head>"
+    r"(?:token|password|passwd|secret|authorization|auth|_authToken|"
+    r"npmRegistryServer|NPM_TOKEN|GH_TOKEN|GITHUB_TOKEN|Bearer)"
+    r"\s*[:=]\s*)(?P<value>[^\s,;\"']+)"
+)
+_CHECK_LOG_TAIL_CHARS = 6000
+_CHECK_LOG_LINES = 120
+
+
+def _scrub_secrets(text: str) -> str:
+    return _SECRET_HEAD_PATTERN.sub(lambda m: m.group("head") + "***", str(text or ""))
+
+
+def _bounded_check_log(evidence: Mapping[str, str]) -> str:
+    """Build a bounded, secret-scrubbed check log from failure evidence."""
+    tail = _scrub_secrets(str(evidence.get("outputTail") or ""))
+    lines = tail.splitlines()
+    if len(lines) > _CHECK_LOG_LINES:
+        tail = "\n".join(lines[-_CHECK_LOG_LINES:])
+    tail = tail[-_CHECK_LOG_TAIL_CHARS:]
+    command = _scrub_secrets(evidence.get("command") or "")
+    if not command and not tail:
+        return ""
+    return "\n".join(
+        line
+        for line in (
+            f"phase: {evidence.get('phase') or 'n/a'}",
+            f"command: {command or 'n/a'}",
+            f"exitCode: {evidence.get('exitCode') or 'n/a'}",
+            f"predicate: {evidence.get('predicate') or 'n/a'}",
+            f"elapsedSeconds: {evidence.get('elapsedSeconds') or 'n/a'}",
+            f"outputTail (sanitized, bounded):{' ' + tail if tail else ' <empty>'}",
+        )
+        if line
+    )
