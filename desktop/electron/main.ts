@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
 import updaterPackage from 'electron-updater'
-import { isDeterministicToolFailure } from './baseline-retry.js'
+import { isDeterministicToolFailure, isDeterministicSourcePreflightFailure, formatSourceCheckoutDirtyFailure } from './baseline-retry.js'
 import { draftArtifactsRoot, draftManifestPath, draftReadFailureText, draftResultStaleness, readDraftResultArtifact, type DraftResultArtifact as ParsedDraftResultArtifact, type DraftReadResult } from './draft-artifact-reader.js'
 import { BASELINE_DECISION_MARKER, extractBaselineDecisionEnvelope } from './migration-baseline-decision.js'
 import { buildDependencyGraphSnapshot } from './dependency-graph.js'
@@ -5965,11 +5965,30 @@ function baselineHumanDecisionRequired(result: { code: number; stderr: string; s
 
 function nonRetryableDeterministicFailure(result: { code: number; stderr: string; stdout: string }): boolean {
   if (baselineHumanDecisionRequired(result) || deterministicWatchdogFailure(result) || deterministicPythonProgrammingFailure(result)) return true
+  if (isDeterministicSourcePreflightFailure(result)) return true
   const text = `${result.stderr}\n${result.stdout}`
   // These failures describe a completed deterministic proof attempt. Re-running
   // registry discovery + solving + localization cannot make them transiently
   // disappear; doing so only repeats hours of identical work.
   return /BASELINE_RECOVERY_CONTINUE_UNAVAILABLE|BASELINE_RECOVERY_CONCURRENT_RUN|BASELINE_VERIFY_UNKNOWN_ERROR|BASELINE_VERIFY_INCONCLUSIVE_PROJECT_ERROR|BASELINE_PLAN_BROKEN|BASELINE_CONSTRAINT_LOOP_STUCK|BASELINE_CONSTRAINT_BUDGET_EXHAUSTED|BASELINE_VERIFICATION_PLATEAU|BASELINE_VERIFICATION_HARD_BUDGET_EXHAUSTED|BASELINE_VERIFICATION_HARD_SAFETY_LIMIT|EXACT_SOLVER_UNSAT_PROVEN|EXACT_SOLVER_UNKNOWN|EXACT_SOLVER_BUDGET_EXHAUSTED|GLOBAL_EXACT_EXCLUSION_UNSAT_PROVEN|GLOBAL_EXACT_EXCLUSION_BUDGET_EXHAUSTED|GLOBAL_EXACT_EXCLUSION_SOLVER_UNKNOWN|BASELINE_SOLVER_REPEATED_FAILED_ASSIGNMENT|BASELINE_CONSTRAINT_MINIMIZATION_INCONCLUSIVE|BASELINE_NOOP_RESOLVER_INVALID|EXACT_SOLVER_PROOF_REQUIRED|FIXED_INPUT_CONSTRAINT_CONFLICT|HETEROGENEOUS_DIRECT_DEPENDENCY_DECLARATION|FIXED_DEPENDENCY_DECLARATION_MISMATCH|ASSIGNMENT_HETEROGENEOUS_SOURCE_CONFLICT|ASSIGNMENT_TARGETS_FIXED_INPUT|ASSIGNMENT_REMOVES_FIXED_INPUT|PROVEN_ASSIGNMENT_REOPENED|PROVEN_ASSIGNMENT_MUTATED|PROVEN_DEPENDENCY_SOURCE_DIRTY|PROVEN_DEPENDENCY_SOURCE_SNAPSHOT_INVALID|PROVEN_DEPENDENCY_PROOF_IDENTITY_UNAVAILABLE|PROVEN_DEPENDENCY_ENVELOPE_INVALID|FINAL_BASELINE_COMPATIBILITY_INVALID|OBSERVED_RESOLVED_ASSIGNMENT_[A-Z0-9_]+/i.test(text)
+}
+
+function isWorkerLifecycleNoise(result: { code: number; stderr: string; stdout: string }): boolean {
+  // Retirement/reuse bookkeeping is not a project diagnosis: if every attempt
+  // ends in worker lifecycle noise the real command failure stays primary.
+  return /BASELINE_WORKER_RETIRING|BASELINE_WORKER_RETIRE_AWAIT_TIMEOUT|BASELINE_WORKER_EXITED|BASELINE_WORKER_START_FAILED|BASELINE_WORKER_STDIN_FAILED|BASELINE_WORKER_PROTOCOL_INVALID|BASELINE_WORKER_IDLE_SHUTDOWN|BASELINE_WORKER_RETIRED_AFTER_UNSAFE_REQUEST/i.test(`${result.stderr}\n${result.stdout}`)
+}
+
+function sourcePreflightCommandFailureMessage(job: JobRecord, result: { code: number; stderr: string; stdout: string }): string | undefined {
+  if (job.action !== 'baseline' || job.baselineProofMode === 'DRAFT') return undefined
+  if (!isDeterministicSourcePreflightFailure(result)) return undefined
+  const code = /\b(SOURCE_[A-Z0-9_]+|GIT_NOT_FOUND)\b/.exec(`${result.stderr}\n${result.stdout}`)?.[1] ?? 'SOURCE_PREFLIGHT_FAILED'
+  const raw = result.stderr.trim()
+  const dirty = formatSourceCheckoutDirtyFailure(result.stderr)
+  const action = dirty
+    ? `Baseline не запустился: в отслеживаемых файлах проекта есть изменения: ${dirty.files.join(', ')}. Закоммитьте или сознательно спрячьте (stash) изменения либо запустите на чистом checkout/worktree; затем повторите. Анализ незакоммиченных изменений возможен только через отдельный явный контракт продукта со снимком source snapshot, а не как обход этого отказа.`
+    : 'Baseline не запустился: детерминированный source preflight не пройден. Исправьте состояние Git-рабочего набора и повторите.'
+  return `${code}: ${action}${raw ? `\n\n${raw}` : ''}`
 }
 
 async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code: number; stderr: string; stdout: string; timedOut: boolean; diagnostics?: VerificationDiagnosticEvidence }> {
@@ -6149,12 +6168,20 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
       }
       const maxCommandAttempts = commandAttemptsForAction(job.action)
       let attemptsPerformed = 1
+      let firstRealFailure: { code: number; stderr: string; stdout: string; timedOut: boolean } | undefined
       let result = await executeCommand(job, spec)
+      if (result.code !== 0 && !isWorkerLifecycleNoise(result)) firstRealFailure = result
       for (let attempt = 2; result.code !== 0 && !nonRetryableDeterministicFailure(result) && attempt <= maxCommandAttempts; attempt += 1) {
         const retrySpec = commandSpecForRetry(job, spec)
         send('flow:job-output', { jobId: job.id, stream: 'system', line: `${spec.label}: transient retry ${attempt}/${maxCommandAttempts}; предыдущий exit=${result.code}.${job.action === 'baseline' ? ' Повтор использует safe resume=auto; explicit restart повторно не применяется.' : ''}` })
         attemptsPerformed = attempt
         result = await executeCommand(job, retrySpec)
+        if (result.code !== 0 && !isWorkerLifecycleNoise(result)) firstRealFailure ??= result
+      }
+      if (result.code !== 0 && isWorkerLifecycleNoise(result) && firstRealFailure) {
+        // Worker retirement/reuse bookkeeping is not a project diagnosis: keep
+        // the real command failure (e.g. the first preflight rejection).
+        result = firstRealFailure
       }
       if (result.code !== 0 && deterministicWatchdogFailure(result)) {
         send('flow:job-output', {
@@ -6171,7 +6198,10 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
         })
       }
       exitCode = result.code
-      if (exitCode !== 0) throw new Error(`${spec.label}: команда завершилась с кодом ${exitCode} после ${attemptsPerformed} попыток.${result.stderr.trim() ? `\n\n${result.stderr.trim()}` : ''}`)
+      if (exitCode !== 0) {
+        const preflightMessage = sourcePreflightCommandFailureMessage(job, result)
+        throw new Error(preflightMessage ?? `${spec.label}: команда завершилась с кодом ${exitCode} после ${attemptsPerformed} попыток.${result.stderr.trim() ? `\n\n${result.stderr.trim()}` : ''}`)
+      }
     }
     // Preserve the generator output for the project that produced it before
     // another `--only-project` run is allowed to replace the configured files.

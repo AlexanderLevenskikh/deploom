@@ -10474,12 +10474,80 @@ class BaselineLivenessBudget:
 
 
 class BaselineProgressReporter:
-    """Live + persisted progress for long deterministic verification phases."""
+    """Live + persisted progress for long deterministic verification phases.
 
-    def __init__(self, path: Optional[Path]) -> None:
+    The persisted latest-state file is scoped to ONE run: ``begin_run`` rotates
+    stale state from a previous run (different runId) into a history sibling
+    file, and every payload carries runId/startedAt, so a preflight stop never
+    presents the previous run's budget-exhausted phase as its own outcome while
+    old diagnostics stay readable in ``*.previous-*`` files.
+    """
+
+    def __init__(
+        self,
+        path: Optional[Path],
+        run_id: str = "",
+        started_at: Optional[str] = None,
+    ) -> None:
         self.path = path
         self._lock = threading.Lock()
         self._terminal = False
+        self._run_id = str(run_id or "")
+        self._started_at = started_at or dt.datetime.now(dt.timezone.utc).isoformat()
+
+    @staticmethod
+    def _stamp() -> str:
+        return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+    def _rotate_locked(self, run_id: str) -> None:
+        """Preserve stale progress from a different run as history before the
+        current run starts writing; never present it as the current outcome."""
+        if self.path is None:
+            return
+        try:
+            if not self.path.is_file():
+                return
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        previous_run = str(payload.get("runId") or "")
+        if previous_run == str(run_id):
+            return
+        stamp = self._stamp()
+        history = self.path.with_name(
+            f"{self.path.name}.previous-{previous_run or 'unknown'}-{stamp}"
+        )
+        try:
+            os.replace(self.path, history)
+        except OSError:
+            pass
+
+    def begin_run(
+        self,
+        project: str,
+        mode: str,
+        run_id: str,
+        *,
+        started_at: Optional[str] = None,
+    ) -> None:
+        """Start a fresh run-scoped progress state.
+
+        Stale state from a previous run is rotated into a history sibling file.
+        The current run is then visibly stamped (run-started + runId/startedAt)
+        even before any verification wave emits, so a preflight stop can never
+        surface an old run's phase as its own.
+        """
+        self._run_id = str(run_id or self._run_id)
+        if started_at:
+            self._started_at = started_at
+        else:
+            self._started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+        with self._lock:
+            self._rotate_locked(self._run_id)
+            self._terminal = False
+        self.emit(project, mode, "run-started")
 
     def emit(
         self, project: str, mode: str, phase: str, /,
@@ -10488,16 +10556,20 @@ class BaselineProgressReporter:
         # Nested telemetry crosses one explicit mapping boundary. Wrapper fields
         # deterministically win; positional envelope fields cannot be overwritten.
         normalized = _normalize_baseline_progress_details({**(details or {}), **fields})
-        for reserved in ("project", "mode", "schemaVersion", "type", "updatedAt"):
+        for reserved in ("project", "mode", "schemaVersion", "type", "updatedAt", "runId", "startedAt"):
             normalized.pop(reserved, None)
         with self._lock:
-            if phase in {"solve-and-verify-started", "external-evidence-localization-started"}:
+            if phase in {
+                "run-started", "solve-and-verify-started",
+                "external-evidence-localization-started",
+            }:
                 self._terminal = False
             if self._terminal and ("check" in phase or "heartbeat" in phase or "running" in phase):
                 return
             if phase in {
                 "localization-timeout", "mode-passed", "mode-passed-no-changes",
                 "budget-exhausted", "solver-terminal", "verification-terminal",
+                "preflight-failed",
             }:
                 self._terminal = True
             payload = {
@@ -10505,6 +10577,8 @@ class BaselineProgressReporter:
                 "project": project,
                 "mode": mode,
                 "phase": phase,
+                "runId": self._run_id,
+                "startedAt": self._started_at,
                 "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
                 **normalized,
             }
@@ -11141,6 +11215,8 @@ def resolve_peer_compatibility_with_verification(
     residual_targets_by_project: Optional[Dict[str, Dict[str, str]]] = None,
     external_evidence_by_project: Optional[Dict[str, CompatibilityEvidence]] = None,
     progress_path: Optional[Path] = None,
+    run_id: str = "",
+    run_started_at: Optional[str] = None,
     proof_envelopes_out: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
 ) -> Dict[str, Dict[str, Dict[str, str]]]:
     """Solve -> materialize -> learn nogood -> solve, before Executor exists.
@@ -11155,7 +11231,9 @@ def resolve_peer_compatibility_with_verification(
     if not hot_worker_continuation:
         reset_same_run_verification_reuse()
         reset_physical_experiment_registry()
-    progress_reporter = BaselineProgressReporter(progress_path)
+    progress_reporter = BaselineProgressReporter(
+        progress_path, run_id=run_id, started_at=run_started_at,
+    )
     localization_checkpoint_store = BaselineLocalizationCheckpointStore(progress_path)
     # BLOCK_V_BASELINE_RECOVERY_V1
     from block_v_recovery import (
@@ -24023,6 +24101,15 @@ def main() -> None:
 
     baseline_progress_path = settings_base / ".dependency-roadmap" / "state" / "baseline-verification-progress.json"
     baseline_resume_store = BaselineLocalizationCheckpointStore(baseline_progress_path)
+    # One CLI invocation is one run, even inside the long-lived Desktop worker.
+    # The run identity stamps every progress payload so a preflight stop can
+    # never present the previous run's phase as the current run's outcome.
+    baseline_run_id = (
+        (args.run_id or os.environ.get("DEPLOOM_RUN_ID", ""))
+        .strip()
+        or f"baseline-{uuid.uuid4().hex[:10]}"
+    )
+    baseline_run_started_at = dt.datetime.now(dt.timezone.utc).isoformat()
 
     for project in projects:
         cache_value = project.constraint_verify_config.get("constraintCachePath")
@@ -24069,6 +24156,26 @@ def main() -> None:
                 "reason": "source checkout guard disabled" if not args.draft_baseline else "Draft: planning-only, no git fetch/switch",
             }
         else:
+            run_progress_reporter = BaselineProgressReporter(
+                baseline_progress_path,
+                run_id=baseline_run_id,
+                started_at=baseline_run_started_at,
+            )
+            verified_mode = str(
+                os.environ.get("DEPLOOM_BASELINE_TARGET_LEVEL")
+                or project.lockfile_sync_config.get("baselineMode")
+                or "yellow"
+            ).strip().lower()
+            try:
+                # Start-of-run marker: rotates stale state from a previous run
+                # into history and stamps the current run BEFORE the preflight,
+                # so a preflight rejection never surfaces the old run's phase.
+                run_progress_reporter.begin_run(
+                    project.name, verified_mode, baseline_run_id,
+                    started_at=baseline_run_started_at,
+                )
+            except Exception:
+                pass
             current_branch_probe = _git_command(project, ["branch", "--show-current"], check=False)
             current_branch = (current_branch_probe.stdout or "").strip()
             if current_branch and project.source_branch and current_branch != project.source_branch:
@@ -24083,6 +24190,16 @@ def main() -> None:
                 )
             except SourceCheckoutGuardError as exc:
                 eprint(f"[error] {exc}")
+                try:
+                    run_progress_reporter.emit(
+                        project.name,
+                        verified_mode,
+                        "preflight-failed",
+                        code=exc.code,
+                        message=str(exc),
+                    )
+                except Exception:
+                    pass
                 raise SystemExit(2) from None
             origin_label = (
                 f"{metadata['remote']}/{metadata['sourceBranch']}"
@@ -24397,6 +24514,8 @@ def main() -> None:
                     residual_targets_by_project=residual_targets_by_project,
                     external_evidence_by_project=external_evidence_by_project,
                     progress_path=baseline_progress_path,
+                    run_id=baseline_run_id,
+                    run_started_at=baseline_run_started_at,
                     proof_envelopes_out=proven_dependency_envelopes,
                 ),
                 rows_by_project,

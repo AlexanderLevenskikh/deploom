@@ -11,10 +11,12 @@ const fakeWorker = join(root, 'fake-worker.py')
 writeFileSync(fakeWorker, String.raw`
 import atexit
 import json
+import os
 import sys
 import time
 
 marker = ""
+slow_exit = False
 
 @atexit.register
 def done():
@@ -22,9 +24,17 @@ def done():
         with open(marker, "w", encoding="utf-8") as stream:
             stream.write("clean")
 
+instances = os.environ.get("INSTANCES")
+if instances:
+    with open(instances, "a", encoding="utf-8") as stream:
+        stream.write(str(os.getpid()) + "\n")
+
 sys.stdout.write('{"type":"ready","pid":1,"encoding":"utf-8"}\n')
 sys.stdout.flush()
-for raw in sys.stdin:
+while True:
+    raw = sys.stdin.readline()
+    if raw == "":
+        break
     request = json.loads(raw)
     argv = request.get("argv") or []
     mode = argv[0] if argv else "ok"
@@ -34,6 +44,36 @@ for raw in sys.stdin:
         while True:
             time.sleep(1)
     marker = str((request.get("env") or {}).get("MARKER") or "")
+    if mode == "retiring":
+        sys.stdout.write(json.dumps({
+            "type":"complete","id":request["id"],"code":0,"reusable":False
+        }, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+        continue
+    if mode == "slow-exit":
+        slow_exit = True
+    sys.stdout.write(json.dumps({
+        "type":"complete","id":request["id"],"code":0,"reusable":True
+    }, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+if slow_exit:
+    time.sleep(1.5)
+`, 'utf8')
+
+const hangWorker = join(root, 'hang-worker.py')
+writeFileSync(hangWorker, String.raw`
+import json
+import sys
+import time
+
+sys.stdout.write('{"type":"ready","pid":1,"encoding":"utf-8"}\n')
+sys.stdout.flush()
+while True:
+    raw = sys.stdin.readline()
+    if raw == "":
+        while True:
+            time.sleep(1)
+    request = json.loads(raw)
     sys.stdout.write(json.dumps({
         "type":"complete","id":request["id"],"code":0,"reusable":True
     }, separators=(",", ":")) + "\n")
@@ -225,12 +265,107 @@ async function gracefulIdle() {
   pool.dispose(child => child.kill())
 }
 
+async function retiringWorkerAwaitsRetirementThenFreshWorkerReuses() {
+  let kills = 0
+  const instances = join(root, 'reuse-instances.txt')
+  // The pool propagates the current process env into each child, so this is
+  // how the test observes distinct worker processes through their startup PID.
+  process.env.INSTANCES = instances
+  const pool = new BaselineWorkerPool(
+    python,
+    fakeWorker,
+    child => { kills += 1; child.kill() },
+    60,
+    5000,
+    5000,
+  )
+  const first = pool.run('reuse', {
+    cwd: workerCwd,
+    argv: ['slow-exit'],
+    env: { INSTANCES: instances },
+    onOutput: () => {},
+  })
+  const result = await first.result
+  if (result.code !== 0) throw new Error(`reuse setup failed: ${result.code}`)
+
+  // Idle retirement (graceful) must have begun: the worker saw stdin EOF and
+  // is still alive in its slow-exit window. A retry now must AWAIT that close
+  // and then run on a READY FRESH worker instead of failing with
+  // BASELINE_WORKER_RETIRING.
+  await delay(250)
+  const second = pool.run('reuse', {
+    cwd: workerCwd,
+    argv: ['ok'],
+    env: { INSTANCES: instances },
+    onOutput: () => {},
+  })
+  const secondResult = await second.result
+  if (secondResult.code !== 0) {
+    throw new Error(`worker reuse after retirement failed: ${secondResult.code} ${secondResult.error}`)
+  }
+  await waitForChildExit(first.child, 'retiring worker')
+  const pids = readFileSync(instances, 'utf8').trim().split(/\r?\n/).filter(Boolean)
+  if (pids.length < 2) {
+    throw new Error(`expected a fresh worker instance after retirement, got ${JSON.stringify(pids)}`)
+  }
+  if (new Set(pids).size !== pids.length) {
+    throw new Error('retirement reuse reused the same worker process')
+  }
+  pool.dispose(child => child.kill())
+}
+
+async function retirementAwaitTimeoutRejectsCleanly() {
+  let kills = 0
+  const pool = new BaselineWorkerPool(
+    python,
+    hangWorker,
+    child => { kills += 1; child.kill() },
+    60,
+    2000,
+    150,
+  )
+  const first = pool.run('hang-timeout', {
+    cwd: workerCwd,
+    argv: [],
+    onOutput: () => {},
+  })
+  const result = await first.result
+  if (result.code !== 0) throw new Error(`hang worker setup failed: ${result.code}`)
+
+  // Idle shutdown begins; the worker hangs on stdin EOF so close never fires.
+  // The awaited-retirement path must give up with its own timeout error rather
+  // than leaving the caller with an unresolved promise or retirement noise.
+  await delay(120)
+  const second = pool.run('hang-timeout', {
+    cwd: workerCwd,
+    argv: [],
+    onOutput: () => {},
+  })
+  let rejected = false
+  try {
+    await Promise.race([
+      second.result,
+      delay(3000).then(() => {
+        throw new Error('retire await timeout rejection did not settle')
+      }),
+    ])
+  } catch (error) {
+    if (String(error).includes('did not settle')) throw error
+    if (!String(error).includes('BASELINE_WORKER_RETIRE_AWAIT_TIMEOUT')) throw error
+    rejected = true
+  }
+  if (!rejected) throw new Error('retire await timeout was not rejected')
+  pool.dispose(child => child.kill())
+}
+
 try {
   await protocolCorruption()
   await stdinStreamErrorRetiresWorker()
   await stdinWriteCallbackFailureRetiresWorker()
   await stdinWriteThrowRetiresWorker()
   await gracefulIdle()
+  await retiringWorkerAwaitsRetirementThenFreshWorkerReuses()
+  await retirementAwaitTimeoutRejectsCleanly()
   console.log('Baseline worker lifecycle hardening contracts OK')
 } finally {
   rmSync(root, {

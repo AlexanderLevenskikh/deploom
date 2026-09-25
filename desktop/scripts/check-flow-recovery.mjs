@@ -99,7 +99,7 @@ if (!releasePrompt.includes("Human prose in chat is diagnostic only")) throw new
 const mainSource = readFileSync(new URL("../electron/main.ts", import.meta.url), "utf8");
 const retrySource = readFileSync(new URL("../electron/baseline-retry.ts", import.meta.url), "utf8");
 for (const retryContract of [
-  "import { isDeterministicToolFailure } from './baseline-retry.js'",
+  "import { isDeterministicToolFailure, isDeterministicSourcePreflightFailure, formatSourceCheckoutDirtyFailure } from './baseline-retry.js'",
   "function nonRetryableDeterministicFailure",
   "function deterministicPythonProgrammingFailure",
   "BASELINE_VERIFY_INCONCLUSIVE_PROJECT_ERROR",

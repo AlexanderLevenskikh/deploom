@@ -37,6 +37,7 @@ export class BaselineWorkerPool {
     private readonly terminateTree: (child: ChildProcessWithoutNullStreams) => void,
     private readonly idleTimeoutMs = 20 * 60_000,
     private readonly gracefulShutdownTimeoutMs = 5_000,
+    private readonly retireAwaitTimeoutMs = 15_000,
   ) {}
 
   private start(key: string, cwd: string): WorkerRecord {
@@ -219,10 +220,32 @@ export class BaselineWorkerPool {
   } {
     let record = this.records.get(key)
     if (record && (record.closing || (!record.alive && !record.closed))) {
-      return {
-        child: record.child,
-        result: Promise.reject(new Error('BASELINE_WORKER_RETIRING')),
-      }
+      // The worker is retiring (unsafe request result, stdin failure, protocol
+      // error or idle shutdown). An immediate retry must NOT masquerade as
+      // BASELINE_WORKER_RETIRING: a genuinely transient failure retries only on
+      // a READY FRESH worker, so await this instance's close, then start a new
+      // worker and run the request there. If retirement itself never completes,
+      // fail with a distinct error and let the caller preserve the original
+      // command failure as the diagnosis.
+      const retiringRecord = record
+      const result = new Promise<BaselineWorkerResult>((resolve, reject) => {
+        let retirementTimer: ReturnType<typeof setTimeout> | undefined
+        const continueOnFreshWorker = () => {
+          if (retirementTimer) clearTimeout(retirementTimer)
+          if (this.records.get(key) === retiringRecord) this.records.delete(key)
+          resolve(this.run(key, request).result)
+        }
+        if (retiringRecord.closed) {
+          continueOnFreshWorker()
+          return
+        }
+        retiringRecord.child.once('close', continueOnFreshWorker)
+        retirementTimer = setTimeout(() => {
+          retiringRecord.child.removeListener('close', continueOnFreshWorker)
+          reject(new Error('BASELINE_WORKER_RETIRE_AWAIT_TIMEOUT'))
+        }, this.retireAwaitTimeoutMs)
+      })
+      return { child: retiringRecord.child, result }
     }
     if (!record || record.closed || record.child.killed) {
       record = this.start(key, request.cwd)
