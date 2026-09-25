@@ -1,4 +1,5 @@
 import { classifyFlowRecovery } from "../dist-electron/flow-recovery.js";
+import { extractBaselineFailureEnvelope, baselineFailureMessage } from "../dist-electron/baseline-failure.js";
 import { BASELINE_DECISION_MARKER, containsBaselineDecisionEnvelope, extractBaselineDecisionEnvelope } from "../dist-electron/migration-baseline-decision.js";
 import { buildReleaseRecoveryPrompt, readReleaseRecoveryResult } from "../dist-electron/release-recovery.js";
 import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
@@ -30,6 +31,7 @@ const cases = [
   ["LIVE_BASELINE_INSTALL_FAILED: yarn install exit=1", "agent", "infrastructure"],
   ["MIGRATION_FINAL_VERIFICATION_WRONG_BRANCH: on release", "agent", "agent"],
   ["RELEASE_TO_MIGRATION_HANDOFF_UNSAFE: unstaged files", "recover", "hard"],
+  ["BASELINE_RECOVERY_CONTINUE_UNAVAILABLE: identity-mismatch", "baseline", "hard"],
   ["RELEASE_TO_MIGRATION_HANDOFF_FAILED: git switch failed", "recover", "infrastructure"],
   ["RELEASE_SOURCE_REF_UNAVAILABLE: fetch failed", "release", "infrastructure"],
   ["GROUP_SCOPE_DRIFT: target changed", "agent", "agent"],
@@ -67,6 +69,28 @@ for (const [message, action, expected] of cases) {
   const actual = classifyFlowRecovery(message, action);
   if (actual.kind !== expected) throw new Error(`${message}: expected ${expected}, got ${JSON.stringify(actual)}`);
 }
+
+const mismatchEnvelope = JSON.stringify({
+  schemaVersion: "DEPLOOM_FAILURE_V2",
+  code: "BASELINE_RECOVERY_CONTINUE_UNAVAILABLE",
+  summary: "BASELINE_RECOVERY_CONTINUE_UNAVAILABLE: demo/yellow: reason=identity-mismatch; previousStatus=running",
+  diagnosticArtifact: "C:/diagnostics/incident.json",
+});
+const mismatchOutput = `dependency scan complete\n${mismatchEnvelope}\nBaseline stopped safely: UNKNOWN`;
+const parsedMismatch = extractBaselineFailureEnvelope(mismatchOutput);
+if (parsedMismatch?.code !== "BASELINE_RECOVERY_CONTINUE_UNAVAILABLE") throw new Error("Baseline failure envelope was not extracted");
+const mismatchMessage = baselineFailureMessage({ code: 3, stderr: mismatchOutput, stdout: "" });
+if (!mismatchMessage?.startsWith("BASELINE_RECOVERY_CONTINUE_UNAVAILABLE:") || !mismatchMessage.includes("Нажмите «Начать заново»")) throw new Error("Checkpoint mismatch must have an actionable first line");
+if (classifyFlowRecovery(mismatchMessage, "baseline").code !== "BASELINE_RECOVERY_CONTINUE_UNAVAILABLE") throw new Error("Recovery must preserve the checkpoint mismatch code");
+for (const [category, code, expectedHint] of [
+  ["BUDGET_EXHAUSTED", "BASELINE_BUDGET_EXHAUSTED", "больший бюджет"],
+  ["PROJECT_INCOMPATIBLE", "BASELINE_VERIFY_INCONCLUSIVE_PROJECT_ERROR", "упавшую команду"],
+  ["SEARCH_LIMIT", "BASELINE_VERIFICATION_PLATEAU", "теми же настройками"],
+]) {
+  const envelope = JSON.stringify({ schemaVersion: "DEPLOOM_FAILURE_V2", category, code, summary: `${code}: demo`, diagnosticArtifact: "" });
+  if (!baselineFailureMessage({ code: 3, stderr: envelope, stdout: "" })?.includes(expectedHint)) throw new Error(`${category} did not present a useful next step`);
+}
+if (baselineFailureMessage({ code: 3, stderr: "network stopped", stdout: "" }) !== undefined) throw new Error("Unstructured Baseline failures must use the existing fallback");
 
 const decisionPayload = `${BASELINE_DECISION_MARKER}${JSON.stringify({ schemaVersion: 2, event: "BASELINE_CONTINUATION_REQUIRED", reason: "AUTOMATIC_BUDGET_EXHAUSTED", suggestedCohort: { id: "vite-build", packages: ["vite"] } })}`;
 const extractedFromStdout = extractBaselineDecisionEnvelope(`[info] before\n[error] ${decisionPayload}\n`, "");

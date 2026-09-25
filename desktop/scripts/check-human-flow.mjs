@@ -31,7 +31,15 @@ for (const needle of [
 
 lacks(app, '<MonitoringPanel', 'default App surface')
 has(app, 'human-error-toast', 'human error surface')
+has(app, "flow.error.split('\\n')[0]", 'visible first-line failure reason')
 has(css, '.human-flow-card', 'human FLOW styling')
+for (const needle of [
+  'baselineRestartRequired',
+  "recovery.message.includes('BASELINE_RECOVERY_CONTINUE_UNAVAILABLE')",
+  'restartBaseline(activeIndex)',
+  'restartBaseline(displayedIndex)',
+  "text('Начать новый поиск', 'Start a new search')",
+]) has(flow, needle, 'Baseline restart after incompatible checkpoint')
 has(css, 'grid-template-columns: 236px minmax(620px, 1fr)', 'two-column default shell')
 
 for (const needle of ['BLOCK_HUMAN_FLOW_ARTIFACT_LOG_V1', 'ARTIFACT_LOG_FLUSH_MS = 250', "'activity.log'", "'run.json'", "flag: 'a'"]) {

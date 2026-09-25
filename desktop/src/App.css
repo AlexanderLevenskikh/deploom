@@ -855,6 +855,7 @@ textarea::placeholder {
 }
 .human-error-toast > div { min-width: 0; display: grid; gap: 4px; }
 .human-error-toast strong { color: var(--red); font-size: 12px; }
+.human-error-toast .error-summary { color: var(--text); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
 .human-error-toast span, .human-error-toast summary { color: var(--text-muted); font-size: 11px; }
 .human-error-toast details { margin-top: 4px; }
 .human-error-toast pre { max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }

@@ -76,7 +76,7 @@ function App() {
 
       {/* BLOCK_PROGRESSIVE_HUMAN_FLOW_V1 */}
       {/* BLOCK_HUMAN_FLOW_GRAPH_MONITOR_CLEANUP_V1 */}
-      {flow.error ? <div className="human-error-toast" role="alert"><div><strong>{t('app.error.title')}</strong><span>{t('app.error.preservedResult')}</span><details><summary>{t('app.error.technicalDetails')}</summary><pre>{flow.error}</pre></details></div><button type="button" className="icon-button" aria-label={t('common.close')} onClick={() => flow.setError(undefined)}>×</button></div> : null}
+      {flow.error ? <div className="human-error-toast" role="alert"><div><strong>{t('app.error.title')}</strong><span>{t('app.error.preservedResult')}</span><span className="error-summary">{flow.error.split('\n')[0]}</span><details><summary>{t('app.error.technicalDetails')}</summary><pre>{flow.error}</pre></details></div><button type="button" className="icon-button" aria-label={t('common.close')} onClick={() => flow.setError(undefined)}>×</button></div> : null}
 
       <div className={`app-grid${graphHideLeft ? ' graph-hide-project-rail' : ''}`}>
         {!graphHideLeft ? <ProjectRail details={details} selected={project} active={flow.workspaceBusy} onRefreshAll={() => void flow.runAction({ action: 'generate-all', workspaceId: details.workspace.id, label: 'DepLoom: all projects' })} onSelectProject={(name) => void flow.selectProject(name)} onAddProject={() => setShowAddProject(true)} onAddWorkspace={() => setShowWorkspaceDialog(true)} onRemoveProject={(name) => void flow.removeProject(name).catch((error) => flow.setError(error instanceof Error ? error.message : String(error)))} /> : null}

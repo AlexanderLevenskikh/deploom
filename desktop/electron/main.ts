@@ -1,6 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
 import updaterPackage from 'electron-updater'
 import { isDeterministicToolFailure, isDeterministicSourcePreflightFailure, formatSourceCheckoutDirtyFailure } from './baseline-retry.js'
+import { baselineFailureMessage } from './baseline-failure.js'
 import { draftArtifactsRoot, draftManifestPath, draftReadFailureText, draftResultStaleness, readDraftResultArtifact, type DraftResultArtifact as ParsedDraftResultArtifact, type DraftReadResult } from './draft-artifact-reader.js'
 import { BASELINE_DECISION_MARKER, extractBaselineDecisionEnvelope } from './migration-baseline-decision.js'
 import { buildDependencyGraphSnapshot } from './dependency-graph.js'
@@ -6200,7 +6201,10 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
       exitCode = result.code
       if (exitCode !== 0) {
         const preflightMessage = sourcePreflightCommandFailureMessage(job, result)
-        throw new Error(preflightMessage ?? `${spec.label}: команда завершилась с кодом ${exitCode} после ${attemptsPerformed} попыток.${result.stderr.trim() ? `\n\n${result.stderr.trim()}` : ''}`)
+        const verifiedBaselineMessage = job.action === 'baseline' && job.baselineProofMode !== 'DRAFT'
+          ? baselineFailureMessage(result)
+          : undefined
+        throw new Error(preflightMessage ?? verifiedBaselineMessage ?? `${spec.label}: команда завершилась с кодом ${exitCode} после ${attemptsPerformed} попыток.${result.stderr.trim() ? `\n\n${result.stderr.trim()}` : ''}`)
       }
     }
     // Preserve the generator output for the project that produced it before

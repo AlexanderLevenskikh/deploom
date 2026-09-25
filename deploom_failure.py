@@ -110,6 +110,14 @@ _CATEGORY_RULES: tuple[tuple[str, str, str, str], ...] = (
         "The package manager cannot resolve this dependency combination.",
     ),
     (
+        r"BASELINE_RECOVERY_CONTINUE_UNAVAILABLE",
+        "RECOVERY_STATE",
+        "user-action-required",
+        "The saved Baseline checkpoint is missing or incompatible with the "
+        "current source or settings. It cannot be resumed; use Start over "
+        "to begin a new search. Previously verified artifacts remain intact.",
+    ),
+    (
         r"BASELINE_BUDGET_EXHAUSTED|budget-exhausted-after-one-candidate"
         r"|wall-clock budget|time budget consumed",
         "BUDGET_EXHAUSTED",

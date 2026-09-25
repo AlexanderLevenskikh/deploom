@@ -119,6 +119,16 @@ class RuntimeFailureEnvelope(unittest.TestCase):
                 category, _r, _a = classify_failure(RuntimeError(message))
                 self.assertEqual(category, expected_category)
 
+    def test_changed_baseline_checkpoint_requires_start_over(self) -> None:
+        failure = build_failure(RuntimeError(
+            "BASELINE_RECOVERY_CONTINUE_UNAVAILABLE: demo/yellow: "
+            "reason=identity-mismatch; previousStatus=running"
+        ))
+        self.assertEqual(failure.code, "BASELINE_RECOVERY_CONTINUE_UNAVAILABLE")
+        self.assertEqual(failure.category, "RECOVERY_STATE")
+        self.assertEqual(failure.retryability, "user-action-required")
+        self.assertIn("Start over", failure.recovery_action)
+
     def test_process_exits_without_a_traceback_on_a_domain_failure(self) -> None:
         """End-to-end: the boundary must convert the exception into a result."""
         script = (
