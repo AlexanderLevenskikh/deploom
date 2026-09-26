@@ -109,6 +109,44 @@ _CATEGORY_RULES: tuple[tuple[str, str, str, str], ...] = (
         "not-retryable",
         "The package manager cannot resolve this dependency combination.",
     ),
+    # D2: exact-solver outcomes are classified by their STRUCTURED status, not
+    # by scanning the detail for package names. ORDER MATTERS: these rules must
+    # precede PROJECT_INCOMPATIBLE, because a dependency named `eslint` (or any
+    # other name/path containing `lint` or `tsc`) must never turn an unfinished
+    # solver result into a "project checks failed" diagnosis.
+    (
+        r"EXACT_SOLVER_UNSAT_PROVEN|GLOBAL_EXACT_EXCLUSION_UNSAT_PROVEN|UNSAT_PROVEN",
+        "EXACT_UNSAT_PROVEN",
+        "not-retryable",
+        "The exact solver PROVED there is no satisfying assignment in the "
+        "modeled finite domain. This is a proven incompatibility of the "
+        "available candidate versions, not an unfinished search.",
+    ),
+    (
+        r"EXACT_SOLVER_BUDGET_EXHAUSTED|unknown_refinement_budget"
+        r"|refinement budget ended|confirmed.*timeout|solver.*timed out"
+        r"|EXACT_SOLVER_UNKNOWN[^\n]*?(?:timeout|canceled)",
+        "SOLVER_BUDGET_EXHAUSTED",
+        "retry",
+        "The exact solver could not complete within its declared budget/timeout. "
+        "This proves only that the search was not finished, not that the project "
+        "is unresolvable. Resume with a larger or explicit budget.",
+    ),
+    (
+        r"EXACT_SOLVER_UNAVAILABLE|SOLVER_UNAVAILABLE|z3-solver is not installed",
+        "SOLVER_UNAVAILABLE",
+        "user-action-required",
+        "The exact solver is unavailable in this environment, so no dependency "
+        "decision could be proven. Fix the solver installation and retry.",
+    ),
+    (
+        r"EXACT_SOLVER_UNKNOWN|SOLVER_UNKNOWN|sat_unproven|no reason given",
+        "SOLVER_UNKNOWN",
+        "user-action-required",
+        "The exact solver did not finish and returned no proof either way. "
+        "This is NOT a proven conflict and NOT a proven solution: the affected "
+        "compatibility remains undecided and needs further review.",
+    ),
     (
         r"BASELINE_RECOVERY_CONTINUE_UNAVAILABLE",
         "RECOVERY_STATE",
@@ -130,7 +168,7 @@ _CATEGORY_RULES: tuple[tuple[str, str, str, str], ...] = (
         "evidence.",
     ),
     (
-        r"PROJECT_[A-Z_]+|project check|lint|tsc|type error",
+        r"PROJECT_[A-Z_]+|project check|lint|tsc|type error|CHECK_EXIT_CODE",
         "PROJECT_INCOMPATIBLE",
         "not-retryable",
         "The project's own checks failed on this dependency combination.",
@@ -182,6 +220,12 @@ class DeploomFailure:
     check_predicate: str = ""
     check_elapsed_seconds: str = ""
     check_log: str = ""
+    # D3: the structured run/solver context (runId, project, mode, phase,
+    # component identity/count, timeoutMs, solverElapsedMs, remaining budget,
+    # reason) and the raw check evidence, preserved verbatim so one diagnostic
+    # artifact identifies the exact operation, its limits and its actual times.
+    context: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    evidence: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
     def to_envelope(self) -> dict[str, object]:
         return {
@@ -206,6 +250,8 @@ class DeploomFailure:
             "checkPredicate": self.check_predicate,
             "checkElapsedSeconds": self.check_elapsed_seconds,
             "diagnosticArtifact": self.diagnostic_artifact,
+            "context": dict(self.context),
+            "evidence": dict(self.evidence),
             "occurredAt": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
 
@@ -235,6 +281,22 @@ class DeploomFailure:
                 f"predicate={self.check_predicate or 'n/a'}, "
                 f"elapsed={self.check_elapsed_seconds or 'n/a'}s)"
             )
+        # D3: surface the solver operation limits/times/reason when present so
+        # the human text answers "was it a timeout? which component? how long?"
+        if self.context.get("component") or self.context.get("reasonUnknown"):
+            solver_line = (
+                f"Solver: phase={self.context.get('phase') or '-'}; "
+                f"component={self.context.get('component') or '-'} "
+                f"({self.context.get('componentCount') or '?'} packages); "
+                f"timeoutMs={self.context.get('timeoutMs') or '-'}; "
+                f"elapsedMs={self.context.get('solverElapsedMs') or '-'}; "
+                f"reason={self.context.get('reasonUnknown') or '-'}"
+            )
+            if self.context.get("confirmedTimeout") == "true":
+                solver_line += "; confirmedTimeout=true"
+            if self.context.get("remainingBudgetSeconds"):
+                solver_line += f"; remainingBudgetSeconds={self.context['remainingBudgetSeconds']}"
+            lines.append(solver_line)
         lines.append(f"Recovery: {self.recovery_action}")
         if self.diagnostic_artifact:
             lines.append("")
@@ -266,11 +328,21 @@ def classify_failure(
     exc: BaseException,
     *,
     expected: bool = True,
+    check_evidence: Optional[Mapping[str, str]] = None,
 ) -> tuple[str, str, str]:
     """Return (category, retryability, recovery_action).
 
     `expected=False` marks a genuine tool defect: only that becomes
     TOOL_INTERNAL_ERROR, and even then the run still stops cleanly.
+
+    D2: PROJECT_INCOMPATIBLE is decided by EVIDENCE of a run command, not by
+    scanning the message for the words `lint`/`tsc` (a package named `eslint`
+    or a path containing `lint` would otherwise turn any failure into a
+    "project checks failed" diagnosis). The bare `lint|tsc|type error` tokens
+    only participate when the failure actually carries check evidence
+    (command/exitCode/phase), i.e. a command really ran and its result is
+    known. Structured solver stop-codes always win over word matching because
+    their rules precede PROJECT_INCOMPATIBLE.
     """
     message = str(exc) or type(exc).__name__
     if not expected:
@@ -280,7 +352,17 @@ def classify_failure(
             "This is a defect in DepLoom itself. The run stopped without "
             "publishing any result; please report the diagnostic artifact.",
         )
+    evidence = dict(check_evidence or {})
+    has_check_evidence = bool(
+        evidence.get("command") or evidence.get("exitCode") or evidence.get("phase")
+    )
     for pattern, category, retryability, recovery in _CATEGORY_RULES:
+        if category == "PROJECT_INCOMPATIBLE" and not has_check_evidence:
+            # Without evidence that a command actually ran, the bare
+            # `lint|tsc|type error` alternatives would match package names in
+            # unrelated failures; the `PROJECT_[A-Z_]+` stop codes and the
+            # "project check" phrase remain valid without evidence.
+            pattern = r"PROJECT_[A-Z_]+|project check"
         if re.search(pattern, message, re.IGNORECASE if pattern.islower() else 0):
             return category, retryability, recovery
     return (
@@ -300,7 +382,11 @@ def build_failure(
 ) -> DeploomFailure:
     context = dict(context or {})
     evidence = dict(check_evidence or {})
-    category, retryability, recovery = classify_failure(exc, expected=expected)
+    category, retryability, recovery = classify_failure(
+        exc,
+        expected=expected,
+        check_evidence=evidence,
+    )
     message = str(exc) or type(exc).__name__
     proof_impact = (
         "No proof was published for this assignment."
@@ -359,6 +445,8 @@ def build_failure(
         check_predicate=evidence.get("predicate", ""),
         check_elapsed_seconds=evidence.get("elapsedSeconds", ""),
         check_log=_bounded_check_log(evidence),
+        context=context,
+        evidence=evidence,
     )
 
 

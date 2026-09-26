@@ -1066,6 +1066,13 @@ class DependencyRow:
     # proven "no target" -- the honest status is `candidate-search-truncated`.
     candidate_search_truncated: bool = False
     candidate_search_truncated_note: str = ""
+    # D1: the exact peer solver finished UNFINISHED (unknown/sat_unproven/
+    # refinement-budget/timeout) for the row's component in a Draft run. The
+    # row keeps its theoretical candidates and its pre-solver target, but the
+    # compatibility is explicitly UNDECIDED -- never a resolved exact
+    # assignment, a safe decision, or a VERIFIED/PLANNING_ONLY proof.
+    peer_compat_unresolved: bool = False
+    peer_compat_unresolved_note: str = ""
 
 
 @dataclasses.dataclass
@@ -8723,6 +8730,125 @@ def _solver_navigation_stability_targets(
     return targets
 
 
+def _exact_solver_component_context(
+    project: str,
+    mode: str,
+    component: Sequence[str],
+    exact_status: str,
+    exact_report: Dict[str, Any],
+    backend_options: Dict[str, Any],
+    client: Any,
+    run_context: Optional[Mapping[str, str]],
+) -> Dict[str, str]:
+    """D3: structured solver context for the failure/partial record.
+
+    One record must answer: which project, phase, component, operation, limits
+    and actual times. A plain ``unknown`` without a reason stays honest
+    ("no reason given"); a Z3 reason mentioning timeout/cancel is marked as a
+    confirmed timeout so the UI never claims "no reason" for a stop that was
+    the declared per-solver timeout.
+    """
+    detail = str(exact_report.get("detail") or "").strip()
+    reason_unknown = detail[:500] or "no reason given"
+    timeout_detail = detail.lower()
+    confirmed_timeout = (
+        exact_status == "unknown"
+        and any(token in timeout_detail for token in ("timeout", "canceled", "max. iterations"))
+    )
+    context: Dict[str, str] = dict(run_context or {})
+    context.update({
+        "phase": "peer-planning",
+        "component": ",".join(component),
+        "componentCount": str(len(component)),
+        "candidateCount": str(int(exact_report.get("candidates") or 0)),
+        "constraintCount": str(int(exact_report.get("hardConstraints") or 0)),
+        "refinements": str(int(exact_report.get("refinements") or 0)),
+        "solverElapsedMs": str(int(exact_report.get("elapsedMs") or 0)),
+        "timeoutMs": str(int(backend_options.get("timeoutMs") or 0)),
+        "terminalStatus": str(_terminal_status_for_exact_solver(exact_status).value),
+        "terminalSource": "z3",
+        "solverStatus": str(exact_status or ""),
+        "reasonUnknown": reason_unknown,
+    })
+    if confirmed_timeout:
+        context["confirmedTimeout"] = "true"
+    remaining = getattr(getattr(client, "deadline", None), "remaining", None)
+    if remaining is not None:
+        context["remainingBudgetSeconds"] = f"{remaining:.1f}"
+    return context
+
+
+def _mark_draft_component_unresolved(
+    project: str,
+    mode: str,
+    component: Sequence[str],
+    rows_for_name: Mapping[str, List[DependencyRow]],
+    exact_status: str,
+    exact_report: Dict[str, Any],
+    backend_options: Dict[str, Any],
+    client: Any,
+    incomplete_components_out: Optional[List[Dict[str, Any]]],
+    run_context: Optional[Mapping[str, str]],
+) -> None:
+    """D1: keep a Draft component collected but mark its compatibility UNDECIDED.
+
+    The exact solver finished UNFINISHED (unknown/sat_unproven/refinement
+    budget, confirmed timeout included) for this component. Every package in
+    it keeps its theoretical candidates and its pre-solver target -- nothing is
+    invented as a "leave everything as is" decision -- and is explicitly
+    flagged so the plan/status/dashboard surface it as unresolved with the
+    reason. The whole Draft run no longer dies with exit 3 just because one
+    component could not be proven.
+    """
+    detail = str(exact_report.get("detail") or "").strip()
+    note = (
+        f"peer compatibility not decided by the exact solver (status={exact_status}); "
+        f"reason: {detail[:400] or 'no reason given'}; "
+        "further review required before this group is treated as compatible"
+    )
+    for name in component:
+        for row in rows_for_name.get(name, []):
+            row.peer_compat_unresolved = True
+            row.peer_compat_unresolved_note = note
+    if incomplete_components_out is not None:
+        context = _exact_solver_component_context(
+            project, mode, component, exact_status, exact_report, backend_options, client, run_context
+        )
+        incomplete_components_out.append({
+            "project": project,
+            "mode": mode,
+            "component": list(component),
+            "componentCount": len(component),
+            "packageCount": len(component),
+            "status": exact_status,
+            "detail": detail[:500] or "no reason given",
+            "terminalStatus": context["terminalStatus"],
+            "candidateCount": context["candidateCount"],
+            "constraintCount": context["constraintCount"],
+            "refinements": context["refinements"],
+            "solverElapsedMs": context["solverElapsedMs"],
+            "timeoutMs": context["timeoutMs"],
+            "confirmedTimeout": context.get("confirmedTimeout") == "true",
+            "reasonUnknown": context.get("reasonUnknown", ""),
+            "note": note,
+        })
+    eprint(
+        f"[warn] {project}: Draft exact z3 {mode}; component={len(component)} package(s) left "
+        f"UNRESOLVED (status={exact_status}); reason={detail[:400] or 'no reason given'}"
+    )
+    emit_observability_event(
+        "solver.component.incomplete",
+        project=project,
+        mode=mode,
+        packageCount=len(component),
+        status=exact_status,
+        detail=detail[:400] or "no reason given",
+        timeoutMs=int(backend_options.get("timeoutMs") or 0),
+        durationMs=int(exact_report.get("elapsedMs") or 0),
+        refinements=int(exact_report.get("refinements") or 0),
+    )
+
+
 def resolve_peer_compatibility(
     rows_by_project: Dict[str, List[DependencyRow]],
     client: LiveDataClient,
@@ -8736,6 +8862,9 @@ def resolve_peer_compatibility(
     shadow_reports_out: Optional[Dict[str, Dict[str, List[Dict[str, Any]]]]] = None,
     residual_targets_by_project: Optional[Dict[str, Dict[str, str]]] = None,
     diagnostic_preferences_by_project_mode: Optional[Dict[str, Dict[str, Dict[str, str]]]] = None,
+    partial_on_incomplete: bool = False,
+    incomplete_components_out: Optional[List[Dict[str, Any]]] = None,
+    run_context: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Dict[str, Dict[str, str]]]:
     """Resolve peer-connected package versions as constraints, never by display group.
 
@@ -8957,8 +9086,24 @@ def resolve_peer_compatibility(
                             f"detail={str(exact_report.get('detail') or '')[:500]}; "
                             "the authoritative finite-domain component has no satisfying assignment",
                             source="z3",
+                            project=project,
+                            mode=mode,
+                            phase="peer-planning",
+                            extra_context=_exact_solver_component_context(
+                                project, mode, component, exact_status, exact_report, backend_options, client, run_context
+                            ),
                         )
                     elif exact_status == "unknown_refinement_budget":
+                        # D1: in a Draft run an UNFINISHED exact outcome for a
+                        # component must not destroy the collected plan. Mark the
+                        # group unresolved and continue; the caller publishes a
+                        # DRAFT_PARTIAL result instead of dying with exit 3.
+                        if partial_on_incomplete:
+                            _mark_draft_component_unresolved(
+                                project, mode, component, rows_for_name, exact_status, exact_report,
+                                backend_options, client, incomplete_components_out, run_context,
+                            )
+                            continue
                         raise _baseline_terminal_error(
                             BaselineTerminalStatus.BUDGET_EXHAUSTED,
                             "EXACT_SOLVER_BUDGET_EXHAUSTED",
@@ -8966,8 +9111,20 @@ def resolve_peer_compatibility(
                             f"detail={str(exact_report.get('detail') or '')[:500]}; "
                             "exact refinement budget ended without a proof",
                             source="z3",
+                            project=project,
+                            mode=mode,
+                            phase="peer-planning",
+                            extra_context=_exact_solver_component_context(
+                                project, mode, component, exact_status, exact_report, backend_options, client, run_context
+                            ),
                         )
                     elif exact_status in {"unknown", "sat_unproven"}:
+                        if partial_on_incomplete:
+                            _mark_draft_component_unresolved(
+                                project, mode, component, rows_for_name, exact_status, exact_report,
+                                backend_options, client, incomplete_components_out, run_context,
+                            )
+                            continue
                         raise _baseline_terminal_error(
                             BaselineTerminalStatus.SOLVER_UNKNOWN,
                             "EXACT_SOLVER_UNKNOWN",
@@ -8975,6 +9132,12 @@ def resolve_peer_compatibility(
                             f"detail={str(exact_report.get('detail') or '')[:500]}; "
                             "unfinished exact proof is not a dependency decision",
                             source="z3",
+                            project=project,
+                            mode=mode,
+                            phase="peer-planning",
+                            extra_context=_exact_solver_component_context(
+                                project, mode, component, exact_status, exact_report, backend_options, client, run_context
+                            ),
                         )
                     elif exact_status == "unavailable":
                         raise _baseline_terminal_error(
@@ -8984,6 +9147,12 @@ def resolve_peer_compatibility(
                             f"detail={str(exact_report.get('detail') or '')[:500]}; "
                             "no heuristic fallback was used",
                             source="z3",
+                            project=project,
+                            mode=mode,
+                            phase="peer-planning",
+                            extra_context=_exact_solver_component_context(
+                                project, mode, component, exact_status, exact_report, backend_options, client, run_context
+                            ),
                         )
                     else:
                         raise _baseline_terminal_error(
@@ -8993,6 +9162,12 @@ def resolve_peer_compatibility(
                             f"detail={str(exact_report.get('detail') or '')[:500]}; "
                             "no heuristic fallback was used",
                             source="z3",
+                            project=project,
+                            mode=mode,
+                            phase="peer-planning",
+                            extra_context=_exact_solver_component_context(
+                                project, mode, component, exact_status, exact_report, backend_options, client, run_context
+                            ),
                         )
                     mode_exact_reports.append(dict(exact_report))
 
@@ -9347,6 +9522,7 @@ def _baseline_terminal_error(
     output_tail: str = "",
     exhaustive_authorized: Optional[bool] = None,
     continuation_reason: str = "",
+    extra_context: Optional[Mapping[str, str]] = None,
 ) -> BaselineConstraintVerificationError:
     context: Dict[str, str] = {}
     for key, value in (
@@ -9358,6 +9534,12 @@ def _baseline_terminal_error(
         ("command", command),
     ):
         if value:
+            context[key] = str(value)
+    # D3: solver/run-scoped context (component identity, candidate/constraint
+    # counts, timeoutMs/solverElapsedMs, remaining budget, runId, reason) so
+    # the diagnostic artifact identifies the exact operation that stopped.
+    for key, value in (extra_context or {}).items():
+        if value not in (None, ""):
             context[key] = str(value)
     if exhaustive_authorized is not None:
         context["exhaustiveAuthorized"] = "true" if exhaustive_authorized else "false"
@@ -17752,13 +17934,25 @@ def validate_final_peer_assignment(
     issues: List[str] = []
     for project, rows in rows_by_project.items():
         rows_by_name = {row.name: row for row in rows}
-        names = set(rows_by_name)
+        # D1: rows whose exact peer compatibility was NOT decided (unfinished
+        # solver in Draft) are explicitly not part of the decided assignment;
+        # validating them would invent claims about undecided groups.
+        active_names = {
+            name for name, row in rows_by_name.items()
+            if not getattr(row, "peer_compat_unresolved", False)
+        }
+        names = set(active_names)
         for mode in modes:
             assignment = {
                 name: (getattr(row, _target_attr(mode)) if target_is_action(getattr(row, _target_attr(mode))) else row.current_version)
                 for name, row in rows_by_name.items()
+                if name in active_names
             }
             for name, row in sorted(rows_by_name.items()):
+                if name not in active_names:
+                    # D1: undecided peer groups are not part of the validated
+                    # assignment; they were already surfaced as unresolved.
+                    continue
                 version = assignment[name]
                 if version != row.current_version and not _candidate_registry_installable(row, version, client):
                     issues.append(f"{project}/{mode}: REGISTRY_TARGET_UNAVAILABLE: {name}@{version}")
@@ -22594,11 +22788,15 @@ def _draft_row_status(row: DependencyRow, chosen_target: str) -> str:
     # candidate limit hid versions from the evidence network), no-target (no
     # safe target on the FULL data -- with the planner's real reason), and
     # unknown-security (OSV unassessed OR an unrated U finding). Metadata-unknown
-    # rows stay "unknown-metadata".
+    # rows stay "unknown-metadata". D1: peer-compat-unresolved -- the exact
+    # solver finished UNFINISHED for the row's component in Draft; neither a
+    # proven conflict nor a chosen target.
     if row.scope_excluded:
         return "excluded"
     if row.planner_deferred:
         return "deferred"
+    if getattr(row, "peer_compat_unresolved", False):
+        return "peer-compat-unresolved"
     if not _row_metadata_known(row):
         return "unknown-metadata"
     current = str(row.current_version or "").strip()
@@ -22654,9 +22852,10 @@ def build_draft_plan(
     proposals: List[Dict[str, Any]] = []
     unknowns: List[Dict[str, Any]] = []
     conflicts: List[Dict[str, Any]] = []
+    unresolved: List[Dict[str, Any]] = []
     manifests: Dict[str, Any] = {}
     projects: List[str] = sorted(rows_by_project)
-    totals = {"proposed": 0, "no-change": 0, "ok": 0, "blocked": 0, "deferred": 0, "excluded": 0, "unknown-metadata": 0, "unknown-security": 0, "no-target": 0, "candidate-search-truncated": 0,
+    totals = {"proposed": 0, "no-change": 0, "ok": 0, "blocked": 0, "deferred": 0, "excluded": 0, "unknown-metadata": 0, "unknown-security": 0, "no-target": 0, "candidate-search-truncated": 0, "peer-compat-unresolved": 0,
               "not-attempted": 0, "interrupted": 0, "registry-failed": 0, "osv-unavailable": 0, "unrated": 0, "total": 0}
     scan: Dict[str, Dict[str, int]] = {}
     for project in projects:
@@ -22702,6 +22901,14 @@ def build_draft_plan(
                     if status == "candidate-search-truncated" and row.candidate_search_truncated_note
                     else _draft_no_target_reason(row)
                 )
+            elif status == "peer-compat-unresolved":
+                # D1: the row's compatibility was NOT decided (the exact solver
+                # finished unfinished); say that plainly, not a display-group
+                # cause and not a fake "leave as is" decision.
+                target_reason = (
+                    row.peer_compat_unresolved_note
+                    or "peer compatibility could not be decided by the exact solver in this Draft run"
+                )
             entry: Dict[str, Any] = {
                 "project": project,
                 "package": row.name,
@@ -22718,12 +22925,28 @@ def build_draft_plan(
                 "scanState": state,
                 "draftUnknown": row.draft_unknown,
                 "candidateSearchTruncated": row.candidate_search_truncated,
+                "peerCompatUnresolved": bool(getattr(row, "peer_compat_unresolved", False)),
                 "breakingChanges": list(row.breaking_changes or []),
                 "migrationNotes": list(row.migration_notes or []),
             }
             if row.compatibility_cohort or row.compatibility_note:
                 entry["conflict"] = row.compatibility_note or row.compatibility_cohort
                 conflicts.append({"package": row.name, "project": project, "note": row.compatibility_note or row.compatibility_cohort, "cohort": row.compatibility_cohort})
+            if getattr(row, "peer_compat_unresolved", False):
+                unresolved.append({
+                    "package": row.name,
+                    "project": project,
+                    "kind": row.kind,
+                    "requestedSpec": row.requested_spec,
+                    "current": row.current_version,
+                    "target": target if target != NO_ACTION else None,
+                    "group": row.group,
+                    "status": "peer-compat-unresolved",
+                    "reason": (
+                        row.peer_compat_unresolved_note
+                        or "peer compatibility could not be decided by the exact solver in this Draft run"
+                    ),
+                })
             plan_rows.append(entry)
             meta_unknown = not _row_metadata_known(row)
             sec_unknown = not _row_security_known(row)
@@ -22737,42 +22960,55 @@ def build_draft_plan(
             # with a security uncertainty add here (no double counting).
             if (sec_unknown or sec_unrated) and status != "unknown-security":
                 totals["unknown-security"] = totals.get("unknown-security", 0) + 1
-            if meta_unknown or sec_unknown or sec_unrated or status in ("unknown-metadata", "unknown-security", "candidate-search-truncated", "blocked", "no-target"):
+            if meta_unknown or sec_unknown or sec_unrated or status in ("unknown-metadata", "unknown-security", "candidate-search-truncated", "blocked", "no-target", "peer-compat-unresolved"):
                 # T3: metadata (registry availability) and security (OSV) are
                 # separate unknown classes; an unassessed OSV state must reach
                 # the plan/summary/prompt even when the registry metadata is
                 # fine, and vice versa. R12: a truncated search is a THIRD
                 # unknown class -- the limit hid versions, so absence of a safe
                 # target among the covered set is not a proven absence.
+                # D1: a peer-compat-unresolved row is a FOURTH unknown class --
+                # the exact solver finished unfinished, so neither a conflict
+                # nor a solution was proven.
                 # F4: a truncation CAVEAT on an actionable PROPOSED row is NOT
                 # a clarification -- only rows without a provable target (or
                 # with unassessed security) belong in the "needs clarification"
                 # list. The caveat survives as the row's candidateSearchTruncated
                 # flag, the candidateTruncated/candidateTruncatedTargetless/
-                # candidateTruncatedProposed counters and a prompt notе.
+                # candidateTruncatedProposed counters and a prompt not�.
                 causes = []
                 if meta_unknown:
                     causes.append(_draft_metadata_unknown_reason(row))
                 if sec_unknown:
                     causes.append("OSV/security state unknown for this package in this Draft run")
                 if sec_unrated:
-                    causes.append("уязвимость без оценки серьёзности (U) для этого пакета в этом Draft run")
+                    causes.append("�梨������ ��� �業�� ���񧭮�� (U) ��� �⮣� ����� � �⮬ Draft run")
                 if row.candidate_search_truncated:
                     causes.append(
                         row.candidate_search_truncated_note
-                        or "candidate search truncated: лимит кандидатов скрыл версии за пределами evidence network"
+                        or "candidate search truncated: ����� �������⮢ ��� ���ᨨ �� �।����� evidence network"
+                    )
+                if getattr(row, "peer_compat_unresolved", False):
+                    causes.append(
+                        row.peer_compat_unresolved_note
+                        or "peer compatibility could not be decided by the exact solver in this Draft run"
                     )
                 sec_blocked = sec_unknown or sec_unrated
                 tr_blocked = row.candidate_search_truncated
+                peer_blocked = bool(getattr(row, "peer_compat_unresolved", False))
+                blocker_count = bool(sec_blocked) + bool(meta_unknown) + bool(tr_blocked) + bool(peer_blocked)
+                clarity = "security" if sec_blocked and not (meta_unknown or tr_blocked or peer_blocked) \
+                    else ("metadata" if meta_unknown and not (sec_blocked or tr_blocked or peer_blocked) \
+                          else ("truncated" if tr_blocked and not (meta_unknown or sec_blocked or peer_blocked) \
+                                else ("peer-compat" if peer_blocked and not (meta_unknown or sec_blocked or tr_blocked) \
+                                      else "both")))
                 unknowns.append({
                     "package": row.name,
                     "project": project,
                     "kind": row.kind,
                     "requestedSpec": row.requested_spec,
                     "current": row.current_version,
-                    "clarity": "security" if sec_blocked and not (meta_unknown or tr_blocked)
-                    else ("metadata" if meta_unknown and not (sec_blocked or tr_blocked)
-                          else ("truncated" if tr_blocked and not (meta_unknown or sec_blocked) else "both")),
+                    "clarity": clarity,
                     "reason": "; ".join(causes),
                 })
             # R11: per-cause partiality counters so the manifest/prompt/UI can
@@ -22938,6 +23174,7 @@ def build_draft_plan(
         "proposals": proposals,
         "unknowns": unknowns,
         "conflicts": conflicts,
+        "unresolved": unresolved,
         "counts": totals,
         "manifests": manifests,
         "scan": scan,
@@ -23435,7 +23672,7 @@ def publish_draft_result(
     # their per-row evidence carries a truncation caveat; they must not be
     # reported as "needs clarification" (previously the whole unknowns list was
     # used and 61 actionable truncated rows inflated the counter).
-    clarification_statuses = {"unknown-metadata", "unknown-security", "candidate-search-truncated", "blocked", "no-target"}
+    clarification_statuses = {"unknown-metadata", "unknown-security", "candidate-search-truncated", "blocked", "no-target", "peer-compat-unresolved"}
     clarification_names: List[str] = []
     truncated_rows = 0
     for project_rows in rows_by_project.values():
@@ -23523,6 +23760,7 @@ def publish_draft_result(
             "blocked": _counts.get("blocked", 0),
             "ok": _counts.get("ok", 0),
             "proposed": _counts.get("proposed", 0),
+            "peerCompatUnresolved": _counts.get("peer-compat-unresolved", 0),
             "scopeTotal": int(_h.get("scope_total") or 0),
         }
     # R11: lifecycle counters shared by the summary and the manifest so the
@@ -23549,6 +23787,7 @@ def publish_draft_result(
     candidate_truncated_targetless = counts.get("candidate-search-truncated", 0)
     no_target = counts.get("no-target", 0)
     blocked = counts.get("blocked", 0)
+    peer_unresolved = counts.get("peer-compat-unresolved", 0)
     shortfall_parts: List[str] = []
     if candidate_truncated:
         shortfall_parts.append(f"поиск кандидатов усечён: {candidate_truncated} строк")
@@ -23556,6 +23795,11 @@ def publish_draft_result(
         shortfall_parts.append(f"без безопасного target: {no_target}")
     if blocked:
         shortfall_parts.append(f"target заблокирован: {blocked}")
+    if peer_unresolved:
+        # D1: an unfinished exact solver leaves the group UNDECIDED -- that is
+        # neither a proven conflict nor a chosen target, so it is its own
+        # honest partiality cause.
+        shortfall_parts.append(f"совместимость не определена: {peer_unresolved} пакетов")
     shortfall_text = ("; " + ", ".join(shortfall_parts)) if shortfall_parts else ""
     # F2/F3: honest post-plan figures in the summary -- projected lag-OK over
     # the whole active scope, the projected C/H on the exact chosen versions
@@ -23677,6 +23921,7 @@ def publish_draft_result(
             "candidateTruncatedTargetless": candidate_truncated_targetless,
             "candidateTruncatedProposed": truncated_proposed,
             "blocked": counts.get("blocked", 0),
+            "peerCompatUnresolved": peer_unresolved,
             "ok": counts.get("ok", 0),
             "postPlanLagOk": post_plan_ok,
             "postPlanLagOkPct": post_plan_pct,
@@ -23701,6 +23946,7 @@ def publish_draft_result(
             "noChange": counts.get("no-change", 0),
             "ok": counts.get("ok", 0),
             "blocked": counts.get("blocked", 0),
+            "peerCompatUnresolved": peer_unresolved,
             "candidateTruncated": counts.get("candidate-search-truncated", 0),
             "deferred": counts.get("deferred", 0),
             "excluded": counts.get("excluded", 0),
@@ -23746,6 +23992,7 @@ def publish_draft_result(
             }
         ),
         "projects": plan.get("projects", []),
+        "unresolved": plan.get("unresolved", []),
     }
     _atomic_write_text(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2))
     return manifest
@@ -24727,6 +24974,7 @@ def main() -> None:
             # R2: the first Draft path solves ONE chosen variant ("default"),
             # not the three required by the Verified planning loop, so the run
             # stays bounded and any expiry publishes the rows gathered so far.
+            draft_incomplete_components: List[Dict[str, Any]] = []
             run_supervised_planning(
                 "planning",
                 deadline_clock,
@@ -24736,9 +24984,47 @@ def main() -> None:
                     modes=("default",),
                     apply_results=True,
                     residual_targets_by_project=residual_targets_by_project,
+                    # D1: an UNFINISHED exact outcome for one component must
+                    # not destroy the collected Draft. The solver marks the
+                    # group unresolved instead of raising a terminal error,
+                    # and the caller publishes a DRAFT_PARTIAL result.
+                    partial_on_incomplete=True,
+                    incomplete_components_out=draft_incomplete_components,
+                    run_context={"runId": run_id},
                 ),
                 rows_by_project,
             )
+            if draft_incomplete_components:
+                # D1: publish whatever was gathered (all rows preserved,
+                # unresolved components explicitly flagged) as a legitimate
+                # partial result and exit 0 -- never a bare exit 3 without a
+                # result. The undisputed solver raises (UNSAT, unavailable,
+                # programming errors) still propagate unchanged.
+                unresolved_groups = "; ".join(
+                    f"{item['project']}/{item['mode']}: {item['componentCount']} package(s) "
+                    f"({','.join(item['component'][:5])}"
+                    + ("…" if len(item['component']) > 5 else "")
+                    + f"), status={item['status']}, reason={item['detail'] or 'no reason given'}"
+                    for item in draft_incomplete_components
+                )
+                _publish_draft_and_exit(
+                    run_id=run_id,
+                    workspace_id=workspace_id,
+                    project_id=project_id,
+                    mode=mode,
+                    rows_by_project=rows_by_project,
+                    projects_by_name=projects_by_name,
+                    client=client,
+                    deadline_clock=deadline_clock,
+                    status="DRAFT_PARTIAL",
+                    partial_reason=(
+                        f"The exact peer solver finished UNFINISHED for {len(draft_incomplete_components)} "
+                        f"component(s); the affected packages stay in the plan marked unresolved -- "
+                        f"this is not a proven conflict and not a proven solution. {unresolved_groups}"
+                    ),
+                    input_hashes=draft_input_hashes,
+                    input_files_by_project=draft_input_files_by_project,
+                )
         else:
             # proof_envelopes_out is filled by reference; the function returns
             # the assignments alone.

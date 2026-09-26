@@ -43,6 +43,14 @@ export function baselineFailureMessage(result: { code: number; stderr: string; s
       : 'Сохранённый checkpoint недоступен для продолжения. Нажмите «Начать заново» в Baseline, чтобы начать новый поиск.'
   } else if (failure.category === 'BUDGET_EXHAUSTED' || failure.code === 'BASELINE_BUDGET_EXHAUSTED') {
     explanation = 'Время поиска истекло до получения нового проверенного результата. Это не означает, что решения нет. Посмотрите последний блокирующий check и задайте больший бюджет для продолжения.'
+  } else if (failure.category === 'SOLVER_UNKNOWN' || failure.code === 'EXACT_SOLVER_UNKNOWN') {
+    explanation = 'Черновой план готов частично: точный solver не завершился и не дал доказательства ни в одну сторону — это не доказанный конфликт и не решение. Совместимость группы не определена; нерешённые пакеты отмечены в плане отдельно. Откройте план и выполните дополнительную проверку нерешённой группы.'
+  } else if (failure.category === 'SOLVER_BUDGET_EXHAUSTED' || failure.code === 'EXACT_SOLVER_BUDGET_EXHAUSTED') {
+    explanation = 'Не удалось завершить точную проверку совместимости за отведённое время (подтверждённый timeout/бюджет). Это доказывает только незавершённость поиска, а не несовместимость. Продолжите с большим или явным бюджетом.'
+  } else if (failure.category === 'EXACT_UNSAT_PROVEN' || failure.code === 'EXACT_SOLVER_UNSAT_PROVEN') {
+    explanation = 'Точный solver доказал: в смоделированном конечном наборе версий нет удовлетворяющего назначения. Это доказанная несовместимость доступных кандидатов, а не незавершённый поиск.'
+  } else if (failure.category === 'SOLVER_UNAVAILABLE' || failure.code === 'EXACT_SOLVER_UNAVAILABLE') {
+    explanation = 'Точный solver недоступен в этом окружении, поэтому решение по зависимостям не доказано. Исправьте установку solver и повторите.'
   } else if (failure.category === 'SEARCH_LIMIT' || failure.code === 'BASELINE_VERIFICATION_PLATEAU') {
     explanation = 'Поиск достиг лимита попыток без улучшения. Повторять с теми же настройками бесполезно: измените состав, попробуйте более глубокий поиск или проверьте блокирующие команды проекта.'
   } else if (failure.category === 'PROJECT_INCOMPATIBLE') {
