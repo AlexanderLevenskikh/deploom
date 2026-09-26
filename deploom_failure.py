@@ -122,10 +122,14 @@ _CATEGORY_RULES: tuple[tuple[str, str, str, str], ...] = (
         "modeled finite domain. This is a proven incompatibility of the "
         "available candidate versions, not an unfinished search.",
     ),
+    # D2/A2: exact-solver outcomes are classified by their STRUCTURED stop code
+    # (see _CODE_CATEGORY), never by scanning the detail for package names.
+    # These text rules are a fallback ONLY for messages that carry no typed
+    # code; a message that does carry one never reaches them, so a package
+    # named `timeout`/`p-canceled`/`eslint` cannot reclassify the outcome.
     (
         r"EXACT_SOLVER_BUDGET_EXHAUSTED|unknown_refinement_budget"
-        r"|refinement budget ended|confirmed.*timeout|solver.*timed out"
-        r"|EXACT_SOLVER_UNKNOWN[^\n]*?(?:timeout|canceled)",
+        r"|refinement budget ended|solver.*timed out",
         "SOLVER_BUDGET_EXHAUSTED",
         "retry",
         "The exact solver could not complete within its declared budget/timeout. "
@@ -324,6 +328,83 @@ def _extract_code(message: str) -> str:
     return codes[0] if codes else ""
 
 
+# A2: typed stop-codes classify BEFORE any free-text heuristic. A code names
+# the exact solver outcome (UNSAT_PROVEN, budget exhausted, unavailable,
+# unknown), so the category is decided by the code -- never by scanning the
+# detail text, where a package named `timeout`, `p-canceled`, `eslint` or a
+# real "registry" wording must not reclassify the same outcome. Text rules
+# below run only for messages that carry NO typed code (legacy/unstructured).
+_CODE_CATEGORY: Dict[str, tuple[str, str, str]] = {
+    "EXACT_SOLVER_UNSAT_PROVEN": (
+        "EXACT_UNSAT_PROVEN", "not-retryable",
+        "The exact solver PROVED there is no satisfying assignment in the "
+        "modeled finite domain. This is a proven incompatibility of the "
+        "available candidate versions, not an unfinished search.",
+    ),
+    "GLOBAL_EXACT_EXCLUSION_UNSAT_PROVEN": (
+        "EXACT_UNSAT_PROVEN", "not-retryable",
+        "The exact solver PROVED there is no satisfying assignment in the "
+        "modeled finite domain. This is a proven incompatibility of the "
+        "available candidate versions, not an unfinished search.",
+    ),
+    "EXACT_SOLVER_BUDGET_EXHAUSTED": (
+        "SOLVER_BUDGET_EXHAUSTED", "retry",
+        "The exact solver could not complete within its declared budget/timeout. "
+        "This proves only that the search was not finished, not that the project "
+        "is unresolvable. Resume with a larger or explicit budget.",
+    ),
+    "GLOBAL_EXACT_EXCLUSION_BUDGET_EXHAUSTED": (
+        "SOLVER_BUDGET_EXHAUSTED", "retry",
+        "The exact solver could not complete within its declared budget/timeout. "
+        "This proves only that the search was not finished, not that the project "
+        "is unresolvable. Resume with a larger or explicit budget.",
+    ),
+    "EXACT_SOLVER_UNAVAILABLE": (
+        "SOLVER_UNAVAILABLE", "user-action-required",
+        "The exact solver is unavailable in this environment, so no dependency "
+        "decision could be proven. Fix the solver installation and retry.",
+    ),
+    "GLOBAL_EXACT_EXCLUSION_SOLVER_UNAVAILABLE": (
+        "SOLVER_UNAVAILABLE", "user-action-required",
+        "The exact solver is unavailable in this environment, so no dependency "
+        "decision could be proven. Fix the solver installation and retry.",
+    ),
+    "EXACT_SOLVER_UNKNOWN": (
+        "SOLVER_UNKNOWN", "user-action-required",
+        "The exact solver did not finish and returned no proof either way. "
+        "This is NOT a proven conflict and NOT a proven solution: the affected "
+        "compatibility remains undecided and needs further review.",
+    ),
+    "GLOBAL_EXACT_EXCLUSION_SOLVER_UNKNOWN": (
+        "SOLVER_UNKNOWN", "user-action-required",
+        "The exact solver did not finish and returned no proof either way. "
+        "This is NOT a proven conflict and NOT a proven solution: the affected "
+        "compatibility remains undecided and needs further review.",
+    ),
+    "BASELINE_BUDGET_EXHAUSTED": (
+        "BUDGET_EXHAUSTED", "user-action-required",
+        "The wall-clock / attempt budget was consumed before a compatible "
+        "assignment was verified. This proves only that the attempted candidate "
+        "failed within the budget, not that the project is unresolvable; the "
+        "previous baseline is preserved. Deepening the search depth (EXHAUSTIVE) "
+        "does not add time -- resume with a larger explicit budget or new "
+        "evidence.",
+    ),
+    "BASELINE_RECOVERY_CONTINUE_UNAVAILABLE": (
+        "RECOVERY_STATE", "user-action-required",
+        "The saved Baseline checkpoint is missing or incompatible with the "
+        "current source or settings. It cannot be resumed; use Start over "
+        "to begin a new search. Previously verified artifacts remain intact.",
+    ),
+    # NOTE: BASELINE_VERIFICATION_PLATEAU / BASELINE_VERIFICATION_HARD_SAFETY_LIMIT
+    # / HARD_SAFETY_LIMIT are intentionally NOT here: that envelope family's
+    # precise category depends on the STRUCTURED reason embedded in the message
+    # (budget-exhausted-after-one-candidate -> BUDGET_EXHAUSTED, but
+    # absolute-hard-safety-ceiling/STAGNATION -> SEARCH_LIMIT), so the ordered
+    # text rules decide it, with the budget marker checked first.
+}
+
+
 def classify_failure(
     exc: BaseException,
     *,
@@ -356,6 +437,24 @@ def classify_failure(
     has_check_evidence = bool(
         evidence.get("command") or evidence.get("exitCode") or evidence.get("phase")
     )
+    # A2: typed stop-code decides the category BEFORE any free-text heuristic.
+    # The same code+detail with a package named `timeout`, `p-canceled`,
+    # `eslint`, `registry` or `network` yields the SAME category: nothing in
+    # the message text reclassifies a typed solver outcome (in particular a
+    # refinement-budget stop is never turned into a registry problem).
+    code = _extract_code(message)
+    if code in _CODE_CATEGORY:
+        return _CODE_CATEGORY[code]
+    if code.startswith("PROJECT_"):
+        return (
+            "PROJECT_INCOMPATIBLE", "not-retryable",
+            "The project's own checks failed on this dependency combination.",
+        )
+    if code.startswith("RESOLVER_"):
+        return (
+            "RESOLVER_INCOMPATIBLE", "not-retryable",
+            "The package manager cannot resolve this dependency combination.",
+        )
     for pattern, category, retryability, recovery in _CATEGORY_RULES:
         if category == "PROJECT_INCOMPATIBLE" and not has_check_evidence:
             # Without evidence that a command actually ran, the bare
