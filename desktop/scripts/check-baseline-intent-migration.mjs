@@ -44,14 +44,14 @@ const normalizeBudgetField = (raw) => ({ budgetMinutesExplicit: typeof raw?.budg
 // The migration machinery (legacy slug -> baseline intent file), plus the
 // loader/budget check that must migrate before reading.
 const migStart = source.indexOf('function legacyArtifactSlug(')
-const migEnd = source.indexOf('function saveBaselineIntent(', migStart)
+const migEnd = source.indexOf('function projectInstalledVersion(', migStart)
 if (migStart < 0 || migEnd < 0) throw new Error('R2: intent-migration slice not found in main.ts')
 // N1: ownership of a legacy file is decided against the workspace's project
 // list, so the check injects readProjects over a mutable project set.
 let PROJECTS = []
 const readProjects = () => PROJECTS
 const intentGlobals = {
-  join, existsSync: fs.existsSync, readFileSync: fs.readFileSync,
+  join, existsSync: fs.existsSync, readFileSync: fs.readFileSync, realpathSync: fs.realpathSync,
   atomicWriteJsonSync, projectArtifactToken, normalizeBaselineIntent, normalizeBudgetField,
   readProjects,
 }
@@ -59,7 +59,7 @@ const intentApi = compile(
   trans(source.slice(migStart, migEnd)),
   intentGlobals,
   ['legacyArtifactSlug', 'legacyBaselineIntentPath', 'legacySlugProjectCount', 'legacyIntentResolutionNeeded',
-   'migrateLegacyBaselineIntent', 'loadBaselineIntent', 'baselineIntentHasPersistedBudgetMinutes'],
+   'migrateLegacyBaselineIntent', 'saveBaselineIntent', 'loadBaselineIntent', 'baselineIntentHasPersistedBudgetMinutes'],
 )
 
 // The output-dir resolvers (join/existsSync/projectArtifactToken/legacyArtifactSlug +
@@ -94,6 +94,10 @@ try {
   const token = projectArtifactToken(project)
   const legacyIntentPath = slash(path.join('baseline-intent', `${intentApi.legacyArtifactSlug(project)}.json`))
   const currentIntentPath = slash(path.join('baseline-intent', `${token}.json`))
+  // F1: unambiguous ownership must be PROVEN (exactly one matching project);
+  // an empty project list now blocks migration, so tests 1-6 declare the
+  // single unambiguous owner instead of relying on "count 0 <= 1".
+  PROJECTS = [{ name: project }]
 
   // 1. A well-formed full legacy intent (mode, target, lag window, explicit
   //    budget, package policy) migrates to the hashed path with EVERY field
@@ -239,6 +243,85 @@ try {
   PROJECTS = [{ name: project, path: wsUnamb }]
   if (baselineProjectOutputDir({ path: wsUnamb }, project) !== unambLegacyOut) {
     throw new Error('R2/N1: an unambiguous project keeps the legacy output read fallback')
+  }
+  PROJECTS = []
+
+  // F1-9. On a case-insensitive volume 'Demo' and 'demo' are the SAME physical
+  // legacy file. Production ownership must decide by FILESYSTEM identity
+  // (realpath canonicalizes the on-disk casing), so the two projects are both
+  // blocked -- the single legacy file is never assigned to either -- and both
+  // get a resolution reason. On a case-SENSITIVE volume the slugs are distinct
+  // files and each migrates its own (correct POSIX behaviour); the check
+  // adapts to whichever filesystem it runs on.
+  const wsCase = path.join(wsRoot, 'ws-case')
+  const projDemo = 'Demo'
+  const projDemoLower = 'demo'
+  const caseSlug = intentApi.legacyArtifactSlug(projDemo)
+  const caseLegacy = path.join(wsCase, '.dependency-roadmap', 'desktop', 'baseline-intent', `${caseSlug}.json`)
+  fs.mkdirSync(path.dirname(caseLegacy), { recursive: true })
+  fs.writeFileSync(caseLegacy, JSON.stringify({ schemaVersion: 1, executionMode: 'BACKGROUND', policies: { x: 'required' }, budgetMinutes: 45 }), 'utf8')
+  const caseAlternate = path.join(wsCase, '.dependency-roadmap', 'desktop', 'baseline-intent', `${intentApi.legacyArtifactSlug(projDemoLower)}.json`)
+  const caseInsensitive = fs.existsSync(caseAlternate)
+  PROJECTS = [{ name: projDemo, path: wsCase }, { name: projDemoLower, path: wsCase }]
+  const tokenDemo = path.join(wsCase, '.dependency-roadmap', 'desktop', 'baseline-intent', `${projectArtifactToken(projDemo)}.json`)
+  const tokenDemoLower = path.join(wsCase, '.dependency-roadmap', 'desktop', 'baseline-intent', `${projectArtifactToken(projDemoLower)}.json`)
+  intentApi.migrateLegacyBaselineIntent({ path: wsCase }, projDemo)
+  intentApi.migrateLegacyBaselineIntent({ path: wsCase }, projDemoLower)
+  if (caseInsensitive) {
+    if (fs.existsSync(tokenDemo) || fs.existsSync(tokenDemoLower)) {
+      throw new Error('F1: a case-only collision must never assign the single legacy file to both projects')
+    }
+    if (!legacyIntentResolutionNeeded({ path: wsCase }, projDemo) || !legacyIntentResolutionNeeded({ path: wsCase }, projDemoLower)) {
+      throw new Error('F1: both case-colliding projects must surface a resolution reason on a case-insensitive volume')
+    }
+  } else {
+    if (!fs.existsSync(tokenDemo)) {
+      throw new Error('F1: on a case-sensitive volume the exact-case project migrates its own file')
+    }
+  }
+  PROJECTS = []
+
+  // F1-10. A legacy file with NO resolvable owner (empty/unreadable project
+  // list) is NOT proof of a single owner: it must never be auto-migrated, must
+  // surface an explainable resolution reason, and the legacy OUTPUT dir must
+  // not be used as a read fallback either.
+  const wsEmpty = path.join(wsRoot, 'ws-empty')
+  const emptyLegacy = path.join(wsEmpty, '.dependency-roadmap', 'desktop', 'baseline-intent', `${intentApi.legacyArtifactSlug(project)}.json`)
+  fs.mkdirSync(path.dirname(emptyLegacy), { recursive: true })
+  fs.writeFileSync(emptyLegacy, JSON.stringify({ schemaVersion: 1, executionMode: 'BACKGROUND', policies: {} }), 'utf8')
+  const emptyCurrent = path.join(wsEmpty, '.dependency-roadmap', 'desktop', 'baseline-intent', `${token}.json`)
+  const wsEmptyOut = path.join(wsRoot, 'ws-empty-out')
+  const emptyLegacyOut = path.join(wsEmptyOut, '.dependency-roadmap', 'desktop', 'baseline-project-output', intentApi.legacyArtifactSlug(project))
+  PROJECTS = []
+  intentApi.migrateLegacyBaselineIntent({ path: wsEmpty }, project)
+  if (fs.existsSync(emptyCurrent)) throw new Error('F1: unknown ownership must not auto-migrate the legacy file')
+  if (!legacyIntentResolutionNeeded({ path: wsEmpty }, project)) {
+    throw new Error('F1: unknown ownership must surface an explainable resolution reason')
+  }
+  fs.mkdirSync(emptyLegacyOut, { recursive: true })
+  if (baselineProjectOutputDir({ path: wsEmptyOut }, project) !== baselineProjectOutputWriteDir({ path: wsEmptyOut }, project)) {
+    throw new Error('F1: unknown ownership must not use the legacy output read fallback')
+  }
+
+  // F3-11. The resolution banner ENDS once THIS project holds a valid saved
+  // current intent -- the legacy file is deliberately kept, but no longer
+  // demands attention. Saving for project A must not clear project B, and a
+  // corrupt current file is not a successful restoration.
+  PROJECTS = [{ name: projectA, path: wsAmb }, { name: projectB, path: wsAmb }]
+  intentApi.saveBaselineIntent({ path: wsAmb }, projectA, { executionMode: 'FAST', targetLevel: 'yellow', policies: { restored: 'required' } })
+  if (legacyIntentResolutionNeeded({ path: wsAmb }, projectA)) {
+    throw new Error('F3: saving current settings must end the resolution banner for THAT project')
+  }
+  if (!legacyIntentResolutionNeeded({ path: wsAmb }, projectB)) {
+    throw new Error('F3: saving for project A must NOT clear the banner for project B')
+  }
+  const restoredA = intentApi.loadBaselineIntent({ path: wsAmb }, projectA)
+  if (restoredA.policies?.restored !== 'required') {
+    throw new Error('F3: the explicitly restored current intent is what the loader applies')
+  }
+  fs.writeFileSync(ambTokenA, '{corrupt', 'utf8')
+  if (!legacyIntentResolutionNeeded({ path: wsAmb }, projectA)) {
+    throw new Error('F3: a corrupt current intent must not count as a successful restoration')
   }
   PROJECTS = []
 

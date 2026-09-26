@@ -15,11 +15,14 @@ could report >100% / 200%).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -502,6 +505,138 @@ console.log(fingerprintOf(section, document));
         self.assertNotEqual("green", result["status"],
                             "N2: a target-mode edit invalidates the snapshot; 4/5 lag-ok is yellow, never the stale green")
         self.assertAlmostEqual(80.0, result["lag_ok_pct"], places=4)
+
+
+class F2MlLimitsCrossLayerTests(unittest.TestCase):
+    """F2: with NO explicit Moderate/Low caps the legacy combined default
+    (M+L)<=20 applies in Python. effective_acceptance_policy materializes the
+    missing fields as 20/20, so the HTML must be told HOW the rule was chosen
+    (mlLimitsMode) -- otherwise the dashboard recomputes per-severity
+    (15<=20 && 15<=20 -> green) while the producer said yellow (15+15 > 20).
+    Every test here runs the REAL write_html -> embedded REPORT_CONTEXT -> JS
+    recompute path: a hand-built policy object would miss the loss between
+    the layers, which is exactly the defect."""
+
+    def _policy_env(self, policy: dict | None = None) -> dict[str, str]:
+        return {
+            "DEPLOOM_ACCEPTANCE_POLICY_JSON": json.dumps(policy) if policy else "",
+            "DEPLOOM_ACCEPTANCE_POLICY_BY_PROJECT": "",
+        }
+
+    def _render(self, policy: dict | None, vulns: str) -> tuple[str, dict]:
+        rows = [_row("pkg", vulns=vulns)]
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "report.html"
+            with patch.dict(os.environ, self._policy_env(policy)):
+                health = generator.compute_project_health(rows, "app")
+                generator.write_html({"app": rows}, target, health_by_project={"app": health},
+                                     registry="https://registry.npmjs.org")
+            html_text = target.read_text(encoding="utf-8")
+        return html_text, asdict(health)
+
+    def _evaluate_html(self, html_text: str, mode: str = "yellow", vulns: str = "C:0;H:0;M:0;L:0") -> dict:
+        probe = r"""
+const fs = require('node:fs');
+const html = fs.readFileSync(process.argv[2], 'utf8');
+const ctxMatch = html.match(/const REPORT_CONTEXT\s*=\s*(\{[^\n]+\});/);
+if (!ctxMatch) throw new Error('REPORT_CONTEXT not found in emitted HTML');
+const ctx = JSON.parse(ctxMatch[1]);
+function extract(name) {
+  const start = html.indexOf(`function ${name}(`);
+  if (start < 0) throw new Error(`function ${name} not found in emitted HTML`);
+  const end = html.indexOf('\nfunction ', start + 1);
+  return html.slice(start, end).replaceAll('\\\\', '\\');
+}
+const evaluate = new Function('section', 'REPORT_CONTEXT', 'document',
+  ['semverParts', 'compareSemverText', 'lagComplianceTargetForDomRow', 'vulnerabilityCountsForDomRow', 'domHealthFingerprint', 'domSecurityKnownFromVulns', 'totalWithinLimit', 'recomputeProjectHealthFromDom', 'calculateProjectHealthFromDom']
+    .map(extract).join('\n') + '\nreturn calculateProjectHealthFromDom(section);');
+const row = { dataset: { name: 'pkg', current: '1.0.0', vulns: '__VULNS__', lagThresholdMonths: '12', scopeExcluded: '0' }, getAttribute: () => '1.0.0' };
+const section = { dataset: { projectSection: 'app' }, querySelectorAll: () => [row] };
+const document = { getElementById: () => ({ value: '__MODE__' }) };
+const result = evaluate(section, ctx, document);
+const app = ctx.projectHealth && ctx.projectHealth.app;
+console.log(JSON.stringify({ domain: 'f2', status: result.status, moderate: result.moderate, low: result.low,
+  embeddedStatus: app ? app.status : null, mlLimitsMode: (ctx.projectPolicy && ctx.projectPolicy.app && ctx.projectPolicy.app.mlLimitsMode) || null }));
+"""
+        body = probe.replace("__VULNS__", vulns).replace("__MODE__", mode)
+        script = ROOT / "probe-f2-2026-09-26.cjs"
+        script.write_text(body, encoding="utf-8")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                html_path = Path(td) / "report.html"
+                html_path.write_text(html_text, encoding="utf-8")
+                done = subprocess.run(["node", str(script), str(html_path)],
+                                      capture_output=True, text=True, encoding="utf-8", timeout=120)
+            if done.returncode != 0:
+                raise AssertionError(f"node probe failed: {done.stdout}\n{done.stderr}")
+            return json.loads(done.stdout.strip().splitlines()[-1])
+        finally:
+            try:
+                script.unlink()
+            except OSError:
+                pass
+
+    # -- Python gate unit-level semantics ------------------------------------
+
+    def test_health_ml_limits_mode_python_gate(self) -> None:
+        with patch.dict(os.environ, self._policy_env(None)):
+            self.assertEqual("combined-20", generator._health_ml_limits_mode("app"))
+            self.assertFalse(generator._health_ml_clear(15, 15, "app"),
+                             "F2: implicit M/L default keeps the combined (M+L)<=20 gate")
+            self.assertTrue(generator._health_ml_clear(5, 5, "app"))
+        with patch.dict(os.environ, self._policy_env({"maxKnownModerate": 20, "maxKnownLow": 20})):
+            self.assertEqual("per-severity", generator._health_ml_limits_mode("app"))
+            self.assertTrue(generator._health_ml_clear(15, 15, "app"))
+            self.assertFalse(generator._health_ml_clear(21, 0, "app"))
+        with patch.dict(os.environ, self._policy_env({"maxKnownModerate": 0, "maxKnownLow": 0})):
+            self.assertEqual("per-severity", generator._health_ml_limits_mode("app"))
+            self.assertFalse(generator._health_ml_clear(1, 0, "app"))
+        with patch.dict(os.environ, self._policy_env({"maxKnownLow": 20})):
+            self.assertEqual("per-severity", generator._health_ml_limits_mode("app"))
+            self.assertFalse(generator._health_ml_clear(0, 21, "app"),
+                             "F2: the unset Moderate keeps the per-severity default 20")
+            self.assertTrue(generator._health_ml_clear(0, 20, "app"))
+
+    # -- Round trip: Python policy -> HTML serialization -> JS recompute -------
+
+    def test_implicit_ml_default_survives_html_round_trip(self) -> None:
+        # The audit reproduction: implicit M/L with M=15/L=15. Producer: yellow
+        # (combined 30 > 20). The DOM recompute (target-mode edit invalidates
+        # the embedded snapshot) must stay yellow, not turn green via 20/20
+        # per-severity look-alike numbers.
+        html, health = self._render(None, "C:0;H:0;M:15;L:15")
+        self.assertEqual("yellow", health["status"], "F2: producer must be yellow for implicit M=15/L=15")
+        before = self._evaluate_html(html, mode="default", vulns="C:0;H:0;M:15;L:15")
+        after = self._evaluate_html(html, mode="yellow", vulns="C:0;H:0;M:15;L:15")
+        self.assertEqual("yellow", before["embeddedStatus"] if before["embeddedStatus"] is not None else before["status"])
+        self.assertEqual("yellow", before["status"], "F2: matched fingerprint renders the authoritative yellow")
+        self.assertEqual("combined-20", after["mlLimitsMode"], "F2: HTML must carry the combined-default semantics")
+        self.assertEqual("yellow", after["status"],
+                         "F2: recompute after a mode edit must stay yellow, not turn green via 20/20")
+
+    def test_explicit_ml_per_severity_survives_html_round_trip(self) -> None:
+        html, health = self._render({"maxKnownModerate": 20, "maxKnownLow": 20}, "C:0;H:0;M:15;L:15")
+        self.assertEqual("green", health["status"], "F2: explicit 20/20 permits M=15/L=15")
+        after = self._evaluate_html(html, mode="yellow", vulns="C:0;H:0;M:15;L:15")
+        self.assertEqual("per-severity", after["mlLimitsMode"])
+        self.assertEqual("green", after["status"], "F2: explicit per-severity must recompute green identically")
+
+    def test_explicit_zero_ml_limits_are_honoured_round_trip(self) -> None:
+        html, health = self._render({"maxKnownModerate": 0, "maxKnownLow": 0}, "C:0;H:0;M:0;L:0")
+        self.assertEqual("green", health["status"])
+        self.assertEqual("green", self._evaluate_html(html, mode="yellow", vulns="C:0;H:0;M:0;L:0")["status"])
+        html2, health2 = self._render({"maxKnownModerate": 0, "maxKnownLow": 0}, "C:0;H:0;M:1;L:0")
+        self.assertNotEqual("green", health2["status"], "F2: M=1 must break a 0/0 explicit policy")
+        self.assertNotEqual("green", self._evaluate_html(html2, mode="yellow", vulns="C:0;H:0;M:1;L:0")["status"])
+
+    def test_one_sided_explicit_ml_keeps_default_for_other(self) -> None:
+        # Only maxKnownLow is explicit -> per-severity, Moderate bounded by 20.
+        html, health = self._render({"maxKnownLow": 20}, "C:0;H:0;M:21;L:0")
+        self.assertNotEqual("green", health["status"], "F2: M=21 must exceed the per-severity default for Moderate")
+        self.assertNotEqual("green", self._evaluate_html(html, mode="yellow", vulns="C:0;H:0;M:21;L:0")["status"])
+        html2, health2 = self._render({"maxKnownLow": 20}, "C:0;H:0;M:19;L:0")
+        self.assertEqual("green", health2["status"])
+        self.assertEqual("green", self._evaluate_html(html2, mode="yellow", vulns="C:0;H:0;M:19;L:0")["status"])
 
 
 class A09RestoreAuthorizationTests(unittest.TestCase):

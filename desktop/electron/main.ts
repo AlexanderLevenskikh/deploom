@@ -662,27 +662,71 @@ function baselineIntentPath(workspace: WorkspaceRecord, projectName: string): st
   return join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-intent', `${projectArtifactToken(projectName)}.json`)
 }
 
-// N1: ownership of a legacy (pre-A08) state. The legacy slug is LOSSY: two
+// N1/F1: ownership of a legacy (pre-A08) state. The legacy slug is LOSSY: two
 // distinct project names ('Проект один'/'Проект два', 'foo/bar'/'foo-bar') can
 // slugify to the SAME key, so a matching legacy file is NOT proof it belongs
-// to the project being loaded. Ownership is only unambiguous when exactly one
-// project in the workspace maps to that slug. With more than one, the legacy
-// state is preserved untouched and neither project silently receives the
-// other's settings -- the loader falls back to defaults and a human-readable
-// resolution reason is surfaced so the user can choose/restore.
+// to the project being loaded. Ownership is decided on the FILESYSTEM identity
+// of the resulting path, never by a plain string comparison of the slug: on a
+// case-insensitive volume 'Demo.json' and 'demo.json' are ONE physical file
+// and both candidate projects are counted as owners. Ownership is unambiguous
+// ONLY when exactly one project maps to that legacy file; zero owners (empty
+// or unreadable project list) and shared ownership both keep the file
+// untouched and surface a resolution reason -- absence of project records is
+// NOT proof of a single owner.
 function legacySlugProjectCount(workspace: WorkspaceRecord, legacySlug: string): number {
-  return readProjects(workspace).filter((project) => legacyArtifactSlug(project.name) === legacySlug).length
+  let projects: { name: string }[]
+  try { projects = readProjects(workspace) } catch { return 0 }
+  const probe = join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-intent', `${legacySlug}.json`)
+  return projects.filter((project) => legacyPathsAreSamePhysicalFile(probe, legacyBaselineIntentPath(workspace, project.name))).length
+}
+
+// N1/F1: two legacy paths are the SAME physical file when they resolve to one
+// on-disk file. An exact string match covers paths that do not exist yet; a
+// case-folded comparison closes the case-insensitive volumes (Windows default)
+// where 'Demo.json' and 'demo.json' are ONE file -- Node's realpath does NOT
+// normalize the input casing, so realpath alone cannot see that collision. On
+// POSIX the case-folded paths are distinct files and stay distinct. realpath
+// additionally resolves symlinks when both sides exist.
+function legacyPathsAreSamePhysicalFile(a: string, b: string): boolean {
+  if (a === b) return true
+  if (process.platform === 'win32' && a.toLowerCase() === b.toLowerCase()) return true
+  try { return realpathSync(a) === realpathSync(b) } catch { return false }
 }
 
 function legacyIntentResolutionNeeded(workspace: WorkspaceRecord, projectName: string): string | undefined {
-  if (!existsSync(legacyBaselineIntentPath(workspace, projectName))) return undefined
+  const legacy = legacyBaselineIntentPath(workspace, projectName)
+  if (!existsSync(legacy)) return undefined
   const slug = legacyArtifactSlug(projectName)
-  if (legacySlugProjectCount(workspace, slug) <= 1) return undefined
+  const owners = legacySlugProjectCount(workspace, slug)
+  if (owners === 1) return undefined
+  // F3: the banner asks the user to choose/restore settings. Once THIS project
+  // holds a well-formed current intent the user HAS made that choice explicit
+  // -- the saved file IS the resolution -- so the banner clears for it even
+  // though the legacy file is deliberately kept (downgrade-safe). A corrupt
+  // current file is not a restoration, and saving for one project never clears
+  // the banner for another.
+  if (currentBaselineIntentIsValid(workspace, projectName)) return undefined
+  if (owners === 0) {
+    return (
+      `Обнаружен legacy-файл настроек '${legacy}' (slug '${slug}'), но ни один проект workspace не ` +
+      `отображается на него однозначно: принадлежность не установлена, настройки не перенесены. ` +
+      `Откройте настройки проекта и выберите/восстановите их заново.`
+    )
+  }
   return (
-    `Обнаружен общий legacy-файл настроек '${legacyBaselineIntentPath(workspace, projectName)}' ` +
+    `Обнаружен общий legacy-файл настроек '${legacy}' ` +
     `(slug '${slug}'), на который отображается несколько проектов workspace. Настройки не перенесены ` +
     `автоматически, чтобы не назначить чужое состояние; откройте настройки проекта и выберите/восстановите их заново.`
   )
+}
+
+// F3: a well-formed CURRENT (hashed) intent file is proof the user resolved
+// the ambiguity for this project -- the loader reads and applies it.
+function currentBaselineIntentIsValid(workspace: WorkspaceRecord, projectName: string): boolean {
+  try {
+    const raw = JSON.parse(readFileSync(baselineIntentPath(workspace, projectName), 'utf8'))
+    return !!raw && typeof raw === 'object' && !Array.isArray(raw)
+  } catch { return false }
 }
 
 // R2: one-time read-time migration of a legacy intent file to the current
@@ -699,12 +743,16 @@ function migrateLegacyBaselineIntent(workspace: WorkspaceRecord, projectName: st
   const legacy = legacyBaselineIntentPath(workspace, projectName)
   if (!existsSync(legacy)) return
   const slug = legacyArtifactSlug(projectName)
-  if (legacySlugProjectCount(workspace, slug) > 1) {
-    // N1: one matching slug is not proof of ownership. Keep the file and
-    // never assign it; callers see defaults plus legacyIntentResolutionNeeded.
+  const owners = legacySlugProjectCount(workspace, slug)
+  if (owners !== 1) {
+    // N1/F1: only ONE owner is proof of ownership. A shared or unknown
+    // (unresolvable/empty project list) slug is never assigned. Keep the file
+    // and never overwrite it; callers see defaults plus a resolution reason.
+    const cause = owners === 0
+      ? 'ownership is unknown (no workspace project resolves to the legacy file)'
+      : `is shared by ${owners} workspace projects`
     console.warn(
-      `[legacy-intent] legacy '${legacy}' (slug '${slug}') is shared by ${legacySlugProjectCount(workspace, slug)} ` +
-      `workspace projects; settings were NOT migrated automatically.`,
+      `[legacy-intent] legacy '${legacy}' (slug '${slug}') ${cause}; settings were NOT migrated automatically.`,
     )
     return
   }
@@ -1188,7 +1236,9 @@ function baselineProjectOutputDir(workspace: WorkspaceRecord, projectName: strin
   const current = baselineProjectOutputWriteDir(workspace, projectName)
   if (existsSync(current)) return current
   const slug = legacyArtifactSlug(projectName)
-  if (legacySlugProjectCount(workspace, slug) > 1) return current
+  // F1: the legacy output fallback is allowed only for an UNAMBIGUOUS owner;
+  // an unknown or shared slug could show another project's output.
+  if (legacySlugProjectCount(workspace, slug) !== 1) return current
   const legacy = join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-project-output', slug)
   return existsSync(legacy) ? legacy : current
 }

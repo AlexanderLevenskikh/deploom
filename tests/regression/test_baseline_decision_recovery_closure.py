@@ -64,8 +64,11 @@ class BaselineDecisionRecoveryClosureTests(unittest.TestCase):
     def test_baseline_snapshots_its_project_private_output(self) -> None:
         main = (ROOT / "desktop" / "electron" / "main.ts").read_text(encoding="utf-8")
         self.assertIn("function baselineProjectOutputDir", main)
+        # N1: the snapshot/backup writer uses the always-hashed project-private
+        # write dir (baselineProjectOutputWriteDir); the read resolver keeps
+        # the legacy-compatible name. The private-output invariant is unchanged.
         self.assertIn(
-            "const baselineOutput = baselineProjectOutputDir(job.workspace, job.projectName)",
+            "const baselineOutput = baselineProjectOutputWriteDir(job.workspace, job.projectName)",
             main,
         )
         self.assertIn(

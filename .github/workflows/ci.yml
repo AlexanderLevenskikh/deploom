@@ -165,12 +165,14 @@ jobs:
           npm run check:workspace-bootstrap
           npm run check:ui-shell
           npm run check:baseline-intent
+          npm run check:baseline-intent-migration
           npm run check:baseline-worker-hardening
           npm run check:interaction-contracts
           npm run check:dependency-graph
           npm run check:ui-lifecycle
           npm run check:target-precedence
           npm run check:baseline-worker-retire
+          npm run check:baseline-worker-cancel
           npm run check:run-slot-isolation
           npm run check:artifact-token
       - name: Version consistency

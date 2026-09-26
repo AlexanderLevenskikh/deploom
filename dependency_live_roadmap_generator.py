@@ -5803,12 +5803,29 @@ def dependency_has_lag_policy_target(row: DependencyRow) -> bool:
     return not row.scope_excluded and has_safe_target(lag_compliance_target_for_row(row))
 
 
-def _health_ml_clear(moderate: int, low: int, project_name: Optional[str] = None) -> bool:
-    """G1: the green gate honours a numeric Moderate/Low policy when the
-    acceptance policy states one (e.g. the product Green preset pins M=0/L=0);
-    otherwise the legacy combined (M+L)<=20 product default applies."""
+def _health_ml_limits_mode(project_name: Optional[str] = None) -> str:
+    """F2: which Moderate/Low acceptance rule applies for a project.
+
+    Returns 'per-severity' when the RAW policy states a numeric Moderate/Low
+    cap (either one -- each severity is then bounded individually and the
+    other defaults to 20, mirroring effective_acceptance_policy), or
+    'combined-20' for the legacy product default (M + L) <= 20. This helper is
+    the SINGLE source of truth for both the Python green gate and the HTML
+    serialization, so the interactive dashboard recomputes exactly the verdict
+    the producer computed instead of guessing from serialized numbers.
+    """
     raw = _policy_env_json(project_name)
     if "maxKnownModerate" in raw or "maxKnownLow" in raw:
+        return "per-severity"
+    return "combined-20"
+
+
+def _health_ml_clear(moderate: int, low: int, project_name: Optional[str] = None) -> bool:
+    """G1/F2: the green gate honours a numeric Moderate/Low policy when the
+    acceptance policy states one (e.g. the product Green preset pins M=0/L=0);
+    otherwise the legacy combined (M+L)<=20 product default applies. The rule
+    is chosen by _health_ml_limits_mode so the HTML sees the same verdict."""
+    if _health_ml_limits_mode(project_name) == "per-severity":
         policy = effective_acceptance_policy(project_name)
         return moderate <= int(policy["maxKnownModerate"]) and low <= int(policy["maxKnownLow"])
     return (moderate + low) <= 20
@@ -18460,8 +18477,15 @@ def write_html(
         # hardcoded 80/20 heuristics, and never fabricates green without a policy.
         "projectPolicy": {
             project: {
-                key: policy.get(key)
-                for key in ("targetLevel", "minLagOkPct", "lagPolicyMonths", "maxKnownCritical", "maxKnownHigh", "maxKnownModerate", "maxKnownLow")
+                **{
+                    key: policy.get(key)
+                    for key in ("targetLevel", "minLagOkPct", "lagPolicyMonths", "maxKnownCritical", "maxKnownHigh", "maxKnownModerate", "maxKnownLow")
+                },
+                # F2: how the M/L acceptance rule was chosen, so the dashboard
+                # applies the same rule the producer applied. Without this the
+                # serialized numbers always look per-severity even when the
+                # legacy combined (M+L)<=20 default was in force.
+                "mlLimitsMode": _health_ml_limits_mode(project),
             }
             for project in (health_by_project or {})
             for policy in [effective_acceptance_policy(project)]
@@ -19350,12 +19374,19 @@ function recomputeProjectHealthFromDom(section, policy){
   const maxCritical = policy && typeof policy.maxKnownCritical === 'number' ? policy.maxKnownCritical : 0;
   const maxModerate = policy && typeof policy.maxKnownModerate === 'number' ? policy.maxKnownModerate : undefined;
   const maxLow = policy && typeof policy.maxKnownLow === 'number' ? policy.maxKnownLow : undefined;
-  // N2: M/L are within limits only when the totals satisfy the policy's numeric
-  // caps; a policy without numeric caps falls back to the legacy combined
-  // (M+L)<=20 rule, mirroring the Python _health_ml_clear gate.
-  const mlClear = (maxModerate === undefined && maxLow === undefined)
-    ? (totals.M + totals.L) <= 20
-    : (totals.M <= (maxModerate === undefined ? 0 : maxModerate)) && (totals.L <= (maxLow === undefined ? 0 : maxLow));
+  // F2: the producer embeds HOW the M/L rule was chosen (mlLimitsMode).
+  // 'per-severity' bounds each severity individually -- an absent numeric
+  // field defaults to 20, exactly like effective_acceptance_policy; a policy
+  // with only one explicit cap keeps the default for the other. 'combined-20'
+  // applies the legacy (M+L)<=20 product default even though the serialized
+  // numbers on their own would look per-severity. A marker-less policy keeps
+  // the historical interpretation (both fields numeric -> per-severity, else
+  // combined) so an old report is not silently re-judged.
+  const mlPerSeverity = policy && (policy.mlLimitsMode === 'per-severity'
+    || (policy.mlLimitsMode === undefined && maxModerate !== undefined && maxLow !== undefined));
+  const mlClear = mlPerSeverity
+    ? (totals.M <= (maxModerate === undefined ? 20 : maxModerate)) && (totals.L <= (maxLow === undefined ? 20 : maxLow))
+    : (totals.M + totals.L) <= 20;
   // N2: projections are COMPUTED from the DOM + policy, never unconditional
   // zeros. A row is projected lag-ok when it already satisfies its compliance
   // target or its planned (yellow/green) target reaches it; the planning
