@@ -323,7 +323,7 @@ class R4D2SolverClassificationTests(unittest.TestCase):
         return build_failure(exc, context=exc.failure_context).to_envelope()
 
     def test_solver_unknown_is_package_name_independent(self):
-        for component in ("package-a", "eslint", "typescript", "libjs", "eslint-plugin-x", "src/lint/foo"):
+        for component in ("package-a", "eslint", "typescript", "app", "eslint-plugin-x", "src/lint/foo"):
             envelope = self.solver_failure(component)
             self.assertEqual("SOLVER_UNKNOWN", envelope["category"], component)
             self.assertNotEqual("PROJECT_INCOMPATIBLE", envelope["category"], component)
@@ -385,10 +385,10 @@ class R4D3FailureContextTests(unittest.TestCase):
         exc = roadmap._baseline_terminal_error(
             roadmap.BaselineTerminalStatus.SOLVER_UNKNOWN,
             "EXACT_SOLVER_UNKNOWN",
-            "libjs/red: component=eslint,typescript status=unknown; detail=no reason given; "
+            "app/red: component=eslint,typescript status=unknown; detail=no reason given; "
             "unfinished exact proof is not a dependency decision",
             source="z3",
-            project="libjs",
+            project="app",
             mode="red",
             extra_context={
                 "component": "eslint,typescript",
@@ -403,7 +403,7 @@ class R4D3FailureContextTests(unittest.TestCase):
         )
         envelope = build_failure(exc, context=exc.failure_context).to_envelope()
         self.assertEqual("SOLVER_UNKNOWN", envelope["category"])
-        self.assertEqual("libjs", envelope["project"])
+        self.assertEqual("app", envelope["project"])
         self.assertEqual("red", envelope["mode"])
         self.assertEqual("peer-planning", envelope["phase"])
         ctx = envelope["context"]
@@ -422,9 +422,9 @@ class R4D3FailureContextTests(unittest.TestCase):
         exc = roadmap._baseline_terminal_error(
             roadmap.BaselineTerminalStatus.BUDGET_EXHAUSTED,
             "EXACT_SOLVER_BUDGET_EXHAUSTED",
-            "libjs/red: component=eslint; detail=timeout; unfinished",
+            "app/red: component=eslint; detail=timeout; unfinished",
             source="z3",
-            project="libjs",
+            project="app",
             mode="red",
             phase="peer-planning",
             command="z3",
@@ -442,7 +442,7 @@ class R4D3FailureContextTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = write_diagnostic_artifact(exc, failure, directory=Path(tmp))
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
-            self.assertEqual("libjs", payload["context"]["project"])
+            self.assertEqual("app", payload["context"]["project"])
             self.assertEqual("red", payload["context"]["mode"])
             self.assertEqual("eslint", payload["context"]["component"])
             self.assertEqual("30000", payload["context"]["timeoutMs"])
