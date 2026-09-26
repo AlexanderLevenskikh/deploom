@@ -54,6 +54,7 @@
     "package:mac:arm64": "npm run build && cross-env TOOL_VENDOR_PLATFORM=macosx_11_0_arm64 node scripts/prepare-tool.mjs && electron-builder --mac --arm64 --publish never",
     "check:cross-platform": "node scripts/check-cross-platform.mjs",
     "check:ui-shell": "node scripts/check-ui-shell.mjs",
+    "check:baseline-failure-message": "node scripts/check-baseline-failure-message.mjs",
     "check:baseline-intent": "node scripts/check-baseline-intent.mjs",
     "check:baseline-intent-migration": "node scripts/check-baseline-intent-migration.mjs",
     "check:baseline-worker-hardening": "node scripts/check-baseline-worker-hardening.mjs",

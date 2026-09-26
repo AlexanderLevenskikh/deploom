@@ -29,11 +29,24 @@ export function extractBaselineFailureEnvelope(output: string): BaselineFailureE
   return latest
 }
 
-/** First line is short and actionable; the technical cause stays available below it. */
-export function baselineFailureMessage(result: { code: number; stderr: string; stdout: string }): string | undefined {
+/**
+ * First line is short and actionable; the technical cause stays available below it.
+ *
+ * A3: whether a "the Draft plan is ready" claim may be made is decided by
+ * `draftPublishable` (a fresh accepted manifest for THIS runId exists), never by
+ * the error envelope alone. Fast/Deep/Verified runs never publish a Draft, so
+ * their unknown/budget explanations honestly say that no new verified result
+ * was obtained instead of promising a plan that does not exist.
+ */
+export function baselineFailureMessage(
+  result: { code: number; stderr: string; stdout: string },
+  options?: { mode?: string; draftPublishable?: boolean },
+): string | undefined {
   if (result.code === 0) return undefined
   const failure = extractBaselineFailureEnvelope(`${result.stderr}\n${result.stdout}`)
   if (!failure) return undefined
+
+  const draftPublishable = options?.draftPublishable === true
 
   let explanation: string
   if (failure.code === 'BASELINE_RECOVERY_CONTINUE_UNAVAILABLE') {
@@ -43,10 +56,18 @@ export function baselineFailureMessage(result: { code: number; stderr: string; s
       : 'Сохранённый checkpoint недоступен для продолжения. Нажмите «Начать заново» в Baseline, чтобы начать новый поиск.'
   } else if (failure.category === 'BUDGET_EXHAUSTED' || failure.code === 'BASELINE_BUDGET_EXHAUSTED') {
     explanation = 'Время поиска истекло до получения нового проверенного результата. Это не означает, что решения нет. Посмотрите последний блокирующий check и задайте больший бюджет для продолжения.'
-  } else if (failure.category === 'SOLVER_UNKNOWN' || failure.code === 'EXACT_SOLVER_UNKNOWN') {
-    explanation = 'Черновой план готов частично: точный solver не завершился и не дал доказательства ни в одну сторону — это не доказанный конфликт и не решение. Совместимость группы не определена; нерешённые пакеты отмечены в плане отдельно. Откройте план и выполните дополнительную проверку нерешённой группы.'
   } else if (failure.category === 'SOLVER_BUDGET_EXHAUSTED' || failure.code === 'EXACT_SOLVER_BUDGET_EXHAUSTED') {
-    explanation = 'Не удалось завершить точную проверку совместимости за отведённое время (подтверждённый timeout/бюджет). Это доказывает только незавершённость поиска, а не несовместимость. Продолжите с большим или явным бюджетом.'
+    // A2/A3: budget is checked BEFORE unknown so an envelope carrying
+    // category=SOLVER_BUDGET_EXHAUSTED is never swallowed by the code-only
+    // unknown branch, and the "plan is ready" wording is gated on an actually
+    // published fresh manifest.
+    explanation = draftPublishable
+      ? 'Не удалось завершить точную проверку совместимости за отведённое время (подтверждённый timeout/бюджет); черновой план готов частично, нерешённые группы отмечены в плане. Это доказывает только незавершённость поиска, а не несовместимость. Продолжите с большим или явным бюджетом.'
+      : 'Не удалось завершить точную проверку совместимости за отведённое время (подтверждённый timeout/бюджет); новый проверенный результат не получен. Это доказывает только незавершённость поиска, а не несовместимость. Откройте техническую причину и диагностический файл ниже; продолжите с большим или явным бюджетом.'
+  } else if (failure.category === 'SOLVER_UNKNOWN' || failure.code === 'EXACT_SOLVER_UNKNOWN') {
+    explanation = draftPublishable
+      ? 'Черновой план готов частично: точный solver не завершился и не дал доказательства ни в одну сторону — это не доказанный конфликт и не решение. Совместимость группы не определена; нерешённые пакеты отмечены в плане отдельно. Откройте план и выполните дополнительную проверку нерешённой группы.'
+      : 'Новый проверенный результат не получен: точный solver не завершился и не дал доказательства ни в одну сторону — это не доказанный конфликт и не решение. Совместимость группы остаётся неопределённой. Откройте техническую причину и диагностический файл ниже; при повторном запуске можно увеличить бюджет и перепроверить нерешённую группу.'
   } else if (failure.category === 'EXACT_UNSAT_PROVEN' || failure.code === 'EXACT_SOLVER_UNSAT_PROVEN') {
     explanation = 'Точный solver доказал: в смоделированном конечном наборе версий нет удовлетворяющего назначения. Это доказанная несовместимость доступных кандидатов, а не незавершённый поиск.'
   } else if (failure.category === 'SOLVER_UNAVAILABLE' || failure.code === 'EXACT_SOLVER_UNAVAILABLE') {

@@ -6523,8 +6523,11 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
       exitCode = result.code
       if (exitCode !== 0) {
         const preflightMessage = sourcePreflightCommandFailureMessage(job, result)
+        // A3: a Verified/Fast/Deep run never publishes a Draft, so the failure
+        // message must not promise a "ready partial plan" -- draftPublishable
+        // stays false because this non-DRAFT branch has no accepted manifest.
         const verifiedBaselineMessage = job.action === 'baseline' && job.baselineProofMode !== 'DRAFT'
-          ? baselineFailureMessage(result)
+          ? baselineFailureMessage(result, { mode: job.baselineProofMode, draftPublishable: false })
           : undefined
         throw new Error(preflightMessage ?? verifiedBaselineMessage ?? `${spec.label}: команда завершилась с кодом ${exitCode} после ${attemptsPerformed} попыток.${result.stderr.trim() ? `\n\n${result.stderr.trim()}` : ''}`)
       }
