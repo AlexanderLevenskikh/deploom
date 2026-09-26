@@ -1073,6 +1073,12 @@ class DependencyRow:
     # assignment, a safe decision, or a VERIFIED/PLANNING_ONLY proof.
     peer_compat_unresolved: bool = False
     peer_compat_unresolved_note: str = ""
+    # A1/A4: the structured exact-solver component report that finished
+    # UNFINISHED, attached to the SAME rows that form the accepted snapshot.
+    # Publishing reads only committed rows, so a worker rolled back by the
+    # supervisor never leaks its reports into a partial result. The dict
+    # carries timeoutMs/solverElapsedMs/counts/reason/operationId/runId.
+    peer_compat_unresolved_report: Optional[Dict[str, Any]] = None
 
 
 @dataclasses.dataclass
@@ -7934,6 +7940,30 @@ def _shadow_solver_options(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _draft_solver_attempt_timeout_ms(
+    client: Optional["LiveDataClient"],
+    default_ms: int,
+) -> int:
+    """A4: cap one exact-solver ATTEMPT to the remaining overall Draft budget
+    minus the publication reserve, so the last component still fits before the
+    deadline and its UNFINISHED outcome can be published as an accepted
+    DRAFT_PARTIAL. The supervisor thread-join remains the hard guarantee; this
+    only avoids a single attempt blowing past the reserve. Never below 1s, and
+    never above the configured per-solver timeout.
+    """
+    deadline = getattr(client, "deadline", None)
+    if deadline is None or deadline.deadline_seconds is None:
+        return int(default_ms)
+    remaining = deadline.remaining
+    if remaining is None:
+        return int(default_ms)
+    usable = max(0.0, float(remaining) - DRAFT_FINALIZE_RESERVE_SECONDS)
+    attempt = min(float(default_ms) / 1000.0, usable - DRAFT_MIN_NET_BUDGET_SECONDS)
+    if attempt <= 0:
+        return int(default_ms)
+    return max(1000, int(attempt * 1000.0))
+
+
 def _run_z3_peer_component(
     component: List[str],
     rows_by_name: Dict[str, DependencyRow],
@@ -7943,6 +7973,7 @@ def _run_z3_peer_component(
     learned_nogoods: Optional[List[Dict[str, str]]],
     raw_config: Optional[Dict[str, Any]],
     stability_targets: Optional[Dict[str, str]] = None,
+    attempt_timeout_ms: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Solve one component exactly and refine registry-unavailable candidates.
 
@@ -7951,6 +7982,7 @@ def _run_z3_peer_component(
     performed here: exact ``unknown`` is a distinct planner state.
     """
     options = _peer_solver_backend_options(raw_config)
+    solver_timeout_ms = int(attempt_timeout_ms or options["timeoutMs"])
     model = _build_peer_optimization_model(
         component,
         rows_by_name,
@@ -7962,7 +7994,7 @@ def _run_z3_peer_component(
     )
     refinements = 0
     total_elapsed_ms = 0
-    result = solve_z3_exact(model, timeout_ms=options["timeoutMs"])
+    result = solve_z3_exact(model, timeout_ms=solver_timeout_ms)
     total_elapsed_ms += int(result.elapsed_ms)
 
     while result.status == "optimal" and result.assignment is not None:
@@ -7995,6 +8027,7 @@ def _run_z3_peer_component(
                 "detail": f"registry refinement budget {options['maxRefinements']} exhausted",
                 "refinements": refinements,
                 "elapsedMs": total_elapsed_ms,
+                "timeoutMs": solver_timeout_ms,
                 "variables": len(model.packages),
                 "candidates": model.candidate_count(),
                 "hardConstraints": len(model.constraints) + len(model.requirements),
@@ -8002,7 +8035,7 @@ def _run_z3_peer_component(
             }
         model = model.with_constraints(unavailable)
         refinements += 1
-        result = solve_z3_exact(model, timeout_ms=options["timeoutMs"])
+        result = solve_z3_exact(model, timeout_ms=solver_timeout_ms)
         total_elapsed_ms += int(result.elapsed_ms)
 
     report: Dict[str, Any] = {
@@ -8011,6 +8044,7 @@ def _run_z3_peer_component(
         "detail": result.detail,
         "refinements": refinements,
         "elapsedMs": total_elapsed_ms,
+        "timeoutMs": solver_timeout_ms,
         "variables": len(model.packages),
         "candidates": model.candidate_count(),
         "hardConstraints": len(model.constraints) + len(model.requirements),
@@ -8750,28 +8784,45 @@ def _exact_solver_component_context(
     """
     detail = str(exact_report.get("detail") or "").strip()
     reason_unknown = detail[:500] or "no reason given"
-    timeout_detail = detail.lower()
+    stop_reason = detail.strip().lower()
+    # A2: a "confirmed timeout" requires the solver's own typed stop reason to
+    # BE the wall-clock timeout (Z3 reports `timeout` or `timeout; ...` as its
+    # stop reason) -- nothing else. `canceled` is an external cancellation,
+    # `max. iterations` is an iteration-cap stop, `max. memory` a memory stop:
+    # none of them proves the time budget was exhausted, and a package name
+    # appearing anywhere else is never evidence (the reason text comes from the
+    # solver, not from the dependency inventory).
     confirmed_timeout = (
         exact_status == "unknown"
-        and any(token in timeout_detail for token in ("timeout", "canceled", "max. iterations"))
+        and stop_reason.split(";", 1)[0].strip() == "timeout"
+    )
+    run_id = str((run_context or {}).get("runId") or "")
+    component_key = ",".join(sorted(component))
+    op_digest = hashlib.sha256(component_key.encode("utf-8")).hexdigest()[:12]
+    operation_id = (
+        f"z3-{run_id}-{project}-{mode}-{op_digest}" if run_id else f"z3-{project}-{mode}-{op_digest}"
     )
     context: Dict[str, str] = dict(run_context or {})
     context.update({
         "phase": "peer-planning",
+        "mode": mode,
         "component": ",".join(component),
         "componentCount": str(len(component)),
         "candidateCount": str(int(exact_report.get("candidates") or 0)),
         "constraintCount": str(int(exact_report.get("hardConstraints") or 0)),
         "refinements": str(int(exact_report.get("refinements") or 0)),
         "solverElapsedMs": str(int(exact_report.get("elapsedMs") or 0)),
-        "timeoutMs": str(int(backend_options.get("timeoutMs") or 0)),
+        "timeoutMs": str(int(exact_report.get("timeoutMs") or backend_options.get("timeoutMs") or 0)),
         "terminalStatus": str(_terminal_status_for_exact_solver(exact_status).value),
         "terminalSource": "z3",
         "solverStatus": str(exact_status or ""),
         "reasonUnknown": reason_unknown,
+        "operationId": operation_id,
     })
     if confirmed_timeout:
         context["confirmedTimeout"] = "true"
+    else:
+        context["confirmedTimeout"] = "false"
     remaining = getattr(getattr(client, "deadline", None), "remaining", None)
     if remaining is not None:
         context["remainingBudgetSeconds"] = f"{remaining:.1f}"
@@ -8806,32 +8857,41 @@ def _mark_draft_component_unresolved(
         f"reason: {detail[:400] or 'no reason given'}; "
         "further review required before this group is treated as compatible"
     )
+    context = _exact_solver_component_context(
+        project, mode, component, exact_status, exact_report, backend_options, client, run_context
+    )
+    # A1/A4: one structured, run-scoped component report, attached to the SAME
+    # rows that form the accepted snapshot. Publishing reads committed rows, so
+    # a worker rolled back by the supervisor never leaks its reports.
+    report: Dict[str, Any] = {
+        "project": project,
+        "mode": mode,
+        "component": list(component),
+        "componentCount": len(component),
+        "packageCount": len(component),
+        "status": exact_status,
+        "detail": detail[:500] or "no reason given",
+        "terminalStatus": context["terminalStatus"],
+        "solverStatus": context["solverStatus"],
+        "candidateCount": context["candidateCount"],
+        "constraintCount": context["constraintCount"],
+        "refinements": context["refinements"],
+        "solverElapsedMs": context["solverElapsedMs"],
+        "timeoutMs": context["timeoutMs"],
+        "confirmedTimeout": context.get("confirmedTimeout") == "true",
+        "reasonUnknown": context.get("reasonUnknown", ""),
+        "operationId": context.get("operationId", ""),
+        "remainingBudgetSeconds": context.get("remainingBudgetSeconds", ""),
+        "runId": context.get("runId", ""),
+        "note": note,
+    }
     for name in component:
         for row in rows_for_name.get(name, []):
             row.peer_compat_unresolved = True
             row.peer_compat_unresolved_note = note
+            row.peer_compat_unresolved_report = dict(report)
     if incomplete_components_out is not None:
-        context = _exact_solver_component_context(
-            project, mode, component, exact_status, exact_report, backend_options, client, run_context
-        )
-        incomplete_components_out.append({
-            "project": project,
-            "mode": mode,
-            "component": list(component),
-            "componentCount": len(component),
-            "packageCount": len(component),
-            "status": exact_status,
-            "detail": detail[:500] or "no reason given",
-            "terminalStatus": context["terminalStatus"],
-            "candidateCount": context["candidateCount"],
-            "constraintCount": context["constraintCount"],
-            "refinements": context["refinements"],
-            "solverElapsedMs": context["solverElapsedMs"],
-            "timeoutMs": context["timeoutMs"],
-            "confirmedTimeout": context.get("confirmedTimeout") == "true",
-            "reasonUnknown": context.get("reasonUnknown", ""),
-            "note": note,
-        })
+        incomplete_components_out.append(dict(report))
     eprint(
         f"[warn] {project}: Draft exact z3 {mode}; component={len(component)} package(s) left "
         f"UNRESOLVED (status={exact_status}); reason={detail[:400] or 'no reason given'}"
@@ -8843,9 +8903,10 @@ def _mark_draft_component_unresolved(
         packageCount=len(component),
         status=exact_status,
         detail=detail[:400] or "no reason given",
-        timeoutMs=int(backend_options.get("timeoutMs") or 0),
-        durationMs=int(exact_report.get("elapsedMs") or 0),
-        refinements=int(exact_report.get("refinements") or 0),
+        timeoutMs=context["timeoutMs"],
+        durationMs=context["solverElapsedMs"],
+        refinements=context["refinements"],
+        operationId=context.get("operationId", ""),
     )
 
 
@@ -9005,6 +9066,11 @@ def resolve_peer_compatibility(
             shadow_active = authoritative_backend == "custom" and backend_options["shadow"] != "off"
             mode_shadow_reports: List[Dict[str, Any]] = []
             mode_exact_reports: List[Dict[str, Any]] = []
+            # A1: packages whose component finished UNFINISHED (Draft partial
+            # mode). They are NOT part of the decided assignment: every apply
+            # step below must skip them, and nothing may claim a global proof
+            # over them.
+            unresolved_names: Set[str] = set()
             for component in components:
                 diagnostics: Dict[str, Any] = {}
                 pre_shadow_report: Optional[Dict[str, Any]] = None
@@ -9046,6 +9112,14 @@ def resolve_peer_compatibility(
                         )
 
                 if authoritative_backend == "z3":
+                    # A4: one attempt must stay within the remaining overall
+                    # Draft budget minus the publication reserve, so an
+                    # UNFINISHED outcome of even the last component can be
+                    # committed and published before the deadline. The
+                    # supervisor thread-join stays the hard guarantee.
+                    attempt_timeout_ms = _draft_solver_attempt_timeout_ms(
+                        client, backend_options.get("timeoutMs", 30000)
+                    )
                     exact_report = _run_z3_peer_component(
                         component,
                         rows_by_name,
@@ -9055,6 +9129,7 @@ def resolve_peer_compatibility(
                         learned_nogoods,
                         solver_config,
                         solver_stability_targets,
+                        attempt_timeout_ms=attempt_timeout_ms,
                     )
                     exact_status = str(exact_report.get("status") or "")
                     if exact_status == "optimal" and isinstance(exact_report.get("assignment"), dict):
@@ -9103,6 +9178,7 @@ def resolve_peer_compatibility(
                                 project, mode, component, rows_for_name, exact_status, exact_report,
                                 backend_options, client, incomplete_components_out, run_context,
                             )
+                            unresolved_names.update(component)
                             continue
                         raise _baseline_terminal_error(
                             BaselineTerminalStatus.BUDGET_EXHAUSTED,
@@ -9124,6 +9200,7 @@ def resolve_peer_compatibility(
                                 project, mode, component, rows_for_name, exact_status, exact_report,
                                 backend_options, client, incomplete_components_out, run_context,
                             )
+                            unresolved_names.update(component)
                             continue
                         raise _baseline_terminal_error(
                             BaselineTerminalStatus.SOLVER_UNKNOWN,
@@ -9266,32 +9343,43 @@ def resolve_peer_compatibility(
                     raise BaselineConstraintVerificationError(
                         f"GLOBAL_EXACT_EXCLUSION_REQUIRES_Z3: {project}/{mode}"
                     )
-                try:
-                    assignment = _coordinate_solver_global_exclusions(
-                        components,
-                        assignment,
-                        global_exact_exclusions,
-                        rows_by_name,
-                        domains,
-                        client,
-                        mode,
-                        learned_nogoods,
-                        solver_config,
-                        solver_stability_targets,
-                    )
-                except GlobalExactExclusionError as exc:
-                    terminal_status = _terminal_status_for_global_exact_reason(exc.reason)
-                    stop_code = {
-                        BaselineTerminalStatus.UNSAT_PROVEN: "GLOBAL_EXACT_EXCLUSION_UNSAT_PROVEN",
-                        BaselineTerminalStatus.BUDGET_EXHAUSTED: "GLOBAL_EXACT_EXCLUSION_BUDGET_EXHAUSTED",
-                        BaselineTerminalStatus.SOLVER_UNAVAILABLE: "GLOBAL_EXACT_EXCLUSION_SOLVER_UNAVAILABLE",
-                    }.get(terminal_status, "GLOBAL_EXACT_EXCLUSION_SOLVER_UNKNOWN")
-                    raise _baseline_terminal_error(
-                        terminal_status,
-                        stop_code,
-                        f"{project}/{mode}: {exc}",
-                        source="global-exact-coordinator",
-                    ) from None
+                # A1: with unfinished components the assignment is only partial,
+                # so a global-exclusion proof must never span undecided groups.
+                # Coordinate ONLY the decided components; an exclusion that
+                # touches an undecided group stays unresolved (its packages are
+                # not in the assignment, so it cannot match and no claim is
+                # made over it).
+                coordinate_components = (
+                    [c for c in components if not unresolved_names.intersection(c)]
+                    if unresolved_names else components
+                )
+                if coordinate_components:
+                    try:
+                        assignment = _coordinate_solver_global_exclusions(
+                            coordinate_components,
+                            assignment,
+                            global_exact_exclusions,
+                            rows_by_name,
+                            domains,
+                            client,
+                            mode,
+                            learned_nogoods,
+                            solver_config,
+                            solver_stability_targets,
+                        )
+                    except GlobalExactExclusionError as exc:
+                        terminal_status = _terminal_status_for_global_exact_reason(exc.reason)
+                        stop_code = {
+                            BaselineTerminalStatus.UNSAT_PROVEN: "GLOBAL_EXACT_EXCLUSION_UNSAT_PROVEN",
+                            BaselineTerminalStatus.BUDGET_EXHAUSTED: "GLOBAL_EXACT_EXCLUSION_BUDGET_EXHAUSTED",
+                            BaselineTerminalStatus.SOLVER_UNAVAILABLE: "GLOBAL_EXACT_EXCLUSION_SOLVER_UNAVAILABLE",
+                        }.get(terminal_status, "GLOBAL_EXACT_EXCLUSION_SOLVER_UNKNOWN")
+                        raise _baseline_terminal_error(
+                            terminal_status,
+                            stop_code,
+                            f"{project}/{mode}: {exc}",
+                            source="global-exact-coordinator",
+                        ) from None
 
             if mode_exact_reports:
                 exact_changed = sum(int(report.get("changed") or 0) for report in mode_exact_reports)
@@ -9365,6 +9453,13 @@ def resolve_peer_compatibility(
             transition_notes: Dict[str, List[str]] = defaultdict(list)
             transition_merge_count = 0
             for solve_component in components:
+                # A1: an UNFINISHED component has no decided target tuple, so no
+                # transition safety proof can be produced for it -- and solving
+                # one here would read assignment[name] for a missing name. Its
+                # packages keep their theoretical candidates and are surfaced as
+                # unresolved; no synthetic "no change" transition is invented.
+                if unresolved_names.intersection(solve_component):
+                    continue
                 if all(assignment[name] == rows_by_name[name].current_version for name in solve_component):
                     # No dependency transition will be executed for this
                     # component (including exact-solver local defers), so it
@@ -9420,6 +9515,12 @@ def resolve_peer_compatibility(
 
             changed = 0
             for name, representative in rows_by_name.items():
+                # A1: never apply a "keep current" invented for a package whose
+                # component finished UNFINISHED. It stays at its pre-solver
+                # target with its peer_compat_unresolved flag and report; no
+                # target/lock/compat mutation.
+                if name in unresolved_names:
+                    continue
                 resolved_version = assignment.get(name, representative.current_version)
                 desired = _desired_target_for_mode(representative, mode)
                 resolved_target = resolved_version if resolved_version != representative.current_version else NO_ACTION
@@ -23636,6 +23737,36 @@ def draft_post_plan_aggregate(proposal_healths: List[Dict[str, Any]]) -> Dict[st
     }
 
 
+def _collect_draft_incomplete_reports(
+    rows_by_project: Mapping[str, Sequence[DependencyRow]],
+) -> List[Dict[str, Any]]:
+    """A1/A4: read the structured UNFINISHED-component reports from the ACCEPTED
+    snapshot rows only (the supervisor splices the working copy back on success,
+    so a rolled-back worker never leaves reports here), deduplicated per
+    (project, mode, component), in stable order.
+    """
+    reports: Dict[Tuple[str, str, Tuple[str, ...]], Dict[str, Any]] = {}
+    for project, rows in rows_by_project.items():
+        for row in rows:
+            report = getattr(row, "peer_compat_unresolved_report", None)
+            if not report:
+                continue
+            mode = str(report.get("mode") or "")
+            component = tuple(str(c) for c in (report.get("component") or []))
+            reports.setdefault((project, mode, component), dict(report))
+    ordered = sorted(
+        reports.values(),
+        key=lambda r: (
+            r.get("project", ""),
+            int(r.get("componentCount") or 0),
+            ",".join(str(c) for c in (r.get("component") or [])),
+        ),
+    )
+    for report in ordered:
+        report["component"] = list(report.get("component") or [])
+    return ordered
+
+
 def publish_draft_result(
     *,
     run_id: str,
@@ -23652,6 +23783,7 @@ def publish_draft_result(
     language: str = "ru",
     input_hashes: Optional[Dict[str, str]] = None,
     input_files_by_project: Optional[Dict[str, List[str]]] = None,
+    solver_component_reports: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Publish the Draft result set atomically and return its manifest.
 
@@ -23865,6 +23997,25 @@ def publish_draft_result(
     _atomic_write_text(prompt_md_path, prompt_md)
     _atomic_write_text(summary_md_path, summary + "\n")
 
+    # A4: the structured UNFINISHED-component solver reports survive as their
+    # own run-scoped file and are referenced from the manifest; plan.json keeps
+    # the per-row surface, this file keeps timeoutMs/solverElapsedMs/counts/
+    # reason/operationId/remaining budget with the run identity.
+    solver_components_path = draft_dir / "solver-components.json"
+    _atomic_write_text(
+        solver_components_path,
+        json.dumps({
+            "runId": run_id,
+            "workspaceId": workspace_id,
+            "projectId": project_id,
+            "mode": mode,
+            "generatedAt": generated_at,
+            "solver": "z3",
+            "authoritative": True,
+            "components": solver_component_reports or [],
+        }, ensure_ascii=False, indent=2),
+    )
+
     manifest: Dict[str, Any] = {
         "schemaVersion": 1,
         "status": status,
@@ -23965,6 +24116,7 @@ def publish_draft_result(
             "plan": str(plan_json_path),
             "prompt": str(prompt_md_path),
             "summary": str(summary_md_path),
+            "solverComponents": str(solver_components_path),
         },
         "hashes": {
             # Hash the exact bytes on disk (LF, UTF-8, no BOM). The Electron
@@ -23993,6 +24145,7 @@ def publish_draft_result(
         ),
         "projects": plan.get("projects", []),
         "unresolved": plan.get("unresolved", []),
+        "solverComponents": solver_component_reports or [],
     }
     _atomic_write_text(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2))
     return manifest
@@ -24213,6 +24366,7 @@ def _publish_draft_and_exit(
     partial_reason: str,
     input_hashes: Optional[Dict[str, str]] = None,
     input_files_by_project: Optional[Dict[str, List[str]]] = None,
+    solver_component_reports: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Publish whatever Draft data was gathered before an abort and exit 0.
 
@@ -24240,6 +24394,7 @@ def _publish_draft_and_exit(
         deadline=deadline_clock,
         input_hashes=input_hashes,
         input_files_by_project=input_files_by_project,
+        solver_component_reports=solver_component_reports,
     )
     eprint(f"[done] Draft partial result published: {manifest['summary']}")
     eprint(f"[info] Draft manifest: {manifest['artifacts']['manifest']}")
@@ -24974,7 +25129,6 @@ def main() -> None:
             # R2: the first Draft path solves ONE chosen variant ("default"),
             # not the three required by the Verified planning loop, so the run
             # stays bounded and any expiry publishes the rows gathered so far.
-            draft_incomplete_components: List[Dict[str, Any]] = []
             run_supervised_planning(
                 "planning",
                 deadline_clock,
@@ -24984,16 +25138,20 @@ def main() -> None:
                     modes=("default",),
                     apply_results=True,
                     residual_targets_by_project=residual_targets_by_project,
-                    # D1: an UNFINISHED exact outcome for one component must
-                    # not destroy the collected Draft. The solver marks the
-                    # group unresolved instead of raising a terminal error,
-                    # and the caller publishes a DRAFT_PARTIAL result.
+                    # D1/A1: an UNFINISHED exact outcome for one component must
+                    # not destroy the collected Draft and must not crash the
+                    # production apply path. The solver marks only the
+                    # unresolved group (skipping it in every apply step) and
+                    # returns; the caller publishes a DRAFT_PARTIAL result.
                     partial_on_incomplete=True,
-                    incomplete_components_out=draft_incomplete_components,
                     run_context={"runId": run_id},
                 ),
                 rows_by_project,
             )
+            # A1/A4: reports are read from the ACCEPTED snapshot rows -- the
+            # supervisor spliced them in atomically on success, so a worker
+            # that was cancelled/rolled back can never publish its results.
+            draft_incomplete_components = _collect_draft_incomplete_reports(rows_by_project)
             if draft_incomplete_components:
                 # D1: publish whatever was gathered (all rows preserved,
                 # unresolved components explicitly flagged) as a legitimate
@@ -25001,9 +25159,9 @@ def main() -> None:
                 # result. The undisputed solver raises (UNSAT, unavailable,
                 # programming errors) still propagate unchanged.
                 unresolved_groups = "; ".join(
-                    f"{item['project']}/{item['mode']}: {item['componentCount']} package(s) "
-                    f"({','.join(item['component'][:5])}"
-                    + ("…" if len(item['component']) > 5 else "")
+                    f"{item['project']}/{item['mode']}: {int(item['componentCount'] or 0)} package(s) "
+                    f"({','.join(str(c) for c in (item['component'] or [])[:5])}"
+                    + ("…" if len(item.get('component') or []) > 5 else "")
                     + f"), status={item['status']}, reason={item['detail'] or 'no reason given'}"
                     for item in draft_incomplete_components
                 )
@@ -25022,6 +25180,7 @@ def main() -> None:
                         f"component(s); the affected packages stay in the plan marked unresolved -- "
                         f"this is not a proven conflict and not a proven solution. {unresolved_groups}"
                     ),
+                    solver_component_reports=draft_incomplete_components,
                     input_hashes=draft_input_hashes,
                     input_files_by_project=draft_input_files_by_project,
                 )
