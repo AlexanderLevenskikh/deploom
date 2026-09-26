@@ -339,7 +339,9 @@ class R4D2SolverClassificationTests(unittest.TestCase):
         self.assertNotEqual("PROJECT_INCOMPATIBLE", without_evidence.to_envelope()["category"])
         self.assertEqual("UNKNOWN", without_evidence.to_envelope()["category"])
 
-    def test_message_level_timeout_still_classifies_as_budget(self):
+    def test_timeout_word_alone_does_not_flip_unknown_to_budget(self):
+        # A2: the typed code EXACT_SOLVER_UNKNOWN decides the category; the word
+        # `timeout` in the detail (or a package name) must NOT reclassify it.
         category, _, _ = classify_failure(
             roadmap._baseline_terminal_error(
                 roadmap.BaselineTerminalStatus.SOLVER_UNKNOWN,
@@ -348,7 +350,7 @@ class R4D2SolverClassificationTests(unittest.TestCase):
                 source="z3",
             )
         )
-        self.assertEqual("SOLVER_BUDGET_EXHAUSTED", category)
+        self.assertEqual("SOLVER_UNKNOWN", category)
 
     def test_structured_budget_and_unsat_and_unavailable_categories(self):
         budget = roadmap._baseline_terminal_error(
@@ -450,6 +452,472 @@ class R4D3FailureContextTests(unittest.TestCase):
             self.assertEqual("true", payload["context"]["confirmedTimeout"])
             self.assertEqual("audit-r4-d3b", payload["context"]["runId"])
             self.assertEqual("SOLVER_BUDGET_EXHAUSTED", payload.get("category") or classify_failure(exc)[0])
+
+
+class R4A1ApplyResultsPartialTests(unittest.TestCase):
+    """A1 (P1 repr.): the PRODUCTION path -- apply_results=True with a real
+    run_supervised_planning and resolve_peer_compatibility -- must not crash
+    with KeyError when a component finishes UNFINISHED, must leave unresolved
+    rows untouched (no invented keep-current, no false optimal/VERIFIED), and
+    must hand the publication the reports from the ACCEPTED snapshot rows."""
+
+    def make_client(self):
+        client = roadmap.LiveDataClient(REGISTRY, timeout=1, batch_size=10, sleep_sec=0)
+        client.deadline = roadmap.DeadlineClock(None)
+        return client
+
+    def add_package(self, client, name, versions):
+        records = {}
+        for version, extra in versions.items():
+            records[version] = {
+                **extra,
+                "dist": {"tarball": f"{REGISTRY}/artifact/{name}/{version}.tgz"},
+            }
+            client.registry_artifact_cache[(name, version)] = {
+                "status": "available",
+                "tarballUrl": f"{REGISTRY}/artifact/{name}/{version}.tgz",
+            }
+        client.npm_cache[name] = {"versions": records}
+
+    @staticmethod
+    def solver_row(name, current="1.0.0", desired="2.0.0"):
+        return roadmap.DependencyRow(
+            project="Demo",
+            package_dir=".",
+            name=name,
+            kind="dev",
+            requested_spec="*",
+            current_version=current,
+            current_source="lockfile",
+            latest_version=desired,
+            current_vulns="0",
+            min_no_critical=current,
+            min_no_high=current,
+            min_no_vuln=current,
+            min_lag_12m=current,
+            min_lag_9m=current,
+            min_lag_6m=current,
+            min_lag_3m=current,
+            group=1,
+            reason="model lab",
+            notes="",
+            target_default=desired,
+            target_yellow=desired,
+            target_green=desired,
+            target_default_reason="desired",
+            target_yellow_reason="desired",
+            target_green_reason="desired",
+        )
+
+    def prepare(self, names, versions):
+        client = self.make_client()
+        for name, vers in versions.items():
+            self.add_package(client, name, vers)
+        rows = [self.solver_row(name) for name in names]
+        by_project = {"Demo": rows}
+        roadmap.capture_desired_targets(by_project)
+        roadmap.enrich_registry_target_evidence(by_project, client)
+        return client, rows, by_project
+
+    def test_single_unknown_component_apply_results_true_no_key_error(self):
+        client, (row_a,), by_project = self.prepare(["a"], {"a": {"1.0.0": {}, "2.0.0": {}}})
+        with mock.patch.object(
+            roadmap, "solve_z3_exact",
+            return_value=ExactSolveResult(backend="z3", status="unknown", detail="no reason given"),
+        ):
+            roadmap.run_supervised_planning(
+                "planning",
+                None,
+                lambda working: roadmap.resolve_peer_compatibility(
+                    working,
+                    client,
+                    modes=("default",),
+                    apply_results=True,
+                    shadow_solver_config_by_project={"Demo": {"solverBackend": "z3"}},
+                    partial_on_incomplete=True,
+                    run_context={"runId": "audit-a1-1"},
+                ),
+                by_project,
+            )
+        reports = roadmap._collect_draft_incomplete_reports(by_project)
+        self.assertEqual(1, len(reports))
+        self.assertEqual(["a"], reports[0]["component"])
+        self.assertEqual("unknown", reports[0]["status"])
+        self.assertTrue(row_a.peer_compat_unresolved)
+        self.assertIsNotNone(row_a.peer_compat_unresolved_report)
+        # pre-solver target preserved -- nothing invented as keep-current
+        self.assertEqual("2.0.0", row_a.target_default)
+        self.assertEqual("audit-a1-1", reports[0]["runId"])
+        self.assertTrue(reports[0]["operationId"])
+
+    def test_mixed_components_resolved_and_unresolved_apply_results_true(self):
+        client, (row_a, row_b), by_project = self.prepare(
+            ["a", "b"],
+            {"a": {"1.0.0": {}, "2.0.0": {}}, "b": {"1.0.0": {}, "2.0.0": {}}},
+        )
+
+        def exact_target(model, timeout_ms=30_000):
+            names = {package.name for package in model.packages}
+            if names == {"a"}:
+                return ExactSolveResult(
+                    backend="z3", status="optimal", assignment={"a": "2.0.0"},
+                    score=model.assignment_score({"a": "2.0.0"}),
+                )
+            return ExactSolveResult(backend="z3", status="unknown", detail="no reason given")
+
+        with mock.patch.object(roadmap, "solve_z3_exact", side_effect=exact_target):
+            roadmap.run_supervised_planning(
+                "planning",
+                None,
+                lambda working: roadmap.resolve_peer_compatibility(
+                    working,
+                    client,
+                    modes=("default",),
+                    apply_results=True,
+                    shadow_solver_config_by_project={"Demo": {"solverBackend": "z3"}},
+                    partial_on_incomplete=True,
+                    run_context={"runId": "audit-a1-2"},
+                ),
+                by_project,
+            )
+        # resolved component applied normally
+        self.assertEqual("2.0.0", row_a.target_default)
+        # unresolved component untouched (no keep-current), flagged, reported
+        self.assertEqual("2.0.0", row_b.target_default)
+        self.assertTrue(row_b.peer_compat_unresolved)
+        self.assertFalse(row_a.peer_compat_unresolved)
+        reports = roadmap._collect_draft_incomplete_reports(by_project)
+        self.assertEqual(["b"], reports[0]["component"])
+        # no invented keep-current for the unresolved row: its pre-solver
+        # target/reason stay exactly as captured, nothing appended
+        self.assertEqual("desired", row_b.target_default_reason)
+        self.assertEqual("", row_b.compatibility_note)
+        self.assertFalse(getattr(row_b, "target_default_dynamic_locked", False))
+        # and the resolved row applied normally without a lock (same target)
+        self.assertEqual("2.0.0", row_a.target_default)
+        self.assertFalse(getattr(row_a, "target_default_dynamic_locked", False))
+
+    def test_global_exclusions_touching_undecided_group_stay_unresolved(self):
+        client, (row_b,), by_project = self.prepare(["b"], {"b": {"1.0.0": {}, "2.0.0": {}}})
+        with mock.patch.object(
+            roadmap, "solve_z3_exact",
+            return_value=ExactSolveResult(backend="z3", status="unknown", detail="no reason given"),
+        ):
+            roadmap.run_supervised_planning(
+                "planning",
+                None,
+                lambda working: roadmap.resolve_peer_compatibility(
+                    working,
+                    client,
+                    modes=("default",),
+                    apply_results=True,
+                    shadow_solver_config_by_project={"Demo": {"solverBackend": "z3"}},
+                    partial_on_incomplete=True,
+                    global_exact_exclusions_by_project_mode={
+                        "Demo": {"default": [{"b": "2.0.0"}]}
+                    },
+                    run_context={"runId": "audit-a1-3"},
+                ),
+                by_project,
+            )
+        self.assertTrue(row_b.peer_compat_unresolved)
+        # no KeyError inside the exclusion coordinator; no global claim made
+        self.assertEqual("2.0.0", row_b.target_default)
+
+
+class R4A4SolverReportPersistenceTests(unittest.TestCase):
+    """A4: the structured solver reports reach the published manifest and a
+    run-scoped solver-components.json referenced from it (not only in-memory)."""
+
+    def test_manifest_and_file_carry_structured_reports(self):
+        report = {
+            "project": "tiny-basic",
+            "mode": "default",
+            "component": ["eslint"],
+            "componentCount": 1,
+            "packageCount": 1,
+            "status": "unknown",
+            "detail": "no reason given",
+            "terminalStatus": "SOLVER_UNKNOWN",
+            "solverStatus": "unknown",
+            "candidateCount": "24",
+            "constraintCount": "8",
+            "refinements": "0",
+            "solverElapsedMs": "1234",
+            "timeoutMs": "30000",
+            "confirmedTimeout": False,
+            "reasonUnknown": "no reason given",
+            "operationId": "z3-audit-r4-a4-tiny-basic-default-abc123",
+            "remainingBudgetSeconds": "42.5",
+            "runId": "run-a4",
+            "note": "peer compatibility not decided (status=unknown)",
+        }
+        row = _make_row(
+            name="eslint",
+            peer_compat_unresolved=True,
+            peer_compat_unresolved_note="peer compatibility not decided (status=unknown); reason: no reason given",
+            peer_compat_unresolved_report=report,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            roadmap.set_draft_artifacts_base(Path(tmp))
+            try:
+                manifest = roadmap.publish_draft_result(
+                    run_id="run-a4",
+                    workspace_id="ws-test",
+                    project_id="tiny-basic",
+                    mode="draft",
+                    rows_by_project={"tiny-basic": [row]},
+                    projects_by_name={},
+                    health_by_project={"tiny-basic": _make_health()},
+                    status="DRAFT_PARTIAL",
+                    partial_reason="peer compatibility not decided: 1 package(s)",
+                    deadline=roadmap.DeadlineClock(None),
+                    solver_component_reports=[row.peer_compat_unresolved_report],
+                )
+                self.assertEqual(1, len(manifest["solverComponents"]))
+                comp = manifest["solverComponents"][0]
+                self.assertEqual("30000", comp["timeoutMs"])
+                self.assertEqual("1234", comp["solverElapsedMs"])
+                self.assertEqual("no reason given", comp["reasonUnknown"])
+                self.assertTrue(comp["operationId"].startswith("z3-audit-r4-a4"))
+                self.assertEqual("42.5", comp["remainingBudgetSeconds"])
+                self.assertEqual("run-a4", comp["runId"])
+                artifact_path = manifest["artifacts"]["solverComponents"]
+                self.assertTrue(Path(artifact_path).is_file())
+                payload = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
+                self.assertEqual("run-a4", payload["runId"])
+                self.assertEqual(1, len(payload["components"]))
+                self.assertEqual("1234", payload["components"][0]["solverElapsedMs"])
+                # the per-row surface keeps its honest flag so the plan reads unresolved
+                self.assertEqual("DRAFT_PARTIAL", manifest["status"])
+                self.assertEqual(1, len(manifest["unresolved"]))
+            finally:
+                roadmap.set_draft_artifacts_base(None)
+
+
+class R4A2CodeFirstClassificationTests(unittest.TestCase):
+    """A2: typed stop-codes decide the category before any free-text heuristic;
+    package names (`timeout`/`p-canceled`/`eslint`/`registry`/`network`) never
+    reclassify a typed solver outcome; a refinement-budget stop is never a
+    registry problem; a confirmed timeout needs the solver's typed reason."""
+
+    def solvable_context(self):
+        return {
+            "confirmedTimeout": "false",
+            "component": "eslint",
+            "componentCount": "1",
+            "candidateCount": "24",
+            "constraintCount": "8",
+            "refinements": "0",
+            "solverElapsedMs": "3",
+            "timeoutMs": "30000",
+            "solverStatus": "unknown",
+            "reasonUnknown": "no reason given",
+        }
+
+    def make_solver_exc(self, status, message):
+        exc = roadmap.BaselineConstraintVerificationError(message)
+        return exc
+
+    def test_unknown_component_names_share_one_category(self):
+        for name in ("eslint", "timeout", "p-canceled", "registry", "network", "libjs-x"):
+            message = (
+                f"EXACT_SOLVER_UNKNOWN: Demo/draft: component={name}; "
+                "detail=no reason given; the authoritative finite-domain "
+                "component has no satisfying assignment"
+            )
+            category, _, _ = classify_failure(self.make_solver_exc("unknown", message))
+            self.assertEqual("SOLVER_UNKNOWN", category, name)
+
+    def test_refinement_budget_stop_is_not_registry(self):
+        for message in (
+            "EXACT_SOLVER_BUDGET_EXHAUSTED: project/mode: component=a; "
+            "detail=registry refinement budget 3 exhausted; "
+            "exact refinement budget ended without a proof",
+            "EXACT_SOLVER_BUDGET_EXHAUSTED: project/mode: component=b; "
+            "detail=registry refinement budget 5 exhausted",
+        ):
+            category, _, _ = classify_failure(Exception(message))
+            self.assertEqual("SOLVER_BUDGET_EXHAUSTED", category)
+
+    def test_typed_unavailable_and_unsat(self):
+        self.assertEqual(
+            "EXACT_UNSAT_PROVEN",
+            classify_failure(Exception("EXACT_SOLVER_UNSAT_PROVEN: m; component=a; detail=unsat"))[0],
+        )
+        self.assertEqual(
+            "SOLVER_UNAVAILABLE",
+            classify_failure(Exception("EXACT_SOLVER_UNAVAILABLE: z3-solver is not installed"))[0],
+        )
+
+    def test_confirmed_timeout_requires_z3_reason_timeout(self):
+        backend_options = {"timeoutMs": 30000, "maxRefinements": 3, "minComponentSize": 1}
+        for reason, expected in (
+            ("timeout", "true"),
+            ("canceled", "false"),
+            ("max. iterations", "false"),
+            ("max. memory", "false"),
+            ("no reason given", "false"),
+            ("registry refinement budget 3 exhausted", "false"),
+        ):
+            report = {
+                "backend": "z3",
+                "status": "unknown",
+                "detail": reason,
+                "elapsedMs": 30042,
+                "candidates": 24,
+                "hardConstraints": 8,
+                "refinements": 0,
+                "timeoutMs": 30000,
+            }
+            context = roadmap._exact_solver_component_context(
+                "Demo", "default", ["eslint"], "unknown", report,
+                backend_options, None, {"runId": "audit-a2"},
+            )
+            self.assertEqual(expected, context["confirmedTimeout"], reason)
+            self.assertEqual("audit-a2", context["runId"])
+            self.assertTrue(context["operationId"].startswith("z3-audit-a2-"))
+
+
+class R4A1SnapshotAtomicityTests(unittest.TestCase):
+    """A1 #4 + acceptance: reports commit only WITH the accepted snapshot rows.
+    A worker cancelled/rolled back by the supervisor must leave zero reports on
+    the shared rows (the late worker publishes nothing)."""
+
+    def test_rollback_worker_leaves_shared_rows_without_reports(self):
+        row = roadmap.DependencyRow(
+            project="Demo", package_dir=".", name="a", kind="dev",
+            requested_spec="*", current_version="1.0.0", current_source="lockfile",
+            latest_version="2.0.0", current_vulns="0",
+            min_no_critical="1.0.0", min_no_high="1.0.0", min_no_vuln="1.0.0",
+            min_lag_12m="1.0.0", min_lag_9m="1.0.0", min_lag_6m="1.0.0",
+            min_lag_3m="1.0.0", group=1, reason="x", notes="",
+            target_default="2.0.0", target_yellow="2.0.0", target_green="2.0.0",
+            target_default_reason="desired", target_yellow_reason="desired",
+            target_green_reason="desired",
+        )
+        rows = {"Demo": [row]}
+
+        def late_worker(working):
+            working["Demo"][0].peer_compat_unresolved = True
+            working["Demo"][0].peer_compat_unresolved_report = {
+                "project": "Demo", "mode": "default", "component": ["a"],
+                "componentCount": 1, "status": "unknown",
+            }
+            raise roadmap.DraftBudgetExceeded("planning")
+
+        with self.assertRaises(roadmap.DraftBudgetExceeded):
+            roadmap.run_supervised_planning(
+                "planning", roadmap.DeadlineClock(5), late_worker, rows,
+            )
+        self.assertFalse(row.peer_compat_unresolved)
+        self.assertIsNone(row.peer_compat_unresolved_report)
+        self.assertEqual([], roadmap._collect_draft_incomplete_reports(rows))
+
+    def test_publish_read_back_preserves_flags_and_solver_reports(self):
+        """A1 acceptance: one resolved + one unresolved component through the
+        production apply path, then the real publisher; the plan/manifest keep
+        the unresolved flag and the run-scoped solver report, and a previous
+        Verified baseline file is untouched."""
+        client = roadmap.LiveDataClient(REGISTRY, timeout=1, batch_size=10, sleep_sec=0)
+        client.deadline = roadmap.DeadlineClock(None)
+        for name in ("a", "b"):
+            for version in ("1.0.0", "2.0.0"):
+                client.npm_cache.setdefault(name, {}).setdefault("versions", {})[version] = {
+                    "name": name,
+                    "version": version,
+                    "dist": {"tarball": f"{REGISTRY}/artifact/{name}/{version}.tgz"},
+                }
+                client.registry_artifact_cache[(name, version)] = {
+                    "status": "available",
+                    "tarballUrl": f"{REGISTRY}/artifact/{name}/{version}.tgz",
+                }
+        rows = []
+        for name in ("a", "b"):
+            rows.append(roadmap.DependencyRow(
+                project="Demo", package_dir=".", name=name, kind="dev",
+                requested_spec="*", current_version="1.0.0", current_source="lockfile",
+                latest_version="2.0.0", current_vulns="0",
+                min_no_critical="1.0.0", min_no_high="1.0.0", min_no_vuln="1.0.0",
+                min_lag_12m="1.0.0", min_lag_9m="1.0.0", min_lag_6m="1.0.0",
+                min_lag_3m="1.0.0", group=1, reason="x", notes="",
+                target_default="2.0.0", target_yellow="2.0.0", target_green="2.0.0",
+                target_default_reason="desired", target_yellow_reason="desired",
+                target_green_reason="desired",
+            ))
+        by_project = {"Demo": rows}
+        roadmap.capture_desired_targets(by_project)
+        roadmap.enrich_registry_target_evidence(by_project, client)
+
+        def exact_target(model, timeout_ms=30_000):
+            names = {package.name for package in model.packages}
+            if names == {"a"}:
+                return ExactSolveResult(
+                    backend="z3", status="optimal", assignment={"a": "2.0.0"},
+                    score=model.assignment_score({"a": "2.0.0"}),
+                )
+            if names == {"b"}:
+                return ExactSolveResult(backend="z3", status="unknown", detail="no reason given")
+            raise AssertionError(f"unexpected component {names}")
+
+        with mock.patch.object(roadmap, "solve_z3_exact", side_effect=exact_target):
+            roadmap.run_supervised_planning(
+                "planning",
+                None,
+                lambda working: roadmap.resolve_peer_compatibility(
+                    working, client, modes=("default",), apply_results=True,
+                    shadow_solver_config_by_project={"Demo": {"solverBackend": "z3"}},
+                    partial_on_incomplete=True,
+                    run_context={"runId": "audit-a1-e2e"},
+                ),
+                by_project,
+            )
+        reports = roadmap._collect_draft_incomplete_reports(by_project)
+        self.assertEqual(["b"], reports[0]["component"])
+        rows_by_name = {r.name: r for r in rows}
+        self.assertTrue(rows_by_name["b"].peer_compat_unresolved)
+        self.assertFalse(rows_by_name["a"].peer_compat_unresolved)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            roadmap.set_draft_artifacts_base(tmp)
+            baselines = tmp / ".dependency-roadmap" / "history" / "baselines"
+            baselines.mkdir(parents=True, exist_ok=True)
+            verified_seed = baselines / "Demo.latest.json"
+            verified_seed.write_text('{"verified": true}\n', encoding="utf-8")
+            seed_before = (verified_seed.read_bytes(), verified_seed.stat().st_mtime_ns)
+            try:
+                manifest = roadmap.publish_draft_result(
+                    run_id="audit-a1-e2e",
+                    workspace_id="ws-1",
+                    project_id="Demo",
+                    mode="draft",
+                    rows_by_project={"Demo": rows},
+                    projects_by_name={},
+                    health_by_project={"Demo": _make_health()},
+                    status="DRAFT_PARTIAL",
+                    partial_reason="peer solver unfinished for 1 component(s)",
+                    deadline=roadmap.DeadlineClock(None),
+                    input_hashes={"Demo": "h"},
+                    input_files_by_project={"Demo": [{"name": "package.json"}]},
+                    solver_component_reports=reports,
+                )
+                self.assertEqual("DRAFT_PARTIAL", manifest["status"])
+                self.assertEqual("audit-a1-e2e", manifest["runId"])
+                self.assertEqual(1, len(manifest["solverComponents"]))
+                plan = json.loads(Path(manifest["artifacts"]["plan"]).read_text(encoding="utf-8"))
+                row_entries = {
+                    e["package"]: e for proposal in plan["proposals"]
+                    for e in (proposal.get("rows") or [])
+                }
+                self.assertTrue(row_entries["b"].get("peerCompatUnresolved"))
+                self.assertTrue(row_entries["a"].get("peerCompatUnresolved") is False or "peerCompatUnresolved" not in row_entries["a"])
+                self.assertIn("audit-a1-e2e", Path(manifest["artifacts"]["prompt"]).read_text(encoding="utf-8"))
+                # previous Verified baseline untouched by the partial publish
+                self.assertEqual(seed_before[0], verified_seed.read_bytes())
+                self.assertEqual(seed_before[1], verified_seed.stat().st_mtime_ns)
+            finally:
+                roadmap.set_draft_artifacts_base(None)
 
 
 if __name__ == "__main__":
