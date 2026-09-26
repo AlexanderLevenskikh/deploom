@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import time
-from typing import Dict, Tuple
+from dataclasses import replace
+from typing import Dict, Optional, Tuple
 
 from peer_solver_model import ExactSolveResult, PeerOptimizationModel
 from verification_observability import (
@@ -193,13 +194,19 @@ def solve_z3_exact(
     model: PeerOptimizationModel,
     *,
     timeout_ms: int = 30_000,
+    operation_id: Optional[str] = None,
 ) -> ExactSolveResult:
     """Instrumented authoritative Z3 entry point.
 
     Telemetry is observational only; the wrapped implementation and returned
     ExactSolveResult are unchanged.
+
+    ``operation_id`` lets the caller build the run -> component -> attempt
+    chain itself: it is generated BEFORE the call, passed in here, used for
+    the matching solver.z3.start/finish events, and returned on the result.
+    When omitted, one is generated locally (historical behavior).
     """
-    operation_id = new_observability_id("z3")
+    operation_id = operation_id or new_observability_id("z3")
     started = time.perf_counter()
     before = process_resource_snapshot()
     packages = tuple(getattr(model, "packages", ()) or ())
@@ -268,5 +275,5 @@ def solve_z3_exact(
         rssBytes=after.rss_bytes,
         peakRssBytes=after.peak_rss_bytes,
     )
-    return result
+    return replace(result, operation_id=operation_id)
 

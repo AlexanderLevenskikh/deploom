@@ -182,6 +182,7 @@ class ExactSolveResult:
     states: int = 0
     detail: str = ""
     elapsed_ms: int = 0
+    operation_id: str = ""
 
 
 def normalize_forbidden_literals(literals: Iterable[Literal]) -> Tuple[Literal, ...]:

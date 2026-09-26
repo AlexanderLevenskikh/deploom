@@ -203,6 +203,7 @@ from project_topology import (
 from verification_observability import (
     configure_observability_path,
     emit_observability_event,
+    new_observability_id,
 )
 from verification_experiment_registry import (
     navigation_negative_candidates,
@@ -7943,25 +7944,34 @@ def _shadow_solver_options(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 def _draft_solver_attempt_timeout_ms(
     client: Optional["LiveDataClient"],
     default_ms: int,
-) -> int:
-    """A4: cap one exact-solver ATTEMPT to the remaining overall Draft budget
-    minus the publication reserve, so the last component still fits before the
-    deadline and its UNFINISHED outcome can be published as an accepted
-    DRAFT_PARTIAL. The supervisor thread-join remains the hard guarantee; this
-    only avoids a single attempt blowing past the reserve. Never below 1s, and
-    never above the configured per-solver timeout.
+) -> Optional[int]:
+    """A4/R6-1: cap ONE exact-solver attempt to the overall Draft budget still
+    available RIGHT NOW, minus the publication reserve.
+
+    The caller evaluates this immediately before every actual solver call --
+    after the model build and after each registry refinement -- so time already
+    spent can never let a fresh attempt exceed what must stay reserved for
+    committing and publishing the accepted snapshot. The value is never raised
+    by a 1s floor and never exceeds the configured per-solver timeout.
+
+    Returns:
+      None -- no deadline applies (caller uses the configured timeout);
+      0    -- the budget is already exhausted before this attempt can start;
+      >0   -- the attempt timeout in milliseconds.
     """
     deadline = getattr(client, "deadline", None)
     if deadline is None or deadline.deadline_seconds is None:
-        return int(default_ms)
+        return None
     remaining = deadline.remaining
     if remaining is None:
-        return int(default_ms)
-    usable = max(0.0, float(remaining) - DRAFT_FINALIZE_RESERVE_SECONDS)
+        return None
+    usable = float(remaining) - DRAFT_FINALIZE_RESERVE_SECONDS
+    if usable <= 0:
+        return 0
     attempt = min(float(default_ms) / 1000.0, usable - DRAFT_MIN_NET_BUDGET_SECONDS)
-    if attempt <= 0:
-        return int(default_ms)
-    return max(1000, int(attempt * 1000.0))
+    if attempt <= 0.0:
+        return 0
+    return max(1, int(round(attempt * 1000.0)))
 
 
 def _run_z3_peer_component(
@@ -7973,16 +7983,30 @@ def _run_z3_peer_component(
     learned_nogoods: Optional[List[Dict[str, str]]],
     raw_config: Optional[Dict[str, Any]],
     stability_targets: Optional[Dict[str, str]] = None,
-    attempt_timeout_ms: Optional[int] = None,
+    budget_capped: bool = False,
 ) -> Dict[str, Any]:
     """Solve one component exactly and refine registry-unavailable candidates.
 
     The returned assignment is authoritative only when the caller explicitly
     configured ``solverBackend=z3``.  No fallback to the heuristic solver is
     performed here: exact ``unknown`` is a distinct planner state.
+
+    ``budget_capped`` (the authoritative Draft path) recomputes the attempt
+    timeout immediately before EVERY ``solve_z3_exact`` call -- after the model
+    build and after each registry refinement -- against the overall budget
+    still available minus the publication reserve (R6-1). A fresh attempt
+    never exceeds what is actually left, is never raised by a 1s floor, and is
+    not started at all with the configured default when the budget is already
+    gone: an honest ``budget_exhausted_before_attempt`` outcome is returned
+    instead, never disguised as a confirmed timeout of a run solver.
+
+    Each executed attempt gets its own observability id BEFORE the call
+    (R6-2); it is passed into ``solve_z3_exact`` so the matching
+    solver.z3.start/finish events share it, and it is returned in the per-attempt
+    record so the component report links to the real Z3 attempts.
     """
     options = _peer_solver_backend_options(raw_config)
-    solver_timeout_ms = int(attempt_timeout_ms or options["timeoutMs"])
+    configured_timeout_ms = int(options["timeoutMs"])
     model = _build_peer_optimization_model(
         component,
         rows_by_name,
@@ -7994,7 +8018,79 @@ def _run_z3_peer_component(
     )
     refinements = 0
     total_elapsed_ms = 0
-    result = solve_z3_exact(model, timeout_ms=solver_timeout_ms)
+    attempts: List[Dict[str, Any]] = []
+
+    def _remaining_for_attempt() -> Optional[float]:
+        return getattr(getattr(client, "deadline", None), "remaining", None)
+
+    def _next_attempt_timeout_ms() -> int:
+        if not budget_capped:
+            return configured_timeout_ms
+        cap = _draft_solver_attempt_timeout_ms(client, configured_timeout_ms)
+        if cap is None:
+            return configured_timeout_ms
+        return int(cap)
+
+    def _start_attempt(timeout_ms: int):
+        """Start one real attempt with its own observability id and record it."""
+        attempt_id = new_observability_id("z3")
+        started_remaining = _remaining_for_attempt()
+        attempt_result = solve_z3_exact(model, timeout_ms=timeout_ms, operation_id=attempt_id)
+        attempts.append({
+            "attemptId": attempt_id,
+            "timeoutMs": timeout_ms,
+            "elapsedMs": int(attempt_result.elapsed_ms),
+            "status": str(attempt_result.status),
+            "remainingBudgetSeconds": (
+                f"{started_remaining:.1f}" if started_remaining is not None else None
+            ),
+        })
+        return attempt_result
+
+    def _not_started_entry() -> Dict[str, Any]:
+        remaining = _remaining_for_attempt()
+        return {
+            "attemptId": "",
+            "timeoutMs": 0,
+            "status": "not_started",
+            "reason": "budget-exhausted-before-attempt",
+            "remainingBudgetSeconds": (
+                f"{remaining:.1f}" if remaining is not None else None
+            ),
+        }
+
+    def _budget_exhausted_before_attempt_report() -> Dict[str, Any]:
+        remaining = _remaining_for_attempt()
+        detail = (
+            "overall Draft budget exhausted before this exact attempt could start"
+            + (
+                f" (remaining={remaining:.2f}s, publish reserve={DRAFT_FINALIZE_RESERVE_SECONDS}s)"
+                if remaining is not None
+                else ""
+            )
+        )
+        return {
+            "backend": "z3",
+            "status": "budget_exhausted_before_attempt",
+            "detail": detail,
+            "refinements": refinements,
+            "elapsedMs": total_elapsed_ms,
+            "timeoutMs": 0,
+            "configuredTimeoutMs": configured_timeout_ms,
+            "variables": len(model.packages),
+            "candidates": model.candidate_count(),
+            "hardConstraints": len(model.constraints) + len(model.requirements),
+            "stateUpperBound": str(model.state_count_upper_bound()),
+            "attempts": attempts,
+            "attemptCount": len(attempts),
+            "operationAttemptIds": [str(a.get("attemptId") or "") for a in attempts if a.get("attemptId")],
+        }
+
+    first_timeout = _next_attempt_timeout_ms()
+    if first_timeout <= 0:
+        attempts.append(_not_started_entry())
+        return _budget_exhausted_before_attempt_report()
+    result = _start_attempt(first_timeout)
     total_elapsed_ms += int(result.elapsed_ms)
 
     while result.status == "optimal" and result.assignment is not None:
@@ -8027,15 +8123,23 @@ def _run_z3_peer_component(
                 "detail": f"registry refinement budget {options['maxRefinements']} exhausted",
                 "refinements": refinements,
                 "elapsedMs": total_elapsed_ms,
-                "timeoutMs": solver_timeout_ms,
+                "timeoutMs": attempts[-1]["timeoutMs"] if attempts else configured_timeout_ms,
+                "configuredTimeoutMs": configured_timeout_ms,
                 "variables": len(model.packages),
                 "candidates": model.candidate_count(),
                 "hardConstraints": len(model.constraints) + len(model.requirements),
                 "stateUpperBound": str(model.state_count_upper_bound()),
+                "attempts": attempts,
+                "attemptCount": len(attempts),
+                "operationAttemptIds": [str(a.get("attemptId") or "") for a in attempts if a.get("attemptId")],
             }
         model = model.with_constraints(unavailable)
         refinements += 1
-        result = solve_z3_exact(model, timeout_ms=solver_timeout_ms)
+        next_timeout = _next_attempt_timeout_ms()
+        if next_timeout <= 0:
+            attempts.append(_not_started_entry())
+            return _budget_exhausted_before_attempt_report()
+        result = _start_attempt(next_timeout)
         total_elapsed_ms += int(result.elapsed_ms)
 
     report: Dict[str, Any] = {
@@ -8044,11 +8148,15 @@ def _run_z3_peer_component(
         "detail": result.detail,
         "refinements": refinements,
         "elapsedMs": total_elapsed_ms,
-        "timeoutMs": solver_timeout_ms,
+        "timeoutMs": attempts[-1]["timeoutMs"] if attempts else configured_timeout_ms,
+        "configuredTimeoutMs": configured_timeout_ms,
         "variables": len(model.packages),
         "candidates": model.candidate_count(),
         "hardConstraints": len(model.constraints) + len(model.requirements),
         "stateUpperBound": str(model.state_count_upper_bound()),
+        "attempts": attempts,
+        "attemptCount": len(attempts),
+        "operationAttemptIds": [str(a.get("attemptId") or "") for a in attempts if a.get("attemptId")],
     }
     if result.assignment is not None:
         report.update(
@@ -8802,6 +8910,7 @@ def _exact_solver_component_context(
     operation_id = (
         f"z3-{run_id}-{project}-{mode}-{op_digest}" if run_id else f"z3-{project}-{mode}-{op_digest}"
     )
+    attempts = list(exact_report.get("attempts") or [])
     context: Dict[str, str] = dict(run_context or {})
     context.update({
         "phase": "peer-planning",
@@ -8812,7 +8921,13 @@ def _exact_solver_component_context(
         "constraintCount": str(int(exact_report.get("hardConstraints") or 0)),
         "refinements": str(int(exact_report.get("refinements") or 0)),
         "solverElapsedMs": str(int(exact_report.get("elapsedMs") or 0)),
-        "timeoutMs": str(int(exact_report.get("timeoutMs") or backend_options.get("timeoutMs") or 0)),
+        "timeoutMs": str(int(exact_report.get("timeoutMs") or 0)),
+        "configuredTimeoutMs": str(int(exact_report.get("configuredTimeoutMs") or backend_options.get("timeoutMs") or 0)),
+        "attemptCount": str(len(attempts)),
+        "attemptTimeoutMs": str(int((attempts[-1].get("timeoutMs") or 0) if attempts else 0)),
+        "attemptOperationIds": ",".join(
+            str(a.get("attemptId") or "") for a in attempts if a.get("attemptId")
+        ),
         "terminalStatus": str(_terminal_status_for_exact_solver(exact_status).value),
         "terminalSource": "z3",
         "solverStatus": str(exact_status or ""),
@@ -8866,6 +8981,8 @@ def _mark_draft_component_unresolved(
     report: Dict[str, Any] = {
         "project": project,
         "mode": mode,
+        "solverVariant": mode,
+        "productMode": str((run_context or {}).get("productMode") or "draft"),
         "component": list(component),
         "componentCount": len(component),
         "packageCount": len(component),
@@ -8878,6 +8995,9 @@ def _mark_draft_component_unresolved(
         "refinements": context["refinements"],
         "solverElapsedMs": context["solverElapsedMs"],
         "timeoutMs": context["timeoutMs"],
+        "configuredTimeoutMs": context["configuredTimeoutMs"],
+        "attempts": list(exact_report.get("attempts") or []),
+        "attemptCount": int(exact_report.get("attemptCount") or len(exact_report.get("attempts") or [])),
         "confirmedTimeout": context.get("confirmedTimeout") == "true",
         "reasonUnknown": context.get("reasonUnknown", ""),
         "operationId": context.get("operationId", ""),
@@ -8900,6 +9020,8 @@ def _mark_draft_component_unresolved(
         "solver.component.incomplete",
         project=project,
         mode=mode,
+        solverVariant=mode,
+        productMode=str((run_context or {}).get("productMode") or "draft"),
         packageCount=len(component),
         status=exact_status,
         detail=detail[:400] or "no reason given",
@@ -8907,6 +9029,9 @@ def _mark_draft_component_unresolved(
         durationMs=context["solverElapsedMs"],
         refinements=context["refinements"],
         operationId=context.get("operationId", ""),
+        componentOperationId=context.get("operationId", ""),
+        attemptCount=context.get("attemptCount", "0"),
+        attemptOperationIds=context.get("attemptOperationIds", ""),
     )
 
 
@@ -9112,14 +9237,13 @@ def resolve_peer_compatibility(
                         )
 
                 if authoritative_backend == "z3":
-                    # A4: one attempt must stay within the remaining overall
-                    # Draft budget minus the publication reserve, so an
-                    # UNFINISHED outcome of even the last component can be
-                    # committed and published before the deadline. The
-                    # supervisor thread-join stays the hard guarantee.
-                    attempt_timeout_ms = _draft_solver_attempt_timeout_ms(
-                        client, backend_options.get("timeoutMs", 30000)
-                    )
+                    # A4/R6-1: `_run_z3_peer_component` caps EACH attempt to the
+                    # overall Draft budget still available immediately before
+                    # the call (after model build, after every registry
+                    # refinement) minus the publication reserve, and never
+                    # starts a fresh attempt with the configured timeout when
+                    # that budget is already gone. The supervisor thread-join
+                    # stays the hard guarantee.
                     exact_report = _run_z3_peer_component(
                         component,
                         rows_by_name,
@@ -9129,7 +9253,7 @@ def resolve_peer_compatibility(
                         learned_nogoods,
                         solver_config,
                         solver_stability_targets,
-                        attempt_timeout_ms=attempt_timeout_ms,
+                        budget_capped=True,
                     )
                     exact_status = str(exact_report.get("status") or "")
                     if exact_status == "optimal" and isinstance(exact_report.get("assignment"), dict):
@@ -9139,12 +9263,17 @@ def resolve_peer_compatibility(
                             "solver.component.finish",
                             project=project,
                             mode=mode,
+                            solverVariant=mode,
                             packageCount=len(component),
                             changed=int(exact_report.get("changed") or 0),
                             hardConstraintCount=int(exact_report.get("hardConstraints") or 0),
                             refinements=int(exact_report.get("refinements") or 0),
                             durationMs=int(exact_report.get("elapsedMs") or 0),
                             status=exact_status,
+                            attemptCount=int(exact_report.get("attemptCount") or 0),
+                            attemptOperationIds=",".join(
+                                str(a) for a in (exact_report.get("operationAttemptIds") or [])
+                            ),
                         )
                         eprint(
                             f"[info] {project}: exact z3 {mode}; packages={len(component)}, "
@@ -9186,6 +9315,33 @@ def resolve_peer_compatibility(
                             f"{project}/{mode}: component={','.join(component)}; "
                             f"detail={str(exact_report.get('detail') or '')[:500]}; "
                             "exact refinement budget ended without a proof",
+                            source="z3",
+                            project=project,
+                            mode=mode,
+                            phase="peer-planning",
+                            extra_context=_exact_solver_component_context(
+                                project, mode, component, exact_status, exact_report, backend_options, client, run_context
+                            ),
+                        )
+                    elif exact_status == "budget_exhausted_before_attempt":
+                        # R6-1: no solver attempt could even start because the
+                        # overall Draft budget was already gone. In a Draft run
+                        # the component is marked unresolved and the publish
+                        # keeps the accepted snapshot; the outcome is never
+                        # confused with a confirmed timeout of a run solver.
+                        if partial_on_incomplete:
+                            _mark_draft_component_unresolved(
+                                project, mode, component, rows_for_name, exact_status, exact_report,
+                                backend_options, client, incomplete_components_out, run_context,
+                            )
+                            unresolved_names.update(component)
+                            continue
+                        raise _baseline_terminal_error(
+                            BaselineTerminalStatus.BUDGET_EXHAUSTED,
+                            "EXACT_SOLVER_BUDGET_EXHAUSTED",
+                            f"{project}/{mode}: component={','.join(component)}; "
+                            f"detail={str(exact_report.get('detail') or '')[:500]}; "
+                            "overall budget was already gone before the exact attempt could start",
                             source="z3",
                             project=project,
                             mode=mode,
@@ -9741,7 +9897,7 @@ def _terminal_status_for_exact_solver(status: str) -> BaselineTerminalStatus:
         return BaselineTerminalStatus.SAT_PROVEN
     if normalized == "unsat":
         return BaselineTerminalStatus.UNSAT_PROVEN
-    if normalized == "unknown_refinement_budget":
+    if normalized in {"unknown_refinement_budget", "budget_exhausted_before_attempt"}:
         return BaselineTerminalStatus.BUDGET_EXHAUSTED
     if normalized == "unavailable":
         return BaselineTerminalStatus.SOLVER_UNAVAILABLE
