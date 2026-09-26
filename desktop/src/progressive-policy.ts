@@ -7,6 +7,11 @@ export type AcceptancePolicy = {
    * minLagOkPct against the audit's lag compliance when the audit carries it. */
   targetLevel?: 'yellow' | 'green'
   minLagOkPct?: number
+  /** Lag window in months; a product criterion, not a transport hint. */
+  lagPolicyMonths?: number
+  /** Package-name caps for Moderate/Low (green preset pins them to 0). */
+  maxKnownModerate?: number
+  maxKnownLow?: number
 }
 
 export type AcceptanceAuditEvidence = {
@@ -48,8 +53,15 @@ function boundedCount(value: unknown, fallback: number): number {
   return Math.max(0, Math.min(99, Math.trunc(parsed)))
 }
 
+function boundedLagMonths(value: unknown): number | undefined {
+  const parsed = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(parsed)) return undefined
+  return parsed === 3 || parsed === 6 || parsed === 9 || parsed === 12 ? parsed : 12
+}
+
 export function normalizeAcceptancePolicy(value: Partial<AcceptancePolicy> | undefined): AcceptancePolicy {
   const rawLagPct = Number(value?.minLagOkPct)
+  const lagMonths = boundedLagMonths(value?.lagPolicyMonths)
   return {
     maxKnownCritical: 0,
     maxKnownHigh: boundedCount(value?.maxKnownHigh, DEFAULT_ACCEPTANCE_POLICY.maxKnownHigh),
@@ -57,6 +69,15 @@ export function normalizeAcceptancePolicy(value: Partial<AcceptancePolicy> | und
     // 0 is a legitimate goal (no slack at the gate), so Number.isFinite, not `|| 80`.
     ...(value?.minLagOkPct !== undefined && value?.minLagOkPct !== null && Number.isFinite(rawLagPct)
       ? { minLagOkPct: Math.max(0, Math.min(100, Math.trunc(rawLagPct))) }
+      : {}),
+    // The lag window and M/L caps are product criteria: normalize (never
+    // silently drop) them so a saved policy round-trips through open/reopen.
+    ...(lagMonths !== undefined ? { lagPolicyMonths: lagMonths } : {}),
+    ...(value?.maxKnownModerate !== undefined && value?.maxKnownModerate !== null
+      ? { maxKnownModerate: boundedCount(value.maxKnownModerate, 0) }
+      : {}),
+    ...(value?.maxKnownLow !== undefined && value?.maxKnownLow !== null
+      ? { maxKnownLow: boundedCount(value.maxKnownLow, 0) }
       : {}),
   }
 }

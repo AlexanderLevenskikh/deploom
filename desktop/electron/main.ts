@@ -341,6 +341,10 @@ type JobRecord = {
   id: string
   action: FlowAction
   projectName?: string
+  // A06: canonical project path (resolve+normalize). Job identity for
+  // concurrency is the real repository, so two project aliases or nested
+  // packages of one git checkout can never run mutating stages at once.
+  projectPath?: string
   workspace: WorkspaceRecord
   target?: string
   releaseBranch?: string
@@ -405,7 +409,20 @@ const jobs = new Map<string, JobRecord>()
 const PROJECT_BACKGROUND_ACTIONS = new Set<FlowAction>(['preflight', 'baseline'])
 const WORKSPACE_GLOBAL_ACTIONS = new Set<FlowAction>(['sync-tool', 'generate-all', 'commit-state', 'push-workspace'])
 
+function sameRepositoryPath(existing: JobRecord, project: ProjectSpec): boolean {
+  // A06: two project aliases of one canonical repository (or nested packages
+  // sharing a git checkout, or the same repo added to two workspaces) mutate
+  // the same working tree. Only a resolved+normalized absolute path is a
+  // trustworthy identity here -- never the display name.
+  const existingPath = existing.projectPath
+    ? normalizePathForComparison(normalize(resolve(existing.projectPath)))
+    : ''
+  const projectPath = normalizePathForComparison(normalize(resolve(project.path)))
+  return Boolean(existingPath && projectPath) && existingPath === projectPath
+}
+
 function projectRunConflicts(existing: JobRecord, workspace: WorkspaceRecord, project: ProjectSpec, action: FlowAction): boolean {
+  if (sameRepositoryPath(existing, project)) return true
   if (existing.workspace.id !== workspace.id) return false
   if (existing.projectName === project.name) return true
 
@@ -418,6 +435,33 @@ function projectRunConflicts(existing: JobRecord, workspace: WorkspaceRecord, pr
   if (WORKSPACE_GLOBAL_ACTIONS.has(action) || WORKSPACE_GLOBAL_ACTIONS.has(existing.action)) return true
   if (PROJECT_BACKGROUND_ACTIONS.has(action) || PROJECT_BACKGROUND_ACTIONS.has(existing.action)) return false
   return true
+}
+
+// A06: the run-action/recover handlers register the real job only after
+// several awaits (git preflight, command construction). Reserving a slot in
+// the jobs map SYNCHRONOUSLY before the first await closes the race where two
+// concurrent starts both pass the conflict check and then both run. The
+// reservation is atomically exchanged for the real job (or released in
+// finally when the handler throws before registering).
+function reserveProjectActionSlot(
+  workspace: WorkspaceRecord,
+  project: ProjectSpec,
+  action: FlowAction,
+): { reservation?: JobRecord; conflict?: JobRecord } {
+  const runningJob = [...jobs.values()].find((existing) =>
+    projectRunConflicts(existing, workspace, project, action)
+  )
+  if (runningJob) return { conflict: runningJob }
+  const reservation: JobRecord = {
+    id: randomUUID(),
+    action,
+    workspace,
+    projectName: action === 'generate-all' ? undefined : project.name,
+    projectPath: project.path,
+    cancelled: false,
+  }
+  jobs.set(reservation.id, reservation)
+  return { reservation }
 }
 
 let mainWindow: BrowserWindow | null = null
@@ -522,9 +566,21 @@ function normalizeBaselineIntent(value: unknown): BaselineIntent {
   }
 }
 
+// A08: mutable per-project artifacts must never collide just because two
+// display names slugify to the same ASCII token ('Проект один'/'Проект два' ->
+// 'project', 'foo/bar'/'foo-bar' -> 'foo-bar', case variants on Windows).
+// The token keeps a lossy readable slug for debugging and appends a short
+// lowercase HEX digest of the ORIGINAL name, so distinct names always get
+// distinct paths -- even on a case-insensitive filesystem (hex keeps the
+// digest case-stable, unlike base64url).
+function projectArtifactToken(projectName: string): string {
+  const slug = projectName.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'project'
+  const digest = createHash('sha256').update(projectName, 'utf8').digest('hex').slice(0, 12)
+  return `${slug}-${digest}`
+}
+
 function baselineIntentPath(workspace: WorkspaceRecord, projectName: string): string {
-  const safeProject = projectName.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'project'
-  return join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-intent', `${safeProject}.json`)
+  return join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-intent', `${projectArtifactToken(projectName)}.json`)
 }
 
 function loadBaselineIntent(workspace: WorkspaceRecord, projectName: string): BaselineIntent {
@@ -975,8 +1031,7 @@ function projectArtifactCachePath(workspace: WorkspaceRecord, projectName: strin
 }
 
 function baselineProjectOutputDir(workspace: WorkspaceRecord, projectName: string): string {
-  const stem = projectName.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'project'
-  return join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-project-output', stem)
+  return join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-project-output', projectArtifactToken(projectName))
 }
 
 function snapshotProjectArtifacts(
@@ -2004,8 +2059,8 @@ function readTargetClosure(workspace: WorkspaceRecord, project: ProjectSpec | un
 }
 
 function manualAuditReportPath(workspace: WorkspaceRecord, projectName: string): string {
-  const slug = projectName.toLowerCase().replace(/[^a-z0-9._-]+/g, '-')
-  return join(artifactPath(workspace, 'artifactsDir', '.dependency-roadmap/artifacts'), `manual-audit-${slug}.json`)
+  const token = projectArtifactToken(projectName)
+  return join(artifactPath(workspace, 'artifactsDir', '.dependency-roadmap/artifacts'), `manual-audit-${token}.json`)
 }
 
 function readAcceptanceVerdict(workspace: WorkspaceRecord, project: ProjectSpec): AcceptanceVerdict {
@@ -2646,7 +2701,7 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
         env: { ...goalPolicyEnv(workspace, project.name), ...generateAllPolicyEnv(workspace) },
       }]
     case 'audit': {
-      const slug = project.name.toLowerCase().replace(/[^a-z0-9._-]+/g, '-')
+      const token = projectArtifactToken(project.name)
       const artifacts = artifactPath(workspace, 'artifactsDir', '.dependency-roadmap/artifacts')
       const intent = loadBaselineIntent(workspace, project.name)
       const auditPolicy = intent.acceptancePolicy ?? normalizeAcceptancePolicy(undefined)
@@ -2654,7 +2709,7 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
         label: 'Независимый audit', command: 'python', cwd: workspace.path,
         args: [join(toolDir, 'manual_dependency_audit.py'), '--project-dir', project.path, '--project-name', project.name,
           '--dashboard-state', artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json'),
-          '--audit-workspace', join(artifacts, `manual-audit-${slug}-workspace`),
+          '--audit-workspace', join(artifacts, `manual-audit-${token}-workspace`),
           // Release acceptance requires canonical Yarn graph authority. For npm/pnpm this option is accepted but ignored.
           '--yarn-audit-engine', 'yarn-inventory',
           '--target-level', auditPolicy.targetLevel ?? 'yellow',
@@ -2666,7 +2721,7 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
           // evidence was produced under the exact green M/L thresholds.
           ...(auditPolicy.maxKnownModerate !== undefined ? ['--max-known-moderate', String(auditPolicy.maxKnownModerate)] : []),
           ...(auditPolicy.maxKnownLow !== undefined ? ['--max-known-low', String(auditPolicy.maxKnownLow)] : []),
-          '--json-out', join(artifacts, `manual-audit-${slug}.json`), '--md-out', join(artifacts, `manual-audit-${slug}.md`)],
+          '--json-out', join(artifacts, `manual-audit-${token}.json`), '--md-out', join(artifacts, `manual-audit-${token}.md`)],
       }]
     }
     case 'recover':
@@ -6676,16 +6731,25 @@ function setupIpc(): void {
     // Same-project jobs remain exclusive. Across different projects, only
     // project-isolated actions (preflight/baseline) may overlap. Mutating FLOW
     // stages still retain the workspace-wide lock.
-    const runningJob = [...jobs.values()].find((existing) =>
-      projectRunConflicts(existing, workspace, project, input.action)
-    )
-    if (runningJob) {
-      const scope = runningJob.projectName === project.name ? `проекта ${project.name}` : 'workspace'
-      throw new Error(`Для ${scope} уже выполняется «${runningJob.action}». Дождитесь завершения или отмените текущую команду.`)
+    // A06: the reservation happens HERE, synchronously, before the first await
+    // (git preflight / command construction below). The old code checked the
+    // jobs map and only then registered the job after several awaits, so two
+    // concurrent starts could both pass the check and both run.
+    const { reservation, conflict } = reserveProjectActionSlot(workspace, project, input.action)
+    if (conflict) {
+      const scope = conflict.projectName === project.name ? `проекта ${project.name}` : 'workspace'
+      throw new Error(`Для ${scope} уже выполняется «${conflict.action}». Дождитесь завершения или отмените текущую команду.`)
     }
+    const reservationId = reservation!.id
+    try {
     const savedRun = readTeamState(workspace)?.projects[project.name]
     const savedReleaseBranch = savedRun?.releaseBranch
-    const effectiveTarget: ClosureTarget = savedRun?.target === 'green' || input.target === 'green' ? 'green' : 'yellow'
+    // A07: an explicit input target is authoritative; only when the caller
+    // does not pass one do we fall back to the persisted run's goal, then to
+    // the yellow default. A saved green must never override an explicit yellow.
+    const effectiveTarget: ClosureTarget = input.target === 'green' || input.target === 'yellow'
+      ? input.target
+      : savedRun?.target === 'green' ? 'green' : 'yellow'
     input.target = effectiveTarget
     if (input.action === 'release') input.releaseBranch = releaseBranchForAction('release', input.releaseBranch, savedReleaseBranch, project.git?.releaseBranch)
     if (input.action === 'push-workspace') input.releaseBranch = releaseBranchForAction('publish', input.releaseBranch, savedReleaseBranch, project.git?.releaseBranch)
@@ -6726,7 +6790,7 @@ function setupIpc(): void {
     }
     const commands = [...await baselineStartCommands(input, project), ...await cleanAgentStartCommands(input, workspace, project), ...actionCommands(input, workspace, project, draftRunId)]
     const job: JobRecord = {
-      id: randomUUID(), action: input.action, workspace, projectName: input.action === 'generate-all' ? undefined : project.name, target: input.target, cancelled: false,
+      id: randomUUID(), action: input.action, workspace, projectName: input.action === 'generate-all' ? undefined : project.name, projectPath: project.path, target: input.target, cancelled: false,
       ...(['agent', 'recover'].includes(input.action) ? { agentProvider: workspace.agent, agentNote: input.agentNote?.trim() || undefined } : {}),
       ...(['release', 'push-workspace'].includes(input.action) ? { releaseBranch: input.releaseBranch } : {}),
       ...(input.action === 'release' ? { releaseSourceCommit: input.sourceCommit, releaseGateCommand: input.gateCommand?.trim() || undefined } : {}),
@@ -6734,9 +6798,15 @@ function setupIpc(): void {
       ...(requestedBaselineProofMode ? { baselineProofMode: requestedBaselineProofMode } : {}),
       ...(draftRunId ? { runId: draftRunId } : {}),
     }
+    jobs.delete(reservationId)
     jobs.set(job.id, job)
     void executeJob(job, commands)
     return { jobId: job.id, runId: draftRunId, preview: commands.map((item) => `${item.command} ${item.args.join(' ')}`) }
+    } finally {
+      // If the real job was never registered (an early throw above), the
+      // reservation must not block the slot forever.
+      if (jobs.has(reservationId)) jobs.delete(reservationId)
+    }
   })
 
   ipcMain.handle('flow:get-hardware-snapshot', () => hardwareSnapshot())
@@ -6805,29 +6875,36 @@ function setupIpc(): void {
     const state = loadState()
     const workspace = findWorkspace(state, raw.workspaceId)
     const project = findProject(workspace, raw.projectName)
-    const runningJob = [...jobs.values()].find((existing) =>
-      projectRunConflicts(existing, workspace, project, 'recover')
-    )
-    if (runningJob) {
-      const scope = runningJob.projectName === project.name ? `проекта ${project.name}` : 'workspace'
-      throw new Error(`Для ${scope} уже выполняется «${runningJob.action}».`)
+    // A06: reserve the slot synchronously before the await below, so a
+    // recover cannot start while another stage on the same repository is
+    // between its own conflict check and job registration.
+    const { reservation, conflict } = reserveProjectActionSlot(workspace, project, 'recover')
+    if (conflict) {
+      const scope = conflict.projectName === project.name ? `проекта ${project.name}` : 'workspace'
+      throw new Error(`Для ${scope} уже выполняется «${conflict.action}».`)
     }
+    const reservationId = reservation!.id
+    try {
     const issue = await inferredRecoveryIssue(workspace, project)
     if (!issue) throw new Error('Нет сохранённой recoverable-ошибки или подготовленной dirty release-ветки.')
     if (issue.kind === 'hard') throw new Error(`${issue.code}: это safety hard-stop; пользовательский prompt не может его обойти.`)
     if (issue.kind === 'infrastructure') throw new Error(`${issue.code}: сначала восстановите инфраструктуру/Git-чтение.`)
     const savedRun = readTeamState(workspace)?.projects[project.name]
     const job: JobRecord = {
-      id: randomUUID(), action: 'recover', workspace, projectName: project.name,
+      id: randomUUID(), action: 'recover', workspace, projectName: project.name, projectPath: project.path,
       target: savedRun?.target, cancelled: false, agentProvider: workspace.agent,
       agentNote: note, recoveryIssue: issue,
       ...(savedRun?.releaseBranch ? { releaseBranch: savedRun.releaseBranch } : {}),
       ...(savedRun?.releaseSourceCommit ? { releaseSourceCommit: savedRun.releaseSourceCommit } : {}),
       ...(savedRun?.releaseGateCommand ? { releaseGateCommand: savedRun.releaseGateCommand } : {}),
     }
+    jobs.delete(reservationId)
     jobs.set(job.id, job)
     void executeJob(job, [])
     return { jobId: job.id }
+    } finally {
+      if (jobs.has(reservationId)) jobs.delete(reservationId)
+    }
   })
 
   ipcMain.handle('flow:open-path', async (_event, targetPath: string) => {

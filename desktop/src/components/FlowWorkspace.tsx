@@ -8,7 +8,7 @@ import { QuickSelect } from './QuickSelect'
 import { ModelPicker } from './ModelPicker'
 import { BaselineIntentDialog } from './BaselineIntentDialog'
 import { PromptPreviewDialog } from './PromptPreviewDialog'
-import { freshBaselineIntent, normalizeBaselineIntentPlan } from '../data/baselineIntent'
+import { normalizeBaselineIntentPlan } from '../data/baselineIntent'
 import type { DraftProgressPayload } from '../hooks/useDependencyFlow'
 import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, DraftResultSnapshot, FlowAction, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
 
@@ -212,16 +212,15 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
   const openBaselineIntentDialog = async (mode: 'prepare' | 'decision', resume: 'auto' | 'continue' | 'restart', decision?: BaselineDecision) => {
     try {
       const loaded = normalizeBaselineIntentPlan(await onGetBaselineIntentPlan(project.name))
-      const fresh = freshBaselineIntent()
-      // A new Baseline retries package scope/deferred cohorts from a clean slate,
-      // but product-level risk/control preferences must not silently reset.
+      // A new Baseline retries package scope/deferred cohorts from a clean
+      // slate; every product-level preference (target level, lag %, lag
+      // window, productMode, control/budget, M/L caps) stays as saved.
       const plan = mode === 'prepare' ? { ...loaded, intent: {
-        ...fresh,
-        controlMode: loaded.intent.controlMode ?? fresh.controlMode,
-        budgetMinutes: loaded.intent.budgetMinutes ?? fresh.budgetMinutes,
-        // N1: a saved implicit default must not become an explicit override.
-        budgetMinutesExplicit: loaded.intent.budgetMinutesExplicit === true ? true : undefined,
-        acceptancePolicy: loaded.intent.acceptancePolicy ?? fresh.acceptancePolicy,
+        ...loaded.intent,
+        policies: {},
+        deferredCohorts: [],
+        cohortAction: undefined,
+        autoOpenPrompt: undefined,
       } } : loaded
       setBaselineIntentDialog({ mode, resume, plan, decision })
     } catch (error) {

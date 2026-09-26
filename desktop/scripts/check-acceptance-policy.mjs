@@ -44,7 +44,7 @@ const report = (critical, high, overrides = {}) => {
     engine: 'yarn-inventory',
     trusted: true,
     canonicalInventory: { complete: true },
-    packageTotals: { critical, high, moderate: 0, low: 0 },
+    packageTotals: { critical, high, moderate: 0, low: 0, unknown: 0 },
     packageDetails: {
       ...(critical ? { danger: { severity: 'critical' } } : {}),
       ...(high ? { highdep: { severity: 'high' } } : {}),
@@ -113,7 +113,7 @@ const greenPolicyAllowsHigh = acceptanceVerdictFromManualAudit(
 )
 if (greenPolicyAllowsHigh.status !== 'REMEDIATION_REQUIRED' || !greenPolicyAllowsHigh.reasons.some((reason) => reason.includes('Green goal requires High=0'))) throw new Error(`green with High>0 in policy must not accept: ${JSON.stringify(greenPolicyAllowsHigh)}`)
 const greenModerate = acceptanceVerdictFromManualAudit(
-  report(0, 0, { policy: GREEN100, audit: { packageTotals: { critical: 0, high: 0, moderate: 1, low: 0 } } }),
+  report(0, 0, { policy: GREEN100, audit: { packageTotals: { critical: 0, high: 0, moderate: 1, low: 0, unknown: 0 } } }),
   identity.hash,
   GREEN100,
 )
@@ -158,6 +158,45 @@ if (zeroGoal.minLagOkPct !== 0) throw new Error(`0% lag gate must survive the me
 const greenHighLegacy = mergeTargetPolicy({ maxKnownCritical: 0, maxKnownHigh: 1 }, { targetLevel: 'green', minLagOkPct: 100 })
 const greenHighVerdict = acceptanceVerdictFromManualAudit(report(0, 1, { policy: { ...greenHighLegacy, maxKnownHigh: 1 } }), identity.hash, greenHighLegacy)
 if (greenHighVerdict.accepted) throw new Error(`green with High>0 must never accept: ${JSON.stringify(greenHighVerdict)}`)
+
+// A11: the gate unit is vulnerable package NAMES; finding-level (advisory)
+// counts stay as diagnostics so one package with several advisories is never
+// confused with several packages.
+const diag = acceptanceVerdictFromManualAudit(
+  report(0, 2, { audit: { advisoryTotals: { critical: 0, high: 3, moderate: 0, low: 0, unknown: 0 }, packageTotals: { critical: 0, high: 2, moderate: 0, low: 0, unknown: 0 } } }),
+  identity.hash,
+)
+if (diag.status !== 'REMEDIATION_REQUIRED' || diag.high !== 2 || diag.highFindings !== 3 || diag.highPackages.length !== 1) {
+  throw new Error(`A11: package-name gate with findings diagnostics: ${JSON.stringify(diag)}`)
+}
+
+// A02: an unrated/unknown-severity package makes "no Critical/High" unproven,
+// so release acceptance fails closed as UNKNOWN even with C0/H0.
+const unknownOne = acceptanceVerdictFromManualAudit(
+  report(0, 0, { audit: { packageTotals: { critical: 0, high: 0, moderate: 0, low: 0, unknown: 1 }, packageDetails: { unrated: { severity: 'unknown' } } } }),
+  identity.hash,
+)
+if (unknownOne.status !== 'UNKNOWN' || unknownOne.accepted) throw new Error(`unknown-severity evidence must fail closed: ${JSON.stringify(unknownOne)}`)
+if (!unknownOne.reasons.some((r) => r.includes('Unrated/unknown-severity vulnerabilities present'))) throw new Error('unknown-severity reason must be explicit')
+if (unknownOne.unknown !== 1 || unknownOne.unknownPackages[0] !== 'unrated') throw new Error(`unknown count and packages must surface: ${JSON.stringify(unknownOne)}`)
+// A missing unknown total is missing evidence, never a proven zero.
+const missingUnknown = acceptanceVerdictFromManualAudit(
+  report(0, 0, { audit: { packageTotals: { critical: 0, high: 0, moderate: 0, low: 0 } } }),
+  identity.hash,
+)
+if (missingUnknown.status !== 'UNKNOWN' || !missingUnknown.reasons.some((r) => r.includes('Unknown-severity (unrated) vulnerability total is missing'))) {
+  throw new Error(`missing unknown total must fail closed: ${JSON.stringify(missingUnknown)}`)
+}
+
+// A13: malformed policy snapshots are schema gaps (fail closed as UNKNOWN),
+// never silently reparsed into defaults, and maxKnownCritical is a real
+// equality check, not a presence check.
+const badLag = acceptanceVerdictFromManualAudit(report(0, 0, { policy: { ...YELLOW80, minLagOkPct: -5 } }), identity.hash, YELLOW80)
+if (badLag.status !== 'UNKNOWN' || !badLag.reasons.some((r) => r.includes('invalid minLagOkPct'))) throw new Error(`out-of-range minLagOkPct must be a schema gap: ${JSON.stringify(badLag)}`)
+const badMonths = acceptanceVerdictFromManualAudit(report(0, 0, { policy: { ...YELLOW80, lagPolicyMonths: 7 } }), identity.hash, YELLOW80)
+if (badMonths.status !== 'UNKNOWN' || !badMonths.reasons.some((r) => r.includes('invalid lagPolicyMonths'))) throw new Error(`non-enum lagPolicyMonths must be a schema gap: ${JSON.stringify(badMonths)}`)
+const badCritical = acceptanceVerdictFromManualAudit(report(0, 0, { policy: { ...YELLOW80, maxKnownCritical: 5 } }), identity.hash, YELLOW80)
+if (badCritical.status !== 'UNKNOWN' || !badCritical.reasons.some((r) => r.includes('different goal policy'))) throw new Error(`maxKnownCritical must be equality-checked: ${JSON.stringify(badCritical)}`)
 
 fs.writeFileSync(path.join(fixture, 'package.json'), '{"dependencies":{"a":"1.0.1"}}\n')
 const changed = dependencyInputIdentity(fixture)

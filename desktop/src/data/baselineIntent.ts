@@ -47,6 +47,14 @@ export function normalizeBaselineIntentPlan(plan: BaselineIntentPlan): BaselineI
   const controlMode = raw.controlMode === 'AUTONOMOUS' || raw.controlMode === 'CONFIRM_SIGNIFICANT'
     ? raw.controlMode
     : legacyConfirm ? 'CONFIRM_SIGNIFICANT' : 'AUTONOMOUS'
+  const acceptancePolicy = normalizeAcceptancePolicy(raw.acceptancePolicy)
+  const rawLagPct = Number(raw.minLagOkPct)
+  const mirrorTarget = raw.targetLevel === 'green' || raw.targetLevel === 'yellow'
+    ? raw.targetLevel
+    : acceptancePolicy.targetLevel
+  const mirrorLagPct = raw.minLagOkPct !== undefined && raw.minLagOkPct !== null && Number.isFinite(rawLagPct)
+    ? Math.max(0, Math.min(100, Math.trunc(rawLagPct)))
+    : acceptancePolicy.minLagOkPct
   return {
     candidates: [...plan.candidates].sort((a, b) => a.name.localeCompare(b.name)),
     intent: {
@@ -57,13 +65,22 @@ export function normalizeBaselineIntentPlan(plan: BaselineIntentPlan): BaselineI
       // N1: preserve whether the saved intent carried a user-chosen budget so
       // the dialog/Action do not turn an implicit default into an override.
       ...(raw.budgetMinutesExplicit === true ? { budgetMinutesExplicit: true } : {}),
-      acceptancePolicy: normalizeAcceptancePolicy(raw.acceptancePolicy),
+      acceptancePolicy,
       extraIterations: Math.max(0, Number(raw.extraIterations ?? 0) || 0),
       decisionGrantIterations: 0,
       searchMode: raw.searchMode ?? 'AUTO',
       executionMode: controlMode === 'AUTONOMOUS' ? 'BACKGROUND' : 'FAST',
       proofMode: raw.proofMode === 'DRAFT' ? 'DRAFT' : 'VERIFIED',
       deferredCohorts: [...(raw.deferredCohorts ?? [])],
+      // Top-level goal mirrors are part of the canonical product intent: they
+      // round-trip through open/reopen/submit so the R9 policy identity and
+      // the decision dialog compare equal values, not silently-reset defaults.
+      // Older intents stored the goal only inside acceptancePolicy; prefer the
+      // explicit top-level value and fall back to the canonical policy.
+      ...(raw.productMode === 'fast' || raw.productMode === 'deep' ? { productMode: raw.productMode } : {}),
+      ...(mirrorTarget ? { targetLevel: mirrorTarget } : {}),
+      ...(mirrorLagPct !== undefined ? { minLagOkPct: mirrorLagPct } : {}),
+      ...(acceptancePolicy.lagPolicyMonths !== undefined ? { lagPolicyMonths: acceptancePolicy.lagPolicyMonths } : {}),
     },
   }
 }

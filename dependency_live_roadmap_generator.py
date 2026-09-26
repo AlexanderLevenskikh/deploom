@@ -1160,11 +1160,18 @@ class ProjectHealth:
     yellow_projected_lag_ok: int = 0
     yellow_projected_lag_pct: float = 0.0
     yellow_plan_shortfall: int = 0
+    # A04: baseline-union closure view. Current-scope projections count active
+    # rows in both members; these union fields also count removals-from-baseline
+    # in both members so closure stays an honest 0..100% metric.
+    yellow_union_projected_lag_ok: int = 0
+    yellow_union_projected_lag_pct: float = 0.0
     # R9: the stricter green closure goal (user gate + 10 points).
     green_required: int = 0
     green_projected_lag_ok: int = 0
     green_projected_lag_pct: float = 0.0
     green_plan_shortfall: int = 0
+    green_union_projected_lag_ok: int = 0
+    green_union_projected_lag_pct: float = 0.0
     # T3: honest coverage breakdown — metadata (registry availability) and
     # security (OSV assessment) are separate dimensions. Unknown is never
     # treated as zero/healthy; an empty known denominator means "insufficient
@@ -5849,8 +5856,12 @@ def _candidate_satisfies_fast_policy(
         if not _row_security_known(r):
             return False
     # H1: the security limits are evaluated over the WHOLE active scope in the
-    # same units as the acceptance policy (aggregated C/H/M/L), not per row --
-    # two packages with H:1 each cannot both hide behind maxKnownHigh=1.
+    # same units as the acceptance policy (vulnerable PACKAGE NAMES per
+    # severity, aggregated over the scope), not per row and not per finding:
+    # two packages with H:1 each cannot both hide behind maxKnownHigh=1, and a
+    # single package whose exact chosen version carries H:2 is ONE vulnerable
+    # package name. Finding counts stay as the per-row totals diagnostic; the
+    # gate unit is the documented package-name limit (A11).
     severity_limits = (
         ("C", max_critical),
         ("H", max_high),
@@ -5871,9 +5882,8 @@ def _candidate_satisfies_fast_policy(
         # version (or onto a version with no OSV evidence) without the gate
         # noticing. Missing evidence for the exact version is unknown -> Fast
         # must not claim the goal. N3 is preserved: a partial fix that leaves
-        # exactly the allowed remaining findings (remaining <= limit) still
-        # satisfies the policy.
-        remaining = 0
+        # exactly the allowed remaining PACKAGES still satisfies the policy.
+        offending_packages = 0
         for r in active:
             planned = str(
                 candidate_targets.get(r.name) or current_targets.get(r.name) or r.current_version or ""
@@ -5881,8 +5891,9 @@ def _candidate_satisfies_fast_policy(
             exact = _severity_at_candidate_version(r, planned, severity)
             if exact is None:
                 return False
-            remaining += exact
-        if remaining > limit:
+            if exact > 0:
+                offending_packages += 1
+        if offending_packages > limit:
             return False
     # H1: the lag goal is computed over the WHOLE active scope. A row without a
     # discovered lag target is NOT compliant and never drops out of the
@@ -5939,19 +5950,34 @@ def compute_project_health(
     yellow_required = required_ratio_count(scope_total, health_yellow_ratio(project))
     yellow_plan_required = required_ratio_count(scope_total, health_planning_ratio(project))
     lag_needed_for_yellow = max(0, yellow_required - scope_lag_ok)
-    yellow_projected_lag_ok = (
-        sum(1 for row in active_rows if dependency_is_lag_ok_after_planned_target(row, "yellow"))
-        + removed_closed
+    # FIX(A04): a projection is one metric in ONE universe. The current-scope
+    # projection counts only active rows in BOTH members (removed deps are not
+    # part of the current scope and must not inflate its numerator over 100%).
+    # The baseline-union closure view adds removed-from-baseline deps to BOTH
+    # members so removal stays visible instead of hiding unfinished work.
+    yellow_scope_projected_lag_ok = sum(
+        1 for row in active_rows if dependency_is_lag_ok_after_planned_target(row, "yellow")
     )
+    yellow_projected_lag_ok = yellow_scope_projected_lag_ok
     yellow_projected_lag_pct = (yellow_projected_lag_ok / scope_total * 100.0) if scope_total else 100.0
     yellow_plan_shortfall = max(0, yellow_plan_required - yellow_projected_lag_ok)
+    yellow_union_total = scope_total + removed_closed
+    yellow_union_projected_lag_ok = yellow_scope_projected_lag_ok + removed_closed
+    yellow_union_projected_lag_pct = (
+        yellow_union_projected_lag_ok / yellow_union_total * 100.0
+    ) if yellow_union_total else 100.0
     green_required = required_ratio_count(scope_total, health_green_ratio())
-    green_projected_lag_ok = (
-        sum(1 for row in active_rows if dependency_is_lag_ok_after_planned_target(row, "green"))
-        + removed_closed
+    green_scope_projected_lag_ok = sum(
+        1 for row in active_rows if dependency_is_lag_ok_after_planned_target(row, "green")
     )
+    green_projected_lag_ok = green_scope_projected_lag_ok
     green_projected_lag_pct = (green_projected_lag_ok / scope_total * 100.0) if scope_total else 100.0
     green_plan_shortfall = max(0, green_required - green_projected_lag_ok)
+    green_union_total = scope_total + removed_closed
+    green_union_projected_lag_ok = green_scope_projected_lag_ok + removed_closed
+    green_union_projected_lag_pct = (
+        green_union_projected_lag_ok / green_union_total * 100.0
+    ) if green_union_total else 100.0
     lag_blockers = [
         {
             "package": row.name,
@@ -6067,10 +6093,14 @@ def compute_project_health(
         yellow_projected_lag_ok=yellow_projected_lag_ok,
         yellow_projected_lag_pct=yellow_projected_lag_pct,
         yellow_plan_shortfall=yellow_plan_shortfall,
+        yellow_union_projected_lag_ok=yellow_union_projected_lag_ok,
+        yellow_union_projected_lag_pct=yellow_union_projected_lag_pct,
         green_required=green_required,
         green_projected_lag_ok=green_projected_lag_ok,
         green_projected_lag_pct=green_projected_lag_pct,
         green_plan_shortfall=green_plan_shortfall,
+        green_union_projected_lag_ok=green_union_projected_lag_ok,
+        green_union_projected_lag_pct=green_union_projected_lag_pct,
         metadata_total=metadata_total,
         metadata_known=metadata_known,
         security_total=security_total,
@@ -19206,22 +19236,38 @@ function calculateProjectHealthFromDom(section){
   const rows = Array.from(section.querySelectorAll('tr.dep-row'));
   const activeRows = rows.filter(row => row.dataset.scopeExcluded !== '1');
   const excluded = rows.length - activeRows.length;
+  // The producer computes health with the versioned policy (R9) and embeds it
+  // in REPORT_CONTEXT.projectHealth. The DOM recompute must NOT invent a
+  // legacy policy (hardcoded 80% / 0.85 reserve / M+L<=20 / U ignored): the
+  // authoritative status and scope metrics win, and only interactive row-level
+  // facts (targets, per-row counts) stay computed from the DOM.
+  const authoritative = REPORT_CONTEXT.projectHealth?.[project] || null;
+  if (authoritative) {
+    const total = Number(authoritative.scope_total ?? authoritative.total ?? activeRows.length);
+    return {project, status: authoritative.status || 'yellow',
+      total,
+      lag_ok_12m: Number(authoritative.scope_lag_ok ?? 0),
+      lag_bad_12m: Math.max(0, total - Number(authoritative.scope_lag_ok ?? 0)),
+      lag_ok_pct: Number(authoritative.scope_lag_pct ?? 0),
+      critical: Number(authoritative.critical ?? 0), high: Number(authoritative.high ?? 0),
+      moderate: Number(authoritative.moderate ?? 0), low: Number(authoritative.low ?? 0),
+      unknown: Number(authoritative.unknown ?? 0),
+      reason: authoritative.reason || '',
+      excluded, lag_unknown: Number(authoritative.lag_unknown ?? 0), removed: Number(authoritative.removed ?? 0),
+      yellow_plan_required: Number(authoritative.yellow_plan_required ?? 0),
+      yellow_projected_lag_ok: Number(authoritative.yellow_projected_lag_ok ?? 0),
+      yellow_projected_lag_pct: Number(authoritative.yellow_projected_lag_pct ?? 0),
+      yellow_plan_shortfall: Number(authoritative.yellow_plan_shortfall ?? 0),
+      scope_total: Number(authoritative.scope_total ?? activeRows.length)};
+  }
+  // Conservative fallback for a health-less fixture: the WHOLE active scope is
+  // the denominator, unknown lag is never compliant, U and missing security
+  // evidence never yield green, and an empty denominator is 0%, not 100%.
   const knownRows = activeRows.filter(row => !!semverParts(lagComplianceTargetForDomRow(row)));
   const lagUnknown = activeRows.length - knownRows.length;
-  const removed = Number(REPORT_CONTEXT.projectHealth?.[project]?.removed || 0);
-  const total = knownRows.length + removed;
-  const lagOk = knownRows.filter(row => compareSemverText(row.dataset.current || '', lagComplianceTargetForDomRow(row)) >= 0).length + removed;
-  const lagBad = total - lagOk;
-  const lagPct = total ? lagOk / total * 100 : 100;
-  const targetMode = document.getElementById('targetMode')?.value || 'default';
-  const projectedLagOk = knownRows.filter(row => {
-    if (compareSemverText(row.dataset.current || '', lagComplianceTargetForDomRow(row)) >= 0) return true;
-    const target = targetForRow(row, targetMode).value;
-    return isActionTargetValue(target) && compareSemverText(target, lagComplianceTargetForDomRow(row)) >= 0;
-  }).length + removed;
-  const projectedLagPct = total ? projectedLagOk / total * 100 : 100;
-  const yellowPlanRequired = total ? Math.ceil(total * 0.85) : 0;
-  const yellowPlanShortfall = Math.max(0, yellowPlanRequired - projectedLagOk);
+  const scopeTotal = activeRows.length;
+  const scopeLagOk = knownRows.filter(row => compareSemverText(row.dataset.current || '', lagComplianceTargetForDomRow(row)) >= 0).length;
+  const scopePct = scopeTotal ? scopeLagOk / scopeTotal * 100 : (lagUnknown ? 0 : 100);
   const totals = {C:0,H:0,M:0,L:0,U:0};
   for (const row of activeRows) {
     const counts = vulnerabilityCountsForDomRow(row);
@@ -19231,27 +19277,26 @@ function calculateProjectHealthFromDom(section){
   let reason = '';
   if (totals.C > 0) {
     status = 'red'; reason = `есть Critical: ${totals.C}`;
-  } else if (total === 0) {
+  } else if (scopeTotal === 0) {
     status = lagUnknown ? 'yellow' : 'green';
     reason = lagUnknown ? `lag-policy target неизвестен для ${lagUnknown} зависимостей` : 'нет зависимостей в активном расчёте';
-  } else if (lagPct < 80) {
-    status = 'red'; reason = `только ${lagPct.toFixed(1)}% библиотек соблюдают свою lag-policy (<80%)`;
-  } else if (lagBad === 0 && lagUnknown === 0 && totals.H === 0 && (totals.M + totals.L) <= 20) {
-    status = 'green'; reason = '0 нарушений lag-policy, 0 C/H, Low+Moderate ≤20';
+  } else if (scopePct < 80) {
+    status = 'red'; reason = `только ${scopePct.toFixed(1)}% активного scope соблюдают lag-policy (<80%)`;
+  } else if (lagUnknown === 0 && totals.H === 0 && totals.U === 0 && (totals.M + totals.L) <= 20) {
+    status = 'green'; reason = '0 нарушений lag-policy, 0 C/H, нет U, Low+Moderate ≤20';
   } else {
-    status = 'yellow';
-    const parts = [`${lagPct.toFixed(1)}% библиотек соблюдают lag-policy`, '0 Critical'];
+    const parts = [`${scopePct.toFixed(1)}% активного scope соблюдают lag-policy`, '0 Critical'];
     if (lagUnknown) parts.push(`lag-policy target неизвестен: ${lagUnknown}`);
     if (totals.H) parts.push(`High остаются: ${totals.H}`);
+    if (totals.U) parts.push(`уязвимости без оценки серьёзности: ${totals.U}`);
     if (totals.M || totals.L) parts.push(`M/L: ${totals.M + totals.L}`);
     reason = parts.join('; ');
   }
   if (excluded) reason += `${reason ? '; ' : ''}не учитывается: ${excluded}`;
-  return {project,status,total,lag_ok_12m:lagOk,lag_bad_12m:lagBad,lag_ok_pct:lagPct,
+  return {project,status,total:scopeTotal,lag_ok_12m:scopeLagOk,lag_bad_12m:Math.max(0,scopeTotal-scopeLagOk),lag_ok_pct:scopePct,
     critical:totals.C,high:totals.H,moderate:totals.M,low:totals.L,unknown:totals.U,
-    reason,excluded,lag_unknown:lagUnknown,removed,
-    yellow_plan_required:yellowPlanRequired,yellow_projected_lag_ok:projectedLagOk,
-    yellow_projected_lag_pct:projectedLagPct,yellow_plan_shortfall:yellowPlanShortfall};
+    reason,excluded,lag_unknown:lagUnknown,removed:0,
+    yellow_plan_required:0,yellow_projected_lag_ok:0,yellow_projected_lag_pct:0,yellow_plan_shortfall:0,scope_total:scopeTotal};
 }
 function updateProjectHealthVisual(section, health){
   section.dataset.projectStatus = health.status;

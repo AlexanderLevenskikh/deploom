@@ -169,6 +169,10 @@ jobs:
           npm run check:interaction-contracts
           npm run check:dependency-graph
           npm run check:ui-lifecycle
+          npm run check:target-precedence
+          npm run check:baseline-worker-retire
+          npm run check:run-slot-isolation
+          npm run check:artifact-token
       - name: Version consistency
         working-directory: desktop
         run: test "$(node -p "require('./package.json').version")" = "$(cat ../VERSION)"

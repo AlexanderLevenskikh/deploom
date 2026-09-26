@@ -56,6 +56,79 @@ function Remove-ValidationWorktree {
     & git worktree prune *> $null
 }
 
+# A10: rollback of a failed local release. `git reset --hard` is destructive,
+# so it only runs when (a) the current HEAD is the EXACT version commit this
+# run created (sha AND subject) and (b) the worktree/index are still clean.
+# New edits made while validation was running are never erased; instead a
+# fully described, recoverable release state is left behind. When the branch
+# was already published no rollback ever runs (history must not be rewritten).
+function Invoke-SafeReleaseRollback {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ReleaseCommit,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Tag,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Branch,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$VersionCommitCreated,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$BranchPublished
+    )
+
+    if (-not $VersionCommitCreated -or $BranchPublished) {
+        return
+    }
+
+    Write-Host ""
+    Write-Host "== Roll back local version commit =="
+
+    $CurrentHeadSha = (& git rev-parse HEAD).Trim()
+    $CurrentHeadMessage = (& git log -1 --pretty=%s).Trim()
+
+    $HeadIsExactRelease = (
+        $LASTEXITCODE -eq 0 -and
+        $CurrentHeadSha -eq $ReleaseCommit -and
+        $CurrentHeadMessage -eq "chore: release $Tag"
+    )
+
+    if ($HeadIsExactRelease) {
+        $DirtyLines = @(& git status --porcelain)
+
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Failed to inspect the worktree; version rollback skipped."
+        }
+        elseif ($DirtyLines.Count -gt 0) {
+            Write-Warning "Uncommitted changes exist -- version rollback refused to protect them:"
+            $DirtyLines | ForEach-Object { Write-Warning "  $_" }
+            Write-Warning "Release state is left recoverable:"
+            Write-Warning "  commit:  $ReleaseCommit"
+            Write-Warning "  branch:  $Branch (not pushed)"
+            Write-Warning "  tag:     $Tag"
+            Write-Warning "To abort the release without losing changes: backup your edits, then"
+            Write-Warning "  git reset --hard HEAD^"
+        }
+        else {
+            & git reset --hard HEAD^
+
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "Rolled back failed local release $Tag."
+                Write-Host "Your source commit was preserved."
+            }
+            else {
+                Write-Warning "Failed to roll back version commit."
+            }
+        }
+    }
+    else {
+        Write-Warning "HEAD is not the exact version commit of this release (sha=$CurrentHeadSha); automatic version rollback skipped."
+    }
+}
+
 # ------------------------------------------------------------
 # Repository
 # ------------------------------------------------------------
@@ -774,10 +847,25 @@ try {
         $TagMessage = "Release $Tag"
     }
 
-    & git tag -a $Tag -m $TagMessage
+    # A10: recovery after partial publication (branch pushed, tag push failed)
+    # must be idempotent for the SAME version. If the local tag already points
+    # at the exact release commit, reuse it; a tag pointing elsewhere must
+    # never be silently moved.
+    $ExistingTagCommit = (& git rev-parse -q --verify "refs/tags/$Tag" 2>$null).Trim()
 
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to create tag '$Tag'."
+    if ($LASTEXITCODE -eq 0) {
+        if ($ExistingTagCommit -ne $ReleaseCommit) {
+            throw "Local tag '$Tag' already exists at $ExistingTagCommit but the release commit is $ReleaseCommit; refusing to move it."
+        }
+
+        Write-Host "Tag $Tag already exists at the release commit; reusing it."
+    }
+    else {
+        & git tag -a $Tag -m $TagMessage
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to create tag '$Tag'."
+        }
     }
 
     # --------------------------------------------------------
@@ -825,49 +913,20 @@ catch {
 
     # --------------------------------------------------------
     # If validation failed after version commit but before
-    # publication, undo ONLY the version commit.
+    # publication, undo ONLY the version commit (subject to the
+    # A10 safety checks inside Invoke-SafeReleaseRollback).
     #
     # Source commit remains intact.
     # VERSION returns to previous value, so rerunning the
     # script produces the SAME next patch version.
     # --------------------------------------------------------
 
-    if ($VersionCommitCreated -and -not $BranchPublished) {
-        Write-Host ""
-        Write-Host "== Roll back local version commit =="
-
-        $CurrentHeadMessage = (
-            & git log -1 --pretty=%s
-        ).Trim()
-
-        if (
-            $LASTEXITCODE -eq 0 -and
-            $CurrentHeadMessage -eq "chore: release $Tag"
-        ) {
-            & git reset --hard HEAD^
-
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host (
-                    "Rolled back failed local release $Tag."
-                )
-
-                Write-Host (
-                    "Your source commit was preserved."
-                )
-            }
-            else {
-                Write-Warning (
-                    "Failed to roll back version commit."
-                )
-            }
-        }
-        else {
-            Write-Warning (
-                "HEAD changed unexpectedly; " +
-                "automatic version rollback skipped."
-            )
-        }
-    }
+    Invoke-SafeReleaseRollback `
+        -ReleaseCommit $ReleaseCommit `
+        -Tag $Tag `
+        -Branch $Branch `
+        -VersionCommitCreated $VersionCommitCreated `
+        -BranchPublished $BranchPublished
 
     throw $OriginalError
 }

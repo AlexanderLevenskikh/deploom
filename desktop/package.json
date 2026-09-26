@@ -62,7 +62,11 @@
     "check:ui-lifecycle": "node scripts/check-ui-lifecycle.mjs",
     "check:acceptance-policy": "node scripts/check-acceptance-policy.mjs",
     "check:progressive-contract": "node scripts/check-progressive-contract.mjs",
-    "check:human-flow": "node scripts/check-human-flow.mjs"
+    "check:human-flow": "node scripts/check-human-flow.mjs",
+    "check:target-precedence": "node scripts/check-target-precedence.mjs",
+    "check:baseline-worker-retire": "node scripts/check-baseline-worker-retire.mjs",
+    "check:run-slot-isolation": "node scripts/check-run-slot-isolation.mjs",
+    "check:artifact-token": "node scripts/check-artifact-token.mjs"
   },
   "dependencies": {
     "electron-updater": "^6.8.9",

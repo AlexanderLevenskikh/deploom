@@ -588,7 +588,11 @@ class PeerCompatibilitySolverTests(unittest.TestCase):
         root = Path(roadmap.__file__).parent
         release = (root / "push-branch-and-tag.ps1").read_text(encoding="utf-8-sig")
         self.assertIn("$BranchPublished = $true", release)
-        self.assertIn("if ($VersionCommitCreated -and -not $BranchPublished)", release)
+        # A10: rollback lives in Invoke-SafeReleaseRollback and refuses to run
+        # once the branch was published (history must never be rewritten); the
+        # error handler delegates to it instead of resetting inline.
+        self.assertIn("if (-not $VersionCommitCreated -or $BranchPublished) {", release)
+        self.assertIn("Invoke-SafeReleaseRollback", release)
         self.assertLess(release.index("git push -u $Remote $Branch"), release.index("$BranchPublished = $true"))
         self.assertLess(release.index("$BranchPublished = $true"), release.index("git push $Remote \"refs/tags/$Tag\""))
 

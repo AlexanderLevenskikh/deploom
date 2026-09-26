@@ -68,7 +68,13 @@ class ProjectIsolationRegressionTests(unittest.TestCase):
             main,
         )
         self.assertIn(
-            "projectRunConflicts(existing, workspace, project, input.action)",
+            "projectRunConflicts(existing, workspace, project, action)",
+            main,
+        )
+        # A06: the run-action handler reserves the project slot synchronously,
+        # before any await can race a second launch of the same project.
+        self.assertIn(
+            "reserveProjectActionSlot(workspace, project, input.action)",
             main,
         )
         self.assertIn(

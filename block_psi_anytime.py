@@ -274,7 +274,15 @@ class BaselineAnytimeState:
             self.repeated_predicate = str(value.get("repeatedPredicate") or "")
             self.candidate_duration_ewma_seconds = max(0.0, float(value.get("observedCandidateDurationSeconds") or 0))
             self.search_strategy = str(value.get("searchStrategy") or self.search_strategy)
-            self.exhaustive_authorized = bool(value.get("exhaustiveAuthorized", False))
+            # A09: restore() rebuilds evidence and counters from the checkpoint;
+            # the CURRENT explicit user authorization is NOT part of that. A
+            # fresh state already granted EXHAUSTIVE (search_mode == EXHAUSTIVE
+            # in __post_init__) must keep that grant -- the old checkpoint flag
+            # cannot revoke a newer explicit choice. The checkpoint only ADDS
+            # BACK consent a resumed run previously carried, so a bounded resume
+            # over an exhaustive checkpoint still goes deep.
+            if not self.exhaustive_authorized:
+                self.exhaustive_authorized = bool(value.get("exhaustiveAuthorized", False))
             desired = value.get("desiredAssignment")
             if isinstance(desired, Mapping):
                 self.desired_assignment = {str(k): str(v) for k, v in desired.items()}

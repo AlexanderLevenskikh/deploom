@@ -28,10 +28,23 @@ export type AcceptanceVerdict = {
   high?: number
   moderate?: number
   low?: number
+  // A02: unrated/unknown-severity vulnerable package names. Present and >0
+  // means absence of Critical/High is NOT proven, so acceptance is impossible.
+  unknown?: number
   criticalPackages: string[]
   highPackages: string[]
   moderatePackages?: string[]
   lowPackages?: string[]
+  unknownPackages: string[]
+  // A11: finding-level (advisory) counts are diagnostic, NOT the gate unit.
+  // The gate unit is vulnerable package names (policy.maxKnown*); these remain
+  // visible so a package with multiple findings is never confused with a
+  // single-finding package.
+  criticalFindings?: number
+  highFindings?: number
+  moderateFindings?: number
+  lowFindings?: number
+  unknownFindings?: number
   auditGeneratedAt?: string
   auditEngine?: string
   lagOkPct?: number
@@ -87,13 +100,6 @@ function optionalBoundedCount(value: unknown): number | undefined {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return undefined
   return Math.max(0, Math.min(99, Math.trunc(parsed)))
-}
-
-function optionalBoundedLagPct(value: unknown): number | undefined {
-  if (value === undefined || value === null) return undefined
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed)) return undefined
-  return Math.max(0, Math.min(100, Math.trunc(parsed)))
 }
 
 export function normalizeAcceptancePolicy(value: unknown): AcceptancePolicy {
@@ -176,6 +182,16 @@ export function acceptanceVerdictFromManualAudit(
   const high = count(packageTotals.high)
   const moderate = count(packageTotals.moderate)
   const low = count(packageTotals.low)
+  const unknown = count(packageTotals.unknown)
+  // A11: finding-level (advisory) totals stay diagnostic while the gate counts
+  // vulnerable package names. packageTotals = affected package names;
+  // advisoryTotals = unique advisory findings (a package may carry several).
+  const advisoryTotals = audit.advisoryTotals && typeof audit.advisoryTotals === 'object' ? audit.advisoryTotals as Record<string, unknown> : {}
+  const criticalFindings = count(advisoryTotals.critical)
+  const highFindings = count(advisoryTotals.high)
+  const moderateFindings = count(advisoryTotals.moderate)
+  const lowFindings = count(advisoryTotals.low)
+  const unknownFindings = count(advisoryTotals.unknown)
   // F1: the lag-policy compliance share is a mandatory acceptance criterion.
   // When the audit payload does not carry it (lagOkPct/compliancePct), the
   // report simply cannot prove the freshness goal, so no score is fabricated
@@ -191,7 +207,7 @@ export function acceptanceVerdictFromManualAudit(
   const auditAuthorityStrong = auditComplete && authoritativeAuditEvidence(audit)
   const packageDetails = audit.packageDetails && typeof audit.packageDetails === 'object' ? audit.packageDetails as Record<string, unknown> : {}
   const packages = audit.packages && typeof audit.packages === 'object' ? audit.packages as Record<string, unknown> : {}
-  const severityPackages = (severity: 'critical' | 'high' | 'moderate' | 'low'): string[] => {
+  const severityPackages = (severity: 'critical' | 'high' | 'moderate' | 'low' | 'unknown'): string[] => {
     const fromDetails = Object.entries(packageDetails).flatMap(([name, raw]) => {
       if (!raw || typeof raw !== 'object') return []
       return String((raw as Record<string, unknown>).severity ?? '').toLowerCase() === severity ? [name] : []
@@ -206,6 +222,11 @@ export function acceptanceVerdictFromManualAudit(
   const highPackages = severityPackages('high')
   const moderatePackages = severityPackages('moderate')
   const lowPackages = severityPackages('low')
+  const unknownPackages = severityPackages('unknown')
+  // A02: the producer counts unrated advisory records in packageTotals.unknown
+  // and marks such packages with severity 'unknown'. When the total is absent
+  // but unrated packages are enumerated, their count still proves presence.
+  const effectiveUnknown = unknown !== undefined ? unknown : unknownPackages.length
   const dependencyEvidenceFresh = Boolean(reportInputHash && currentDependencyInputHash && reportInputHash === currentDependencyInputHash)
   const auditGeneratedAt = typeof report.generatedAt === 'string' ? report.generatedAt.trim() : ''
   const auditGeneratedAtMs = auditGeneratedAt ? Date.parse(auditGeneratedAt) : Number.NaN
@@ -217,42 +238,46 @@ export function acceptanceVerdictFromManualAudit(
   // produced under (same dependency inputs via hash AND same target/lag/High
   // limits). Without a matching policy snapshot the lag+security evidence
   // cannot vouch for the current goal, even when it is fresh and complete.
+  // A13: the snapshot is validated STRICTLY (types, ranges, enums) before any
+  // comparison. An invalid value is never silently parsed into "absent" and
+  // replaced by current defaults -- malformed evidence fails closed.
   const reportPolicy = report.policy && typeof report.policy === 'object' ? report.policy as Record<string, unknown> : undefined
   const policyMismatch: string[] = []
-  if (reportPolicy) {
-    const reportTarget = reportPolicy.targetLevel === 'green' ? 'green' : 'yellow'
-    if (reportTarget !== (policy.targetLevel ?? 'yellow')) policyMismatch.push(`targetLevel=${reportTarget}`)
-    const reportLag = optionalBoundedLagPct(reportPolicy.minLagOkPct)
-    if (reportLag !== undefined && reportLag !== (policy.minLagOkPct ?? 80)) policyMismatch.push(`minLagOkPct=${reportLag}`)
-    const reportHigh = optionalBoundedCount(reportPolicy.maxKnownHigh)
-    if (reportHigh !== undefined && reportHigh !== policy.maxKnownHigh) policyMismatch.push(`maxKnownHigh=${reportHigh}`)
-    const reportModerate = optionalBoundedCount(reportPolicy.maxKnownModerate)
-    if (reportModerate !== undefined && reportModerate !== policy.maxKnownModerate) policyMismatch.push(`maxKnownModerate=${reportModerate}`)
-    const reportLow = optionalBoundedCount(reportPolicy.maxKnownLow)
-    if (reportLow !== undefined && reportLow !== policy.maxKnownLow) policyMismatch.push(`maxKnownLow=${reportLow}`)
-    const reportLagMonths = reportPolicy.lagPolicyMonths
-    const currentLagMonths = policy.lagPolicyMonths ?? 12
-    if (reportLagMonths !== undefined && reportLagMonths !== currentLagMonths) policyMismatch.push(`lagPolicyMonths=${reportLagMonths}`)
-  }
-
-  // G2: the report's policy snapshot must carry the COMPLETE goal schema the
-  // run was accepted under -- target level, lag gate, lag window and the
-  // numeric C/H limits. A snapshot that only says { targetLevel: 'yellow' }
-  // cannot prove the evidence was produced under this goal, so it fails
-  // closed as UNKNOWN instead of being treated as "the policy present".
   const policySchemaGaps: string[] = []
+  // Returns the parsed number, or undefined when absent/invalid. A gap is
+  // recorded for REQUIRED fields so the verdict fails closed instead of
+  // comparing nothing; optional fields (moderate/low limits) are only
+  // validated when the current goal policy actually demands a numeric limit.
+  const strictBounded = (field: string, min: number, max: number, label: string, required: boolean): number | undefined => {
+    const raw = reportPolicy![field]
+    if (raw === undefined || raw === null || raw === '') { if (required) policySchemaGaps.push(label); return undefined }
+    const parsed = Number(raw)
+    if (!Number.isFinite(parsed) || parsed < min || parsed > max) { policySchemaGaps.push(`invalid ${label}`); return undefined }
+    return Math.trunc(parsed)
+  }
   if (reportPolicy) {
-    const mandatoryFields: Array<[keyof Record<string, unknown>, string]> = [
-      ['targetLevel', 'targetLevel'],
-      ['minLagOkPct', 'minLagOkPct'],
-      ['lagPolicyMonths', 'lagPolicyMonths'],
-      ['maxKnownCritical', 'maxKnownCritical'],
-      ['maxKnownHigh', 'maxKnownHigh'],
-    ]
-    for (const [field, label] of mandatoryFields) {
-      const rawField = reportPolicy[field as string]
-      if (rawField === undefined || rawField === null || rawField === '') policySchemaGaps.push(label)
+    const reportTarget = reportPolicy.targetLevel
+    if (reportTarget !== 'green' && reportTarget !== 'yellow') {
+      policySchemaGaps.push(reportTarget === undefined || reportTarget === null || reportTarget === '' ? 'targetLevel' : 'invalid targetLevel')
+    } else {
+      if (reportTarget !== (policy.targetLevel ?? 'yellow')) policyMismatch.push(`targetLevel=${reportTarget}`)
     }
+    const reportLag = strictBounded('minLagOkPct', 0, 100, 'minLagOkPct', true)
+    if (reportLag !== undefined && reportLag !== (policy.minLagOkPct ?? 80)) policyMismatch.push(`minLagOkPct=${reportLag}`)
+    const reportLagMonths = strictBounded('lagPolicyMonths', 3, 12, 'lagPolicyMonths', true)
+    if (reportLagMonths !== undefined && ![3, 6, 9, 12].includes(reportLagMonths)) policySchemaGaps.push('invalid lagPolicyMonths')
+    else if (reportLagMonths !== undefined && reportLagMonths !== (policy.lagPolicyMonths ?? 12)) policyMismatch.push(`lagPolicyMonths=${reportLagMonths}`)
+    // A13: maxKnownCritical must be a valid bounded number AND equal the
+    // enforced 0 — the Critical tolerance is a product invariant, never
+    // "present but different".
+    const reportCritical = strictBounded('maxKnownCritical', 0, 99, 'maxKnownCritical', true)
+    if (reportCritical !== undefined && reportCritical !== policy.maxKnownCritical) policyMismatch.push(`maxKnownCritical=${reportCritical}`)
+    const reportHigh = strictBounded('maxKnownHigh', 0, 99, 'maxKnownHigh', true)
+    if (reportHigh !== undefined && reportHigh !== policy.maxKnownHigh) policyMismatch.push(`maxKnownHigh=${reportHigh}`)
+    const reportModerate = strictBounded('maxKnownModerate', 0, 99, 'maxKnownModerate', policy.maxKnownModerate !== undefined)
+    if (reportModerate !== undefined && reportModerate !== policy.maxKnownModerate) policyMismatch.push(`maxKnownModerate=${reportModerate}`)
+    const reportLow = strictBounded('maxKnownLow', 0, 99, 'maxKnownLow', policy.maxKnownLow !== undefined)
+    if (reportLow !== undefined && reportLow !== policy.maxKnownLow) policyMismatch.push(`maxKnownLow=${reportLow}`)
   }
 
   // Missing or weak evidence -> UNKNOWN (fail closed, nothing fabricated).
@@ -260,6 +285,11 @@ export function acceptanceVerdictFromManualAudit(
   if (!auditComplete) unverifiable.push('Vulnerability audit evidence is incomplete.')
   else if (!auditAuthorityStrong) unverifiable.push('Vulnerability audit graph is not authoritative for release acceptance.')
   if (critical === undefined || high === undefined) unverifiable.push('Vulnerable-package Critical/High totals are unknown.')
+  // A02: unrated/unknown-severity advisories make "no Critical/High" unproven.
+  // A missing unknown total is a missing count, not a proven zero; both fail
+  // closed. A proven U=0 report still accepts.
+  if (unknown === undefined && unknownPackages.length === 0) unverifiable.push('Unknown-severity (unrated) vulnerability total is missing from the audit report.')
+  else if (effectiveUnknown > 0) unverifiable.push(`Unrated/unknown-severity vulnerabilities present (${effectiveUnknown}): absence of Critical/High is not proven.`)
   if (!reportInputHash) unverifiable.push('Audit report is not bound to dependencyInputHash.')
   else if (!dependencyEvidenceFresh) unverifiable.push('package.json/lockfile inputs changed after the audit.')
   if (!auditGeneratedAt) unverifiable.push('Audit report generatedAt is missing.')
@@ -278,8 +308,13 @@ export function acceptanceVerdictFromManualAudit(
       status: 'UNKNOWN', accepted: false, evidenceComplete: false, dependencyEvidenceFresh,
       ...(critical !== undefined ? { critical } : {}), ...(high !== undefined ? { high } : {}),
       ...(moderate !== undefined ? { moderate } : {}), ...(low !== undefined ? { low } : {}),
+      ...(effectiveUnknown > 0 ? { unknown: effectiveUnknown } : {}),
       criticalPackages, highPackages,
       ...(moderatePackages.length ? { moderatePackages } : {}), ...(lowPackages.length ? { lowPackages } : {}),
+      unknownPackages,
+      ...(criticalFindings !== undefined ? { criticalFindings } : {}), ...(highFindings !== undefined ? { highFindings } : {}),
+      ...(moderateFindings !== undefined ? { moderateFindings } : {}), ...(lowFindings !== undefined ? { lowFindings } : {}),
+      ...(unknownFindings !== undefined ? { unknownFindings } : {}),
       ...(auditGeneratedAt ? { auditGeneratedAt } : {}),
       ...(typeof audit.engine === 'string' ? { auditEngine: audit.engine } : {}),
       ...(auditLagOkPct !== undefined ? { lagOkPct: auditLagOkPct } : {}),
@@ -312,6 +347,10 @@ export function acceptanceVerdictFromManualAudit(
       ...(moderate !== undefined ? { moderate } : {}), ...(low !== undefined ? { low } : {}),
       criticalPackages, highPackages,
       ...(moderatePackages.length ? { moderatePackages } : {}), ...(lowPackages.length ? { lowPackages } : {}),
+      unknownPackages,
+      ...(criticalFindings !== undefined ? { criticalFindings } : {}), ...(highFindings !== undefined ? { highFindings } : {}),
+      ...(moderateFindings !== undefined ? { moderateFindings } : {}), ...(lowFindings !== undefined ? { lowFindings } : {}),
+      ...(unknownFindings !== undefined ? { unknownFindings } : {}),
       ...(auditGeneratedAt ? { auditGeneratedAt } : {}),
       ...(typeof audit.engine === 'string' ? { auditEngine: audit.engine } : {}),
       ...(auditLagOkPct !== undefined ? { lagOkPct: auditLagOkPct } : {}),
@@ -325,6 +364,10 @@ export function acceptanceVerdictFromManualAudit(
     ...(moderate !== undefined ? { moderate } : {}), ...(low !== undefined ? { low } : {}),
     criticalPackages, highPackages,
     ...(moderatePackages.length ? { moderatePackages } : {}), ...(lowPackages.length ? { lowPackages } : {}),
+    unknownPackages,
+    ...(criticalFindings !== undefined ? { criticalFindings } : {}), ...(highFindings !== undefined ? { highFindings } : {}),
+    ...(moderateFindings !== undefined ? { moderateFindings } : {}), ...(lowFindings !== undefined ? { lowFindings } : {}),
+    ...(unknownFindings !== undefined ? { unknownFindings } : {}),
     ...(auditGeneratedAt ? { auditGeneratedAt } : {}),
     ...(typeof audit.engine === 'string' ? { auditEngine: audit.engine } : {}),
     ...(auditLagOkPct !== undefined ? { lagOkPct: auditLagOkPct } : {}),

@@ -47,9 +47,27 @@ for (const sentinel of [
   "text('Открыть артефакты', 'Open artifacts')",
   'releaseBlocked',
   "ACTION_ORDER.filter((action) => action !== 'push-workspace')",
-  'acceptancePolicy: loaded.intent.acceptancePolicy ?? fresh.acceptancePolicy',
+  // A01: a new Baseline (prepare) preserves the WHOLE loaded intent - target
+  // level, lag %, lag window, productMode, control/budget, M/L caps and
+  // acceptancePolicy all stay as saved; only run-scoped fields (policies,
+  // deferred cohorts, cohort action, auto-open prompt) restart from a clean
+  // slate. The old code rebuilt prepare from freshBaselineIntent() and
+  // re-carried just four fields, silently resetting every product-level
+  // preference to a default on every "Start a new search".
+  "mode === 'prepare' ? { ...loaded, intent: {",
+  '...loaded.intent,',
+  'policies: {},',
+  'deferredCohorts: [],',
+  'cohortAction: undefined,',
+  'autoOpenPrompt: undefined,',
 ]) has(flow, sentinel, 'Flow acceptance UX')
-for (const forbidden of ['setTarget(', 'target-field', 'goalMissed', 'bestEffortReleaseEligible', 'goalBlocked', 'targetReached']) lacks(flow, forbidden, 'old target UX')
+for (const forbidden of [
+  'setTarget(', 'target-field', 'goalMissed', 'bestEffortReleaseEligible', 'goalBlocked', 'targetReached',
+  // A01: prepare must never fall back to the fresh default acceptance policy
+  // or other product-level preferences (the old loaded.??.fresh reset).
+  'acceptancePolicy: loaded.intent.acceptancePolicy ?? fresh.acceptancePolicy',
+  '...fresh,',
+]) lacks(flow, forbidden, 'A01 preference reset / old target UX')
 
 lacks(dialog, 'preferredFreshnessPct', 'unimplemented freshness target must not be exposed')
 has(dialog, "text('Бюджет Baseline / планирования', 'Baseline / planning budget')", 'honest planning budget')

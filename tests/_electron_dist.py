@@ -6,11 +6,19 @@ Electron modules (desktop/dist-electron/*.js). `dist-electron` is gitignored,
 so on a fresh checkout (or a CI job that did not build the desktop) the
 modules must be compiled once before probes/verdicts can run. This helper
 makes every dependent module self-sufficient: build when missing or stale,
-and SkipTest honestly when the Node/TypeScript toolchain is unavailable
-(instead of hard-failing the whole suite in an environment without Node).
+and SkipTest honestly when the Node/TypeScript toolchain is unavailable.
+
+A12: the helper must distinguish an ABSENT toolchain (an honest skip: no
+node/npx on PATH, or typescript is not installed) from a REAL compile error
+(tsc ran and emitted "error TS..." diagnostics -- that is a failing build and
+must hard-fail, never silently skip). A tsc run that reports success but
+produces no output asset is also a hard failure. Release CI therefore builds
+explicitly (npm ci + npx tsc) before running the Python suites, and cannot
+mask a broken TypeScript consumer as a skip.
 """
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import unittest
@@ -31,8 +39,13 @@ ASSETS = (
 
 
 def tsc_command() -> list[str]:
-    """Cross-platform tsc invocation: npx.cmd on Windows, npx elsewhere."""
-    return [shutil.which("npx.cmd") or "npx", "tsc", "-p", "tsconfig.electron.json"]
+    """Cross-platform tsc invocation: npx.cmd on Windows, npx elsewhere.
+
+    --no-install keeps the build deterministic: npx must use the project's
+    installed typescript instead of silently fetching one from the registry
+    (which would make CI and local runs diverge).
+    """
+    return [shutil.which("npx.cmd") or "npx", "--no-install", "tsc", "-p", "tsconfig.electron.json"]
 
 
 def _needs_build() -> bool:
@@ -51,23 +64,56 @@ def _needs_build() -> bool:
     return False
 
 
-def ensure_dist_electron() -> None:
-    """Compile desktop/dist-electron when missing/stale; SkipTest if unavailable."""
-    if not _needs_build():
-        return
-    finished = subprocess.run(
+def _toolchain_present() -> bool:
+    return bool(shutil.which("npx.cmd") or shutil.which("npx") or shutil.which("node"))
+
+
+def _run_tsc() -> subprocess.CompletedProcess:
+    return subprocess.run(
         tsc_command(),
         cwd=str(ROOT / "desktop"),
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
         timeout=180,
     )
-    if finished.returncode != 0:
+
+
+def ensure_dist_electron() -> None:
+    """Compile desktop/dist-electron when missing/stale.
+
+    Skips only when the toolchain is genuinely unavailable. A compile error
+    or a successful build that produced no asset is a failure.
+    """
+    if not _needs_build():
+        return
+    if not _toolchain_present():
         raise unittest.SkipTest(
-            f"tsc electron unavailable (dist-electron missing and build failed): "
-            f"{finished.stderr[-500:]}"
+            "tsc electron unavailable: no Node/npx on PATH and dist-electron is missing"
         )
-    missing = [asset for asset in ASSETS if not (DIST_DIR / asset).is_file()]
-    if missing:
-        raise unittest.SkipTest(f"tsc electron produced no output asset: {missing}")
+    try:
+        finished = _run_tsc()
+    except FileNotFoundError:
+        raise unittest.SkipTest(
+            "tsc electron unavailable: npx not found and dist-electron is missing"
+        ) from None
+
+    if finished.returncode == 0:
+        missing = [asset for asset in ASSETS if not (DIST_DIR / asset).is_file()]
+        if missing:
+            raise AssertionError(
+                f"tsc electron reported success but produced no output asset: {missing}"
+            )
+        return
+
+    stderr = finished.stderr or ""
+    if re.search(r"error TS\d+", stderr):
+        raise AssertionError(
+            "tsc electron compile error (dist-electron missing and build failed):\n"
+            f"{stderr[-2000:]}"
+        )
+    raise unittest.SkipTest(
+        f"tsc electron unavailable (dist-electron missing and build failed without TS diagnostics): "
+        f"{stderr[-500:]}"
+    )

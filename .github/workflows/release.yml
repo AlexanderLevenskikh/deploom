@@ -45,36 +45,37 @@ jobs:
       - name: Check public source sanitization
         run: python scripts/check-public-sanitization.py
 
+      # A12: the toolchain and the TypeScript build come FIRST, before the
+      # Python suites. The suites contain cross-language tests that load the
+      # compiled Electron modules (desktop/dist-electron); building explicitly
+      # here means a compile error fails the job instead of becoming a
+      # SkipTest, and the suites run against the real artifact of THIS exact
+      # release commit.
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Lint and build desktop
+        working-directory: desktop
+        run: |
+          npm run lint
+          npm run build
+
+      - name: Build Electron reader modules
+        working-directory: desktop
+        run: npx tsc -p tsconfig.electron.json
+
+      - name: Run all desktop contract checks
+        working-directory: desktop
+        run: node scripts/run-all-contract-checks.mjs
+
       - name: Install and test Python tool
         run: |
           python -m pip install -r requirements.txt
           python -m pip install -r requirements-solver.txt
           python dependency_live_roadmap_generator.py --help >/dev/null
+          python run_tool_tests.py --suite production-fast
           python run_tool_tests.py --suite all
-
-      - name: Install desktop dependencies
-        working-directory: desktop
-        run: npm ci
-
-      - name: Build and run desktop contracts
-        working-directory: desktop
-        run: |
-          npm run lint
-          npm run build
-          npm run check:cross-platform
-          npm run check:updater-runtime
-          npm run check:updater-schedule
-          npm run check:updater-error
-          npm run check:public-update-target
-          npm run check:process-launcher
-          npm run check:migration-progress
-          npm run check:deterministic-planner
-          npm run check:parallel-groups
-          npm run check:autopilot
-          npm run check:flow-recovery
-          npm run check:executor-context
-          npm run check:materialization-proof
-          npm run check:workspace-bootstrap
 
       - name: Validate release workflow/assets contract
         run: |

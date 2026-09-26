@@ -42,7 +42,12 @@ class DesktopReleaseAndProjectConcurrencyRegression(unittest.TestCase):
         self.assertIn("existing.projectName === project.name", text)
         self.assertIn("WORKSPACE_GLOBAL_ACTIONS.has(existing.action)", text)
         self.assertIn("PROJECT_BACKGROUND_ACTIONS.has(existing.action)", text)
-        self.assertIn("projectRunConflicts(existing, workspace, project, 'recover')", text)
+        # A06: the recover action reserves a project slot synchronously through
+        # the same function as every other run action, so the canonical-repo
+        # and workspace conflict rules cannot be bypassed while the recover
+        # job first awaits its async setup.
+        self.assertIn("reserveProjectActionSlot(workspace, project, 'recover')", text)
+        self.assertIn("projectRunConflicts(existing, workspace, project, action)", text)
 
 
 if __name__ == "__main__":

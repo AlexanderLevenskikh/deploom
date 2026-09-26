@@ -72,4 +72,28 @@ if (legacyFast.controlMode !== 'CONFIRM_SIGNIFICANT') throw new Error('legacy FA
 const missingLegacyMode = normalizer.normalizeBaselineIntentPlan({ candidates: [], intent: { schemaVersion: 2, policies: {} } }).intent
 if (missingLegacyMode.controlMode !== 'AUTONOMOUS') throw new Error('missing intent mode must default to AUTONOMOUS')
 
+// A01: reopening a saved run must preserve the user's goal and policy instead
+// of silently resetting them to defaults. Losing productMode/target/lag window
+// or the M/L caps changed the decision-dialog fingerprint, so a plain Continue
+// was rendered as a Restart with a fresh default intent.
+const savedRun = {
+  schemaVersion: 2, policies: {},
+  productMode: 'fast', targetLevel: 'green', minLagOkPct: 100, lagPolicyMonths: 3,
+  acceptancePolicy: { maxKnownCritical: 0, maxKnownHigh: 0, targetLevel: 'green', minLagOkPct: 100, lagPolicyMonths: 3, maxKnownModerate: 0, maxKnownLow: 0 },
+}
+const roundTrip = normalizer.normalizeBaselineIntentPlan({ candidates: [], intent: savedRun }).intent
+if (roundTrip.productMode !== 'fast') throw new Error('A01: productMode must survive baseline-intent normalization')
+if (roundTrip.targetLevel !== 'green') throw new Error('A01: targetLevel must survive baseline-intent normalization')
+if (roundTrip.minLagOkPct !== 100) throw new Error('A01: minLagOkPct must survive baseline-intent normalization')
+if (roundTrip.lagPolicyMonths !== 3) throw new Error('A01: lagPolicyMonths must survive baseline-intent normalization')
+if (roundTrip.acceptancePolicy.lagPolicyMonths !== 3) throw new Error('A01: acceptancePolicy.lagPolicyMonths must survive normalization')
+if (roundTrip.acceptancePolicy.maxKnownModerate !== 0) throw new Error('A01: acceptancePolicy.maxKnownModerate must survive normalization')
+if (roundTrip.acceptancePolicy.maxKnownLow !== 0) throw new Error('A01: acceptancePolicy.maxKnownLow must survive normalization')
+// A legacy intent with the goal only inside acceptancePolicy must still
+// migrate: top-level mirrors fall back to the canonical policy values.
+const legacyNestedOnly = normalizer.normalizeBaselineIntentPlan({
+  candidates: [], intent: { schemaVersion: 1, executionMode: 'FAST', policies: {}, acceptancePolicy: { maxKnownCritical: 0, maxKnownHigh: 1, targetLevel: 'green', minLagOkPct: 90, lagPolicyMonths: 6 } },
+}).intent
+if (legacyNestedOnly.targetLevel !== 'green' || legacyNestedOnly.minLagOkPct !== 90 || legacyNestedOnly.acceptancePolicy.lagPolicyMonths !== 6) throw new Error('A01: legacy nested-only goal must migrate to top-level mirrors')
+
 console.log('Baseline progressive intent contract OK')

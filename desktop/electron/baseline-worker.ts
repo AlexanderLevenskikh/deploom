@@ -227,13 +227,41 @@ export class BaselineWorkerPool {
       // worker and run the request there. If retirement itself never completes,
       // fail with a distinct error and let the caller preserve the original
       // command failure as the diagnosis.
+      // A05: the handle handed back must be the process that ACTUALLY executes
+      // this request. The retiring worker is not it (a fresh one will be), so
+      // returning the retiring child made cancel/timeout kill a dead process
+      // while the fresh worker kept running the command -- with mutations.
+      // Expose a proxy whose pid() tracks the live process and whose kill()
+      // applies to the retiree now and to the fresh worker the moment it
+      // starts; a kill before the fresh worker spawns also prevents it from
+      // starting at all.
       const retiringRecord = record
+      let currentChild: ChildProcessWithoutNullStreams | undefined
+      let cancelled = false
+      const killActive = () => {
+        cancelled = true
+        try { retiringRecord.child.kill('SIGKILL') } catch { /* already gone */ }
+        if (currentChild) {
+          try { currentChild.kill('SIGKILL') } catch { /* already gone */ }
+        }
+      }
       const result = new Promise<BaselineWorkerResult>((resolve, reject) => {
         let retirementTimer: ReturnType<typeof setTimeout> | undefined
         const continueOnFreshWorker = () => {
           if (retirementTimer) clearTimeout(retirementTimer)
           if (this.records.get(key) === retiringRecord) this.records.delete(key)
-          resolve(this.run(key, request).result)
+          if (cancelled) {
+            reject(new Error('BASELINE_WORKER_CANCELLED'))
+            return
+          }
+          const spawned = this.run(key, request)
+          currentChild = spawned.child
+          if (cancelled) {
+            try { spawned.child.kill('SIGKILL') } catch { /* already gone */ }
+            reject(new Error('BASELINE_WORKER_CANCELLED'))
+            return
+          }
+          spawned.result.then(resolve, reject)
         }
         if (retiringRecord.closed) {
           continueOnFreshWorker()
@@ -245,7 +273,16 @@ export class BaselineWorkerPool {
           reject(new Error('BASELINE_WORKER_RETIRE_AWAIT_TIMEOUT'))
         }, this.retireAwaitTimeoutMs)
       })
-      return { child: retiringRecord.child, result }
+      const childProxy = new Proxy(retiringRecord.child, {
+        get(target, property, receiver) {
+          if (property === 'pid') return currentChild?.pid ?? target.pid
+          if (property === 'killed') return cancelled || target.killed
+          if (property === 'kill') return (_signal?: NodeJS.Signals | number) => killActive()
+          const value = Reflect.get(target, property, receiver)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      }) as ChildProcessWithoutNullStreams
+      return { child: childProxy, result }
     }
     if (!record || record.closed || record.child.killed) {
       record = this.start(key, request.cwd)

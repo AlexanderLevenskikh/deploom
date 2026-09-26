@@ -90,12 +90,34 @@ class B1FastGateExactVersionAlwaysTests(unittest.TestCase):
                          "no evidence for the exact chosen version is unknown, not safe")
 
     def test_b1_growth_inside_current_allowance_is_checked(self) -> None:
-        # Current H:1, policy allows High<=1, but the candidate grows the
-        # finding to H:2 on 2.0.0. The old skip-by-current-aggregate missed it.
-        rows = [_row("a", vulns="C:0;H:1;M:0;L:0", current="1.0.0", min_high="2.0.0",
-                     evidence={"1.0.0": "C:0;H:1", "2.0.0": "C:0;H:2"})]
-        self.assertFalse(_gate(rows, {"a": "2.0.0"}, policy={"maxKnownHigh": 1}),
-                         "candidate growth H:1 -> H:2 exceeds the allowed limit -> must not satisfy")
+        # A11: the Fast gate counts PACKAGES per severity, matching the
+        # acceptance reader and the renderer. Two distinct packages with a High
+        # finding exceed a limit of 1 package even when every current version is
+        # H:0 - the candidate INTRODUCES the second High package.
+        rows = [
+            _row("a", vulns="C:0;H:0;M:0;L:0", current="1.0.0", min_high="2.0.0",
+                 evidence={"1.0.0": "0", "2.0.0": "C:0;H:1"}),
+            _row("b", vulns="C:0;H:0;M:0;L:0", current="1.0.0", min_high="2.0.0",
+                 evidence={"1.0.0": "0", "2.0.0": "C:0;H:1"}),
+        ]
+        # Only `a` moves to a High version: now exactly 1 High package -> OK.
+        self.assertTrue(_gate(rows, {"a": "2.0.0"}, policy={"maxKnownHigh": 1}),
+                         "exactly one High package within the package-name limit -> must satisfy (A11 unit)")
+        # Both move: 2 High packages exceed the 1-package limit.
+        self.assertFalse(_gate(rows, {"a": "2.0.0", "b": "2.0.0"}, policy={"maxKnownHigh": 1}),
+                         "second High package introduced by the candidate must not satisfy")
+
+    def test_b1_multiple_findings_in_one_package_count_as_one_package(self) -> None:
+        # A11: one package with High:2 still counts as ONE High package, so it
+        # stays within a limit of 1 - the acceptance reader (package names) and
+        # the renderer count the same unit, and Fast must not be stricter than
+        # the final acceptance verdict it feeds.
+        rows = [_row("a", vulns="C:0;H:0;M:0;L:0", current="1.0.0", min_high="2.0.0",
+                     evidence={"1.0.0": "0", "2.0.0": "C:0;H:2"})]
+        self.assertTrue(_gate(rows, {"a": "2.0.0"}, policy={"maxKnownHigh": 1}),
+                         "a single package with two findings equals one High package within the limit")
+        self.assertFalse(_gate(rows, {"a": "2.0.0"}, policy={"maxKnownHigh": 0}),
+                         "one High package still exceeds a zero-package tolerance")
 
     def test_b1_clean_to_clean_candidate_still_satisfies(self) -> None:
         # Positive control: 0 -> 0 under a zero-tolerance policy stays green.
