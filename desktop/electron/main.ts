@@ -5,7 +5,7 @@ import { baselineFailureMessage } from './baseline-failure.js'
 import { draftArtifactsRoot, draftManifestPath, draftReadFailureText, draftResultStaleness, readDraftResultArtifact, type DraftResultArtifact as ParsedDraftResultArtifact, type DraftReadResult } from './draft-artifact-reader.js'
 import { BASELINE_DECISION_MARKER, extractBaselineDecisionEnvelope } from './migration-baseline-decision.js'
 import { buildDependencyGraphSnapshot } from './dependency-graph.js'
-import { BaselineWorkerPool } from './baseline-worker.js'
+import { BaselineWorkerPool, WORKER_CANCEL } from './baseline-worker.js'
 const { autoUpdater } = updaterPackage
 import { buildClaudeAgentArgs, buildClaudeResumeArgs, buildCodexAgentArgs, buildCodexResumeArgs, buildOpenCodeAgentArgs, buildOpenCodeResumeArgs, parseOpencodeModelsOutput } from './agent-command.js'
 import { agentBatchCompletionFingerprint, agentScopeFingerprint, extractAgentSessionId, resumableAgentSessionId } from './agent-session.js'
@@ -52,7 +52,7 @@ import { commandEnvironment, decodeProcessOutputChunk, normalizePathForCompariso
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
 import { createHash, randomUUID } from 'node:crypto'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, type Dirent } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, type Dirent } from 'node:fs'
 import { basename, delimiter, dirname, join, normalize, resolve, isAbsolute, relative, sep } from 'node:path'
 import { createServer as createNetServer } from 'node:net'
 import os from 'node:os'
@@ -409,16 +409,69 @@ const jobs = new Map<string, JobRecord>()
 const PROJECT_BACKGROUND_ACTIONS = new Set<FlowAction>(['preflight', 'baseline'])
 const WORKSPACE_GLOBAL_ACTIONS = new Set<FlowAction>(['sync-tool', 'generate-all', 'commit-state', 'push-workspace'])
 
+// R4: repository identity is the actual GIT WORKTREE ROOT, not the package
+// directory. Two sibling packages in one monorepo (packages/a, packages/b)
+// share one checkout: resolving + normalizing the package paths does NOT
+// detect that, and a junction/symlink alias defeats plain string comparison.
+// Walking UP from the project path to the nearest `.git` marker gives the
+// canonical checkout root; realpath first so aliases resolve to the same
+// identity. A `.git` FILE means a linked worktree/submodule: the checkout
+// root is that directory, but references/objects are shared with the main
+// repository (mainGitDir), so two linked worktrees of one repo still conflict
+// on the shared Git resource.
+function mainGitDirOf(gitDir: string): string {
+  const parts = normalize(gitDir).split(sep)
+  const worktreesIndex = parts.indexOf('worktrees')
+  return worktreesIndex > 0 ? join(...parts.slice(0, worktreesIndex)) : normalize(gitDir)
+}
+
+function gitWorktreeIdentity(projectPath: string): { worktreeRoot: string; mainGitDir: string } | undefined {
+  let resolved = projectPath
+  try {
+    if (!existsSync(resolved)) return undefined
+    resolved = realpathSync(resolved)
+  } catch {
+    return undefined
+  }
+  let current = normalize(resolve(resolved))
+  for (;;) {
+    const parent = dirname(current)
+    if (parent === current) return undefined
+    const marker = join(current, '.git')
+    try {
+      const markerStats = statSync(marker)
+      if (markerStats.isDirectory()) {
+        return { worktreeRoot: normalizePathForComparison(current), mainGitDir: normalizePathForComparison(join(current, '.git')) }
+      }
+      const pointer = readFileSync(marker, 'utf8')
+      const gitDirMatch = /^gitdir:\s*(.+)$/m.exec(pointer)
+      const resolvedGitDir = gitDirMatch ? normalize(resolve(current, gitDirMatch[1].trim())) : marker
+      return { worktreeRoot: normalizePathForComparison(current), mainGitDir: normalizePathForComparison(mainGitDirOf(resolvedGitDir)) }
+    } catch {
+      current = parent
+    }
+  }
+}
+
 function sameRepositoryPath(existing: JobRecord, project: ProjectSpec): boolean {
   // A06: two project aliases of one canonical repository (or nested packages
   // sharing a git checkout, or the same repo added to two workspaces) mutate
   // the same working tree. Only a resolved+normalized absolute path is a
   // trustworthy identity here -- never the display name.
+  // R4: the canonical identity is the shared GIT WORKTREE ROOT (and main git
+  // dir for linked worktrees). Exact string equality of package directories
+  // cannot see a monorepo, and plain normalization cannot see a symlink alias.
   const existingPath = existing.projectPath
     ? normalizePathForComparison(normalize(resolve(existing.projectPath)))
     : ''
   const projectPath = normalizePathForComparison(normalize(resolve(project.path)))
-  return Boolean(existingPath && projectPath) && existingPath === projectPath
+  if (!existingPath || !projectPath) return false
+  if (existingPath === projectPath) return true
+  const existingIdentity = gitWorktreeIdentity(existing.projectPath!)
+  const projectIdentity = gitWorktreeIdentity(project.path)
+  if (!existingIdentity || !projectIdentity) return false
+  return existingIdentity.worktreeRoot === projectIdentity.worktreeRoot
+    || existingIdentity.mainGitDir === projectIdentity.mainGitDir
 }
 
 function projectRunConflicts(existing: JobRecord, workspace: WorkspaceRecord, project: ProjectSpec, action: FlowAction): boolean {
@@ -579,11 +632,48 @@ function projectArtifactToken(projectName: string): string {
   return `${slug}-${digest}`
 }
 
+// R2: the pre-A08 storage identity. Before the artifact-token hashing change
+// (A08) the baseline-intent file was '<slug>.json' (case-preserved slug, no
+// digest) and baseline-project-output was a plain slug directory. An upgrade
+// must keep finding USER DATA saved under those legacy keys -- a settings file
+// is not a regenerable artifact.
+function legacyArtifactSlug(projectName: string): string {
+  return projectName.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'project'
+}
+
+function legacyBaselineIntentPath(workspace: WorkspaceRecord, projectName: string): string {
+  return join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-intent', `${legacyArtifactSlug(projectName)}.json`)
+}
+
 function baselineIntentPath(workspace: WorkspaceRecord, projectName: string): string {
   return join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-intent', `${projectArtifactToken(projectName)}.json`)
 }
 
+// R2: one-time read-time migration of a legacy intent file to the current
+// hashed path. The copy is atomic (temp + rename) and the legacy file is left
+// untouched, so a downgrade still reads it and a second run is a no-op (the
+// hashed path already exists). Only a well-formed JSON object migrates;
+// anything else is left alone and the loader falls back to defaults rather
+// than corrupting user data. Intents are unambiguous per project name: the
+// legacy slug is the only identity the old format carried, and each project
+// computes its own hashed destination, so no other project's current file can
+// be overwritten.
+function migrateLegacyBaselineIntent(workspace: WorkspaceRecord, projectName: string): void {
+  const current = baselineIntentPath(workspace, projectName)
+  if (existsSync(current)) return
+  const legacy = legacyBaselineIntentPath(workspace, projectName)
+  if (!existsSync(legacy)) return
+  try {
+    const raw = JSON.parse(readFileSync(legacy, 'utf8'))
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return
+    atomicWriteJsonSync(current, raw)
+  } catch {
+    /* leave the legacy file untouched; the loader reports defaults instead */
+  }
+}
+
 function loadBaselineIntent(workspace: WorkspaceRecord, projectName: string): BaselineIntent {
+  migrateLegacyBaselineIntent(workspace, projectName)
   try { return normalizeBaselineIntent(JSON.parse(readFileSync(baselineIntentPath(workspace, projectName), 'utf8'))) }
   catch { return normalizeBaselineIntent(undefined) }
 }
@@ -596,6 +686,7 @@ function loadBaselineIntent(workspace: WorkspaceRecord, projectName: string): Ba
 // explicit-flag / v1-migration / non-default-30 migration rules).
 function baselineIntentHasPersistedBudgetMinutes(workspace: WorkspaceRecord, projectName: string): boolean {
   try {
+    migrateLegacyBaselineIntent(workspace, projectName)
     const raw = JSON.parse(readFileSync(baselineIntentPath(workspace, projectName), 'utf8'))
     return normalizeBudgetField(raw).budgetMinutesExplicit
   } catch { return false }
@@ -1031,7 +1122,11 @@ function projectArtifactCachePath(workspace: WorkspaceRecord, projectName: strin
 }
 
 function baselineProjectOutputDir(workspace: WorkspaceRecord, projectName: string): string {
-  return join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-project-output', projectArtifactToken(projectName))
+  const current = join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-project-output', projectArtifactToken(projectName))
+  // R2: a pre-A08 output directory keyed by the plain slug stays visible until
+  // the project records a NEW baseline (which then writes the hashed dir).
+  const legacy = join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-project-output', legacyArtifactSlug(projectName))
+  return existsSync(legacy) && !existsSync(current) ? legacy : current
 }
 
 function snapshotProjectArtifacts(
@@ -1274,6 +1369,15 @@ function captureAgentSession(job: JobRecord, chunk: string): void {
 // Windows process tree). A timeout/cancel must terminate npm/node/test descendants
 // too; otherwise a hidden child can hold pipes, worktrees or package-manager locks.
 function killProcessTree(child: ChildProcessWithoutNullStreams): void {
+  // R3: a baseline-worker run handle advertises a REQUEST-level canceller
+  // under WORKER_CANCEL. It must run BEFORE the OS process tree is stopped:
+  // only the request (not the ChildProcess) can know that this kill is a
+  // user cancellation, and only that knowledge prevents a retiring worker's
+  // close event from starting a brand-new worker after the user asked to
+  // stop. Generic spontaneous children (plain spawns) have no such hook and
+  // are unaffected.
+  const cancelRequest = (child as unknown as { [WORKER_CANCEL]?: () => void })[WORKER_CANCEL]
+  cancelRequest?.()
   const pid = child.pid
   if (!pid) return
   if (process.platform === 'win32') {

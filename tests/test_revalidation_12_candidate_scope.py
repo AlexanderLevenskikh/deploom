@@ -28,6 +28,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -550,6 +551,21 @@ class DraftGoalHonestyTests(unittest.TestCase):
         self.assertEqual(health["postPlanGoal"], "unknown", health)
         self.assertNotEqual(health["postPlanGoal"], "feasible", health)
 
+    def test_r6_draft_counts_unique_package_names_not_findings(self):
+        """R6: the Draft post-plan High projection is measured in unique
+        PACKAGE NAMES. One package whose exact chosen version carries TWO High
+        findings is ONE offender: at maxKnownHigh=1 the goal stays feasible.
+        The old finding-summed counter reported 2 and blocked the plan."""
+        row = self._synthetic_row("dup", current="1.0.0", vulns="C:0;H:2;M:0;L:0",
+                                  evidence={"1.0.9": "C:0;H:2;M:0;L:0"})
+        with mock.patch.dict(os.environ, {"DEPLOOM_ACCEPTANCE_POLICY_JSON": json.dumps(
+            {"targetLevel": "yellow", "minLagOkPct": 80, "maxKnownCritical": 0, "maxKnownHigh": 1}
+        )}):
+            plan = self._plan_for([row])
+        health = plan["proposals"][0]["health"]
+        self.assertEqual(1, health["postPlanHigh"], health)
+        self.assertEqual("feasible", health["postPlanGoal"], health)
+
     def test_policy_gate_counts_are_split_into_policy_and_reserve_shortfalls(self):
         """F1: when projected lag-OK sits between the policy gate and the
         reserve (62 >= 61 but < 65), the POLICY shortfall is 0 while the RESERVE
@@ -699,9 +715,17 @@ class DraftGoalHonestyTests(unittest.TestCase):
         self.assertNotEqual(health_u["postPlanGoal"], "feasible", health_u)
         ml = self._synthetic_row("mlowg", current="1.0.9", vulns="M:25",
                                  evidence={"1.0.9": "M:25"})
+        # A green goal demands M/L = 0 by definition, so the M/L limits are
+        # zero in the policy; one offender (however many findings it carries)
+        # then blocks the goal.
+        self._policy_ctx({"targetLevel": "green", "maxKnownModerate": 0, "maxKnownLow": 0})
         plan_m = self._plan_for([ml])
         health_m = plan_m["proposals"][0]["health"]
-        self.assertEqual(health_m["postPlanModerate"], 25, health_m)
+        # R6: the post-plan Moderate projection is measured in UNIQUE package
+        # NAMES. One package carrying M:25 is ONE offender, so the projection
+        # reports 1 -- the goal is still red/blocked for a green policy with
+        # maxKnownModerate=0, but the counter is names, not findings.
+        self.assertEqual(health_m["postPlanModerate"], 1, health_m)
         self.assertEqual(health_m["postPlanGoal"], "blocked", health_m)
 
     def test_yellow_and_green_pair_on_identical_rows(self):

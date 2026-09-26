@@ -120,6 +120,13 @@ class BaselineAnytimeState:
     desired_identity: str = ""
     continuation_reason: Optional[ContinuationReason] = None
     exhaustive_authorized: bool = False
+    # R7: whether the CURRENT invocation explicitly chose a search depth
+    # (EXHAUSTIVE or BOUNDED_IMPROVEMENT) instead of leaving it AUTO. An
+    # explicit bounded resume must NOT resurrect an old exhaustive consent from
+    # a checkpoint; an explicit exhaustive grant must survive an old bounded
+    # checkpoint; only "no explicit choice now" (AUTO) restores the checkpoint
+    # authorization.
+    authorization_explicit: bool = False
     # BLOCK_PSI_VERIFIED_BASELINE_FAST_BUDGET_V1
     # Metadata recorded by the generator so a terminal failure can say where the
     # time/attempt budget came from and which phase actually stopped, instead of
@@ -134,6 +141,12 @@ class BaselineAnytimeState:
     def __post_init__(self) -> None:
         self.started_at = self.clock()
         self.exhaustive_authorized = self.search_mode == BaselineSearchMode.EXHAUSTIVE
+        # R7: only explicit depth modes count as an explicit choice. AUTO means
+        # "no new user decision", so a checkpoint may restore its old consent.
+        self.authorization_explicit = self.search_mode in (
+            BaselineSearchMode.EXHAUSTIVE,
+            BaselineSearchMode.BOUNDED_IMPROVEMENT,
+        )
 
     @property
     def elapsed_seconds(self) -> float:
@@ -278,11 +291,15 @@ class BaselineAnytimeState:
             # the CURRENT explicit user authorization is NOT part of that. A
             # fresh state already granted EXHAUSTIVE (search_mode == EXHAUSTIVE
             # in __post_init__) must keep that grant -- the old checkpoint flag
-            # cannot revoke a newer explicit choice. The checkpoint only ADDS
-            # BACK consent a resumed run previously carried, so a bounded resume
-            # over an exhaustive checkpoint still goes deep.
-            if not self.exhaustive_authorized:
-                self.exhaustive_authorized = bool(value.get("exhaustiveAuthorized", False))
+            # cannot revoke a newer explicit choice.
+            # R7: the reverse direction is also true. An explicit BOUNDED
+            # request must NOT inherit an old exhaustive consent from the
+            # checkpoint: ignoring the user's chosen depth boundary is as wrong
+            # as letting the checkpoint revoke a grant. Only when the current
+            # invocation made NO explicit depth choice (AUTO) does the
+            # checkpoint consent restore.
+            if not self.authorization_explicit and bool(value.get("exhaustiveAuthorized", False)):
+                self.exhaustive_authorized = True
             desired = value.get("desiredAssignment")
             if isinstance(desired, Mapping):
                 self.desired_assignment = {str(k): str(v) for k, v in desired.items()}

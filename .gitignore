@@ -47,3 +47,6 @@ desktop/.cache/
 
 # Local agent-managed worktrees
 .claude/worktrees/
+
+# Local per-date probe/audit artifacts (never published)
+docs/2026-*/

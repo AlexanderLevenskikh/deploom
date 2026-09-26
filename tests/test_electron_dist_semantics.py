@@ -89,6 +89,78 @@ class ElectronDistSkipSemanticsTests(unittest.TestCase):
                 electron_dist.ensure_dist_electron()
             self.assertIn("produced no output asset", str(ctx.exception))
 
+    def test_nonzero_without_error_pattern_is_still_a_failure(self) -> None:
+        # R8: once the compiler is present, ANY non-zero exit is a real
+        # compile failure -- diagnostics may land on stdout or nowhere at all,
+        # so the absence of an "error TS..." pattern must never demote a
+        # broken build to a skip.
+        with (
+            mock.patch.object(electron_dist, "_needs_build", return_value=True),
+            mock.patch.object(electron_dist, "_toolchain_present", return_value=True),
+            mock.patch.object(
+                electron_dist,
+                "_run_tsc",
+                return_value=_fake_tsc("esbuild: Transform failed\n  error: unexpected token"),
+            ),
+        ):
+            with self.assertRaises(AssertionError) as ctx:
+                electron_dist.ensure_dist_electron()
+            self.assertIn("compile error", str(ctx.exception))
+
+    def test_failure_message_carries_stdout_and_stderr(self) -> None:
+        # R8: a compile failure surfaces BOTH streams so the cause is debuggable
+        # regardless of which stream tsc wrote the diagnosis to.
+        with (
+            mock.patch.object(electron_dist, "_needs_build", return_value=True),
+            mock.patch.object(electron_dist, "_toolchain_present", return_value=True),
+            mock.patch.object(
+                electron_dist,
+                "_run_tsc",
+                return_value=subprocess.CompletedProcess(
+                    args=["npx", "tsc", "-p", "tsconfig.electron.json"],
+                    returncode=1,
+                    stdout="src/a.ts(1,1): error TS2304: cannot find name 'x'",
+                    stderr="stderr noise from the runner",
+                ),
+            ),
+        ):
+            with self.assertRaises(AssertionError) as ctx:
+                electron_dist.ensure_dist_electron()
+            self.assertIn("TS2304", str(ctx.exception))
+            self.assertIn("stderr noise", str(ctx.exception))
+
+    def test_nonzero_tsc_run_never_skips(self) -> None:
+        # A12+R8: a compiler that ran and failed must raise AssertionError,
+        # and must never become a SkipTest even when toolchain checks pass.
+        with (
+            mock.patch.object(electron_dist, "_needs_build", return_value=True),
+            mock.patch.object(electron_dist, "_toolchain_present", return_value=True),
+            mock.patch.object(
+                electron_dist,
+                "_run_tsc",
+                return_value=_fake_tsc("whatever", returncode=2),
+            ),
+        ):
+            with self.assertRaises(AssertionError):
+                electron_dist.ensure_dist_electron()
+
+    def test_toolchain_present_requires_typescript_package(self) -> None:
+        # R8: node/npx on PATH is not enough -- the project-installed
+        # typescript package (which npx --no-install depends on) must exist,
+        # or the environment honestly lacks the toolchain.
+        tmp = ROOT / "tests" / "__no_typescript_here__"
+        tmp.mkdir(exist_ok=True)
+        self.addCleanup(lambda: tmp.rmdir())
+        with (
+            mock.patch.object(electron_dist, "ROOT", tmp),
+            mock.patch.object(electron_dist.shutil, "which", return_value="npx"),
+        ):
+            self.assertFalse(electron_dist._toolchain_present())
+        with (
+            mock.patch.object(electron_dist.shutil, "which", return_value=None),
+        ):
+            self.assertFalse(electron_dist._toolchain_present())
+
     def test_tsc_command_never_installs_typescript(self) -> None:
         """--no-install keeps the build deterministic and offline-safe."""
         cmd = electron_dist.tsc_command()

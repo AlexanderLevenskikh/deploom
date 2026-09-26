@@ -8,6 +8,14 @@ export type BaselineWorkerResult = {
   error?: string
 }
 
+// R3: a run handle advertises its REQUEST-LEVEL canceller under this symbol.
+// The production cancel path calls killProcessTree(handle.child), which never
+// invokes ChildProcess.kill() (on Windows it taskkills by pid, on POSIX it
+// kills the process group). Marking the RUN as cancelled before stopping the
+// process tree is what prevents a retiring worker's close event from spawning
+// a fresh worker after the user asked to stop.
+export const WORKER_CANCEL = Symbol('baseline-worker-cancel')
+
 type PendingRequest = {
   id: string
   settled: boolean
@@ -217,6 +225,7 @@ export class BaselineWorkerPool {
   ): {
     child: ChildProcessWithoutNullStreams
     result: Promise<BaselineWorkerResult>
+    cancel: (reason?: string) => void
   } {
     let record = this.records.get(key)
     if (record && (record.closing || (!record.alive && !record.closed))) {
@@ -235,17 +244,28 @@ export class BaselineWorkerPool {
       // applies to the retiree now and to the fresh worker the moment it
       // starts; a kill before the fresh worker spawns also prevents it from
       // starting at all.
+      // R3: cancellation is REQUEST-scoped, not a method of the proxy. The
+      // production cancel path is killProcessTree(handle.child) (taskkill by
+      // pid on Windows, process-group kill on POSIX) -- it never calls the
+      // proxy's kill(). The proxy therefore also exposes WORKER_CANCEL, which
+      // main.killProcessTree invokes BEFORE touching the OS, so the request is
+      // marked cancelled and the pending fresh spawn is suppressed no matter
+      // how the process tree is stopped.
       const retiringRecord = record
       let currentChild: ChildProcessWithoutNullStreams | undefined
       let cancelled = false
-      const killActive = () => {
+      let rejectResult: ((error: Error) => void) | undefined
+      const cancelRequest = (message = 'BASELINE_WORKER_CANCELLED') => {
+        if (cancelled) return
         cancelled = true
         try { retiringRecord.child.kill('SIGKILL') } catch { /* already gone */ }
         if (currentChild) {
           try { currentChild.kill('SIGKILL') } catch { /* already gone */ }
         }
+        rejectResult?.(new Error(message))
       }
       const result = new Promise<BaselineWorkerResult>((resolve, reject) => {
+        rejectResult = reject
         let retirementTimer: ReturnType<typeof setTimeout> | undefined
         const continueOnFreshWorker = () => {
           if (retirementTimer) clearTimeout(retirementTimer)
@@ -275,14 +295,15 @@ export class BaselineWorkerPool {
       })
       const childProxy = new Proxy(retiringRecord.child, {
         get(target, property, receiver) {
+          if (property === WORKER_CANCEL) return () => cancelRequest()
           if (property === 'pid') return currentChild?.pid ?? target.pid
           if (property === 'killed') return cancelled || target.killed
-          if (property === 'kill') return (_signal?: NodeJS.Signals | number) => killActive()
+          if (property === 'kill') return (_signal?: NodeJS.Signals | number) => cancelRequest()
           const value = Reflect.get(target, property, receiver)
           return typeof value === 'function' ? value.bind(target) : value
         },
       }) as ChildProcessWithoutNullStreams
-      return { child: childProxy, result }
+      return { child: childProxy, result, cancel: (reason?: string) => cancelRequest(reason) }
     }
     if (!record || record.closed || record.child.killed) {
       record = this.start(key, request.cwd)
@@ -329,7 +350,14 @@ export class BaselineWorkerPool {
     } catch (error) {
       retireWriteFailure(error)
     }
-    return { child: activeRecord.child, result }
+    return {
+      child: activeRecord.child,
+      result,
+      cancel: (reason?: string) => {
+        this.terminateTree(activeRecord.child)
+        rejectRequest(new Error(reason ?? 'BASELINE_WORKER_CANCELLED'))
+      },
+    }
   }
 
   dispose(kill: (child: ChildProcessWithoutNullStreams) => void): void {

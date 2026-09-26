@@ -1197,6 +1197,12 @@ class ProjectHealth:
     scope_lag_ok: int = 0
     scope_lag_unknown: int = 0
     scope_lag_pct: float = 0.0
+    # R5: identity of the exact scope/lag/vulns state this health was computed
+    # for. The interactive dashboard recomputes the same string over the live
+    # DOM; the producer snapshot is only authoritative while the fingerprint
+    # matches (after a lag-window/exclusion/vulns/target-mode edit it is stale
+    # and the DOM is recomputed against the embedded policy instead).
+    dom_fingerprint: str = ""
 
 
 @dataclasses.dataclass
@@ -5825,6 +5831,33 @@ def _severity_at_candidate_version(row: DependencyRow, planned: str, severity: s
     return None
 
 
+def _scope_policy_package_names(rows: List[DependencyRow], version_of: Callable[[DependencyRow], str]) -> Tuple[Dict[str, Set[str]], int]:
+    """R6/A11: the policy limit is measured in UNIQUE PACKAGE NAMES, and every
+    consumer (Fast stop, Draft projection, final acceptance) must aggregate in
+    the SAME unit through this single helper. A package appearing in two rows
+    (runtime + dev, or several versions) is ONE offending name; finding counts
+    stay per-row diagnostics. A row whose exact-version OSV evidence is
+    missing is counted as unknown evidence -- absence of evidence is never a
+    clean bill, so it can neither add a proven name nor claim a proven zero.
+
+    Returns ({severity: set(package names)}, unknown_evidence_rows).
+    """
+    by_severity: Dict[str, Set[str]] = {"C": set(), "H": set(), "M": set(), "L": set(), "U": set()}
+    unknown = 0
+    for r in rows:
+        version = str(version_of(r) or "").strip()
+        assessed = True
+        for severity in ("C", "H", "M", "L", "U"):
+            exact = _severity_at_candidate_version(r, version, severity)
+            if exact is None:
+                assessed = False
+            elif int(exact) > 0:
+                by_severity[severity].add(r.name)
+        if not assessed:
+            unknown += 1
+    return by_severity, unknown
+
+
 def _candidate_satisfies_fast_policy(
     rows: List[DependencyRow],
     candidate_targets: Mapping[str, str],
@@ -5860,8 +5893,9 @@ def _candidate_satisfies_fast_policy(
     # severity, aggregated over the scope), not per row and not per finding:
     # two packages with H:1 each cannot both hide behind maxKnownHigh=1, and a
     # single package whose exact chosen version carries H:2 is ONE vulnerable
-    # package name. Finding counts stay as the per-row totals diagnostic; the
-    # gate unit is the documented package-name limit (A11).
+    # package name -- as is one package present in both runtime and dev
+    # (R6). Finding counts stay as the per-row totals diagnostic; the gate
+    # unit is the documented package-name limit (A11).
     severity_limits = (
         ("C", max_critical),
         ("H", max_high),
@@ -5874,27 +5908,20 @@ def _candidate_satisfies_fast_policy(
         # dimensions, so B1/N2/N3 stay intact).
         ("U", 0),
     )
+    # R6: one aggregation helper for Fast, Draft, health and acceptance -- the
+    # unique PACKAGE NAME per severity (a version without OSV evidence counts
+    # as unknown, never clean).
+    by_severity, unknown_evidence = _scope_policy_package_names(
+        active,
+        lambda r: str(
+            candidate_targets.get(r.name) or current_targets.get(r.name) or r.current_version or ""
+        ).strip(),
+    )
     for severity, limit in severity_limits:
-        # B1: EVERY active package's EXACT chosen version is the subject for
-        # each severity, including packages whose CURRENT version carries zero
-        # findings. The old "current aggregate <= limit -> continue" skip meant
-        # a verified candidate could bump a clean package onto a vulnerable
-        # version (or onto a version with no OSV evidence) without the gate
-        # noticing. Missing evidence for the exact version is unknown -> Fast
-        # must not claim the goal. N3 is preserved: a partial fix that leaves
-        # exactly the allowed remaining PACKAGES still satisfies the policy.
-        offending_packages = 0
-        for r in active:
-            planned = str(
-                candidate_targets.get(r.name) or current_targets.get(r.name) or r.current_version or ""
-            ).strip()
-            exact = _severity_at_candidate_version(r, planned, severity)
-            if exact is None:
-                return False
-            if exact > 0:
-                offending_packages += 1
-        if offending_packages > limit:
+        if len(by_severity.get(severity, ())) > limit:
             return False
+    if unknown_evidence:
+        return False
     # H1: the lag goal is computed over the WHOLE active scope. A row without a
     # discovered lag target is NOT compliant and never drops out of the
     # denominator: 1 confirmed-compliant package out of 10 is 10% scope
@@ -5911,6 +5938,21 @@ def _candidate_satisfies_fast_policy(
     lag_pct = max(0, min(100, int(policy.get("minLagOkPct", 80))))
     needed = required_ratio_count(total, (lag_pct, 100)) if total else 0
     return compliant >= needed
+
+
+def _project_health_fingerprint(rows: List[DependencyRow], target_mode: str = "default") -> str:
+    """R5: canonical identity of the exact dashboard state a ProjectHealth was
+    computed for. Mirrors the JS domHealthFingerprint over the rendered row
+    dataset: name|current|vulns|excluded|lag window, sorted, prefixed with the
+    target mode. The interactive recompute compares this to the LIVE DOM; a
+    mismatch means the scope/lag/vulns/target-mode changed after generation,
+    so the producer snapshot is stale and must not be exported as current.
+    """
+    items = sorted(
+        f"{r.name}|{r.current_version}|{r.current_vulns}|{1 if r.scope_excluded else 0}|{r.lag_threshold_months}"
+        for r in rows
+    )
+    return f"{target_mode};" + ";;".join(items)
 
 
 def compute_project_health(
@@ -6112,6 +6154,7 @@ def compute_project_health(
         scope_lag_ok=scope_lag_ok,
         scope_lag_unknown=scope_lag_unknown,
         scope_lag_pct=scope_lag_pct,
+        dom_fingerprint=_project_health_fingerprint(rows),
     )
 
 
@@ -11893,6 +11936,7 @@ def resolve_peer_compatibility_with_verification(
                 # Legacy field means no human budget boundary here; Ψ.5
                 # keeps actual search depth separately in search_mode.
                 anytime.exhaustive_authorized = True
+                anytime.authorization_explicit = True
             liveness.exhaustive_authorized = anytime.exhaustive_authorized
             if _baseline_background_autonomous():
                 eprint(
@@ -11929,6 +11973,7 @@ def resolve_peer_compatibility_with_verification(
                     # only restores unattended hard-ceiling authorization.
                     anytime.search_mode = effective_search_mode
                     anytime.exhaustive_authorized = True
+                    anytime.authorization_explicit = True
                     anytime.continuation_reason = None
                 liveness.exhaustive_authorized = anytime.exhaustive_authorized
             try:
@@ -18409,6 +18454,18 @@ def write_html(
         "provenDependencyState": proven_dependency_state or {"schemaVersion": 1, "projects": {}},
         "provenDependencyStatePath": str(proven_dependency_state_path or ""),
         "projectHealth": {project: dataclasses.asdict(health) for project, health in (health_by_project or {}).items()},
+        # R5: the per-project acceptance policy embedded beside the health so the
+        # interactive dashboard can recompute a STALE health (after a lag-window
+        # / exclusion / vulns / target-mode edit) with the REAL policy instead of
+        # hardcoded 80/20 heuristics, and never fabricates green without a policy.
+        "projectPolicy": {
+            project: {
+                key: policy.get(key)
+                for key in ("targetLevel", "minLagOkPct", "lagPolicyMonths", "maxKnownCritical", "maxKnownHigh", "maxKnownModerate", "maxKnownLow")
+            }
+            for project in (health_by_project or {})
+            for policy in [effective_acceptance_policy(project)]
+        },
         "suggestions": {
             "global": [dataclasses.asdict(item) for item in global_suggestions],
             "byProject": {project: [dataclasses.asdict(item) for item in items] for project, items in suggestions_by_project.items()},
@@ -19237,12 +19294,17 @@ function calculateProjectHealthFromDom(section){
   const activeRows = rows.filter(row => row.dataset.scopeExcluded !== '1');
   const excluded = rows.length - activeRows.length;
   // The producer computes health with the versioned policy (R9) and embeds it
-  // in REPORT_CONTEXT.projectHealth. The DOM recompute must NOT invent a
-  // legacy policy (hardcoded 80% / 0.85 reserve / M+L<=20 / U ignored): the
-  // authoritative status and scope metrics win, and only interactive row-level
-  // facts (targets, per-row counts) stay computed from the DOM.
+  // in REPORT_CONTEXT.projectHealth, together with a domFingerprint of the
+  // exact scope/lag/vulns state it describes. The authoritative snapshot is
+  // used ONLY while that fingerprint still matches the live DOM:
+  // - matched (no edits): exact producer semantics, zero drift;
+  // - mismatched (lag window, exclusion, vulns/security, target-mode edits):
+  //   the snapshot is STALE and must never be shown or exported as current --
+  //   the DOM is recomputed with the embedded project policy instead;
+  // - no snapshot / no policy: nothing proves the goal, so health never
+  //   fabricates green and never quotes a hardcoded 80% policy.
   const authoritative = REPORT_CONTEXT.projectHealth?.[project] || null;
-  if (authoritative) {
+  if (authoritative && authoritative.dom_fingerprint === domHealthFingerprint(section)) {
     const total = Number(authoritative.scope_total ?? authoritative.total ?? activeRows.length);
     return {project, status: authoritative.status || 'yellow',
       total,
@@ -19260,35 +19322,55 @@ function calculateProjectHealthFromDom(section){
       yellow_plan_shortfall: Number(authoritative.yellow_plan_shortfall ?? 0),
       scope_total: Number(authoritative.scope_total ?? activeRows.length)};
   }
-  // Conservative fallback for a health-less fixture: the WHOLE active scope is
-  // the denominator, unknown lag is never compliant, U and missing security
-  // evidence never yield green, and an empty denominator is 0%, not 100%.
+  const policy = REPORT_CONTEXT.projectPolicy?.[project] || null;
+  return recomputeProjectHealthFromDom(section, policy);
+}
+function recomputeProjectHealthFromDom(section, policy){
+  const project = section.dataset.projectSection || '';
+  const rows = Array.from(section.querySelectorAll('tr.dep-row'));
+  const activeRows = rows.filter(row => row.dataset.scopeExcluded !== '1');
+  const excluded = rows.length - activeRows.length;
+  // Conservative recompute over the WHOLE active scope with the REAL policy:
+  // unknown lag is never compliant, the denominator is every active row,
+  // unknown/unparsed security evidence is never a clean zero, and an absent
+  // policy snapshot can never produce green.
   const knownRows = activeRows.filter(row => !!semverParts(lagComplianceTargetForDomRow(row)));
   const lagUnknown = activeRows.length - knownRows.length;
   const scopeTotal = activeRows.length;
   const scopeLagOk = knownRows.filter(row => compareSemverText(row.dataset.current || '', lagComplianceTargetForDomRow(row)) >= 0).length;
   const scopePct = scopeTotal ? scopeLagOk / scopeTotal * 100 : (lagUnknown ? 0 : 100);
   const totals = {C:0,H:0,M:0,L:0,U:0};
+  let securityUnknownRows = 0;
   for (const row of activeRows) {
     const counts = vulnerabilityCountsForDomRow(row);
     for (const key of Object.keys(totals)) totals[key] += counts[key] || 0;
+    if (!domSecurityKnownFromVulns(row.dataset.vulns)) securityUnknownRows += 1;
   }
+  const minLagOkPct = policy && typeof policy.minLagOkPct === 'number' ? policy.minLagOkPct : undefined;
+  const maxCritical = policy && typeof policy.maxKnownCritical === 'number' ? policy.maxKnownCritical : 0;
+  const maxHigh = policy && typeof policy.maxKnownHigh === 'number' ? policy.maxKnownHigh : 0;
+  const maxModerate = policy && typeof policy.maxKnownModerate === 'number' ? policy.maxKnownModerate : undefined;
+  const maxLow = policy && typeof policy.maxKnownLow === 'number' ? policy.maxKnownLow : undefined;
   let status = 'yellow';
   let reason = '';
-  if (totals.C > 0) {
+  if (policy === null || minLagOkPct === undefined) {
+    status = 'yellow'; reason = 'нет авторитетного policy-снапшота; актуальная оценка не подтверждается';
+  } else if (totals.C > 0) {
     status = 'red'; reason = `есть Critical: ${totals.C}`;
   } else if (scopeTotal === 0) {
     status = lagUnknown ? 'yellow' : 'green';
     reason = lagUnknown ? `lag-policy target неизвестен для ${lagUnknown} зависимостей` : 'нет зависимостей в активном расчёте';
-  } else if (scopePct < 80) {
-    status = 'red'; reason = `только ${scopePct.toFixed(1)}% активного scope соблюдают lag-policy (<80%)`;
-  } else if (lagUnknown === 0 && totals.H === 0 && totals.U === 0 && (totals.M + totals.L) <= 20) {
-    status = 'green'; reason = '0 нарушений lag-policy, 0 C/H, нет U, Low+Moderate ≤20';
+  } else if (scopePct < minLagOkPct) {
+    status = 'red'; reason = `только ${scopePct.toFixed(1)}% активного scope соблюдают lag-policy (<${minLagOkPct}%)`;
+  } else if (lagUnknown === 0 && securityUnknownRows === 0 && totals.U === 0
+      && totals.H <= maxHigh && totalWithinLimit(totals.M, maxModerate) && totalWithinLimit(totals.L, maxLow)) {
+    status = 'green'; reason = '0 нарушений lag-policy, 0 C, H/M/L в пределах policy, нет неизвестной security';
   } else {
     const parts = [`${scopePct.toFixed(1)}% активного scope соблюдают lag-policy`, '0 Critical'];
     if (lagUnknown) parts.push(`lag-policy target неизвестен: ${lagUnknown}`);
-    if (totals.H) parts.push(`High остаются: ${totals.H}`);
+    if (securityUnknownRows) parts.push(`security неизвестна: ${securityUnknownRows}`);
     if (totals.U) parts.push(`уязвимости без оценки серьёзности: ${totals.U}`);
+    if (totals.H) parts.push(`High остаются: ${totals.H}`);
     if (totals.M || totals.L) parts.push(`M/L: ${totals.M + totals.L}`);
     reason = parts.join('; ');
   }
@@ -19297,6 +19379,28 @@ function calculateProjectHealthFromDom(section){
     critical:totals.C,high:totals.H,moderate:totals.M,low:totals.L,unknown:totals.U,
     reason,excluded,lag_unknown:lagUnknown,removed:0,
     yellow_plan_required:0,yellow_projected_lag_ok:0,yellow_projected_lag_pct:0,yellow_plan_shortfall:0,scope_total:scopeTotal};
+}
+function domSecurityKnownFromVulns(text){
+  // Mirrors the Python producer (_summary_security_known): only an explicit
+  // finding summary or an explicit zero is an ASSESSED security state. Empty,
+  // '—' or "OSV unavailable"-style summaries are UNKNOWN -- never a clean zero.
+  const value = String(text || '').trim().toLowerCase();
+  if (!value || value === '—') return false;
+  return !/unknown|неизвестно|not assessed|registry unavailable|недоступн|unavailable/.test(value);
+}
+function totalWithinLimit(total, limit){
+  return limit === undefined || total <= limit;
+}
+function domHealthFingerprint(section){
+  // Canonical identity of the dashboard state a health was computed for: the
+  // target mode plus every row's name|current|vulns|excluded|lag window,
+  // sorted. MUST stay byte-identical with the Python _project_health_fingerprint.
+  const modeSelect = document.getElementById('targetMode');
+  const rows = Array.from(section.querySelectorAll('tr.dep-row'))
+    .map(row => [row.dataset.name || '', row.dataset.current || '', String(row.dataset.vulns || ''),
+      row.dataset.scopeExcluded === '1' ? '1' : '0', String(row.dataset.lagThresholdMonths || '12')].join('|'))
+    .sort();
+  return ((modeSelect && modeSelect.value) || 'default') + ';' + rows.join(';;');
 }
 function updateProjectHealthVisual(section, health){
   section.dataset.projectStatus = health.status;
@@ -20738,8 +20842,20 @@ ${manifestJson}
 Read \\`${runbookPath}\\` before any edits. It is mandatory and may strengthen this compact index; do not paste it into chat.
 `;
 }
+function currentProjectHealth(project){
+  // R5: exports must never quote a stale producer snapshot. The live
+  // (recomputed) health wins; if it is not cached yet, recompute the project's
+  // section on demand so the exported status always matches the current DOM.
+  const cached = liveProjectHealth?.[project];
+  if (cached) return cached;
+  let section = null;
+  document.querySelectorAll('.project-section').forEach(el => {
+    if (el.dataset.projectSection === project) section = el;
+  });
+  return section ? calculateProjectHealthFromDom(section) : {};
+}
 function taskSpecHealthLine(project){
-  const h = liveProjectHealth?.[project] || REPORT_CONTEXT.projectHealth?.[project] || {};
+  const h = currentProjectHealth(project);
   const status = h.status || 'unknown';
   return `Статус: **${status}**; lag policy выполнена для ${Number(h.lag_ok_pct ?? 0).toFixed(1)}%; ` +
     `уязвимости C/H/M/L: ${h.critical || 0}/${h.high || 0}/${h.moderate || 0}/${h.low || 0}. ` +
@@ -21457,7 +21573,7 @@ function currentDashboardSnapshot(label=''){
   const projects = {};
   for (const [project, dependencies] of Object.entries(projectRows)) {
     projects[project] = {
-      health: JSON.parse(JSON.stringify(liveProjectHealth?.[project] || REPORT_CONTEXT.projectHealth?.[project] || {})),
+      health: JSON.parse(JSON.stringify(currentProjectHealth(project))),
       baselineComparison: JSON.parse(JSON.stringify(REPORT_CONTEXT.baselineComparisons?.[project] || null)),
       git: JSON.parse(JSON.stringify(REPORT_CONTEXT.projectGit?.[project] || {})),
       suggestions: JSON.parse(JSON.stringify(REPORT_CONTEXT.suggestions?.byProject?.[project] || [])),
@@ -22680,18 +22796,26 @@ def build_draft_plan(
         sec_known = 0
         sec_unknown = 0
         lag_unprovable = 0
+        # R6: the Draft projection measures the security gate in the SAME unit
+        # as the Fast stop and final acceptance -- unique PACKAGE NAMES per
+        # severity at the exact post-plan version. Two rows of one package
+        # (runtime+dev) are one name; finding counts stay diagnostics.
+        draft_by_severity: Dict[str, Set[str]] = {"C": set(), "H": set(), "M": set(), "L": set()}
         for r in active_rows:
             crit, high, moderate, low, known = _projected_row_security_full(r, _draft_target_for_major(r))
-            sec_critical += crit
-            sec_high += high
-            sec_moderate += moderate
-            sec_low += low
+            for severity, value in (("C", crit), ("H", high), ("M", moderate), ("L", low)):
+                if int(value) > 0:
+                    draft_by_severity[severity].add(r.name)
             if known:
                 sec_known += 1
             else:
                 sec_unknown += 1
             if not dependency_has_lag_policy_target(r):
                 lag_unprovable += 1
+        sec_critical = len(draft_by_severity["C"])
+        sec_high = len(draft_by_severity["H"])
+        sec_moderate = len(draft_by_severity["M"])
+        sec_low = len(draft_by_severity["L"])
         max_critical = 0 if target_level == "green" else int(project_policy.get("maxKnownCritical", 0) or 0)
         max_high = 0 if target_level == "green" else int(project_policy.get("maxKnownHigh", 1) or 0)
         goal_verdict = _draft_goal_verdict(

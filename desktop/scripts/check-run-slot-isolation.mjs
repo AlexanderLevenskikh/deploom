@@ -1,81 +1,129 @@
-// A06: run-action concurrency must be isolated by CANONICAL REPOSITORY, not by
-// display name or workspace, and the job slot must be reserved synchronously
-// before the first await so two concurrent starts cannot both pass the check.
-// This runs the REAL production conflict/reservation functions extracted from
-// main.ts (types erased by transpile, dependencies injected as globals).
+// A06+R4: run-action concurrency must be isolated by CANONICAL REPOSITORY, not
+// by display name or workspace, and the job slot must be reserved synchronously
+// before the first await.
+// R4: the canonical identity is the shared GIT WORKTREE ROOT (and main git
+// dir for linked worktrees), resolved through realpath -- an exact-string path
+// comparison cannot see a monorepo (packages/a vs packages/b), a linked
+// worktree, a symlink/junction alias, or nested checkouts. This runs the REAL
+// production conflict/reservation functions extracted from main.ts (types
+// erased by transpile, dependencies injected as globals) against a REAL git
+// monorepo built in a temp dir.
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
+import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import ts from 'typescript'
 import { normalizePathForComparison } from '../dist-electron/process-launcher.js'
 
+const { join, dirname, sep, normalize, resolve } = path
+
 const source = fs.readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8')
-const start = source.indexOf('function sameRepositoryPath(')
+const start = source.indexOf('function mainGitDirOf(')
 const end = source.indexOf('function reserveProjectActionSlot(', start)
 const reserveEnd = source.indexOf('let mainWindow: BrowserWindow | null', end)
-if (start < 0 || end < 0 || reserveEnd < 0) throw new Error('A06 source slice not found in main.ts')
+if (start < 0 || end < 0 || reserveEnd < 0) throw new Error('R4 source slice not found in main.ts')
 const slice = source.slice(start, reserveEnd)
 const jobs = new Map()
 const js = ts.transpileModule(slice, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
 }).outputText
-const fn = new Function(
-  'jobs', 'randomUUID', 'normalize', 'resolve', 'normalizePathForComparison',
+const factory = new Function(
+  'jobs', 'randomUUID', 'join', 'dirname', 'sep', 'normalize', 'resolve',
+  'normalizePathForComparison',
+  'realpathSync', 'existsSync', 'statSync', 'readFileSync',
   'WORKSPACE_GLOBAL_ACTIONS', 'PROJECT_BACKGROUND_ACTIONS',
   js + '\nreturn { sameRepositoryPath, projectRunConflicts, reserveProjectActionSlot };',
 )
-const { normalize, resolve } = path
 const WORKSPACE_GLOBAL_ACTIONS = new Set(['sync-tool', 'generate-all', 'commit-state', 'push-workspace'])
 const PROJECT_BACKGROUND_ACTIONS = new Set(['preflight', 'baseline'])
-const { projectRunConflicts, reserveProjectActionSlot } = fn(
-  jobs, randomUUID, normalize, resolve, normalizePathForComparison,
+const instance = factory(
+  jobs, randomUUID, join, dirname, sep, normalize, resolve, normalizePathForComparison,
+  fs.realpathSync, fs.existsSync, fs.statSync, fs.readFileSync,
   WORKSPACE_GLOBAL_ACTIONS, PROJECT_BACKGROUND_ACTIONS,
 )
-const ws = (id) => ({ id, name: id, path: 'C:/workspaces/' + id, templateRemote: '', toolRemote: '', settingsPath: '', agent: 'claude' })
-const job = (workspace, name, repo, action) => ({
-  id: randomUUID(), action, workspace: ws(workspace), projectName: name,
-  projectPath: `C:/repos/${repo}`, cancelled: false,
-})
+const { projectRunConflicts, reserveProjectActionSlot } = instance
 
-// A06: two project aliases of ONE repository MUST conflict, whatever their
-// display names, whatever the workspace (the old check keyed on workspace+name
-// and explicitly let baseline/preflight overlap on different names).
-if (!projectRunConflicts(job('one', 'alias-A', 'shared', 'agent'), ws('one'), { name: 'alias-B', path: 'C:/repos/shared' }, 'baseline')) {
-  throw new Error('A06: two aliases of the same repo must conflict even for baseline vs agent')
+// ---- Build a real monorepo + an independent repo + a linked worktree.
+const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'deploom-r4-'))
+const git = (cwd, ...args) => execFileSync('git', args, { cwd, stdio: 'pipe' })
+const initRepo = (dir) => {
+  fs.mkdirSync(dir, { recursive: true })
+  git(dir, 'init', '-q')
+  git(dir, 'config', 'user.email', 'check@deploom.local')
+  git(dir, 'config', 'user.name', 'contract-check')
+  fs.writeFileSync(path.join(dir, 'marker.txt'), 'ok\n')
+  git(dir, 'add', '.')
+  git(dir, 'commit', '-qm', 'init')
 }
-if (!projectRunConflicts(job('one', 'alias-A', 'shared', 'agent'), ws('two'), { name: 'alias-C', path: 'C:/repos/shared' }, 'agent')) {
-  throw new Error('A06: the same repo registered in two workspaces must conflict')
-}
-if (!projectRunConflicts(job('one', 'nested-pkg', 'monorepo', 'agent'), ws('one'), { name: 'nested-pkg-2', path: 'C:/repos/monorepo/packages/b' }, 'agent')) {
-  throw new Error('A06: nested packages sharing a git checkout must conflict')
-}
-// Case/drive-normalized path equality on Windows.
-if (!projectRunConflicts(job('one', 'a', 'shared', 'agent'), ws('one'), { name: 'b', path: 'c:/REPOS/shared' }, 'agent')) {
-  throw new Error('A06: path comparison must be case-insensitive on Windows')
-}
-// Different repositories remain independent.
-if (projectRunConflicts(job('one', 'a', 'repo-a', 'agent'), ws('one'), { name: 'b', path: 'C:/repos/repo-b' }, 'baseline')) {
-  throw new Error('A06: unrelated repos must stay independent')
-}
-if (projectRunConflicts(job('one', 'a', 'repo-a', 'agent'), ws('two'), { name: 'a', path: 'C:/repos/repo-b' }, 'agent')) {
-  throw new Error('A06: same name in another workspace on a different repo must stay independent')
-}
+try {
+  const monorepo = path.join(tmpRoot, 'monorepo')
+  fs.mkdirSync(path.join(monorepo, 'packages', 'a'), { recursive: true })
+  fs.mkdirSync(path.join(monorepo, 'packages', 'b'), { recursive: true })
+  initRepo(monorepo)
+  const other = path.join(tmpRoot, 'other')
+  fs.mkdirSync(path.join(other, 'packages', 'a'), { recursive: true })
+  initRepo(other)
+  // A linked worktree of the monorepo (its .git is a gitdir: pointer file).
+  const worktree = path.join(tmpRoot, 'wt')
+  git(monorepo, 'worktree', 'add', '-q', '-b', 'wt-branch', worktree)
+  fs.mkdirSync(path.join(worktree, 'packages', 'x'), { recursive: true })
+  // A junction (Windows) / symlink alias of one package dir.
+  const alias = path.join(tmpRoot, 'alias-a')
+  fs.symlinkSync(path.join(monorepo, 'packages', 'a'), alias,
+    process.platform === 'win32' ? 'junction' : 'dir')
 
-// A06: the slot is reserved upfront and released afterwards; a second caller
-// on the same repo loses the race instead of both passing the check.
-const first = reserveProjectActionSlot(ws('one'), { name: 'alias-B', path: 'C:/repos/shared' }, 'agent')
-if (!first.reservation || first.conflict) throw new Error('A06: first reservation must win')
-const second = reserveProjectActionSlot(ws('one'), { name: 'alias-A', path: 'C:/repos/shared' }, 'baseline')
-if (!second.conflict || second.reservation) throw new Error('A06: concurrent start on the same repo must lose the race')
-// Exchange: the real job replaces the reservation; a third start then loses
-// against the real job.
-jobs.delete(first.reservation.id)
-jobs.set(job('one', 'alias-B', 'shared', 'agent').id, job('one', 'alias-B', 'shared', 'agent'))
-const third = reserveProjectActionSlot(ws('one'), { name: 'alias-A', path: 'C:/repos/shared' }, 'agent')
-if (!third.conflict) throw new Error('A06: a third start must lose against the registered real job')
-// Release in finally: after deletion the slot is free again.
-jobs.clear()
-const fourth = reserveProjectActionSlot(ws('one'), { name: 'alias-A', path: 'C:/repos/shared' }, 'agent')
-if (!fourth.reservation) throw new Error('A06: the slot must be reusable after release')
+  const ws = (id) => ({ id, name: id, path: id, templateRemote: '', toolRemote: '', settingsPath: '', agent: 'claude' })
+  const job = (workspace, name, projectPath, action) => ({
+    id: randomUUID(), action, workspace: ws(workspace), projectName: name,
+    projectPath, cancelled: false,
+  })
 
-console.log('Run-slot isolation by canonical repository OK')
+  // R4: nested packages of ONE monorepo share one worktree root -> conflict.
+  if (!projectRunConflicts(job('one', 'a', join(monorepo, 'packages', 'a'), 'agent'), ws('one'), { name: 'b', path: join(monorepo, 'packages', 'b') }, 'baseline')) {
+    throw new Error('R4: two packages of one monorepo must conflict')
+  }
+  // The monorepo root itself vs a nested package.
+  if (!projectRunConflicts(job('one', 'root', monorepo, 'agent'), ws('one'), { name: 'b', path: join(monorepo, 'packages', 'b') }, 'agent')) {
+    throw new Error('R4: the monorepo root and a nested package must conflict')
+  }
+  // R4: a LINKED WORKTREE of the same repo conflicts with the main checkout
+  // (shared mainGitDir), even though the two worktree roots differ.
+  if (!projectRunConflicts(job('one', 'wt', join(worktree, 'packages', 'x'), 'agent'), ws('one'), { name: 'a', path: join(monorepo, 'packages', 'a') }, 'agent')) {
+    throw new Error('R4: a linked worktree must conflict with its main checkout')
+  }
+  // R4: a symlink/junction alias of a package resolves through realpath to the
+  // same worktree root -> conflict with its sibling.
+  if (!projectRunConflicts(job('one', 'alias', alias, 'agent'), ws('one'), { name: 'b', path: join(monorepo, 'packages', 'b') }, 'agent')) {
+    throw new Error('R4: a symlink alias of a monorepo package must conflict with its sibling')
+  }
+  // Different repositories remain independent (different project names within
+  // one workspace, and different workspaces regardless of the name).
+  if (projectRunConflicts(job('one', 'a', join(monorepo, 'packages', 'a'), 'agent'), ws('one'), { name: 'b', path: join(other, 'packages', 'a') }, 'baseline')) {
+    throw new Error('R4: unrelated repos must stay independent within one workspace (different names)')
+  }
+  if (projectRunConflicts(job('one', 'a', join(monorepo, 'packages', 'a'), 'agent'), ws('two'), { name: 'a', path: join(other, 'packages', 'a') }, 'agent')) {
+    throw new Error('R4: same name in another workspace on a different repo must stay independent')
+  }
+
+  // A06: the slot is reserved upfront and released afterwards; a second caller
+  // on the same repo loses the race instead of both passing the check.
+  const first = reserveProjectActionSlot(ws('one'), { name: 'b', path: join(monorepo, 'packages', 'b') }, 'agent')
+  if (!first.reservation || first.conflict) throw new Error('A06: first reservation must win')
+  const second = reserveProjectActionSlot(ws('one'), { name: 'a', path: join(monorepo, 'packages', 'a') }, 'baseline')
+  if (!second.conflict || second.reservation) throw new Error('A06: concurrent start on the same repo must lose the race')
+  // Exchange: the real job replaces the reservation; a third start then loses
+  // against the real job.
+  jobs.delete(first.reservation.id)
+  jobs.set(job('one', 'b', join(monorepo, 'packages', 'b'), 'agent').id, job('one', 'b', join(monorepo, 'packages', 'b'), 'agent'))
+  const third = reserveProjectActionSlot(ws('one'), { name: 'a', path: join(monorepo, 'packages', 'a') }, 'agent')
+  if (!third.conflict) throw new Error('A06: a third start must lose against the registered real job')
+  // Release in finally: after deletion the slot is free again.
+  jobs.clear()
+  const fourth = reserveProjectActionSlot(ws('one'), { name: 'a', path: join(monorepo, 'packages', 'a') }, 'agent')
+  if (!fourth.reservation) throw new Error('A06: the slot must be reusable after release')
+
+  console.log('Run-slot isolation by canonical repository (worktree root) OK')
+} finally {
+  fs.rmSync(tmpRoot, { recursive: true, force: true })
+}

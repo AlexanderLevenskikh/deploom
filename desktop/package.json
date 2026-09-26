@@ -55,6 +55,7 @@
     "check:cross-platform": "node scripts/check-cross-platform.mjs",
     "check:ui-shell": "node scripts/check-ui-shell.mjs",
     "check:baseline-intent": "node scripts/check-baseline-intent.mjs",
+    "check:baseline-intent-migration": "node scripts/check-baseline-intent-migration.mjs",
     "check:baseline-worker-hardening": "node scripts/check-baseline-worker-hardening.mjs",
     "check:baseline-retry": "node scripts/check-baseline-retry.mjs",
     "check:interaction-contracts": "node scripts/check-interaction-contracts.mjs",
@@ -65,6 +66,7 @@
     "check:human-flow": "node scripts/check-human-flow.mjs",
     "check:target-precedence": "node scripts/check-target-precedence.mjs",
     "check:baseline-worker-retire": "node scripts/check-baseline-worker-retire.mjs",
+    "check:baseline-worker-cancel": "node scripts/check-baseline-worker-cancel.mjs",
     "check:run-slot-isolation": "node scripts/check-run-slot-isolation.mjs",
     "check:artifact-token": "node scripts/check-artifact-token.mjs"
   },

@@ -276,13 +276,54 @@ try {
     }
 
     if ($RemoteTag) {
-        throw "Tag '$Tag' already exists on remote '$Remote'."
+        # R1: an already-published tag is only acceptable when it already
+        # points at the commit this retry would produce -- i.e. the current
+        # HEAD, because a retry runs with the previously pushed branch as the
+        # base (version files already current, release commit already pushed).
+        # Peeling with ^{} compares the annotated tag's COMMIT, never the tag
+        # object sha, and the remote tag is never overwritten.
+        $RemotePeeledLine = & git ls-remote --tags `
+            $Remote `
+            "refs/tags/$Tag^{}"
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to peel remote tag '$Tag'."
+        }
+
+        $RemotePeeled = (`
+            $RemotePeeledLine -split "\s+" |
+                Select-Object -First 1
+        ).Trim()
+
+        if ([string]::IsNullOrWhiteSpace($RemotePeeled)) {
+            throw "Tag '$Tag' already exists on remote '$Remote' but its peeled commit could not be read; refusing to overwrite it."
+        }
+
+        $HeadSha = (& git rev-parse HEAD).Trim()
+
+        if ($RemotePeeled -ne $HeadSha) {
+            throw "Tag '$Tag' already exists on remote '$Remote' at $RemotePeeled while HEAD is $HeadSha; refusing to overwrite the remote tag."
+        }
+
+        Write-Host "Tag $Tag already published on $Remote at HEAD; the retry will reuse it."
     }
 
-    & git show-ref --verify --quiet "refs/tags/$Tag"
+    # R1: a local tag does NOT block a retry when it already points at HEAD
+    # (the exact release commit from an interrupted run whose tag push failed).
+    # Any other local tag is refused without being moved. Peeling with ^{}
+    # compares the annotated tag's target commit, not the tag object sha.
+    & git rev-parse -q --verify "refs/tags/$Tag^{}" 2>$null
 
     if ($LASTEXITCODE -eq 0) {
-        throw "Tag '$Tag' already exists locally."
+        $LocalTagCommit = (& git rev-parse -q --verify "refs/tags/$Tag^{}" 2>$null) -join ""
+
+        $HeadShaForTagCheck = (& git rev-parse HEAD).Trim()
+
+        if ($LocalTagCommit.Trim() -ne $HeadShaForTagCheck) {
+            throw "Tag '$Tag' already exists locally at $($LocalTagCommit.Trim()) while HEAD is $HeadShaForTagCheck; refusing to move it."
+        }
+
+        Write-Host "Local tag $Tag already points at HEAD; the retry will reuse it."
     }
 
     # --------------------------------------------------------
@@ -851,11 +892,14 @@ try {
     # must be idempotent for the SAME version. If the local tag already points
     # at the exact release commit, reuse it; a tag pointing elsewhere must
     # never be silently moved.
-    # `git rev-parse -q` prints nothing and exits nonzero when the tag does
-    # not exist; the captured value is then $null, so flatten defensively
-    # before calling methods on it.
+    # R1: the comparison must use the PEELED commit (^{}). `git rev-parse
+    # refs/tags/<tag>` returns the SHA of the annotated TAG OBJECT, which
+    # always differs from the release COMMIT sha, so a plain comparison would
+    # reject a perfectly reusable annotated tag. `-\q` prints nothing and
+    # exits nonzero when the tag does not exist; the captured value is then
+    # $null, so flatten defensively before calling methods on it.
     $ExistingTagCommit = (
-        (& git rev-parse -q --verify "refs/tags/$Tag" 2>$null) -join ""
+        (& git rev-parse -q --verify "refs/tags/$Tag^{}" 2>$null) -join ""
     ).Trim()
 
     if ($LASTEXITCODE -eq 0) {

@@ -18,7 +18,6 @@ mask a broken TypeScript consumer as a skip.
 """
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
 import unittest
@@ -65,7 +64,13 @@ def _needs_build() -> bool:
 
 
 def _toolchain_present() -> bool:
-    return bool(shutil.which("npx.cmd") or shutil.which("npx") or shutil.which("node"))
+    # R8: "toolchain available" is decided BEFORE the compiler runs: node/npx on
+    # PATH AND the project-installed typescript package (npx --no-install will
+    # refuse to fetch a missing one). Once the compiler IS available, any
+    # non-zero exit is a real compiler failure, never a skip.
+    if not (shutil.which("npx.cmd") or shutil.which("npx") or shutil.which("node")):
+        return False
+    return (ROOT / "desktop" / "node_modules" / "typescript").is_dir()
 
 
 def _run_tsc() -> subprocess.CompletedProcess:
@@ -83,14 +88,18 @@ def _run_tsc() -> subprocess.CompletedProcess:
 def ensure_dist_electron() -> None:
     """Compile desktop/dist-electron when missing/stale.
 
-    Skips only when the toolchain is genuinely unavailable. A compile error
-    or a successful build that produced no asset is a failure.
+    Skips only when the toolchain is genuinely unavailable (no node/npx, or
+    typescript not installed in desktop/node_modules). R8: once the compiler
+    is present, ANY non-zero exit is a hard compile failure -- diagnostics
+    land on stdout for tsc just as often as on stderr, so a pattern-scanned
+    stderr alone could never be a safe skip signal. A successful build that
+    produced no asset is also a hard failure.
     """
     if not _needs_build():
         return
     if not _toolchain_present():
         raise unittest.SkipTest(
-            "tsc electron unavailable: no Node/npx on PATH and dist-electron is missing"
+            "tsc electron unavailable: no Node/npx on PATH (or typescript not installed) and dist-electron is missing"
         )
     try:
         finished = _run_tsc()
@@ -107,13 +116,8 @@ def ensure_dist_electron() -> None:
             )
         return
 
-    stderr = finished.stderr or ""
-    if re.search(r"error TS\d+", stderr):
-        raise AssertionError(
-            "tsc electron compile error (dist-electron missing and build failed):\n"
-            f"{stderr[-2000:]}"
-        )
-    raise unittest.SkipTest(
-        f"tsc electron unavailable (dist-electron missing and build failed without TS diagnostics): "
-        f"{stderr[-500:]}"
+    combined = f"{finished.stdout or ''}\n{finished.stderr or ''}"
+    raise AssertionError(
+        "tsc electron compile error (dist-electron missing and the installed "
+        f"TypeScript compiler exited {finished.returncode}):\n{combined[-2000:]}"
     )

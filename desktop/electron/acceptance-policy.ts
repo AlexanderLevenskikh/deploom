@@ -227,6 +227,14 @@ export function acceptanceVerdictFromManualAudit(
   // and marks such packages with severity 'unknown'. When the total is absent
   // but unrated packages are enumerated, their count still proves presence.
   const effectiveUnknown = unknown !== undefined ? unknown : unknownPackages.length
+  // R10: the paradox case -- a package that ALSO carries a rated severity
+  // (e.g. high) plus one or more unrated advisories. The producer still counts
+  // the package under `high`, leaving packageTotals.unknown = 0, while
+  // advisoryTotals.unknown (the finding-level counter) proves unrated findings
+  // exist. Such evidence must block acceptance independently of the
+  // containing package's rated severity: an unrated advisory inside a rated
+  // package means "no Critical beyond the rated part" is NOT established.
+  const hasUnratedFindings = (unknownFindings ?? 0) > 0
   const dependencyEvidenceFresh = Boolean(reportInputHash && currentDependencyInputHash && reportInputHash === currentDependencyInputHash)
   const auditGeneratedAt = typeof report.generatedAt === 'string' ? report.generatedAt.trim() : ''
   const auditGeneratedAtMs = auditGeneratedAt ? Date.parse(auditGeneratedAt) : Number.NaN
@@ -250,10 +258,16 @@ export function acceptanceVerdictFromManualAudit(
   // validated when the current goal policy actually demands a numeric limit.
   const strictBounded = (field: string, min: number, max: number, label: string, required: boolean): number | undefined => {
     const raw = reportPolicy![field]
-    if (raw === undefined || raw === null || raw === '') { if (required) policySchemaGaps.push(label); return undefined }
-    const parsed = Number(raw)
-    if (!Number.isFinite(parsed) || parsed < min || parsed > max) { policySchemaGaps.push(`invalid ${label}`); return undefined }
-    return Math.trunc(parsed)
+    if (raw === undefined || raw === null) { if (required) policySchemaGaps.push(label); return undefined }
+    // R9: a policy snapshot is EVIDENCE, not user input. Only a finite integer
+    // number inside the accepted range is valid proof; booleans, arrays,
+    // numeric strings, fractions and objects are malformed evidence (fail
+    // closed) and are NEVER coerced or rounded into a usable value.
+    if (typeof raw !== 'number' || !Number.isFinite(raw) || !Number.isInteger(raw) || raw < min || raw > max) {
+      policySchemaGaps.push(`invalid ${label}`)
+      return undefined
+    }
+    return raw
   }
   if (reportPolicy) {
     const reportTarget = reportPolicy.targetLevel
@@ -288,7 +302,11 @@ export function acceptanceVerdictFromManualAudit(
   // A02: unrated/unknown-severity advisories make "no Critical/High" unproven.
   // A missing unknown total is a missing count, not a proven zero; both fail
   // closed. A proven U=0 report still accepts.
-  if (unknown === undefined && unknownPackages.length === 0) unverifiable.push('Unknown-severity (unrated) vulnerability total is missing from the audit report.')
+  // R10: unrated FINDINGS (advisory level) block even when the containing
+  // package was rated -- an aggregate packageTotals.unknown=0 must never
+  // suppress explicitly detected unknown-severity advisories.
+  if (hasUnratedFindings) unverifiable.push(`Unrated/unknown-severity advisory findings present (${unknownFindings}): absence of Critical/High beyond the rated part is not proven.`)
+  else if (unknown === undefined && unknownPackages.length === 0) unverifiable.push('Unknown-severity (unrated) vulnerability total is missing from the audit report.')
   else if (effectiveUnknown > 0) unverifiable.push(`Unrated/unknown-severity vulnerabilities present (${effectiveUnknown}): absence of Critical/High is not proven.`)
   if (!reportInputHash) unverifiable.push('Audit report is not bound to dependencyInputHash.')
   else if (!dependencyEvidenceFresh) unverifiable.push('package.json/lockfile inputs changed after the audit.')

@@ -344,5 +344,182 @@ class G5FastStopPolicyTests(unittest.TestCase):
         self.assertTrue(satisfied)
 
 
+class R6UniqueNamePolicyTests(unittest.TestCase):
+    """R6: the Fast policy gate measures the security limits in unique PACKAGE
+    NAMES per severity over the whole active scope -- not in rows and not in
+    findings. Two scope rows of one package (runtime+dev) are ONE offender; a
+    single package whose exact chosen version carries two findings is still
+    ONE name. Absence of exact-version OSV evidence counts as unknown, never
+    as a clean bill."""
+
+    def _gate(self, rows, candidate, *, max_high=1) -> bool:
+        current = {r.name: r.current_version for r in rows}
+        with mock.patch.dict(os.environ, {"DEPLOOM_ACCEPTANCE_POLICY_JSON": json.dumps(
+            {"targetLevel": "yellow", "minLagOkPct": 80, "maxKnownCritical": 0, "maxKnownHigh": max_high}
+        )}):
+            return generator._candidate_satisfies_fast_policy(
+                rows=rows, candidate_targets=candidate, current_targets=current,
+                active_names=set(r.name for r in rows), project_name="app",
+            )
+
+    def test_r6_two_rows_of_same_package_count_once(self) -> None:
+        # runtime + dev rows of the SAME package, each H:1 at the chosen
+        # version: one offending NAME -> allowed at maxKnownHigh=1. The old
+        # row-counted gate saw 2 rows and blocked.
+        rows = [
+            _row("pkg", vulns="C:0;H:1;M:0;L:0", current="1.0.0", evidence={"2.0.0": "C:0;H:1;M:0;L:0"}),
+            _row("pkg", vulns="C:0;H:1;M:0;L:0", current="1.0.0", evidence={"2.0.0": "C:0;H:1;M:0;L:0"}),
+        ]
+        self.assertTrue(self._gate(rows, {"pkg": "2.0.0"}, max_high=1),
+                        "one package name in two rows must count once")
+
+    def test_r6_two_different_packages_high_each_block(self) -> None:
+        # Two DISTINCT packages with H:1 each exceed maxKnownHigh=1: neither
+        # may hide behind the other's allowance.
+        rows = [
+            _row("a", vulns="C:0;H:1;M:0;L:0", current="1.0.0", evidence={"2.0.0": "C:0;H:1;M:0;L:0"}),
+            _row("b", vulns="C:0;H:1;M:0;L:0", current="1.0.0", evidence={"2.0.0": "C:0;H:1;M:0;L:0"}),
+        ]
+        self.assertFalse(self._gate(rows, {"a": "2.0.0", "b": "2.0.0"}, max_high=1))
+
+    def test_r6_two_findings_in_one_package_count_once(self) -> None:
+        # One package, H:2 at the chosen version: ONE offending name.
+        row = _row("pkg", vulns="C:0;H:2;M:0;L:0", current="1.0.0",
+                   evidence={"2.0.0": "C:0;H:2;M:0;L:0"})
+        self.assertTrue(self._gate([row], {"pkg": "2.0.0"}, max_high=1),
+                        "two findings inside one package are one name")
+
+    def test_r6_missing_evidence_for_chosen_version_is_unknown(self) -> None:
+        # No OSV evidence for the exact chosen version: not a name, not a
+        # zero -- unknown evidence blocks the goal.
+        row = _row("pkg", vulns="C:0;H:0;M:0;L:0", current="1.0.0", evidence={"2.0.0": "C:0;H:1;M:0;L:0"})
+        rows = [_row("pkg", vulns="C:0;H:0;M:0;L:0", current="1.0.0")]
+        self.assertFalse(self._gate(rows, {"pkg": "3.0.0"}, max_high=1),
+                         "a chosen version without OSV evidence must not satisfy the Fast goal")
+
+
+class R9R10PolicyVerdictTests(unittest.TestCase):
+    """R9/R10: the manual-audit verdict is built from the report's OWN policy
+    snapshot, which is EVIDENCE -- its numeric fields are validated strictly
+    (R9: a string/fraction/boolean is malformed evidence, never coerced), and
+    detected unrated FINDINGS block even when the containing package totals
+    show unknown=0 (R10)."""
+
+    def setUp(self) -> None:
+        self._tmp = Path(tempfile.mkdtemp(prefix="deploom-r9-"))
+        self.addCleanup(shutil.rmtree, self._tmp, True)
+        self.node = NodeDriver(self._tmp)
+
+    _BASE_POLICY = "{ targetLevel: 'yellow', minLagOkPct: 80, lagPolicyMonths: 3, maxKnownHigh: 1, maxKnownCritical: 0 }"
+
+    def _verdict(self, report_js: str, policy_js: str = _BASE_POLICY) -> dict:
+        project = self._tmp / "p"
+        _write(project / "package.json", json.dumps({"name": "demo", "dependencies": {"a": "1.0.0"}}))
+        _write(project / "yarn.lock", 'a@1.0.0:\n  version "1.0.0"\n')
+        return self.node.run(f"""
+import {{ dependencyInputIdentity, acceptanceVerdictFromManualAudit }} from '{_file_uri(ROOT / 'desktop' / 'dist-electron' / 'acceptance-policy.js')}'
+const project = '{_js(str(project))}'
+const identity = dependencyInputIdentity(project)
+const report = {report_js}
+report.dependencyInputHash = identity.hash
+report.generatedAt = new Date(Date.now() - 30 * 1000).toISOString()
+const policy = {policy_js}
+const verdict = acceptanceVerdictFromManualAudit(report, identity.hash, policy)
+console.log(JSON.stringify({{ status: verdict.status, reasons: verdict.reasons, unknownFindings: verdict.unknownFindings, unknown: verdict.unknown }}))
+"""
+        )
+
+    def test_r9_control_verified(self) -> None:
+        out = self._verdict(
+            "{ auditComplete: true, audit: { complete: true, engine: 'npm-native',"
+            " packageTotals: { critical: 0, high: 0, moderate: 0, low: 0, unknown: 0 },"
+            " advisoryTotals: { unknown: 0 }, lagOkPct: 100, lagOk: 1, lagTotal: 1, lagUnknown: 0 },"
+            " policy: { targetLevel: 'yellow', minLagOkPct: 80, lagPolicyMonths: 3, maxKnownHigh: 1, maxKnownCritical: 0 } }"
+        )
+        self.assertEqual("ACCEPTED", out["status"], out)
+
+    def test_r9_snapshot_string_percent_fails_closed(self) -> None:
+        # The snapshot carries minLagOkPct as the STRING '80' (e.g. a form
+        # field). That is malformed evidence: it must fail closed with an
+        # 'invalid minLagOkPct' schema gap, never be coerced into a match.
+        out = self._verdict(
+            "{ auditComplete: true, audit: { complete: true, engine: 'npm-native',"
+            " packageTotals: { critical: 0, high: 0, moderate: 0, low: 0, unknown: 0 },"
+            " advisoryTotals: { unknown: 0 }, lagOkPct: 100, lagOk: 1, lagTotal: 1, lagUnknown: 0 },"
+            " policy: { targetLevel: 'yellow', minLagOkPct: '80', lagPolicyMonths: 3, maxKnownHigh: 1, maxKnownCritical: 0 } }"
+        )
+        self.assertEqual("UNKNOWN", out["status"], out)
+        self.assertTrue(any("invalid minLagOkPct" in r for r in out["reasons"]), out)
+
+    def test_r9_snapshot_fraction_fails_closed(self) -> None:
+        out = self._verdict(
+            "{ auditComplete: true, audit: { complete: true, engine: 'npm-native',"
+            " packageTotals: { critical: 0, high: 0, moderate: 0, low: 0, unknown: 0 },"
+            " advisoryTotals: { unknown: 0 }, lagOkPct: 100, lagOk: 1, lagTotal: 1, lagUnknown: 0 },"
+            " policy: { targetLevel: 'yellow', minLagOkPct: 80.5, lagPolicyMonths: 3, maxKnownHigh: 1, maxKnownCritical: 0 } }"
+        )
+        self.assertEqual("UNKNOWN", out["status"], out)
+        self.assertTrue(any("invalid minLagOkPct" in r for r in out["reasons"]), out)
+
+    def test_r9_snapshot_boolean_months_fails_closed(self) -> None:
+        out = self._verdict(
+            "{ auditComplete: true, audit: { complete: true, engine: 'npm-native',"
+            " packageTotals: { critical: 0, high: 0, moderate: 0, low: 0, unknown: 0 },"
+            " advisoryTotals: { unknown: 0 }, lagOkPct: 100, lagOk: 1, lagTotal: 1, lagUnknown: 0 },"
+            " policy: { targetLevel: 'yellow', minLagOkPct: 80, lagPolicyMonths: true, maxKnownHigh: 1, maxKnownCritical: 0 } }"
+        )
+        self.assertEqual("UNKNOWN", out["status"], out)
+        self.assertTrue(any("invalid lagPolicyMonths" in r for r in out["reasons"]), out)
+
+    def test_r9_snapshot_string_high_fails_closed(self) -> None:
+        out = self._verdict(
+            "{ auditComplete: true, audit: { complete: true, engine: 'npm-native',"
+            " packageTotals: { critical: 0, high: 0, moderate: 0, low: 0, unknown: 0 },"
+            " advisoryTotals: { unknown: 0 }, lagOkPct: 100, lagOk: 1, lagTotal: 1, lagUnknown: 0 },"
+            " policy: { targetLevel: 'yellow', minLagOkPct: 80, lagPolicyMonths: 3, maxKnownHigh: '1', maxKnownCritical: 0 } }"
+        )
+        self.assertEqual("UNKNOWN", out["status"], out)
+        self.assertTrue(any("invalid maxKnownHigh" in r for r in out["reasons"]), out)
+
+    def test_r10_unrated_findings_block_rated_packages(self) -> None:
+        # R10: the containing package was RATED (packageTotals.unknown=0), yet
+        # the audit detected one unrated/unknown-severity advisory FINDING. The
+        # verdict must not silently pass; the finding-level counter blocks.
+        out = self._verdict(
+            "{ auditComplete: true, audit: { complete: true, engine: 'npm-native',"
+            " packageTotals: { critical: 0, high: 0, moderate: 0, low: 0, unknown: 0 },"
+            " advisoryTotals: { unknown: 1 }, lagOkPct: 100, lagOk: 1, lagTotal: 1, lagUnknown: 0 },"
+            " policy: { targetLevel: 'yellow', minLagOkPct: 80, lagPolicyMonths: 3, maxKnownHigh: 1, maxKnownCritical: 0 } }"
+        )
+        self.assertEqual("UNKNOWN", out["status"], out)
+        self.assertEqual(1, out["unknownFindings"], out)
+        self.assertTrue(any("advisory findings present" in r for r in out["reasons"]), out)
+
+    def test_r10_package_unknown_total_still_blocks(self) -> None:
+        # A02 regression control: packageTotals.unknown=1 (package marked
+        # unrated) still blocks even with no advisoryTotals at all.
+        out = self._verdict(
+            "{ auditComplete: true, audit: { complete: true, engine: 'npm-native',"
+            " packageTotals: { critical: 0, high: 0, moderate: 0, low: 0, unknown: 1 },"
+            " lagOkPct: 100, lagOk: 1, lagTotal: 1, lagUnknown: 0 },"
+            " policy: { targetLevel: 'yellow', minLagOkPct: 80, lagPolicyMonths: 3, maxKnownHigh: 1, maxKnownCritical: 0 } }"
+        )
+        self.assertEqual("UNKNOWN", out["status"], out)
+        self.assertEqual(1, out["unknown"], out)
+        self.assertTrue(any("vulnerabilities present" in r for r in out["reasons"]), out)
+
+    def test_r10_missing_unknown_total_blocks(self) -> None:
+        # A02 regression control: a report that records NO unrated/unknown
+        # evidence at all fails closed, not passes.
+        out = self._verdict(
+            "{ auditComplete: true, audit: { complete: true, engine: 'npm-native',"
+            " packageTotals: { critical: 0, high: 0, moderate: 0, low: 0 },"
+            " lagOkPct: 100, lagOk: 1, lagTotal: 1, lagUnknown: 0 },"
+            " policy: { targetLevel: 'yellow', minLagOkPct: 80, lagPolicyMonths: 3, maxKnownHigh: 1, maxKnownCritical: 0 } }"
+        )
+        self.assertEqual("UNKNOWN", out["status"], out)
+        self.assertTrue(any("total is missing" in r for r in out["reasons"]), out)
+
+
 if __name__ == "__main__":
     unittest.main()

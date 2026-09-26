@@ -104,9 +104,11 @@ class A10RollbackSafetyTests(unittest.TestCase):
         self.assertIn("Invoke-SafeReleaseRollback", handler)
 
     def test_tag_reuse_for_partial_publication_recovery(self) -> None:
-        """A10-4: rerun after a failed tag push reuses the local tag only when
-        it points at the exact release commit and refuses to move it."""
-        self.assertIn("git rev-parse -q --verify \"refs/tags/$Tag\"", SCRIPT)
+        """A10-4/R1: rerun after a failed tag push reuses the local tag only
+        when it points at the exact release commit and refuses to move it --
+        the comparison peels ^{} because an annotated tag object sha never
+        equals the commit."""
+        self.assertIn("git rev-parse -q --verify \"refs/tags/$Tag^{}\"", SCRIPT)
         self.assertIn("refusing to move it", SCRIPT)
 
     def test_version_commit_and_release_sha_are_captured(self) -> None:
@@ -115,6 +117,79 @@ class A10RollbackSafetyTests(unittest.TestCase):
         version_commit_pos = SCRIPT.index("$VersionCommitCreated = $true")
         release_sha_pos = SCRIPT.index("$ReleaseCommit = (& git rev-parse HEAD).Trim()")
         self.assertLess(version_commit_pos, release_sha_pos)
+
+
+class R1ReleaseReexecutionTests(unittest.TestCase):
+    """R1: a re-run of an already-published (or partially-published) version
+    is a retry, not a second release: it must REUSE a matching tag and REFUSE
+    (never overwrite, never move) a mismatching one -- both on the remote and
+    locally, in the preflight (before any commit) and again at tag creation.
+    All tag comparisons must use the PEELED commit (^{}), and $null from
+    `git rev-parse -q` must be flattened before method calls."""
+
+    def test_tag_checked_before_any_commit(self) -> None:
+        """R1: the remote/local tag state is verified in preflight, strictly
+        before COMMIT 1 starts, so a foreign tag is never an after-the-fact
+        discovery."""
+        check_tag_pos = SCRIPT.index("== Check tag ==")
+        commit1_pos = SCRIPT.index("== Commit current changes ==")
+        self.assertLess(check_tag_pos, commit1_pos)
+
+    def test_remote_tag_peeled_and_never_overwritten(self) -> None:
+        """R1: an existing remote tag is peeled (^{}) and either REUSED when it
+        matches HEAD or refused -- never deleted and re-pushed."""
+        self.assertIn("refs/tags/$Tag^{}", SCRIPT)
+        self.assertIn('$RemotePeeled -ne $HeadSha', SCRIPT)
+        self.assertIn("refusing to overwrite the remote tag", SCRIPT)
+        self.assertIn("the retry will reuse it", SCRIPT)
+        # Recovery by reuse means no delete/force: the tag is pushed plainly.
+        tag_region = SCRIPT[SCRIPT.index("== Create tag =="):SCRIPT.index("RELEASE COMPLETED")]
+        self.assertNotIn("--force", tag_region)
+        self.assertIn('& git push $Remote "refs/tags/$Tag"', SCRIPT)
+
+    def test_local_tag_preflight_peeled_and_null_safe(self) -> None:
+        """R1: the preflight local-tag check peels with ^{} (annotated tag
+        object sha != commit) and flattens the -q $null result before calling
+        .Trim() on it."""
+        rev_parse_pos = SCRIPT.index(
+            '& git rev-parse -q --verify "refs/tags/$Tag^{}" 2>$null'
+        )
+        self.assertLess(rev_parse_pos, SCRIPT.index("== Commit current changes =="))
+        self.assertIn(
+            '(& git rev-parse -q --verify "refs/tags/$Tag^{}" 2>$null) -join ""',
+            SCRIPT,
+        )
+        self.assertIn("refusing to move it", SCRIPT)
+        self.assertIn("the retry will reuse it", SCRIPT)
+
+    def test_tag_creation_reuses_existing_commit_and_never_moves(self) -> None:
+        """R1/A10: at tag-creation time the existing local tag is compared
+        against the exact release commit (peeled); on a match the tag is
+        REUSED, otherwise the script throws -- `git tag -a` may only create a
+        tag that does not exist yet."""
+        create_section = SCRIPT.index("== Create tag ==")
+        existing = SCRIPT.index("$ExistingTagCommit = (", create_section)
+        compare = SCRIPT.index("$ExistingTagCommit -ne $ReleaseCommit", create_section)
+        reuse = SCRIPT.index("reusing it", create_section)
+        create = SCRIPT.index("& git tag -a $Tag", create_section)
+        self.assertLess(existing, compare)
+        self.assertIn("refusing to move it", SCRIPT[compare:create])
+        self.assertLess(reuse, create, "a reusable tag must not be re-created")
+        self.assertGreater(create, compare)
+        # The reuse branch must not call git tag -a at all.
+        reuse_branch = SCRIPT[reuse:create]
+        self.assertNotIn("git tag -a", reuse_branch)
+
+    def test_version_idempotency_skips_second_version_commit(self) -> None:
+        """R1: when the version files already match (package.json, lock, and
+        VERSION), the version commit is skipped and COMMIT 2 is guarded by the
+        same flag -- a retry never commits a no-op version bump."""
+        self.assertIn("$VersionAlreadyCurrent", SCRIPT)
+        self.assertIn("no version commit is required", SCRIPT)
+        self.assertIn("$CurrentPackageVersion -eq $Version", SCRIPT)
+        self.assertIn("$CurrentPackageLockVersion -eq $Version", SCRIPT)
+        self.assertIn("$CurrentVersionFileValue -eq $Version", SCRIPT)
+        self.assertIn("if (-not $VersionAlreadyCurrent)", SCRIPT)
 
 
 if __name__ == "__main__":
