@@ -46,25 +46,39 @@ const normalizeBudgetField = (raw) => ({ budgetMinutesExplicit: typeof raw?.budg
 const migStart = source.indexOf('function legacyArtifactSlug(')
 const migEnd = source.indexOf('function saveBaselineIntent(', migStart)
 if (migStart < 0 || migEnd < 0) throw new Error('R2: intent-migration slice not found in main.ts')
+// N1: ownership of a legacy file is decided against the workspace's project
+// list, so the check injects readProjects over a mutable project set.
+let PROJECTS = []
+const readProjects = () => PROJECTS
 const intentGlobals = {
   join, existsSync: fs.existsSync, readFileSync: fs.readFileSync,
   atomicWriteJsonSync, projectArtifactToken, normalizeBaselineIntent, normalizeBudgetField,
+  readProjects,
 }
 const intentApi = compile(
   trans(source.slice(migStart, migEnd)),
   intentGlobals,
-  ['legacyArtifactSlug', 'legacyBaselineIntentPath', 'migrateLegacyBaselineIntent', 'loadBaselineIntent', 'baselineIntentHasPersistedBudgetMinutes'],
+  ['legacyArtifactSlug', 'legacyBaselineIntentPath', 'legacySlugProjectCount', 'legacyIntentResolutionNeeded',
+   'migrateLegacyBaselineIntent', 'loadBaselineIntent', 'baselineIntentHasPersistedBudgetMinutes'],
 )
 
-// The output-dir fallback (join/existsSync/projectArtifactToken/legacyArtifactSlug).
-const outStart = source.indexOf('function baselineProjectOutputDir(')
+// The output-dir resolvers (join/existsSync/projectArtifactToken/legacyArtifactSlug +
+// legacySlugProjectCount over the injected project list).
+const outStart = source.indexOf('function baselineProjectOutputWriteDir(')
 const outEnd = source.indexOf('function snapshotProjectArtifacts(', outStart)
-if (outStart < 0 || outEnd < 0) throw new Error('R2: baselineProjectOutputDir slice not found in main.ts')
-const { baselineProjectOutputDir } = compile(
+if (outStart < 0 || outEnd < 0) throw new Error('R2/N1: baselineProjectOutputWriteDir slice not found in main.ts')
+const outGlobals = {
+  join, existsSync: fs.existsSync, projectArtifactToken, legacyArtifactSlug: intentApi.legacyArtifactSlug,
+  legacySlugProjectCount: intentApi.legacySlugProjectCount, readProjects,
+}
+const outApi = compile(
   trans(source.slice(outStart, outEnd)),
-  { join, existsSync: fs.existsSync, projectArtifactToken, legacyArtifactSlug: intentApi.legacyArtifactSlug },
-  ['baselineProjectOutputDir'],
+  outGlobals,
+  ['baselineProjectOutputDir', 'baselineProjectOutputWriteDir'],
 )
+const baselineProjectOutputDir = outApi.baselineProjectOutputDir
+const baselineProjectOutputWriteDir = outApi.baselineProjectOutputWriteDir
+const legacyIntentResolutionNeeded = intentApi.legacyIntentResolutionNeeded
 
 // Both read paths must migrate the legacy file before reading the current one.
 const reads = source.slice(migStart, migEnd)
@@ -81,9 +95,14 @@ try {
   const legacyIntentPath = slash(path.join('baseline-intent', `${intentApi.legacyArtifactSlug(project)}.json`))
   const currentIntentPath = slash(path.join('baseline-intent', `${token}.json`))
 
-  // 1. A well-formed legacy intent migrates to the hashed path with its
-  //    content preserved; the legacy file stays untouched (downgrade-safe).
-  const legacyPayload = { schemaVersion: 1, executionMode: 'BACKGROUND', policies: {}, budgetMinutes: 60 }
+  // 1. A well-formed full legacy intent (mode, target, lag window, explicit
+  //    budget, package policy) migrates to the hashed path with EVERY field
+  //    preserved; the legacy file stays untouched (downgrade-safe).
+  const legacyPayload = {
+    schemaVersion: 1, executionMode: 'BACKGROUND', targetLevel: 'yellow', minLagOkPct: 90,
+    lagPolicyMonths: 6, budgetMinutes: 60,
+    policies: { 'left-pad': 'required', 'ansi-regex': 'keep-current' },
+  }
   fs.mkdirSync(path.dirname(legacyIntentPath), { recursive: true })
   fs.writeFileSync(legacyIntentPath, JSON.stringify(legacyPayload, null, 2), 'utf8')
   intentApi.migrateLegacyBaselineIntent(workspace, project)
@@ -154,6 +173,74 @@ try {
   if (baselineProjectOutputDir({ path: ws4 }, project) !== ws4Hashed) {
     throw new Error('R2: a project without any legacy output dir must use the hashed dir')
   }
+
+  // N1-7. An AMBIGUOUS legacy slug must never be assigned to either project.
+  // Two distinct projects slugify to the same 'project' key; ONE legacy file
+  // cannot be attributed to either, so it is preserved untouched, no hashed
+  // file is written for any of them, and a clear resolution reason is surfaced.
+  PROJECTS = []
+  const wsAmb = path.join(wsRoot, 'ws-amb')
+  const projectA = 'Проект один'
+  const projectB = 'Проект два'
+  const ambSlug = intentApi.legacyArtifactSlug(projectA)
+  if (ambSlug !== intentApi.legacyArtifactSlug(projectB)) {
+    throw new Error('R2/N1: fixture projects must share the lossy legacy slug')
+  }
+  const ambLegacy = path.join(wsAmb, '.dependency-roadmap', 'desktop', 'baseline-intent', `${ambSlug}.json`)
+  const ambTokenA = path.join(wsAmb, '.dependency-roadmap', 'desktop', 'baseline-intent', `${projectArtifactToken(projectA)}.json`)
+  const ambTokenB = path.join(wsAmb, '.dependency-roadmap', 'desktop', 'baseline-intent', `${projectArtifactToken(projectB)}.json`)
+  fs.mkdirSync(path.dirname(ambLegacy), { recursive: true })
+  fs.writeFileSync(ambLegacy, JSON.stringify({ schemaVersion: 1, executionMode: 'BACKGROUND', policies: { 'shared-pkg': 'required' }, budgetMinutes: 60 }), 'utf8')
+  PROJECTS = [{ name: projectA, path: wsAmb }, { name: projectB, path: wsAmb }]
+  intentApi.migrateLegacyBaselineIntent({ path: wsAmb }, projectA)
+  intentApi.migrateLegacyBaselineIntent({ path: wsAmb }, projectB)
+  if (fs.existsSync(ambTokenA) || fs.existsSync(ambTokenB)) {
+    throw new Error('R2/N1: an ambiguous legacy intent must never be assigned to either project')
+  }
+  if (!fs.existsSync(ambLegacy)) throw new Error('R2/N1: the ambiguous legacy file must be preserved untouched')
+  if (!legacyIntentResolutionNeeded({ path: wsAmb }, projectA)) {
+    throw new Error('R2/N1: an ambiguous legacy intent must surface a resolution reason for BOTH projects')
+  }
+  if (!legacyIntentResolutionNeeded({ path: wsAmb }, projectB)) {
+    throw new Error('R2/N1: an ambiguous legacy intent must surface a resolution reason')
+  }
+  if (intentApi.loadBaselineIntent({ path: wsAmb }, projectA)?.executionMode === 'BACKGROUND') {
+    throw new Error('R2/N1: an ambiguous legacy intent must NOT silently become one project\'s settings')
+  }
+  if (intentApi.baselineIntentHasPersistedBudgetMinutes({ path: wsAmb }, projectA)) {
+    throw new Error('R2/N1: an ambiguous legacy intent must not report a persisted budget')
+  }
+
+  // N1-8. A NEW baseline writes into the project-unique hashed dir; a shared
+  // legacy output dir is never a write destination, and the legacy READ
+  // fallback is refused while the slug is ambiguous.
+  PROJECTS = [{ name: projectA, path: wsAmb }, { name: projectB, path: wsAmb }]
+  const ambLegacyOut = path.join(wsAmb, '.dependency-roadmap', 'desktop', 'baseline-project-output', ambSlug)
+  fs.mkdirSync(ambLegacyOut, { recursive: true })
+  const writeA = baselineProjectOutputWriteDir({ path: wsAmb }, projectA)
+  const writeB = baselineProjectOutputWriteDir({ path: wsAmb }, projectB)
+  if (writeA === writeB) {
+    throw new Error('R2/N1: two projects must never share a baseline output WRITE destination')
+  }
+  if (writeA === ambLegacyOut || writeB === ambLegacyOut) {
+    throw new Error('R2/N1: the legacy output dir must never be a WRITE destination')
+  }
+  if (!writeA.endsWith(projectArtifactToken(projectA)) || !writeB.endsWith(projectArtifactToken(projectB))) {
+    throw new Error('R2/N1: write destinations must be the per-project hashed dirs')
+  }
+  if (baselineProjectOutputDir({ path: wsAmb }, projectA) !== writeA) {
+    throw new Error('R2/N1: an ambiguous legacy output slug must not be used as a read fallback for either project')
+  }
+  // With ONE unambiguous project the legacy output dir stays a read fallback.
+  PROJECTS = []
+  const wsUnamb = path.join(wsRoot, 'ws-unamb')
+  const unambLegacyOut = path.join(wsUnamb, '.dependency-roadmap', 'desktop', 'baseline-project-output', intentApi.legacyArtifactSlug(project))
+  fs.mkdirSync(unambLegacyOut, { recursive: true })
+  PROJECTS = [{ name: project, path: wsUnamb }]
+  if (baselineProjectOutputDir({ path: wsUnamb }, project) !== unambLegacyOut) {
+    throw new Error('R2/N1: an unambiguous project keeps the legacy output read fallback')
+  }
+  PROJECTS = []
 
   console.log('Baseline legacy-artifact migration (R2) OK')
 } finally {

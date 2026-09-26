@@ -166,7 +166,7 @@ class A03DomHealthAuthorityTests(unittest.TestCase):
     the embedded project policy (never a hardcoded 80/20) and never
     fabricates green without a policy or security evidence."""
 
-    def _evaluate(self, rows_js: str, project_health_js: str, project_policy_js: str = "null") -> dict:
+    def _evaluate(self, rows_js: str, project_health_js: str, project_policy_js: str = "null", mode: str = "default") -> dict:
         probe = r"""
 const fs = require('node:fs');
 const source = fs.readFileSync(process.argv[2], 'utf8');
@@ -187,7 +187,7 @@ function row(current, lag, vulns = 'C:0, H:0, M:0, L:0, U:0', excluded = '0') {
 }
 const rows = __ROWS__;
 const section = { dataset: { projectSection: 'fixture' }, querySelectorAll: () => rows };
-const document = { getElementById: () => ({ value: 'default' }) };
+const document = { getElementById: () => ({ value: '__MODE__' }) };
 const healthJs = __PROJECT_HEALTH__;
 // The producer embeds dom_fingerprint; inject it for the rows under test when
 // the test did not pin its own (so a stale/mismatch scenario can be built).
@@ -207,7 +207,8 @@ console.log(JSON.stringify(result));
         body = (probe
                 .replace("__ROWS__", rows_js)
                 .replace("__PROJECT_HEALTH__", project_health_js)
-                .replace("__PROJECT_POLICY__", project_policy_js))
+                .replace("__PROJECT_POLICY__", project_policy_js)
+                .replace("__MODE__", mode))
         script = ROOT / "probe-a03-2026-09-25.cjs"
         script.write_text(body, encoding="utf-8")
         try:
@@ -262,9 +263,10 @@ console.log(fingerprintOf(section, document));
                 pass
 
     def _ok_row(self, current: str = "1.0.0", vulns: str = "C:0, H:0, M:0, L:0, U:0", lag: str = "1.0.0",
-                excluded: str = "0", window: str = "12") -> str:
-        return ("{ dataset: { current: '%s', vulns: '%s', lagThresholdMonths: '%s', scopeExcluded: '%s' }, "
-                "getAttribute: () => '%s' }" % (current, vulns, window, excluded, lag))
+                excluded: str = "0", window: str = "12", target_yellow: str = "", target_green: str = "") -> str:
+        return ("{ dataset: { current: '%s', vulns: '%s', lagThresholdMonths: '%s', scopeExcluded: '%s', "
+                "targetYellow: '%s', targetGreen: '%s' }, "
+                "getAttribute: () => '%s' }" % (current, vulns, window, excluded, target_yellow, target_green, lag))
 
     def test_authoritative_project_health_wins_over_dom(self) -> None:
         # The DOM looks "100% healthy" (one known-ok row, rest with lag target),
@@ -397,10 +399,12 @@ console.log(fingerprintOf(section, document));
         self.assertEqual("green", result["status"])
         self.assertEqual(100.0, result["lag_ok_pct"])
 
-    def test_lag80_not_green_under_green_policy(self) -> None:
-        # R5: 80% scope compliance at 10 rows is acceptable at an 80% policy but
-        # NOT at a green (100%) policy -- the recompute uses the REAL policy,
-        # not a hardcoded 80 threshold.
+    def test_lag80_is_yellow_not_green_under_any_policy(self) -> None:
+        # N2: meeting the CHOSEN policy (yellow 80%) is a yellow gate, not an
+        # absolute health colour. An 80%-compliant scope still has lag_bad =
+        # 2 rows out of 10 and must NEVER render green -- green requires the
+        # WHOLE active scope to satisfy the lag policy (lag_bad == 0), C=0, H=0
+        # and no unknown security, regardless of the policy's latitude.
         rows = "[" + ",".join([self._ok_row() for _ in range(8)]
                               + [self._ok_row(lag="9.0.0") for _ in range(2)]) + "]"
         yellow = self._evaluate(rows, "{}",
@@ -409,9 +413,95 @@ console.log(fingerprintOf(section, document));
         green = self._evaluate(rows, "{}",
                                json.dumps({"targetLevel": "green", "minLagOkPct": 100, "lagPolicyMonths": 12,
                                            "maxKnownCritical": 0, "maxKnownHigh": 0, "maxKnownModerate": 20, "maxKnownLow": 20}))
-        self.assertEqual("green", yellow["status"], "80% compliance may be green at an 80% policy")
+        self.assertNotEqual("green", yellow["status"], "N2: yellow tolerance must never relax green; 80% is yellow")
+        self.assertAlmostEqual(80.0, yellow["lag_ok_pct"], places=4)
+        self.assertEqual(2, yellow["lag_bad_12m"], "N2: reason must reflect the real lagging count")
+        self.assertNotIn("0 нарушений", yellow["reason"], "N2: reason must not claim zero violations while a row lags")
         self.assertNotEqual("green", green["status"], "R5: 80% compliance is NOT green under a 100% policy")
-        self.assertAlmostEqual(80.0, green["lag_ok_pct"], places=4)
+
+    def test_recompute_lag80_never_green_with_reason_reflecting_lag_bad(self) -> None:
+        # N2 reproduction 1: 5 active packages, 4 satisfy the lag policy, one
+        # lags, no vulnerabilities; yellow 80% policy. The recompute previously
+        # awarded GREEN while claiming "0 нарушений lag-policy" although
+        # lag_bad_12m = 1 -- green must be YELLOW with an honest reason.
+        rows = "[" + ",".join([self._ok_row(lag="1.0.0") for _ in range(4)]
+                              + [self._ok_row(lag="9.0.0")]) + "]"
+        policy = json.dumps({"targetLevel": "yellow", "minLagOkPct": 80, "lagPolicyMonths": 12,
+                             "maxKnownCritical": 0, "maxKnownHigh": 1, "maxKnownModerate": 20, "maxKnownLow": 20})
+        result = self._evaluate(rows, "{}", policy)
+        self.assertNotEqual("green", result["status"], "N2: 4/5 lag-ok at an 80% policy must be yellow, not green")
+        self.assertEqual(1, result["lag_bad_12m"])
+        self.assertAlmostEqual(80.0, result["lag_ok_pct"], places=4)
+        self.assertNotIn("0 нарушений", result["reason"], "N2: reason must not claim zero violations while a row lags")
+        self.assertIn("соблюдают", result["reason"])
+
+    def test_recompute_high1_never_green_under_yellow_policy(self) -> None:
+        # N2 reproduction 2: a fully lag-compliant scope carrying H:1 under a
+        # yellow policy that ALLOWS one High. Green is an absolute colour: any
+        # remaining High keeps the status yellow, whatever maxKnownHigh says.
+        rows = "[" + self._ok_row(vulns="C:0, H:1, M:0, L:0, U:0") + "]"
+        policy = json.dumps({"targetLevel": "yellow", "minLagOkPct": 80, "lagPolicyMonths": 12,
+                             "maxKnownCritical": 0, "maxKnownHigh": 1, "maxKnownModerate": 20, "maxKnownLow": 20})
+        result = self._evaluate(rows, "{}", policy)
+        self.assertNotEqual("green", result["status"], "N2: H=1 must never render green, even at maxKnownHigh=1")
+        self.assertEqual(1, result["high"])
+        self.assertIn("High остаются: 1", result["reason"])
+
+    def test_recompute_green_requires_whole_scope_lag_ok(self) -> None:
+        # Control: 5/5 lag-ok, C=H=U=0, known security -> green, still reachable
+        # under the same yellow 80% policy once the scope is FULLY compliant.
+        rows = "[" + ",".join([self._ok_row(lag="1.0.0") for _ in range(5)]) + "]"
+        policy = json.dumps({"targetLevel": "yellow", "minLagOkPct": 80, "lagPolicyMonths": 12,
+                             "maxKnownCritical": 0, "maxKnownHigh": 1, "maxKnownModerate": 20, "maxKnownLow": 20})
+        result = self._evaluate(rows, "{}", policy)
+        self.assertEqual("green", result["status"])
+        self.assertAlmostEqual(100.0, result["lag_ok_pct"], places=4)
+
+    def test_recompute_yellow_projection_is_computed_never_unconditional_zero(self) -> None:
+        # N2: the recompute must not publish unconditional yellow_* zeros. The
+        # projection counts rows that would become lag-ok at the row's YELLOW
+        # planned target, against the planning reserve (minLagOkPct+5).
+        rows = "[" + ",".join([
+            self._ok_row(lag="1.0.0"),                              # already lag-ok
+            self._ok_row(lag="9.0.0", target_yellow="12.0.0"),      # lags now, planned yellow target closes it
+        ]) + "]"
+        policy = json.dumps({"targetLevel": "yellow", "minLagOkPct": 80, "lagPolicyMonths": 12,
+                             "maxKnownCritical": 0, "maxKnownHigh": 1, "maxKnownModerate": 20, "maxKnownLow": 20})
+        result = self._evaluate(rows, "{}", policy)
+        self.assertEqual(2, result["yellow_projected_lag_ok"], "N2: the row closed by its yellow target must be projected lag-ok")
+        self.assertAlmostEqual(100.0, result["yellow_projected_lag_pct"], places=4)
+        self.assertEqual(0, result["yellow_plan_shortfall"])
+        self.assertEqual(2, result["yellow_plan_required"])
+        # Without a planned yellow target the lagging row stays unprojected.
+        rows2 = "[" + ",".join([
+            self._ok_row(lag="1.0.0"),
+            self._ok_row(lag="9.0.0", target_yellow=""),
+        ]) + "]"
+        result2 = self._evaluate(rows2, "{}", policy)
+        self.assertEqual(1, result2["yellow_projected_lag_ok"])
+        self.assertAlmostEqual(50.0, result2["yellow_projected_lag_pct"], places=4)
+        self.assertEqual(1, result2["yellow_plan_shortfall"], "N2: shortfall = reserve (2) minus projected (1)")
+
+    def test_target_mode_switch_invalidates_authoritative_snapshot(self) -> None:
+        # N2: domHealthFingerprint embeds targetMode. Switching the mode after
+        # generation makes the producer's snapshot stale, so the recompute must
+        # re-evaluate with the embedded policy -- a stale GREEN over a 4/5
+        # lag-ok scope must not survive a yellow->green mode edit either, and a
+        # stale RED must not become green just because the mode changed.
+        rows = "[" + ",".join([self._ok_row(lag="1.0.0") for _ in range(4)]
+                              + [self._ok_row(lag="9.0.0")]) + "]"
+        stale_fp = self._fingerprint_for(rows)
+        stale = json.dumps({
+            "fixture": {"status": "green", "scope_total": 5, "scope_lag_ok": 5, "scope_lag_pct": 100.0,
+                        "lag_unknown": 0, "critical": 0, "high": 0, "moderate": 0, "low": 0, "unknown": 0,
+                        "reason": "", "dom_fingerprint": stale_fp},
+        })
+        policy = json.dumps({"targetLevel": "yellow", "minLagOkPct": 80, "lagPolicyMonths": 12,
+                             "maxKnownCritical": 0, "maxKnownHigh": 1, "maxKnownModerate": 20, "maxKnownLow": 20})
+        result = self._evaluate(rows, stale, policy, mode="green")
+        self.assertNotEqual("green", result["status"],
+                            "N2: a target-mode edit invalidates the snapshot; 4/5 lag-ok is yellow, never the stale green")
+        self.assertAlmostEqual(80.0, result["lag_ok_pct"], places=4)
 
 
 class A09RestoreAuthorizationTests(unittest.TestCase):

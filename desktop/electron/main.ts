@@ -78,7 +78,7 @@ type BaselineDeferredCohort = { id: string; label: string; packages: string[]; p
 type BaselineCohortAction = { kind: 'DEFER' | 'REACTIVATE'; cohortId: string; label: string; packages: string[]; predicate?: string; confidence?: number; decisionId?: string }
 type BaselineIntent = { schemaVersion: 1 | 2; policies: Record<string, BaselinePackagePolicy>; controlMode?: BaselineControlMode; budgetMinutes?: number; acceptancePolicy?: AcceptancePolicy; extraIterations?: number; decisionGrantIterations?: number; searchMode?: BaselineSearchMode; executionMode?: BaselineExecutionMode; proofMode?: BaselineProofMode; deferredCohorts?: BaselineDeferredCohort[]; cohortAction?: BaselineCohortAction; targetLevel?: 'yellow' | 'green'; minLagOkPct?: number; lagPolicyMonths?: number; productMode?: 'fast' | 'deep' }
 type BaselineIntentCandidate = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string }
-type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent }
+type BaselineIntentPlan = { candidates: BaselineIntentCandidate[]; intent: BaselineIntent; legacyIntentResolutionNeeded?: string }
 type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
 type BaselineRecoveryInfo = { available: boolean; mode?: 'yellow' | 'green'; status?: string; phase?: string; updatedAt?: string; generation?: number; iteration?: number; lastAssignment?: string; lastPredicate?: string; learnedConstraints?: number; exactExclusions?: number; reason?: string }
 
@@ -419,10 +419,23 @@ const WORKSPACE_GLOBAL_ACTIONS = new Set<FlowAction>(['sync-tool', 'generate-all
 // root is that directory, but references/objects are shared with the main
 // repository (mainGitDir), so two linked worktrees of one repo still conflict
 // on the shared Git resource.
+// N3: the shared git dir is NEVER derived by splitting the gitdir path on a
+// 'worktrees' segment. That string surgery lost the POSIX root ('/repo/main/
+// .git/worktrees/w1' became the relative 'repo/main/.git') and can be fooled
+// by an unrelated parent folder literally named 'worktrees'. Git records the
+// real --git-common-dir in the linked worktree's own `commondir` metadata
+// file, expressed RELATIVE to that worktree's gitdir (for the main checkout no
+// commondir exists and the gitdir IS the common dir).
 function mainGitDirOf(gitDir: string): string {
-  const parts = normalize(gitDir).split(sep)
-  const worktreesIndex = parts.indexOf('worktrees')
-  return worktreesIndex > 0 ? join(...parts.slice(0, worktreesIndex)) : normalize(gitDir)
+  try {
+    const commonDir = readFileSync(join(gitDir, 'commondir'), 'utf8').trim()
+    if (commonDir) {
+      return normalize(resolve(gitDir, commonDir))
+    }
+  } catch {
+    /* not a linked-worktree gitdir: the gitdir itself is the shared git dir */
+  }
+  return normalize(gitDir)
 }
 
 function gitWorktreeIdentity(projectPath: string): { worktreeRoot: string; mainGitDir: string } | undefined {
@@ -649,20 +662,52 @@ function baselineIntentPath(workspace: WorkspaceRecord, projectName: string): st
   return join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-intent', `${projectArtifactToken(projectName)}.json`)
 }
 
+// N1: ownership of a legacy (pre-A08) state. The legacy slug is LOSSY: two
+// distinct project names ('Проект один'/'Проект два', 'foo/bar'/'foo-bar') can
+// slugify to the SAME key, so a matching legacy file is NOT proof it belongs
+// to the project being loaded. Ownership is only unambiguous when exactly one
+// project in the workspace maps to that slug. With more than one, the legacy
+// state is preserved untouched and neither project silently receives the
+// other's settings -- the loader falls back to defaults and a human-readable
+// resolution reason is surfaced so the user can choose/restore.
+function legacySlugProjectCount(workspace: WorkspaceRecord, legacySlug: string): number {
+  return readProjects(workspace).filter((project) => legacyArtifactSlug(project.name) === legacySlug).length
+}
+
+function legacyIntentResolutionNeeded(workspace: WorkspaceRecord, projectName: string): string | undefined {
+  if (!existsSync(legacyBaselineIntentPath(workspace, projectName))) return undefined
+  const slug = legacyArtifactSlug(projectName)
+  if (legacySlugProjectCount(workspace, slug) <= 1) return undefined
+  return (
+    `Обнаружен общий legacy-файл настроек '${legacyBaselineIntentPath(workspace, projectName)}' ` +
+    `(slug '${slug}'), на который отображается несколько проектов workspace. Настройки не перенесены ` +
+    `автоматически, чтобы не назначить чужое состояние; откройте настройки проекта и выберите/восстановите их заново.`
+  )
+}
+
 // R2: one-time read-time migration of a legacy intent file to the current
 // hashed path. The copy is atomic (temp + rename) and the legacy file is left
 // untouched, so a downgrade still reads it and a second run is a no-op (the
 // hashed path already exists). Only a well-formed JSON object migrates;
 // anything else is left alone and the loader falls back to defaults rather
-// than corrupting user data. Intents are unambiguous per project name: the
-// legacy slug is the only identity the old format carried, and each project
-// computes its own hashed destination, so no other project's current file can
-// be overwritten.
+// than corrupting user data. The copy preserves every field of the legacy
+// intent (mode, target, lag window, explicit budget, package policy), and
+// N1 guarantees migration only for an UNAMBIGUOUS slug owner.
 function migrateLegacyBaselineIntent(workspace: WorkspaceRecord, projectName: string): void {
   const current = baselineIntentPath(workspace, projectName)
   if (existsSync(current)) return
   const legacy = legacyBaselineIntentPath(workspace, projectName)
   if (!existsSync(legacy)) return
+  const slug = legacyArtifactSlug(projectName)
+  if (legacySlugProjectCount(workspace, slug) > 1) {
+    // N1: one matching slug is not proof of ownership. Keep the file and
+    // never assign it; callers see defaults plus legacyIntentResolutionNeeded.
+    console.warn(
+      `[legacy-intent] legacy '${legacy}' (slug '${slug}') is shared by ${legacySlugProjectCount(workspace, slug)} ` +
+      `workspace projects; settings were NOT migrated automatically.`,
+    )
+    return
+  }
   try {
     const raw = JSON.parse(readFileSync(legacy, 'utf8'))
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return
@@ -733,7 +778,13 @@ function baselineIntentPlan(workspace: WorkspaceRecord, project: ProjectSpec): B
   add('optionalDependencies', 'runtime')
   add('devDependencies', 'dev')
   add('peerDependencies', 'peer')
-  return { candidates: [...result.values()].sort((a, b) => a.name.localeCompare(b.name)), intent: loadBaselineIntent(workspace, project.name) }
+  const intent = loadBaselineIntent(workspace, project.name)
+  const resolution = legacyIntentResolutionNeeded(workspace, project.name)
+  return {
+    candidates: [...result.values()].sort((a, b) => a.name.localeCompare(b.name)),
+    intent,
+    ...(resolution ? { legacyIntentResolutionNeeded: resolution } : {}),
+  }
 }
 
 function dependencyGraphSnapshot(workspace: WorkspaceRecord, project: ProjectSpec) {
@@ -1121,12 +1172,25 @@ function projectArtifactCachePath(workspace: WorkspaceRecord, projectName: strin
   return join(projectArtifactCacheDir(workspace, projectName), kind === 'json' ? 'dependency-roadmap.json' : 'local-dependency-roadmap.html')
 }
 
+// N1: a NEW Verified Baseline ALWAYS writes into the project-unique hashed
+// directory. The pre-A08 legacy slug dir is a lossy key (several projects can
+// share it) and must never be a write target, so this resolver carries no
+// legacy fallback -- every new result lands in the project's own directory.
+function baselineProjectOutputWriteDir(workspace: WorkspaceRecord, projectName: string): string {
+  return join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-project-output', projectArtifactToken(projectName))
+}
+
+// The READ-side resolver: prefers the hashed dir, and only falls back to a
+// pre-A08 output directory while (a) the hashed dir does not exist yet and
+// (b) the legacy slug is UNAMBIGUOUS across the workspace -- a shared slug
+// could show another project's output, so it is never used as a fallback.
 function baselineProjectOutputDir(workspace: WorkspaceRecord, projectName: string): string {
-  const current = join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-project-output', projectArtifactToken(projectName))
-  // R2: a pre-A08 output directory keyed by the plain slug stays visible until
-  // the project records a NEW baseline (which then writes the hashed dir).
-  const legacy = join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-project-output', legacyArtifactSlug(projectName))
-  return existsSync(legacy) && !existsSync(current) ? legacy : current
+  const current = baselineProjectOutputWriteDir(workspace, projectName)
+  if (existsSync(current)) return current
+  const slug = legacyArtifactSlug(projectName)
+  if (legacySlugProjectCount(workspace, slug) > 1) return current
+  const legacy = join(workspace.path, '.dependency-roadmap', 'desktop', 'baseline-project-output', slug)
+  return existsSync(legacy) ? legacy : current
 }
 
 function snapshotProjectArtifacts(
@@ -2693,7 +2757,7 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
       // legacy MD/JSON/HTML reports: those outputs feed the Verified UI cache
       // and writing them would let a planning-only result shadow the last
       // verified roadmap/dashboard (R5).
-      const baselineProjectOutput = baselineProjectOutputDir(workspace, project.name)
+      const baselineProjectOutput = baselineProjectOutputWriteDir(workspace, project.name)
       const baselineOutputArgs = proofMode === 'DRAFT'
         ? []
         : [
@@ -6397,7 +6461,9 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
         // Snapshot exactly those files; reading the shared configured roadmap
         // here used to turn a successful Baseline into a false failure whenever
         // that shared file happened to contain another project.
-        const baselineOutput = baselineProjectOutputDir(job.workspace, job.projectName)
+        // N1: read exactly what THIS run wrote -- the project-unique hashed
+        // dir, never a legacy slug dir that another project may share.
+        const baselineOutput = baselineProjectOutputWriteDir(job.workspace, job.projectName)
         if (!snapshotProjectArtifacts(job.workspace, job.projectName, {
           roadmap: join(baselineOutput, 'dependency-roadmap.json'),
           dashboard: join(baselineOutput, 'dependency-roadmap.html'),

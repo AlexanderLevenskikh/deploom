@@ -354,6 +354,13 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
 
         {resume === 'restart' ? <div className="resume-notice baseline-restart-notice"><strong>{text('Baseline будет начат заново', 'Baseline will be restarted')}</strong><span>{text('После запуска оркестрационный checkpoint будет сброшен; exact proof/artifact cache с совпадающей identity останется доступен. Здесь можно применить состав Baseline или сразу запустить.', 'After you start, the orchestration checkpoint will be reset, while the exact proof/artifact cache with matching identity stays reusable. Apply the Baseline scope here or start right away.')}</span></div> : null}
 
+        {plan.legacyIntentResolutionNeeded ? (
+          <div className="resume-notice baseline-restart-notice" role="alert">
+            <strong>{text('Настройки не перенесены автоматически', 'Settings were not migrated')}</strong>
+            <span>{text('Несколько проектов workspace имеют одинаковый legacy-ключ настроек. Сохранённые настройки не назначены ни одному из них, чтобы не подставить чужое состояние; выберите или восстановите настройки здесь и сохраните.', 'Several workspace projects share the same legacy settings key. The saved settings were not assigned to any of them to avoid applying another project\'s state; choose or restore the settings here and save.')}</span>
+          </div>
+        ) : null}
+
         <div className="baseline-intent-scroll">
         <div className="baseline-fast-flow">
           <div>

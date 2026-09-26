@@ -82,5 +82,8 @@ export function normalizeBaselineIntentPlan(plan: BaselineIntentPlan): BaselineI
       ...(mirrorLagPct !== undefined ? { minLagOkPct: mirrorLagPct } : {}),
       ...(acceptancePolicy.lagPolicyMonths !== undefined ? { lagPolicyMonths: acceptancePolicy.lagPolicyMonths } : {}),
     },
+    // N1: an ambiguous legacy intent stays unresolved; carry the human-readable
+    // reason through to the dialog so the user can choose/restore settings.
+    ...(plan.legacyIntentResolutionNeeded ? { legacyIntentResolutionNeeded: plan.legacyIntentResolutionNeeded } : {}),
   }
 }

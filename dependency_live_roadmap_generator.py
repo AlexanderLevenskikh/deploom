@@ -19348,9 +19348,37 @@ function recomputeProjectHealthFromDom(section, policy){
   }
   const minLagOkPct = policy && typeof policy.minLagOkPct === 'number' ? policy.minLagOkPct : undefined;
   const maxCritical = policy && typeof policy.maxKnownCritical === 'number' ? policy.maxKnownCritical : 0;
-  const maxHigh = policy && typeof policy.maxKnownHigh === 'number' ? policy.maxKnownHigh : 0;
   const maxModerate = policy && typeof policy.maxKnownModerate === 'number' ? policy.maxKnownModerate : undefined;
   const maxLow = policy && typeof policy.maxKnownLow === 'number' ? policy.maxKnownLow : undefined;
+  // N2: M/L are within limits only when the totals satisfy the policy's numeric
+  // caps; a policy without numeric caps falls back to the legacy combined
+  // (M+L)<=20 rule, mirroring the Python _health_ml_clear gate.
+  const mlClear = (maxModerate === undefined && maxLow === undefined)
+    ? (totals.M + totals.L) <= 20
+    : (totals.M <= (maxModerate === undefined ? 0 : maxModerate)) && (totals.L <= (maxLow === undefined ? 0 : maxLow));
+  // N2: projections are COMPUTED from the DOM + policy, never unconditional
+  // zeros. A row is projected lag-ok when it already satisfies its compliance
+  // target or its planned (yellow/green) target reaches it; the planning
+  // reserve is minLagOkPct + 5. Mirrors dependency_is_lag_ok_after_planned_target.
+  const plannedTargetForMode = (row, mode) => mode === 'yellow'
+    ? (row.dataset.targetYellow || '')
+    : (mode === 'green' ? (row.dataset.targetGreen || '') : '');
+  const projectedLagOkForMode = (row, mode) => {
+    const target = lagComplianceTargetForDomRow(row);
+    if (!semverParts(target)) return false;
+    if (compareSemverText(row.dataset.current || '', target) >= 0) return true;
+    const planned = plannedTargetForMode(row, mode);
+    return !!semverParts(planned) && compareSemverText(planned, target) >= 0;
+  };
+  const planningPct = Math.max(0, Math.min(100, (minLagOkPct === undefined ? 80 : minLagOkPct) + 5));
+  const ratioRequired = (total, pct) => pct >= 100 ? total : Math.ceil(total * pct / 100);
+  const yellowPlanRequired = ratioRequired(scopeTotal, planningPct);
+  const yellowProjectedLagOk = activeRows.filter(row => projectedLagOkForMode(row, 'yellow')).length;
+  const yellowProjectedLagPct = scopeTotal ? (yellowProjectedLagOk / scopeTotal * 100) : 100;
+  const yellowPlanShortfall = Math.max(0, yellowPlanRequired - yellowProjectedLagOk);
+  const greenProjectedLagOk = activeRows.filter(row => projectedLagOkForMode(row, 'green')).length;
+  const greenProjectedLagPct = scopeTotal ? (greenProjectedLagOk / scopeTotal * 100) : 100;
+  const greenPlanShortfall = Math.max(0, scopeTotal - greenProjectedLagOk);
   let status = 'yellow';
   let reason = '';
   if (policy === null || minLagOkPct === undefined) {
@@ -19362,11 +19390,17 @@ function recomputeProjectHealthFromDom(section, policy){
     reason = lagUnknown ? `lag-policy target неизвестен для ${lagUnknown} зависимостей` : 'нет зависимостей в активном расчёте';
   } else if (scopePct < minLagOkPct) {
     status = 'red'; reason = `только ${scopePct.toFixed(1)}% активного scope соблюдают lag-policy (<${minLagOkPct}%)`;
-  } else if (lagUnknown === 0 && securityUnknownRows === 0 && totals.U === 0
-      && totals.H <= maxHigh && totalWithinLimit(totals.M, maxModerate) && totalWithinLimit(totals.L, maxLow)) {
-    status = 'green'; reason = '0 нарушений lag-policy, 0 C, H/M/L в пределах policy, нет неизвестной security';
+  } else if (lagUnknown === 0 && scopeLagOk === scopeTotal
+      && totals.C === 0 && totals.H === 0 && totals.U === 0 && securityUnknownRows === 0 && mlClear) {
+    // N2: green is an ABSOLUTE colour, independent of the policy's latitude.
+    // The whole active scope satisfies the lag policy (lag_bad == 0), C=0, H=0,
+    // no unknown security and M/L within policy -- the SAME criterion the
+    // Python producer applies. A yellow 80% gate or maxKnownHigh=1 must never
+    // relax green.
+    status = 'green'; reason = '0 нарушений lag-policy, 0 C/H, нет неизвестной security, Low+Moderate в пределах policy';
   } else {
     const parts = [`${scopePct.toFixed(1)}% активного scope соблюдают lag-policy`, '0 Critical'];
+    if (scopeLagOk < scopeTotal) parts.push(`не соблюдают lag-policy: ${scopeTotal - scopeLagOk}`);
     if (lagUnknown) parts.push(`lag-policy target неизвестен: ${lagUnknown}`);
     if (securityUnknownRows) parts.push(`security неизвестна: ${securityUnknownRows}`);
     if (totals.U) parts.push(`уязвимости без оценки серьёзности: ${totals.U}`);
@@ -19378,7 +19412,9 @@ function recomputeProjectHealthFromDom(section, policy){
   return {project,status,total:scopeTotal,lag_ok_12m:scopeLagOk,lag_bad_12m:Math.max(0,scopeTotal-scopeLagOk),lag_ok_pct:scopePct,
     critical:totals.C,high:totals.H,moderate:totals.M,low:totals.L,unknown:totals.U,
     reason,excluded,lag_unknown:lagUnknown,removed:0,
-    yellow_plan_required:0,yellow_projected_lag_ok:0,yellow_projected_lag_pct:0,yellow_plan_shortfall:0,scope_total:scopeTotal};
+    yellow_plan_required:yellowPlanRequired,yellow_projected_lag_ok:yellowProjectedLagOk,yellow_projected_lag_pct:yellowProjectedLagPct,yellow_plan_shortfall:yellowPlanShortfall,
+    green_required:scopeTotal,green_projected_lag_ok:greenProjectedLagOk,green_projected_lag_pct:greenProjectedLagPct,green_plan_shortfall:greenPlanShortfall,
+    scope_total:scopeTotal};
 }
 function domSecurityKnownFromVulns(text){
   // Mirrors the Python producer (_summary_security_known): only an explicit

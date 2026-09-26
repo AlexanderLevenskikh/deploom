@@ -44,6 +44,70 @@ const instance = factory(
 )
 const { projectRunConflicts, reserveProjectActionSlot } = instance
 
+// ---- N3: POSIX path semantics for linked worktrees (in-memory model).
+// The shared Git dir of a linked worktree is Git's `commondir` metadata
+// (git rev-parse --git-common-dir), resolved RELATIVE to the worktree gitdir --
+// never a string split on a 'worktrees' segment, which loses the POSIX root
+// ('/repo/main/.git/worktrees/w1' -> 'repo/main/.git') and can be fooled by an
+// unrelated parent folder literally named 'worktrees'. Modeled as an in-memory
+// POSIX filesystem: no real repository is created or mutated.
+{
+  const px = path.posix
+  const model = {
+    '/repo/main/.git': 'dir',
+    '/repo/linked/.git': 'file:/repo/main/.git/worktrees/w1',
+    '/repo/linked2/.git': 'file:/repo/main/.git/worktrees/w2',
+    '/repo/main/.git/worktrees/w1/commondir': 'data:../..',
+    '/repo/main/.git/worktrees/w2/commondir': 'data:../..',
+    '/tmp/worktrees/other/.git': 'dir',
+  }
+  const projectDirs = new Set(['/repo/main', '/repo/linked', '/repo/linked2', '/tmp/worktrees/other'])
+  const statSync = (p) => {
+    const v = model[p]
+    if (v === 'dir') return { isDirectory: () => true }
+    if (v && v.startsWith('file:')) return { isDirectory: () => false }
+    const err = new Error('ENOENT'); err.code = 'ENOENT'; throw err
+  }
+  const existsSync = (p) => model[p] !== undefined || projectDirs.has(p)
+  const readFileSync = (p) => {
+    const v = model[p]
+    if (v !== undefined && v.startsWith('file:')) return `gitdir: ${v.slice(5)}\n`
+    if (v !== undefined && v.startsWith('data:')) return `${v.slice(5)}\n`
+    const err = new Error('ENOENT'); err.code = 'ENOENT'; throw err
+  }
+  const identity = (p) => p
+  const posixInstance = factory(
+    new Map(), randomUUID, px.join, px.dirname, px.sep, px.normalize, px.resolve, identity,
+    identity, existsSync, statSync, readFileSync,
+    WORKSPACE_GLOBAL_ACTIONS, PROJECT_BACKGROUND_ACTIONS,
+  )
+  const posixWs = (id) => ({ id, name: id, path: id, templateRemote: '', toolRemote: '', settingsPath: '', agent: 'claude' })
+  const posixJob = (wsId, name, projectPath, action) => ({
+    id: randomUUID(), action, workspace: posixWs(wsId), projectName: name, projectPath, cancelled: false,
+  })
+  const posixConflict = (existing, wsId, name, pathName, action) =>
+    posixInstance.projectRunConflicts(existing, posixWs(wsId), { name, path: pathName }, action)
+
+  // Main checkout + linked worktree of the SAME repo: same --git-common-dir.
+  const mainJob = posixJob('one', 'main', '/repo/main', 'agent')
+  if (!posixConflict(mainJob, 'one', 'linked1', '/repo/linked', 'baseline')) {
+    throw new Error('N3: main checkout + linked worktree must conflict in one workspace')
+  }
+  if (!posixConflict(mainJob, 'two', 'another-ws', '/repo/linked', 'baseline')) {
+    throw new Error('N3: main checkout + linked worktree must conflict across workspaces')
+  }
+  // Two linked worktrees of the SAME repo conflict too.
+  const linked1Job = posixJob('one', 'linked1', '/repo/linked', 'agent')
+  if (!posixConflict(linked1Job, 'one', 'linked2', '/repo/linked2', 'baseline')) {
+    throw new Error('N3: two linked worktrees of one repo must conflict')
+  }
+  // An INDEPENDENT repo whose parent folder is literally named 'worktrees' is
+  // its own identity -- never conflated with anything by segment surgery.
+  if (posixConflict(mainJob, 'one', 'other', '/tmp/worktrees/other', 'baseline')) {
+    throw new Error('N3: an unrelated repo under a folder named worktrees must not conflict')
+  }
+}
+
 // ---- Build a real monorepo + an independent repo + a linked worktree.
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'deploom-r4-'))
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, stdio: 'pipe' })
