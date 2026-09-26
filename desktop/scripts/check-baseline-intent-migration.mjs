@@ -12,6 +12,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { createRequire } from 'node:module'
 import ts from 'typescript'
 
 const { join } = path
@@ -21,6 +22,26 @@ const trans = (text) => ts.transpileModule(text, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
 }).outputText
 const compile = (js, globals, names) => new Function(...Object.keys(globals), js + `\nreturn { ${names.join(', ')} };`)(...Object.values(globals))
+const runModule = (text) => {
+  const module = { exports: {} }
+  const nodeRequire = createRequire(import.meta.url)
+  new Function('require', 'module', 'exports', trans(text))(nodeRequire, module, module.exports)
+  return module.exports
+}
+
+// G1: the migration/load machinery must run against the REAL production
+// normalizers (loader semantics decide what "well formed" means), not the
+// identity stubs the earlier N1/F3 harness used.
+const { mergeTargetPolicy } = runModule(fs.readFileSync(new URL('../electron/acceptance-policy.ts', import.meta.url), 'utf8'))
+const { normalizeBudgetField } = runModule(fs.readFileSync(new URL('../electron/baseline-intent.ts', import.meta.url), 'utf8'))
+const normStart = source.indexOf('function normalizeBaselineIntent(')
+const normEnd = source.indexOf('function projectArtifactToken(', normStart)
+if (normStart < 0 || normEnd < 0) throw new Error('G1: normalizeBaselineIntent slice not found in main.ts')
+const { normalizeBaselineIntent } = compile(
+  trans(source.slice(normStart, normEnd)),
+  { normalizeBudgetField, mergeTargetPolicy },
+  ['normalizeBaselineIntent'],
+)
 
 // Real production projectArtifactToken (A08 hashed identity).
 const tokenSliceStart = source.indexOf('function projectArtifactToken(')
@@ -38,8 +59,6 @@ const atomicWriteJsonSync = (file, value) => {
   fs.writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8')
   fs.renameSync(tmp, file)
 }
-const normalizeBaselineIntent = (value) => value // normalizer semantics live in check-baseline-intent.mjs
-const normalizeBudgetField = (raw) => ({ budgetMinutesExplicit: typeof raw?.budgetMinutes === 'number' })
 
 // The migration machinery (legacy slug -> baseline intent file), plus the
 // loader/budget check that must migrate before reading.
@@ -53,13 +72,14 @@ const readProjects = () => PROJECTS
 const intentGlobals = {
   join, existsSync: fs.existsSync, readFileSync: fs.readFileSync, realpathSync: fs.realpathSync,
   atomicWriteJsonSync, projectArtifactToken, normalizeBaselineIntent, normalizeBudgetField,
-  readProjects,
+  mergeTargetPolicy, readProjects,
 }
 const intentApi = compile(
   trans(source.slice(migStart, migEnd)),
   intentGlobals,
   ['legacyArtifactSlug', 'legacyBaselineIntentPath', 'legacySlugProjectCount', 'legacyIntentResolutionNeeded',
-   'migrateLegacyBaselineIntent', 'saveBaselineIntent', 'loadBaselineIntent', 'baselineIntentHasPersistedBudgetMinutes'],
+   'currentBaselineIntentIsValid', 'migrateLegacyBaselineIntent', 'saveBaselineIntent', 'loadBaselineIntent',
+   'baselineIntentHasPersistedBudgetMinutes'],
 )
 
 // The output-dir resolvers (join/existsSync/projectArtifactToken/legacyArtifactSlug +
@@ -208,7 +228,11 @@ try {
   if (!legacyIntentResolutionNeeded({ path: wsAmb }, projectB)) {
     throw new Error('R2/N1: an ambiguous legacy intent must surface a resolution reason')
   }
-  if (intentApi.loadBaselineIntent({ path: wsAmb }, projectA)?.executionMode === 'BACKGROUND') {
+  // With the REAL normalizer a missing current intent loads as DEFAULTS, so a
+  // bare "executionMode" probe is not distinguishing; the legacy's own fields
+  // (policies['shared-pkg'], budgetMinutes=60) must NOT leak through either.
+  const ambiguousLoad = intentApi.loadBaselineIntent({ path: wsAmb }, projectA)
+  if (ambiguousLoad?.policies?.['shared-pkg'] === 'required' || ambiguousLoad?.budgetMinutes === 60) {
     throw new Error('R2/N1: an ambiguous legacy intent must NOT silently become one project\'s settings')
   }
   if (intentApi.baselineIntentHasPersistedBudgetMinutes({ path: wsAmb }, projectA)) {
@@ -322,6 +346,71 @@ try {
   fs.writeFileSync(ambTokenA, '{corrupt', 'utf8')
   if (!legacyIntentResolutionNeeded({ path: wsAmb }, projectA)) {
     throw new Error('F3: a corrupt current intent must not count as a successful restoration')
+  }
+  PROJECTS = []
+
+  // G1-12. A semantically BROKEN current intent (valid JSON object whose
+  // loader-significant fields the production normalizer would silently drop)
+  // is NOT a successful restoration: the warning stays and the loader returns
+  // DEFAULTS, never the user's settings. Runs against the REAL normalizer, so
+  // "would be dropped" is defined by the production loader, not a stub.
+  const wsG1 = path.join(wsRoot, 'ws-g1')
+  const g1Legacy = path.join(wsG1, '.dependency-roadmap', 'desktop', 'baseline-intent', `${intentApi.legacyArtifactSlug(projectA)}.json`)
+  const g1TokenA = path.join(wsG1, '.dependency-roadmap', 'desktop', 'baseline-intent', `${projectArtifactToken(projectA)}.json`)
+  const g1TokenB = path.join(wsG1, '.dependency-roadmap', 'desktop', 'baseline-intent', `${projectArtifactToken(projectB)}.json`)
+  fs.mkdirSync(path.dirname(g1Legacy), { recursive: true })
+  fs.writeFileSync(g1Legacy, JSON.stringify({ schemaVersion: 1, executionMode: 'BACKGROUND', policies: { 'shared-pkg': 'required' }, budgetMinutes: 60 }), 'utf8')
+  PROJECTS = [{ name: projectA, path: wsG1 }, { name: projectB, path: wsG1 }]
+  if (!intentApi.legacyIntentResolutionNeeded({ path: wsG1 }, projectA)) {
+    throw new Error('G1: missing current intent must keep the resolution warning')
+  }
+  for (const [label, raw] of [['invalid-json', '{corrupt'], ['array', '[1,2,3]'], ['null', 'null']]) {
+    fs.writeFileSync(g1TokenA, raw, 'utf8')
+    if (intentApi.currentBaselineIntentIsValid({ path: wsG1 }, projectA)) {
+      throw new Error(`G1: ${label} must not be a valid restoration`)
+    }
+    if (!intentApi.legacyIntentResolutionNeeded({ path: wsG1 }, projectA)) {
+      throw new Error(`G1: ${label} must keep the resolution warning`)
+    }
+  }
+  fs.writeFileSync(g1TokenA, JSON.stringify({
+    schemaVersion: 2, policies: 'broken', productMode: 'broken', targetLevel: 'broken',
+    minLagOkPct: 'broken', acceptancePolicy: 'broken',
+  }), 'utf8')
+  if (intentApi.currentBaselineIntentIsValid({ path: wsG1 }, projectA)) {
+    throw new Error('G1: a semantically broken current intent must not validate')
+  }
+  if (!intentApi.legacyIntentResolutionNeeded({ path: wsG1 }, projectA)) {
+    throw new Error('G1: a semantically broken current intent must keep the resolution warning')
+  }
+  const brokenLoad = intentApi.loadBaselineIntent({ path: wsG1 }, projectA)
+  if (JSON.stringify(brokenLoad.policies ?? {}) !== JSON.stringify({}) ||
+      brokenLoad.targetLevel !== 'yellow' || brokenLoad.minLagOkPct !== 80) {
+    throw new Error('G1: a semantically broken intent must load as DEFAULTS, not as the user settings')
+  }
+  fs.writeFileSync(g1TokenA, JSON.stringify({ schemaVersion: 2, policies: { pkg: 'broken' } }), 'utf8')
+  if (intentApi.currentBaselineIntentIsValid({ path: wsG1 }, projectA)) {
+    throw new Error('G1: an invalid policies value must not validate')
+  }
+  fs.writeFileSync(g1TokenA, JSON.stringify({ schemaVersion: 1, executionMode: 'BACKGROUND', policies: {} }), 'utf8')
+  if (!intentApi.currentBaselineIntentIsValid({ path: wsG1 }, projectA)) {
+    throw new Error('G1: a valid legacy v1 intent must validate even with unrelated optional fields missing')
+  }
+  intentApi.saveBaselineIntent({ path: wsG1 }, projectA, { executionMode: 'FAST', targetLevel: 'yellow', policies: { restored: 'required' } })
+  if (!intentApi.currentBaselineIntentIsValid({ path: wsG1 }, projectA)) {
+    throw new Error('G1: saveBaselineIntent must persist a semantically valid intent')
+  }
+  if (intentApi.legacyIntentResolutionNeeded({ path: wsG1 }, projectA)) {
+    throw new Error('G1: saving current settings must end the resolution warning for THAT project')
+  }
+  if (!intentApi.legacyIntentResolutionNeeded({ path: wsG1 }, projectB)) {
+    throw new Error('G1: saving for project A must NOT clear the warning for project B')
+  }
+  if (intentApi.loadBaselineIntent({ path: wsG1 }, projectA).policies?.restored !== 'required') {
+    throw new Error('G1: the saved, semantically valid intent is what the loader applies')
+  }
+  if (fs.existsSync(g1TokenB)) {
+    throw new Error('G1: opening/planning must never create another project\'s current intent')
   }
   PROJECTS = []
 

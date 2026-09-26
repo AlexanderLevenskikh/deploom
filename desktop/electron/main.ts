@@ -720,12 +720,61 @@ function legacyIntentResolutionNeeded(workspace: WorkspaceRecord, projectName: s
   )
 }
 
-// F3: a well-formed CURRENT (hashed) intent file is proof the user resolved
-// the ambiguity for this project -- the loader reads and applies it.
+// G1: a well-formed CURRENT (hashed) intent file is proof the user resolved
+// the ambiguity for this project -- the loader reads and applies it. "Well
+// formed" means more than parses-to-an-object: the loader SILENTLY drops a
+// broken policies value, a targetLevel that is not yellow/green, a
+// non-numeric minLagOkPct, a wrong-typed acceptancePolicy, an unknown
+// productMode/controlMode/searchMode, a non-3/6/9/12 lagPolicyMonths, a
+// non-array deferredCohorts and so on, and returns defaults. A file whose
+// present significant fields would be thrown away is therefore NOT the user's
+// explicit restoration -- the banner stays and defaults are not presented as a
+// successful restore. Absent fields are fine (optional modern fields, legacy
+// v1 forms); only a PRESENT value the loader would discard marks the file
+// corrupt.
+function baselineIntentObjectIsWellFormed(raw: Record<string, unknown>): boolean {
+  const numberish = (value: unknown): boolean => {
+    if (value === null || value === undefined) return false
+    return Number.isFinite(Number(value))
+  }
+  if ('policies' in raw) {
+    const policies = raw.policies
+    if (!policies || typeof policies !== 'object' || Array.isArray(policies)) return false
+    for (const value of Object.values(policies as Record<string, unknown>)) {
+      if (value !== 'keep-current' && value !== 'required') return false
+    }
+  }
+  if ('productMode' in raw && raw.productMode !== 'fast' && raw.productMode !== 'deep') return false
+  if ('targetLevel' in raw && raw.targetLevel !== 'yellow' && raw.targetLevel !== 'green') return false
+  if ('minLagOkPct' in raw && !numberish(raw.minLagOkPct)) return false
+  if ('lagPolicyMonths' in raw && raw.lagPolicyMonths !== 3 && raw.lagPolicyMonths !== 6 && raw.lagPolicyMonths !== 9 && raw.lagPolicyMonths !== 12) return false
+  if ('budgetMinutes' in raw && !numberish(raw.budgetMinutes)) return false
+  if ('controlMode' in raw && raw.controlMode !== 'AUTONOMOUS' && raw.controlMode !== 'CONFIRM_SIGNIFICANT') return false
+  if ('executionMode' in raw && raw.executionMode !== 'FAST' && raw.executionMode !== 'AUTOPILOT' && raw.executionMode !== 'BACKGROUND') return false
+  if ('searchMode' in raw && raw.searchMode !== 'EXHAUSTIVE' && raw.searchMode !== 'BOUNDED_IMPROVEMENT' && raw.searchMode !== 'AUTO') return false
+  if ('proofMode' in raw && raw.proofMode !== 'DRAFT') return false
+  if ('deferredCohorts' in raw && !Array.isArray(raw.deferredCohorts)) return false
+  if ('cohortAction' in raw && (!raw.cohortAction || typeof raw.cohortAction !== 'object' || Array.isArray(raw.cohortAction))) return false
+  if ('extraIterations' in raw && !numberish(raw.extraIterations)) return false
+  if ('decisionGrantIterations' in raw && !numberish(raw.decisionGrantIterations)) return false
+  if ('acceptancePolicy' in raw) {
+    const policy = raw.acceptancePolicy
+    if (!policy || typeof policy !== 'object' || Array.isArray(policy)) return false
+    const record = policy as Record<string, unknown>
+    for (const key of ['maxKnownCritical', 'maxKnownHigh', 'maxKnownModerate', 'maxKnownLow', 'minLagOkPct']) {
+      if (key in record && !numberish(record[key])) return false
+    }
+    if ('targetLevel' in record && record.targetLevel !== 'yellow' && record.targetLevel !== 'green') return false
+    if ('lagPolicyMonths' in record && record.lagPolicyMonths !== 3 && record.lagPolicyMonths !== 6 && record.lagPolicyMonths !== 9 && record.lagPolicyMonths !== 12) return false
+  }
+  return true
+}
+
 function currentBaselineIntentIsValid(workspace: WorkspaceRecord, projectName: string): boolean {
   try {
-    const raw = JSON.parse(readFileSync(baselineIntentPath(workspace, projectName), 'utf8'))
-    return !!raw && typeof raw === 'object' && !Array.isArray(raw)
+    const raw: unknown = JSON.parse(readFileSync(baselineIntentPath(workspace, projectName), 'utf8'))
+    return !!raw && typeof raw === 'object' && !Array.isArray(raw) &&
+      baselineIntentObjectIsWellFormed(raw as Record<string, unknown>)
   } catch { return false }
 }
 
