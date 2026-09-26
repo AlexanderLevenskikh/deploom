@@ -851,7 +851,12 @@ try {
     # must be idempotent for the SAME version. If the local tag already points
     # at the exact release commit, reuse it; a tag pointing elsewhere must
     # never be silently moved.
-    $ExistingTagCommit = (& git rev-parse -q --verify "refs/tags/$Tag" 2>$null).Trim()
+    # `git rev-parse -q` prints nothing and exits nonzero when the tag does
+    # not exist; the captured value is then $null, so flatten defensively
+    # before calling methods on it.
+    $ExistingTagCommit = (
+        (& git rev-parse -q --verify "refs/tags/$Tag" 2>$null) -join ""
+    ).Trim()
 
     if ($LASTEXITCODE -eq 0) {
         if ($ExistingTagCommit -ne $ReleaseCommit) {
