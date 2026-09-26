@@ -433,7 +433,7 @@ class FixedNonRegistryInputTests(unittest.TestCase):
             _learned,
             _config,
             _stability=None,
-            attempt_timeout_ms=None,
+            budget_capped=False,
         ):
             components.append(tuple(component))
             assignment = {

@@ -263,7 +263,7 @@ class PeerSolverModelTests(unittest.TestCase):
                 diagnostics.update(status="unknown_budget", states=1)
             return {name: rows_by_name[name].current_version for name in component}
 
-        def exact_target(model, timeout_ms=30_000):
+        def exact_target(model, timeout_ms=30_000, operation_id=None):
             assignment = {package.name: "2.0.0" for package in model.packages}
             return ExactSolveResult(
                 backend="z3",
@@ -302,7 +302,7 @@ class PeerSolverModelTests(unittest.TestCase):
         roadmap.capture_desired_targets(by_project)
         roadmap.enrich_registry_target_evidence(by_project, client)
 
-        def exact_target(model, timeout_ms=30_000):
+        def exact_target(model, timeout_ms=30_000, operation_id=None):
             assignment = {package.name: "2.0.0" for package in model.packages}
             return ExactSolveResult(
                 backend="z3", status="optimal", assignment=assignment,
@@ -363,7 +363,7 @@ class PeerSolverModelTests(unittest.TestCase):
         roadmap.enrich_registry_target_evidence(by_project, client)
         order = []
 
-        def exact_target(model, timeout_ms=30_000):
+        def exact_target(model, timeout_ms=30_000, operation_id=None):
             order.append("z3")
             assignment = {package.name: "2.0.0" for package in model.packages}
             return ExactSolveResult(

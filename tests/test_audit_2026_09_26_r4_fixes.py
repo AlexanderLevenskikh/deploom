@@ -556,7 +556,7 @@ class R4A1ApplyResultsPartialTests(unittest.TestCase):
             {"a": {"1.0.0": {}, "2.0.0": {}}, "b": {"1.0.0": {}, "2.0.0": {}}},
         )
 
-        def exact_target(model, timeout_ms=30_000):
+        def exact_target(model, timeout_ms=30_000, operation_id=None):
             names = {package.name for package in model.packages}
             if names == {"a"}:
                 return ExactSolveResult(
@@ -849,7 +849,7 @@ class R4A1SnapshotAtomicityTests(unittest.TestCase):
         roadmap.capture_desired_targets(by_project)
         roadmap.enrich_registry_target_evidence(by_project, client)
 
-        def exact_target(model, timeout_ms=30_000):
+        def exact_target(model, timeout_ms=30_000, operation_id=None):
             names = {package.name for package in model.packages}
             if names == {"a"}:
                 return ExactSolveResult(
