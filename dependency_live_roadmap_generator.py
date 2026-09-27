@@ -7463,6 +7463,113 @@ def _potential_peer_graph(
     return graph
 
 
+def _progressive_delta_atomic_closure(
+    rows_by_name: Dict[str, DependencyRow],
+    domains: Dict[str, List[str]],
+    client: LiveDataClient,
+    current_versions: Mapping[str, str],
+    desired_versions: Mapping[str, str],
+    *_,
+    fixed_names: Collection[str] = (),
+) -> Dict[str, Set[str]]:
+    """Version-specific atomic migration closure (Part D).
+
+    Unlike ``_potential_peer_graph`` (the search index over every candidate
+    version), this graph carries an edge (a, b) only when the CURRENT -> DESIRED
+    delta forces a and b to move together:
+
+      - a's TARGET version declares a (non-optional) peer on b that b's CURRENT
+        version no longer satisfies (moving a alone would break a's peer), or
+      - b's CURRENT version declares a peer on a that a's TARGET version does
+        not satisfy (moving a alone would break b's standing requirement).
+
+    A satisfaction that cannot be proven from local/registry metadata
+    (``_known_peer_range_satisfaction`` returns None) is conservatively treated
+    as an edge so necessary atomicity is never silently split. Optional peers
+    and peers outside the managed set are skipped. ``fixed_names`` never move,
+    so an edge whose satisfaction depends on a fixed peer still marks the
+    cohort; the planner/verifier decide feasibility.
+
+    Components of this graph are the atomic migration cohorts for the exact
+    delta: a large potential peer component often splits into small independent
+    version-specific cohorts.
+    """
+    managed = set(rows_by_name)
+    moving = {
+        name for name in managed
+        if name not in fixed_names
+        and desired_versions.get(name, current_versions.get(name)) != current_versions.get(name)
+    }
+    graph: Dict[str, Set[str]] = {name: set() for name in managed}
+
+    def _peer_endpoints(name: str, version: str) -> Dict[str, Dict[str, Optional[bool]]]:
+        """peer_name -> {"optional": bool, "satisfied_by_current_of": ...}"""
+        row = rows_by_name[name]
+        result: Dict[str, Dict[str, Optional[bool]]] = {}
+        for peer_name, spec, optional in _peer_entries(row, version, client):
+            if peer_name not in managed or peer_name == name:
+                continue
+            peer_current = current_versions.get(peer_name, "")
+            satisfaction = _known_peer_range_satisfaction(spec, peer_current) if peer_current else None
+            result[peer_name] = {"optional": optional, "satisfied_with_peer_current": satisfaction}
+        return result
+
+    def _mark_edge(a: str, b: str) -> None:
+        graph[a].add(b)
+        graph[b].add(a)
+
+    # a moves; b anywhere in the managed set. Edge if the joint move is the only
+    # consistent interpretation of either endpoint's peer requirement.
+    for a in sorted(moving):
+        target_a = desired_versions.get(a, current_versions.get(a))
+        for b in sorted(managed):
+            if b == a:
+                continue
+            target_b = desired_versions.get(b, current_versions.get(b))
+            b_moving = b in moving
+            # a's TARGET peer on b must still be satisfiable while b stays at
+            # current; a coercion edge exists when it is not (or is unprovable).
+            a_target_peers = _peer_endpoints(a, target_a)
+            if b in a_target_peers:
+                entry = a_target_peers[b]
+                if not entry["optional"]:
+                    satisfied = entry["satisfied_with_peer_current"]
+                    if satisfied is None or satisfied is False:
+                        _mark_edge(a, b)
+            # b's CURRENT peer on a must survive a moving to target_a; if not,
+            # b must be considered together with a.
+            b_current_peers = _peer_endpoints(b, current_versions.get(b, ""))
+            if a in b_current_peers:
+                entry = b_current_peers[a]
+                if not entry["optional"]:
+                    satisfied = _known_peer_range_satisfaction(
+                        _spec_for_peer(rows_by_name[b], current_versions.get(b, ""), a, client),
+                        target_a,
+                    )
+                    if satisfied is None or satisfied is False:
+                        _mark_edge(a, b)
+            # both move: their joint TARGET pair must be mutually satisfiable,
+            # otherwise they are the same atomic cohort by construction.
+            if b_moving:
+                b_target_peers = _peer_endpoints(b, target_b)
+                if a in b_target_peers and not b_target_peers[a]["optional"]:
+                    satisfied_joint = _known_peer_range_satisfaction(
+                        _spec_for_peer(rows_by_name[b], target_b, a, client),
+                        target_a,
+                    )
+                    if satisfied_joint is None or satisfied_joint is False:
+                        _mark_edge(a, b)
+    return graph
+
+
+def _spec_for_peer(row: DependencyRow, version: str, peer_name: str, client: LiveDataClient) -> str:
+    """The exact non-optional peer spec of ``version`` for ``peer_name``."""
+    for entry_name, spec, optional in _peer_entries(row, version, client):
+        if entry_name == peer_name:
+            return spec if not optional else ""
+    return ""
+
+
 def _graph_components(graph: Dict[str, Set[str]]) -> List[List[str]]:
     remaining = set(graph)
     components: List[List[str]] = []
@@ -12611,8 +12718,29 @@ def resolve_peer_compatibility_with_verification(
                     )
                     for name, row in rows_by_name.items()
                 }
-                progressive_graph = _potential_peer_graph(
-                    rows_by_name, progressive_domains, client
+                # Part D: the ATOMIC MIGRATION cohorts are the components of the
+                # version-specific delta closure (current -> desired), not the
+                # full potential peer graph. A big potential peer component
+                # usually splits into small independent cohorts whose TARGET
+                # versions stay compatible with their peers' CURRENT versions.
+                # Learned nogoods still force their members into one cohort.
+                current_versions = {
+                    name: row.current_version for name, row in rows_by_name.items()
+                }
+                desired_versions = {
+                    name: desired_assignment.get(name, row.current_version)
+                    for name, row in rows_by_name.items()
+                }
+                progressive_graph = _progressive_delta_atomic_closure(
+                    rows_by_name,
+                    progressive_domains,
+                    client,
+                    current_versions,
+                    desired_versions,
+                    fixed_names={
+                        name for name, row in rows_by_name.items()
+                        if _is_fixed_dependency_input(row)
+                    },
                 )
                 merge_nogood_edges(progressive_graph, learned[project][mode])
                 return tuple(
@@ -12625,9 +12753,11 @@ def resolve_peer_compatibility_with_verification(
                 if incumbent is None or not desired_assignment:
                     return None
                 # Resolver overrides are a separate verified decision dimension.
-                # Do not silently drop/rewrite them while extending direct deps.
-                if incumbent.resolver_overrides:
-                    return None
+                # They are PINNED (never silently dropped/rewritten while
+                # extending direct deps) but must not cut off every subsequent
+                # direct upgrade (Part D): `fixed_names` keeps the overridden
+                # packages at their incumbent values while the rest of the
+                # direct deps keep being planned.
                 blocked = set(confirmed_failed_assignments)
                 blocked.update(
                     assignment_fingerprint(item)
@@ -12641,6 +12771,7 @@ def resolve_peer_compatibility_with_verification(
                     learned_nogoods=learned[project][mode],
                     fingerprint_fn=assignment_fingerprint,
                     priority_packages=baseline_required,
+                    fixed_names=tuple(incumbent.resolver_overrides or ()),
                 )
 
             def _remember_verified_candidate(

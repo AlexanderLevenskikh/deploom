@@ -74,6 +74,7 @@ def plan_progressive_extension(
     learned_nogoods: Sequence[Mapping[str, str]],
     fingerprint_fn: Callable[[Mapping[str, str]], str],
     priority_packages: Collection[str] = (),
+    fixed_names: Collection[str] = (),
 ) -> ProgressiveExtensionPlan | None:
     """Choose one bounded exact improvement on top of the verified incumbent.
 
@@ -82,14 +83,26 @@ def plan_progressive_extension(
     failed exact points and assignments already forbidden by authoritative
     learned clauses are skipped.  No transitive package can be introduced
     because candidates are restricted to keys already present in the incumbent.
+
+    ``fixed_names`` (resolver overrides / resolutions) are pinned at their
+    incumbent values for planning: they are excluded from every deferred set and
+    are never proposed to change. Their presence is therefore a *pin*, not a
+    block: other direct upgrades continue to be planned instead of the whole
+    extension being silently cut off by an early return.
     """
     base = {str(name): str(version) for name, version in incumbent.items()}
     target = {str(name): str(version) for name, version in desired.items()}
+    fixed = {str(name) for name in fixed_names}
     managed = set(base) & set(target)
     if not managed:
         return None
 
-    deferred = {name for name in managed if base[name] != target[name]}
+    # Fixed/override names stay at their incumbent (already verified) values:
+    # they never appear in `deferred`, so they neither move nor block the rest.
+    deferred = {
+        name for name in managed
+        if name not in fixed and base[name] != target[name]
+    }
     if not deferred:
         return None
 
@@ -113,7 +126,7 @@ def plan_progressive_extension(
             continue
 
         remaining = sum(
-            1 for name in managed if candidate.get(name) != target.get(name)
+            1 for name in deferred if candidate.get(name) != target.get(name)
         )
         if remaining >= len(deferred):
             continue

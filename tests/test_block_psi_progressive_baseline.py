@@ -92,6 +92,61 @@ class ProgressiveBaselinePlannerTests(unittest.TestCase):
         self.assertEqual(plan.packages, ("A", "B", "C"))
         self.assertEqual(plan.remaining_distance, 0)
 
+    def test_fixed_names_pin_overrides_but_do_not_block_other_upgrades(self) -> None:
+        """Part D: a resolver override is pinned at its incumbent value and
+        must NOT silently cut off every subsequent direct upgrade (the former
+        early return). Other direct deps keep getting planned."""
+        plan = plan_progressive_extension(
+            incumbent={"rollup": "4.52.0", "vite": "5", "vitest": "1"},
+            desired={"rollup": "5.0.0", "vite": "6", "vitest": "2"},
+            atomic_groups=(("rollup",), ("vite",), ("vitest",)),
+            blocked_fingerprints=(),
+            learned_nogoods=(),
+            fingerprint_fn=fp,
+            fixed_names={"rollup"},
+        )
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertNotIn("rollup", plan.packages)
+        self.assertEqual(plan.assignment_dict["rollup"], "4.52.0")
+        # vite comes first (lexical order among equal small cohorts)
+        self.assertEqual(plan.packages, ("vite",))
+
+    def test_all_upgrades_pinned_returns_none_not_a_blocker_plan(self) -> None:
+        """Whole scope pinned by overrides -> no extension is possible; the
+        planner returns None naturally (like the old early return) only when
+        there is genuinely nothing else to move."""
+        plan = plan_progressive_extension(
+            incumbent={"rollup": "4.52.0", "vite": "6"},
+            desired={"rollup": "5.0.0", "vite": "7"},
+            atomic_groups=(("rollup",), ("vite",)),
+            blocked_fingerprints=(),
+            learned_nogoods=(),
+            fingerprint_fn=fp,
+            fixed_names={"rollup", "vite"},
+        )
+        self.assertIsNone(plan)
+
+    def test_failed_b_does_not_lose_accepted_a_and_c_still_reachable(self) -> None:
+        """Part D acceptance: rejected B never loses the accepted A; with A
+        already accepted (incumbent) the blocked B fingerprint is skipped and
+        C is planned next."""
+        desired = {"A": "2", "B": "2", "C": "2"}
+        incumbent = {"A": "2", "B": "1", "C": "1"}
+        failed_b = fp({"A": "2", "B": "2", "C": "1"})
+        plan = plan_progressive_extension(
+            incumbent=incumbent,
+            desired=desired,
+            atomic_groups=(("A",), ("B",), ("C",)),
+            blocked_fingerprints={failed_b},
+            learned_nogoods=(),
+            fingerprint_fn=fp,
+        )
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.assignment_dict, {"A": "2", "B": "1", "C": "2"})
+        self.assertEqual(plan.remaining_distance, 1)
+
 
 class ProgressiveBaselineDurabilityTests(unittest.TestCase):
     def test_resolver_overrides_round_trip_with_incumbent(self) -> None:
