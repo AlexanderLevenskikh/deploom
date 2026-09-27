@@ -50,7 +50,11 @@ function packageScriptCommands(packageJson: unknown, packageManager: 'yarn' | 'n
   if (plainLint && !plainLintIsExactDuplicate) selectedNames.push('lint')
   for (const name of ['build', 'test:unit', 'test']) {
     if (typeof scripts[name] !== 'string') continue
-    if (name === 'test' && selectedNames.includes('test:unit')) continue
+    // A composite `test` script (for example libjs: `yarn test:unit && yarn
+    // test:build`) MUST keep its extra stage: dropping it because `test:unit`
+    // is already selected would silently lose `test:build`. Only an EXACT
+    // duplicate of `test:unit` is skipped.
+    if (name === 'test' && typeof scripts['test:unit'] === 'string' && scripts['test:unit'].trim() === scripts[name].trim()) continue
     selectedNames.push(name)
   }
   return selectedNames.map((name) => packageManager === 'yarn' ? `yarn ${name}` : `${packageManager} run ${name}`)

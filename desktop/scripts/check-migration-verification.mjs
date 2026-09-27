@@ -204,8 +204,8 @@ policy = migrationGatePolicy({}, "Demo", { scripts: {
   lint: "eslint .", "lint:types": "tsc --noEmit", "lint:scripts": "eslint src",
   build: "vite build", "test:unit": "vitest run", test: "vitest",
 } }, "yarn");
-if (!policy.verificationCommands.includes("yarn lint") || policy.verificationCommands.includes("yarn test")) {
-  throw new Error(`Distinct plain lint must run alongside focused checks while test:unit suppresses test: ${JSON.stringify(policy)}`);
+if (!policy.verificationCommands.includes("yarn lint") || !policy.verificationCommands.includes("yarn test")) {
+  throw new Error(`Distinct plain lint/test must run alongside focused checks (only EXACT duplicates are suppressed): ${JSON.stringify(policy)}`);
 }
 
 const keyA = liveBaselineObservationCacheKey("Demo", "apps/web", "a".repeat(40), "yarn lint:types");
@@ -288,6 +288,35 @@ policy = migrationGatePolicy({}, "Demo", { scripts: {
 } }, "yarn");
 if (policy.verificationCommands.filter((item) => item.includes("lint")).length !== 1) {
   throw new Error(`Exact duplicate lint bodies should run once: ${JSON.stringify(policy)}`);
+}
+
+// Part F acceptance row: libjs `test` is COMPOSITE (`yarn test:unit && yarn
+// test:build`). Selecting test:unit must NOT silently drop the composite
+// `test` stage that carries test:build: the composite is retained. Only an
+// exact duplicate of test:unit is skipped.
+policy = migrationGatePolicy({}, "libjs", { scripts: {
+  "test:unit": "node scripts/test.js --passWithNoTests",
+  "test:build": "webpack",
+  test: "yarn test:unit && yarn test:build",
+  build: "./scripts/release/build.sh",
+} }, "yarn");
+const gateCommands = policy.verificationCommands;
+if (!gateCommands.includes("yarn test")) {
+  throw new Error(`Composite test:test:build must not be lost when test:unit is selected: ${JSON.stringify(policy)}`);
+}
+if (!gateCommands.includes("yarn test:unit")) {
+  throw new Error(`test:unit must still be selected: ${JSON.stringify(policy)}`);
+}
+if (policy.source === "package-scripts" && !gateCommands.includes("yarn build")) {
+  throw new Error(`build stage must stay selected: ${JSON.stringify(policy)}`);
+}
+
+policy = migrationGatePolicy({}, "Demo", { scripts: {
+  "test:unit": "node scripts/test.js --passWithNoTests",
+  test: "node scripts/test.js --passWithNoTests",
+} }, "yarn");
+if (policy.verificationCommands.some((item) => item === "yarn test")) {
+  throw new Error(`Exact duplicate test body should run once: ${JSON.stringify(policy)}`);
 }
 
 console.log("Migration verification and integration-repair checks passed");
