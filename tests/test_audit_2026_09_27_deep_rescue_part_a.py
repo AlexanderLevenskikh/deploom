@@ -110,7 +110,14 @@ def _optimal(model, version_by_name):
 
 class T1BigUnknownMustNotAbortSmallCandidate(unittest.TestCase):
     """The libjs barrier: a large peer component comes FIRST and is `unknown`;
-    the bootstrap-style call must still check the independent small candidate."""
+    the bootstrap-style call must still check the independent small candidate.
+
+    Part C turned the verified/bootstrap path tolerant (partial_on_incomplete),
+    so this test pins that call shape. The DEFAULT strict contract (an unknown
+    finite-domain component fails closed and raises EXACT_SOLVER_UNKNOWN) is a
+    separate, preserved contract: test_peer_solver_model.test_authoritative_
+    z3_unknown_fails_closed_without_legacy_fallback.
+    """
 
     def test_barrier_bootstrap_big_unknown_blocks_small_candidate(self):
         client = _client(
@@ -121,6 +128,7 @@ class T1BigUnknownMustNotAbortSmallCandidate(unittest.TestCase):
         by_project = {"Demo": [_row("big-a"), _row("big-b"), _row("small-c")]}
         roadmap.capture_desired_targets(by_project)
         solved = []
+        incomplete: list = []
 
         def exact_target(model, timeout_ms=30_000, operation_id=None):
             pkg_names = _pkg_names(model)
@@ -137,6 +145,8 @@ class T1BigUnknownMustNotAbortSmallCandidate(unittest.TestCase):
                 by_project, client, modes=("default",), apply_results=False,
                 solver_statuses_out=statuses,
                 shadow_solver_config_by_project={"Demo": {"solverBackend": "z3"}},
+                partial_on_incomplete=True,
+                incomplete_components_out=incomplete,
             )
 
         assignment = result["Demo"]["default"]
@@ -148,6 +158,11 @@ class T1BigUnknownMustNotAbortSmallCandidate(unittest.TestCase):
         self.assertIn(["small-c"], solved)
         # the big component is recorded as unknown, never as decided
         self.assertEqual("optimal", statuses["Demo"]["default"].get("small-c"))
+        big_entries = [e for e in incomplete if "big-a" in e["component"]]
+        self.assertEqual(1, len(big_entries))
+        self.assertEqual("unknown", big_entries[0]["status"])
+        self.assertEqual("SOLVER_UNKNOWN", big_entries[0]["terminalStatus"])
+        self.assertIn("big-b", big_entries[0]["component"])
 
 
 class T2QueuedFallbackWithoutNewSolve(unittest.TestCase):

@@ -7984,12 +7984,21 @@ def _run_z3_peer_component(
     raw_config: Optional[Dict[str, Any]],
     stability_targets: Optional[Dict[str, str]] = None,
     budget_capped: bool = False,
+    residual_targets: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """Solve one component exactly and refine registry-unavailable candidates.
 
     The returned assignment is authoritative only when the caller explicitly
     configured ``solverBackend=z3``.  No fallback to the heuristic solver is
     performed here: exact ``unknown`` is a distinct planner state.
+
+    If ``residual_targets`` pins EVERY package of the component, the component
+    is already decided: the queued/prepared fallback is accepted as the
+    component assignment WITHOUT a fresh global solve (Part C / T2). The report
+    carries ``pinned=True`` / ``proof=queued-fallback`` so downstream output can
+    distinguish a fresh exact proof from a pinned fallback; nothing claims a
+    new solve ran. A partially pinned component still goes through the exact
+    solve (the pinned candidates stay inside its finite domain).
 
     ``budget_capped`` (the authoritative Draft path) recomputes the attempt
     timeout immediately before EVERY ``solve_z3_exact`` call -- after the model
@@ -8016,6 +8025,55 @@ def _run_z3_peer_component(
         learned_nogoods,
         stability_targets,
     )
+    # Part C / T2: a fully pinned component (every package has a residual
+    # target -- a queued/prepared fallback from an earlier, already checked
+    # assignment) is decided WITHOUT a fresh global solve -- but ONLY when the
+    # pinned assignment is already CONSTRAINT-CONSISTENT. `assignment_issue` is
+    # a bounded, non-solving check over the built IR (domains, forbidden
+    # combinations, peer requirements): a residual target that a NEW hard
+    # constraint forces to move must still move (the exact solver runs). The
+    # report stays "optimal" (the component IS decided) and marks the pin so
+    # reports never misread it as a fresh proof.
+    residual = residual_targets or {}
+    pinned_assignment = {
+        name: str(residual[name]) for name in component if name in residual
+    } if residual else {}
+    if pinned_assignment and len(pinned_assignment) == len(component):
+        pin_issue = model.assignment_issue(pinned_assignment)
+        if not pin_issue:
+            _pin_project = str(getattr(next(iter(rows_by_name.values()), None), "project", "?"))
+            eprint(
+                f"[info] {_pin_project}: exact z3 {mode}; "
+                f"component={len(component)} package(s) fully pinned by residual targets "
+                "and consistent; queued/prepared fallback accepted without a fresh global solve"
+            )
+            return {
+                "backend": "z3",
+                "status": "optimal",
+                "detail": (
+                    "component fully pinned by residual targets and consistent; queued/prepared "
+                    "fallback accepted without a fresh global solve"
+                ),
+                "assignment": dict(pinned_assignment),
+                "refinements": 0,
+                "elapsedMs": 0,
+                "timeoutMs": 0,
+                "configuredTimeoutMs": configured_timeout_ms,
+                "variables": len(model.packages),
+                "candidates": model.candidate_count(),
+                "hardConstraints": len(model.constraints) + len(model.requirements),
+                "stateUpperBound": str(model.state_count_upper_bound()),
+                "attempts": [],
+                "attemptCount": 0,
+                "pinned": True,
+                "proof": "queued-fallback",
+                "residualTargets": dict(pinned_assignment),
+            }
+        eprint(
+            f"[warn] {getattr(next(iter(rows_by_name.values()), None), 'project', '?')}: "
+            f"exact z3 {mode}; residual pin for {','.join(pinned_assignment)} is NOT "
+            f"constraint-consistent ({pin_issue[:240]}); the exact solver moves it"
+        )
     refinements = 0
     total_elapsed_ms = 0
     attempts: List[Dict[str, Any]] = []
@@ -9254,6 +9312,11 @@ def resolve_peer_compatibility(
                         solver_config,
                         solver_stability_targets,
                         budget_capped=True,
+                        **(
+                            {"residual_targets": residual_targets}
+                            if residual_targets
+                            else {}
+                        ),
                     )
                     exact_status = str(exact_report.get("status") or "")
                     if exact_status == "optimal" and isinstance(exact_report.get("assignment"), dict):
@@ -12879,110 +12942,138 @@ def resolve_peer_compatibility_with_verification(
                     )
                     break
                 else:
-                    solver_statuses: Dict[str, Dict[str, Dict[str, str]]] = {}
-                    try:
-                        candidate_map = resolve_peer_compatibility(
-                            {project: rows}, client,
-                            modes=(mode,),
-                            learned_nogoods_by_project_mode=learned,
-                            global_exact_exclusions_by_project_mode=global_exact_exclusions,
-                            apply_results=False,
-                            solver_statuses_out=solver_statuses,
-                            shadow_solver_config_by_project={project: spec.constraint_verify_config},
-                            residual_targets_by_project=residual_targets_by_project,
-                            diagnostic_preferences_by_project_mode=predicate_diagnostic_preferences,
-                        )
-                    except BaselineConstraintVerificationError as exc:
-                        active_intent_packages = sorted(set(baseline_keep_current) | set(baseline_required))
-                        if (
-                            _baseline_interactive()
-                            and not _baseline_background_autonomous()
-                            and exc.terminal_status == BaselineTerminalStatus.UNSAT_PROVEN.value
-                            and active_intent_packages
-                        ):
-                            focus_name = active_intent_packages[0] if len(active_intent_packages) == 1 else ""
-                            checkpoint_baseline_run(
-                                "human-decision-required",
-                                completed_iteration=max(restored_iteration, iteration - 1),
-                                status="decision-required",
+                    # Part C / unitified selector: a queued/prepared POSSIBLE
+                    # next candidate (offered by a prior verified iteration,
+                    # hint/predicate analysis or publication) is consumed FIRST
+                    # and checked WITHOUT a fresh global solve. Only when the
+                    # queue is empty does the exact solver run -- tolerantly,
+                    # per-component, so one UNFINISHED component does not
+                    # abort the independent candidates that did solve.
+                    promising_candidate = pending_promising_assignments.pop(project, mode)
+                    if promising_candidate is not None:
+                        promising_assignment = promising_candidate.assignment_dict
+                        promising_identity = assignment_fingerprint(promising_assignment)
+                        if promising_identity != promising_candidate.assignment_fingerprint:
+                            raise BaselineConstraintVerificationError(
+                                f"PSI56_PROMISING_ASSIGNMENT_IDENTITY_MISMATCH: {project}/{mode}: "
+                                f"stored={promising_candidate.assignment_fingerprint}, "
+                                f"observed={promising_identity}"
                             )
-                            decision_payload = {
-                                "schemaVersion": 1,
-                                "reason": "policy-unsat",
-                                "project": project,
-                                "mode": mode,
-                                "iteration": iteration,
-                                "hardIterations": liveness.hard_iterations,
-                                "learnedConstraints": len(learned[project][mode]),
-                                **({
-                                    "package": focus_name,
-                                    "currentVersion": baseline_current_versions.get(focus_name, ""),
-                                } if focus_name else {}),
-                            }
-                            progress_reporter.emit(
-                                project, mode, "human-decision-required",
-                                iteration=iteration,
-                                stopCode="BASELINE_HUMAN_DECISION_REQUIRED",
-                                terminalStatus="HUMAN_DECISION_REQUIRED",
-                                reason="policy-unsat",
+                        assignment = promising_assignment
+                        solver_statuses: Dict[str, Dict[str, Dict[str, str]]] = {}
+                        if promising_candidate.preparation_proof_key:
+                            prioritize_prepared_artifact_record(
+                                promising_candidate.preparation_proof_key,
+                                priority=SEARCH_PRIORITY_PROMISING,
                             )
-                            _raise_baseline_human_decision(decision_payload)
-                        if exc.terminal_status:
-                            progress_reporter.emit(
-                                project,
-                                mode,
-                                "solver-terminal",
-                                iteration=iteration,
-                                terminalStatus=exc.terminal_status,
-                                terminalSource=exc.terminal_source,
-                                stopCode=exc.stop_code,
-                                details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                        progress_reporter.emit(
+                            project,
+                            mode,
+                            "promising-assignment-prioritized",
+                            iteration=iteration,
+                            candidate=promising_identity,
+                            originatingPredicate=promising_candidate.originating_predicate,
+                            removedPredicates=list(promising_candidate.removed_predicates),
+                            remainingPredicates=list(promising_candidate.remaining_predicates),
+                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                        )
+                        emit_observability_event(
+                            "baseline.search.promising-prioritized",
+                            project=project,
+                            mode=mode,
+                            iteration=iteration,
+                            candidate=promising_identity,
+                            authority=EVIDENCE_DIAGNOSTIC_HINT,
+                        )
+                        eprint(
+                            f"[info] {project}: exact promising assignment prioritized {mode}; "
+                            f"candidate={promising_identity}, "
+                            f"origin={promising_candidate.originating_predicate}, "
+                            f"authority={EVIDENCE_DIAGNOSTIC_HINT}; "
+                            "ordinary full Baseline verification remains authoritative"
+                        )
+                    else:
+                        solver_statuses: Dict[str, Dict[str, Dict[str, str]]] = {}
+                        # Part C: the verified bootstrap solve is TOLERANT and
+                        # per-component. One component that the exact solver leaves
+                        # UNFINISHED (unknown/sat_unproven/budget) must not abort
+                        # the whole round and must not destroy the independent
+                        # candidates that DID solve. Unresolved components are
+                        # collected via incomplete_components_out, their rows are
+                        # flagged peer_compat_unresolved (never claimed verified),
+                        # and the partial assignment still enters physical
+                        # verification. Strict outcomes (UNSAT_PROVEN,
+                        # SOLVER_UNAVAILABLE, config invalid) still raise below.
+                        incomplete_components: List[Dict[str, Any]] = []
+                        try:
+                            candidate_map = resolve_peer_compatibility(
+                                {project: rows}, client,
+                                modes=(mode,),
+                                learned_nogoods_by_project_mode=learned,
+                                global_exact_exclusions_by_project_mode=global_exact_exclusions,
+                                apply_results=False,
+                                solver_statuses_out=solver_statuses,
+                                shadow_solver_config_by_project={project: spec.constraint_verify_config},
+                                residual_targets_by_project=residual_targets_by_project,
+                                diagnostic_preferences_by_project_mode=predicate_diagnostic_preferences,
+                                partial_on_incomplete=True,
+                                incomplete_components_out=incomplete_components,
                             )
-                        raise
-                    assignment = candidate_map[project][mode]
-                promising_candidate = pending_promising_assignments.pop(project, mode)
-                if promising_candidate is not None and progressive_plan is None:
-                    promising_assignment = promising_candidate.assignment_dict
-                    promising_identity = assignment_fingerprint(promising_assignment)
-                    if promising_identity != promising_candidate.assignment_fingerprint:
-                        raise BaselineConstraintVerificationError(
-                            f"PSI56_PROMISING_ASSIGNMENT_IDENTITY_MISMATCH: {project}/{mode}: "
-                            f"stored={promising_candidate.assignment_fingerprint}, "
-                            f"observed={promising_identity}"
-                        )
-                    assignment = promising_assignment
-                    solver_statuses.setdefault(project, {})[mode] = {}
-                    if promising_candidate.preparation_proof_key:
-                        prioritize_prepared_artifact_record(
-                            promising_candidate.preparation_proof_key,
-                            priority=SEARCH_PRIORITY_PROMISING,
-                        )
-                    progress_reporter.emit(
-                        project,
-                        mode,
-                        "promising-assignment-prioritized",
-                        iteration=iteration,
-                        candidate=promising_identity,
-                        originatingPredicate=promising_candidate.originating_predicate,
-                        removedPredicates=list(promising_candidate.removed_predicates),
-                        remainingPredicates=list(promising_candidate.remaining_predicates),
-                        authority=EVIDENCE_DIAGNOSTIC_HINT,
-                    )
-                    emit_observability_event(
-                        "baseline.search.promising-prioritized",
-                        project=project,
-                        mode=mode,
-                        iteration=iteration,
-                        candidate=promising_identity,
-                        authority=EVIDENCE_DIAGNOSTIC_HINT,
-                    )
-                    eprint(
-                        f"[info] {project}: exact promising assignment prioritized {mode}; "
-                        f"candidate={promising_identity}, "
-                        f"origin={promising_candidate.originating_predicate}, "
-                        f"authority={EVIDENCE_DIAGNOSTIC_HINT}; "
-                        "ordinary full Baseline verification remains authoritative"
-                    )
+                        except BaselineConstraintVerificationError as exc:
+                            active_intent_packages = sorted(set(baseline_keep_current) | set(baseline_required))
+                            if (
+                                _baseline_interactive()
+                                and not _baseline_background_autonomous()
+                                and exc.terminal_status == BaselineTerminalStatus.UNSAT_PROVEN.value
+                                and active_intent_packages
+                            ):
+                                focus_name = active_intent_packages[0] if len(active_intent_packages) == 1 else ""
+                                checkpoint_baseline_run(
+                                    "human-decision-required",
+                                    completed_iteration=max(restored_iteration, iteration - 1),
+                                    status="decision-required",
+                                )
+                                decision_payload = {
+                                    "schemaVersion": 1,
+                                    "reason": "policy-unsat",
+                                    "project": project,
+                                    "mode": mode,
+                                    "iteration": iteration,
+                                    "hardIterations": liveness.hard_iterations,
+                                    "learnedConstraints": len(learned[project][mode]),
+                                    **({
+                                        "package": focus_name,
+                                        "currentVersion": baseline_current_versions.get(focus_name, ""),
+                                    } if focus_name else {}),
+                                }
+                                progress_reporter.emit(
+                                    project, mode, "human-decision-required",
+                                    iteration=iteration,
+                                    stopCode="BASELINE_HUMAN_DECISION_REQUIRED",
+                                    terminalStatus="HUMAN_DECISION_REQUIRED",
+                                    reason="policy-unsat",
+                                )
+                                _raise_baseline_human_decision(decision_payload)
+                            if exc.terminal_status:
+                                progress_reporter.emit(
+                                    project,
+                                    mode,
+                                    "solver-terminal",
+                                    iteration=iteration,
+                                    terminalStatus=exc.terminal_status,
+                                    terminalSource=exc.terminal_source,
+                                    stopCode=exc.stop_code,
+                                    details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
+                                )
+                            raise
+                        assignment = candidate_map[project][mode]
+                        if incomplete_components:
+                            eprint(
+                                f"[warn] {project}: Baseline {mode}: "
+                                f"{len(incomplete_components)} component(s) left UNRESOLVED by the "
+                                "exact solver this iteration; they are reported as undecided and will "
+                                "not be claimed verified; the solved components still proceed"
+                            )
                 component_statuses = solver_statuses.get(project, {}).get(mode, {})
                 unknown_budget_names = sorted(
                     name for name, status in component_statuses.items() if status == "unknown_budget"
