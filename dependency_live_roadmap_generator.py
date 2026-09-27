@@ -23438,6 +23438,232 @@ def build_draft_plan(
     }
 
 
+def _sanitize_registry_url(url: str) -> str:
+    """Strip userinfo (credentials) from a registry URL for prompt output."""
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    if "://" in text:
+        scheme, rest = text.split("://", 1)
+        if "@" in rest.split("/", 1)[0]:
+            authority = rest.split("/", 1)[0]
+            rest = rest.replace(authority, authority.rsplit("@", 1)[-1], 1)
+        return f"{scheme}://{rest}"
+    return text
+
+
+def _power_shell_quote(value: str) -> str:
+    """Quote a value for Windows PowerShell 5.1: single quotes with '' doubling."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def input_hashes_for_context(ctx: Mapping[str, Any]) -> Dict[str, str]:
+    """Input identity hashes (source/lock/inputs) for the prompt's context block."""
+    raw = ctx.get("inputHashes")
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if str(k) and str(v)}
+
+
+def _draft_commands_note(commands: Mapping[str, Any], language: str, composite_note: str = "") -> str:
+    """Human note about discovered check commands and their availability."""
+    if not commands:
+        if language == "ru":
+            base = "не переданы — обнаружь в проекте и проверь доступность перед запуском"
+        else:
+            base = "not provided - discover them in the project and verify availability before running"
+    else:
+        items = []
+        for name in sorted(commands):
+            entry = commands[name]
+            status = "доступна" if entry.get("available") else "недоступна/не проверена"
+            if language != "ru":
+                status = "available" if entry.get("available") else "unavailable/unchecked"
+            detail = str(entry.get("detail") or "")
+            items.append(f"`{name}`: {status}" + (f" ({detail})" if detail else ""))
+        base = ", ".join(items) if items else ("нет команд" if language == "ru" else "no commands")
+    return base + (f"; {composite_note.strip()}" if composite_note.strip() else "")
+
+
+def _draft_audit_command_block(policy_hash: str, language: str, ctx: Mapping[str, Any], artifact_root: str) -> str:
+    """The ready-to-run manual_dependency_audit.py PowerShell command with real
+    values substituted (batch B3 contract) plus the engine/accuracy rationale
+    delivered directly in the prompt."""
+    tool_root = str(ctx.get("toolRoot") or Path(__file__).resolve().parent)
+    project_path = str(ctx.get("projectPath") or "<candidate-project>")
+    project_name = str(ctx.get("projectName") or "<project-name>")
+    registry = _sanitize_registry_url(str(ctx.get("registry") or ""))
+    policy = dict(ctx.get("policy") or {})
+    run_level = str(policy.get("targetLevel") or "yellow")
+    lag_months = str(policy.get("lagPolicyMonths")) if policy.get("lagPolicyMonths") is not None else "12"
+    min_ok = str(policy.get("minLagOkPct")) if policy.get("minLagOkPct") is not None else "80"
+    max_high = str(policy.get("maxKnownHigh")) if policy.get("maxKnownHigh") is not None else "1"
+    audit_ws = str(artifact_root).rstrip("/\\") + "/audit-step-001"
+    audit_json = str(artifact_root).rstrip("/\\") + "/audit-step-001.json"
+    audit_md = str(artifact_root).rstrip("/\\") + "/audit-step-001.md"
+    helper = os.path.join(str(tool_root).rstrip("/\\"), "manual_dependency_audit.py")
+
+    engine_parts: List[str] = []
+    if registry:
+        engine_parts.append("--registry " + _power_shell_quote(registry))
+    if project_name and project_name != "<project-name>":
+        engine_parts.append("--project-name " + _power_shell_quote(project_name))
+    policy_parts = [
+        f"--target-level {_power_shell_quote(run_level)}",
+        f"--lag-months {lag_months}",
+        f"--min-lag-ok-pct {min_ok}",
+        f"--max-known-high {max_high}",
+    ]
+    if policy.get("maxKnownModerate") is not None:
+        policy_parts.append(f"--max-known-moderate {policy['maxKnownModerate']}")
+    if policy.get("maxKnownLow") is not None:
+        policy_parts.append(f"--max-known-low {policy['maxKnownLow']}")
+
+    command_lines = [
+        "```powershell",
+        "python " + _power_shell_quote(helper) + " `",
+        "  --project-dir " + _power_shell_quote(project_path) + " `",
+    ]
+    command_lines.extend("  " + part + " `" for part in engine_parts if part)
+    command_lines.extend("  " + part + " `" for part in policy_parts)
+    command_lines += [
+        "  --yarn-audit-engine auto `",
+        "  --audit-workspace " + _power_shell_quote(audit_ws) + " `",
+        "  --json-out " + _power_shell_quote(audit_json) + " `",
+        "  --md-out " + _power_shell_quote(audit_md),
+        "```",
+    ]
+    command_text = "\n".join(command_lines)
+    if language == "ru":
+        return (
+            command_text
+            + "\n\n"
+            + f"- `policyHash` этого run: `{policy_hash}`; подставляй пользовательскую политику, а не константы примера.\n"
+            + "- Если задана per-package политика (dashboard-state), передавай её через `--dashboard-state`.\n"
+            + "- Проект именно Yarn: `--lag-months/--min-lag-ok-pct/--max-known-high` берутся из политики выше; "
+            + "проверь, что все флаги поддерживаются текущей версией helper (иначе threshold невыразим — это честное ограничение, не скрывай расхождение)."
+        )
+    return (
+        command_text
+        + "\n\n"
+        + f"- `policyHash` of this run: `{policy_hash}`; substitute the user policy, not example constants.\n"
+        + "- If a per-package policy exists (dashboard-state), pass it via `--dashboard-state`.\n"
+        + "- The project is Yarn: `--lag-months/--min-lag-ok-pct/--max-known-high` come from the policy above; "
+        + "verify the flags are supported by the installed helper (otherwise the threshold is simply not expressible - an honest limitation, not a hidden drift)."
+    )
+
+
+MIGRATION_PROGRESS_SCHEMA = 1
+
+
+def initial_migration_progress_record(
+    *,
+    run_id: str,
+    workspace_id: str,
+    project_id: str,
+    mode: str,
+    policy_hash: str,
+    ctx: Mapping[str, Any],
+    plan_counts: Mapping[str, Any],
+    settings_snapshot: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Machine-readable migration-progress record for one checkpoint point
+    (B2 contract). Every number carries its unit; denominators are explicit."""
+    c = dict(ctx)
+    input_hashes = input_hashes_for_context(c)
+    policy = dict(c.get("policy") or {})
+    lag_ok_n = int(plan_counts.get("lag_ok_12m", 0) or 0)
+    lag_total = int(plan_counts.get("total", 0) or 0)
+    return {
+        "schemaVersion": MIGRATION_PROGRESS_SCHEMA,
+        "kind": "checkpoint-point",
+        "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "runId": str(run_id),
+        "workspaceId": str(workspace_id),
+        "projectId": str(project_id),
+        "mode": str(mode),
+        "policyHash": str(policy_hash),
+        "inputHashes": dict(input_hashes) if input_hashes else {},
+        "acceptedCohortIds": [],
+        "actualHealth": {
+            "lagOk": lag_ok_n,
+            "lagTotal": lag_total,
+            "lagPercent": round((lag_ok_n / lag_total * 100.0) if lag_total else 0.0, 1),
+            "critical": int(plan_counts.get("critical", 0) or 0),
+            "high": int(plan_counts.get("high", 0) or 0),
+            "moderate": int(plan_counts.get("moderate", 0) or 0),
+            "low": int(plan_counts.get("low", 0) or 0),
+            "unknown": int(plan_counts.get("unknown", 0) or 0),
+        },
+        "audit": {
+            "engine": "not-started",
+            "accuracy": "none",
+            "coverageKnown": 0,
+            "coverageTotal": int(plan_counts.get("total", 0) or 0),
+            "unit": "packages",
+        },
+        "commands": {},
+        "exits": {},
+        "checkpointIdentity": "",
+        "remaining": None,
+        "deferred": [],
+        "securityCounts": {
+            "vulnerablePackages": int(plan_counts.get("critical", 0) or 0) + int(plan_counts.get("high", 0) or 0)
+            + int(plan_counts.get("moderate", 0) or 0) + int(plan_counts.get("low", 0) or 0),
+            "advisories": 0,
+            "nodes": 0,
+        },
+        "projected": {
+            "targetLevel": str(policy.get("targetLevel") or "yellow"),
+            "minLagOkPct": str(policy.get("minLagOkPct")) if policy.get("minLagOkPct") is not None else "80",
+            "lagPolicyMonths": str(policy.get("lagPolicyMonths")) if policy.get("lagPolicyMonths") is not None else "12",
+        },
+    }
+
+
+def append_migration_progress(
+    draft_dir: Path,
+    record: Dict[str, Any],
+    *,
+    journal_language: str = "ru",
+) -> Dict[str, Any]:
+    """Append one checkpoint point to migration-progress.json (atomic) and one
+    readable line to migration-journal.md. Both live next to the Draft prompt
+    and are referenced from it (B2). Returns the updated payload."""
+    draft_dir.mkdir(parents=True, exist_ok=True)
+    payload_path = draft_dir / "migration-progress.json"
+    journal_path = draft_dir / "migration-journal.md"
+    payload: Dict[str, Any] = {"schemaVersion": MIGRATION_PROGRESS_SCHEMA, "points": []}
+    if payload_path.is_file():
+        try:
+            existing = json.loads(payload_path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict) and isinstance(existing.get("points"), list):
+                payload = existing
+        except (OSError, ValueError):
+            payload = {"schemaVersion": MIGRATION_PROGRESS_SCHEMA, "points": []}
+    payload.setdefault("points", []).append(record)
+    _atomic_write_text(payload_path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+    health = record.get("actualHealth") or {}
+    ts = str(record.get("timestamp") or "")
+    line_parts = [
+        f"{ts} | {record.get('runId')} | phase=initial-measurement",
+        f"lag={health.get('lagOk')}/{health.get('lagTotal')} ({health.get('lagPercent')}%)"
+        + f" | C/H/M/L/U={health.get('critical')}/{health.get('high')}/{health.get('moderate')}/{health.get('low')}/{health.get('unknown')}",
+        f"audit={record.get('audit', {}).get('engine')}/{record.get('audit', {}).get('accuracy')}",
+        f"coverage={record.get('audit', {}).get('coverageKnown')}/{record.get('audit', {}).get('coverageTotal')}",
+        f"policyHash={record.get('policyHash')}",
+        "security[packages]=" + str(record.get("securityCounts", {}).get("vulnerablePackages")),
+    ]
+    if journal_language == "ru":
+        line_parts.append("— исходное измерение, НЕ проверено (NOT_VERIFIED)")
+    else:
+        line_parts.append("- initial measurement, NOT_VERIFIED")
+    with journal_path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(" | ".join(line_parts) + "\n")
+    return payload
+
+
 def build_draft_prompt(
     run_id: str,
     workspace_id: str,
@@ -23448,6 +23674,8 @@ def build_draft_prompt(
     projects_by_name: Dict[str, ProjectSpec],
     language: str = "ru",
     snapshot: Optional[Dict[str, Any]] = None,
+    execution_context: Optional[Dict[str, Any]] = None,
+    artifacts_dir: Optional[str] = None,
 ) -> str:
     """Planning-only agent prompt, fully independent of the Dashboard/DOM.
 
@@ -23456,6 +23684,14 @@ def build_draft_prompt(
     proposed targets plus keep-current/deferred/unknown rows and instructs the
     agent what to verify before touching the project. No ProofEnvelope
     authority is implied.
+
+    ``execution_context`` (optional) carries the real execution facts the agent
+    needs instead of guessing: project/tool/artifact paths, source identity,
+    package manager/runtime, sanitized registry, discovered package.json
+    scripts and their availability. ``artifacts_dir`` names the run-scoped
+    artifacts directory so the prompt can point the agent at
+    ``migration-progress.json`` and the upcoming B4 documents. Everything is
+    optional and degrades to honest "not provided" wording when absent.
     """
     lines: List[str] = []
     target_level = str(snapshot.get("targetLevel") or "yellow") if snapshot else "yellow"
@@ -23493,6 +23729,297 @@ def build_draft_prompt(
             f"mode: `{mode}`", f"policyHash: `{policy_hash}`",
             f"Run goal: target level `{target_level}`, minimum `{min_lag_pct}%` of lag-policy-compliant libraries.",
             "The Draft does not prove the goal is met: applying it still requires verified acceptance under the same policy.",
+            "",
+        ]
+
+    ctx = execution_context or {}
+    registry = str(ctx.get("registry") or "").strip()
+    registry_note = "—" if not registry else "см. ниже (без credentials)"
+    source_identity = ctx.get("source") or {}
+    tool_root = str(ctx.get("toolRoot") or Path(__file__).resolve().parent)
+    artifact_root = str(artifacts_dir or ctx.get("artifactsDir") or "—")
+    project_path = str(ctx.get("projectPath") or "—")
+    manager = str(ctx.get("packageManager") or "—")
+    runtime = str(ctx.get("runtime") or "—")
+    commands = dict(ctx.get("commands") or {})
+    scripts = ctx.get("scripts") or {}
+    composite_test = ""
+    if isinstance(scripts, dict) and scripts.get("test") and scripts.get("test:unit"):
+        composite_test = (
+            f" (`test` = `{scripts['test']}`, содержит отдельный `test:build`;"
+            " запуск одной лишь `test:unit` НЕ является полным `test`)"
+            if language == "ru"
+            else f" (`test` = `{scripts['test']}` and includes a separate `test:build`;"
+            " running only `test:unit` is NOT the full `test`)"
+        )
+
+    if language == "ru":
+        lines += [
+            "## Контекст выполнения",
+            "",
+            f"- Путь проекта: `{project_path}`",
+            f"- Артефакты run (план, prompt, progress): `{artifact_root}`",
+            f"- Путь инструмента (manual_dependency_audit.py и helpers): `{tool_root}`",
+            (
+                f"- Источник: ветка `{source_identity.get('branch') or '—'}`, commit `{source_identity.get('commit') or source_identity.get('head') or '—'}`"
+                if any(source_identity.get(k) for k in ("branch", "commit", "head"))
+                else "- Источник: данные отсутствуют (указать после checkout)"
+            ),
+            (
+                f"- Хеши входа (source/lock/inputs): {', '.join(f'{k}={v}' for k, v in sorted(input_hashes_for_context(ctx).items()))}"
+                if input_hashes_for_context(ctx)
+                else "- Хеши входа: не переданы"
+            ),
+            f"- Package manager: `{manager}`; runtime: `{runtime}`; registry: {registry_note}",
+            f"- Прогресс миграции (машиночитаемый): `{artifact_root}/migration-progress.json`; журнал: `{artifact_root}/migration-journal.md` (см. «Промежуточные отчёты»)",
+            f"- Команды проверки: {_draft_commands_note(commands, language, composite_test)}.",
+            "",
+        ]
+        lines += [
+            "## Политика запуска (подставляй пользовательскую, не константы)",
+            "",
+            f"- Уровень: `{str(snapshot.get('targetLevel') or 'yellow') if snapshot else 'yellow'}`; lag-policy месяцев: "
+            f"`{str(snapshot.get('lagPolicyMonths')) if snapshot and 'lagPolicyMonths' in snapshot else '12'}`; "
+            f"минимальная доля актуальных: `{min_lag_pct}%`.",
+            f"- Лимиты: Critical <= {snapshot.get('maxKnownCritical') if snapshot and 'maxKnownCritical' in snapshot else 'не задан'}, "
+            f"High <= {snapshot.get('maxKnownHigh') if snapshot and 'maxKnownHigh' in snapshot else 'не задан'}, "
+            f"Moderate <= {snapshot.get('maxKnownModerate') if snapshot and 'maxKnownModerate' in snapshot else 'не задан'}, "
+            f"Low <= {snapshot.get('maxKnownLow') if snapshot and 'maxKnownLow' in snapshot else 'не задан'}. "
+            "Значение 0 сохраняется строго (0 не заменяется дефолтом).",
+            "",
+            "Не переноси в команды константы из примера: подставляй именно эти числа.",
+            "",
+        ]
+        lines += [
+            "## Алгоритм миграции (по шагам, накопительно)",
+            "",
+            "1. Измерь ИСХОДНОЕ состояние: существующие versions в package.json и каноническом lockfile, исходные "
+            "lag/C/H/M/L/U и результат проверочных команд. Lockfile сам по себе не делает floor «проверенным» — "
+            "измерь исходные checks/health и сохрани failure fingerprint, если они не проходят.",
+            "2. Выбери ОГРАНИЧЕННУЮ когорту: небольшие feasibility-шаги, остальные версии зафиксированы. Не требуй "
+            "глобального оптимального набора для первого полезного результата.",
+            "3. Установи когорту штатным package manager и выполни необходимые checks (см. «Обязательные проверки агента»).",
+            "4. При несовместимости API/конфига — исправляй код/конфиг ограниченным шагом; другую версию/companion/"
+            "override оформляй явным репланом, а не скрывай внутри repair.",
+            "5. Пересчитай ACTUAL метрики на cumulative snapshot (package.json + lockfile + код вместе).",
+            "6. Сохрани checkpoint (source snapshot/commit, manifests, lock, policy, overrides, checks/evidence, метрики, "
+            "очередь, deferred-причины). Каждый следующий шаг идёт от последнего cumulative результата, НЕ от "
+            "первоначального package.json.",
+            "7. Вернись к шагу 2 для следующей когорты.",
+            "",
+            "До фактической верификации держи статус NOT_VERIFIED / PLANNING_ONLY; все утверждения подкрепляй ссылками "
+            "на evidence (файлы отчётов, пути в артефактах).",
+            "",
+        ]
+        lines += [
+            "## Аудит уязвимостей (штатная команда, подставлены реальные значения)",
+            "",
+            _draft_audit_command_block(policy_hash, language, ctx, artifact_root) + "",
+            "- НЕ заменяй helper прямым `yarn audit`: Yarn `auto` сейчас означает изолированный npm-lock-bridge; "
+            "корневой yarn.lock остаётся каноническим, сгенерированный package-lock не попадает в исходный проект.",
+            "- `accuracy=npm-resolved-approximation` — сверка по другому разрешённому графу, а не точное доказательство "
+            "безопасности Yarn-графа; не выдавай approximate/trusted за canonical pass.",
+            "- Для строгой canonical проверки используй `--yarn-audit-engine yarn-inventory`: точные package/version из "
+            "yarn.lock через npm security endpoint без нового разрешения диапазонов; неполный inventory/registry — "
+            "unknown, не zero.",
+            "- Выводи отдельно: OSV/direct (генератор), canonical inventory и npm bridge. До/после сравнивай ОДИН engine "
+            "и одну единицу подсчёта; храни время и источник adivsories, coverage, raw evidence.",
+            "- Exit code аудита интерпретируй по структурированному результату: findings и failure получения данных — "
+            "разные исходы.",
+            "- Аудит запускай как шаг явно заданного workflow, не скрытым побочным эффектом генерации Draft.",
+            "- Считай отдельно: vulnerable packages / advisories / nodes. Unknown/сетевой отказ/неполное покрытие ≠ 0.",
+            "",
+        ]
+        lines += [
+            "## Scope и когорты",
+            "",
+            "- user-excluded / keep-current — НЕ обходи и НЕ меняй без явного пересогласования (они выведены по "
+            "вопросам ниже, где это уместно).",
+            "- search-deferred (временное откладывание из-за незавершённого поиска) можно пересматривать внутри "
+            "разрешённого migration scope; это отдельный статус от user-excluded.",
+            "- Добавление нового прямого package, удаление или смена resolver override требует явной записи изменения "
+            "плана и применимой проверки scope.",
+            "- Отсутствие optional peer само по себе НЕ является поводом для установки.",
+            "",
+        ]
+        lines += [
+            "## Промежуточные отчёты",
+            "",
+            "Выдавай короткий отчёт после исходного измерения, после КАЖДОЙ принятой когорты, после значимого "
+            "blocker'а, при остановке и в финале. Во время длинной операции — стадия и elapsed, без выдуманного "
+            "процента завершения.",
+            "Формат (пример — числа бери только из evidence):",
+            "",
+            "`Шаг 3: ESLint/tooling; принято 2/7 запланированных когорт; actual Lag OK 72/110 = 65.5% (цель 80%); "
+            "C/H/M/L/U = 1/4/9/20/3; source = OSV/direct, coverage = 91/133; canonical audit = auto/npm-lock-bridge, "
+            "accuracy = npm-resolved-approximation; checks = lint:0, build:0, test:unit:1; checkpoint = <id>; "
+            "следующий шаг = ...`",
+            "",
+            "Разделяй три величины: актуальность библиотек, покрытие исследования и долю выполненного текущего плана "
+            "(при изменении состава плана показывай смену знаменателя). Отложенный пакет ≠ успешно обновлённый; "
+            "проценты не улучшай исключением неудобных строк. Строго различай actual и projected; unknown/stale "
+            "сохраняй явно.",
+            "Прогресс пиши в `migration-progress.json` (машиночитаемо) и `migration-journal.md`: для каждой точки — "
+            "timestamp, хеши source/manifest/lock, policyHash, принятые cohort IDs, actual health, audit engine/"
+            "accuracy/coverage, команды/exits, checkpoint identity, remaining/deferred. Security counts — с явной "
+            "единицей (packages / advisories / nodes). Изменённые definitions/denominators нельзя сравнивать тихо.",
+            "",
+        ]
+        lines += [
+            "## Три обязательных результата для разработчика",
+            "",
+            "- Комментарии в изменённом коде/конфиге: политика `detailed-why-comments` — объясняй нетривиальную "
+            "причину, новое ограничение API, workaround и условия его удаления. Не комментируй каждую строку и не "
+            "оставляй временный дневник в source. В JSON/generated lockfile комментарии не добавляй — опиши изменение "
+            "с file/key reference в MIGRATION_REPORT.",
+            f"- `docs/dependency-migration/{run_id}/DEVELOPER_UPGRADE_GUIDE.md`: главные новые возможности именно "
+            "фактически обновлённых библиотек, примеры применяемых API/паттернов, ограничения runtime/browser/"
+            "toolchain, breaking changes, что учитывать дальше. Не выдавай предположение за найденную возможность и "
+            "не документируй ещё не установленный target как доступный.",
+            f"- `docs/dependency-migration/{run_id}/MIGRATION_REPORT.md`: все прямые изменения/удаления/добавления/"
+            "overrides, существенные transitive/security изменения со ссылкой на полный lockfile diff; old/requested/"
+            "actual; мотивация, breaking changes, изменения файлов, шаги и проверки с exits, before/after метрики, "
+            "engine/coverage/unknown, отложенные когорты с причинами, остаточные риски, checkpoint/rollback, ссылки "
+            "на raw evidence.",
+            "",
+            "Оба файла обновляй по ходу; в финале они отражают cumulative состояние. Пути из prompt, из state и из "
+            "твоего ответа должны совпадать. Отсутствие файлов/docs — отдельный статус поставки, а не успешное "
+            "завершение. Сырые audit workspace/cache/secrets в production не коммитить.",
+            "",
+        ]
+    else:
+        lines += [
+            "## Execution context",
+            "",
+            f"- Project path: `{project_path}`",
+            f"- Run artifacts (plan, prompt, progress): `{artifact_root}`",
+            f"- Tool root (manual_dependency_audit.py and helpers): `{tool_root}`",
+            (
+                f"- Source: branch `{source_identity.get('branch') or '—'}`, commit `{source_identity.get('commit') or source_identity.get('head') or '—'}`"
+                if any(source_identity.get(k) for k in ("branch", "commit", "head"))
+                else "- Source: not provided (record after checkout)"
+            ),
+            (
+                f"- Input hashes (source/lock/inputs): {', '.join(f'{k}={v}' for k, v in sorted(input_hashes_for_context(ctx).items()))}"
+                if input_hashes_for_context(ctx)
+                else "- Input hashes: not provided"
+            ),
+            f"- Package manager: `{manager}`; runtime: `{runtime}`; registry: {registry_note}",
+            f"- Migration progress (machine-readable): `{artifact_root}/migration-progress.json`; journal: `{artifact_root}/migration-journal.md` (see the \"Intermediate reports\" section)",
+            f"- Check commands: {_draft_commands_note(commands, language, composite_test)}.",
+            "",
+        ]
+        lines += [
+            "## Run policy (substitute the user's values, never constants)",
+            "",
+            f"- Level: `{str(snapshot.get('targetLevel') or 'yellow') if snapshot else 'yellow'}`; lag-policy months: "
+            f"`{str(snapshot.get('lagPolicyMonths')) if snapshot and 'lagPolicyMonths' in snapshot else '12'}`; "
+            f"minimum lag-OK share: `{min_lag_pct}%`.",
+            f"- Limits: Critical <= {snapshot.get('maxKnownCritical') if snapshot and 'maxKnownCritical' in snapshot else 'unset'}, "
+            f"High <= {snapshot.get('maxKnownHigh') if snapshot and 'maxKnownHigh' in snapshot else 'unset'}, "
+            f"Moderate <= {snapshot.get('maxKnownModerate') if snapshot and 'maxKnownModerate' in snapshot else 'unset'}, "
+            f"Low <= {snapshot.get('maxKnownLow') if snapshot and 'maxKnownLow' in snapshot else 'unset'}. "
+            "A value of 0 is preserved strictly (0 is never replaced by a default).",
+            "",
+            "Do not copy constants from the example into commands; use exactly these numbers.",
+            "",
+        ]
+        lines += [
+            "## Migration algorithm (accumulative)",
+            "",
+            "1. Measure the INITIAL state: versions in package.json and the canonical lockfile, original "
+            "lag/C/H/M/L/U and the result of the check commands. A lockfile alone does not make a verified floor - "
+            "measure the original checks/health and keep the failure fingerprint if they do not pass.",
+            "2. Pick a BOUNDED cohort: small feasibility steps with the other versions fixed. Do not require a global "
+            "optimal assignment before the first useful result.",
+            "3. Install the cohort with the project's package manager and run the required checks (see "
+            "the \"Required agent checks\" section).",
+            "4. On API/config incompatibility fix code/config as a bounded step; a different version / companion / "
+            "override is an explicit replan, never hidden inside repair.",
+            "5. Recompute ACTUAL metrics on the cumulative snapshot (package.json + lockfile + code together).",
+            "6. Save a checkpoint (source snapshot/commit, manifests, lock, policy, overrides, checks/evidence, "
+            "metrics, queue, deferred reasons). Every next step starts from the last cumulative result, NOT from the "
+            "original package.json.",
+            "7. Go back to step 2 for the next cohort.",
+            "",
+            "Until actually verified keep the status NOT_VERIFIED / PLANNING_ONLY and back every claim with evidence "
+            "references (report files, artifact paths).",
+            "",
+        ]
+        lines += [
+            "## Vulnerability audit (canonical helper command, real values substituted)",
+            "",
+            _draft_audit_command_block(policy_hash, language, ctx, artifact_root) + "",
+            "- Do NOT replace the helper with a plain `yarn audit`: Yarn `auto` currently means an isolated npm-lock-"
+            "bridge; the root yarn.lock stays canonical and the generated package-lock never lands in the project.",
+            "- `accuracy=npm-resolved-approximation` is a cross-check against another resolved graph, not proof of "
+            "security of the Yarn graph; do not present approximate/trusted as a canonical pass.",
+            "- For a strict canonical check use `--yarn-audit-engine yarn-inventory`: exact package/version from "
+            "yarn.lock via the npm security endpoint without re-resolving ranges; an incomplete inventory/registry is "
+            "unknown, not zero.",
+            "- Report separately: OSV/direct (generator), canonical inventory, and npm bridge. Before/after must use "
+            "the SAME engine and the same counting unit; keep advisory source/time, coverage, raw evidence.",
+            "- Interpret the audit exit code from the structured result: findings and data-fetch failure are different "
+            "outcomes.",
+            "- Run the audit as an explicit workflow step, never as a hidden side effect of Draft generation.",
+            "- Count separately: vulnerable packages / advisories / nodes. Unknown/network failure/incomplete coverage is "
+            "not zero.",
+            "",
+        ]
+        lines += [
+            "## Scope and cohorts",
+            "",
+            "- user-excluded / keep-current must not be bypassed or changed without explicit re-negotiation.",
+            "- search-deferred (temporary delay due to an unfinished search) may be revisited inside the allowed "
+            "migration scope - it is a separate status from user-excluded.",
+            "- Adding a new direct package, removing one, or changing a resolver override requires an explicit plan "
+            "change and an applicable scope check.",
+            "- A missing optional peer is by itself NOT a reason to install.",
+            "",
+        ]
+        lines += [
+            "## Intermediate reports",
+            "",
+            "Emit a short report after the initial measurement, after EVERY accepted cohort, after a significant "
+            "blocker, on stop, and at the end. During a long operation report stage and elapsed, never a fabricated "
+            "percent.",
+            "Example format (numbers only from evidence):",
+            "",
+            "`Step 3: ESLint/tooling; accepted 2/7 planned cohorts; actual Lag OK 72/110 = 65.5% (target 80%); "
+            "C/H/M/L/U = 1/4/9/20/3; source = OSV/direct, coverage = 91/133; canonical audit = auto/npm-lock-bridge, "
+            "accuracy = npm-resolved-approximation; checks = lint:0, build:0, test:unit:1; checkpoint = <id>; "
+            "next step = ...`",
+            "",
+            "Keep the three measures apart: library currency, search coverage, and how much of the current plan is done "
+            "(when the plan changes, show the denominator change). A deferred package is not successfully upgraded; do "
+            "not improve percentages by dropping uncomfortable rows. Distinguish actual from projected strictly; keep "
+            "unknown/stale explicit.",
+            "Write progress into `migration-progress.json` (machine-readable) and `migration-journal.md`: per point - "
+            "timestamp, source/manifest/lock hashes, policyHash, accepted cohort IDs, actual health, audit engine/"
+            "accuracy/coverage, commands/exits, checkpoint identity, remaining/deferred. Security counts with an "
+            "explicit unit (packages / advisories / nodes). Changed definitions/denominators must not be compared "
+            "silently.",
+            "",
+        ]
+        lines += [
+            "## Three mandatory developer deliverables",
+            "",
+            "- Comments in changed code/config: policy `detailed-why-comments` - explain a non-trivial reason, a new "
+            "API constraint, a workaround and when to remove it. No per-line comments, no temporary diary in source. No "
+            "comments in JSON/generated lockfiles - describe the change with file/key references in MIGRATION_REPORT.",
+            f"- `docs/dependency-migration/{run_id}/DEVELOPER_UPGRADE_GUIDE.md`: the main NEW capabilities of the "
+            "actually installed libraries, applicable API/pattern examples, runtime/browser/toolchain constraints, "
+            "breaking changes and what to consider next. Never claim a guessed capability or document a not-yet-"
+            "installed target as available.",
+            f"- `docs/dependency-migration/{run_id}/MIGRATION_REPORT.md`: all direct changes/removals/additions/"
+            "overrides, significant transitive/security changes with a reference to the full lockfile diff; old/"
+            "requested/actual; motivation, breaking changes, file changes, executed steps and checks with exits, "
+            "before/after metrics, engine/coverage/unknown, deferred cohorts with reasons, residual risks, checkpoint/"
+            "rollback, raw evidence links.",
+            "",
+            "Update both files as you go; at the end they reflect the cumulative state. Paths in the prompt, in state "
+            "and in your answer must match. Missing docs/comments is a separate deliverable status, not build or proof "
+            "success. Never commit raw audit workspace/cache/secrets.",
             "",
         ]
 
@@ -23940,6 +24467,7 @@ def publish_draft_result(
     input_hashes: Optional[Dict[str, str]] = None,
     input_files_by_project: Optional[Dict[str, List[str]]] = None,
     solver_component_reports: Optional[List[Dict[str, Any]]] = None,
+    execution_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Publish the Draft result set atomically and return its manifest.
 
@@ -23950,7 +24478,30 @@ def publish_draft_result(
     policy_hash = draft_policy_hash(snapshot)
     generated_at = dt.datetime.now(dt.timezone.utc).isoformat()
     plan = build_draft_plan(rows_by_project, projects_by_name, health_by_project)
-    prompt_md = build_draft_prompt(run_id, workspace_id, project_id, mode, policy_hash, plan, projects_by_name, language=language, snapshot=snapshot)
+    draft_dir = _draft_artifacts_dir(run_id)
+    exec_ctx = dict(execution_context or {})
+    first_spec = next(iter(projects_by_name.values()), None) if projects_by_name else None
+    if first_spec is not None:
+        exec_ctx.setdefault("projectPath", str(first_spec.path))
+        exec_ctx.setdefault("projectName", first_spec.name)
+        exec_ctx.setdefault("packageManager", str(getattr(first_spec, "package_manager", "") or ""))
+        source_identity = dict(exec_ctx.get("source") or {})
+        checkout = first_spec.source_checkout or {}
+        if not any(source_identity.get(k) for k in ("branch", "commit", "head")):
+            source_identity.setdefault("branch", str(first_spec.source_branch or ""))
+            if checkout.get("commit"):
+                source_identity.setdefault("commit", str(checkout["commit"]))
+            else:
+                source_identity.setdefault("head", str(checkout.get("head") or first_spec.source_checkout.get("resolvedHead") or ""))
+        exec_ctx.setdefault("source", source_identity)
+    exec_ctx.setdefault("inputHashes", input_hashes or {})
+    exec_ctx.setdefault("policy", dict(snapshot or {}))
+    exec_ctx.setdefault("artifactsDir", str(draft_dir))
+    prompt_md = build_draft_prompt(
+        run_id, workspace_id, project_id, mode, policy_hash, plan, projects_by_name,
+        language=language, snapshot=snapshot,
+        execution_context=exec_ctx, artifacts_dir=str(draft_dir),
+    )
     counts = plan["counts"]
     proposed = counts.get("proposed", 0)
     # R12: `unknown`/`unknownPackages` list packages whose plan genuinely needs
@@ -24134,12 +24685,10 @@ def publish_draft_result(
             + (f". {partial_reason or 'Частичный результат по deadline/ошибке.'}")
         )
 
-    run_dir = next((p for p in (artifacts_dir_for_draft() or [])), None)
     # The Draft artifacts live under .dependency-roadmap/artifacts/runs/<runId>/draft
     # alongside every other run log; the path is derived from the workspace
     # settings base so a relocation of the workspace keeps artifacts together.
-    draft_dir = _draft_artifacts_dir(run_id)
-    del run_dir
+    # (`draft_dir` is computed early so the prompt can reference the artifact root.)
     plan_json_path = draft_dir / "plan.json"
     prompt_md_path = draft_dir / "prompt.md"
     summary_md_path = draft_dir / "summary.md"
@@ -24152,6 +24701,27 @@ def publish_draft_result(
     _atomic_write_text(plan_json_path, json.dumps(plan, ensure_ascii=False, indent=2))
     _atomic_write_text(prompt_md_path, prompt_md)
     _atomic_write_text(summary_md_path, summary + "\n")
+
+    # B2: the initial migration checkpoint-point is emitted with the Draft so
+    # the agent's very first report has a machine-readable anchor (hashes,
+    # policyHash, initial actual health, audit/coverage placeholders titled
+    # NOT_VERIFIED). Later points are appended by the migration itself.
+    migration_progress_path = draft_dir / "migration-progress.json"
+    migration_journal_path = draft_dir / "migration-journal.md"
+    append_migration_progress(
+        draft_dir,
+        initial_migration_progress_record(
+            run_id=run_id,
+            workspace_id=workspace_id,
+            project_id=project_id,
+            mode=mode,
+            policy_hash=policy_hash,
+            ctx=exec_ctx,
+            plan_counts=counts,
+            settings_snapshot=snapshot,
+        ),
+        journal_language=language,
+    )
 
     # A4: the structured UNFINISHED-component solver reports survive as their
     # own run-scoped file and are referenced from the manifest; plan.json keeps
@@ -24273,6 +24843,8 @@ def publish_draft_result(
             "prompt": str(prompt_md_path),
             "summary": str(summary_md_path),
             "solverComponents": str(solver_components_path),
+            "migrationProgress": str(migration_progress_path),
+            "migrationJournal": str(migration_journal_path),
         },
         "hashes": {
             # Hash the exact bytes on disk (LF, UTF-8, no BOM). The Electron
