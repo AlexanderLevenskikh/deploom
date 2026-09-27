@@ -81,6 +81,11 @@ from block_psi_anytime import (
     ContinuationReason,
 )
 from block_psi_progressive_baseline import plan_progressive_extension
+from baseline_repair_handoff import (
+    RepairHandoffStore,
+    build_repair_request,
+    is_repairable_project_failure,
+)
 from baseline_cohort_inference import infer_baseline_cohort
 
 from deploom_failure import build_failure, write_diagnostic_artifact
@@ -11995,6 +12000,11 @@ def resolve_peer_compatibility_with_verification(
     global_exact_exclusions: Dict[str, Dict[str, List[Dict[str, str]]]] = {
         project: {mode: [] for mode in modes} for project in rows_by_project
     }
+    # Part E: repairable project-kind failures are NEVER dependency authority.
+    # They are deferred with a machine-readable repair request instead of being
+    # learned as a nogood/exact exclusion/confirmed-failed assignment, so the
+    # same version tuple can pass after the source/config repair.
+    repair_handoff = RepairHandoffStore()
     graph_generalization_repeats: Dict[str, int] = {}
     graph_generalization_failed_candidates: Set[Tuple[str, str]] = set()
     graph_generalization_seed_packages: Dict[str, Tuple[str, ...]] = {}
@@ -12763,6 +12773,10 @@ def resolve_peer_compatibility_with_verification(
                     assignment_fingerprint(item)
                     for item in global_exact_exclusions[project][mode]
                 )
+                # Part E: repairable project failures are deferred (not learned),
+                # but the planner must not re-select the exact same tuple while
+                # the cohort is pending source/config repair.
+                blocked.update(repair_handoff.fingerprints(project, mode))
                 return plan_progressive_extension(
                     incumbent=incumbent.assignment,
                     desired=desired_assignment,
@@ -14212,6 +14226,58 @@ def resolve_peer_compatibility_with_verification(
                 # that failed, then re-solve immediately. A localized witness is
                 # not automatically a context-independent Solver nogood.
                 if result.kind in {"dependency", "preparation", "project"}:
+                    # Part E: a PROJECT-kind failure is snapshot-local migration
+                    # evidence for the SAME tuple, not proof that the tuple is
+                    # dependency-incompatible. The same version set is expected to
+                    # pass AFTER the source/config repair (candidate ->
+                    # verify -> repair -> verify -> accept). Defer the cohort
+                    # with a machine-readable repair request and CONTINUE to
+                    # other cohorts: no confirmed-failed assignment, no exact
+                    # exclusion, no nogood is learned, so the solver cache is
+                    # never poisoned for a repairable tuple.
+                    if result.kind == "project" and is_repairable_project_failure(result):
+                        # Pure, cheap classification for the machine-readable
+                        # request. Never run a control verification here: this
+                        # is the failure fast-path, not evidence production.
+                        structural_hints = sorted(
+                            structural_project_failure_signatures(result)
+                        )
+                        repair_request = build_repair_request(
+                            project=project,
+                            mode=mode,
+                            assignment=verification_assignment,
+                            result=result,
+                            snapshot_identity=project_source_snapshot_key,
+                            fingerprint=fingerprint,
+                            structural_signatures=structural_hints,
+                        )
+                        repair_handoff.defer(project, mode, repair_request)
+                        anytime.observe_candidate(
+                            duration_seconds=time.monotonic() - candidate_started,
+                            passed=False,
+                            predicate=f"repair-required:{repair_request.reason}",
+                            learned_constraints=len(learned[project][mode]),
+                        )
+                        eprint(
+                            f"[info] {project}: Baseline {mode} candidate {fingerprint} "
+                            f"resolver-green but requires source/config repair; "
+                            f"deferred cohort (repair-required); "
+                            f"structural=[{','.join(structural_hints) or 'none'}]; "
+                            f"no dependency nogood learned; "
+                            f"request={repair_request.request_id}"
+                        )
+                        progress_reporter.emit(
+                            project,
+                            mode,
+                            "cohort-repair-required",
+                            iteration=iteration,
+                            assignment=fingerprint,
+                            origin=result.kind,
+                            repairRequest=repair_request.to_json(),
+                            deferred=True,
+                            authority="SOURCE_CONFIG_REPAIR_HANDOFF",
+                        )
+                        continue
                     exact_nogood = dict(verification_assignment)
                     if not exact_nogood:
                         raise BaselineConstraintVerificationError(
