@@ -60,3 +60,17 @@ export function handleDialogBudget(input: DialogBudgetInput): { budgetMinutes?: 
 export function attemptsForMinutes(minutes: number): number {
   return Math.max(2, Math.min(8, Math.ceil(Math.max(5, Math.min(240, Math.round(minutes) || 30)) / 10)))
 }
+
+/**
+ * Advisory budget recommendation for the Baseline dialog. It only informs the
+ * user what a plausible explicit budget is for the managed package count and
+ * the chosen search strategy; it is NEVER applied on its own - only an actual
+ * dialog choice carries the override (handleDialogBudget / N1).
+ */
+export function recommendedBudgetMinutes(options: { managedCount: number; productMode?: 'fast' | 'deep' }): number {
+  const count = Math.max(0, Math.floor(Number(options.managedCount) || 0))
+  const raw = options.productMode === 'fast' ? 15 + count / 6 : 30 + count / 2
+  const min = options.productMode === 'fast' ? 5 : 30
+  const max = options.productMode === 'fast' ? 60 : 240
+  return Math.min(max, Math.max(min, Math.round(raw / 5) * 5))
+}

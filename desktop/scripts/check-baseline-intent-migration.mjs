@@ -33,7 +33,7 @@ const runModule = (text) => {
 // normalizers (loader semantics decide what "well formed" means), not the
 // identity stubs the earlier N1/F3 harness used.
 const { mergeTargetPolicy } = runModule(fs.readFileSync(new URL('../electron/acceptance-policy.ts', import.meta.url), 'utf8'))
-const { normalizeBudgetField } = runModule(fs.readFileSync(new URL('../electron/baseline-intent.ts', import.meta.url), 'utf8'))
+const { normalizeBudgetField, recommendedBudgetMinutes } = runModule(fs.readFileSync(new URL('../electron/baseline-intent.ts', import.meta.url), 'utf8'))
 const normStart = source.indexOf('function normalizeBaselineIntent(')
 const normEnd = source.indexOf('function projectArtifactToken(', normStart)
 if (normStart < 0 || normEnd < 0) throw new Error('G1: normalizeBaselineIntent slice not found in main.ts')
@@ -413,6 +413,17 @@ try {
     throw new Error('G1: opening/planning must never create another project\'s current intent')
   }
   PROJECTS = []
+
+  // Budget recommendation is advisory only: sane scale by managed package
+  // count and search strategy, clamped to the product range, and it never
+  // makes anything explicit by itself.
+  const recDeep = recommendedBudgetMinutes({ managedCount: 133, productMode: 'deep' })
+  if (recDeep < 60 || recDeep > 180) throw new Error(`deep recommendation for 133 packages must land in a sane band: ${recDeep}`)
+  const recFast = recommendedBudgetMinutes({ managedCount: 133, productMode: 'fast' })
+  if (recFast < 5 || recFast > 60) throw new Error(`fast recommendation must stay in the fast range: ${recFast}`)
+  if (recommendedBudgetMinutes({ managedCount: 0, productMode: 'deep' }) !== 30) throw new Error('empty project must clamp to the deep minimum (30)')
+  if (recommendedBudgetMinutes({ managedCount: 100000, productMode: 'deep' }) !== 240) throw new Error('huge project must clamp to the deep maximum (240)')
+  if (recommendedBudgetMinutes({ managedCount: 0, productMode: 'fast' }) < 5) throw new Error('empty fast project must not drop below the fast minimum (5)')
 
   console.log('Baseline legacy-artifact migration (R2) OK')
 } finally {

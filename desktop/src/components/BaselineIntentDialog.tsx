@@ -1,7 +1,7 @@
 import { AlertTriangle, Search, ShieldCheck, X } from 'lucide-react'
 import { useDeferredValue, useEffect, useMemo, useState } from 'react'
 import { useLanguage } from '../i18n'
-import { attemptsForMinutes, handleDialogBudget } from '../../electron/baseline-intent'
+import { attemptsForMinutes, handleDialogBudget, recommendedBudgetMinutes } from '../../electron/baseline-intent'
 import type { BaselineControlMode, BaselineDecision, BaselineIntent, BaselineIntentPlan, BaselinePackagePolicy, BaselineProofMode, BaselineSearchMode } from '../types'
 import { QuickSelect } from './QuickSelect'
 
@@ -68,8 +68,9 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
   const [controlMode, setControlMode] = useState<BaselineControlMode>(normalizedControlMode(plan.intent))
   const [budgetMinutes, setBudgetMinutes] = useState(boundedInteger(plan.intent.budgetMinutes, 30, 5, 240))
   // N1: an untouched budget field is NOT an explicit user choice. Only editing
-  // the minutes (or reopening an explicitly saved intent) carries the override.
-  const [budgetEdited, setBudgetEdited] = useState(false)
+  // the minutes (or reopening an explicitly saved intent) carries the override;
+  // the "default limits" checkbox below clears the override in either case.
+  const [budgetEdited, setBudgetEdited] = useState(() => Boolean(plan.intent.budgetMinutesExplicit))
   const [maxKnownHigh, setMaxKnownHigh] = useState(boundedInteger(plan.intent.acceptancePolicy?.maxKnownHigh, 1, 0, 99))
   const [searchDepth, setSearchDepth] = useState<BaselineSearchMode>(normalizedSearchMode(plan.intent.searchMode))
   const [deferredCohorts, setDeferredCohorts] = useState<DeferredCohort[]>([...(plan.intent.deferredCohorts ?? [])])
@@ -83,12 +84,14 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
   // verified assignment that actually satisfies the acceptance policy; DEEP
   // keeps improving and preserves the best verified incumbent (legacy default).
   const [productMode, setProductMode] = useState<'fast' | 'deep'>(plan.intent.productMode ?? 'deep')
+  const recommendedBudget = recommendedBudgetMinutes({ managedCount: plan.candidates.length, productMode })
   const deferredQuery = useDeferredValue(query)
 
   useEffect(() => {
     setPolicies({ ...plan.intent.policies })
     setControlMode(normalizedControlMode(plan.intent))
     setBudgetMinutes(boundedInteger(plan.intent.budgetMinutes, 30, 5, 240))
+    setBudgetEdited(Boolean(plan.intent.budgetMinutesExplicit))
     setMaxKnownHigh(boundedInteger(plan.intent.acceptancePolicy?.maxKnownHigh, 1, 0, 99))
     setSearchDepth(normalizedSearchMode(plan.intent.searchMode))
     setDeferredCohorts([...(plan.intent.deferredCohorts ?? [])])
@@ -96,7 +99,6 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
     setMinLagOkPct(boundedInteger(plan.intent.minLagOkPct, 80, 0, 100))
     setLagPolicyMonths(boundedLagMonths(plan.intent.lagPolicyMonths ?? plan.intent.acceptancePolicy?.lagPolicyMonths ?? 12))
     setProductMode(plan.intent.productMode ?? 'deep')
-    setBudgetEdited(false)
   }, [plan])
 
   const visible = useMemo(() => {
@@ -170,9 +172,11 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
       // N1: only a genuinely chosen budget travels as an explicit override.
       // An untouched field (or a default that was never saved as a user
       // choice) carries NOTHING, so the Desktop/engine keep the mode budgets.
+      // The "default limits" checkbox makes budgetEdited=false and suppresses
+      // even an inherited explicit budget: the user actively chose defaults.
       ...handleDialogBudget({
         edited: budgetEdited,
-        planExplicit: Boolean(plan.intent.budgetMinutesExplicit),
+        planExplicit: !budgetEdited ? false : Boolean(plan.intent.budgetMinutesExplicit),
         shownMinutes: budgetMinutes,
         planBudgetMinutes: plan.intent.budgetMinutes,
       }),
@@ -399,8 +403,24 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
             </div>
             <div className="baseline-run-control">
               <span className="baseline-run-control-label">{text('Бюджет Baseline / планирования', 'Baseline / planning budget')}</span>
-              <label>{text('Минуты', 'Minutes')}<input type="number" min={5} max={240} step={5} value={budgetMinutes} disabled={busy} onChange={(event) => { setBudgetEdited(true); setBudgetMinutes(boundedInteger(event.target.value, 30, 5, 240)) }} /></label>
-              <small>{text('Ограничивает дорогой поиск и physical verification на этапе Baseline. Это не таймер всего FLOW.', 'Bounds expensive search and physical verification during Baseline. It is not a timer for the whole FLOW.')}</small>
+              <label className="baseline-default-budget-toggle">
+                <input type="checkbox" checked={!budgetEdited} disabled={busy} onChange={() => setBudgetEdited((edited) => !edited)} />
+                {text('Лимиты по умолчанию (без явного бюджета)', 'Default limits (no explicit budget)')}
+              </label>
+              {budgetEdited ? (
+                <>
+                  <label>{text('Минуты', 'Minutes')}<input type="number" min={5} max={240} step={5} value={budgetMinutes} disabled={busy} onChange={(event) => { setBudgetEdited(true); setBudgetMinutes(boundedInteger(event.target.value, 30, 5, 240)) }} /></label>
+                  <small className="baseline-budget-applied">
+                    {text(`Применяемый лимит: ${boundedInteger(budgetMinutes, 30, 5, 240)} мин (${boundedInteger(budgetMinutes, 30, 5, 240) * 60} с · ${attemptsForMinutes(budgetMinutes)} дорогих попыток)`, `Applied budget: ${boundedInteger(budgetMinutes, 30, 5, 240)} min (${boundedInteger(budgetMinutes, 30, 5, 240) * 60}s · ${attemptsForMinutes(budgetMinutes)} expensive attempts)`)}
+                  </small>
+                  <small className="baseline-budget-suggestion">
+                    {text(`Рекомендация: ${recommendedBudget} мин для ${plan.candidates.length} пакетов (${productMode})`, `Suggestion: ${recommendedBudget} min for ${plan.candidates.length} packages (${productMode})`)}
+                    <button type="button" className="button secondary" disabled={busy} onClick={() => setBudgetMinutes(recommendedBudget)}>{text('Взять рекомендацию', 'Use suggestion')}</button>
+                  </small>
+                </>
+              ) : (
+                <small>{text('Без выбора бюджета применяются режимные лимиты: Fast 300 с / 2 попытки, Deep 3600 с / 12.', 'Without a chosen budget the mode limits apply: Fast 300s/2 attempts, Deep 3600s/12.')}</small>
+              )}
             </div>
             <div className="baseline-run-control">
               <span className="baseline-run-control-label">{text('Acceptance policy', 'Acceptance policy')}</span>
