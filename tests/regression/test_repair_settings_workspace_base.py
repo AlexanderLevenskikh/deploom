@@ -14,7 +14,7 @@ import dependency_live_roadmap_generator as roadmap
 
 
 def norm(path: Path) -> str:
-    # Windows 8.3 short names (LEVENS~1 vs levenskikh) can differ between
+    # Windows 8.3 short names and their long forms can differ between
     # resolve() calls in different directory levels; compare normalized forms.
     from os import path as ospath
 
