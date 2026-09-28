@@ -1789,6 +1789,49 @@ def _dirty_checkout_details(project: ProjectSpec) -> str:
     return preview
 
 
+# R6 review P1#1: repair-capture authorization. The Baseline repair chain runs
+# its FRESH authoritative re-verification against an ISOLATED repair checkout
+# (a local-only clone of the original project at the exact source commit the
+# episode was opened against), which the repair agent has edited in place. Such
+# a dirty tree is authorizable ONLY here, explicitly, fail-closed and anchored:
+#   DEPLOOM_BASELINE_SOURCE_REPAIR=1 allows a dirty tree to be captured, but
+#   ONLY when HEAD equals DEPLOOM_BASELINE_SOURCE_COMMIT (the episode's pinned
+#   original source commit). A mismatch, a missing pin, or a missing flag keeps
+#   the ordinary SOURCE_CHECKOUT_DIRTY reject -- the same tree is refused
+#   everywhere else. Authorized repair captures never move the base commit.
+SOURCE_REPAIR_CAPTURE_ENV = "DEPLOOM_BASELINE_SOURCE_REPAIR"
+SOURCE_REPAIR_PIN_ENV = "DEPLOOM_BASELINE_SOURCE_COMMIT"
+
+
+def _repair_capture_requested() -> bool:
+    return os.environ.get(SOURCE_REPAIR_CAPTURE_ENV) == "1"
+
+
+def _repair_capture_pinned_commit() -> str:
+    return (os.environ.get(SOURCE_REPAIR_PIN_ENV) or "").strip().lower()
+
+
+def _assert_repair_capture_anchor(project: ProjectSpec) -> None:
+    """Fail-closed: a repair capture must sit exactly on the pinned commit."""
+    pinned = _repair_capture_pinned_commit()
+    head_result = _git_command(project, ["rev-parse", "HEAD"], check=False)
+    head = (head_result.stdout or "").strip().lower()
+    if not pinned or not re.fullmatch(r"[0-9a-f]{40}", pinned):
+        raise SourceCheckoutGuardError(
+            "SOURCE_CHECKOUT_REPAIR_PIN_MISSING",
+            project,
+            "repair-capture authorized but no pinned source commit "
+            f"({SOURCE_REPAIR_PIN_ENV}) was provided; refusing to capture a dirty tree",
+        )
+    if head != pinned:
+        raise SourceCheckoutGuardError(
+            "SOURCE_CHECKOUT_REPAIR_HEAD_MISMATCH",
+            project,
+            f"repair-capture authorized but HEAD={head or '<unreadable>'} does not match "
+            f"pinned source commit {pinned}; authorized repair captures never move the base commit",
+        )
+
+
 def _verify_local_only_source(project: ProjectSpec, branch: str) -> Dict[str, Any]:
     """Provenance for a repository that has no configured remotes at all.
 
@@ -1834,7 +1877,7 @@ def _verify_local_only_source(project: ProjectSpec, branch: str) -> Dict[str, An
             )
 
     dirty_after = _dirty_checkout_details(project)
-    if dirty_after:
+    if dirty_after and not _repair_capture_requested():
         raise SourceCheckoutGuardError(
             "SOURCE_CHECKOUT_DIRTY_AFTER_SYNC",
             project,
@@ -1849,6 +1892,7 @@ def _verify_local_only_source(project: ProjectSpec, branch: str) -> Dict[str, An
         "sourceCommit": source_commit,
         "remoteCommit": "",
         "localOnly": True,
+        "repairCapture": _repair_capture_requested(),
         "verifiedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     project.source_checkout = metadata
@@ -1870,23 +1914,33 @@ def ensure_source_checkout(project: ProjectSpec, *, allow_checkpoint_resume: boo
 
     dirty = _dirty_checkout_details(project)
     if dirty:
-        workspace = str(project.audit_bootstrap_config.get("workspace") or ".dependency-roadmap-audit")
-        try:
-            recovered = recover_orphaned_managed_workspace(project.path, workspace)
-        except AuditBranchError as exc:
-            raise SourceCheckoutGuardError(exc.code, project, exc.detail) from exc
-        if recovered:
+        if _repair_capture_requested():
+            # R6 review P1#1: the ONLY way a dirty tree is captured. Still
+            # fail-closed -- the tree must sit exactly on the pinned commit.
+            _assert_repair_capture_anchor(project)
             eprint(
-                f"[warn] recovered orphaned tool-managed audit workspace before source sync: "
-                f"{project.name} {workspace}"
+                f"[repair-capture] authorized dirty source capture for {project.name} "
+                f"on pinned commit {_repair_capture_pinned_commit()}; "
+                "sealing the repaired tree as a NEW source identity"
             )
-            dirty = _dirty_checkout_details(project)
-        if dirty:
-            raise SourceCheckoutGuardError(
-                "SOURCE_CHECKOUT_DIRTY",
-                project,
-                f"commit/stash/remove changes before generation: {dirty}",
-            )
+        else:
+            workspace = str(project.audit_bootstrap_config.get("workspace") or ".dependency-roadmap-audit")
+            try:
+                recovered = recover_orphaned_managed_workspace(project.path, workspace)
+            except AuditBranchError as exc:
+                raise SourceCheckoutGuardError(exc.code, project, exc.detail) from exc
+            if recovered:
+                eprint(
+                    f"[warn] recovered orphaned tool-managed audit workspace before source sync: "
+                    f"{project.name} {workspace}"
+                )
+                dirty = _dirty_checkout_details(project)
+            if dirty:
+                raise SourceCheckoutGuardError(
+                    "SOURCE_CHECKOUT_DIRTY",
+                    project,
+                    f"commit/stash/remove changes before generation: {dirty}",
+                )
 
     branch = project.source_branch.strip()
     remote = project.git_remote.strip() or "origin"
@@ -2009,7 +2063,7 @@ def ensure_source_checkout(project: ProjectSpec, *, allow_checkpoint_resume: boo
         )
 
     dirty_after = _dirty_checkout_details(project)
-    if dirty_after:
+    if dirty_after and not _repair_capture_requested():
         raise SourceCheckoutGuardError(
             "SOURCE_CHECKOUT_DIRTY_AFTER_SYNC",
             project,
@@ -2022,6 +2076,7 @@ def ensure_source_checkout(project: ProjectSpec, *, allow_checkpoint_resume: boo
         "sourceBranch": branch,
         "sourceCommit": source_commit,
         "remoteCommit": remote_commit,
+        "repairCapture": _repair_capture_requested(),
         "verifiedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     project.source_checkout = metadata

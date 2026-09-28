@@ -31,7 +31,8 @@ import { plannerResultCacheKey, plannerResultCachePath, writePlannerResultCache 
 import { buildReleaseRecoveryPrompt, readReleaseRecoveryResult } from './release-recovery.js'
 import { assessMigrationCheckpoint, baselineFailureDecision, baselineFailuresNeedingProbe, baselineObservationMatchesFailure, createVerificationDiagnosticCollector, verificationCommandKey, type BaselineVerificationObservation, type MigrationVerificationAssessment, type VerificationDiagnosticEvidence, type VerificationEvidence, type VerificationFailure } from './migration-verification.js'
 import { openRepairRequests, repairHandoffStateRelativeDir, requestSummary, extractRepairRequiredEnvelope, type RepairRequest, type RepairRequiredEnvelope } from './repair-handoff.js'
-import { DEFAULT_MAX_BASELINE_REPAIR_CYCLES, clearRepairDispatchState, readRepairDispatchState, runBaselineRepairCycles } from './repair-dispatch.js'
+import { DEFAULT_MAX_BASELINE_REPAIR_CYCLES, clearRepairDispatchState, readRepairDispatchState, repairCheckoutDirName, repairSettingsFileName, runBaselineRepairCycles } from './repair-dispatch.js'
+import { applyRepairReVerification, buildRepairSettingsFile, createIsolatedRepairCheckout, resolveGitHead } from './repair-checkout.js'
 import { buildBaselineRepairPrompt, readBaselineRepairAgentResult } from './baseline-repair-result.js'
 import { migrationGatePolicy } from './migration-gates.js'
 import { cleanEphemeralVerificationCaches, liveBaselineObservationCacheKey } from './verification-environment.js'
@@ -332,6 +333,11 @@ type CommandSpec = {
   skipWhenNoStagedChanges?: boolean
   finalizeTeamStateBeforeRun?: boolean
   captureAgentSession?: boolean
+  // R6 review P1#2: invoked the moment the agent's session id is first seen in
+  // its output -- while the process is still running, not after it exits. The
+  // repair dispatcher uses it to persist the id durably before the agent
+  // returns, so a mid-agent crash resumes the same session.
+  onAgentSessionId?: (sessionId: string) => void
   captureVerificationDiagnostics?: boolean
   timeoutMs?: number
   stallWarningMs?: number
@@ -1515,7 +1521,7 @@ async function inferredRecoveryIssue(workspace: WorkspaceRecord, project: Projec
   return undefined
 }
 
-function captureAgentSession(job: JobRecord, chunk: string): void {
+function captureAgentSession(job: JobRecord, chunk: string, onSessionId?: (sessionId: string) => void): void {
   if (!job.agentProvider || job.agentSessionId) return
   const combined = `${job.stdoutBuffer ?? ''}${chunk}`
   const lines = combined.split(/\r?\n/)
@@ -1527,6 +1533,8 @@ function captureAgentSession(job: JobRecord, chunk: string): void {
     job.agentSessionId = sessionId
     job.stdoutBuffer = ''
     updateTeamState(job, 'running')
+    // Mid-run notification: the id is known long before the process exits.
+    onSessionId?.(sessionId)
     return
   }
 }
@@ -6290,7 +6298,17 @@ function commandSpecForRetry(job: JobRecord, spec: CommandSpec): CommandSpec {
 // mismatch or silently continue the OLD search; Start-over re-plans and
 // re-verifies the repaired snapshot. Previously verified artifacts are
 // preserved on disk independently of this run.
-function baselineRepairReVerificationSpec(job: JobRecord, spec: CommandSpec): CommandSpec {
+// R6 review P1#1: when the episode has an isolated repair checkout, the
+// re-verification runs against it (repair settings file + fail-closed
+// repair-capture authorization pinned to the episode's source commit).
+function baselineRepairReVerificationSpec(
+  job: JobRecord,
+  spec: CommandSpec,
+  repair?: { settingsPath?: string; sourceCommit?: string },
+): CommandSpec {
+  if (repair?.settingsPath && repair.sourceCommit) {
+    return applyRepairReVerification(spec, { settingsPath: repair.settingsPath, sourceCommit: repair.sourceCommit }) as CommandSpec
+  }
   return {
     ...spec,
     label: `${spec.label} (повторная авторитетная верификация после repair)`,
@@ -6308,12 +6326,19 @@ function baselineRepairReVerificationSpec(job: JobRecord, spec: CommandSpec): Co
 // orchestrator decides from it, and the following authoritative re-verification
 // is the real verdict. A previously captured session id resumes the same
 // conversation, which is what makes a mid-episode restart correct.
+// R6 review P1#1: the agent works in the ISOLATED repair checkout
+// (repairCheckoutPath), never in the original project checkout, so its
+// edits to tracked source files cannot dirty the original.
+// R6 review P1#2: onSessionId fires the moment the id is first seen in the
+// agent's output -- before this function returns -- and the caller persists it
+// durably, so a mid-agent crash can resume the same session.
 async function runBaselineRepairAgent(
   job: JobRecord,
   project: ProjectSpec,
   requests: RepairRequest[],
-  input: { attempt: number; cycle: number; resumeSessionId?: string; lastTerminalRunId?: string },
+  input: { attempt: number; cycle: number; resumeSessionId?: string; lastTerminalRunId?: string; onSessionId?: (sessionId: string) => void; repairCheckoutPath?: string },
 ): Promise<{ status: 'repaired' | 'partial' | 'blocked'; reason: string; sessionId?: string }> {
+  const workProject = input.repairCheckoutPath ? { ...project, path: input.repairCheckoutPath } : project
   const promptDir = join(app.getPath('userData'), 'baseline-repair-prompts')
   mkdirSync(promptDir, { recursive: true })
   const stem = `${project.name}-${input.cycle}-${input.attempt}`.replace(/[^a-zA-Z0-9._-]+/g, '-')
@@ -6325,11 +6350,11 @@ async function runBaselineRepairAgent(
     /* overwritten below */
   }
   const savedPrompt = promptPathForProject(job.workspace, project.name)
-  const openCodeServerUrl = await ensureOpenCodeServer(job, project.path)
+  const openCodeServerUrl = await ensureOpenCodeServer(job, workProject.path)
   job.agentProvider = job.workspace.agent
   const prompt = buildBaselineRepairPrompt({
     projectName: project.name,
-    projectPath: project.path,
+    projectPath: workProject.path,
     savedPromptPath: savedPrompt ?? undefined,
     resultPath: repairResultPath,
     requests,
@@ -6343,9 +6368,17 @@ async function runBaselineRepairAgent(
   writeFileSync(repairPromptPath, prompt, 'utf8')
   job.agentSessionId = input.resumeSessionId
   job.stdoutBuffer = ''
-  const spec = input.resumeSessionId
-    ? { ...agentResumeSpec(job.workspace.agent, project, input.resumeSessionId, repairPromptPath, job.workspace.agentModel, undefined, 'Продолжение repair', undefined, openCodeServerUrl), label: `Baseline repair agent (cycle ${input.cycle}, attempt ${input.attempt})`, captureAgentSession: true }
-    : { ...agentStartSpec(job.workspace.agent, project, repairPromptPath, prompt, job.workspace.agentModel, undefined, openCodeServerUrl), label: `Baseline repair agent (cycle ${input.cycle}, attempt ${input.attempt})`, captureAgentSession: true }
+  const forwardSession = (sessionId: string): void => {
+    job.agentSessionId = sessionId
+    input.onSessionId?.(sessionId)
+  }
+  const baseSpec = input.resumeSessionId
+    ? { ...agentResumeSpec(job.workspace.agent, workProject, input.resumeSessionId, repairPromptPath, job.workspace.agentModel, undefined, 'Продолжение repair', undefined, openCodeServerUrl), label: `Baseline repair agent (cycle ${input.cycle}, attempt ${input.attempt})`, captureAgentSession: true }
+    : { ...agentStartSpec(job.workspace.agent, workProject, repairPromptPath, prompt, job.workspace.agentModel, undefined, openCodeServerUrl), label: `Baseline repair agent (cycle ${input.cycle}, attempt ${input.attempt})`, captureAgentSession: true }
+  const spec = {
+    ...baseSpec,
+    ...(input.onSessionId ? { onAgentSessionId: forwardSession } : {}),
+  }
   const result = await executeCommand(job, spec)
   const machineResult = readBaselineRepairAgentResult(repairResultPath)
   const sessionId = job.agentSessionId || input.resumeSessionId
@@ -6484,14 +6517,14 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
       const text = decodeProcessOutputChunk(chunk)
       diagnosticCollector?.push(text, 'stdout')
       stdout = `${stdout}${text}`.slice(-6000)
-      if (spec.captureAgentSession !== false) captureAgentSession(job, text)
+      if (spec.captureAgentSession !== false) captureAgentSession(job, text, spec.onAgentSessionId)
       send('flow:job-output', { jobId: job.id, stream: 'stdout', line: text })
     })
     child.stderr.on('data', (chunk: Buffer) => {
       markOutput()
       const text = decodeProcessOutputChunk(chunk)
       diagnosticCollector?.push(text, 'stderr')
-      if (spec.captureAgentSession !== false) captureAgentSession(job, text)
+      if (spec.captureAgentSession !== false) captureAgentSession(job, text, spec.onAgentSessionId)
       stderr = `${stderr}${text}`.slice(-6000)
       send('flow:job-output', { jobId: job.id, stream: 'stderr', line: text })
     })
@@ -6663,22 +6696,60 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
         stateDir: repairStateDir,
         workspaceId: job.workspace.id,
         project: job.projectName,
+        originalPath: repairProject.path,
+        sourceBranch: repairProject.git?.sourceBranch?.trim() || 'master',
         maxCycles: DEFAULT_MAX_BASELINE_REPAIR_CYCLES,
         onEvent: (line) => send('flow:job-output', { jobId: job.id, stream: 'system', workspaceId: job.workspace.id, projectName: job.projectName, line }),
-        dispatchRepairAgent: async ({ attempt, requests, resumeSessionId, state }) => runBaselineRepairAgent(job, repairProject, requests, {
+        ensureRepairCheckout: async ({ originalPath, sourceBranch, stateDir, project }) => {
+          const checkoutDir = join(stateDir, repairCheckoutDirName(project))
+          // R7 review P1#1: the repair settings must sit in the SAME directory
+          // as the original settings, so the generator's settings_workspace_base
+          // resolves the identical workspace base and every relative path
+          // (handoff, history, cache, groups, outputs) keeps its meaning: the
+          // re-verification writes its durable repair handoff exactly where the
+          // Desktop reads the open requests -- one durable state for both.
+          const settingsFilePath = join(dirname(resolveSettingsPath(job.workspace)), repairSettingsFileName(project))
+          if (!existsSync(checkoutDir)) {
+            // Pin the original checkpoint at episode time: the repair clone is
+            // created at the exact source commit the original checkout has
+            // right now. The original repo is never modified.
+            const sourceCommit = resolveGitHead(originalPath)
+            createIsolatedRepairCheckout({ originalPath, sourceBranch, sourceCommit, targetDir: checkoutDir })
+          }
+          const sourceCommit = resolveGitHead(checkoutDir)
+          if (!existsSync(settingsFilePath)) {
+            buildRepairSettingsFile({
+              sourceSettingsPath: resolveSettingsPath(job.workspace),
+              projectName: project,
+              repairCheckoutPath: checkoutDir,
+              targetPath: settingsFilePath,
+            })
+          }
+          return { path: checkoutDir, sourceCommit, settingsPath: settingsFilePath }
+        },
+        dispatchRepairAgent: async ({ attempt, requests, resumeSessionId, state, onSessionId }) => runBaselineRepairAgent(job, repairProject, requests, {
           attempt,
           cycle: state.cycle,
           resumeSessionId,
           lastTerminalRunId: state.lastTerminalRunId,
+          onSessionId,
+          repairCheckoutPath: state.repairCheckoutPath,
         }),
         runReVerification: async ({ attempt }) => {
-          const reVerifySpec = baselineRepairReVerificationSpec(job, baselineCommandSpec!)
+          // The episode's repair checkpoint/settings are read from the durable
+          // dispatch state so a re-verification after a restart still targets
+          // the isolated repair checkout with the fail-closed repair capture.
+          const episode = readRepairDispatchState(repairStateDir, job.projectName!)
+          const reVerifySpec = baselineRepairReVerificationSpec(job, baselineCommandSpec!, {
+            settingsPath: episode?.repairSettingsPath,
+            sourceCommit: episode?.repairSourceCommit,
+          })
           send('flow:job-output', {
             jobId: job.id,
             stream: 'system',
             workspaceId: job.workspace.id,
             projectName: job.projectName,
-            line: `Повторная авторитетная верификация Baseline после repair (cycle attempt ${attempt}).`,
+            line: `Повторная авторитетная верификация Baseline после repair (cycle attempt ${attempt})${episode?.repairCheckoutPath ? ` на изолированном repair checkout` : ''}.`,
           })
           const re = await executeCommand(job, reVerifySpec)
           if (re.code !== 0) {
