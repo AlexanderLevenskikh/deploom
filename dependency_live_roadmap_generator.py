@@ -21077,6 +21077,15 @@ function projectTargetPromptRowsForProject(project){
     .filter(row => row.dataset.project === project)
     .map(row => rowToPromptData(row, mode));
 }
+function isExplicitPlannerDeferral(r){
+  // Keep a planner-recorded unresolved target in the immutable deferred scope.
+  // This permits exporting partial work, not satisfying the lag policy.
+  if (r.scopeExcluded || r.plannedAction !== 'deferred' || r.hasTarget || isActionTargetValue(r.target)) return false;
+  const marker = `PEER_RESOLUTION_DEFERRED: desired=${r.lagPolicyTarget}; resolved=current ${r.current}; `;
+  const reason = String(r.targetReason || '');
+  const offset = reason.indexOf(marker);
+  return offset >= 0 && reason.slice(offset + marker.length).trim().length > 0;
+}
 function planningConsistencyIssues(rows){
   const issues = rows.filter(r => {
     if (r.scopeExcluded) return false;
@@ -21084,7 +21093,7 @@ function planningConsistencyIssues(rows){
     const policyTarget = r.lagPolicyTarget || '—';
     const policyDue = strictPolicy && semverParts(policyTarget) &&
       compareSemverText(r.current || '0.0.0', policyTarget) < 0;
-    return policyDue && !(r.hasTarget && isActionTargetValue(r.target));
+    return policyDue && !(r.hasTarget && isActionTargetValue(r.target)) && !isExplicitPlannerDeferral(r);
   }).map(r => `${r.project}:${r.name} current=${r.current}, lagPolicy=≤${r.lagThresholdMonths}м, lagPolicyTarget=${r.lagPolicyTarget}, target=${r.target}`);
   rows.filter(r => !r.scopeExcluded && r.hasTarget && isActionTargetValue(r.target)).forEach(r => {
     const status = r.registryArtifact?.status || 'not-proven';
@@ -21634,7 +21643,7 @@ ${projectWarning}
 1. Прочитай \\`package.json\\` и собери прямые объявления из четырёх секций: \\`dependencies\\`, \\`devDependencies\\`, \\`optionalDependencies\\`, \\`peerDependencies\\`.
 2. Сверь каждую строку manifest по составному ключу \\`project + section + package\\`; учти одинаковый пакет в разных секциях как разные объявления.
 3. Должно быть: selected=${rows.length}, update=${actionRows.length}, deferred=${deferredRows.length}, excluded=${excludedRows.length}, scopeHash=\\`${scopeHash}\\`.
-4. Поля \\`lagPolicyMonths\\`, \\`lagPolicyTarget\\` и \\`targetReason\\` входят в hash. Если package-policy строже 12 месяцев, current ниже concrete \\`lagPolicyTarget\\`, но строка помечена deferred — остановись с \\`ROADMAP_TARGET_DESYNC\\`; не угадывай intent самостоятельно.
+4. Поля \\`lagPolicyMonths\\`, \\`lagPolicyTarget\\` и \\`targetReason\\` входят в hash. Если package-policy строже 12 месяцев, current ниже concrete \\`lagPolicyTarget\\`, но строка помечена deferred — проверь причину и при отсутствии явного planner deferral остановись с \\`ROADMAP_TARGET_DESYNC\\`; не угадывай intent самостоятельно. Исключение: точная запись PEER_RESOLUTION_DEFERRED в targetReason с desired=lagPolicyTarget и resolved=current разрешает частичный план. Такой пакет остаётся deferred, неизменяемым в этом scope и невыполненной целью policy. Без этой записи остановись; не подставляй target самостоятельно.
 5. Если update-пакет отсутствует, дублируется, оказался в другой секции или manifest не соответствует checkout — **остановись до изменения файлов** с \\`SCOPE_MANIFEST_MISMATCH\\` и точным diff.
 6. Меняй только строки \\`shouldUpdate=true\\` и соблюдай immutable \\`action=update|remove\\`. Для \\`remove\\` удали прямое объявление и stale lock entry; не устанавливай deprecated stub. Deferred-строки сохраняй в отчёте как осознанно не изменённые. Excluded-строки сохраняй без изменений и с указанной причиной; они не дают разрешения на транзитивное или попутное обновление.
 
@@ -21955,7 +21964,7 @@ Replace \\`<branch>\\` with the exact work branch name from the Branch plan belo
 ## Rules
 
 1. Save the compact manifest below **unchanged** to \\`${scopeTemplate}\\`; validator supports \\`compact-v1\\`.
-2. Before edits, verify every row by \\`project + section + package\\`, counts and hash. \\`lagPolicyMonths\\`, \\`lagPolicyTarget\\`, \\`targetReason\\`, target artifact proof, compatibility cohort and exclusion reason are hash-protected. On mismatch stop with \\`SCOPE_MANIFEST_MISMATCH\\`. If a non-excluded policy stricter than 12 months has current below a concrete \\`lagPolicyTarget\\` but the row is deferred, stop with \\`ROADMAP_TARGET_DESYNC\\`.
+2. Before edits, verify every row by \\`project + section + package\\`, counts and hash. \\`lagPolicyMonths\\`, \\`lagPolicyTarget\\`, \\`targetReason\\`, target artifact proof, compatibility cohort and exclusion reason are hash-protected. On mismatch stop with \\`SCOPE_MANIFEST_MISMATCH\\`. If a non-excluded policy stricter than 12 months has current below a concrete \\`lagPolicyTarget\\` but the row is deferred without an explicit planner reason, stop with \\`ROADMAP_TARGET_DESYNC\\`. Exception: an exact PEER_RESOLUTION_DEFERRED record in targetReason with desired=lagPolicyTarget and resolved=current permits a partial plan. Keep that package deferred, immutable in this scope and unmet under the policy. Without this record stop; never invent a target.
 3. Change only rows with \\`shouldUpdate=true\\` and execute immutable \\`action=update|remove\\`. Rows with \\`action=excluded\\` are explicit user blockers: do not edit them, do not add them to branches, and preserve their \\`exclusionReason\\` in evidence. Every update row must have \\`targetArtifactStatus=available\\` and a tarball URL under exactly \\`${REPORT_CONTEXT.registry || 'the configured project registry'}\\`. Metadata/maintainers from \\`yarn info\\` are not proof that the tarball exists. If install cannot read the exact target tarball, or a lockfile/redirect points to npmjs/yarnpkg/another package registry, stop with \\`REGISTRY_TARGET_UNAVAILABLE\\` or \\`FOREIGN_REGISTRY_URL\\`; **do not choose another version, revert the package, or edit the immutable manifest yourself**. Storybook/cohort constraints are also immutable: incompatibility is a planner blocker, not permission for an ad-hoc substitution. For \\`remove\\`, delete the direct declaration and stale lock entry instead of installing a deprecated stub. Never silently drop deferred or excluded rows. **NO_REFACTORING:** no opportunistic cleanup, rename/move/split, architecture/public-API change, broad formatting/autofix-only diffs, unrelated code removal, or existing-test rewrite. Make only minimal package-required compatibility changes backed by release/migration evidence; otherwise stop with \\`REFACTOR_REQUIRED\\`. Every non-lockfile change needs a short rationale entry in \\`docs/dependency-update-review-notes.md\\`.
 4. Follow the branch plan. Verify/create \\`base\\` exactly from the pinned \\`sourceCommit\\`; automatic audit bootstrap is not part of generation. Start every work branch from that exact base. Use only the project package manager: Yarn → \\`yarn.lock\\`; npm → \\`package-lock.json/npm-shrinkwrap.json\\`. Never create a cross-manager root lockfile. Every intermediate commit, merge and internal push MUST run through \\`${gitHookPolicyToolPath} --mode skip\\`; do not use ordinary \\`git commit\\` and do not rely on \\`--no-verify\\`. Merge successful branches in order into \\`merged\\`; no destructive reset/force-push. After every merge, reconcile all cumulative package actions against the immutable manifest; a lost target or resurrected remove action is \\`MERGE_TARGET_REGRESSION\\`.
 5. Before editing a package, read its entry in the **Critical release dossier below**, then read the full target-specific release intelligence from \\`${roadmapPath}\\`. The dossier is mandatory, not decorative. Cover current→target; record \\`breakingChanges\\`, \\`migrationNotes\\`, \\`deprecations\\`, \\`requirements\\`, \\`coverage\\` and \\`sources\\` in run evidence. No source means \\`unknown\\`, not “no breaking changes”.

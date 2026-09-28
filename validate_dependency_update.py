@@ -567,6 +567,24 @@ def fnv1a_scope_hash(rows: Iterable[Dict[str, Any]], hash_version: int = 1) -> s
     return f"{value:08x}"
 
 
+def explicit_peer_resolution_deferral(row: Dict[str, Any], hash_version: int) -> bool:
+    """Permit a hash-bound planner deferral, without satisfying the lag policy.
+
+    The marker must describe this exact current/policy target pair. Unexplained
+    missing targets and stale planner reasons remain desynchronization errors.
+    Deferred rows remain immutable through scope_boundary_findings.
+    """
+    if hash_version < 3 or bool(row.get("shouldUpdate")):
+        return False
+    if str(row.get("action") or "") != "deferred" or parse_version(str(row.get("target") or "")) is not None:
+        return False
+    current = str(row.get("current") or "")
+    desired = str(row.get("lagPolicyTarget") or row.get("lag_policy_target") or "")
+    reason = str(row.get("targetReason") or row.get("target_reason") or "")
+    marker = f"PEER_RESOLUTION_DEFERRED: desired={desired}; resolved=current {current}; "
+    return marker in reason and bool(reason.split(marker, 1)[1].strip())
+
+
 def read_scope_manifest(path: Path, project: Optional[str]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     data = read_json(path)
     registry = str(data.get("registry") or "").strip()
@@ -654,6 +672,7 @@ def read_scope_manifest(path: Path, project: Optional[str]) -> Tuple[List[Dict[s
             and version_lt(current_version, policy_version)
             and not bool(raw.get("shouldUpdate"))
             and not scope_excluded
+            and not explicit_peer_resolution_deferral(raw, manifest_hash_version)
         ):
             raise ValueError(
                 "ROADMAP_TARGET_DESYNC: strict lag policy requires update "
