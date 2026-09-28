@@ -913,9 +913,8 @@ textarea::placeholder {
 .flow-technical-details { max-width: 980px; margin: 0 auto 20px; border-top: 1px solid var(--border); }
 .flow-technical-details > summary { padding: 11px 2px; color: var(--text-muted); cursor: pointer; font-size: 11px; user-select: none; }
 .flow-technical-details-body { padding-top: 2px; }
-.flow-logs-details .log-panel { border-left: 0; height: 700px; max-width: 980px; }
-.flow-logs-details .log-panel .activity-log { min-height: 480px; border: 1px solid var(--border); border-radius: 5px; }
-.flow-logs-details .log-panel .run-monitor, .flow-logs-details .log-panel .log-controls, .flow-logs-details .log-panel .agent-chat-composer { flex: none; }
+.flow-logs-details .log-panel { border-left: 0; max-width: 980px; }
+.flow-logs-details .log-panel .run-monitor { max-height: none; }
 .flow-artifact-note { margin: 0 0 8px; padding: 8px 10px; border-radius: 6px; background: var(--surface); color: var(--text-muted); font-size: 10px; line-height: 1.45; }
 .baseline-critical-fixed { display: inline-grid; grid-template-columns: auto auto auto; align-items: center; gap: 6px; min-height: 30px; padding: 0 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); }
 .baseline-critical-fixed span, .baseline-critical-fixed small { color: var(--text-muted); font-size: 10px; }
