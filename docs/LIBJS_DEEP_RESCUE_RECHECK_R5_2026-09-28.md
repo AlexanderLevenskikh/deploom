@@ -74,6 +74,14 @@ Commit `1dc588a`. `repair-handoff.ts` — только read-only (parse/scan/rea
 
 **Граница подтверждения**: полное подтверждение — фикстурой с фейковыми исполняемыми файлами (тот же production-код `runBaselineRepairCycles` через DI). Production-путь подключён к реальным исполнителям (repair-агент — реальный provider/сессия через `agentStartSpec`/`agentResumeSpec`, пере-верификация — реальный Baseline CLI в worker pool), но сам этот производственный маршрут end-to-end выполнялся с фейковым CLI, а не с реальным прогоном целевого проекта. Реальная цепочка с реальным нуждой в repair на целевом проекте не наблюдалась; см. пункт 4.
 
-### 4. Реальный run целевого проекта — в работе
+### 4. Реальный run целевого проекта — выполнен (28.09), финализация зелёного уровня в процессе
 
-REAL_RUN_ACCEPTANCE по-прежнему пуст; цель — реальный run целевого проекта (путь предоставлен ревьюером) и фактический before/after + checkpoint + restart + first-useful-upgrade.
+Значимый реальный прогон выполнен и подтверждает цепочку, которую legacy не проходил. Workspace: `.dependency-roadmap/audit-reviews/tsapp-deep-2026-09-27/real-run-2026-09-28/` (изолированный, gitignored; входы в `snapshot/`).
+
+- Входы идентичны аудиту: source HEAD d4b8b6d85ad8, manager yarn, 133 direct, lockfile yarn.lock; source+lockfile verified.
+- Solver больше НЕ падает: exact z3 на iteration 1 разрешил 70/71 компонент (legacy: EXACT_SOLVER_UNKNOWN, exit 3). Неизвестная компонента честно остаётся undecided и не блокирует остальных.
+- Реальная физическая проверка на материализованных копиях (изоляция checkout подтверждена: sealed snapshot 2170 файлов, private trials): реальные `yarn install`, `yarn flow:check` (RED exit=8), `yarn test` (RED exit=1) записаны как learned constraints, планировщик перебирает следующие кандидаты; жёлтая стадия пройдена — перешёл на зелёную (iteration 1..N идёт).
+- Checkpoint'ы — durable: `baseline-run-recovery.json` + journal, T_первого checkpoint ≈ 23 мин после старта (первый sealed snapshot publish ≈ 14 мин).
+- RESTART доказан: процесс убит на iteration 3; повторный запуск того же вызова → `recovery-resumed` (interrupted=true, completedIteration=2), продолжил iteration 3 с тем же assignment (ResolverProof HIT), не начал заново.
+
+Финальный before/after + оба developer-файла заполняются в REAL_RUN_ACCEPTANCE после конвергенции (в процессе, отдельный detached-прогон).
