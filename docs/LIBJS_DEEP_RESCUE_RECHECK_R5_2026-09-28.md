@@ -46,13 +46,34 @@ matchingRepairRequests получает только project, mode, packages. З
 - Повторный diagnostic-repair probe подтвердил исправление Python; физическая проверка в нём подменена, реальных установок нет.
 - Два новых Node probes воспроизвели Desktop-дефекты на production helpers.
 - `git diff --check` прошёл.
-- Реальный libjs run в этой приёмке не выполнялся. Проверенный REAL_RUN_ACCEPTANCE по-прежнему содержит пустые before/after/checkpoint/restart/first-useful-upgrade.
+- Реальный run целевого проекта в этой приёмке не выполнялся. Проверенный REAL_RUN_ACCEPTANCE по-прежнему содержит пустые before/after/checkpoint/restart/first-useful-upgrade.
 
 Материалы: `.dependency-roadmap/audit-reviews/recheck-r5-2026-09-28/`: suite.txt, diagnostic-repair.json, matching-result.json, red-checkpoint-result.json и воспроизводящие scripts.
 
-## Конкретное следующее задание
+## Закрытие пунктов задания (реализация 28.09.2026)
 
-1. Убрать закрытие repair по packages + общему migration pass. Ввести отдельное доказательство успешного исправления конкретного запроса или оставить resolution только authoritative verifier.
-2. Добавить негативные тесты одинаковых имён при разных версиях/snapshots, красной pre-existing команды и отсутствующей команды.
-3. Подключить Baseline repair dispatch/return и пройти end-to-end фикстуру с restart.
-4. Зафиксировать реальный полезный checkpoint libjs и actual before/after. Уже закрытые путь и Python project-green guard не переделывать.
+### 1–2. Desktop resolution убран; негативные тесты exact-tuple
+
+Commit `1dc588a`. `repair-handoff.ts` — только read-only (parse/scan/read + `findOpenRepairRequest`); `matchingRepairRequests`/`resolveRepairRequest`/`ResolveOutcome` удалены; `main.ts` резолюцию не выполняет. Удаление запросов — только authoritative verifier (Python: свежая project-green verify точного tuple, `project_result.ok`). Добавлены:
+- `test_repair_resolution_is_per_fingerprint_not_per_package_names` — 4 фазы: a@2/S1 → r1; план на a@3/S2 → r2; green a@2 закрывает только r1 (r2 остаётся); repair S2→S3 → green a@3 закрывает r2.
+- `test_repair_request_stays_open_when_project_checks_are_disabled` — checks off → нет repair-resolved, файл и snapshot не тронуты.
+- Тест вскрыл реальный баг: терминальный персист писал in-memory запросы текущего прогона и затирал stale durable-запросы. Исправлено на `_persist_open_repair_map(durable_repair_map, run_id=run_id)` (L13611–13613).
+
+Санитизация: найдены и вымараны приватные токены (путь машины ревьюера, корпоративный префикс, внутренний скоуп) во всех audit-доках; `Public sanitization OK`.
+
+Широкая регрессия 219 тестов зелёная (единственный фейл — тайминг-флак heartbeat-теста, изолированно проходит).
+
+### 3. Baseline repair dispatch/return (+ restart) — реализовано, проверено фикстурой на фейковом CLI
+
+Новые модули:
+- `desktop/electron/repair-handoff.ts` — `extractRepairRequiredEnvelope()`: детектор терминала `repair-required-terminal` из канала `DEPLOOM_PROGRESS_V2` (run завершается exit 0, поэтому детектит Desktop, а не код возврата).
+- `desktop/electron/repair-dispatch.ts` — машина состояний эпизода (cycle, exact-tuple закрытие через `sameRepairTuple`, restart-resume через durable `repair-dispatch-<token>.json`) и DI-обёртка `runBaselineRepairCycles()` — цепочка REPAIR_REQUIRED → запуск/возобновление repair-агента → свежая авторитетная пере-верификация → repairReturnPoint.
+- `desktop/electron/baseline-repair-result.ts` — обязательный machine result агента (`repaired|partial|blocked`) и сборка repair-prompt (передаёт точный assignment/fingerprint/snapshot/failing-commands; запрет менять версии, коммитить, ослаблять проверки).
+- `main.ts`: детекция после команды baseline (Verified, не Draft); при REPAIR_REQUIRED — цикл dispatch/return (до `DEFAULT_MAX_BASELINE_REPAIR_CYCLES=3`), повторная верификация — `DEPLOOM_BASELINE_RESUME=restart` (свежий прогон; ранее проверенные артефакты сохраняются на диске); blocked/exhausted — типизированные ошибки; зелёный финал — очистка dispatch-книг.
+- `desktop/scripts/check-repair-dispatch.mjs` + npm `check:repair-dispatch` + `ci.yml`: e2e-фикстура на фейковых CLI/агенте — fresh dispatch → repair → пере-верификация → закрытие; restart mid-episode резюмирует ТУ ЖЕ сессию; blocked; exact-tuple (пере-верификация, оставившая A@2, не закрывает, а A@2+оставшийся A@3 закрывается по точному tuple).
+
+**Граница подтверждения**: полное подтверждение — фикстурой с фейковыми исполняемыми файлами (тот же production-код `runBaselineRepairCycles` через DI). Production-путь подключён к реальным исполнителям (repair-агент — реальный provider/сессия через `agentStartSpec`/`agentResumeSpec`, пере-верификация — реальный Baseline CLI в worker pool), но сам этот производственный маршрут end-to-end выполнялся с фейковым CLI, а не с реальным прогоном целевого проекта. Реальная цепочка с реальным нуждой в repair на целевом проекте не наблюдалась; см. пункт 4.
+
+### 4. Реальный run целевого проекта — в работе
+
+REAL_RUN_ACCEPTANCE по-прежнему пуст; цель — реальный run целевого проекта (путь предоставлен ревьюером) и фактический before/after + checkpoint + restart + first-useful-upgrade.

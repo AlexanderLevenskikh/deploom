@@ -41,6 +41,57 @@ export type RepairHandoffScan = {
   requests: RepairRequest[]
 }
 
+// R5 item 3: the Desktop-side detection signal. The generator ends a mode
+// with the machine-readable `repair-required-terminal` progress event
+// (DEPLOOM_PROGRESS_V2 on stderr) and still exits 0 -- so a plain "exit code
+// 0" cannot distinguish a green Baseline from a source/config-repairable
+// result. This envelope carries the exact durable request set the terminal
+// was written with (project/mode/fingerprint + assignment), which is the
+// only thing a repair dispatch must hand to the repair agent.
+export type RepairRequiredEnvelope = {
+  runId: string
+  project: string
+  mode: string
+  assignment: string
+  terminalStatus: string
+  requests: RepairRequest[]
+}
+
+function parseProgressJson(line: string): unknown {
+  const start = line.indexOf('{')
+  if (start < 0) return undefined
+  try {
+    return JSON.parse(line.slice(start))
+  } catch {
+    return undefined
+  }
+}
+
+export function extractRepairRequiredEnvelope(output: string): RepairRequiredEnvelope | undefined {
+  let latest: RepairRequiredEnvelope | undefined
+  for (const line of String(output || '').split(/\r?\n/)) {
+    const value = parseProgressJson(line)
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+    const record = value as Record<string, unknown>
+    if (record.phase !== 'repair-required-terminal') continue
+    const rawRequests = Array.isArray(record.repairRequests) ? record.repairRequests : []
+    const requests: RepairRequest[] = []
+    for (const item of rawRequests) {
+      const parsed = parseRequest(item)
+      if (parsed) requests.push(parsed)
+    }
+    latest = {
+      runId: asString(record.runId),
+      project: asString(record.project),
+      mode: asString(record.mode),
+      assignment: asString(record.assignment),
+      terminalStatus: asString(record.terminalStatus) || 'REPAIR_REQUIRED',
+      requests,
+    }
+  }
+  return latest
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }

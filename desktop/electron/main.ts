@@ -30,7 +30,9 @@ import { deterministicPlannerDecision } from './deterministic-planner.js'
 import { plannerResultCacheKey, plannerResultCachePath, writePlannerResultCache } from './planner-result-cache.js'
 import { buildReleaseRecoveryPrompt, readReleaseRecoveryResult } from './release-recovery.js'
 import { assessMigrationCheckpoint, baselineFailureDecision, baselineFailuresNeedingProbe, baselineObservationMatchesFailure, createVerificationDiagnosticCollector, verificationCommandKey, type BaselineVerificationObservation, type MigrationVerificationAssessment, type VerificationDiagnosticEvidence, type VerificationEvidence, type VerificationFailure } from './migration-verification.js'
-import { openRepairRequests, repairHandoffStateRelativeDir, requestSummary } from './repair-handoff.js'
+import { openRepairRequests, repairHandoffStateRelativeDir, requestSummary, extractRepairRequiredEnvelope, type RepairRequest, type RepairRequiredEnvelope } from './repair-handoff.js'
+import { DEFAULT_MAX_BASELINE_REPAIR_CYCLES, clearRepairDispatchState, readRepairDispatchState, runBaselineRepairCycles } from './repair-dispatch.js'
+import { buildBaselineRepairPrompt, readBaselineRepairAgentResult } from './baseline-repair-result.js'
 import { migrationGatePolicy } from './migration-gates.js'
 import { cleanEphemeralVerificationCaches, liveBaselineObservationCacheKey } from './verification-environment.js'
 import { buildMergedRepairPrompt, readMergedRepairResult } from './merged-repair.js'
@@ -6282,6 +6284,78 @@ function commandSpecForRetry(job: JobRecord, spec: CommandSpec): CommandSpec {
   }
 }
 
+// R5 (2026-09-28), acceptance item 3: the repair RE-VERIFICATION is a FRESH
+// authoritative Baseline run, never a checkpoint resume. A repair changed the
+// source identity, so resume (auto/continue) would either refuse an identity
+// mismatch or silently continue the OLD search; Start-over re-plans and
+// re-verifies the repaired snapshot. Previously verified artifacts are
+// preserved on disk independently of this run.
+function baselineRepairReVerificationSpec(job: JobRecord, spec: CommandSpec): CommandSpec {
+  return {
+    ...spec,
+    label: `${spec.label} (повторная авторитетная верификация после repair)`,
+    env: {
+      ...spec.env,
+      DEPLOOM_BASELINE_RESUME: 'restart',
+      DEPLOOM_BASELINE_RECOVERY_PROOF_REUSE: '0',
+    },
+  }
+}
+
+// R5 (2026-09-28), acceptance item 3: dispatch (or resume) the source/config
+// repair agent for the open repair requests, using the SAME provider session
+// machinery as the other agent stages. The agent writes a machine result; the
+// orchestrator decides from it, and the following authoritative re-verification
+// is the real verdict. A previously captured session id resumes the same
+// conversation, which is what makes a mid-episode restart correct.
+async function runBaselineRepairAgent(
+  job: JobRecord,
+  project: ProjectSpec,
+  requests: RepairRequest[],
+  input: { attempt: number; cycle: number; resumeSessionId?: string; lastTerminalRunId?: string },
+): Promise<{ status: 'repaired' | 'partial' | 'blocked'; reason: string; sessionId?: string }> {
+  const promptDir = join(app.getPath('userData'), 'baseline-repair-prompts')
+  mkdirSync(promptDir, { recursive: true })
+  const stem = `${project.name}-${input.cycle}-${input.attempt}`.replace(/[^a-zA-Z0-9._-]+/g, '-')
+  const repairPromptPath = join(promptDir, `${stem}.md`)
+  const repairResultPath = join(promptDir, `${stem}-result.json`)
+  try {
+    if (existsSync(repairResultPath)) unlinkSync(repairResultPath)
+  } catch {
+    /* overwritten below */
+  }
+  const savedPrompt = promptPathForProject(job.workspace, project.name)
+  const openCodeServerUrl = await ensureOpenCodeServer(job, project.path)
+  job.agentProvider = job.workspace.agent
+  const prompt = buildBaselineRepairPrompt({
+    projectName: project.name,
+    projectPath: project.path,
+    savedPromptPath: savedPrompt ?? undefined,
+    resultPath: repairResultPath,
+    requests,
+    terminalRunId: input.lastTerminalRunId,
+    cycle: input.cycle,
+    attempt: input.attempt,
+    resumeNote: input.resumeSessionId
+      ? 'Продолжите существующую repair-сессию: предыдущий repair-агент не довёл исправление до авторитетного зелёного результата, и повторная верификация снова вернулась REPAIR_REQUIRED.'
+      : undefined,
+  })
+  writeFileSync(repairPromptPath, prompt, 'utf8')
+  job.agentSessionId = input.resumeSessionId
+  job.stdoutBuffer = ''
+  const spec = input.resumeSessionId
+    ? { ...agentResumeSpec(job.workspace.agent, project, input.resumeSessionId, repairPromptPath, job.workspace.agentModel, undefined, 'Продолжение repair', undefined, openCodeServerUrl), label: `Baseline repair agent (cycle ${input.cycle}, attempt ${input.attempt})`, captureAgentSession: true }
+    : { ...agentStartSpec(job.workspace.agent, project, repairPromptPath, prompt, job.workspace.agentModel, undefined, openCodeServerUrl), label: `Baseline repair agent (cycle ${input.cycle}, attempt ${input.attempt})`, captureAgentSession: true }
+  const result = await executeCommand(job, spec)
+  const machineResult = readBaselineRepairAgentResult(repairResultPath)
+  const sessionId = job.agentSessionId || input.resumeSessionId
+  if (machineResult) return { status: machineResult.status, reason: machineResult.reason, sessionId }
+  if (result.code !== 0) {
+    return { status: 'partial', reason: `Repair-agent завершился с кодом ${result.code}${result.stderr.trim() ? `: ${result.stderr.trim().slice(-700)}` : ''}`, sessionId }
+  }
+  return { status: 'partial', reason: 'Repair-agent не записал обязательный machine result; авторитетная повторная верификация решит итог.', sessionId }
+}
+
 function deterministicWatchdogFailure(result: { code: number; stderr: string; stdout: string }): boolean {
   if (result.code === 124) return true
   const text = `${result.stderr}\n${result.stdout}`
@@ -6481,6 +6555,12 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
   let errorMessage = ''
   let teamStateFinalized = false
   let draftResult: DraftResultSnapshot | undefined
+  // R5 item 3: a Verified Baseline run may end REPAIR_REQUIRED (machine
+  // progress envelope on stderr) while still exiting 0. Captured per command
+  // so the repair dispatch/return chain can be driven below instead of the
+  // run being declared a plain green pass.
+  let repairEnvelope: RepairRequiredEnvelope | undefined
+  let baselineCommandSpec: CommandSpec | undefined
   try {
     updateTeamState(job, 'running')
     if (job.bestEffortReason) {
@@ -6531,6 +6611,20 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
         })
       }
       exitCode = result.code
+      if (job.action === 'baseline' && job.baselineProofMode !== 'DRAFT' && spec.command === 'python') {
+        baselineCommandSpec = spec
+        repairEnvelope = extractRepairRequiredEnvelope(`${result.stderr}\n${result.stdout}`)
+        if (repairEnvelope) {
+          send('flow:job-output', {
+            jobId: job.id,
+            stream: 'system',
+            workspaceId: job.workspace.id,
+            projectName: job.projectName,
+            line: `Baseline завершился с REPAIR_REQUIRED (${repairEnvelope.requests.length} открытых repair-запросов): запускаю repair dispatch вместо объявления зелёного результата.`,
+          })
+          break
+        }
+      }
       if (exitCode !== 0) {
         const preflightMessage = sourcePreflightCommandFailureMessage(job, result)
         // A3: a Verified/Fast/Deep run never publishes a Draft, so the failure
@@ -6541,6 +6635,72 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
           : undefined
         throw new Error(preflightMessage ?? verifiedBaselineMessage ?? `${spec.label}: команда завершилась с кодом ${exitCode} после ${attemptsPerformed} попыток.${result.stderr.trim() ? `\n\n${result.stderr.trim()}` : ''}`)
       }
+    }
+    // R5 item 3: the repair dispatch/return chain. Only reached when a
+    // Verified Baseline run ended REPAIR_REQUIRED. The Desktop dispatches (or
+    // resumes) the source/config repair agent for the exact open requests and
+    // then re-runs the FRESH authoritative Baseline verification; the request
+    // is closed ONLY by a project-green verify of the exact tuple (observed
+    // through the durable handoff, never via package names or "no new
+    // regressions"). The durable dispatch state makes a mid-episode restart
+    // resume the same episode and session.
+    if (repairEnvelope && baselineCommandSpec && job.action === 'baseline' && job.baselineProofMode !== 'DRAFT' && job.projectName) {
+      const repairProject = findProject(job.workspace, job.projectName)
+      const repairStateDir = join(job.workspace.path, ...repairHandoffStateRelativeDir)
+      const previousDispatch = readRepairDispatchState(repairStateDir, job.projectName)
+      if (previousDispatch && !previousDispatch.outcome) {
+        send('flow:job-output', {
+          jobId: job.id,
+          stream: 'system',
+          workspaceId: job.workspace.id,
+          projectName: job.projectName,
+          line: `Обнаружен открытый repair-эпизод (cycle ${previousDispatch.cycle}, ${previousDispatch.requests.length} запросов): продолжаю его (restart-safe resume) вместо нового эпизода.`,
+        })
+      }
+      const repairRun = await runBaselineRepairCycles({
+        envelope: repairEnvelope,
+        previous: previousDispatch,
+        stateDir: repairStateDir,
+        workspaceId: job.workspace.id,
+        project: job.projectName,
+        maxCycles: DEFAULT_MAX_BASELINE_REPAIR_CYCLES,
+        onEvent: (line) => send('flow:job-output', { jobId: job.id, stream: 'system', workspaceId: job.workspace.id, projectName: job.projectName, line }),
+        dispatchRepairAgent: async ({ attempt, requests, resumeSessionId, state }) => runBaselineRepairAgent(job, repairProject, requests, {
+          attempt,
+          cycle: state.cycle,
+          resumeSessionId,
+          lastTerminalRunId: state.lastTerminalRunId,
+        }),
+        runReVerification: async ({ attempt }) => {
+          const reVerifySpec = baselineRepairReVerificationSpec(job, baselineCommandSpec!)
+          send('flow:job-output', {
+            jobId: job.id,
+            stream: 'system',
+            workspaceId: job.workspace.id,
+            projectName: job.projectName,
+            line: `Повторная авторитетная верификация Baseline после repair (cycle attempt ${attempt}).`,
+          })
+          const re = await executeCommand(job, reVerifySpec)
+          if (re.code !== 0) {
+            throw new Error(`BASELINE_REPAIR_VERIFY_FAILED: повторная верификация после repair завершилась с кодом ${re.code}.${re.stderr.trim() ? `\n\n${re.stderr.trim().slice(-1200)}` : ''}`)
+          }
+          return { output: `${re.stderr}\n${re.stdout}` }
+        },
+        readOpenRequests: () => openRepairRequests(repairStateDir).requests,
+      })
+      if (repairRun.outcome === 'blocked') {
+        throw new Error(`BASELINE_REPAIR_BLOCKED: repair-агент не может безопасно исправить исходники/конфиг: ${repairRun.state.requests.map((request) => requestSummary(request)).join('; ') || 'см. machine result'}. Repair-запросы остаются открытыми.`)
+      }
+      if (repairRun.outcome === 'exhausted') {
+        throw new Error(`BASELINE_REPAIR_EXHAUSTED: источник/конфиг не удалось довести до зелёного результата за ${DEFAULT_MAX_BASELINE_REPAIR_CYCLES} repair-циклов. Открытые repair-запросы: ${repairRun.state.requests.map((request) => requestSummary(request)).join('; ')}`)
+      }
+      send('flow:job-output', {
+        jobId: job.id,
+        stream: 'system',
+        workspaceId: job.workspace.id,
+        projectName: job.projectName,
+        line: 'Baseline repair-цепочка завершена: авторитетная повторная верификация зелёная, repair-запросы закрыты; финализирую baseline как проверенный.',
+      })
     }
     // Preserve the generator output for the project that produced it before
     // another `--only-project` run is allowed to replace the configured files.
@@ -6588,6 +6748,13 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
         // therefore lands on Step 3; explicit Autopilot may immediately continue
         // to agent because its own stage scheduler is still active.
         await cleanupSupersededMigrationAfterBaseline(job, findProject(job.workspace, job.projectName))
+        // R5 item 3: a green finalization also closes the Desktop's repair
+        // dispatch bookkeeping once no repair request for this project remains
+        // open (the authoritative verifier resolved them via repair-resolved).
+        const repairStateDirAfterPass = join(job.workspace.path, ...repairHandoffStateRelativeDir)
+        if (openRepairRequests(repairStateDirAfterPass).requests.filter((request) => request.project === job.projectName).length === 0) {
+          clearRepairDispatchState(repairStateDirAfterPass, job.projectName)
+        }
       }
     } else if (job.action === 'generate' && job.projectName) {
       if (!snapshotProjectArtifacts(job.workspace, job.projectName)) {

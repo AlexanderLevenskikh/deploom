@@ -11,6 +11,7 @@
     "check:updater-error": "node scripts/check-updater-error.mjs",
     "check:public-update-target": "node scripts/check-public-update-target.mjs",
     "check:repair-handoff": "node scripts/check-repair-handoff.mjs",
+    "check:repair-dispatch": "node scripts/check-repair-dispatch.mjs",
     "check:agent-command": "node scripts/check-agent-command.mjs",
     "precheck:migration-progress": "tsc -p tsconfig.electron.json",
     "check:migration-progress": "node scripts/check-migration-progress.mjs",

@@ -177,6 +177,7 @@ jobs:
           npm run check:run-slot-isolation
           npm run check:artifact-token
           npm run check:repair-handoff
+          npm run check:repair-dispatch
       - name: Version consistency
         working-directory: desktop
         run: test "$(node -p "require('./package.json').version")" = "$(cat ../VERSION)"
