@@ -1,4 +1,4 @@
-"""Part D of the libjs deep rescue (2026-09-27): real small migration cohorts.
+"""Part D of the tsapp deep rescue (2026-09-27): real small migration cohorts.
 
 Acceptance covered here:
   D1 - a LARGE potential peer component (the search index over all versions)
@@ -52,10 +52,13 @@ def _row(name: str, current: str = "1.0.0", desired: str = "2.0.0") -> roadmap.D
 
 
 def _client(names, *, peer_edges=()):
-    """Offline metadata client; peer_edges = (name, peer, spec, version): the
-    peer dependency ``^spec`` is attached to `version`'s metadata only."""
+    """Offline metadata client; peer_edges = (name, peer, spec, version[, optional]):
+    the peer dependency ``^spec`` is attached to `version`'s metadata only; the
+    5th element (True) marks it optional in peerDependenciesMeta."""
     client = roadmap.LiveDataClient(REGISTRY, timeout=1, batch_size=10, sleep_sec=0)
-    edges = {(edge[0], edge[3]): (edge[1], edge[2]) for edge in peer_edges}
+    edges = {}
+    for edge in peer_edges:
+        edges[(edge[0], edge[3])] = (edge[1], edge[2], edge[4] if len(edge) > 4 else False)
     for name in names:
         versions = {}
         for version in ("1.0.0", "1.5.0", "2.0.0"):
@@ -65,9 +68,11 @@ def _client(names, *, peer_edges=()):
                 "dist": {"tarball": f"{REGISTRY}/artifact/{name}/{version}.tgz"},
             }
             if (name, version) in edges:
-                peer_name, spec = edges[(name, version)]
+                peer_name, spec, optional = edges[(name, version)]
                 meta["peerDependencies"] = {peer_name: f"^{spec}"}
-                meta.setdefault("peerDependenciesMeta", {})[peer_name] = {}
+                meta.setdefault("peerDependenciesMeta", {})[peer_name] = (
+                    {"optional": True} if optional else {}
+                )
             versions[version] = meta
         client.npm_cache[name] = {"versions": versions}
         for version in ("1.0.0", "1.5.0", "2.0.0"):
@@ -202,6 +207,103 @@ class D3FixedNamesNeverMove(unittest.TestCase):
         components = _components(delta)
         self.assertEqual(["a"], components[0])
         self.assertEqual(["fixed"], components[1])
+
+
+class D4PresentOptionalPeersBindTheMovingCohort(unittest.TestCase):
+    """R5: present optional peers lose atomicity when the closure skips them
+    entirely. The production resolver materializes OPTIONAL peers into its hard
+    model too, so the TRANSITIONAL state conflicts even when the eventual joint
+    target pair is compatible: a@2 requiring optional b@^2 while b is still at
+    current 1.0.0 fails with PEER_CONFLICT, and so does the reverse. Atomicity
+    follows the transitional state, so any present peer whose combination with
+    the mover's TARGET is unsatisfiable (while the peer stays at current) binds
+    the pair -- independently of its optional flag. An absent optional peer
+    still never coerces."""
+
+    def test_transitional_optional_conflict_binds_even_when_joint_target_ok(self):
+        # The auditor's counterexample: a@1,b@1; target a@2,b@2; a@2 requires
+        # OPTIONAL b@^2 and b@2 requires OPTIONAL a@^2. The joint pair
+        # (a@2, b@2) is compatible, yet neither single upgrade is: a@2+b@1 and
+        # a@1+b@2 both conflict. The closure must bind {a, b} into ONE cohort so
+        # the planner offers the joint move instead of two failed singletons.
+        client = _client(
+            ("a", "b"),
+            peer_edges=(
+                ("a", "b", "2.0.0", "2.0.0", True),
+                ("b", "a", "2.0.0", "2.0.0", True),
+            ),
+        )
+        rows_by_name = {"a": _row("a"), "b": _row("b")}
+        roadmap.capture_desired_targets({"Demo": list(rows_by_name.values())})
+        domains = {"a": ["1.0.0", "2.0.0"], "b": ["1.0.0", "2.0.0"]}
+        current = {"a": "1.0.0", "b": "1.0.0"}
+        desired = {"a": "2.0.0", "b": "2.0.0"}
+        delta = roadmap._progressive_delta_atomic_closure(
+            rows_by_name, domains, client, current, desired,
+        )
+        components = _components(delta)
+        self.assertEqual(1, len(components))
+        self.assertEqual({"a", "b"}, set(components[0]))
+
+    def test_both_moving_optional_targets_unsatisfiable_are_one_cohort(self):
+        client = _client(
+            ("a", "b"),
+            peer_edges=(
+                ("a", "b", "3.0.0", "2.0.0", True),
+                ("b", "a", "3.0.0", "2.0.0", True),
+            ),
+        )
+        rows_by_name = {"a": _row("a"), "b": _row("b")}
+        roadmap.capture_desired_targets({"Demo": list(rows_by_name.values())})
+        domains = {"a": ["1.0.0", "2.0.0"], "b": ["1.0.0", "2.0.0"]}
+        current = {"a": "1.0.0", "b": "1.0.0"}
+        desired = {"a": "2.0.0", "b": "2.0.0"}
+        delta = roadmap._progressive_delta_atomic_closure(
+            rows_by_name, domains, client, current, desired,
+        )
+        components = _components(delta)
+        self.assertEqual(1, len(components))
+        self.assertEqual({"a", "b"}, set(components[0]))
+
+    def test_present_static_optional_peer_with_conflicting_target_binds_pair(self):
+        # a@2 declares an OPTIONAL peer on b@^3; b is present but static at
+        # current 1.0.0 (not in the desired delta). Moving a alone leaves the
+        # transitional a@2+b@1 combination in conflict with a's own optional
+        # requirement, so the pair is one cohort.
+        client = _client(
+            ("a", "b"),
+            peer_edges=(("a", "b", "3.0.0", "2.0.0", True),),
+        )
+        rows_by_name = {"a": _row("a"), "b": _row("b", desired="1.0.0")}
+        roadmap.capture_desired_targets({"Demo": list(rows_by_name.values())})
+        domains = {"a": ["1.0.0", "2.0.0"], "b": ["1.0.0"]}
+        current = {"a": "1.0.0", "b": "1.0.0"}
+        desired = {"a": "2.0.0", "b": "1.0.0"}
+        delta = roadmap._progressive_delta_atomic_closure(
+            rows_by_name, domains, client, current, desired,
+        )
+        components = _components(delta)
+        self.assertEqual(1, len(components))
+        self.assertEqual({"a", "b"}, set(components[0]))
+
+    def test_present_optional_peer_satisfied_at_current_never_binds(self):
+        # a@2's OPTIONAL peer b@^1.0.0 is satisfied by b's current 1.0.0: the
+        # transitional state does NOT conflict, so a moves independently.
+        client = _client(
+            ("a", "b"),
+            peer_edges=(("a", "b", "1.0.0", "2.0.0", True),),
+        )
+        rows_by_name = {"a": _row("a"), "b": _row("b", desired="1.0.0")}
+        roadmap.capture_desired_targets({"Demo": list(rows_by_name.values())})
+        domains = {"a": ["1.0.0", "2.0.0"], "b": ["1.0.0"]}
+        current = {"a": "1.0.0", "b": "1.0.0"}
+        desired = {"a": "2.0.0", "b": "1.0.0"}
+        delta = roadmap._progressive_delta_atomic_closure(
+            rows_by_name, domains, client, current, desired,
+        )
+        components = _components(delta)
+        self.assertEqual(["a"], components[0])
+        self.assertEqual(["b"], components[1])
 
 
 if __name__ == "__main__":

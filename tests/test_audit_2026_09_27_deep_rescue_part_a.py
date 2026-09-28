@@ -1,4 +1,4 @@
-"""Part A of the libjs deep rescue (2026-09-27): behavioral tests of the
+"""Part A of the tsapp deep rescue (2026-09-27): behavioral tests of the
 PRODUCTION selector/orchestrator transitions.
 
 Only Z3 `unknown` / network / registry are mocked. The peer graph
@@ -16,7 +16,7 @@ Scenario coverage (matches the audit + the task):
   T4  -- interrupted run resumes the correct checkpoint; a changed
          source/lock/policy invalidates the old authority.
 
-T1 and T2 are the repeatable FAILING tests for the libjs barrier today; they
+T1 and T2 are the repeatable FAILING tests for the tsapp barrier today; they
 are the specification Part C turns green. T3 documents the production
 state-transition contract in the existing tolerant mode.
 """
@@ -109,7 +109,7 @@ def _optimal(model, version_by_name):
 
 
 class T1BigUnknownMustNotAbortSmallCandidate(unittest.TestCase):
-    """The libjs barrier: a large peer component comes FIRST and is `unknown`;
+    """The tsapp barrier: a large peer component comes FIRST and is `unknown`;
     the bootstrap-style call must still check the independent small candidate.
 
     Part C turned the verified/bootstrap path tolerant (partial_on_incomplete),

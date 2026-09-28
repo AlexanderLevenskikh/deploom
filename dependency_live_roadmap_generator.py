@@ -7490,10 +7490,16 @@ def _progressive_delta_atomic_closure(
 
     A satisfaction that cannot be proven from local/registry metadata
     (``_known_peer_range_satisfaction`` returns None) is conservatively treated
-    as an edge so necessary atomicity is never silently split. Optional peers
-    and peers outside the managed set are skipped. ``fixed_names`` never move,
-    so an edge whose satisfaction depends on a fixed peer still marks the
-    cohort; the planner/verifier decide feasibility.
+    as an edge so necessary atomicity is never silently split. A peer outside
+    the managed set is skipped. A PRESENT peer -- optional included -- whose
+    combination with the moving package's TARGET is not satisfiable while the
+    peer stays at its CURRENT/verified-incumbent version binds the pair: the
+    production resolver materializes optional peers into its hard model too, so
+    the TRANSITIONAL state (the mover alone at its target, the peer at current)
+    conflicts even when the eventual joint target pair is compatible. An absent
+    optional peer never coerces. ``fixed_names`` never move, so an edge whose
+    satisfaction depends on a fixed peer still marks the cohort; the
+    planner/verifier decide feasibility.
 
     Components of this graph are the atomic migration cohorts for the exact
     delta: a large potential peer component often splits into small independent
@@ -7519,6 +7525,15 @@ def _progressive_delta_atomic_closure(
             result[peer_name] = {"optional": optional, "satisfied_with_peer_current": satisfaction}
         return result
 
+    def _peer_spec_for(name: str, version: str, peer_name: str) -> str:
+        """The raw peer spec (kept for OPTIONAL peers too, which
+        ``_spec_for_peer`` deliberately blanks out)."""
+        return next(
+            (spec for entry_name, spec, _op in _peer_entries(rows_by_name[name], version, client)
+             if entry_name == peer_name),
+            "",
+        )
+
     def _mark_edge(a: str, b: str) -> None:
         graph[a].add(b)
         graph[b].add(a)
@@ -7534,33 +7549,48 @@ def _progressive_delta_atomic_closure(
             b_moving = b in moving
             # a's TARGET peer on b must still be satisfiable while b stays at
             # current; a coercion edge exists when it is not (or is unprovable).
+            # R5: this covers PRESENT OPTIONAL peers too -- the production
+            # resolver materializes optional peers into its hard model, so the
+            # TRANSITIONAL state (a alone moved, b still at current) conflicts
+            # even when the eventual joint target pair would be compatible.
+            # Atomicity must follow the transitional state, not the final pair.
             a_target_peers = _peer_endpoints(a, target_a)
             if b in a_target_peers:
                 entry = a_target_peers[b]
-                if not entry["optional"]:
-                    satisfied = entry["satisfied_with_peer_current"]
-                    if satisfied is None or satisfied is False:
-                        _mark_edge(a, b)
+                satisfied = entry["satisfied_with_peer_current"]
+                if satisfied is None or satisfied is False:
+                    _mark_edge(a, b)
             # b's CURRENT peer on a must survive a moving to target_a; if not,
-            # b must be considered together with a.
+            # b must be considered together with a. Same rule, applied from the
+            # static endpoint: a present optional peer at b's current version
+            # that the moving target does not satisfy also conflicts in the
+            # transitional state.
             b_current_peers = _peer_endpoints(b, current_versions.get(b, ""))
             if a in b_current_peers:
-                entry = b_current_peers[a]
-                if not entry["optional"]:
-                    satisfied = _known_peer_range_satisfaction(
-                        _spec_for_peer(rows_by_name[b], current_versions.get(b, ""), a, client),
-                        target_a,
-                    )
-                    if satisfied is None or satisfied is False:
-                        _mark_edge(a, b)
+                satisfied = _known_peer_range_satisfaction(
+                    _peer_spec_for(b, current_versions.get(b, ""), a),
+                    target_a,
+                )
+                if satisfied is None or satisfied is False:
+                    _mark_edge(a, b)
             # both move: their joint TARGET pair must be mutually satisfiable,
-            # otherwise they are the same atomic cohort by construction.
+            # otherwise they are the same atomic cohort by construction. R5:
+            # this holds for PRESENT OPTIONAL peers too -- once both endpoints
+            # are already moving, the pair is planned and verified together, so
+            # an incompatible (or unprovable) joint pair cannot be split.
             if b_moving:
                 b_target_peers = _peer_endpoints(b, target_b)
-                if a in b_target_peers and not b_target_peers[a]["optional"]:
+                if a in b_target_peers:
                     satisfied_joint = _known_peer_range_satisfaction(
-                        _spec_for_peer(rows_by_name[b], target_b, a, client),
+                        _peer_spec_for(b, target_b, a),
                         target_a,
+                    )
+                    if satisfied_joint is None or satisfied_joint is False:
+                        _mark_edge(a, b)
+                if b in a_target_peers:
+                    satisfied_joint = _known_peer_range_satisfaction(
+                        _peer_spec_for(a, target_a, b),
+                        target_b,
                     )
                     if satisfied_joint is None or satisfied_joint is False:
                         _mark_edge(a, b)
@@ -8144,8 +8174,10 @@ def _run_z3_peer_component(
     # a bounded, non-solving check over the built IR (domains, forbidden
     # combinations, peer requirements): a residual target that a NEW hard
     # constraint forces to move must still move (the exact solver runs). The
-    # report stays "optimal" (the component IS decided) and marks the pin so
-    # reports never misread it as a fresh proof.
+    # TODO: (R6) The report stays "feasible" (the component IS decided, and the
+    # pinned point is constraint-consistent) and marks the pin so reports never
+    # misread it as a fresh proof of GLOBAL optimality, which the pinned fallback
+    # did not establish -- "optimal" is reserved for a proven optimum.
     residual = residual_targets or {}
     pinned_assignment = {
         name: str(residual[name]) for name in component if name in residual
@@ -8161,7 +8193,7 @@ def _run_z3_peer_component(
             )
             return {
                 "backend": "z3",
-                "status": "optimal",
+                "status": "feasible",
                 "detail": (
                     "component fully pinned by residual targets and consistent; queued/prepared "
                     "fallback accepted without a fresh global solve"
@@ -8960,7 +8992,7 @@ def _coordinate_solver_global_exclusions(
         )
         status = str(report.get("status") or "")
         candidate = report.get("assignment")
-        if status == "optimal" and isinstance(candidate, dict):
+        if status in {"optimal", "feasible"} and isinstance(candidate, dict):
             candidate_assignment = {
                 name: str(candidate[name])
                 for name in component
@@ -9125,6 +9157,7 @@ def _mark_draft_component_unresolved(
     client: Any,
     incomplete_components_out: Optional[List[Dict[str, Any]]],
     run_context: Optional[Mapping[str, str]],
+    status_by_name: Optional[Dict[str, str]] = None,
 ) -> None:
     """D1: keep a Draft component collected but mark its compatibility UNDECIDED.
 
@@ -9182,6 +9215,13 @@ def _mark_draft_component_unresolved(
             row.peer_compat_unresolved_report = dict(report)
     if incomplete_components_out is not None:
         incomplete_components_out.append(dict(report))
+    # Part G honesty: the CALLER must see the unresolved per-package status
+    # (not only the row flags) so the verification loop can never claim
+    # SAT_PROVEN/VERIFIED_TARGET_COMPLETE over packages a component left
+    # undecided.
+    if status_by_name is not None:
+        for name in component:
+            status_by_name[name] = str(exact_status or "unknown")
     eprint(
         f"[warn] {project}: Draft exact z3 {mode}; component={len(component)} package(s) left "
         f"UNRESOLVED (status={exact_status}); reason={detail[:400] or 'no reason given'}"
@@ -9392,7 +9432,7 @@ def resolve_peer_compatibility(
                             "install optional z3-solver to enable exact comparison"
                         )
                         shadow_active = False
-                    elif shadow_status == "optimal":
+                    elif shadow_status in {"optimal", "feasible"}:
                         eprint(
                             f"[info] {project}: shadow z3 {mode} READY; packages={len(component)}, "
                             f"shadowChanged={pre_shadow_report.get('shadowChanged', 0)}, "
@@ -9431,9 +9471,13 @@ def resolve_peer_compatibility(
                         ),
                     )
                     exact_status = str(exact_report.get("status") or "")
-                    if exact_status == "optimal" and isinstance(exact_report.get("assignment"), dict):
+                    if exact_status in {"optimal", "feasible"} and isinstance(exact_report.get("assignment"), dict):
                         component_assignment = dict(exact_report["assignment"])
-                        diagnostics.update(status="optimal", backend="z3")
+                        # R6: carry the solver's REAL status through. "feasible"
+                        # (a pinned/queued fallback) is not a proven optimum and
+                        # must not be relabeled "optimal" by the caller - the
+                        # per-package publication below uses this value.
+                        diagnostics.update(status=exact_status, backend="z3")
                         emit_observability_event(
                             "solver.component.finish",
                             project=project,
@@ -9481,6 +9525,7 @@ def resolve_peer_compatibility(
                             _mark_draft_component_unresolved(
                                 project, mode, component, rows_for_name, exact_status, exact_report,
                                 backend_options, client, incomplete_components_out, run_context,
+                                status_by_name=status_by_name,
                             )
                             unresolved_names.update(component)
                             continue
@@ -9508,6 +9553,7 @@ def resolve_peer_compatibility(
                             _mark_draft_component_unresolved(
                                 project, mode, component, rows_for_name, exact_status, exact_report,
                                 backend_options, client, incomplete_components_out, run_context,
+                                status_by_name=status_by_name,
                             )
                             unresolved_names.update(component)
                             continue
@@ -9530,6 +9576,7 @@ def resolve_peer_compatibility(
                             _mark_draft_component_unresolved(
                                 project, mode, component, rows_for_name, exact_status, exact_report,
                                 backend_options, client, incomplete_components_out, run_context,
+                                status_by_name=status_by_name,
                             )
                             unresolved_names.update(component)
                             continue
@@ -9631,7 +9678,7 @@ def resolve_peer_compatibility(
 
                 if pre_shadow_report is not None:
                     report = dict(pre_shadow_report)
-                    if report.get("status") == "optimal" and isinstance(report.get("assignment"), dict):
+                    if report.get("status") in {"optimal", "feasible"} and isinstance(report.get("assignment"), dict):
                         model = _build_peer_optimization_model(
                             component, rows_by_name, domains, client, mode,
                             learned_nogoods, residual_targets
@@ -10068,7 +10115,10 @@ class BaselineBudgetExceededCutoff(BaselineConstraintVerificationError):
 
 def _terminal_status_for_exact_solver(status: str) -> BaselineTerminalStatus:
     normalized = str(status or "").strip().lower()
-    if normalized == "optimal":
+    if normalized in {"optimal", "feasible"}:
+        # R6: "feasible" is the pinned residual fallback -- the component IS
+        # decided (constraint-consistent) but was not globally re-optimized;
+        # it still resolves to a proven component outcome, never to unknown.
         return BaselineTerminalStatus.SAT_PROVEN
     if normalized == "unsat":
         return BaselineTerminalStatus.UNSAT_PROVEN
@@ -10115,6 +10165,200 @@ def _verification_assignment(
         for name in sorted(assignment)
         if name in rows_by_name
     }
+
+
+def _managed_scope_assignment(
+    assignment: Dict[str, str],
+    rows_by_name: Dict[str, DependencyRow],
+) -> Dict[str, str]:
+    """Full managed direct scope (Part G honesty fix).
+
+    Every managed (non-fixed) row participates in the verified assignment and
+    in the completion comparison: decided names take the solver assignment, the
+    rest stay at their CURRENT version. A component the solver left unresolved
+    can therefore never silently fall out of the target/verified scope, and an
+    empty/partial solver result is never mistaken for a full target. Fixed
+    git/file/workspace/http declarations remain resolver inputs and do not
+    enter the managed assignment (unchanged from _verification_assignment).
+    """
+    result: Dict[str, str] = {}
+    for name, row in rows_by_name.items():
+        if _is_fixed_dependency_input(row):
+            continue
+        version = assignment.get(name)
+        result[name] = str(version if version is not None else (row.current_version or ""))
+    for name in assignment:
+        if name in rows_by_name and name not in result:
+            result[name] = str(assignment[name])
+    return result
+
+
+def _progressive_goal_assignment(
+    rows_by_name: Dict[str, DependencyRow],
+    mode: str,
+) -> Dict[str, str]:
+    """The migration GOAL per mode over the full managed scope.
+
+    Mirrors _candidate_domain fallbacks: an actionable chosen target for an
+    ordinary row, the CURRENT version for fixed/scope-excluded/planner-deferred
+    rows and for rows without an actionable target. A row the solver could not
+    decide keeps its target in the goal, so an unresolved component is never
+    counted as complete by omission (Part G honesty fix).
+    """
+    goal: Dict[str, str] = {}
+    for name, row in rows_by_name.items():
+        if _is_fixed_dependency_input(row) or row.scope_excluded or row.planner_deferred:
+            goal[name] = str(row.current_version or "")
+            continue
+        target = _desired_target_for_mode(row, mode)
+        goal[name] = str(target if target_is_action(target) else (row.current_version or ""))
+    return goal
+
+
+def _actual_scan_health(rows: List[DependencyRow]) -> Dict[str, Any]:
+    """ACTUAL cumulative security/lag health from the scan rows (Part G fix).
+
+    The initial migration checkpoint must reflect the known findings of the
+    rows as scanned (C/H/M/L/U from current_vulns, actual lag-OK, actual
+    security coverage) -- never the PLAN-status counters, which are zero until
+    a row is planned and would render known vulnerabilities as zeros in a new
+    migration journal.
+    """
+    severities = {"C": 0, "H": 0, "M": 0, "L": 0, "U": 0}
+    vulnerable_packages = 0
+    lag_ok = 0
+    lag_total = 0
+    security_known = 0
+    security_total = 0
+    for row in rows:
+        if row.scope_excluded:
+            continue
+        lag_total += 1
+        if dependency_is_lag_ok_12m(row):
+            lag_ok += 1
+        security_total += 1
+        if _row_security_known(row):
+            security_known += 1
+        counts = parse_vuln_counts(row.current_vulns)
+        if any(counts.get(key, 0) > 0 for key in severities):
+            vulnerable_packages += 1
+        for key in severities:
+            severities[key] += counts.get(key, 0)
+    return {
+        "lag_ok": lag_ok,
+        "lag_total": lag_total,
+        "critical": severities["C"],
+        "high": severities["H"],
+        "moderate": severities["M"],
+        "low": severities["L"],
+        "unknown": severities["U"],
+        "vulnerable_packages": vulnerable_packages,
+        "security_known": security_known,
+        "security_total": security_total,
+    }
+
+
+def _persist_repair_requests(
+    requests: Sequence[Any],
+    progress_path: Optional[Path],
+    run_id: str = "",
+) -> Optional[Path]:
+    """Durable machine-readable repair handoff for the Desktop Executor.
+
+    Written next to the run's activity/events log (the same directory the
+    Desktop agent reads), listing every OPEN source/config repair request with
+    its assignment, fingerprint, snapshot identity and failing commands. The
+    Executor repairs an isolated checkout and triggers a fresh verification;
+    an agent's prose is never proof -- the tuple is re-verified by the run.
+    """
+    if not requests:
+        return None
+    base = progress_path.parent if progress_path is not None else None
+    if base is None:
+        return None
+    target = base / "repair-requests.json"
+    payload = {
+        "schemaVersion": 1,
+        "runId": run_id,
+        "requests": [
+            request.to_json() if hasattr(request, "to_json") else request
+            for request in requests
+        ],
+    }
+    _atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
+    return target
+
+
+def _load_repair_requests(progress_path: Optional[Path]) -> Tuple[Dict[str, Any], ...]:
+    """R1: reload the durable repair handoff file written next to a previous
+    run's activity log, so a RESTART keeps deferring the same broken tuple
+    (no re-verify spin on the same source snapshot) and can RESOLVE it as soon
+    as a fresh verify-after-repair pass accepts it. Requests that do not carry
+    a fingerprint are never re-loaded (they are not machine-actionable)."""
+    if progress_path is None:
+        return ()
+    target = progress_path.parent / "repair-requests.json"
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return ()
+    requests = payload.get("requests") if isinstance(payload, dict) else None
+    if not isinstance(requests, list):
+        return ()
+    result: List[Dict[str, Any]] = []
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        if not str(request.get("fingerprint") or "").strip():
+            continue
+        result.append(request)
+    return tuple(result)
+
+
+def _repair_request_from_json(request: Mapping[str, Any]) -> RepairRequest:
+    """Rebuild a durable RepairRequest from its persisted JSON shape."""
+    return RepairRequest(
+        project=str(request.get("project") or ""),
+        mode=str(request.get("mode") or ""),
+        assignment=tuple(sorted(
+            (str(name), str(version))
+            for name, version in (request.get("assignment") or {}).items()
+        )),
+        fingerprint=str(request.get("fingerprint") or ""),
+        request_id=str(request.get("requestId") or ""),
+        snapshot_identity=str(request.get("snapshotIdentity") or ""),
+        structural_signatures=tuple(
+            str(signature) for signature in (request.get("structuralSignatures") or [])
+        ),
+        failing_commands=tuple(
+            (str(failure.get("command") or ""), int(failure.get("exitCode") or 0))
+            for failure in (request.get("failingCommands") or [])
+            if isinstance(failure, dict)
+        ),
+        diagnostics_tail=str(request.get("diagnosticsTail") or ""),
+        reason=str(request.get("reason") or "project"),
+    )
+
+
+def _persist_open_repair_map(
+    open_map: Mapping[Tuple[str, str, str], Any],
+    progress_path: Optional[Path],
+    run_id: str = "",
+) -> Optional[Path]:
+    """R1: persist ALL open durable repair requests (deferred AND stale, across
+    projects/modes) from the open map, atomically. An empty map REMOVES the
+    handoff file so a restart no longer carries resolved requests."""
+    requests = [request for _key, request in sorted(open_map.items())]
+    if not requests:
+        if progress_path is not None:
+            target = progress_path.parent / "repair-requests.json"
+            try:
+                if target.exists():
+                    target.unlink()
+            except OSError:
+                return None
+        return None
+    return _persist_repair_requests(requests, progress_path, run_id=run_id)
 
 
 
@@ -12005,6 +12249,17 @@ def resolve_peer_compatibility_with_verification(
     # learned as a nogood/exact exclusion/confirmed-failed assignment, so the
     # same version tuple can pass after the source/config repair.
     repair_handoff = RepairHandoffStore()
+    # R1: the durable repair handoff survives restarts. Open requests are
+    # reloaded from the previous run's artifacts dir and reconciled against the
+    # CURRENT source snapshot per mode: a matching snapshot stays deferred (no
+    # re-verify spin on the same broken tuple), a changed snapshot means the
+    # source/config was repaired -- the tuple is re-verified now and the request
+    # is resolved only by a fresh green verify-after-repair pass.
+    durable_repair_map: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for request in _load_repair_requests(progress_path):
+        durable_repair_map[
+            (str(request.get("project") or ""), str(request.get("mode") or ""), str(request.get("fingerprint") or ""))
+        ] = request
     graph_generalization_repeats: Dict[str, int] = {}
     graph_generalization_failed_candidates: Set[Tuple[str, str]] = set()
     graph_generalization_seed_packages: Dict[str, Tuple[str, ...]] = {}
@@ -12453,6 +12708,32 @@ def resolve_peer_compatibility_with_verification(
             )
 
         for mode in modes:
+            # R1: reconcile the durable repair handoff against the CURRENT
+            # source snapshot for this (project, mode). A request still bound
+            # to the snapshot we are verifying is re-deferred so the loop never
+            # spins on the same broken tuple; a request whose snapshot differs
+            # (the source/config was repaired between runs) is left OUT of the
+            # blocking map so the tuple is physically re-verified now -- and is
+            # resolved only by a fresh green verify-after-repair pass.
+            for (r_project, r_mode, r_fingerprint), durable_request in list(durable_repair_map.items()):
+                if r_project != project or r_mode != mode:
+                    continue
+                if (
+                    str(durable_request.get("snapshotIdentity") or "") == project_source_snapshot_key
+                    and not repair_handoff.is_deferred(project, mode, r_fingerprint)
+                ):
+                    repair_handoff.defer(project, mode, _repair_request_from_json(durable_request))
+                    eprint(
+                        f"[info] {project}: reloaded durable repair request {r_fingerprint} "
+                        "for the same source snapshot; kept deferred"
+                    )
+                elif (
+                    str(durable_request.get("snapshotIdentity") or "") != project_source_snapshot_key
+                ):
+                    eprint(
+                        f"[info] {project}: durable repair request {r_fingerprint} bound to a "
+                        "DIFFERENT source snapshot; re-verifying the tuple in this run"
+                    )
             recovery_identity = baseline_run_identity(
                 project=project,
                 mode=mode,
@@ -12662,6 +12943,11 @@ def resolve_peer_compatibility_with_verification(
             verified_candidate_evidence: Dict[
                 str, Tuple[Optional[BaselineVerifyResult], Optional[BaselineVerifyResult]]
             ] = {}
+            # Part G: consecutive iterations whose ONLY work is an already-deferred
+            # repair tuple. When the same pending-repair tuple is offered again, the
+            # mode ends with a machine-readable repair-required handoff instead of
+            # re-verifying it until the safety limit.
+            repair_deferred_only_iterations = 0
 
             def record_verified_incumbent(
                 verified_assignment: Mapping[str, str],
@@ -12777,6 +13063,14 @@ def resolve_peer_compatibility_with_verification(
                 # but the planner must not re-select the exact same tuple while
                 # the cohort is pending source/config repair.
                 blocked.update(repair_handoff.fingerprints(project, mode))
+                # Part D/R2: the incumbent's resolver overrides are stored as
+                # (name, version) PAIRS; the planner's `fixed_names` needs the
+                # NAMES so the pinned package never moves on the next cohort.
+                _override_pairs = tuple(incumbent.resolver_overrides or ())
+                _override_fixed_names = tuple(
+                    str(item[0]) for item in _override_pairs
+                    if isinstance(item, (list, tuple)) and len(item) >= 1 and str(item[0])
+                ) if _override_pairs and isinstance(_override_pairs[0], (list, tuple)) else tuple(_override_pairs)
                 return plan_progressive_extension(
                     incumbent=incumbent.assignment,
                     desired=desired_assignment,
@@ -12785,7 +13079,7 @@ def resolve_peer_compatibility_with_verification(
                     learned_nogoods=learned[project][mode],
                     fingerprint_fn=assignment_fingerprint,
                     priority_packages=baseline_required,
-                    fixed_names=tuple(incumbent.resolver_overrides or ()),
+                    fixed_names=_override_fixed_names,
                 )
 
             def _remember_verified_candidate(
@@ -13226,13 +13520,55 @@ def resolve_peer_compatibility_with_verification(
                 sat_unproven_names = sorted(
                     name for name, status in component_statuses.items() if status == "sat_unproven"
                 )
+                # Part G: every component the solver left UNDECIDED (unknown,
+                # sat_unproven, refinement/budget exhaustion in partial mode)
+                # is now recorded per package; these names can never be part of
+                # a SAT_PROVEN claim or a VERIFIED_TARGET_COMPLETE result.
+                unresolved_component_names = sorted(
+                    name for name, status in component_statuses.items()
+                    if status not in {"optimal", "feasible", "unknown_budget"}
+                )
+
+                def _flag_undecided(names):
+                    rows_for_name = {_name: [row] for _name, row in rows_by_name.items()}
+                    for _name in names:
+                        _mark_draft_component_unresolved(
+                            project, mode, [_name], rows_for_name,
+                            str(component_statuses.get(_name) or "unknown"),
+                            {"detail": "exact solver left the component undecided during verification"},
+                            {}, client, None, {},
+                        )
                 changed = _changed_assignment(assignment, rows_by_name)
-                verification_assignment = _verification_assignment(assignment, rows_by_name)
+                verification_assignment = _managed_scope_assignment(assignment, rows_by_name)
                 removals = _types_stub_removals_for_assignment(rows_by_name, assignment, mode, client)
                 fingerprint = assignment_fingerprint(verification_assignment)
+                # Part G/R2: resolver overrides accepted with the verified
+                # incumbent are PART of the verified substrate and must reach
+                # every subsequent physical verification, not only the override
+                # acceptance pass itself. Carry them into the per-iteration
+                # config so the materialized resolver keeps the pins intact.
+                # R2b: when the run starts from a RESTART, the incumbent may be
+                # fresh while `config.resolver_overrides` already carries the
+                # previously accepted map (fed from the proven state/envelope);
+                # seed from it so the first new incumbent and every verify keep
+                # the same pins and the map is never dropped at finalization.
+                _incumbent_overrides = dict(
+                    anytime.incumbent.resolver_overrides
+                ) if anytime.incumbent is not None and anytime.incumbent.resolver_overrides else dict(
+                    config.resolver_overrides or {}
+                )
+                _iteration_verify_config = (
+                    dataclasses.replace(config, resolver_overrides=_incumbent_overrides)
+                    if _incumbent_overrides
+                    else config
+                )
                 if not desired_identity:
-                    desired_assignment = dict(verification_assignment)
-                    desired_identity = fingerprint
+                    # Part G: the goal is the full managed scope per mode (rows'
+                    # chosen targets, current as fallback), NOT the first solve's
+                    # output. Otherwise an unresolved component falls out of the
+                    # target and a partial candidate is wrongly VERIFIED_COMPLETE.
+                    desired_assignment = _progressive_goal_assignment(rows_by_name, mode)
+                    desired_identity = assignment_fingerprint(desired_assignment)
                     anytime.desired_assignment = dict(desired_assignment)
                     anytime.desired_identity = desired_identity
                 if fingerprint in confirmed_failed_assignments:
@@ -13241,7 +13577,85 @@ def resolve_peer_compatibility_with_verification(
                         f"solver returned previously confirmed failing assignment {fingerprint}; "
                         "authoritative learned/exact constraints were not respected"
                     )
+                if repair_handoff.is_deferred(project, mode, fingerprint):
+                    # Part E/G: this exact tuple is already in the source/config
+                    # repair handoff. Never re-verify it inside the same run: the
+                    # deferred state is snapshot-bound and a post-repair run with a
+                    # changed source identity re-plans and re-verifies it. A second
+                    # consecutive encounter means the solver keeps offering the same
+                    # repair-blocked tuple, so end the mode with the machine-readable
+                    # repair handoff instead of burning the safety limit.
+                    repair_deferred_only_iterations += 1
+                    progress_reporter.emit(
+                        project,
+                        mode,
+                        "repair-handoff-suppressed-reverify",
+                        iteration=iteration,
+                        assignment=fingerprint,
+                        repairRequests=len(repair_handoff.requests(project, mode)),
+                        deferredOnlyCount=repair_deferred_only_iterations,
+                        authority="SOURCE_CONFIG_REPAIR_HANDOFF",
+                    )
+                    eprint(
+                        f"[info] {project}: Baseline {mode} candidate {fingerprint} is already "
+                        "in source/config repair handoff; skipped re-verification"
+                    )
+                    if repair_deferred_only_iterations >= 2:
+                        open_repair_requests = repair_handoff.requests(project, mode)
+                        _persist_repair_requests(
+                            open_repair_requests, progress_path, run_id=run_id
+                        )
+                        progress_reporter.emit(
+                            project,
+                            mode,
+                            "repair-required-terminal",
+                            iteration=iteration,
+                            assignment=fingerprint,
+                            repairRequests=[
+                                request.to_json() for request in open_repair_requests
+                            ],
+                            terminalStatus="REPAIR_REQUIRED",
+                            authority="SOURCE_CONFIG_REPAIR_HANDOFF",
+                        )
+                        checkpoint_baseline_run(
+                            "repair-required", completed_iteration=iteration,
+                            last_assignment=fingerprint, status="running",
+                        )
+                        break
+                    continue
+                repair_deferred_only_iterations = 0
                 if not changed and not removals:
+                    # Part G honesty: an iteration where the solver left the whole
+                    # (or any) component UNDECIDED is NOT a verified "no changes"
+                    # state and carries no proof. Report it as unresolved and end
+                    # the mode without recording a verified incumbent -- never
+                    # SAT_PROVEN, never VERIFIED_TARGET_COMPLETE.
+                    if unresolved_component_names:
+                        _flag_undecided(unresolved_component_names)
+                        eprint(
+                            f"[warn] {project}: Baseline verify {mode}: solver left "
+                            f"{len(unresolved_component_names)} package(s) UNDECIDED "
+                            f"({', '.join(unresolved_component_names[:10])}); "
+                            "no verified assignment for this iteration; NOT claiming SAT_PROVEN"
+                        )
+                        progress_reporter.emit(
+                            project,
+                            mode,
+                            "noop-unresolved-components",
+                            iteration=iteration,
+                            assignment=fingerprint,
+                            unresolvedPackages=unresolved_component_names,
+                            terminalStatus=BaselineTerminalStatus.SOLVER_UNKNOWN.value,
+                            completionStatus=BaselineCompletionStatus.SEARCH_BUDGET_EXHAUSTED_NO_INCUMBENT.value,
+                            details=liveness.snapshot(
+                                learned_constraints=len(learned[project][mode])
+                            ),
+                        )
+                        checkpoint_baseline_run(
+                            "unresolved-no-verified", completed_iteration=iteration,
+                            last_assignment=fingerprint, status="running",
+                        )
+                        break
                     # Zero managed delta still needs resolver proof when fixed
                     # inputs participate in the real package-manager graph.
                     if fixed_input_names:
@@ -13252,7 +13666,7 @@ def resolve_peer_compatibility_with_verification(
                         noop_result = verify_assignment(
                             spec.path,
                             verification_assignment,
-                            config=config,
+                            config=_iteration_verify_config,
                             run_project_checks=False,
                             remove_packages=(),
                             progress=lambda message: (
@@ -13298,6 +13712,7 @@ def resolve_peer_compatibility_with_verification(
                     completion_status = record_verified_incumbent(
                         verification_assignment, fingerprint,
                         getattr(noop_result, "resolved_state_key", "") if fixed_input_names else fingerprint,
+                        resolver_overrides=_incumbent_overrides,
                     )
                     final_assignments.setdefault(project, {})[mode] = assignment
                     checkpoint_baseline_run(
@@ -13350,7 +13765,7 @@ def resolve_peer_compatibility_with_verification(
                     # regression before paying for the complete project suite.
                     # BLOCK_PSI58_RESOLVER_SEED_BRIDGE_V1
                     resolver_bridge_config = dataclasses.replace(
-                        config,
+                        _iteration_verify_config,
                         resolver_seed_publication_hint=(
                             RESOLVER_SEED_PUBLICATION_BRIDGE
                             if config.project_checks != "off" and config.commands
@@ -13468,8 +13883,10 @@ def resolve_peer_compatibility_with_verification(
                             and len(config.commands) > 1
                         ):
                             screen_command = config.commands[0]
+                            # R2b: the adaptive screen also derives from the
+                            # iteration config so resolver overrides follow.
                             screen_config = dataclasses.replace(
-                                config,
+                                _iteration_verify_config,
                                 commands=(screen_command,),
                                 verification_purpose="intermediate-candidate",
                                 publish_durable_prepared_artifact=False,
@@ -13606,10 +14023,13 @@ def resolve_peer_compatibility_with_verification(
                         # Successful candidates still need the full configured
                         # ProjectProof. Screening only short-circuits a freshly
                         # proven introduced structural regression.
+                        # R2b: the project preflight MUST run with the SAME
+                        # iteration config (incumbent resolver overrides) as the
+                        # resolver pass, so both verify one materialized state.
                         if project_result is None:
                             project_result = verify_assignment(
                                 spec.path, verification_assignment,
-                                config=_with_candidate_deadline(config, candidate_phase_deadline),
+                                config=_with_candidate_deadline(_iteration_verify_config, candidate_phase_deadline),
                                 run_project_checks=True, remove_packages=removals,
                                 progress=lambda message: (progress_reporter.emit(project, mode, "project-preflight", iteration=iteration, assignment=fingerprint, message=message), eprint(f"[info] {project}: {message}")),
                                 progress_label=f"Baseline {mode} iteration {iteration} project preflight {fingerprint}",
@@ -13685,12 +14105,53 @@ def resolve_peer_compatibility_with_verification(
                                 f"project migration is expected: {project_result.summary}"
                             )
                     if result.ok:
+                        # R1: the SAME tuple that once required source/config
+                        # repair is resolved ONLY by a fresh verify-after-repair
+                        # pass in which the PROJECT stage is green too. The
+                        # request is a source/config repair ticket: resolver-green
+                        # alone -- a diagnostic non-structural project failure or
+                        # disabled project checks -- is a PARTIAL result and must
+                        # keep the request open.
+                        project_green = (
+                            config.project_checks != "off"
+                            and config.commands
+                            and project_result is not None
+                            and project_result.ok
+                        )
+                        resolved_request = (
+                            durable_repair_map.pop(
+                                (project, mode, fingerprint), None
+                            )
+                            if project_green
+                            else None
+                        )
+                        if resolved_request is not None:
+                            repair_handoff.resolve(project, mode, fingerprint)
+                            _persist_open_repair_map(
+                                durable_repair_map, progress_path, run_id=run_id
+                            )
+                            progress_reporter.emit(
+                                project,
+                                mode,
+                                "repair-resolved",
+                                iteration=iteration,
+                                assignment=fingerprint,
+                                requestId=resolved_request.get("requestId", ""),
+                                sourceSnapshotKey=project_source_snapshot_key,
+                                authority="SOURCE_CONFIG_REPAIR_HANDOFF",
+                            )
+                            eprint(
+                                f"[info] {project}: Baseline {mode} tuple {fingerprint} "
+                                "accepted after source/config repair; "
+                                "durable repair request resolved"
+                            )
                         successful_resolver_evidence[(project, mode)] = result
                         if config.project_checks != "off" and config.commands:
                             successful_project_evidence[(project, mode)] = project_result
                         completion_status = record_verified_incumbent(
                             verification_assignment, fingerprint,
                             getattr(result, "resolved_state_key", "") or fingerprint,
+                            resolver_overrides=_incumbent_overrides,
                         )
                         if (config.project_checks != "off" and config.commands and project_result is not None and project_result.ok and getattr(project_result, "preparation_proof_key", "")):
                             promoted_incumbent = promote_same_run_prepared_artifact(
@@ -13712,6 +14173,14 @@ def resolve_peer_compatibility_with_verification(
                                 f"[warn] {project}: Baseline solve-and-verify {mode} VERIFIED_SAT_UNPROVEN after "
                                 f"{iteration} iteration(s); assignment={fingerprint}; affectedPackages={len(sat_unproven_names)}"
                             )
+                        elif unresolved_component_names:
+                            _flag_undecided(unresolved_component_names)
+                            eprint(
+                                f"[warn] {project}: Baseline solve-and-verify {mode} VERIFIED_PARTIAL "
+                                f"(resolver-green, N component(s) UNDECIDED) after {iteration} iteration(s); "
+                                f"assignment={fingerprint}; unresolvedPackages={len(unresolved_component_names)}; "
+                                "not SAT_PROVEN"
+                            )
                         else:
                             eprint(
                                 f"[info] {project}: Baseline solve-and-verify {mode} PASSED "
@@ -13729,9 +14198,10 @@ def resolve_peer_compatibility_with_verification(
                             assignment=fingerprint,
                             terminalStatus=(
                                 BaselineTerminalStatus.SOLVER_UNKNOWN.value
-                                if unknown_budget_names or sat_unproven_names
+                                if unknown_budget_names or sat_unproven_names or unresolved_component_names
                                 else BaselineTerminalStatus.SAT_PROVEN.value
                             ),
+                            unresolvedPackages=unresolved_component_names or None,
                             completionStatus=completion_status.value,
                                 details=liveness.snapshot(learned_constraints=len(learned[project][mode])),
                         )
@@ -14252,6 +14722,12 @@ def resolve_peer_compatibility_with_verification(
                             structural_signatures=structural_hints,
                         )
                         repair_handoff.defer(project, mode, repair_request)
+                        # R1: the handoff is durable immediately (crash-safe),
+                        # and a re-deferred request carries the CURRENT source
+                        # snapshot so a restart can tell "same broken tuple"
+                        # from "repaired since".
+                        durable_repair_map[(project, mode, fingerprint)] = repair_request.to_json()
+                        _persist_open_repair_map(durable_repair_map, progress_path, run_id=run_id)
                         anytime.observe_candidate(
                             duration_seconds=time.monotonic() - candidate_started,
                             passed=False,
@@ -23854,14 +24330,62 @@ def initial_migration_progress_record(
     ctx: Mapping[str, Any],
     plan_counts: Mapping[str, Any],
     settings_snapshot: Optional[Mapping[str, Any]] = None,
+    scan_health: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Machine-readable migration-progress record for one checkpoint point
-    (B2 contract). Every number carries its unit; denominators are explicit."""
+    (B2 contract). Every number carries its unit; denominators are explicit.
+
+    Part G honesty fix: `scan_health` (the ACTUAL cumulative C/H/M/L/U, lag
+    and security coverage of the scanned rows) takes precedence for
+    actualHealth/securityCounts/audit coverage. Without it the record must NOT
+    fall back to plan-status counters, which are zero until a row is planned
+    and would render KNOWN vulnerabilities as zeros in a new journal -- the
+    record then reports the plan did nothing rather than that the scan sees
+    findings. If scan_health is absent the counts stay empty/unknown, never a
+    fabricated zero.
+    """
     c = dict(ctx)
     input_hashes = input_hashes_for_context(c)
     policy = dict(c.get("policy") or {})
-    lag_ok_n = int(plan_counts.get("lag_ok_12m", 0) or 0)
-    lag_total = int(plan_counts.get("total", 0) or 0)
+    if scan_health is not None:
+        lag_ok_n = int(scan_health.get("lag_ok", 0) or 0)
+        lag_total = int(scan_health.get("lag_total", 0) or 0)
+        critical = int(scan_health.get("critical", 0) or 0)
+        high = int(scan_health.get("high", 0) or 0)
+        moderate = int(scan_health.get("moderate", 0) or 0)
+        low = int(scan_health.get("low", 0) or 0)
+        unknown = int(scan_health.get("unknown", 0) or 0)
+        coverage_known = int(scan_health.get("security_known", 0) or 0)
+        coverage_total = int(scan_health.get("security_total", 0) or int(scan_health.get("lag_total", 0) or 0))
+        lag_fallback = bool(False)
+        security_counts = {
+            "vulnerablePackages": int(scan_health.get("vulnerable_packages", 0) or 0),
+            # R3b: C+H+M+L+U is the count of severity FINDINGS across rows --
+            # an honest "occurrences" unit, never a pretend de-duplicated
+            # advisory count. `advisories` (unique advisories) and `nodes`
+            # (resolved tree nodes) were NOT measured by a row-level scan, so
+            # they are null, not zero.
+            "findingsOccurrences": critical + high + moderate + low + unknown,
+            "advisories": None,
+            "nodes": None,
+        }
+    else:
+        lag_ok_n = 0
+        lag_total = 0
+        critical = 0
+        high = 0
+        moderate = 0
+        low = 0
+        unknown = 0
+        coverage_known = 0
+        coverage_total = int(plan_counts.get("total", 0) or 0)
+        lag_fallback = True
+        security_counts = {
+            "vulnerablePackages": None,
+            "findingsOccurrences": None,
+            "advisories": None,
+            "nodes": None,
+        }
     return {
         "schemaVersion": MIGRATION_PROGRESS_SCHEMA,
         "kind": "checkpoint-point",
@@ -23877,17 +24401,18 @@ def initial_migration_progress_record(
             "lagOk": lag_ok_n,
             "lagTotal": lag_total,
             "lagPercent": round((lag_ok_n / lag_total * 100.0) if lag_total else 0.0, 1),
-            "critical": int(plan_counts.get("critical", 0) or 0),
-            "high": int(plan_counts.get("high", 0) or 0),
-            "moderate": int(plan_counts.get("moderate", 0) or 0),
-            "low": int(plan_counts.get("low", 0) or 0),
-            "unknown": int(plan_counts.get("unknown", 0) or 0),
+            "critical": critical,
+            "high": high,
+            "moderate": moderate,
+            "low": low,
+            "unknown": unknown,
+            "metricsSource": "scan-rows" if not lag_fallback else "plan-statuses",
         },
         "audit": {
             "engine": "not-started",
             "accuracy": "none",
-            "coverageKnown": 0,
-            "coverageTotal": int(plan_counts.get("total", 0) or 0),
+            "coverageKnown": coverage_known,
+            "coverageTotal": coverage_total,
             "unit": "packages",
         },
         "commands": {},
@@ -23896,10 +24421,10 @@ def initial_migration_progress_record(
         "remaining": None,
         "deferred": [],
         "securityCounts": {
-            "vulnerablePackages": int(plan_counts.get("critical", 0) or 0) + int(plan_counts.get("high", 0) or 0)
-            + int(plan_counts.get("moderate", 0) or 0) + int(plan_counts.get("low", 0) or 0),
-            "advisories": 0,
-            "nodes": 0,
+            "vulnerablePackages": security_counts["vulnerablePackages"],
+            "findingsOccurrences": security_counts["findingsOccurrences"],
+            "advisories": security_counts["advisories"],
+            "nodes": security_counts["nodes"],
         },
         "projected": {
             "targetLevel": str(policy.get("targetLevel") or "yellow"),
@@ -23983,7 +24508,13 @@ def build_draft_prompt(
     """
     lines: List[str] = []
     target_level = str(snapshot.get("targetLevel") or "yellow") if snapshot else "yellow"
-    min_lag_pct = str(snapshot.get("minLagOkPct") or "80") if snapshot else "80"
+    # R4: an explicit minLagOkPct=0 is a VALID numeric policy (the run enforces
+    # zero lag headroom) and must survive, not fall through `or "80"` to 80%.
+    min_lag_pct = (
+        str(snapshot.get("minLagOkPct"))
+        if snapshot and "minLagOkPct" in snapshot
+        else "80"
+    )
     if language == "ru":
         lines += [
             "# IMPORTANT — DRAFT BASELINE / PLANNING ONLY",
@@ -24738,6 +25269,117 @@ def _collect_draft_incomplete_reports(
     return ordered
 
 
+def _draft_declared_node_runtime(project_dir: Path, pkg_json: Mapping[str, Any]) -> str:
+    """R4b: the DECLARED node runtime requirement, never a measured one.
+
+    Precedence: package.json ``engines.node``, then ``.nvmrc``, then
+    ``.node-version``. If nothing declares a requirement, returns "" so the
+    prompt renders "—" instead of a fabricated runtime. The value is marked
+    "(declared ...)" so the agent never reads it as an actually measured
+    runtime.
+    """
+    engines = pkg_json.get("engines") or {}
+    engines_node = str(engines.get("node") or "").strip()
+    if engines_node:
+        return f"node {engines_node} (declared:engines.node)"
+    for marker_name in (".nvmrc", ".node-version"):
+        marker = project_dir / marker_name
+        try:
+            text = marker.read_text(encoding="utf-8").strip()
+        except Exception:
+            text = ""
+        if text:
+            return f"node {text} (declared:{marker_name})"
+    return ""
+
+
+def _build_draft_execution_context(
+    projects_by_name: Mapping[str, ProjectSpec],
+    *,
+    registry: str = "",
+    input_hashes: Optional[Dict[str, str]] = None,
+    artifacts_dir: Optional[Path] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """R4: assemble the REAL execution facts the Draft agent needs instead of
+    guessing them -- project path/name, package manager, normalized source
+    identity (branch/commit from source_checkout), the sanitized registry
+    (credentials stripped), the discovered package.json scripts and the
+    discovered verification commands. Local/cheap only: never runs network and
+    never spawns a process, so it degrades gracefully on any failure. Values
+    the caller already put in `extra` win (setdefault semantics).
+    """
+    ctx: Dict[str, Any] = dict(extra or {})
+    first_spec = next(iter(projects_by_name.values()), None) if projects_by_name else None
+    if first_spec is not None:
+        ctx.setdefault("projectPath", str(first_spec.path))
+        ctx.setdefault("projectName", first_spec.name)
+        try:
+            pkg_json = read_json(first_spec.path / "package.json")
+        except Exception:
+            pkg_json = {}
+        manager = str(getattr(first_spec, "package_manager", "") or "")
+        if not manager:
+            # R4b: the modern "packageManager": "yarn@1.22.22" field carries the
+            # NAME and the VERSION; detect_package_manager gives only the name.
+            declared_manager = str(pkg_json.get("packageManager") or "").strip()
+            if declared_manager:
+                manager = declared_manager
+            else:
+                try:
+                    manager = detect_package_manager(first_spec.path) or ""
+                except Exception:
+                    manager = ""
+        if manager:
+            ctx.setdefault("packageManager", manager)
+        checkout = first_spec.source_checkout or {}
+        branch = str(first_spec.source_branch or checkout.get("branch") or "")
+        # R4b: production source checkout publishes the commit as
+        # `sourceCommit` (camelCase), not `commit`/`head`.
+        commit = str(
+            checkout.get("sourceCommit")
+            or checkout.get("commit")
+            or checkout.get("resolvedHead")
+            or checkout.get("head")
+            or ""
+        )
+        if branch or commit:
+            ctx.setdefault("source", {"branch": branch, "commit": commit})
+        if not ctx.get("runtime"):
+            # R4b: runtime is never fabricated. What we CAN report without
+            # spawning a process is the DECLARED node requirement (engines.node
+            # or .nvmrc/.node-version); an actually measured runtime would come
+            # in via `extra` and wins (setdefault). The source of the value is
+            # recorded so a declared requirement is never presented as a
+            # detected one.
+            declared_runtime = _draft_declared_node_runtime(first_spec.path, pkg_json)
+            if declared_runtime:
+                ctx["runtime"] = declared_runtime
+        if not ctx.get("scripts"):
+            scripts = pkg_json.get("scripts") or {}
+            if isinstance(scripts, dict) and scripts:
+                ctx["scripts"] = scripts
+        if not ctx.get("commands"):
+            try:
+                checks = discover_baseline_project_checks(first_spec.path)
+            except Exception:
+                checks = ()
+            commands: Dict[str, Dict[str, Any]] = {}
+            for check in checks:
+                key = str(check).strip()
+                if key and key not in commands:
+                    commands[key] = {"available": True, "detail": "обнаружена в package.json"}
+            if commands:
+                ctx["commands"] = commands
+    if registry:
+        ctx.setdefault("registry", _sanitize_registry_url(registry))
+    if input_hashes:
+        ctx.setdefault("inputHashes", input_hashes)
+    if artifacts_dir is not None:
+        ctx.setdefault("artifactsDir", str(artifacts_dir))
+    return ctx
+
+
 def publish_draft_result(
     *,
     run_id: str,
@@ -25007,6 +25649,9 @@ def publish_draft_result(
             ctx=exec_ctx,
             plan_counts=counts,
             settings_snapshot=snapshot,
+            scan_health=_actual_scan_health(
+                [row for rows in rows_by_project.values() for row in rows]
+            ),
         ),
         journal_language=language,
     )
@@ -25392,6 +26037,7 @@ def _publish_draft_and_exit(
     runId rather than treating process exit as success.
     """
     _draft_progress(client, step="finalize", operation="publish draft", status=status)
+    registry = str(getattr(client, "registry", "") or "")
     del client
     health_by_project = {
         project: compute_project_health(rows, project, None)
@@ -25411,6 +26057,12 @@ def _publish_draft_and_exit(
         input_hashes=input_hashes,
         input_files_by_project=input_files_by_project,
         solver_component_reports=solver_component_reports,
+        execution_context=_build_draft_execution_context(
+            projects_by_name,
+            registry=registry,
+            input_hashes=input_hashes,
+            artifacts_dir=_draft_artifacts_dir(run_id),
+        ),
     )
     eprint(f"[done] Draft partial result published: {manifest['summary']}")
     eprint(f"[info] Draft manifest: {manifest['artifacts']['manifest']}")
@@ -26334,6 +26986,12 @@ def main() -> None:
                 deadline=deadline_clock,
                 input_hashes=draft_input_hashes,
                 input_files_by_project=draft_input_files_by_project,
+                execution_context=_build_draft_execution_context(
+                    projects_by_name,
+                    registry=str(getattr(client, "registry", "") or ""),
+                    input_hashes=draft_input_hashes,
+                    artifacts_dir=_draft_artifacts_dir(run_id),
+                ),
             )
         except DraftBudgetExceeded as budget_exc:
             eprint(f"[info] Draft deadline exceeded at finalization: {budget_exc.phase}")

@@ -243,7 +243,46 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 },
             }), encoding="utf-8")
             self.assertEqual(
-                ("yarn lint:types", "yarn lint:scripts", "yarn lint", "yarn build", "yarn test:unit"),
+                ("yarn lint:types", "yarn lint:scripts", "yarn lint", "yarn build",
+                 "yarn test:unit", "yarn test"),
+                discover_baseline_project_checks(root),
+            )
+
+    def test_auto_discovery_keeps_composite_test_with_build_stage(self) -> None:
+        # R7: `test` = `yarn test:unit && yarn test:build` is NOT an exact
+        # duplicate of `test:unit`; dropping it because `test:unit` is already
+        # selected would silently lose `test:build` from the verification.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(json.dumps({
+                "packageManager": "yarn@1.22.22",
+                "scripts": {
+                    "build": "vite build",
+                    "test:unit": "vitest run",
+                    "test:build": "vite build --mode test",
+                    "test": "vitest run && vite build --mode test",
+                },
+            }), encoding="utf-8")
+            self.assertEqual(
+                ("yarn build", "yarn test:unit", "yarn test"),
+                discover_baseline_project_checks(root),
+            )
+
+    def test_auto_discovery_skips_exact_test_alias_only(self) -> None:
+        # R7: an exact textual alias (`test` == `test:unit`) is skipped; only
+        # that case, matching the Desktop migration-gates rule.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(json.dumps({
+                "packageManager": "yarn@1.22.22",
+                "scripts": {
+                    "build": "vite build",
+                    "test:unit": "vitest run",
+                    "test": "vitest run",
+                },
+            }), encoding="utf-8")
+            self.assertEqual(
+                ("yarn build", "yarn test:unit"),
                 discover_baseline_project_checks(root),
             )
 

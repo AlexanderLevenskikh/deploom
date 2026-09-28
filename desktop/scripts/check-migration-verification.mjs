@@ -290,11 +290,11 @@ if (policy.verificationCommands.filter((item) => item.includes("lint")).length !
   throw new Error(`Exact duplicate lint bodies should run once: ${JSON.stringify(policy)}`);
 }
 
-// Part F acceptance row: libjs `test` is COMPOSITE (`yarn test:unit && yarn
+// Part F acceptance row: tsapp `test` is COMPOSITE (`yarn test:unit && yarn
 // test:build`). Selecting test:unit must NOT silently drop the composite
 // `test` stage that carries test:build: the composite is retained. Only an
 // exact duplicate of test:unit is skipped.
-policy = migrationGatePolicy({}, "libjs", { scripts: {
+policy = migrationGatePolicy({}, "tsapp", { scripts: {
   "test:unit": "node scripts/test.js --passWithNoTests",
   "test:build": "webpack",
   test: "yarn test:unit && yarn test:build",

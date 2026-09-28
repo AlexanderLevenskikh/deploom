@@ -1,10 +1,10 @@
-"""Part F of the libjs deep rescue (2026-09-27): executable acceptance matrix,
+"""Part F of the tsapp deep rescue (2026-09-27): executable acceptance matrix,
 UX states and honest real-run readiness.
 
 Each row of the mandatory acceptance matrix (task L199-L210) is pinned here to
 the responsibility of a Part A/B/C/D/E test or a production contract, so the
 matrix is runnable in CI and the coverage is explicit. Nothing here promises a
-specific libjs percentage or runtime: real acceptance is measured by the user's
+specific tsapp percentage or runtime: real acceptance is measured by the user's
 isolated run (see the REAL_RUN_ACCEPTANCE checklist beside this audit).
 """
 from __future__ import annotations
@@ -110,7 +110,7 @@ class AcceptanceMatrixRows(unittest.TestCase):
         self.assertIn("manifest", reader)
         self.assertIn("summary", reader)
 
-    def test_r11_libjs_composite_test_keeps_test_build(self):
+    def test_r11_tsapp_composite_test_keeps_test_build(self):
         check = _source("desktop/scripts/check-migration-verification.mjs")
         self.assertIn("Composite test:test:build must not be lost", check)
         gates = _source("desktop/electron/migration-gates.ts")
@@ -171,30 +171,50 @@ class UXStatesAndHonestLabels(unittest.TestCase):
 
 
 class RealRunReadiness(unittest.TestCase):
-    """The isolated libjs real run must be reproducible at fixed settings and
-    honest if blocked. Preparation lives in the audit-review checklist."""
+    """The isolated tsapp real run must be reproducible at fixed settings and
+    honest if blocked. The acceptance SPEC lives in a TRACKED template; the
+    filled evidence file is a local, gitignored artifact and is checked only
+    when present -- a clean checkout must pass without any personal
+    .dependency-roadmap (Part F R8)."""
 
-    def test_real_run_checklist_exists_beside_this_audit(self):
-        checklist = ROOT / (
-            ".dependency-roadmap/audit-reviews/libjs-deep-2026-09-27/"
-            "REAL_RUN_ACCEPTANCE.md"
-        )
-        self.assertTrue(checklist.exists(), str(checklist))
-        text = checklist.read_text(encoding="utf-8")
-        # fixed settings, a measurable budget and the control scenario are fixed
-        for marker in (
-            "budgetMinutes",
-            "minLagOkPct",
-            "maxKnownCritical",
-            "timeToFirstCheckpoint",
-            "timeToFirstProjectVerified",
-        ):
+    TEMPLATE = ROOT / "docs" / "REAL_RUN_ACCEPTANCE_TEMPLATE.md"
+    CHECKLIST = ROOT / (
+        ".dependency-roadmap/audit-reviews/tsapp-deep-2026-09-27/"
+        "REAL_RUN_ACCEPTANCE.md"
+    )
+    MARKERS = (
+        "budgetMinutes",
+        "minLagOkPct",
+        "maxKnownCritical",
+        "timeToFirstCheckpoint",
+        "timeToFirstProjectVerified",
+    )
+
+    def test_tracked_acceptance_template_pins_the_real_run_spec(self):
+        # The spec is reproducible from a tracked source on any checkout, so
+        # CI never depends on a personal gitignored evidence file.
+        template = self.TEMPLATE
+        self.assertTrue(template.is_file(), str(template))
+        text = template.read_text(encoding="utf-8")
+        for marker in self.MARKERS:
             self.assertIn(marker, text)
-        # no deferred promise of a specific libjs percentage
+        # fixed settings, a measurable budget and the control scenario are fixed
+        # no deferred promise of a specific tsapp percentage
         self.assertIn("не обещаем", text)
         # incomplete real acceptance is explicitly markable
         self.assertIn("INCOMPLETE", text)
         # first useful upgrade requirement is pinned
+        self.assertIn("First useful upgrade", text)
+
+    def test_local_real_run_evidence_extends_the_template_when_present(self):
+        checklist = self.CHECKLIST
+        if not checklist.is_file():
+            self.skipTest("local real-run evidence not present in this checkout")
+        text = checklist.read_text(encoding="utf-8")
+        for marker in self.MARKERS:
+            self.assertIn(marker, text)
+        self.assertIn("не обещаем", text)
+        self.assertIn("INCOMPLETE", text)
         self.assertIn("First useful upgrade", text)
 
 

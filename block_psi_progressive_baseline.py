@@ -92,7 +92,22 @@ def plan_progressive_extension(
     """
     base = {str(name): str(version) for name, version in incumbent.items()}
     target = {str(name): str(version) for name, version in desired.items()}
-    fixed = {str(name) for name in fixed_names}
+    # R2: `fixed_names` may arrive as plain NAMES or as (name, version) PAIRS
+    # (the verified incumbent's resolver_overrides are stored as pairs). Only
+    # the NAME is a pin: a pair passed through would stringify to a garbage
+    # name and silently drop the pin, letting the override move on the next
+    # cohort. Normalize both shapes here so the caller's exact format cannot
+    # defeat the pin.
+    normalized_fixed: set[str] = set()
+    for item in fixed_names:
+        if isinstance(item, (list, tuple)):
+            if len(item) >= 1:
+                item = item[0]
+            else:
+                continue
+        if isinstance(item, str) and item:
+            normalized_fixed.add(item)
+    fixed = normalized_fixed
     managed = set(base) & set(target)
     if not managed:
         return None

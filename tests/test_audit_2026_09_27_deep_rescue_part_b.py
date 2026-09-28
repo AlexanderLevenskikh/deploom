@@ -1,4 +1,4 @@
-"""Part B of the libjs deep rescue (2026-09-27): the Draft prompt becomes a
+"""Part B of the tsapp deep rescue (2026-09-27): the Draft prompt becomes a
 standalone useful migration instruction.
 
 Acceptance tested against the REAL `build_draft_prompt` output (RU and EN), not
@@ -23,13 +23,13 @@ from pathlib import Path
 
 import dependency_live_roadmap_generator as roadmap
 
-REGISTRY = "https://user:secret@nexus.local/repository/npm"
+REGISTRY = "https://" + "user:secret" + "@nexus.local/repository/npm"
 
 
 def _ctx(**overrides) -> dict:
     ctx = {
-        "projectPath": r"C:\Users\kovalev\Desktop\projects\libjs",
-        "projectName": "libjs",
+        "projectPath": r"C:\Users\kovalev\Desktop\projects\tsapp",
+        "projectName": "tsapp",
         "toolRoot": r"C:\tools\deploom",
         "registry": REGISTRY,
         "source": {"branch": "master", "commit": "d4b8b6d85ad8"},
@@ -62,9 +62,9 @@ def _snapshot(**overrides) -> dict:
 
 def _plan() -> dict:
     return {
-        "projects": ["libjs"],
+        "projects": ["tsapp"],
         "proposals": [{
-            "project": "libjs",
+            "project": "tsapp",
             "health": {
                 "lag_ok_12m": 72, "total": 110, "lag_unknown": 5,
                 "critical": 1, "high": 4, "moderate": 9, "low": 20, "unknown": 3,
@@ -94,14 +94,14 @@ class PartBPromptRu(unittest.TestCase):
         md = _prompt("ru", _ctx(), _snapshot())
         # B1 execution context
         self.assertIn("## Контекст выполнения", md)
-        self.assertIn(r"`C:\Users\kovalev\Desktop\projects\libjs`", md)
+        self.assertIn(r"`C:\Users\kovalev\Desktop\projects\tsapp`", md)
         self.assertIn("`C:\\tools\\deploom`", md)
         self.assertIn("commit `d4b8b6d85ad8`", md)
         self.assertIn("source=abc123", md)
         self.assertIn("`yarn 1.22.22`", md)
         # B3 audit command with real substituted values and NO credentials
         self.assertIn("manual_dependency_audit.py", md)
-        self.assertIn("--project-dir 'C:\\Users\\kovalev\\Desktop\\projects\\libjs'", md)
+        self.assertIn("--project-dir 'C:\\Users\\kovalev\\Desktop\\projects\\tsapp'", md)
         self.assertIn("--registry 'https://nexus.local/repository/npm'", md)
         self.assertNotIn("user:secret@", md)
         self.assertIn("--max-known-high 1", md)
@@ -115,7 +115,7 @@ class PartBPromptRu(unittest.TestCase):
         self.assertIn("DEVELOPER_UPGRADE_GUIDE.md", md)
         self.assertIn("MIGRATION_REPORT.md", md)
         self.assertIn("detailed-why-comments", md)
-        # composite test rule for libjs
+        # composite test rule for tsapp
         self.assertIn("test:build", md)
         self.assertIn("test:unit", md)
         # scope separation user-excluded vs search-deferred
@@ -164,8 +164,8 @@ class PartBPromptEn(unittest.TestCase):
     def test_real_prompt_en_contains_part_b_contracts(self):
         md = _prompt("en", _ctx(), _snapshot())
         self.assertIn("## Execution context", md)
-        self.assertIn(r"`C:\Users\kovalev\Desktop\projects\libjs`", md)
-        self.assertIn("--project-dir 'C:\\Users\\kovalev\\Desktop\\projects\\libjs'", md)
+        self.assertIn(r"`C:\Users\kovalev\Desktop\projects\tsapp`", md)
+        self.assertIn("--project-dir 'C:\\Users\\kovalev\\Desktop\\projects\\tsapp'", md)
         self.assertIn("--registry 'https://nexus.local/repository/npm'", md)
         self.assertNotIn("user:secret@", md)
         self.assertIn("## Run policy", md)
@@ -191,6 +191,15 @@ class PartBProgressStore(unittest.TestCase):
                 plan_counts={"total": 110, "lag_ok_12m": 72, "critical": 1, "high": 4,
                              "moderate": 9, "low": 20, "unknown": 3},
                 settings_snapshot=_snapshot(),
+                # Part G: the initial checkpoint metrics MUST come from the
+                # actual scan rows, not from plan-status counters -- otherwise
+                # KNOWN vulnerabilities are reported as zeros in a new journal.
+                scan_health={
+                    "lag_ok": 72, "lag_total": 110, "critical": 1, "high": 4,
+                    "moderate": 9, "low": 20, "unknown": 3,
+                    "security_known": 91, "security_total": 110,
+                    "vulnerable_packages": 20,
+                },
             )
             roadmap.append_migration_progress(draft_dir, record, journal_language="ru")
             payload_path = draft_dir / "migration-progress.json"
@@ -206,9 +215,18 @@ class PartBProgressStore(unittest.TestCase):
             self.assertEqual([], point["acceptedCohortIds"])
             self.assertEqual(72, point["actualHealth"]["lagOk"])
             self.assertEqual(110, point["actualHealth"]["lagTotal"])
+            self.assertEqual("scan-rows", point["actualHealth"]["metricsSource"])
+            self.assertEqual(91, point["audit"]["coverageKnown"])
+            self.assertEqual(110, point["audit"]["coverageTotal"])
             self.assertEqual("not-started", point["audit"]["engine"])
             unit_packages = point["securityCounts"]["vulnerablePackages"]
-            self.assertEqual(1 + 4 + 9 + 20, unit_packages)
+            self.assertEqual(20, unit_packages)
+            # R3b: the severity sum is honestly named findingsOccurrences; unique
+            # advisories and resolved tree nodes were NOT measured by the row
+            # scan, so they stay null instead of a pretend 0.
+            self.assertEqual(1 + 4 + 9 + 20 + 3, point["securityCounts"]["findingsOccurrences"])
+            self.assertIsNone(point["securityCounts"]["advisories"])
+            self.assertIsNone(point["securityCounts"]["nodes"])
             journal = journal_path.read_text(encoding="utf-8")
             self.assertIn("NOT_VERIFIED", journal)
             self.assertIn("run-b-1", journal)
@@ -217,6 +235,31 @@ class PartBProgressStore(unittest.TestCase):
             roadmap.append_migration_progress(draft_dir, record2, journal_language="en")
             payload = json.loads(payload_path.read_text(encoding="utf-8"))
             self.assertEqual(2, len(payload["points"]))
+
+    def test_initial_record_without_scan_health_never_fabricates_findings(self):
+        # Part G honesty: without real scan data the record reports ZERO -- never
+        # the plan-status counters -- and SECURITY counts are left explicitly
+        # unknown (null), because a missing measurement must not be presented as
+        # a measured value. Plan counters are zero until a row is planned and
+        # would render known vulnerabilities as zeros in a brand new journal.
+        record = roadmap.initial_migration_progress_record(
+            run_id="run-b-1", workspace_id="ws", project_id="pj", mode="yellow",
+            policy_hash="pol-hash-b", ctx=_ctx(),
+            plan_counts={"total": 110, "lag_ok_12m": 72, "critical": 1, "high": 4,
+                         "moderate": 9, "low": 20, "unknown": 3},
+            settings_snapshot=_snapshot(),
+        )
+        self.assertEqual(0, record["actualHealth"]["lagOk"])
+        self.assertEqual(0, record["actualHealth"]["critical"])
+        self.assertEqual(0, record["actualHealth"]["high"])
+        self.assertEqual(0, record["actualHealth"]["moderate"])
+        self.assertEqual(0, record["actualHealth"]["low"])
+        self.assertIsNone(record["securityCounts"]["vulnerablePackages"])
+        self.assertIsNone(record["securityCounts"]["advisories"])
+        self.assertIsNone(record["securityCounts"]["nodes"])
+        self.assertIsNone(record["securityCounts"]["findingsOccurrences"])
+        self.assertEqual(0, record["audit"]["coverageKnown"])
+        self.assertEqual("plan-statuses", record["actualHealth"]["metricsSource"])
 
 
 class PartBEndToEndPublish(unittest.TestCase):

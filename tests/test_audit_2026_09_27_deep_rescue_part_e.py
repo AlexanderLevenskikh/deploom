@@ -1,4 +1,4 @@
-"""Part E of the libjs deep rescue (2026-09-27): managed source/config repair
+"""Part E of the tsapp deep rescue (2026-09-27): managed source/config repair
 handoff in the right moment.
 
 Acceptance pinned here:
@@ -81,7 +81,7 @@ class E1RepairableProjectFailureIsNeverDependencyAuthority(unittest.TestCase):
     def test_repair_request_is_machine_readable_and_snapshot_bound(self):
         result = _project_failure()
         request = handoff.build_repair_request(
-            project="libjs",
+            project="tsapp",
             mode="default",
             assignment={"vite": "6.0.0", "vitest": "2.0.0"},
             result=result,
@@ -108,18 +108,18 @@ class E1RepairableProjectFailureIsNeverDependencyAuthority(unittest.TestCase):
     def test_store_defers_and_resolves_without_learning_anything(self):
         store = handoff.RepairHandoffStore()
         request = handoff.build_repair_request(
-            project="libjs", mode="default",
+            project="tsapp", mode="default",
             assignment={"vite": "6.0.0"}, result=_project_failure(),
             snapshot_identity="s0", fingerprint="fpA",
         )
-        self.assertTrue(store.defer("libjs", "default", request))
-        self.assertFalse(store.defer("libjs", "default", request))  # dedup
-        self.assertTrue(store.is_deferred("libjs", "default", "fpA"))
-        self.assertEqual(store.fingerprints("libjs", "default"), frozenset({"fpA"}))
+        self.assertTrue(store.defer("tsapp", "default", request))
+        self.assertFalse(store.defer("tsapp", "default", request))  # dedup
+        self.assertTrue(store.is_deferred("tsapp", "default", "fpA"))
+        self.assertEqual(store.fingerprints("tsapp", "default"), frozenset({"fpA"}))
         # resolving clears the deferral so the tuple may be re-planned
-        self.assertEqual(store.resolve("libjs", "default", "fpA"), request)
-        self.assertFalse(store.is_deferred("libjs", "default", "fpA"))
-        self.assertEqual(store.fingerprints("libjs", "default"), frozenset())
+        self.assertEqual(store.resolve("tsapp", "default", "fpA"), request)
+        self.assertFalse(store.is_deferred("tsapp", "default", "fpA"))
+        self.assertEqual(store.fingerprints("tsapp", "default"), frozenset())
 
     def test_store_scopes_by_project_and_mode(self):
         store = handoff.RepairHandoffStore()
@@ -144,13 +144,13 @@ class E2SameTuplePassesAfterRepairNotPoisoned(unittest.TestCase):
         store = handoff.RepairHandoffStore()
         fp_full = planner_fp({"vite": "6.0.0", "vitest": "2.0.0"})
         request = handoff.build_repair_request(
-            project="libjs", mode="default",
+            project="tsapp", mode="default",
             assignment={"vite": "6.0.0", "vitest": "2.0.0"},
             result=_project_failure(),
             snapshot_identity="snapshot-before-repair", fingerprint=fp_full,
         )
-        store.defer("libjs", "default", request)
-        self.assertEqual(store.fingerprints("libjs", "default"), frozenset({fp_full}))
+        store.defer("tsapp", "default", request)
+        self.assertEqual(store.fingerprints("tsapp", "default"), frozenset({fp_full}))
 
         # The tuple was never poisoned: learned/exact-exclusion sets stay empty.
         learned: list = []
@@ -161,7 +161,7 @@ class E2SameTuplePassesAfterRepairNotPoisoned(unittest.TestCase):
         # The full deferred cohort (vite@6 AND vitest@2 together) is blocked
         # while it is pending source/config repair...
         blocked = set()
-        blocked.update(store.fingerprints("libjs", "default"))
+        blocked.update(store.fingerprints("tsapp", "default"))
         plan = plan_progressive_extension(
             incumbent={"vite": "5.0.0", "vitest": "1.0.0"},
             desired={"vite": "6.0.0", "vitest": "2.0.0"},
@@ -202,8 +202,8 @@ class E2SameTuplePassesAfterRepairNotPoisoned(unittest.TestCase):
         # Phase 2: repair arrived, the SAME tuple re-verifies green -> the
         # deferral is resolved and the full cohort is immediately re-plannable;
         # the solver cache was never poisoned by the pre-repair failure.
-        store.resolve("libjs", "default", fp_full)
-        self.assertEqual(store.fingerprints("libjs", "default"), frozenset())
+        store.resolve("tsapp", "default", fp_full)
+        self.assertEqual(store.fingerprints("tsapp", "default"), frozenset())
         replica = BaselineVerifyResult(True, "passed", "after repair all green")
         self.assertTrue(replica.ok)
         self.assertFalse(handoff.is_repairable_project_failure(replica))

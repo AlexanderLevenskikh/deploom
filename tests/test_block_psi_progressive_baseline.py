@@ -112,6 +112,27 @@ class ProgressiveBaselinePlannerTests(unittest.TestCase):
         # vite comes first (lexical order among equal small cohorts)
         self.assertEqual(plan.packages, ("vite",))
 
+    def test_fixed_names_as_production_pairs_still_pin_the_override(self) -> None:
+        """R2: the verified incumbent stores resolver_overrides as (name,
+        version) PAIRS. When those pairs are handed to the planner as
+        `fixed_names` (the production call shape), the NAME must be treated as
+        the pin -- not the pair stringified. a@1 incumbent with an override
+        must NEVER be re-selected at its target a@2 on the next cohort."""
+        plan = plan_progressive_extension(
+            incumbent={"a": "1", "b": "1"},
+            desired={"a": "2", "b": "2"},
+            atomic_groups=(("a",), ("b",)),
+            blocked_fingerprints=(),
+            learned_nogoods=(),
+            fingerprint_fn=fp,
+            fixed_names=(("a", "1"),),
+        )
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertNotIn("a", plan.packages)
+        self.assertEqual(plan.assignment_dict["a"], "1")
+        self.assertEqual(plan.packages, ("b",))
+
     def test_all_upgrades_pinned_returns_none_not_a_blocker_plan(self) -> None:
         """Whole scope pinned by overrides -> no extension is possible; the
         planner returns None naturally (like the old early return) only when

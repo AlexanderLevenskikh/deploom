@@ -196,6 +196,21 @@ class BaselineVerifyConfig:
             commands = tuple(item.strip() for item in commands_raw)
         else:
             raise ValueError("CONSTRAINT_VERIFY_CONFIG_INVALID: commands must be an array of non-empty strings")
+        # R2b: resolver overrides accepted with the verified incumbent must
+        # survive the RESTART boundary. They arrive here through the spec's
+        # constraint_verify_config (fed from the previous run's proven state /
+        # envelope) and must actually reach the verify config -- otherwise the
+        # first fresh incumbent starts with an empty set and finalization drops
+        # the previously accepted override map.
+        overrides_raw = raw.get("resolverOverrides", raw.get("resolver_overrides"))
+        if isinstance(overrides_raw, dict):
+            resolver_overrides = {
+                str(name): str(version)
+                for name, version in overrides_raw.items()
+                if str(name).strip()
+            }
+        else:
+            resolver_overrides = {}
         return BaselineVerifyConfig(
             enabled=_as_bool(raw.get("enabled"), True),
             parallelism=max(1, min(_as_int(raw.get("parallelism"), 4), 16)),
@@ -215,11 +230,14 @@ class BaselineVerifyConfig:
                         ),
                         1800,
                     ),
+                    # Ψ.5.6: a prepared-artifact copy is production-adjacent; cap
+                    # it so runaway copies cannot hang a run behind the budget.
                     7200,
                 ),
             ),
             project_checks=mode,
             commands=commands,
+            resolver_overrides=resolver_overrides,
             budget_phase_deadline=(
                 float(raw.get("budgetPhaseDeadline", raw.get("budget_phase_deadline")))
                 if raw.get("budgetPhaseDeadline", raw.get("budget_phase_deadline")) is not None
@@ -576,7 +594,19 @@ def discover_baseline_project_checks(project_dir: Path) -> Tuple[str, ...]:
     if len(flow_names) > 1:
         keep = flow_names[0]
         names = [name for name in names if name not in set(flow_names) or name == keep]
-    if "test:unit" in names and "test" in names:
+    # R7: only an EXACT duplicate of `test:unit` is skipped. A composite
+    # `test` script (for example `yarn test:unit && yarn test:build`) MUST keep
+    # its extra stage: dropping it because `test:unit` is already selected would
+    # silently lose `test:build` from the verification.
+    test_unit_text = scripts.get("test:unit")
+    test_text = scripts.get("test")
+    if (
+        "test:unit" in names
+        and "test" in names
+        and isinstance(test_unit_text, str)
+        and isinstance(test_text, str)
+        and test_text.strip() == test_unit_text.strip()
+    ):
         names = [name for name in names if name != "test"]
     commands: List[str] = []
     for name in names:

@@ -879,3 +879,137 @@ class DraftProgressHeartbeatTests(unittest.TestCase):
             self.assertEqual(lines[2].get("pct"), 100, "terminal 100 is allowed only on the finalize/publish event")
         finally:
             client.mark_draft_terminal()
+
+
+def test_draft_prompt_keeps_explicit_zero_min_lag_ok_pct() -> None:
+    """R4: an explicit minLagOkPct=0 in the policy is a valid numeric and must
+    NOT be rewritten to the default 80% by an `or "80"` fallback."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        roadmap.set_draft_artifacts_base(base)
+        try:
+            row = _make_row()
+            manifest = roadmap.publish_draft_result(
+                run_id="run-r4-zero-lag",
+                workspace_id="ws-test",
+                project_id="tiny-basic",
+                mode="draft",
+                rows_by_project={"tiny-basic": [row]},
+                projects_by_name={},
+                health_by_project={"tiny-basic": _make_health()},
+                status="DRAFT_READY",
+                partial_reason=None,
+                deadline=roadmap.DeadlineClock(None),
+                settings_snapshot={"targetLevel": "yellow", "minLagOkPct": 0},
+            )
+            draft_dir = base / "runs" / "run-r4-zero-lag" / "draft"
+            prompt = (draft_dir / "prompt.md").read_text(encoding="utf-8")
+            assert "минимум актуальности `0%`" in prompt, prompt
+            assert "минимум актуальности `80%`" not in prompt, prompt
+            assert manifest["status"] == "DRAFT_READY"
+        finally:
+            roadmap.set_draft_artifacts_base(None)
+
+
+def _r4_project_spec(base: Path, name: str = "proj") -> roadmap.ProjectSpec:
+    project = roadmap.ProjectSpec(
+        name=name,
+        path=base / "proj",
+        # production shape: the source checkout publishes the commit under
+        # `sourceCommit` (camelCase), not `commit`/`head`.
+        source_checkout={"sourceCommit": "12345678"},
+    )
+    project.path.mkdir(parents=True, exist_ok=True)
+    (project.path / "package.json").write_text(
+        '{"name":"proj","version":"1.0.0",'
+        '"packageManager":"yarn@1.22.22",'
+        '"engines":{"node":"^18"},'
+        '"scripts":'
+        '{"lint":"eslint .","test":"vitest run","test:unit":"vitest run"}}',
+        encoding="utf-8",
+    )
+    (project.path / "package-lock.json").write_text("{}", encoding="utf-8")
+    return project
+
+
+def test_build_draft_execution_context_carries_real_facts() -> None:
+    """R4: the context builder produces the real execution facts (package
+    manager WITH version, normalized source identity from production-shaped
+    sourceCommit, declared-but-not-fabricated runtime, sanitized registry,
+    discovered scripts/commands, input hashes) from a REAL project directory --
+    the shape the top-level publish calls must feed publish_draft_result."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        project = _r4_project_spec(base)
+        ctx = roadmap._build_draft_execution_context(
+            {"proj": project},
+            registry="https://" + "user:pass@" + "registry.example.com/",
+            input_hashes={"proj": "h1"},
+            artifacts_dir=base / "artifacts",
+        )
+        assert ctx["projectPath"] == str(project.path)
+        assert ctx["projectName"] == "proj"
+        # R4b: the manager version survives (packageManager field, not just the
+        # detected name).
+        assert ctx["packageManager"] == "yarn@1.22.22", ctx["packageManager"]
+        # R4b: the commit comes from the production-shaped `sourceCommit`.
+        assert ctx["source"] == {"branch": "", "commit": "12345678"}, ctx["source"]
+        assert ctx["registry"] == "https://registry.example.com/", ctx["registry"]
+        assert "user:pass" not in ctx["registry"]
+        assert ctx["scripts"]["lint"] == "eslint ."
+        # R4b: the runtime is the DECLARED requirement, honestly labelled.
+        assert ctx["runtime"].startswith("node ^18 (declared:engines.node)"), ctx.get("runtime")
+        commands = {k: v for k, v in ctx["commands"].items()}
+        assert "yarn lint" in commands, commands
+        assert "yarn test:unit" in commands, commands
+        assert commands["yarn lint"]["available"] is True
+        assert ctx["inputHashes"] == {"proj": "h1"}
+        assert ctx["artifactsDir"] == str(base / "artifacts")
+
+
+def test_publish_with_helper_context_writes_real_execution_context_prompt() -> None:
+    """R4 acceptance: the REAL publisher (not just build_draft_prompt with a
+    hand-made ctx) must produce a prompt carrying the real execution facts:
+    source commit, package manager WITH version, declared runtime, sanitized
+    registry, discovered commands, and the honest 0% lag goal when
+    minLagOkPct=0."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        project = _r4_project_spec(base)
+        roadmap.set_draft_artifacts_base(base)
+        try:
+            row = _make_row()
+            ctx = roadmap._build_draft_execution_context(
+                {"proj": project},
+                registry="https://" + "user:pass@" + "registry.example.com/",
+                input_hashes={"proj": "h2"},
+                artifacts_dir=base / "runs" / "run-r4-real" / "draft",
+            )
+            manifest = roadmap.publish_draft_result(
+                run_id="run-r4-real",
+                workspace_id="ws-test",
+                project_id="proj",
+                mode="draft",
+                rows_by_project={"proj": [row]},
+                projects_by_name={"proj": project},
+                health_by_project={"proj": _make_health()},
+                status="DRAFT_READY",
+                partial_reason=None,
+                deadline=roadmap.DeadlineClock(None),
+                settings_snapshot={"targetLevel": "yellow", "minLagOkPct": 0},
+                input_hashes={"proj": "h2"},
+                execution_context=ctx,
+            )
+            draft_dir = base / "runs" / "run-r4-real" / "draft"
+            prompt = (draft_dir / "prompt.md").read_text(encoding="utf-8")
+            assert "commit `12345678`" in prompt, prompt
+            assert "Package manager: `yarn@1.22.22`" in prompt, prompt
+            assert "node ^18" in prompt, prompt
+            assert "https://registry.example.com/" in prompt, prompt
+            assert "user:pass" not in prompt, prompt
+            assert "минимум актуальности `0%`" in prompt, prompt
+            assert "минимум актуальности `80%`" not in prompt, prompt
+            assert manifest["inputHashes"]["proj"] == "h2"
+            assert manifest["status"] == "DRAFT_READY"
+        finally:
+            roadmap.set_draft_artifacts_base(None)

@@ -1,4 +1,4 @@
-"""Part C of the libjs deep rescue (2026-09-27): the verified path stops
+"""Part C of the tsapp deep rescue (2026-09-27): the verified path stops
 aborting on a single UNFINISHED component and delivers the first useful result.
 
 Production coverage beyond Part A's T1/T2:
@@ -114,7 +114,7 @@ class C1FullyPinnedComponentShortCircuit(unittest.TestCase):
                 ["a"], rows_by_name, domains, client, "default", [], None, None,
                 residual_targets={"a": "1.0.0"},
             )
-        self.assertEqual("optimal", report["status"])
+        self.assertEqual("feasible", report["status"])
         self.assertEqual({"a": "1.0.0"}, report["assignment"])
         self.assertTrue(report["pinned"])
         self.assertEqual("queued-fallback", report["proof"])
@@ -135,6 +135,7 @@ class C1FullyPinnedComponentShortCircuit(unittest.TestCase):
         by_project = {"Demo": [_row("big-a"), _row("big-b")]}
         roadmap.capture_desired_targets(by_project)
         solved = []
+        statuses: dict = {}
 
         def forbid(model, timeout_ms=30_000, operation_id=None):
             solved.append(_pkg_names(model))
@@ -145,9 +146,14 @@ class C1FullyPinnedComponentShortCircuit(unittest.TestCase):
                 by_project, client, modes=("default",), apply_results=False,
                 shadow_solver_config_by_project={"Demo": {"solverBackend": "z3"}},
                 residual_targets_by_project={"Demo": {"big-a": "1.0.0", "big-b": "1.0.0"}},
+                solver_statuses_out=statuses,
             )
         self.assertEqual({"big-a": "1.0.0", "big-b": "1.0.0"}, result["Demo"]["default"])
         self.assertEqual([], solved)
+        # R6: the OUTER status publication carries the solver's real verdict --
+        # a pinned fallback is "feasible", never relabeled "optimal" by the
+        # caller (global optimality cannot be derived from a pin).
+        self.assertEqual("feasible", statuses["Demo"]["default"]["big-a"])
 
 
 class C2PartialPinStillSolves(unittest.TestCase):

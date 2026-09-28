@@ -30,6 +30,7 @@ import { deterministicPlannerDecision } from './deterministic-planner.js'
 import { plannerResultCacheKey, plannerResultCachePath, writePlannerResultCache } from './planner-result-cache.js'
 import { buildReleaseRecoveryPrompt, readReleaseRecoveryResult } from './release-recovery.js'
 import { assessMigrationCheckpoint, baselineFailureDecision, baselineFailuresNeedingProbe, baselineObservationMatchesFailure, createVerificationDiagnosticCollector, verificationCommandKey, type BaselineVerificationObservation, type MigrationVerificationAssessment, type VerificationDiagnosticEvidence, type VerificationEvidence, type VerificationFailure } from './migration-verification.js'
+import { matchingRepairRequests, openRepairRequests, repairHandoffStateRelativeDir, requestSummary, resolveRepairRequest } from './repair-handoff.js'
 import { migrationGatePolicy } from './migration-gates.js'
 import { cleanEphemeralVerificationCaches, liveBaselineObservationCacheKey } from './verification-environment.js'
 import { buildMergedRepairPrompt, readMergedRepairResult } from './merged-repair.js'
@@ -4543,12 +4544,27 @@ async function runGroupAgentSession(job: JobRecord, workspace: WorkspaceRecord, 
         clearAgentBranchSessionState(workspace, project.name, branch.branch)
         job.agentSessionId = undefined
         job.stdoutBuffer = ''
+        // Desktop Executor consumes the durable source/config repair handoff
+        // at the SINGLE producer contract path:
+        //   <workspace>/.dependency-roadmap/state/repair-requests.json
+        // A green batch pass is verify-after-repair evidence ONLY for the
+        // requests whose FULL assignment this batch covered in the SAME mode;
+        // any other open request of the project stays untouched (a green c
+        // batch is not proof that a@2 or b@3 was fixed).
+        const repairHandoffDir = join(job.workspace.path, repairHandoffStateRelativeDir.join('/'))
+        for (const repair of matchingRepairRequests(
+          openRepairRequests(repairHandoffDir).requests,
+          { project: project.name, mode: targetMode, packages: batch.packages },
+        )) {
+          resolveRepairRequest(repairHandoffDir, repair.requestId)
+          send('flow:job-output', { jobId: job.id, stream: 'system', line: `Repair request resolved: ${requestSummary(repair)}` })
+        }
         send('flow:job-output', { jobId: job.id, stream: 'system', line: `Batch ${batchIndex + 1}/${batches.length} завершён: ${batch.packages.join(', ')}. Verification checkpoint не содержит новых baseline→post регрессий.` })
         break
       }
 
       const verificationFeedback = verification.status === 'repair-required'
-        ? `; ВАЖНО: ${verification.feedback}. Это новая регрессия относительно baseline — исправь её сейчас и повтори конкретные проверки; нельзя ссылаться на будущую группу, которой нет в текущем Branch plan.`
+        ? `; ВАЖНО: ${verification.feedback}. Это новая регрессия относительно baseline — исправь её сейчас и повтори конкретные проверки; нельзя ссылаться на будущую группу, которой нет в текущем Branch plan.${matchingRepairRequests(openRepairRequests(join(job.workspace.path, repairHandoffStateRelativeDir.join('/'))).requests, { project: project.name, mode: targetMode, packages: batch.packages }).map((request) => `; открытый repair-запрос ${requestSummary(request)}`).join('')}`
         : verification.status === 'unknown'
           ? '; verification checkpoint не найден/не читается — запиши state JSON с baseline/post evidence и migrationOutcome перед завершением'
           : ''

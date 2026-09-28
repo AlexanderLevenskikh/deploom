@@ -369,5 +369,46 @@ class R6_2OperationChainTests(unittest.TestCase):
         self.assertEqual(30000, report["attempts"][0]["timeoutMs"])
 
 
-if __name__ == "__main__":
-    unittest.main()
+class R6PinnedFeasibleStatusTests(unittest.TestCase):
+    """R6 (v0.2.144 re-acceptance): a fully pinned, constraint-consistent
+    component is reported as FEASIBLE (decided by the bounded check on the
+    residual fallback), never as a fresh "optimal" -- the pinned path did not
+    prove global optimality. Consumers still treat it as decided (SAT terminal,
+    non-unresolved, alternative-candidate), and the exact solver must not be
+    started for an already consistent pin."""
+
+    def test_pinned_consistent_component_is_feasible_not_optimal(self):
+        client, rows_by_name, domains = _component_ctx(10.0)
+
+        def forbidden_solve(*_args, **_kwargs):
+            raise AssertionError("a consistent fully-pinned component must not start a fresh global solve")
+
+        with mock.patch.object(roadmap, "solve_z3_exact", side_effect=forbidden_solve):
+            report = roadmap._run_z3_peer_component(
+                ["a"], rows_by_name, domains, client, "default", [], None, None,
+                budget_capped=True, residual_targets={"a": "1.0.0"},
+            )
+        self.assertEqual("feasible", report["status"])
+        self.assertNotEqual("optimal", report["status"])
+        self.assertTrue(report.get("pinned"))
+        self.assertEqual("queued-fallback", report.get("proof"))
+        self.assertEqual({"a": "1.0.0"}, report["assignment"])
+        self.assertEqual(0, report["attemptCount"])
+        self.assertEqual("SAT_PROVEN", roadmap._terminal_status_for_exact_solver(report["status"]).value)
+
+    def test_feasible_maps_to_proven_terminal_never_unknown(self):
+        self.assertEqual("SAT_PROVEN", roadmap._terminal_status_for_exact_solver("feasible").value)
+        self.assertEqual("SAT_PROVEN", roadmap._terminal_status_for_exact_solver("optimal").value)
+        self.assertNotEqual("SAT_PROVEN", roadmap._terminal_status_for_exact_solver("unknown").value)
+
+    def test_resolve_peer_compatibility_keeps_pinned_rows_non_unresolved(self):
+        # The verification consumers must NOT push a feasible pinned component
+        # into the unresolved bucket: it is decided.
+        client, rows_by_name, domains = _component_ctx(10.0)
+        row = rows_by_name["a"]
+        report = roadmap._run_z3_peer_component(
+            ["a"], rows_by_name, domains, client, "default", [], None, None,
+            budget_capped=True, residual_targets={"a": "1.0.0"},
+        )
+        self.assertEqual("feasible", report["status"])
+        self.assertFalse(getattr(row, "peer_compat_unresolved", False))
