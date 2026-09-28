@@ -13602,8 +13602,14 @@ def resolve_peer_compatibility_with_verification(
                     )
                     if repair_deferred_only_iterations >= 2:
                         open_repair_requests = repair_handoff.requests(project, mode)
-                        _persist_repair_requests(
-                            open_repair_requests, progress_path, run_id=run_id
+                        # R5: persist the FULL durable open set, never just the
+                        # in-memory deferred requests of this run. A stale
+                        # durable request from a previous run (bound to an older
+                        # snapshot, awaiting re-verification) is still OPEN; the
+                        # terminal overwrite must not drop it while a NEW request
+                        # for the same project/mode is being deferred.
+                        _persist_open_repair_map(
+                            durable_repair_map, progress_path, run_id=run_id
                         )
                         progress_reporter.emit(
                             project,

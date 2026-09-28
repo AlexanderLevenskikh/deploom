@@ -480,6 +480,191 @@ class PartGWorkingLoopHonesty(unittest.TestCase):
         # Resolver-green is still a legitimate partial incumbent, not dropped.
         self.assertEqual("2.0.0", final2["Demo"]["yellow"]["a"])
 
+    def test_repair_resolution_is_per_fingerprint_not_per_package_names(self):
+        # R5 acceptance (P1): requests of the SAME project/mode/package name but
+        # DIFFERENT versions and snapshots are DIFFERENT repair tickets. A green
+        # verification of one assignment (a@2 on a fresh source snapshot) is
+        # proof for THAT exact request only; another open request for a@3 bound
+        # to a different snapshot must stay in the durable handoff until ITS
+        # exact tuple verifies green. Package-name coverage never closes a
+        # request -- only the authoritative full-state verification does.
+        phase_paths = [self.root / f"p{i}.log" for i in (1, 2, 3, 4)]
+        offered = {"assignment": {"a": "2.0.0"}}
+        rows_cell = {"rows": [_row("a", target_yellow="2.0.0")]}
+
+        def solver(rows_by_project, client, **kwargs):
+            modes = kwargs.get("modes", ("default",))
+            solver_statuses_out = kwargs.get("solver_statuses_out")
+            if solver_statuses_out is None:
+                solver_statuses_out = {}
+            for mode in modes:
+                solver_statuses_out.setdefault("Demo", {})[mode] = {"a": "optimal"}
+            return {"Demo": {m: dict(offered["assignment"]) for m in modes}}
+
+        self.spec.constraint_verify_config = {
+            "project_checks": "diagnostic",
+            "commands": ["yarn lint"],
+            "maxIterations": 8,
+        }
+
+        def verify_broken(*args, **kwargs):
+            return roadmap.BaselineVerifyResult(
+                False, "project", "project preflight failed",
+                output="yarn lint: error TS2322", command="yarn lint")
+
+        def verify_ok(*args, **kwargs):
+            return roadmap.BaselineVerifyResult(True, "dependency", "resolver ok")
+
+        def _requests():
+            payload = json.loads(artifact.read_text(encoding="utf-8"))
+            by_version = {r["assignment"].get("a"): r for r in payload["requests"]}
+            return by_version
+
+        def _plan(version):
+            rows_cell["rows"] = [_row("a", target_yellow=version)]
+            offered["assignment"] = {"a": version}
+
+        # Phase 1: a@2 on source S1 breaks -> durable request r1 bound to S1.
+        self._run(rows_cell["rows"], solver, verify_broken, mode="yellow",
+                  progress_path=phase_paths[0])
+        artifact = self.root / "repair-requests.json"
+        self.assertTrue(artifact.is_file())
+        r1 = _requests()["2.0.0"]
+        self.assertTrue(r1["snapshotIdentity"])
+        active_file = self.root / "baseline-run-active.json"
+
+        # Phase 2: a Desktop repair changes the source (S1 -> S2) and the plan
+        # moves to a@3, which is also broken -> SECOND durable request r2 bound
+        # to S2. Both share project/mode and the package name "a".
+        if active_file.exists():
+            active_file.unlink()
+        (self.root / "package.json").write_text(
+            json.dumps({"name": "demo", "version": "1.0.0",
+                        "dependencies": {"a": "1.0.0", "b": "1.0.0"},
+                        "lint-staged": {"repaired": True}}),
+            encoding="utf-8",
+        )
+        _plan("3.0.0")
+        self._run(rows_cell["rows"], solver, verify_broken, mode="yellow",
+                  progress_path=phase_paths[1])
+        by_version2 = _requests()
+        self.assertEqual({"2.0.0", "3.0.0"}, set(by_version2), by_version2)
+        self.assertNotEqual(by_version2["2.0.0"]["snapshotIdentity"],
+                            by_version2["3.0.0"]["snapshotIdentity"],
+                            "the two requests must be bound to different snapshots")
+
+        # Phase 3: the plan returns to a@2 and the source stays at S2; the
+        # engine re-verifies the a@2 tuple (its snapshot moved) to GREEN. Only
+        # r1 (a@2) may be resolved; r2 (a@3, still bound to the current S2, and
+        # never verified green) must remain untouched.
+        if active_file.exists():
+            active_file.unlink()
+        _plan("2.0.0")
+        self._run(rows_cell["rows"], solver, verify_ok, mode="yellow",
+                  progress_path=phase_paths[2])
+        events3 = self._streamed_events
+        self.assertTrue(any(e.get("phase") == "repair-resolved" for e in events3),
+                        "the a@2 tuple must resolve on its green verification")
+        remaining = _requests()
+        self.assertEqual({"3.0.0"}, set(remaining),
+                         "a@2's green pass must not close the a@3 request")
+
+        # Phase 4: a second repair moves the source (S2 -> S3); only then the
+        # a@3 tuple re-verifies green and its own request resolves.
+        if active_file.exists():
+            active_file.unlink()
+        (self.root / "package.json").write_text(
+            json.dumps({"name": "demo", "version": "1.0.0",
+                        "dependencies": {"a": "1.0.0", "b": "1.0.0"},
+                        "lint-staged": {"repaired": True, "round": 2}}),
+            encoding="utf-8",
+        )
+        _plan("3.0.0")
+        final4 = self._run(rows_cell["rows"], solver, verify_ok, mode="yellow",
+                           progress_path=phase_paths[3])
+        resolved_events = [e for e in self._streamed_events
+                           if e.get("phase") == "repair-resolved"]
+        self.assertTrue(resolved_events,
+                        "the a@3 tuple must resolve on its own green verification")
+        self.assertEqual(by_version2["3.0.0"]["fingerprint"],
+                         resolved_events[-1].get("assignment"),
+                         "the resolved event must identify the a@3 tuple")
+        self.assertFalse(artifact.exists(),
+                         "both requests must resolve once their exact tuples are green")
+        self.assertEqual("3.0.0", final4["Demo"]["yellow"]["a"])
+
+    def test_repair_request_stays_open_when_project_checks_are_disabled(self):
+        # R5 acceptance (P1): a MISSING verification command must not close a
+        # repair request. Phase 1 creates the durable request with project
+        # checks ON; phase 2 disables project checks entirely: the resolver is
+        # green, but with NO project verification there is no evidence the
+        # repair worked, so the request stays open and no repair-resolved event
+        # may fire -- even though the mode still accepts the resolver-green
+        # incumbent.
+        rows = [_row("a", target_yellow="2.0.0")]
+        phase1_path = self.root / "c1.log"
+        phase2_path = self.root / "c2.log"
+
+        def solver(rows_by_project, client, **kwargs):
+            modes = kwargs.get("modes", ("default",))
+            solver_statuses_out = kwargs.get("solver_statuses_out")
+            if solver_statuses_out is None:
+                solver_statuses_out = {}
+            for mode in modes:
+                solver_statuses_out.setdefault("Demo", {})[mode] = {"a": "optimal"}
+            return {"Demo": {m: {"a": "2.0.0"} for m in modes}}
+
+        self.spec.constraint_verify_config = {
+            "project_checks": "diagnostic",
+            "commands": ["yarn lint"],
+            "maxIterations": 8,
+        }
+
+        def verify_broken(*args, **kwargs):
+            return roadmap.BaselineVerifyResult(
+                False, "project", "project preflight failed",
+                output="yarn lint: error TS2322", command="yarn lint")
+
+        self._run(rows, solver, verify_broken, mode="yellow",
+                  progress_path=phase1_path)
+        artifact = self.root / "repair-requests.json"
+        self.assertTrue(artifact.is_file())
+        bound_snapshot = json.loads(
+            artifact.read_text(encoding="utf-8"))["requests"][0]["snapshotIdentity"]
+        self.assertTrue(bound_snapshot)
+        active_file = self.root / "baseline-run-active.json"
+        if active_file.exists():
+            active_file.unlink()
+        (self.root / "package.json").write_text(
+            json.dumps({"name": "demo", "version": "1.0.0",
+                        "dependencies": {"a": "1.0.0", "b": "1.0.0"},
+                        "lint-staged": {"repaired": True}}),
+            encoding="utf-8",
+        )
+
+        self.spec.constraint_verify_config = {
+            "project_checks": "off",
+            "commands": [],
+            "maxIterations": 8,
+        }
+
+        def verify_ok(*args, **kwargs):
+            return roadmap.BaselineVerifyResult(True, "dependency", "resolver ok")
+
+        final2 = self._run(rows, solver, verify_ok, mode="yellow",
+                           progress_path=phase2_path)
+        events2 = self._streamed_events
+        self.assertFalse(
+            [e for e in events2 if e.get("phase") == "repair-resolved"],
+            "disabled project checks must never produce a resolution event",
+        )
+        self.assertTrue(artifact.is_file(),
+                        "a request must stay open while no project command ran")
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+        self.assertEqual(bound_snapshot, payload["requests"][0]["snapshotIdentity"])
+        # The resolver-green incumbent is still accepted as a partial result.
+        self.assertEqual("2.0.0", final2["Demo"]["yellow"]["a"])
+
     def test_desktop_consumer_locates_producer_handoff_at_contract_path(self):
         # R4 acceptance (P1#1): the Desktop Executor must consume the durable
         # repair handoff at the SINGLE path the Python producer actually

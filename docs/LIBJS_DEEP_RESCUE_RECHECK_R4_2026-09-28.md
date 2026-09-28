@@ -2,7 +2,7 @@
 
 Вердикт: прежние локальные дефекты в основном устранены; автоматический repair пока НЕ ПРИНЯТ.
 
-Проверены текущие незакоммиченные изменения поверх baf6359. Production-код не менялся в ходе приёмки. Генератор SHA256 AA07D1DB3BB7646DDC65DAF634C9664A16F4B9DAE87AEDE18B139628080C375B; desktop/electron/main.ts SHA256 426881CFC5F03A65F4128CB74E48D5B0DE729ADB115004B753131C558D452134.
+Проверены текущие незакоммиченные изменения поверх baf6359. Production-код не менялся в ходе приёмки. Генератор SHA256 <redacted:опaque-reviewer-fingerprint>; desktop/electron/main.ts SHA256 <redacted:opaque-reviewer-fingerprint>.
 
 ## Что закрыто относительно R3
 
@@ -50,7 +50,7 @@
 - Независимые helper probes подтвердили optional peers, feasible, production-shaped sourceCommit/runtime и единицы метрик; результаты в probes.json.
 - Python тесты запускаются с workspace-temp адаптером из-за недоступных mode-0700 директорий tempfile в Windows sandbox. Изолированные control-flow проверки дополнительно подменяют source snapshot/registry/executable и physical verifier; они не являются реальной миграцией.
 - `git diff --check` не обнаружил whitespace errors, только предупреждения о нормализации CRLF.
-- Реальную миграцию libjs я не запускал. Проверенный REAL_RUN_ACCEPTANCE по-прежнему содержит незаполненные checkpoint/before-after/restart/first-useful-upgrade.
+- Реальную миграцию ЦЕЛЕВОГО_ПРОЕКТА я не запускал. Проверенный REAL_RUN_ACCEPTANCE по-прежнему содержит незаполненные checkpoint/before-after/restart/first-useful-upgrade.
 
 Локальные материалы: `.dependency-roadmap/audit-reviews/recheck-r4-2026-09-28/`. Новый check-repair-handoff проверяет парсер/чтение/удаление файла и helper matching; не проверяет фактический producer path, runGroupAgentSession или основание для resolution.
 
@@ -59,6 +59,6 @@
 1. Один адресуемый producer→consumer repair contract; реальный dispatch и возврат результата.
 2. Запрет resolution по одному project.name или resolver-green; закрытие только по подходящему project-green evidence.
 3. Негативные интеграционные тесты: чужой batch, другой mode/snapshot, failing project checks и два одновременно открытых запроса.
-4. После этого реальный изолированный libjs run с полезным checkpoint и restart, фактическими метриками и developer-артефактами.
+4. После этого реальный изолированный ЦЕЛЕВОГО_ПРОЕКТА run с полезным checkpoint и restart, фактическими метриками и developer-артефактами.
 
 Уже исправленные пункты R3 переделывать не требуется. Оставшаяся работа сосредоточена в жизненном цикле repair и реальном подтверждении результата.

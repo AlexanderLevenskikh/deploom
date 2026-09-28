@@ -1,21 +1,21 @@
-# Аудит Deep и Draft на примере libjs — 27 сентября 2026
+# Аудит Deep и Draft на примере ЦЕЛЕВОГО_ПРОЕКТА — 27 сентября 2026
 
 Вывод: ситуацию можно исправить, но очередного увеличения timeout недостаточно. Сейчас первый полезный результат зависит от полного оптимизационного solve. Накопительный механизм существует, однако стартует слишком поздно. Нужен цикл «зафиксировать исходное состояние → получить небольшой проверенный шаг → сохранить его → расширять следующей когортой», с агентом для миграции кода до окончательного отказа от подходящего набора зависимостей.
 
-Это аудит и проект задания, а не заявление об исправлении программы. Production-код и проекты Kontur не изменялись; установка зависимостей, повторная миграция libjs и обращения к корпоративному registry не запускались.
+Это аудит и проект задания, а не заявление об исправлении программы. Production-код и проекты projectbase не изменялись; установка зависимостей, повторная миграция ЦЕЛЕВОГО_ПРОЕКТА и обращения к корпоративному registry не запускались.
 
 ## 1. Что проверено
 
 - Репозиторий DepLoom: `715c9c29e583f98db675aea2420da4ae92d79e41`, VERSION `0.2.142`.
 - Вставленный пользователем текст ошибки.
-- `C:/Users/levenskikh/Desktop/Kontur/dependency-roadmap-template/.dependency-roadmap/artifacts/runs/f3d9ce6c-d255-4783-9894-fea15b976057/activity.log`.
-- `state/baseline-verification-progress.json`, настройки проекта, сохранённый intent libjs.
-- `C:/Users/levenskikh/.deploom/diagnostics/deploom-failure-20260927T025830Z-43888.json`.
-- Реальный draft `runs/run-05666e4d-b30f-4b15-88b7-e72be075edf3/draft/prompt.md` для Info.UI, генератор Draft и путь чтения в Desktop. Draft для libjs среди найденных run-scoped manifests отсутствует; чужой draft не выдаётся за libjs.
+- `C:/Users/user/Desktop/projectbase/dependency-roadmap-template/.dependency-roadmap/artifacts/runs/f3d9ce6c-d255-4783-9894-fea15b976057/activity.log`.
+- `state/baseline-verification-progress.json`, настройки проекта, сохранённый intent ЦЕЛЕВОГО_ПРОЕКТА.
+- `C:/Users/user/.deploom/diagnostics/deploom-failure-20260927T025830Z-43888.json`.
+- Реальный draft `runs/run-05666e4d-b30f-4b15-88b7-e72be075edf3/draft/prompt.md` для projectbase.ui, генератор Draft и путь чтения в Desktop. Draft для ЦЕЛЕВОГО_ПРОЕКТА среди найденных run-scoped manifests отсутствует; чужой draft не выдаётся за ЦЕЛЕВОГО_ПРОЕКТА.
 - Исходники solver, progressive planner, verification, prompt generation и manual audit.
 - Установленные `resources/tool/{dependency_live_roadmap_generator.py,peer_solver_z3.py,block_psi_progressive_baseline.py,manual_dependency_audit.py}` совпадают с workspace после нормализации окончаний строк. Первоначально разные byte hashes объясняются CRLF/LF.
 
-Локальные воспроизводимые probes: `.dependency-roadmap/audit-reviews/libjs-deep-2026-09-27/probe.py`; результаты — `probe-results.json`, тесты — `tests.txt`.
+Локальные воспроизводимые probes: `.dependency-roadmap/audit-reviews/ЦЕЛЕВОГО_ПРОЕКТА-deep-2026-09-27/probe.py`; результаты — `probe-results.json`, тесты — `tests.txt`.
 
 ## 2. Что произошло в запуске
 
@@ -37,7 +37,7 @@
 
 Около 6 минут прошло от старта UI, но собственно solve-and-verify занял около 42 секунд. Более пяти минут ушло на подготовку/данные до него. До физической проверки кандидата дело не дошло. Отсутствие решения не доказано. Диагностика содержит `confirmedTimeout=false`: близость elapsed к лимиту не позволяет переименовать unknown в подтверждённый timeout.
 
-Наблюдавшийся отказ относится к стадии выбора версий. Он ещё ничего не говорит о том, пройдут ли Flow, lint, build и tests libjs после изменений.
+Наблюдавшийся отказ относится к стадии выбора версий. Он ещё ничего не говорит о том, пройдут ли Flow, lint, build и tests ЦЕЛЕВОГО_ПРОЕКТА после изменений.
 
 ## 3. Основные находки
 
@@ -47,7 +47,7 @@
 
 `peer_solver_z3.py:65–143`: используется `Optimize(priority="lex")`, 8 основных objectives из `_build_peer_optimization_model` (`generator:7881`) и ещё по одному лексикографическому tie-break objective на пакет. Для компоненты из 53 пакетов это 61 objective. Кроме существования допустимой комбинации код требует закрытия всех оптимизационных bounds; `sat_unproven` тоже не возвращает assignment.
 
-Лексикографический порядок objectives соответствует документации Z3: [Combining Objectives](https://microsoft.github.io/z3guide/docs/optimization/combiningobjectives/). Предположение, что именно tie-breaks составляют основную долю времени libjs, требует benchmark/IR replay; в этом аудите это не измерялось.
+Лексикографический порядок objectives соответствует документации Z3: [Combining Objectives](https://microsoft.github.io/z3guide/docs/optimization/combiningobjectives/). Предположение, что именно tie-breaks составляют основную долю времени ЦЕЛЕВОГО_ПРОЕКТА, требует benchmark/IR replay; в этом аудите это не измерялось.
 
 Смысл проблемы: доказательство оптимальности плана сделано входным условием практической проверки. Для полезной миграции достаточно конкретного кандидата, удовлетворяющего hard constraints, после чего всё равно нужны install и проверки проекта. «Feasible», «optimal», «resolver verified», «project verified» и «цель достигнута» должны быть разными фактами. Unknown нельзя объявлять успехом, но он не должен запрещать другой проверяемый следующий шаг.
 
@@ -93,11 +93,11 @@ Runtime probe: заблокированная группа A/B/C не даёт �
 
 Решение: ранний кандидат → проверка → bounded repair кода/конфига в изолированном checkout → повторная полная проверка → cumulative commit. Ошибка адаптации API не должна автоматически становиться вечным dependency-only nogood. Доказательства и кеш должны учитывать source/config snapshot. Resolver-proof не заменяет project-proof; policy acceptance не заменяет оба.
 
-### P2. Контракт проверок libjs требует дополнительной ревизии
+### P2. Контракт проверок ЦЕЛЕВОГО_ПРОЕКТА требует дополнительной ревизии
 
 `discover_baseline_project_checks` фактически выбрал `yarn flow:check`, `yarn lint`, `yarn build`, `yarn test:unit`.
 
-В package.json libjs `test` равен `yarn test:unit && yarn test:build`, а `test:build` — `webpack`. Discovery удаляет `test` при наличии `test:unit`, поэтому webpack-ветка test не включена этим механизмом. Нельзя считать весь declared test suite исполненным по одному unit-step.
+В package.json ЦЕЛЕВОГО_ПРОЕКТА `test` равен `yarn test:unit && yarn test:build`, а `test:build` — `webpack`. Discovery удаляет `test` при наличии `test:unit`, поэтому webpack-ветка test не включена этим механизмом. Нельзя считать весь declared test suite исполненным по одному unit-step.
 
 Текущий checkout также не содержит файла `scripts/release/build.sh`, на который указывает `build`. Это read-only наблюдение о текущем checkout, не доказанная причина запуска 27 сентября: до build он не дошёл. Перед real acceptance требуется сверить ветку/snapshot и реальные команды; не скрывать отсутствующий script и не запускать release-команды наугад.
 
@@ -116,7 +116,7 @@ Runtime probe: заблокированная группа A/B/C не даёт �
 5. Policy комментариев к изменённому коду/конфигам. В Dashboard генераторе уже есть `codeCommentPolicy`; Draft его не содержит.
 6. Обязательные `DEVELOPER_UPGRADE_GUIDE.md` и `MIGRATION_REPORT.md` с конкретным содержанием и проверкой существования.
 7. Разделение user-excluded/keep-current и временно deferred из-за незавершённого поиска. Сейчас просьба не трогать deferred без пересогласования способна законсервировать техническое откладывание.
-8. Краткий список когорт с evidence-ссылками. Реальный prompt Info.UI ~33.7 KB повторяет длинные peer-conflict цепочки по многим пакетам; это уменьшает ясность следующего действия.
+8. Краткий список когорт с evidence-ссылками. Реальный prompt projectbase.ui ~33.7 KB повторяет длинные peer-conflict цепочки по многим пакетам; это уменьшает ясность следующего действия.
 
 Регрессионные проверки Dashboard ищут `manual_dependency_audit.py` и policy во всём файле генератора; они не гарантируют присутствие этих инструкций именно в сгенерированном Draft. Runtime probe вызова `build_draft_prompt` подтверждает отсутствие названия audit helper, его project-dir, comment policy и требуемых doc filenames.
 
@@ -140,7 +140,7 @@ Runtime probe: заблокированная группа A/B/C не даёт �
 3. Перейти к локальным задачам «incumbent + delta», version-specific peer closure, промежуточным версиям и расширению домена только по необходимости.
 4. Встроить bounded code/config repair до отказа от кандидата. Подтверждать каждый cumulative результат заново; сохранять исправленный source snapshot вместе с lockfile.
 5. Перевести exhausted/unknown в честный partial/resumable outcome, если есть проверенный результат; показывать остаток и отдельно недостигнутую цель.
-6. Принять работу на replay libjs и реальном изолированном запуске, а не только на тестах A/B/C и проверках наличия строк.
+6. Принять работу на replay ЦЕЛЕВОГО_ПРОЕКТА и реальном изолированном запуске, а не только на тестах A/B/C и проверках наличия строк.
 
 Нельзя обещать, что любая цель достижима: могут потребоваться замена заброшенной библиотеки, новый peer package или серьёзная миграция API. Программа должна сохранять достигнутое и выдавать конкретную следующую работу, а не останавливаться до первого шага из-за недоказанного optimum.
 
@@ -150,6 +150,6 @@ Runtime probe: заблокированная группа A/B/C не даёт �
 
 Локальные probes подтвердили unknown → terminal, ограничение широких atomic groups, состав Draft prompt, auto dispatch npm-lock-bridge и соответствие установленного кода. Порядок queue/solver проверен статически; это отдельно отмечено в JSON.
 
-Полный real migration/libjs install и производительность альтернативного solver не проверялись. Отчёт не содержит выдуманного «после», новых процентов или обещания нулевых vulnerabilities. Изменён только набор документов и локальных материалов аудита.
+Полный real migration/ЦЕЛЕВОГО_ПРОЕКТА install и производительность альтернативного solver не проверялись. Отчёт не содержит выдуманного «после», новых процентов или обещания нулевых vulnerabilities. Изменён только набор документов и локальных материалов аудита.
 
-Задание для реализации: [LIBJS_DEEP_RESCUE_AGENT_TASK_2026-09-27.md](LIBJS_DEEP_RESCUE_AGENT_TASK_2026-09-27.md).
+Задание для реализации: [ЦЕЛЕВОГО_ПРОЕКТА_DEEP_RESCUE_AGENT_TASK_2026-09-27.md](ЦЕЛЕВОГО_ПРОЕКТА_DEEP_RESCUE_AGENT_TASK_2026-09-27.md).

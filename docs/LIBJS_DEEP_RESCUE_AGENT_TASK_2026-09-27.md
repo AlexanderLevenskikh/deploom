@@ -1,10 +1,10 @@
 # Задание агенту: рабочая накопительная миграция DepLoom и полноценный Draft
 
-Реализуй задание по последовательным частям A–F. Сначала прочитай соседний `LIBJS_DEEP_AUDIT_2026-09-27.md` и проверь актуальность ссылок относительно текущего HEAD. Отчёт основан на `715c9c29e583f98db675aea2420da4ae92d79e41`, VERSION 0.2.142; не откатывай последующие пользовательские изменения.
+Реализуй задание по последовательным частям A–F. Сначала прочитай соседний `ЦЕЛЕВОГО_ПРОЕКТА_DEEP_AUDIT_2026-09-27.md` и проверь актуальность ссылок относительно текущего HEAD. Отчёт основан на `715c9c29e583f98db675aea2420da4ae92d79e41`, VERSION 0.2.142; не откатывай последующие пользовательские изменения.
 
 Цель: на реальном проекте получить проверенный небольшой результат, накопительно улучшать его, переживать unknown/timeout/плохую когорту и давать агенту весь контекст для миграции кода. Глобальный оптимум не должен быть предварительным условием первой практической попытки. Выполнение задания не считается завершённым после улучшения сообщения об ошибке или добавления новых маркеров в source.
 
-Соблюдай Windows AGENTS.md: без apply_patch, без удаления пользовательских изменений; bounded edits или проверенный git apply; diff --check и узкая валидация. Внешние проекты и исходные артефакты используй для чтения; реальные installs/repair выполняй в предназначенном для теста изолированном checkout внутри разрешённого workspace. Не меняй registry, Git refs и lockfile исходного libjs ради эксперимента. Не публикуй приватные исходники/metadata в публичный fixture.
+Соблюдай Windows AGENTS.md: без apply_patch, без удаления пользовательских изменений; bounded edits или проверенный git apply; diff --check и узкая валидация. Внешние проекты и исходные артефакты используй для чтения; реальные installs/repair выполняй в предназначенном для теста изолированном checkout внутри разрешённого workspace. Не меняй registry, Git refs и lockfile исходного ЦЕЛЕВОГО_ПРОЕКТА ради эксперимента. Не публикуй приватные исходники/metadata в публичный fixture.
 
 Общий критерий: proof остаётся строгим; поиск может быть незавершённым; полезный проверенный результат не теряется. Заявление «цель достигнута» требует актуальных install/check/security/lag evidence для одного cumulative snapshot.
 
@@ -12,13 +12,13 @@
 
 **Входные материалы**
 
-- Лог: `C:/Users/levenskikh/Desktop/Kontur/dependency-roadmap-template/.dependency-roadmap/artifacts/runs/f3d9ce6c-d255-4783-9894-fea15b976057/activity.log`.
-- Диагностика: `C:/Users/levenskikh/.deploom/diagnostics/deploom-failure-20260927T025830Z-43888.json`.
-- Intent: `.dependency-roadmap/desktop/baseline-intent/libjs-ab016216ea9e.json` в workspace template.
-- Исходный проект: `C:/Users/levenskikh/Desktop/Kontur/libjs`.
-- Локальные probes этого аудита: `.dependency-roadmap/audit-reviews/libjs-deep-2026-09-27/`.
+- Лог: `C:/Users/user/Desktop/projectbase/dependency-roadmap-template/.dependency-roadmap/artifacts/runs/f3d9ce6c-d255-4783-9894-fea15b976057/activity.log`.
+- Диагностика: `C:/Users/user/.deploom/diagnostics/deploom-failure-20260927T025830Z-43888.json`.
+- Intent: `.dependency-roadmap/desktop/baseline-intent/ЦЕЛЕВОГО_ПРОЕКТА-ab016216ea9e.json` в workspace template.
+- Исходный проект: `C:/Users/user/Desktop/projectbase/ЦЕЛЕВОГО_ПРОЕКТА`.
+- Локальные probes этого аудита: `.dependency-roadmap/audit-reviews/ЦЕЛЕВОГО_ПРОЕКТА-deep-2026-09-27/`.
 
-Собери fixture/replay без live registry там, где возможно: package/version domains, constraints/requirements, frozen policy, runtime/manager, source/lock identities. Исходный лог содержит размеры, но не полный IR; не объявляй синтетические 53 пакета точным replay libjs. Если IR не сохранён, экспортируй его при контролируемом повторении или честно используй отдельные synthetic и real сценарии. Закрытые данные оставь локально; для CI подготовь обезличенный эквивалент проблемной структуры.
+Собери fixture/replay без live registry там, где возможно: package/version domains, constraints/requirements, frozen policy, runtime/manager, source/lock identities. Исходный лог содержит размеры, но не полный IR; не объявляй синтетические 53 пакета точным replay ЦЕЛЕВОГО_ПРОЕКТА. Если IR не сохранён, экспортируй его при контролируемом повторении или честно используй отдельные synthetic и real сценарии. Закрытые данные оставь локально; для CI подготовь обезличенный эквивалент проблемной структуры.
 
 Добавь поведенческие тесты production selector/orchestrator:
 
@@ -29,7 +29,7 @@
 
 Моки допустимы для unknown, таймера и сетевого отказа, но selector/state transitions должны быть production. Source-string assertions не заменяют эти тесты.
 
-**Готово, когда:** есть повторяемый failing test для барьера libjs, baseline замеров и список конкретных переходов, которые предстоит изменить. Сохрани run IDs, время scan/solve/install/check, размер domain, число попыток, time-to-first-materialized и time-to-first-project-verified.
+**Готово, когда:** есть повторяемый failing test для барьера ЦЕЛЕВОГО_ПРОЕКТА, baseline замеров и список конкретных переходов, которые предстоит изменить. Сохрани run IDs, время scan/solve/install/check, размер domain, число попыток, time-to-first-materialized и time-to-first-project-verified.
 
 ## Часть B. Улучшить Draft как самостоятельный полезный результат
 
@@ -43,7 +43,7 @@
 
 - точными project path, artifact root, tool path, source snapshot/branch/commit, package manager/version, runtime, registry без credentials;
 - политикой yellow/green, lagMonths/minLagOkPct и C/H/M/L limits; не теряй допустимое значение 0 через `or default`;
-- commands discovery и результатом проверки доступности команд; для libjs учитывать отдельный `test:build`, входящий в `test`;
+- commands discovery и результатом проверки доступности команд; для ЦЕЛЕВОГО_ПРОЕКТА учитывать отдельный `test:build`, входящий в `test`;
 - алгоритмом: измерить исходное → выбрать ограниченную когорту → install → repair кода/конфига → checks → пересчитать actual metrics → checkpoint → следующий шаг;
 - продолжением с последнего cumulative результата, а не с первоначального package.json;
 - `NOT_VERIFIED / PLANNING_ONLY` до фактической верификации и ссылками на evidence для последующих утверждений.
@@ -58,7 +58,7 @@ Prompt требует короткий отчёт после исходного 
 
 `Шаг 3: ESLint/tooling; принято 2/7 запланированных когорт; actual Lag OK 72/110 = 65.5% (цель 80%); C/H/M/L/U = …; source = OSV/direct, coverage = …; canonical audit = …; checks = …; checkpoint = …; следующий шаг = …`.
 
-Это пример формата, не данные libjs. Числа брать только из evidence. Отделять три величины: актуальность библиотек, покрытие исследования и долю выполненного текущего плана. Если состав плана изменился, показывать смену знаменателя. Не считать отложенный пакет успешно обновлённым, не улучшать проценты исключением неудобных строк. Строго различать actual и projected; unknown/stale сохранять явно.
+Это пример формата, не данные ЦЕЛЕВОГО_ПРОЕКТА. Числа брать только из evidence. Отделять три величины: актуальность библиотек, покрытие исследования и долю выполненного текущего плана. Если состав плана изменился, показывать смену знаменателя. Не считать отложенный пакет успешно обновлённым, не улучшать проценты исключением неудобных строк. Строго различать actual и projected; unknown/stale сохранять явно.
 
 Добавь машинный `migration-progress.json` и читаемый журнал. Для каждой точки: timestamp, source/manifest/lock hashes, policyHash, accepted cohort IDs, actual health, audit engine/accuracy/coverage, commands/exits, checkpoint identity, remaining/deferred. Security counts имеют явную единицу: packages / advisories / nodes. Изменённые definitions/denominators нельзя тихо сравнивать.
 
@@ -69,7 +69,7 @@ Prompt должен содержать реально доступную ком�
 ```powershell
 python "<tool-root>/manual_dependency_audit.py" `
   --project-dir "<candidate-project>" `
-  --project-name "libjs" `
+  --project-name "ЦЕЛЕВОГО_ПРОЕКТА" `
   --registry "<configured-registry>" `
   --target-level yellow `
   --lag-months 12 `
@@ -206,14 +206,14 @@ Progress: elapsed по стадиям, фактические когорты/che
 | Security endpoint unavailable | Unknown/coverage gap, не 0 vulnerabilities |
 | Yarn bridge drift | Approximate evidence отделено от canonical acceptance |
 | Prompt RU/EN и Desktop reader | Контекст, audit command, comments, документы доходят до агента |
-| libjs test script составной | Не теряется test:build при выборе test:unit |
+| ЦЕЛЕВОГО_ПРОЕКТА test script составной | Не теряется test:build при выборе test:unit |
 | Невыполнимая политика/закрытый scope | Частичный результат и scoped blocker; нет ложного goal-met |
 
-После synthetic/fixture тестов проведи изолированный real run libjs с зафиксированными настройками и snapshot. Отдельно сравни legacy/current и исправленный подход на одинаковых входных metadata/lock/runtime, если это практически возможно. Не использовать свежесть registry как скрытое отличие benchmark.
+После synthetic/fixture тестов проведи изолированный real run ЦЕЛЕВОГО_ПРОЕКТА с зафиксированными настройками и snapshot. Отдельно сравни legacy/current и исправленный подход на одинаковых входных metadata/lock/runtime, если это практически возможно. Не использовать свежесть registry как скрытое отличие benchmark.
 
 В приёмочном отчёте: scan/solve/install/check/repair times; time-to-first-checkpoint и time-to-first-project-verified; число checked/accepted/deferred когорт; actual before/after lag denominator/numerator, C/H/M/L/U по источникам, coverage; что получилось после restart; оба итоговых developer-файла; ссылки на командные логи. First useful upgrade обязан быть ненулевым, если test fixture содержит доступное безопасное обновление; неизменённый source floor не закрывает этот критерий.
 
-Не обещай заранее конкретный процент libjs или время на его hardware. До реализации зафиксируй измеримый бюджет и контрольный сценарий; после предъяви фактические результаты. Если реальный run блокирован доступом/runtime/registry, прямо отметь незавершённую real acceptance, сохрани готовые fixes и evidence; не называй задачу полностью закрытой по unit tests.
+Не обещай заранее конкретный процент ЦЕЛЕВОГО_ПРОЕКТА или время на его hardware. До реализации зафиксируй измеримый бюджет и контрольный сценарий; после предъяви фактические результаты. Если реальный run блокирован доступом/runtime/registry, прямо отметь незавершённую real acceptance, сохрани готовые fixes и evidence; не называй задачу полностью закрытой по unit tests.
 
 ## Что не принимать за решение
 

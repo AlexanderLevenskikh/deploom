@@ -1,5 +1,15 @@
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+
+// R5 (2026-09-28): the Desktop Executor is a READ-ONLY consumer of the
+// durable repair handoff. It parses and surfaces open repair requests for
+// feedback, and it carries NO resolution capability on purpose: a repair
+// request is a SOURCE/CONFIG ticket whose only valid close is a fresh
+// project-green verification of the exact cumulative assignment on the
+// current snapshot, performed by the authoritative Baseline verifier
+// (generator-side resolve, guarded by project_result.ok). Any removal keyed
+// on package names / batch passes here would close tickets the Executor has
+// not proven. There is deliberately no resolver or matcher exported.
 
 export type RepairFailureCommand = {
   command: string
@@ -113,35 +123,6 @@ export function openRepairRequests(artifactsDir: string): RepairHandoffScan {
   }
 }
 
-function writeHandoff(file: string | undefined, requests: RepairRequest[], runId: string): void {
-  if (!file) return
-  const dir = dirname(file)
-  if (!existsSync(dir)) return
-  if (!requests.length) {
-    if (existsSync(file)) rmSync(file)
-    return
-  }
-  const payload: RepairHandoffFile = { schemaVersion: 1, runId, requests }
-  const temp = `${file}.resolve-${process.pid}.tmp`
-  writeFileSync(temp, JSON.stringify(payload, null, 2), 'utf8')
-  renameSync(temp, file)
-}
-
-export type ResolveOutcome = {
-  resolved: boolean
-  remaining: RepairRequest[]
-  file?: string
-}
-
-export function resolveRepairRequest(artifactsDir: string, requestId: string): ResolveOutcome {
-  const scan = openRepairRequests(artifactsDir)
-  if (!scan.file) return { resolved: false, remaining: [], file: undefined }
-  const remaining = scan.requests.filter((request) => request.requestId !== requestId)
-  const resolved = remaining.length !== scan.requests.length
-  if (resolved) writeHandoff(scan.file, remaining, scan.runId)
-  return { resolved, remaining, file: scan.file }
-}
-
 export function findOpenRepairRequest(
   requests: readonly RepairRequest[],
   match: { project?: string; mode?: string; fingerprint?: string } = {},
@@ -161,24 +142,6 @@ export function findOpenRepairRequest(
 // Desktop and producer MUST agree on this single relative contract.
 export const repairHandoffStateRelativeDir = ['.dependency-roadmap', 'state']
 export const repairHandoffStateRelativePath = [...repairHandoffStateRelativeDir, 'repair-requests.json'].join('/')
-
-// R4: only a request whose FULL assignment is covered by a freshly verified
-// cumulative state may be closed. A green pass over ANY subset of the project
-// (wrong mode, unrelated packages) is not proof that another open request was
-// fixed -- an unrelated batch must leave it untouched.
-export function matchingRepairRequests(
-  requests: readonly RepairRequest[],
-  evidence: { project: string; mode: string; packages: readonly string[] },
-): RepairRequest[] {
-  const packageSet = new Set(evidence.packages)
-  return requests.filter((request) => {
-    if (request.project !== evidence.project) return false
-    if (request.mode !== evidence.mode) return false
-    const requestPackages = Object.keys(request.assignment)
-    if (!requestPackages.length) return false
-    return requestPackages.every((name) => packageSet.has(name))
-  })
-}
 
 export function requestSummary(request: RepairRequest): string {
   const commands = request.failingCommands.length
