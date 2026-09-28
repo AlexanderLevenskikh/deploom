@@ -1,0 +1,168 @@
+{
+  "schemaVersion": 1,
+  "description": "Shared cross-language identity/schema contract for the Iterative Migration coordinator. Both Python (tests/regression/test_iterative_migration_schemas.py) and Node (desktop/scripts/check-iterative-migration.mjs) must validate the same fixture so a schema drift between the Python owner and the Desktop coordinator is caught on both sides.",
+  "run": {
+    "schemaVersion": 1,
+    "runId": "iter-000000000001",
+    "workspaceId": "ws-1",
+    "projectId": "sample-app",
+    "generation": 1,
+    "targetPolicyHash": "policyhash-0001",
+    "initialSnapshotKey": "snap-0001",
+    "activeCheckpointId": "C0",
+    "activeCandidateId": null,
+    "phase": "READY",
+    "terminal": null,
+    "budgetLedger": {
+      "candidateAttempts": 0,
+      "repairAttempts": 0,
+      "repairAttemptsForRevision": 0,
+      "infraRetries": 0,
+      "repeatedAttempts": 0
+    },
+    "leaseOwner": "",
+    "deadlineAt": "2026-10-01T00:00:00Z",
+    "heartbeatAt": "2026-09-29T00:00:00Z",
+    "createdAt": "2026-09-29T00:00:00Z",
+    "updatedAt": "2026-09-29T00:00:00Z",
+    "toolBuildId": "tool-0001"
+  },
+  "checkpoint": {
+    "schemaVersion": 1,
+    "checkpointId": "C0",
+    "parentCheckpointId": null,
+    "seq": 0,
+    "status": "VERIFIED",
+    "projectName": "sample-app",
+    "sourceSnapshotKey": "snap-0001",
+    "sourceSnapshotContainer": "sources/snap-0001",
+    "sourceHead": "deadbeef00000000000000000000000000000000",
+    "projectRelative": ".",
+    "manifestHash": "manifest-0001",
+    "lockfileHash": "lock-0001",
+    "resolvedStateKey": "resolved-0001",
+    "observedResolvedHash": "observed-0001",
+    "fullAssignment": {
+      "pkg-a": "1.0.0",
+      "pkg-b": "1.0.0"
+    },
+    "acceptedDelta": {
+      "added": {},
+      "changed": {},
+      "removed": {}
+    },
+    "cohortId": null,
+    "verification": {
+      "status": "passed",
+      "kind": "passed",
+      "commands": ["npm run test"],
+      "failingCommands": []
+    },
+    "proofRefs": {
+      "resolvedStateKey": "resolved-0001",
+      "preparationProofKey": ""
+    },
+    "audit": {
+      "status": "UNKNOWN",
+      "evidenceRef": ""
+    },
+    "createdAt": "2026-09-29T00:00:00Z",
+    "updatedAt": "2026-09-29T00:00:00Z",
+    "toolBuildId": "tool-0001"
+  },
+  "candidate": {
+    "schemaVersion": 1,
+    "candidateId": "cand-0001",
+    "runId": "iter-000000000001",
+    "baseCheckpointId": "C0",
+    "cohortId": "cohort-0001",
+    "policyHash": "policyhash-0001",
+    "fullAssignment": {
+      "pkg-a": "1.1.0",
+      "pkg-b": "1.0.0"
+    },
+    "delta": {
+      "changed": {
+        "pkg-a": "1.1.0"
+      }
+    },
+    "atomicGroups": [["pkg-a"]],
+    "allowedSourceScope": {
+      "mode": "source-config",
+      "forbiddenRelatives": ["package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"]
+    },
+    "stage": "PLANNED",
+    "attemptId": 0,
+    "agentSessionId": "",
+    "feedbackRevision": 0,
+    "budgetConsumed": {},
+    "materializationRefs": {},
+    "resolverContextKey": "",
+    "createdAt": "2026-09-29T00:00:00Z",
+    "updatedAt": "2026-09-29T00:00:00Z"
+  },
+  "feedback": {
+    "schemaVersion": 1,
+    "runId": "iter-000000000001",
+    "candidateId": "cand-0001",
+    "baseCheckpointId": "C0",
+    "attemptId": 0,
+    "kind": "READY_FOR_VERIFY",
+    "reason": "source adapted to new API",
+    "changedFiles": ["src/config.js"],
+    "diagnosticsRefs": [],
+    "proposedScope": {},
+    "proposedConstraints": {},
+    "createdAt": "2026-09-29T00:00:10Z"
+  },
+  "feedbackKinds": [
+    "REPAIRING",
+    "READY_FOR_VERIFY",
+    "NEEDS_COHORT_EXPANSION",
+    "NEEDS_ALTERNATIVE",
+    "INCONCLUSIVE",
+    "INFRA_BLOCKED"
+  ],
+  "phases": [
+    "BASELINING",
+    "BOOTSTRAP_REPAIR",
+    "PLANNING",
+    "MATERIALIZING",
+    "PRECHECK",
+    "REPAIRING",
+    "VERIFYING",
+    "CHECKPOINTING",
+    "READY",
+    "TERMINAL"
+  ],
+  "terminals": [
+    "COMPLETE",
+    "PARTIAL_VERIFIED",
+    "STOPPED_WITH_CHECKPOINT",
+    "BLOCKED_BASELINE",
+    "BLOCKED_INFRA",
+    "NO_VERIFIED_UPGRADE"
+  ],
+  "staleFeedbackCases": [
+    {
+      "name": "wrong-run",
+      "field": "runId",
+      "value": "iter-000000000099"
+    },
+    {
+      "name": "wrong-candidate",
+      "field": "candidateId",
+      "value": "cand-0009"
+    },
+    {
+      "name": "wrong-base",
+      "field": "baseCheckpointId",
+      "value": "C5"
+    },
+    {
+      "name": "wrong-attempt",
+      "field": "attemptId",
+      "value": 3
+    }
+  ]
+}
