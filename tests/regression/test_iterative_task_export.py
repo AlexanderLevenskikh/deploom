@@ -199,10 +199,24 @@ class IterativeTaskExportTests(unittest.TestCase):
         first = task.current_task(run_dir)
         first_root = run_dir / "task" / first["artifactId"]
         self.assertTrue((first_root / "task-manifest.json").exists())
-        # Second export supersedes; the old artifact directory survives and is
-        # marked stale in history.
+        # A NEW accepted checkpoint (different assignment) supersedes the task:
+        # the old artifact directory survives and is marked stale in history.
+        active = {
+            "schemaVersion": 1, "checkpointId": "C2", "parentCheckpointId": "C1", "seq": 2,
+            "status": "VERIFIED", "sourceSnapshotKey": "snap-c2", "sourceSnapshotContainer": str(self.root / "snap-c2"),
+            "sourceHead": "", "projectRelative": ".", "manifestHash": "mh-3", "lockfileHash": "lh-3",
+            "resolvedStateKey": "rsk-c2", "observedResolvedHash": "orh-c2",
+            "fullAssignment": {"is-number": "7.0.0", "is-finite": "1.1.0", "@example/widgets": "1.2.0"},
+            "acceptedDelta": {"added": {}, "changed": {"is-finite": "1.1.0"}, "removed": {}},
+            "cohortId": "cohort-b",
+            "verification": {"status": "passed", "kind": "passed", "commands": ["node check.js"], "failingCommands": []},
+            "proofRefs": {"resolvedStateKey": "rsk-c2", "preparationProofKey": ""},
+            "audit": {"status": "UNKNOWN", "evidenceRef": ""},
+            "createdAt": "2026-09-29T00:10:00Z",
+        }
+        (run_dir / "checkpoints" / "C2.json").write_text(json.dumps(active), encoding="utf-8")
         run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-        run["generation"] = 3
+        run["activeCheckpointId"] = "C2"
         (run_dir / "run.json").write_text(json.dumps(run), encoding="utf-8")
         task.export_task_artifact(run_dir)
         second = task.current_task(run_dir)
@@ -225,6 +239,38 @@ class IterativeTaskExportTests(unittest.TestCase):
         manifest_path = run_dir / "task" / manifest["artifactId"] / task.TASK_MANIFEST_FILENAME
         on_disk = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(on_disk, manifest)
+
+    def test_reexport_after_lost_pointer_is_idempotent(self):
+        # Kill between artifact write and pointer flip: the pointer is gone,
+        # the full artifact set is on disk. A re-export (fresh process) must
+        # reuse the SAME artifact dir, not fork a second one, and restore the
+        # pointer.
+        run_dir = make_run_dir(self.root)
+        task.export_task_artifact(run_dir)
+        first = task.current_task(run_dir)
+        (run_dir / "task" / task.CURRENT_FILENAME).unlink()
+        task.export_task_artifact(run_dir)
+        second = task.current_task(run_dir)
+        self.assertEqual(first["artifactId"], second["artifactId"])
+        self.assertEqual(first["contentHash"], second["contentHash"])
+        dirs = sorted(p.name for p in (run_dir / "task").iterdir() if p.is_dir())
+        self.assertEqual(1, len(dirs), f"artifact dirs forked: {dirs}")
+
+    def test_partial_artifact_gets_a_fresh_full_set(self):
+        # Kill mid-write leaves a truncated set (missing one language body).
+        # The stale partial dir must never be trusted for dispatch: re-export
+        # publishes a fresh complete set and moves the pointer there.
+        run_dir = make_run_dir(self.root)
+        task.export_task_artifact(run_dir)
+        first = task.current_task(run_dir)
+        (run_dir / "task" / first["artifactId"] / "task.ru.md").unlink()
+        task.export_task_artifact(run_dir)
+        second = task.current_task(run_dir)
+        self.assertNotEqual(first["artifactId"], second["artifactId"])
+        second_root = run_dir / "task" / second["artifactId"]
+        self.assertTrue((second_root / "task.ru.md").exists())
+        self.assertTrue((second_root / "task.en.md").exists())
+        self.assertTrue((second_root / task.TASK_MANIFEST_FILENAME).exists())
 
 
 if __name__ == "__main__":

@@ -178,6 +178,9 @@ jobs:
           npm run check:artifact-token
           npm run check:repair-handoff
           npm run check:repair-dispatch
+          npm run check:iterative-migration
+          npm run check:task-clipboard
+          npm run check:electron-clipboard
       - name: Version consistency
         working-directory: desktop
         run: test "$(node -p "require('./package.json').version")" = "$(cat ../VERSION)"

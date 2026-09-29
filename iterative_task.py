@@ -592,6 +592,17 @@ def _current_pointer(task_root: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _read_manifest(task_root: Path) -> Optional[Dict[str, Any]]:
+    path = task_root / TASK_MANIFEST_FILENAME
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (ValueError, OSError):
+        return None
+
+
 def export_task_artifact(
     run_dir: Path,
     *,
@@ -657,10 +668,22 @@ def export_task_artifact(
         files[f"task.{language}.md"] = text
     files[TASK_MANIFEST_FILENAME] = json.dumps(manifest, ensure_ascii=False, indent=2)
     if artifact_root.exists():
-        artifact_root = root / f"{manifest['artifactId']}-{manifest['contentHash'][:8]}"
-        manifest["artifactId"] = artifact_root.name
-        files[TASK_MANIFEST_FILENAME] = json.dumps(manifest, ensure_ascii=False, indent=2)
-    _atomic_write_directory(artifact_root, files)
+        # Kill/restart safety: an interrupted export may leave the artifact
+        # dir on disk without the pointer (or with a truncated set). A COMPLETE
+        # set for the same content is idempotently reused -- re-export after a
+        # lost pointer must not fork another artifact dir. A partial set is
+        # never trusted: it gets a fresh suffixed dir and the full set.
+        existing = _read_manifest(artifact_root)
+        complete = existing is not None and all(
+            (artifact_root / f"task.{language}.md").exists()
+            for language in existing.get("languages") or []
+        ) and existing.get("contentHash") == manifest["contentHash"] and existing.get("artifactId") == artifact_root.name
+        if not complete:
+            artifact_root = root / f"{manifest['artifactId']}-{manifest['contentHash'][:8]}"
+            manifest["artifactId"] = artifact_root.name
+            files[TASK_MANIFEST_FILENAME] = json.dumps(manifest, ensure_ascii=False, indent=2)
+    if not (artifact_root.exists() and _read_manifest(artifact_root) is not None):
+        _atomic_write_directory(artifact_root, files)
     published.append(manifest)
 
     pointer = {

@@ -28,6 +28,8 @@
     "check:iterative-migration": "node scripts/check-iterative-migration.mjs",
     "precheck:task-clipboard": "tsc -p tsconfig.electron.json",
     "check:task-clipboard": "node scripts/check-task-clipboard.mjs",
+    "precheck:electron-clipboard": "tsc -p tsconfig.electron.json",
+    "check:electron-clipboard": "node scripts/check-electron-clipboard.mjs",
     "check:run-monitor": "node scripts/check-run-monitor.mjs",
     "check:app-icon": "node scripts/check-app-icon.mjs",
     "lint": "oxlint",
