@@ -506,6 +506,25 @@ export function useDependencyFlow() {
     }
     applyWorkspaceResult(await api.updateProjectBranches(input))
   }, [api, applyWorkspaceResult])
+  const updateProjectNode = useCallback(async (input: { workspaceId?: string; projectName: string; nodeVersion?: string }) => {
+    if (!api) {
+      setPayload((current) => {
+        if (!current?.details) return current
+        const projects = current.details.projects.map((project) => project.name === input.projectName ? {
+          ...project,
+          nodeVersion: input.nodeVersion ? input.nodeVersion : undefined,
+        } : project)
+        return { ...current, details: { ...current.details, projects } }
+      })
+      return
+    }
+    applyWorkspaceResult(await api.updateProjectNode(input))
+  }, [api, applyWorkspaceResult])
+  const listNodeVersions = useCallback(async (): Promise<string[]> => {
+    if (!api) return []
+    const result = await api.listNodeVersions()
+    return result?.runtimes ?? []
+  }, [api])
   const runAction = useCallback(async (input: ActionInput): Promise<{ jobId: string; runId?: string } | undefined> => {
     setContextError(input.workspaceId, input.projectName, undefined)
     const logContext = { workspaceId: input.workspaceId, projectName: input.projectName }
@@ -710,7 +729,7 @@ export function useDependencyFlow() {
 
   return {
     payload, loading, error, baselineDecision, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch, acknowledgeDraftRun,
-    load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, removeProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches,
+    load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, removeProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches, updateProjectNode, listNodeVersions,
     runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult,     getDependencyGraphSnapshot, getIterativeTask, exportIterativeTask, exportLegacyIterativeTask, copyIterativeTask, saveIterativeTask, iterativeStatus, iterativeStep, iterativeBegin, iterativeAgent, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }
 }

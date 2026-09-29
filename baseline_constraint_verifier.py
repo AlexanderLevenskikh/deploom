@@ -2526,6 +2526,7 @@ def verify_assignment(
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "assignment verification",
     proof_identity: Optional[VerificationProofIdentity] = None,
+    runtime_env: Optional[Mapping[str, str]] = None,
     _allow_prepared_fastpath: bool = True,
 ) -> BaselineVerifyResult:
     """Materialize one exact assignment over the sealed SourceSnapshot subject."""
@@ -2533,6 +2534,12 @@ def verify_assignment(
     attempt_started = time.monotonic()
     attempt_deadline = attempt_started + config.attempt_timeout_seconds
     base_env = semantic_verification_environment(os.environ)
+    if runtime_env:
+        # An EXPLICIT project/CI Node runtime beats ambient PATH exactly where
+        # the runtime is the subject: proof/tool identity and subprocess PATH
+        # must reflect the requested Node, matching what CI would run. The host
+        # ambient runtime remains untouched.
+        base_env = {**base_env, **runtime_env}
     remove_packages = tuple(sorted({str(item) for item in remove_packages}))
     telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
     assignment_hash = assignment_fingerprint(assignment)
@@ -4018,6 +4025,7 @@ def verify_assignment(
                                 progress=progress,
                                 progress_label=progress_label,
                                 proof_identity=proof_identity,
+                                runtime_env=runtime_env,
                             )
                         return BaselineVerifyResult(
                             False,
@@ -4142,6 +4150,7 @@ def verify_assignment(
                                 progress=progress,
                                 progress_label=progress_label,
                                 proof_identity=proof_identity,
+                                runtime_env=runtime_env,
                             )
                         # Clean rebuild already happened and still mismatches:
                         # deterministic substrate invariant failure. Fail closed,
@@ -4271,6 +4280,7 @@ def verify_assignment(
                             progress=progress,
                             progress_label=progress_label,
                             proof_identity=proof_identity,
+                            runtime_env=runtime_env,
                         )
 
                     # Allowed root cache writes are cache-only. Remove them
@@ -4656,6 +4666,7 @@ def _verify_assignment_uncached(
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "assignment verification",
     proof_identity: Optional[VerificationProofIdentity] = None,
+    runtime_env: Optional[Mapping[str, str]] = None,
     _allow_prepared_fastpath: bool = True,
 ) -> BaselineVerifyResult:
     # BLOCK_Y_OBSERVABILITY_CONTRACT_V1
@@ -4691,6 +4702,7 @@ def _verify_assignment_uncached(
                 progress=progress,
                 progress_label=progress_label,
                 proof_identity=proof_identity,
+                runtime_env=runtime_env,
                 _allow_prepared_fastpath=_allow_prepared_fastpath,
             )
         except BaseException as exc:
@@ -4792,6 +4804,7 @@ def _retry_assignment_without_prepared_fastpath(
     progress: Optional[ProgressCallback],
     progress_label: str,
     proof_identity: VerificationProofIdentity,
+    runtime_env: Optional[Mapping[str, str]] = None,
 ) -> BaselineVerifyResult:
     # Project checks run only after ResolverProof + ResolvedState have been
     # captured. Preserve that exact proof identity and restore the exact
@@ -4811,6 +4824,7 @@ def _retry_assignment_without_prepared_fastpath(
         progress=progress,
         progress_label=progress_label,
         proof_identity=proof_identity,
+        runtime_env=runtime_env,
         _allow_prepared_fastpath=False,
     )
 
@@ -4824,6 +4838,7 @@ def verify_assignment(
     remove_packages: Iterable[str] = (),
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "assignment verification",
+    runtime_env: Optional[Mapping[str, str]] = None,
 ) -> BaselineVerifyResult:
     """Cache-aware proof entry point with ResolvedState-bound project proofs."""
     project_dir = project_dir.resolve()
@@ -4861,6 +4876,7 @@ def verify_assignment(
             remove_packages=remove_packages,
             progress=progress,
             progress_label=progress_label,
+            runtime_env=runtime_env,
         )
 
     manager = live_topology.profile.manager
@@ -4877,6 +4893,12 @@ def verify_assignment(
         )
 
     environment = semantic_verification_environment(os.environ)
+    if runtime_env:
+        # The EXPLICIT project/CI Node runtime participates in proof identity:
+        # a proof cached under the ambient host Node must never be reused for a
+        # different requested runtime, and tool identity in the proof must name
+        # the runtime CI actually uses.
+        environment = {**environment, **runtime_env}
     identity = build_verification_proof_identity(
         project_dir,
         assignment=assignment,
@@ -5047,6 +5069,7 @@ def verify_assignment(
         progress=progress,
         progress_label=progress_label,
         proof_identity=identity,
+        runtime_env=runtime_env,
     )
 
 # BLOCK_Y_OBSERVABILITY_CONTRACT_V1
@@ -5062,6 +5085,7 @@ def verify_assignment(
     remove_packages: Iterable[str] = (),
     progress: Optional[ProgressCallback] = None,
     progress_label: str = "assignment verification",
+    runtime_env: Optional[Mapping[str, str]] = None,
 ) -> BaselineVerifyResult:
     project_dir = project_dir.resolve()
     remove_packages = tuple(str(item) for item in remove_packages)
@@ -5109,6 +5133,7 @@ def verify_assignment(
                         remove_packages=remove_packages,
                         progress=progress,
                         progress_label=progress_label,
+                        runtime_env=runtime_env,
                     )
             else:
                 result = _verify_assignment_cache_aware_impl(
@@ -5119,6 +5144,7 @@ def verify_assignment(
                     remove_packages=remove_packages,
                     progress=progress,
                     progress_label=progress_label,
+                    runtime_env=runtime_env,
                 )
         except BaseException as exc:
             resources_after = process_resource_snapshot()

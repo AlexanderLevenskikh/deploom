@@ -135,4 +135,34 @@ for (const flag of ["--dashboard-state", "--lag-months", "--min-lag-ok-pct", "--
   }
 }
 
+// 3c. D3: an explicit Node.js for project/CI is forwarded as --requested-node;
+// an unset one must produce NO runtime claim (no flag, no invented value).
+const withNode = iterativeBeginInvocation(
+  runDir,
+  { projectDir: "C:/ws/demo", projectName: "DemoApp", targetLevel: "yellow", requestedNode: "22" },
+  "iterative_migration.py",
+  "python",
+);
+if (!withNode.args.includes("--requested-node") || !withNode.args.includes("22")) {
+  throw new Error("--requested-node must be forwarded when the project has an explicit Node.js");
+}
+const withExactNode = iterativeBeginInvocation(
+  runDir,
+  { projectDir: "C:/ws/demo", projectName: "DemoApp", targetLevel: "yellow", requestedNode: "22.18.0" },
+  "iterative_migration.py",
+  "python",
+);
+if (!withExactNode.args.includes("22.18.0")) {
+  throw new Error("exact --requested-node version must be forwarded verbatim");
+}
+const withoutNode = iterativeBeginInvocation(
+  runDir,
+  { projectDir: "C:/ws/demo", projectName: "DemoApp", targetLevel: "yellow" },
+  "iterative_migration.py",
+  "python",
+);
+if (withoutNode.args.includes("--requested-node")) {
+  throw new Error("--requested-node must be omitted when the project has no explicit Node.js");
+}
+
 console.log("check-iterative-begin: OK");

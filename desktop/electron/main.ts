@@ -105,6 +105,10 @@ type ProjectSpec = {
   name: string
   path: string
   git?: GitPlan
+  // Explicit Node.js for project/CI: exact version or major. Empty (unset)
+  // means "no CI-compatibility claim" — the child runtime stays the host
+  // ambient one and verification makes no requested-runtime commitment.
+  nodeVersion?: string
 }
 
 type WorkspaceRecord = {
@@ -7181,6 +7185,41 @@ function setupIpc(): void {
     renameSync(temporary, settingsPath)
     return { state, details: await workspaceDetails(workspace) }
   })
+  ipcMain.handle('flow:update-project-node', async (_event, raw: { workspaceId?: string; projectName: string; nodeVersion?: string }) => {
+    const state = loadState()
+    const workspace = findWorkspace(state, raw.workspaceId)
+    const settingsPath = resolveSettingsPath(workspace)
+    if (!existsSync(settingsPath)) throw new Error('settings.project.json не найден.')
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as Record<string, unknown>
+    const projects = Array.isArray(settings.projects) ? settings.projects as ProjectSpec[] : []
+    const projectIndex = projects.findIndex((project) => project.name === raw.projectName)
+    if (projectIndex < 0) throw new Error(`Проект ${raw.projectName} не найден в settings.project.json.`)
+    const normalized = (raw.nodeVersion ?? '').trim()
+    if (normalized && !/^(v?\d+(\.\d+){0,2})$/.test(normalized)) {
+      throw new Error('Неверный формат версии Node.js. Примеры: 22, 22.18.0, v22.18.0')
+    }
+    const updated: ProjectSpec = { ...projects[projectIndex] }
+    if (normalized) updated.nodeVersion = normalized
+    else delete updated.nodeVersion
+    projects[projectIndex] = updated
+    settings.projects = projects
+    const temporary = `${settingsPath}.dependency-flow-tmp`
+    writeFileSync(temporary, `${JSON.stringify(settings, null, 2)}\n`, 'utf8')
+    renameSync(temporary, settingsPath)
+    return { state, details: await workspaceDetails(workspace) }
+  })
+  ipcMain.handle('flow:list-node-versions', async () => {
+    // Discovery runs in the main process via the Python runtime module; the
+    // renderer only ever sees deduplicated version strings, never raw paths.
+    const python = resolveExecutable('python')
+    const runtimeModule = join(bundledToolDir(), 'project_runtime.py')
+    const result = await spawnCapture(python, [runtimeModule, '--list-runtimes'], process.cwd(), 60_000)
+    if (result.code !== 0) throw new Error(result.stderr.trim() || `RUNTIMES_EXIT_${result.code}`)
+    const payload = JSON.parse(result.stdout) as Array<{ path: string; version: string }>
+    const versions = [...new Set(payload.map((entry) => entry.version))]
+    versions.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+    return { runtimes: versions }
+  })
   ipcMain.handle('flow:refresh-workspace', async () => {
     const state = loadState()
     const workspace = findWorkspace(state)
@@ -7467,6 +7506,7 @@ function setupIpc(): void {
       projectId: project.name,
       targetsFile,
       toolBuildId: app.getVersion(),
+      requestedNode: project.nodeVersion || undefined,
       // R8: the run captures the workspace dashboard-state (user package lag
       // policy) and the goal audit thresholds so the independent audit runs
       // with the ACTUAL policy, not dashboard_state=None defaults.

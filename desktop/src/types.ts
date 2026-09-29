@@ -39,6 +39,7 @@ export type ProjectSpec = {
     releaseBranch?: string
     push?: boolean
   }
+  nodeVersion?: string
 }
 
 export type WorkspaceRecord = {
@@ -415,6 +416,8 @@ export type DependencyFlowApi = {
   selectWorkspace: (workspaceId: string) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   updateWorkspace: (input: Partial<WorkspaceRecord> & { id: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   updateProjectBranches: (input: { workspaceId?: string; projectName: string; branchBase?: string; push?: boolean }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
+  listNodeVersions: () => Promise<{ runtimes: string[] }>
+  updateProjectNode: (input: { workspaceId?: string; projectName: string; nodeVersion?: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   refreshWorkspace: () => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   getBaselineIntentPlan: (input: { workspaceId?: string; projectName: string }) => Promise<BaselineIntentPlan>
   getCurrentProjectPromptPreview: () => Promise<ProjectPromptPreview | undefined>

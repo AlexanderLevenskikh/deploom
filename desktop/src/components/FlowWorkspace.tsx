@@ -45,6 +45,8 @@ type Props = {
   onChoosePrompt: (projectName: string) => Promise<void>
   onUpdateWorkspace: (patch: { id: string; agent?: AgentProvider; agentModel?: string }) => Promise<void>
   onUpdateProjectBranches: (input: { workspaceId?: string; projectName: string; branchBase?: string; push?: boolean }) => Promise<void>
+  onUpdateProjectNode: (input: { workspaceId?: string; projectName: string; nodeVersion?: string }) => Promise<void>
+  onListNodeVersions: () => Promise<string[]>
   onListAgentModels: (agentProvider: AgentProvider, cwd?: string) => Promise<string[]>
   onGetIterativeTask: (projectName: string) => Promise<IterativeTaskSnapshot>
   onExportIterativeTask: (projectName: string) => Promise<IterativeTaskActionOutcome>
@@ -62,7 +64,7 @@ type Props = {
   onClearLogs?: () => void
 }
 
-export function FlowWorkspace({ details, project, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onExportLegacyIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeStep, onIterativeBegin, onIterativeAgent, logs, onCancelJob, onClearLogs }: Props) {
+export function FlowWorkspace({ details, project, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onUpdateProjectNode, onListNodeVersions, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onExportLegacyIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeStep, onIterativeBegin, onIterativeAgent, logs, onCancelJob, onClearLogs }: Props) {
   const { language, text, t } = useLanguage()
   // The persisted goal drives stage actions and autopilot: a green target set
   // in the Baseline dialog must survive into generate/release instead of
@@ -179,6 +181,12 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
   const configuredBranch = project.git?.baseBranch || project.git?.branchPrefix || 'libs'
   const [branchBase, setBranchBase] = useState(configuredBranch)
   const [pushEnabled, setPushEnabled] = useState(Boolean(project.git?.push))
+  const configuredNodeVersion = project.nodeVersion ?? ''
+  const [nodeVersionDraft, setNodeVersionDraft] = useState(configuredNodeVersion)
+  const [availableNodeVersions, setAvailableNodeVersions] = useState<string[]>([])
+  useEffect(() => {
+    void onListNodeVersions().then((versions) => setAvailableNodeVersions(versions)).catch(() => setAvailableNodeVersions([]))
+  }, [onListNodeVersions])
   const [agentModel, setAgentModel] = useState(details.workspace.agentModel ?? '')
   const [modelSuggestions, setModelSuggestions] = useState<string[]>([])
   const migrationStatusLabels = {
@@ -404,6 +412,21 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
     }
   }
 
+  const persistNodeVersion = async (nextVersion: string) => {
+    const normalized = nextVersion.trim()
+    setNodeVersionDraft(normalized)
+    try {
+      await onUpdateProjectNode({
+        workspaceId: details.workspace.id,
+        projectName: project.name,
+        nodeVersion: normalized || undefined,
+      })
+    } catch (error) {
+      setNodeVersionDraft(configuredNodeVersion)
+      window.alert(error instanceof Error ? error.message : String(error))
+    }
+  }
+
 
   // BLOCK_PROGRESSIVE_HUMAN_FLOW_V1
   const humanVerifiedUpdates = details.migrationProgress?.completedDependencies
@@ -579,6 +602,7 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
         <div><span>{t('flow.workspace')}</span><strong className={details.git.dirty ? 'warning-text' : 'success-text'}>{details.git.dirty ? t('flow.workspaceDirty', { count: details.git.summary.length }) : t('flow.workspaceClean')}</strong></div>
         <div><span>{t('flow.agent')}</span><QuickSelect value={details.workspace.agent} options={[{ value: 'codex', label: 'Codex' }, { value: 'opencode', label: 'OpenCode' }, { value: 'claude', label: 'Claude' }]} onChange={(value) => void onUpdateWorkspace({ id: details.workspace.id, agent: value as AgentProvider })} ariaLabel={t('flow.agent')} /></div>
         <div><span>{t('flow.model')}</span><ModelPicker value={agentModel} options={modelSuggestions} onChange={setAgentModel} onCommit={persistAgentModel} placeholder={t('flow.modelDefault')} ariaLabel={t('flow.modelAria')} title={t('flow.modelTitle')} /></div>
+        <div><span title={text('Явная версия Node.js проекта/CI. Пусто = среда не зафиксирована (host runtime, без гарантии совместимости с CI). Проверки и верификация будут выполняться установленным Node.', 'Explicit project/CI Node.js version. Empty = no fixed runtime (host ambient Node, no CI-compatibility claim). Verification and checks run on the installed Node.')}>{text('Node.js', 'Node.js')}</span><ModelPicker value={nodeVersionDraft} options={availableNodeVersions} onChange={setNodeVersionDraft} onCommit={() => persistNodeVersion(nodeVersionDraft)} placeholder={text('не задано', 'not set')} ariaLabel={text('Node.js для проекта/CI', 'Node.js for project/CI')} title={text('Node.js для проекта/CI', 'Node.js for project/CI')} /></div>
       </div>
 
       <div className="run-progress">

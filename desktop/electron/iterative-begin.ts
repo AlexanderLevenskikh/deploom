@@ -27,6 +27,9 @@ export type IterativeBeginOptions = {
   // audit evidence is bound to the same numbers the roadmap enforces.
   dashboardStatePath?: string
   auditPolicy?: { lagPolicyMonths?: number; minLagOkPct?: number; maxKnownHigh?: number }
+  // D3: explicit Node.js for project/CI (exact or major). Empty = no claim —
+  // no --requested-node is passed and the run makes no CI-runtime commitment.
+  requestedNode?: string
 }
 
 /** Extract exact target versions from one dashboard-state row batch.
@@ -93,5 +96,6 @@ export function iterativeBeginInvocation(
   if (options.workspaceId) args.push('--workspace-id', options.workspaceId)
   if (options.projectId) args.push('--project-id', options.projectId)
   if (options.toolBuildId) args.push('--tool-build-id', options.toolBuildId)
+  if (options.requestedNode) args.push('--requested-node', options.requestedNode)
   return { command: python, args }
 }

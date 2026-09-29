@@ -539,7 +539,19 @@ def _manager_and_install(project_dir: Path) -> Tuple[str, Optional[str], List[st
     return manager, executable, list(install)
 
 
-def _run_install(project_dir: Path, *, timeout_seconds: int, progress_label: str) -> subprocess.CompletedProcess[str]:
+def _runtime_env(config: Mapping[str, Any]) -> Optional[Dict[str, str]]:
+    """Child env carrying the EXPLICIT project/CI Node runtime, or None when the
+    user left the setting empty (empty never claims CI compatibility)."""
+    runtime = config.get("runtime") or {}
+    node_path = str(runtime.get("nodePath") or "").strip()
+    if not node_path:
+        return None
+    from project_runtime import runtime_env_for_path
+
+    return runtime_env_for_path(node_path)
+
+
+def _run_install(project_dir: Path, *, timeout_seconds: int, progress_label: str, runtime_env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess[str]:
     manager, executable, install_args = _manager_and_install(project_dir)
     if not executable:
         raise IterativeMigrationError(
@@ -552,12 +564,15 @@ def _run_install(project_dir: Path, *, timeout_seconds: int, progress_label: str
         "YARN_ENABLE_SCRIPTS": "false",
         "npm_config_ignore_scripts": "true",
     }
+    base_env = os.environ
+    if runtime_env:
+        base_env = {**base_env, **runtime_env}
     return _run(
         [executable, *install_args],
         project_dir,
         timeout_seconds=timeout_seconds,
         env=env,
-        base_env=os.environ,
+        base_env=base_env,
         progress_label=progress_label,
     )
 
@@ -686,6 +701,30 @@ def build_run_config(run_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
     dashboard_state_path = Path(dashboard_state).expanduser().resolve() if dashboard_state else None
     if dashboard_state_path is not None and not dashboard_state_path.exists():
         raise InvalidInputError(f"DASHBOARD_STATE_MISSING: {dashboard_state_path}")
+
+    # D3: an explicitly requested project/CI Node runtime is resolved to ONE
+    # concrete installed executable+exact-version at begin. Empty means "not
+    # set by the user" — no CI-compatibility claim, no automatic latest; a set
+    # but unavailable version is ENVIRONMENT_UNAVAILABLE, never a PATH fallback.
+    requested_node = (args.requested_node or "").strip()
+    runtime: Dict[str, Any] = {}
+    if requested_node:
+        from project_runtime import resolve_requested_node
+
+        resolution = resolve_requested_node(requested_node)
+        if not resolution.found:
+            raise InvalidInputError(
+                f"ENVIRONMENT_UNAVAILABLE: requested Node {requested_node!r} is not installed; "
+                + resolution.unavailable_reason
+            )
+        runtime = {
+            "requested": requested_node,
+            "effectiveVersion": resolution.effective_version,
+            "nodePath": resolution.node_path,
+            "npmPath": resolution.npm_path,
+            "source": resolution.source,
+            "contractHash": resolution.contract_hash(),
+        }
     audit_policy = {
         "lagMonths": _clamp_int(
             args.lag_months if args.lag_months is not None else 12,
@@ -713,6 +752,8 @@ def build_run_config(run_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "budget": budget,
         "auditPolicy": audit_policy,
         "dashboardState": str(dashboard_state_path) if dashboard_state_path is not None else "",
+        "requestedNode": requested_node,
+        "runtime": runtime,
         "createdAt": _now_iso(),
         "toolBuildId": args.tool_build_id or "",
     }
@@ -753,6 +794,7 @@ def _begin_locked(run_dir: Path, config: Mapping[str, Any], args: argparse.Names
         config=verify_config,
         run_project_checks=True,
         progress_label="iterative migration C0 control verification",
+        runtime_env=_runtime_env(config),
     )
 
     observed = dict(result.observed_resolved_versions or {})
@@ -955,6 +997,7 @@ def _bootstrap_materialize_locked(
         project_path,
         timeout_seconds=args.timeout_seconds,
         progress_label="iterative migration bootstrap materialization",
+        runtime_env=_runtime_env(config),
     )
     run = dict(run)
     run["bootstrapRefs"] = {
@@ -1013,6 +1056,7 @@ def cmd_verify_bootstrap(args: argparse.Namespace) -> int:
             config=verify_config,
             run_project_checks=True,
             progress_label="iterative migration bootstrap re-verification",
+            runtime_env=_runtime_env(config),
         )
         if result.ok:
             # The repaired trial becomes the authoritative C0 source identity:
@@ -1380,6 +1424,7 @@ def _materialize_locked(
         project_path,
         timeout_seconds=args.timeout_seconds,
         progress_label="iterative migration exact materialization",
+        runtime_env=_runtime_env(config),
     )
     if install_result.returncode != 0:
         kind = _classify_materialization_failure(install_result.stdout or "")
@@ -1690,6 +1735,7 @@ def _verify_exact_locked(
         config=verify_config,
         run_project_checks=True,
         progress_label="iterative migration verify-exact",
+        runtime_env=_runtime_env(config),
     )
     _emit_status(
         {
@@ -2784,6 +2830,12 @@ def build_parser() -> argparse.ArgumentParser:
     begin.add_argument("--lag-months", type=int, default=None)
     begin.add_argument("--min-lag-ok-pct", type=int, default=None)
     begin.add_argument("--max-known-high", type=int, default=None)
+    begin.add_argument(
+        "--requested-node",
+        default="",
+        help="Явный Node.js для проекта/CI (точная версия или major). Пусто = не задано пользователем; "
+        "недоступная версия даёт ENVIRONMENT_UNAVAILABLE, а не fallback на PATH",
+    )
 
     verify_bootstrap = sub.add_parser("verify-bootstrap", help="Повторная контрольная проверка C0 после bootstrap repair")
     verify_bootstrap.add_argument("--timeout-seconds", type=int, default=1800)

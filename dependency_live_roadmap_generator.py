@@ -946,6 +946,7 @@ class ProjectSpec:
     release_branch: str = ""
     git_push: bool = False
     git_remote: str = "origin"
+    node_version: str = ""
     source_checkout_guard: Optional[bool] = None
     source_checkout: Dict[str, Any] = dataclasses.field(default_factory=dict)
     audit_bootstrap_config: Dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -991,6 +992,7 @@ class DependencyRow:
     notes: str
     subgroup: str = ""
     lag_threshold_months: int = 12
+    node_version_override: str = ""
     release_target: str = "—"
     release_status: str = "not-checked"
     release_summary: str = "Release notes не проверялись"
@@ -1690,6 +1692,7 @@ def parse_project_entries(
             release_branch = str(entry.get("releaseBranch") or git_cfg.get("releaseBranch") or "")
             git_push = as_bool(entry.get("gitPush") if "gitPush" in entry else git_cfg.get("push"), False)
             git_remote = str(entry.get("gitRemote") or git_cfg.get("remote") or "origin")
+            node_version = str(entry.get("nodeVersion") or entry.get("node") or "").strip()
             guard_raw = entry.get("sourceCheckoutGuard") if "sourceCheckoutGuard" in entry else git_cfg.get("sourceCheckoutGuard")
             source_checkout_guard = None if guard_raw is None else as_bool(guard_raw, True)
             audit_cfg_raw = entry.get("auditBootstrap") if "auditBootstrap" in entry else git_cfg.get("auditBootstrap")
@@ -1724,6 +1727,7 @@ def parse_project_entries(
                 release_branch=release_branch,
                 git_push=git_push,
                 git_remote=git_remote,
+                node_version=node_version,
                 source_checkout_guard=source_checkout_guard,
                 audit_bootstrap_config=audit_cfg,
                 git_hooks=hooks_cfg,
@@ -4766,6 +4770,7 @@ def analyze_project(
             planner_target_default=planner_target_default,
             planner_target_yellow=planner_target_yellow,
             planner_target_green=planner_target_green,
+            node_version_override=project.node_version,
         )
 
         if is_non_registry_spec(spec):
@@ -7133,20 +7138,29 @@ def _normalized_node_version(value: Any) -> str:
     return match.group(1) if match else ""
 
 
-def _project_node_versions(project_dir: str) -> List[Tuple[str, str]]:
+def _project_node_versions(project_dir: str, override: str = "") -> List[Tuple[str, str]]:
     """Return only exact Node versions explicitly pinned by the project.
 
     The runtime executing DepLoom is tool infrastructure, not project intent.
     Feeding the planner host runtime into Z3 makes one source commit produce
     different assignments on different machines. Only repository pins are
     authoritative here; an unpinned project must not inherit the host.
+
+    D4: the user's per-project "Node.js for project / CI" setting (``override``)
+    is the highest-priority exact pin — it names the runtime the project/CI
+    must run under, so an engines.node-incompatible candidate is a plan-level
+    contradiction in THAT runtime context, never a global nogood.
     """
     key = str(Path(project_dir).resolve())
     cached = _PROJECT_NODE_VERSION_CACHE.get(key)
-    if cached is not None:
+    if cached is not None and not override:
         return cached
     root = Path(key)
     found: List[Tuple[str, str]] = []
+    if override:
+        exact = _normalized_node_version(override)
+        if exact:
+            found.append((exact, "settings.nodeVersion"))
     try:
         package_json = json.loads((root / "package.json").read_text(encoding="utf-8"))
         volta = package_json.get("volta") if isinstance(package_json, dict) else None
@@ -7196,7 +7210,7 @@ def _project_environment_constraint_issue(
         return ""
     incompatible = [
         (node_version, source)
-        for node_version, source in _project_node_versions(row.package_dir)
+        for node_version, source in _project_node_versions(row.package_dir, override=row.node_version_override)
         if not _npm_peer_satisfied(node_spec, node_version)
     ]
     if not incompatible:
