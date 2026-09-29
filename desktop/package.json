@@ -24,6 +24,8 @@
     "check:workspace-bootstrap": "node scripts/check-workspace-bootstrap.mjs",
     "check:log-presentation": "node scripts/check-log-presentation.mjs",
     "check:i18n": "node scripts/check-i18n.mjs",
+    "precheck:iterative-migration": "tsc -p tsconfig.electron.json",
+    "check:iterative-migration": "node scripts/check-iterative-migration.mjs",
     "check:run-monitor": "node scripts/check-run-monitor.mjs",
     "check:app-icon": "node scripts/check-app-icon.mjs",
     "lint": "oxlint",
