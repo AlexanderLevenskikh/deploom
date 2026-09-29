@@ -358,6 +358,33 @@ export type IterativeTaskSnapshot = {
   runDir?: string
 }
 export type IterativeTaskActionOutcome = { ok: boolean; artifactId?: string; stale?: boolean; canceled?: boolean; path?: string; fingerprint?: string; missing?: string[]; error?: string }
+export type IterativeRunnerRepairRequest = { requestId: string; summary: string }
+export type IterativeRunnerDecision = {
+  step: 'begin' | 'verify-bootstrap' | 'plan-next' | 'materialize' | 'precheck' | 'verify-exact' | 'apply-feedback' | 'finish' | 'audit' | 'agent' | null
+  phase: string
+  reason: string
+  repairRequests?: IterativeRunnerRepairRequest[]
+  satisfied?: boolean
+}
+export type IterativeStatusOutcome = {
+  ok: boolean
+  present: boolean
+  stale: boolean
+  staleReason?: string
+  phase?: string
+  decision?: IterativeRunnerDecision
+  error?: string
+}
+export type IterativeStepOutcome = {
+  ok: boolean
+  step?: string
+  phase?: string
+  gated?: 'agent'
+  repairRequests?: IterativeRunnerRepairRequest[]
+  reason?: string
+  next?: IterativeRunnerDecision
+  error?: string
+}
 
 export type DependencyFlowApi = {
   bootstrap: () => Promise<BootstrapPayload>
@@ -380,6 +407,8 @@ export type DependencyFlowApi = {
   exportIterativeTask: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeTaskActionOutcome>
   copyIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
+  iterativeStatus: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStatusOutcome>
+  iterativeStep: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStepOutcome>
   runAction: (input: ActionInput) => Promise<{ jobId: string; runId?: string; preview: string[] }>
   cancelJob: (jobId: string) => Promise<boolean>
   pauseJob: (jobId: string) => Promise<boolean>

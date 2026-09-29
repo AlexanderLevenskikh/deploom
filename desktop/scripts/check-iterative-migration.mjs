@@ -150,11 +150,18 @@ if (iterativeRunDirPath(root, "DemoApp") !== join(root, iterativeRunDirRelativeP
 const runRel = iterativeRunDirRelativePath("DemoApp");
 if (!runRel.startsWith(".dependency-roadmap/iterative/")) throw new Error("Run-dir must live under .dependency-roadmap/iterative");
 
-// 7. Invocation shape for the export step.
+// 7. Invocation shape for the export step. --run-dir is a TOP-LEVEL CLI
+// argument, so it must precede the subcommand; a consumer that appends it
+// after 'export-task' fails the real parser with "required: --run-dir".
 const invocation = iterativeExportInvocation(runDir, GENERATOR, PYTHON, "both");
-if (invocation.args[0] !== GENERATOR || !invocation.args.includes("export-task")) {
+if (invocation.args[0] !== GENERATOR) {
   throw new Error(`Export invocation malformed: ${JSON.stringify(invocation)}`);
 }
+if (invocation.args[1] !== "--run-dir" || invocation.args[2] !== runDir) {
+  throw new Error(`--run-dir must precede the subcommand: ${JSON.stringify(invocation)}`);
+}
+const subcommandIndex = invocation.args.indexOf("export-task");
+if (subcommandIndex < 3) throw new Error(`export-task must follow --run-dir: ${JSON.stringify(invocation)}`);
 
 console.log("check-iterative-migration: OK");
 

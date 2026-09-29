@@ -54,6 +54,7 @@ import { flowNotificationContent, type FlowNotificationEvent } from './notificat
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
 import { currentTask as readIterativeCurrentTask, iterativeRunDirPath, missingTaskExportInput, taskStaleness } from './iterative-migration.js'
+import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
@@ -7290,7 +7291,7 @@ function setupIpc(): void {
     const generator = join(bundledToolDir(), 'iterative_migration.py')
     const result = await spawnCapture(
       python,
-      [generator, 'export-task', '--run-dir', runDir, '--language', 'both'],
+      [generator, '--run-dir', runDir, 'export-task', '--language', 'both'],
       workspace.path,
       120_000,
     )
@@ -7341,6 +7342,94 @@ function setupIpc(): void {
       return { ok: true, canceled: false, path: result.filePath }
     },
   )
+
+  const iterativeStepInFlight = new Set<string>()
+
+  ipcMain.handle('flow:iterative:status', async (_event, input: { workspaceId?: string; projectName: string }) => {
+    const state = loadState()
+    const workspace = findWorkspace(state, input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    const runDir = iterativeTaskRunDir(workspace, project)
+    const present = existsSync(join(runDir, 'run.json'))
+    const stale = taskStaleness(runDir).stale
+    let phase: string | undefined
+    let decision: ReturnType<typeof decideNextStep> | undefined
+    let error: string | undefined
+    if (present && !stale) {
+      const python = resolveExecutable('python')
+      const generator = join(bundledToolDir(), 'iterative_migration.py')
+      const result = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
+      if (result.code !== 0) {
+        error = result.stderr.trim() || `STATUS_EXIT_${result.code}`
+      } else {
+        const payload = parseIterativeStatusPayload(result.stdout) ?? readIterativeStatus(runDir)
+        if (payload) {
+          phase = String(payload.run?.phase ?? '')
+          decision = decideNextStep(runDir, payload)
+        }
+      }
+    }
+    return { ok: error === undefined, present, stale, staleReason: taskStaleness(runDir).reason, phase, decision, error }
+  })
+
+  ipcMain.handle('flow:iterative:step', async (_event, input: { workspaceId?: string; projectName: string }) => {
+    const state = loadState()
+    const workspace = findWorkspace(state, input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    const runDir = iterativeTaskRunDir(workspace, project)
+    if (iterativeStepInFlight.has(project.name)) {
+      return { ok: false, error: 'STEP_IN_PROGRESS' }
+    }
+    if (!existsSync(join(runDir, 'run.json'))) {
+      return { ok: false, error: 'NO_RUN' }
+    }
+    if (taskStaleness(runDir).stale) {
+      return { ok: false, error: 'TASK_STALE: переустановите ожидаемый результат перед продолжением' }
+    }
+    const python = resolveExecutable('python')
+    const generator = join(bundledToolDir(), 'iterative_migration.py')
+    const statusResult = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
+    const payload = statusResult.code === 0
+      ? parseIterativeStatusPayload(statusResult.stdout) ?? readIterativeStatus(runDir)
+      : undefined
+    if (!payload) {
+      return { ok: false, error: statusResult.stderr.trim() || 'STATUS_UNREADABLE' }
+    }
+    const decision = decideNextStep(runDir, payload)
+    if (decision.step === 'agent') {
+      return {
+        ok: true,
+        gated: 'agent',
+        phase: decision.phase,
+        repairRequests: decision.repairRequests,
+        reason: decision.reason,
+      }
+    }
+    if (decision.step === null) {
+      return { ok: false, error: decision.reason }
+    }
+    iterativeStepInFlight.add(project.name)
+    try {
+      const result = await spawnCapture(
+        python,
+        iterativeStepInvocation(runDir, decision.step, generator, python).args,
+        workspace.path,
+        1_200_000,
+      )
+      if (result.code !== 0) {
+        const raw = (result.stderr.trim() || result.stdout.trim() || `STEP_EXIT_${result.code}`)
+        return { ok: false, step: decision.step, error: raw.slice(0, 4000) }
+      }
+      const refresh = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
+      const refreshed = refresh.code === 0
+        ? parseIterativeStatusPayload(refresh.stdout) ?? readIterativeStatus(runDir)
+        : undefined
+      const next = refreshed ? decideNextStep(runDir, refreshed) : undefined
+      return { ok: true, step: decision.step, phase: next?.phase, next }
+    } finally {
+      iterativeStepInFlight.delete(project.name)
+    }
+  })
 
   ipcMain.handle('flow:dependency-graph-snapshot', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()

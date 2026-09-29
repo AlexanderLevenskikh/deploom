@@ -175,7 +175,8 @@ export function iterativeExportInvocation(
   python: string = 'python',
   language: 'ru' | 'en' | 'both' = 'both',
 ): { command: string; args: string[] } {
-  return { command: python, args: [scriptPath, 'export-task', '--run-dir', runDir, '--language', language] }
+  // --run-dir is a TOP-LEVEL argument of the Python CLI, before the subcommand.
+  return { command: python, args: [scriptPath, '--run-dir', runDir, 'export-task', '--language', language] }
 }
 
 /** Deterministic per-project token for the run dir; the same sha256/slug scheme

@@ -1,8 +1,8 @@
-import { Check, Clipboard, ExternalLink, FileText, RefreshCw, Save, X } from 'lucide-react'
+import { Check, Clipboard, ExternalLink, FileText, Play, RefreshCw, Save, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useLanguage } from '../i18n'
-import type { IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
+import type { IterativeStatusOutcome, IterativeStepOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
 
 type Props = {
   workspaceId?: string
@@ -12,6 +12,8 @@ type Props = {
   onExport: (projectName: string) => Promise<IterativeTaskActionOutcome>
   onCopy: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onSave: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
+  onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
+  onStep: (projectName: string) => Promise<IterativeStepOutcome>
   onOpenPath: (path?: string) => Promise<void>
 }
 
@@ -20,14 +22,27 @@ type PanelState =
   | { phase: 'ready'; snapshot: IterativeTaskSnapshot }
   | { phase: 'error'; message: string }
 
-export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, onCopy, onSave, onOpenPath }: Props) {
+export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, onCopy, onSave, onStatus, onStep, onOpenPath }: Props) {
   const { text, language } = useLanguage()
   const [state, setState] = useState<PanelState>({ phase: 'loading' })
   const [busy, setBusy] = useState<string>()
   const [copied, setCopied] = useState(false)
   const [note, setNote] = useState<string>()
   const [showDialog, setShowDialog] = useState(false)
+  const [runner, setRunner] = useState<IterativeStatusOutcome>()
+  const [stepBusy, setStepBusy] = useState(false)
   const loadSeq = useRef(0)
+
+  const refreshRunner = useCallback(async () => {
+    try {
+      const status = await onStatus(projectName)
+      setRunner(status)
+      return status
+    } catch {
+      setRunner(undefined)
+      return undefined
+    }
+  }, [onStatus, projectName])
 
   const load = useCallback(async () => {
     const seq = ++loadSeq.current
@@ -44,7 +59,8 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
 
   useEffect(() => {
     void load()
-  }, [load, refreshKey])
+    void refreshRunner()
+  }, [load, refreshRunner, refreshKey])
 
   const run = async (kind: string, action: () => Promise<IterativeTaskActionOutcome>) => {
     setBusy(kind)
@@ -65,6 +81,37 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
       setNote(error instanceof Error ? error.message : String(error))
     } finally {
       setBusy(undefined)
+    }
+  }
+
+  const stepNow = async () => {
+    setStepBusy(true)
+    setNote(undefined)
+    try {
+      const outcome = await onStep(projectName)
+      if (outcome.ok && outcome.gated === 'agent') {
+        setNote(
+          text(
+            `Нужен агент: ${outcome.reason ?? ''}`,
+            `Agent required: ${outcome.reason ?? ''}`,
+          ),
+        )
+      } else if (outcome.ok) {
+        setNote(
+          text(
+            `Шаг «${outcome.step ?? ''}» выполнен${outcome.next ? ` · далее: ${outcome.next.step ?? '—'}` : ''}`,
+            `Step "${outcome.step ?? ''}" done${outcome.next ? ` · next: ${outcome.next.step ?? '—'}` : ''}`,
+          ),
+        )
+      } else {
+        setNote(outcome.error ?? 'Ошибка')
+      }
+    } catch (error) {
+      setNote(error instanceof Error ? error.message : String(error))
+    } finally {
+      setStepBusy(false)
+      void refreshRunner()
+      void load()
     }
   }
 
@@ -144,7 +191,19 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
 
           {note ? <div className="resume-notice"><span>{note}</span></div> : null}
 
+          {runner && runner.present && !runner.stale ? (
+            <div className="resume-notice">
+              <strong>{text('Состояние прогона', 'Run state')}: {runner.phase ?? '—'}</strong>
+              {runner.decision ? (
+                <span>{text('Следующий шаг', 'Next step')}: {runner.decision.step ?? '—'} · {runner.decision.reason}</span>
+              ) : null}
+            </div>
+          ) : null}
+
           <footer className="baseline-intent-actions">
+            <button type="button" className="button secondary" disabled={busy !== undefined || stepBusy} onClick={() => void stepNow()}>
+              <Play size={16} />{text('Выполнить следующий шаг', 'Run next step')}
+            </button>
             <button type="button" className="button secondary" disabled={busy !== undefined} onClick={() => setShowDialog(true)}>
               <FileText size={16} />{text('Посмотреть', 'View')}
             </button>
