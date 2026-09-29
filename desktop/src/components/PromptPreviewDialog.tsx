@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 
 import { useLanguage } from '../i18n'
 import type { ProjectPromptPreview } from '../types'
+import { copyTextToClipboard } from '../clipboard'
 
 type Props = {
   preview: ProjectPromptPreview
@@ -23,13 +24,13 @@ export function PromptPreviewDialog({ preview, onClose, onOpenPath }: Props) {
   }, [onClose])
 
   const copyPrompt = async () => {
-    try {
-      await navigator.clipboard.writeText(preview.content)
+    const ok = await copyTextToClipboard(preview.content)
+    if (ok) {
       setCopied(true)
       window.setTimeout(() => setCopied(false), 1600)
-    } catch (error) {
-      window.alert(error instanceof Error ? error.message : String(error))
+      return
     }
+    window.alert(text('Не удалось скопировать в буфер обмена. Выделите текст вручную.', 'Failed to copy to clipboard. Select the text manually.'))
   }
 
   return (

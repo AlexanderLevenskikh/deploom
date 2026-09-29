@@ -269,6 +269,11 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
                 <span>{text('Следующий шаг', 'Next step')}: {runner.decision.step ?? '—'} · {runner.decision.reason}</span>
               ) : null}
               {runtimeLine(runner)}
+              <footer className="baseline-intent-actions">
+                <button type="button" className="button secondary" disabled={busy !== undefined || stepBusy} onClick={() => void run('export', () => onExport(projectName))}>
+                  <RefreshCw size={16} />{text('Сформировать задание', 'Build the assignment')}
+                </button>
+              </footer>
             </div>
           ) : null}
           {runner?.decision?.step === 'agent' ? (
@@ -346,7 +351,7 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
             <button type="button" className="button secondary" disabled={busy !== undefined} onClick={() => void run('save', () => onSave(projectName, language))}>
               <Save size={16} />{text('Сохранить', 'Save…')}
             </button>
-            <button type="button" className="button secondary" disabled={busy !== undefined || snapshot?.stale} onClick={() => void run('export', () => onExport(projectName))}>
+            <button type="button" className="button secondary" disabled={busy !== undefined || stepBusy} onClick={() => void run('export', () => onExport(projectName))}>
               <RefreshCw size={16} />{text('Переэкспортировать', 'Re-export')}
             </button>
           </footer>

@@ -2,6 +2,7 @@ import { AlertTriangle, Check, Copy, X } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useLanguage } from '../i18n'
 import type { LagBlocker, TargetClosure } from '../types'
+import { copyTextToClipboard } from '../clipboard'
 
 type Props = {
   closure: TargetClosure
@@ -44,11 +45,11 @@ export function GoalDetailsModal({ closure, projectName, onClose }: Props) {
   }, [closure, currentLabel, fixable, needed, projectName, stuck, targetLabel, t, text])
 
   const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(copyText)
+    const ok = await copyTextToClipboard(copyText)
+    if (ok) {
       setCopied(true)
       window.setTimeout(() => setCopied(false), 1500)
-    } catch { /* clipboard unavailable, ignore */ }
+    }
   }
 
   return (

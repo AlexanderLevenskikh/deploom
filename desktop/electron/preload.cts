@@ -4,6 +4,7 @@ const api = {
   bootstrap: () => ipcRenderer.invoke('flow:bootstrap'),
   pickDirectory: () => ipcRenderer.invoke('flow:pick-directory'),
   pickFile: (filters?: Array<{ name: string; extensions: string[] }>) => ipcRenderer.invoke('flow:pick-file', filters),
+  copyText: (text: string) => ipcRenderer.invoke('flow:copy-text', text),
   listAgentModels: (agentProvider: string, cwd?: string) => ipcRenderer.invoke('flow:list-agent-models', agentProvider, cwd),
   registerWorkspace: (input: unknown) => ipcRenderer.invoke('flow:register-workspace', input),
   cloneWorkspace: (input: unknown) => ipcRenderer.invoke('flow:clone-workspace', input),

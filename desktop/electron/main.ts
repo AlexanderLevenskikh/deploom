@@ -7343,6 +7343,14 @@ function setupIpc(): void {
   // Iterative migration ТЗ (task) surface. The Desktop is a pure CONSUMER of
   // the artifact the Python export-task step publishes under the durable run
   // dir (.dependency-roadmap/iterative/<token>/task). Reading never starts a
+  ipcMain.handle('flow:copy-text', async (_event, payload: unknown) => {
+    if (typeof payload !== 'string' || !payload.trim()) {
+      return { ok: false, error: 'EMPTY_TEXT' }
+    }
+    clipboard.writeText(payload)
+    return { ok: true }
+  })
+
   // Baseline and never mutates producer bytes; export runs the real CLI when
   // durable JSON is sufficient and diagnoses TASK_INPUT_INSUFFICIENT otherwise.
   ipcMain.handle('flow:iterative:task', async (_event, input: { workspaceId?: string; projectName: string }) => {

@@ -5,6 +5,7 @@ import { presentRunError } from '../data/errorPresentation'
 import { latestJobId } from '../data/logPresentation'
 import { useLanguage } from '../i18n'
 import type { BaselineRecoveryInfo, EnvironmentInfo, FlowAction, HardwareSnapshot, JobOutput, JobOutputSource, MigrationProgress } from '../types'
+import { copyTextToClipboard } from '../clipboard'
 import { LogPanel } from './LogPanel'
 import { QuickSelect } from './QuickSelect'
 import { RunMonitor } from './RunMonitor'
@@ -151,7 +152,7 @@ export function MonitoringPanel({ logs, knownSources = [], environment, active, 
         {view === 'errors' ? (
           <section className="monitoring-errors">
             <div className="monitoring-errors-header"><div><AlertTriangle size={16} /><strong>{text('Ошибки выполнения', 'Run errors')}</strong></div>{error ? <span className="monitoring-error-count">1</span> : null}</div>
-            {error ? <><div className="monitoring-error-card" role="alert"><pre>{visibleError}</pre></div><div className="monitoring-error-actions"><button className="button secondary" onClick={() => visibleError && void navigator.clipboard.writeText(visibleError)}><ClipboardCopy size={14} /> {text('Копировать', 'Copy')}</button><button className="button secondary" onClick={() => setView('logs')}>{text('Открыть логи', 'Open logs')}</button><button className="button secondary" onClick={onDismissError}><X size={14} /> {text('Закрыть ошибку', 'Dismiss error')}</button></div></> : <div className="monitoring-errors-empty">{text('Ошибок выполнения нет', 'No run errors')}</div>}
+            {error ? <><div className="monitoring-error-card" role="alert"><pre>{visibleError}</pre></div><div className="monitoring-error-actions"><button className="button secondary" onClick={() => visibleError && void copyTextToClipboard(visibleError)}><ClipboardCopy size={14} /> {text('Копировать', 'Copy')}</button><button className="button secondary" onClick={() => setView('logs')}>{text('Открыть логи', 'Open logs')}</button><button className="button secondary" onClick={onDismissError}><X size={14} /> {text('Закрыть ошибку', 'Dismiss error')}</button></div></> : <div className="monitoring-errors-empty">{text('Ошибок выполнения нет', 'No run errors')}</div>}
           </section>
         ) : null}
         {view === 'environment' ? <div className="environment-only">{Object.entries(environment).map(([name, info]) => <div className="environment-row" key={name}><span className={`status-dot ${info.available ? 'success' : 'danger'}`} /><strong>{name}</strong><span>{info.available ? info.version : t('log.notFound')}</span></div>)}</div> : null}

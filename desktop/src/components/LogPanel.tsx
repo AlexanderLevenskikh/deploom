@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState, type UIEvent } from 'react'
 import { latestJobId, mergeLogSources, presentLogs, summarizeTokenUsage, type PresentedLog } from '../data/logPresentation'
 import { useLanguage, type Language, type TranslationKey } from '../i18n'
 import type { EnvironmentInfo, FlowAction, JobOutput, JobOutputSource, MigrationProgress } from '../types'
+import { copyTextToClipboard } from '../clipboard'
 import { RunMonitor } from './RunMonitor'
 import { QuickSelect } from './QuickSelect'
 
@@ -111,11 +112,11 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
     : activity.map((entry) => `[${sourceLabel(entry.source)}] ${localizeActivityTitle(entry.title, entry.kind)}: ${entry.body}${entry.detail ? ` (${entry.detail})` : ''}`).join('\n')
 
   const copyLog = async () => {
-    try {
-      await navigator.clipboard.writeText(copyText)
+    const ok = await copyTextToClipboard(copyText)
+    if (ok) {
       setCopied(true)
       window.setTimeout(() => setCopied(false), 1500)
-    } catch { /* clipboard unavailable, ignore */ }
+    }
   }
 
   const sendNote = async () => {

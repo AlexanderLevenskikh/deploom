@@ -424,6 +424,7 @@ export type DependencyFlowApi = {
   bootstrap: () => Promise<BootstrapPayload>
   pickDirectory: () => Promise<string | undefined>
   pickFile: (filters?: Array<{ name: string; extensions: string[] }>) => Promise<string | undefined>
+  copyText: (text: string) => Promise<{ ok: boolean }>
   listAgentModels: (agentProvider: AgentProvider, cwd?: string) => Promise<string[]>
   registerWorkspace: (input: { path: string; name?: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   cloneWorkspace: (input: { parentPath: string; folderName: string; teamRemote?: string; templateRemote?: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
