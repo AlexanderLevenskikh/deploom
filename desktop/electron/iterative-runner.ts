@@ -12,7 +12,9 @@
 //                        the run is terminal); an in-flight candidate is
 //                        resumed by its stage, a consumed one (VERIFYING/
 //                        ACCEPTED/REJECTED leftover) is skipped
-//   BOOTSTRAP_REPAIR  -> agent (GATE over the C0 bytes; decision.bootstrap)
+//   BOOTSTRAP_REPAIR  -> bootstrap-materialize (no trial yet) / agent (GATE,
+//                        decision.bootstrap) once the version-neutral trial
+//                        exists
 //   PLANNING          -> materialize
 //   MATERIALIZING     -> materialize (PLANNED) / precheck (MATERIALIZED) [R2]
 //   PRECHECK          -> precheck (MATERIALIZED) / verify-exact (PRECHECKED)
@@ -32,6 +34,7 @@ import { join } from 'node:path'
 export type IterativeStep =
   | 'begin'
   | 'verify-bootstrap'
+  | 'bootstrap-materialize'
   | 'plan-next'
   | 'materialize'
   | 'precheck'
@@ -163,20 +166,30 @@ export function decideNextStep(
   switch (phase) {
     case '':
       return { step: 'begin', phase, reason: 'NO_RUN: run.json is absent; capture C0' }
-    case 'BOOTSTRAP_REPAIR':
-      // C0 failed control verification. The bootstrap repair is an AGENT GATE
-      // over the C0 bytes (version-neutral): the driver must dispatch the
-      // repair agent in an isolated bootstrap trial BEFORE verify-bootstrap
-      // re-runs the control. The decision names the repair request bytes.
+    case 'BOOTSTRAP_REPAIR': {
+      // C0 failed control verification. The bootstrap repair is a two-stage
+      // AGENT GATE over the C0 bytes (version-neutral): first materialize the
+      // isolated trial (bootstrap-materialize), then dispatch the repair agent
+      // in THAT trial BEFORE verify-bootstrap re-runs the control. The durable
+      // run.bootstrapRefs says whether the trial exists yet.
+      const bootstrapRefs = (run.bootstrapRefs ?? null) as Record<string, string> | null
+      if (!bootstrapRefs?.workspaceRoot) {
+        return {
+          step: 'bootstrap-materialize',
+          phase,
+          reason: 'bootstrap C0 repair needs an isolated version-neutral trial; materialize it first',
+        }
+      }
       return {
         step: 'agent',
         phase,
         reason: repairSummaries.length > 0
-          ? `bootstrap C0 repair required on ${repairSummaries.length} request(s)`
-          : 'bootstrap C0 repair required in an isolated trial',
+          ? `bootstrap C0 repair required on ${repairSummaries.length} request(s) in the isolated trial`
+          : 'bootstrap C0 repair required in the isolated trial',
         repairRequests: repairSummaries,
         bootstrap: true,
       }
+    }
     case 'PLANNING':
       return { step: 'materialize', phase, reason: 'candidate is planned; materialize exact versions into the isolated trial' }
     case 'MATERIALIZING': {

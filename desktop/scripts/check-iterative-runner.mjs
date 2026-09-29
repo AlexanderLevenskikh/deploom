@@ -42,8 +42,17 @@ const empty = decideNextStep(runDir, {});
 if (empty.step !== "begin" || !empty.reason.includes("NO_RUN")) throw new Error("Run-less dir must decide begin");
 
 // 2. Phase -> step mapping, grounding on the Python status contract.
-const bootstrap = expectDecision(
+// R7: bootstrap repair first materializes the version-neutral trial, then
+// becomes an AGENT GATE with the request bytes.
+const bootstrapFirst = expectDecision(
   { phase: "BOOTSTRAP_REPAIR", activeCandidateId: null },
+  { openRepairRequests: [{ requestId: "boot-1", summary: "C0 control verification failed" }] },
+  "bootstrap-materialize",
+  "trial",
+);
+if (bootstrapFirst.bootstrap === true) throw new Error("Bootstrap without a trial must not be an agent gate yet");
+const bootstrap = expectDecision(
+  { phase: "BOOTSTRAP_REPAIR", activeCandidateId: null, bootstrapRefs: { workspaceRoot: "C:/run/trial/bootstrap", projectRelative: "." } },
   { openRepairRequests: [{ requestId: "boot-1", summary: "C0 control verification failed" }] },
   "agent",
   "repair",

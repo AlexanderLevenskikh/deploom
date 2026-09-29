@@ -233,6 +233,7 @@ SOURCE_DIR = "sources"
 TRIAL_DIR = "trial"
 TRIAL_CANDIDATE_FILENAME = "candidate.json"
 TRIAL_WORKSPACE = "workspace"
+BOOTSTRAP_DIR = "bootstrap"
 REPAIR_REQUESTS_FILENAME = "repair-requests.json"
 REPORTS_DIR = "reports"
 AUDIT_DIR = "audit"
@@ -426,6 +427,13 @@ def clear_candidate(run_dir: Path) -> None:
 
 def trial_workspace_root(run_dir: Path) -> Path:
     return _trial_dir(run_dir) / TRIAL_WORKSPACE
+
+
+def bootstrap_workspace_root(run_dir: Path) -> Path:
+    """Version-neutral C0 repair workspace: a private materialization of the C0
+    source snapshot (original, un-modified dependencies). The source/config
+    repair agent works HERE, never on the developer checkout."""
+    return _trial_dir(run_dir) / BOOTSTRAP_DIR
 
 
 def read_repair_requests(run_dir: Path) -> List[Dict[str, Any]]:
@@ -875,8 +883,86 @@ def _write_bootstrap_repair_request(
     )
 
 
+def cmd_bootstrap_materialize(args: argparse.Namespace) -> int:
+    """Materialize the version-neutral C0 repair workspace into an isolated
+    trial. The bootstrap repair agent works HERE, never on the developer
+    checkout; verify-bootstrap then re-runs the control on the repaired bytes
+    and captures a NEW C0 source snapshot."""
+    run_dir = Path(args.run_dir).resolve()
+    run = load_run(run_dir)
+    config = load_config(run_dir)
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=300)
+    lock.acquire()
+    try:
+        return _bootstrap_materialize_locked(run_dir, run, config, args)
+    finally:
+        lock.release()
+
+
+def _bootstrap_materialize_locked(
+    run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], args: argparse.Namespace
+) -> int:
+    if run.get("phase") != "BOOTSTRAP_REPAIR":
+        raise InvalidInputError(f"PHASE_NOT_BOOTSTRAP: {run.get('phase')}")
+    if not run_budget_ok(config, run):
+        raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+    requests = read_repair_requests(run_dir)
+    if not any(isinstance(req, dict) and req.get("bootstrap") for req in requests):
+        raise InvalidInputError("BOOTSTRAP_REQUEST_MISSING")
+    checkpoint = load_checkpoint(run_dir, "C0")
+    if checkpoint.get("status") == "VERIFIED":
+        raise InvalidInputError("C0_ALREADY_VERIFIED")
+
+    _emit_status(
+        {
+            "event": "bootstrap-materialize.start",
+            "runId": run["runId"],
+            "checkpointId": "C0",
+        }
+    )
+    snapshot = open_source_snapshot(
+        Path(str(checkpoint["sourceSnapshotContainer"])),
+        expected_key=str(checkpoint["sourceSnapshotKey"]),
+        timeout_seconds=1800,
+    )
+    workspace_root = bootstrap_workspace_root(run_dir)
+    if workspace_root.exists():
+        shutil.rmtree(workspace_root, ignore_errors=True)
+    _materialize_trial_tree(snapshot, workspace_root, args.timeout_seconds)
+    project_relative = Path(str(checkpoint.get("projectRelative") or "."))
+    project_path = workspace_root / project_relative
+    install_result = _run_install(
+        project_path,
+        timeout_seconds=args.timeout_seconds,
+        progress_label="iterative migration bootstrap materialization",
+    )
+    run = dict(run)
+    run["bootstrapRefs"] = {
+        "workspaceRoot": str(workspace_root),
+        "projectRelative": str(project_relative),
+        "installExitCode": install_result.returncode,
+    }
+    run["updatedAt"] = _now_iso()
+    save_run(run_dir, run)
+    _emit_status(
+        {
+            "event": "bootstrap-materialize.done",
+            "runId": run["runId"],
+            "checkpointId": "C0",
+            "installExitCode": install_result.returncode,
+            "outputTail": (install_result.stdout or install_result.stderr or "")[-2000:]
+            if install_result.returncode != 0
+            else "",
+        }
+    )
+    return 0
+
+
 def cmd_verify_bootstrap(args: argparse.Namespace) -> int:
-    """Re-run the C0 control verification after a version-neutral bootstrap repair."""
+    """Re-run the C0 control verification on the REPAIRED bootstrap trial
+    (version-neutral). On success the trial's repaired bytes become the NEW C0
+    source snapshot: the source/config identity of checkpoint C0 is replaced by
+    a fresh sealed snapshot so every later materialization uses repaired bytes."""
     run_dir = Path(args.run_dir).resolve()
     run = load_run(run_dir)
     config = load_config(run_dir)
@@ -887,22 +973,52 @@ def cmd_verify_bootstrap(args: argparse.Namespace) -> int:
             raise InvalidInputError(f"PHASE_NOT_BOOTSTRAP: {run.get('phase')}")
         if not run_budget_ok(config, run):
             raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
-        project_dir = Path(config["projectDir"])
+        refs = run.get("bootstrapRefs") or {}
+        if not refs.get("workspaceRoot"):
+            raise InvalidInputError(
+                "BOOTSTRAP_TRIAL_MISSING: запустите bootstrap-materialize перед verify-bootstrap"
+            )
+        workspace_root = Path(str(refs["workspaceRoot"]))
+        project_path = workspace_root / str(refs.get("projectRelative") or ".")
+        if not (project_path / "package.json").exists():
+            raise InvalidInputError(f"BOOTSTRAP_TRIAL_PROJECT_MISSING: {project_path}")
         checkpoint = load_checkpoint(run_dir, "C0")
         verify_config = verify_config_from(config["verifyConfig"], run_dir)
         verify_config = dataclasses.replace(
             verify_config, verification_purpose="baseline-control"
         )
         result = verify_assignment(
-            project_dir,
+            project_path,
             checkpoint["fullAssignment"],
             config=verify_config,
             run_project_checks=True,
             progress_label="iterative migration bootstrap re-verification",
         )
         if result.ok:
+            # The repaired trial becomes the authoritative C0 source identity:
+            # capture a NEW durable snapshot at the SAME checkpoint slot (C0) so
+            # the source key/container point at the repaired bytes.
+            snapshot_container = run_dir / SOURCE_DIR / "C0"
+            new_snapshot = capture_durable_source_snapshot(
+                project_path, snapshot_container, timeout_seconds=1800
+            )
+            project_relative = resolve_project_relative(project_path, new_snapshot)
+            manifest_hash, lock_hash, _lock = manifest_and_lock_hashes(project_path)
             checkpoint = dict(checkpoint)
             checkpoint["status"] = "VERIFIED"
+            checkpoint["sourceSnapshotKey"] = new_snapshot.key
+            checkpoint["sourceSnapshotContainer"] = str(new_snapshot.container)
+            checkpoint["sourceHead"] = new_snapshot.git_head or ""
+            checkpoint["projectRelative"] = str(project_relative)
+            checkpoint["manifestHash"] = manifest_hash
+            checkpoint["lockfileHash"] = lock_hash or ""
+            checkpoint["resolvedStateKey"] = (
+                result.resolved_state_key or checkpoint.get("resolvedStateKey", "")
+            )
+            checkpoint["observedResolvedHash"] = (
+                result.observed_resolved_hash
+                or observed_resolved_hash(result.observed_resolved_versions or {})
+            )
             checkpoint["updatedAt"] = _now_iso()
             checkpoint["verification"] = {
                 "status": "passed",
@@ -910,11 +1026,10 @@ def cmd_verify_bootstrap(args: argparse.Namespace) -> int:
                 "commands": list(verify_config.commands),
                 "failingCommands": [],
             }
-            checkpoint["resolvedStateKey"] = result.resolved_state_key or checkpoint.get("resolvedStateKey", "")
-            checkpoint["observedResolvedHash"] = result.observed_resolved_hash or checkpoint.get("observedResolvedHash", "")
             save_checkpoint(run_dir, checkpoint)
             run = dict(run)
             run["phase"] = "READY"
+            run.pop("bootstrapRefs", None)
             run["updatedAt"] = _now_iso()
             save_run(run_dir, run)
             write_repair_requests(run_dir, [])
@@ -924,6 +1039,7 @@ def cmd_verify_bootstrap(args: argparse.Namespace) -> int:
                     "runId": run["runId"],
                     "checkpointId": "C0",
                     "phase": "READY",
+                    "newSourceSnapshotKey": new_snapshot.key,
                 }
             )
             return 0
@@ -2322,6 +2438,12 @@ def build_parser() -> argparse.ArgumentParser:
     verify_bootstrap = sub.add_parser("verify-bootstrap", help="Повторная контрольная проверка C0 после bootstrap repair")
     verify_bootstrap.add_argument("--timeout-seconds", type=int, default=1800)
 
+    bootstrap_materialize = sub.add_parser(
+        "bootstrap-materialize",
+        help="Материализация version-neutral trial для repair исходников C0",
+    )
+    bootstrap_materialize.add_argument("--timeout-seconds", type=int, default=1800)
+
     plan_next = sub.add_parser("plan-next", help="Выбрать следующий небольшой шаг от активного checkpoint")
 
     materialize = sub.add_parser("materialize", help="Физическая материализация точных версий в isolated trial")
@@ -2358,6 +2480,7 @@ def build_parser() -> argparse.ArgumentParser:
 COMMANDS = {
     "begin": cmd_begin,
     "verify-bootstrap": cmd_verify_bootstrap,
+    "bootstrap-materialize": cmd_bootstrap_materialize,
     "plan-next": cmd_plan_next,
     "materialize": cmd_materialize,
     "precheck": cmd_precheck,

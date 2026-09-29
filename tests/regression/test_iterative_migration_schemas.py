@@ -440,6 +440,63 @@ class IterativeMigrationGuardTests(unittest.TestCase):
             )
             self.assertIn("TRIAL_PROJECT_MISSING", str(ctx.exception))
 
+    def test_verify_bootstrap_requires_trial_and_bootstrap_phase(self) -> None:
+        # R7: the control re-verify runs on the isolated version-neutral trial
+        # (created by bootstrap-materialize), NEVER on the developer checkout, so
+        # without durable bootstrapRefs it must refuse instead of re-checking
+        # config.projectDir.
+        from iterative_migration import cmd_verify_bootstrap
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = _RunDir(Path(tmp))
+            run_dir.write_run(_run_dict(phase="READY"))
+            run_dir.write_config()
+            run_dir.write_checkpoint()
+            import argparse
+
+            args = argparse.Namespace(run_dir=str(run_dir.root), owner="test")
+            with self.assertRaises(InvalidInputError) as ctx:
+                cmd_verify_bootstrap(args)
+            self.assertIn("PHASE_NOT_BOOTSTRAP", str(ctx.exception))
+
+            run_dir.write_run(_run_dict(phase="BOOTSTRAP_REPAIR"))
+            with self.assertRaises(InvalidInputError) as ctx:
+                cmd_verify_bootstrap(args)
+            self.assertIn("BOOTSTRAP_TRIAL_MISSING", str(ctx.exception))
+
+    def test_bootstrap_materialize_guards_phase_and_request(self) -> None:
+        from iterative_migration import (
+            InvalidInputError,
+            cmd_bootstrap_materialize,
+            write_repair_requests,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = _RunDir(Path(tmp))
+            run_dir.write_run(_run_dict(phase="READY"))
+            run_dir.write_config()
+            run_dir.write_checkpoint()
+            import argparse
+
+            args = argparse.Namespace(run_dir=str(run_dir.root), owner="test", timeout_seconds=1800)
+            with self.assertRaises(InvalidInputError) as ctx:
+                cmd_bootstrap_materialize(args)
+            self.assertIn("PHASE_NOT_BOOTSTRAP", str(ctx.exception))
+
+            run_dir.write_run(_run_dict(phase="BOOTSTRAP_REPAIR"))
+            with self.assertRaises(InvalidInputError) as ctx:
+                cmd_bootstrap_materialize(args)
+            self.assertIn("BOOTSTRAP_REQUEST_MISSING", str(ctx.exception))
+
+            write_repair_requests(run_dir.root, [{"bootstrap": True, "reason": "C0 red"}])
+            # With a live bootstrap request the materializer proceeds to the
+            # sealed snapshot: the fixture has no real source container, so it
+            # must fail there (controlled), i.e. past the guards.
+            with self.assertRaises(Exception) as ctx:
+                cmd_bootstrap_materialize(args)
+            self.assertNotIn("BOOTSTRAP_REQUEST_MISSING", str(ctx.exception))
+            self.assertNotIn("PHASE_NOT_BOOTSTRAP", str(ctx.exception))
+
     def test_plan_next_with_red_checkpoint_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = _RunDir(Path(tmp))

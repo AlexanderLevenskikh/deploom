@@ -41,6 +41,18 @@ export type IterativeAgentContext = {
   taskText: string
 }
 
+export type IterativeBootstrapContext = {
+  runId: string
+  checkpointId: string
+  projectName: string
+  targetLevel: string
+  workspaceRoot: string
+  projectRelative: string
+  assignment: Array<[string, string]>
+  repairRequests: IterativeRepairRequest[]
+  taskText: string
+}
+
 export type IterativeFeedbackKind =
   | 'REPAIRING'
   | 'READY_FOR_VERIFY'
@@ -104,6 +116,52 @@ export function buildIterativeRepairPrompt(ctx: IterativeAgentContext): string {
     `- НЕ запускай установку пакетов и не редактируй lock-файлы.`,
     `- Проверки зависимостей и верификация выполнятся после тебя контроллером.`,
     `- Если ремонт невозможен без изменения зависимостей — опиши это словами и предложи альтернативу.`,
+    ``,
+    `## Формат ответа`,
+    `Заверши ответ строкой "${CHANGED_FILES_MARKER}" и перечисли по одному изменённому файлу на строку (путь относительно корня trial).`,
+  ].join('\n')
+}
+
+/** RU bootstrap repair prompt. This is VERSION-NEUTRAL: C0 control failed on
+ * source/config, not dependency versions. The agent fixes source/config in the
+ * isolated version-neutral trial (C0 bytes), and MAY NOT touch dependency
+ * versions or lockfiles; verify-bootstrap re-runs the control afterwards. */
+export function buildIterativeBootstrapPrompt(ctx: IterativeBootstrapContext): string {
+  const forbidden = [...ITERATIVE_FORBIDDEN_NAMES].sort().join(', ')
+  const requests = ctx.repairRequests.map((request, index) => {
+    const commands = request.failingCommands
+      .map((item) => `  $ ${item.command}  (exit ${item.exitCode})`)
+      .join('\n')
+    const tail = request.diagnosticsTail ? `\nХвост диагностики (последние строки вывода):\n${request.diagnosticsTail}` : ''
+    return (
+      `### Запрос на ремонт ${index + 1}: ${request.requestId}\n` +
+      `Причина: ${request.reason}\n` +
+      `Падающие проверки:\n${commands}${tail}`
+    )
+  }).join('\n\n')
+
+  return [
+    `# Bootstrap-ремонт исходников (DepLoom, iterative migration)`,
+    ``,
+    `Проект: ${ctx.projectName} (целевой уровень: ${ctx.targetLevel}).`,
+    `Контрольная проверка C0 (${ctx.checkpointId}) упала на ИСХОДНОМ состоянии зависимостей.`,
+    `Назначение версий НЕ меняется:`,
+    ``,
+    `## Текущее назначение (зафиксировано, менять нельзя)`,
+    ctx.assignment.map(([name, version]) => `  - ${name} = ${version}`).join('\n'),
+    ``,
+    `## Задание на адаптацию (ТЗ)`,
+    ctx.taskText,
+    ``,
+    `## Открытые запросы на ремонт`,
+    requests,
+    ``,
+    `## Правила работы`,
+    `- Работай ТОЛЬКО внутри изолированного version-neutral trial: ${join(ctx.workspaceRoot, ctx.projectRelative)}.`,
+    `- Меняй только исходный/конфигурационный код проекта. НЕЛЬЗЯ трогать: node_modules и файлы ${forbidden} — версии и lock-файлы принадлежат контроллеру.`,
+    `- НЕ запускай установку пакетов, не правь package.json и lock-файлы. Это bootstrap: зависимости оставляем как есть.`,
+    `- Контрольная проверка перезапустится после тебя контроллером.`,
+    `- Если контроль не проходим без изменения зависимостей — опиши это словами и предложи альтернативу.`,
     ``,
     `## Формат ответа`,
     `Заверши ответ строкой "${CHANGED_FILES_MARKER}" и перечисли по одному изменённому файлу на строку (путь относительно корня trial).`,
