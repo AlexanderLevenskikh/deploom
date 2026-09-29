@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
 import updaterPackage from 'electron-updater'
 import { isDeterministicToolFailure, isDeterministicSourcePreflightFailure, formatSourceCheckoutDirtyFailure } from './baseline-retry.js'
 import { baselineFailureMessage } from './baseline-failure.js'
@@ -52,7 +52,9 @@ import { normalizeBudgetField } from './baseline-intent.js'
 import { summarizeUpdaterError } from './updater-error.js'
 import { flowNotificationContent, type FlowNotificationEvent } from './notifications.js'
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveSpawnInvocation } from './process-launcher.js'
+import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
+import { currentTask as readIterativeCurrentTask, iterativeRunDirPath, missingTaskExportInput, taskStaleness } from './iterative-migration.js'
+import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
 import { createHash, randomUUID } from 'node:crypto'
@@ -7231,6 +7233,114 @@ function setupIpc(): void {
     const project = findProject(workspace, input.projectName)
     return baselineIntentPlan(workspace, project)
   })
+
+  function iterativeTaskRunDir(workspace: WorkspaceRecord, project: ProjectSpec): string {
+    return iterativeRunDirPath(workspace.path, project.name)
+  }
+
+  // Iterative migration ТЗ (task) surface. The Desktop is a pure CONSUMER of
+  // the artifact the Python export-task step publishes under the durable run
+  // dir (.dependency-roadmap/iterative/<token>/task). Reading never starts a
+  // Baseline and never mutates producer bytes; export runs the real CLI when
+  // durable JSON is sufficient and diagnoses TASK_INPUT_INSUFFICIENT otherwise.
+  ipcMain.handle('flow:iterative:task', async (_event, input: { workspaceId?: string; projectName: string }) => {
+    const state = loadState()
+    const workspace = findWorkspace(state, input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    const runDir = iterativeTaskRunDir(workspace, project)
+    const missing = missingTaskExportInput(runDir)
+    const task = readIterativeCurrentTask(runDir)
+    const staleness = taskStaleness(runDir)
+    return {
+      present: Boolean(task),
+      missing,
+      stale: staleness.stale,
+      staleReason: staleness.reason,
+      task: task
+        ? {
+            artifactId: task.manifest.artifactId,
+            runId: task.manifest.runId,
+            projectName: task.manifest.projectName,
+            targetCheckpointId: task.manifest.targetCheckpointId,
+            languages: task.manifest.languages,
+            actions: task.manifest.actions,
+            deferred: task.manifest.deferred,
+            exactVersions: task.manifest.exactVersions,
+            completeness: task.manifest.completeness,
+            verification: task.manifest.verification,
+            content: task.text.ru ?? Object.values(task.text)[0] ?? '',
+            contentHashes: task.manifest.contents,
+            createdAt: task.manifest.createdAt,
+          }
+        : undefined,
+      runDir,
+    }
+  })
+
+  ipcMain.handle('flow:iterative:export', async (_event, input: { workspaceId?: string; projectName: string }) => {
+    const state = loadState()
+    const workspace = findWorkspace(state, input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    const runDir = iterativeTaskRunDir(workspace, project)
+    const missing = missingTaskExportInput(runDir)
+    if (missing.length > 0) {
+      return { ok: false, missing, error: `TASK_INPUT_INSUFFICIENT: ${missing.join('; ')}` }
+    }
+    const python = resolveExecutable('python')
+    const generator = join(bundledToolDir(), 'iterative_migration.py')
+    const result = await spawnCapture(
+      python,
+      [generator, 'export-task', '--run-dir', runDir, '--language', 'both'],
+      workspace.path,
+      120_000,
+    )
+    if (result.code !== 0) {
+      return { ok: false, error: result.stderr.trim() || `EXPORT_EXIT_${result.code}` }
+    }
+    const task = readIterativeCurrentTask(runDir)
+    return { ok: true, artifactId: task?.manifest.artifactId, stale: task ? taskStaleness(runDir).stale : undefined }
+  })
+
+  ipcMain.handle(
+    'flow:iterative:copy-task',
+    async (_event, input: { workspaceId?: string; projectName: string; language?: string }) => {
+      const state = loadState()
+      const workspace = findWorkspace(state, input.workspaceId)
+      const project = findProject(workspace, input.projectName)
+      const task = readIterativeCurrentTask(iterativeTaskRunDir(workspace, project))
+      if (!task) return { ok: false, error: 'NO_TASK' }
+      if (taskStaleness(iterativeTaskRunDir(workspace, project)).stale) {
+        return { ok: false, error: 'TASK_STALE: переэкспортируйте задание перед отправкой' }
+      }
+      const writer: ClipboardWriter = { writeText: (text) => clipboard.writeText(text), readText: () => clipboard.readText() }
+      return copyTaskWithVerification(task, input.language ?? 'ru', writer)
+    },
+  )
+
+  ipcMain.handle(
+    'flow:iterative:save-task',
+    async (event, input: { workspaceId?: string; projectName: string; language?: string }) => {
+      const state = loadState()
+      const workspace = findWorkspace(state, input.workspaceId)
+      const project = findProject(workspace, input.projectName)
+      const runDir = iterativeTaskRunDir(workspace, project)
+      const task = readIterativeCurrentTask(runDir)
+      if (!task) return { ok: false, error: 'NO_TASK' }
+      const language = input.language ?? 'ru'
+      const text = task.text[language]
+      if (text === undefined) return { ok: false, error: `NO_TASK_LANGUAGE: ${language}` }
+      const options: Electron.SaveDialogOptions = {
+        title: 'Сохранить задание на адаптацию зависимостей',
+        defaultPath: join(runDir, 'task', task.manifest.artifactId, `task.${language}.md`),
+        filters: [{ name: 'Markdown', extensions: ['md'] }],
+      }
+      const owner = BrowserWindow.fromWebContents(event.sender) ?? undefined
+      const result = owner ? await dialog.showSaveDialog(owner, options) : await dialog.showSaveDialog(options)
+      if (result.canceled || !result.filePath) return { ok: true, canceled: true }
+      writeFileSync(result.filePath, text, 'utf8')
+      return { ok: true, canceled: false, path: result.filePath }
+    },
+  )
 
   ipcMain.handle('flow:dependency-graph-snapshot', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()

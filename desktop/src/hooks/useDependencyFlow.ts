@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntentPlan, BootstrapPayload, DependencyGraphSnapshot, DownloadSaved, FlowAction, HardwareSnapshot, JobFinished, JobOutput, ProjectSpec, TargetLevel, ThemePreference, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
+import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntentPlan, BootstrapPayload, DependencyGraphSnapshot, DownloadSaved, FlowAction, HardwareSnapshot, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobFinished, JobOutput, ProjectSpec, TargetLevel, ThemePreference, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
 import { parseBaselineDecision } from '../data/baselineIntent'
 import { goalSeekingStopReason, nextAutopilotAction, type AutopilotPolicyState } from '../autopilot-policy'
 
@@ -592,6 +592,22 @@ export function useDependencyFlow() {
     if (!api) return { schemaVersion: 1, project: projectName, capturedAt: new Date().toISOString(), packages: [], edges: [], intent: { policies: {}, deferredCohorts: [] }, manifestCoverage: { observed: 0, total: 0, missing: [] }, authorityBoundary: { packageList: 'PROJECT_MANIFEST', relations: 'OBSERVED_LOCAL_MANIFEST', cohorts: 'DIAGNOSTIC_HINT_OR_USER_POLICY', proofAuthority: false } }
     return api.getDependencyGraphSnapshot({ workspaceId: selectedWorkspaceId, projectName })
   }, [api, selectedWorkspaceId])
+  const getIterativeTask = useCallback(async (projectName: string): Promise<IterativeTaskSnapshot> => {
+    if (!api) return { present: false, missing: ['NO_DESKTOP_API'], stale: false }
+    return api.getIterativeTask({ workspaceId: selectedWorkspaceId, projectName })
+  }, [api, selectedWorkspaceId])
+  const exportIterativeTask = useCallback(async (projectName: string): Promise<IterativeTaskActionOutcome> => {
+    if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
+    return api.exportIterativeTask({ workspaceId: selectedWorkspaceId, projectName })
+  }, [api, selectedWorkspaceId])
+  const copyIterativeTask = useCallback(async (projectName: string, language?: string): Promise<IterativeTaskActionOutcome> => {
+    if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
+    return api.copyIterativeTask({ workspaceId: selectedWorkspaceId, projectName, language })
+  }, [api, selectedWorkspaceId])
+  const saveIterativeTask = useCallback(async (projectName: string, language?: string): Promise<IterativeTaskActionOutcome> => {
+    if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
+    return api.saveIterativeTask({ workspaceId: selectedWorkspaceId, projectName, language })
+  }, [api, selectedWorkspaceId])
   const setThemePreference = useCallback(async (preference: ThemePreference) => { setThemePreferenceState(preference); if (!api) return; const result = await api.setThemePreference(preference); setThemePreferenceState(result.preference); document.documentElement.dataset.theme = result.preference === 'system' ? '' : result.preference }, [api])
 
   const cancelJob = useCallback(async () => {
@@ -675,6 +691,6 @@ export function useDependencyFlow() {
   return {
     payload, loading, error, baselineDecision, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch, acknowledgeDraftRun,
     load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, removeProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches,
-    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult, getDependencyGraphSnapshot, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
+    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult, getDependencyGraphSnapshot, getIterativeTask, exportIterativeTask, copyIterativeTask, saveIterativeTask, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }
 }

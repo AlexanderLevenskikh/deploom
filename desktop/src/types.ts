@@ -332,6 +332,33 @@ export type JobFinished = { jobId: string; action: FlowAction; workspaceId?: str
 export type DownloadSaved = { path: string; filename: string; workspaceId?: string; projectName?: string; recalculate?: boolean; recalculateProjects?: string[] }
 export type UpdateStatus = { state: 'idle' | 'checking' | 'available' | 'downloading' | 'current' | 'ready' | 'error'; version?: string; percent?: number; message?: string; authRequired?: boolean }
 
+export type IterativeTaskUiAction = { package: string; from: string; to: string }
+export type IterativeTaskUiDeferred = { package: string; current: string; lagPolicyTarget: string; reason: string }
+export type IterativeTaskUiView = {
+  artifactId: string
+  runId: string
+  projectName: string
+  targetCheckpointId: string
+  languages: string[]
+  actions: IterativeTaskUiAction[]
+  deferred: IterativeTaskUiDeferred[]
+  exactVersions: Record<string, string>
+  completeness: { policySatisfied: boolean; denominator: number; remaining: number }
+  verification: { status: string }
+  content: string
+  contentHashes: Record<string, { contentHash: string; contentBytes: number }>
+  createdAt: string
+}
+export type IterativeTaskSnapshot = {
+  present: boolean
+  missing: string[]
+  stale: boolean
+  staleReason?: string
+  task?: IterativeTaskUiView
+  runDir?: string
+}
+export type IterativeTaskActionOutcome = { ok: boolean; artifactId?: string; stale?: boolean; canceled?: boolean; path?: string; fingerprint?: string; missing?: string[]; error?: string }
+
 export type DependencyFlowApi = {
   bootstrap: () => Promise<BootstrapPayload>
   pickDirectory: () => Promise<string | undefined>
@@ -349,6 +376,10 @@ export type DependencyFlowApi = {
   getCurrentProjectPromptPreview: () => Promise<ProjectPromptPreview | undefined>
   getCurrentDraftResult: (input: { workspaceId?: string; projectName: string; runId?: string }) => Promise<{ result: DraftResultSnapshot; prompt?: ProjectPromptPreview; plan?: string } | undefined>
   getDependencyGraphSnapshot: (input: { workspaceId?: string; projectName: string }) => Promise<DependencyGraphSnapshot>
+  getIterativeTask: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeTaskSnapshot>
+  exportIterativeTask: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeTaskActionOutcome>
+  copyIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
+  saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   runAction: (input: ActionInput) => Promise<{ jobId: string; runId?: string; preview: string[] }>
   cancelJob: (jobId: string) => Promise<boolean>
   pauseJob: (jobId: string) => Promise<boolean>
