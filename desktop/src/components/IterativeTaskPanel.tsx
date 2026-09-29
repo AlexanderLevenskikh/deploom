@@ -1,8 +1,8 @@
-import { Check, Clipboard, ExternalLink, FileText, Play, RefreshCw, Save, X } from 'lucide-react'
+import { Check, Clipboard, ExternalLink, FileText, Play, RefreshCw, Save, Wrench, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useLanguage } from '../i18n'
-import type { IterativeStatusOutcome, IterativeStepOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
+import type { IterativeAgentOutcome, IterativeStatusOutcome, IterativeStepOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
 
 type Props = {
   workspaceId?: string
@@ -14,6 +14,7 @@ type Props = {
   onSave: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
   onStep: (projectName: string) => Promise<IterativeStepOutcome>
+  onAgent: (projectName: string) => Promise<IterativeAgentOutcome>
   onOpenPath: (path?: string) => Promise<void>
 }
 
@@ -22,7 +23,7 @@ type PanelState =
   | { phase: 'ready'; snapshot: IterativeTaskSnapshot }
   | { phase: 'error'; message: string }
 
-export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, onCopy, onSave, onStatus, onStep, onOpenPath }: Props) {
+export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, onCopy, onSave, onStatus, onStep, onAgent, onOpenPath }: Props) {
   const { text, language } = useLanguage()
   const [state, setState] = useState<PanelState>({ phase: 'loading' })
   const [busy, setBusy] = useState<string>()
@@ -101,6 +102,31 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
           text(
             `Шаг «${outcome.step ?? ''}» выполнен${outcome.next ? ` · далее: ${outcome.next.step ?? '—'}` : ''}`,
             `Step "${outcome.step ?? ''}" done${outcome.next ? ` · next: ${outcome.next.step ?? '—'}` : ''}`,
+          ),
+        )
+      } else {
+        setNote(outcome.error ?? 'Ошибка')
+      }
+    } catch (error) {
+      setNote(error instanceof Error ? error.message : String(error))
+    } finally {
+      setStepBusy(false)
+      void refreshRunner()
+      void load()
+    }
+  }
+
+  const agentNow = async () => {
+    setStepBusy(true)
+    setNote(undefined)
+    try {
+      const outcome = await onAgent(projectName)
+      if (outcome.ok) {
+        const changed = (outcome.changedFiles ?? []).length
+        setNote(
+          text(
+            `Агент исправил ${changed} файлов${outcome.next ? ` · далее: ${outcome.next.step ?? '—'}` : ''}`,
+            `Agent repaired ${changed} file(s)${outcome.next ? ` · next: ${outcome.next.step ?? '—'}` : ''}`,
           ),
         )
       } else {
@@ -201,6 +227,11 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
           ) : null}
 
           <footer className="baseline-intent-actions">
+            {runner?.decision?.step === 'agent' ? (
+              <button type="button" className="button primary" disabled={busy !== undefined || stepBusy} onClick={() => void agentNow()}>
+                <Wrench size={16} />{text('Исправить агентом', 'Repair with agent')}
+              </button>
+            ) : null}
             <button type="button" className="button secondary" disabled={busy !== undefined || stepBusy} onClick={() => void stepNow()}>
               <Play size={16} />{text('Выполнить следующий шаг', 'Run next step')}
             </button>

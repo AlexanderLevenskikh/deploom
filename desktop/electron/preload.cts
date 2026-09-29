@@ -23,6 +23,7 @@ const api = {
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => ipcRenderer.invoke('flow:iterative:save-task', input),
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:status', input),
   iterativeStep: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:step', input),
+  iterativeAgent: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:agent', input),
   runAction: (input: unknown) => ipcRenderer.invoke('flow:run-action', input),
   cancelJob: (jobId: string) => ipcRenderer.invoke('flow:cancel-job', jobId),
   pauseJob: (jobId: string) => ipcRenderer.invoke('flow:pause-job', jobId),

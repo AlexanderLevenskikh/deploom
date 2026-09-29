@@ -55,6 +55,7 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:chil
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
 import { currentTask as readIterativeCurrentTask, iterativeRunDirPath, missingTaskExportInput, taskStaleness } from './iterative-migration.js'
 import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
+import { agentPromptFile, buildFeedbackPayload, buildIterativeRepairPrompt, changedFilesFromBaseline, iterativeApplyFeedbackInvocation, parseChangedFilesFromAgentOutput, trialBaselineFile, trialProjectPath, writeTrialBaseline } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
@@ -7426,6 +7427,150 @@ function setupIpc(): void {
         : undefined
       const next = refreshed ? decideNextStep(runDir, refreshed) : undefined
       return { ok: true, step: decision.step, phase: next?.phase, next }
+    } finally {
+      iterativeStepInFlight.delete(project.name)
+    }
+  })
+
+  async function startStandaloneOpenCodeServer(cwd: string): Promise<{ url: string; databasePath: string; stop: () => void } | undefined> {
+    const directory = join(app.getPath('temp'), `iter-agent-opencode-${randomUUID()}`)
+    mkdirSync(directory, { recursive: true })
+    const databasePath = join(directory, 'opencode.db')
+    const port = await reserveLocalPort()
+    const url = `http://127.0.0.1:${port}`
+    const commandEnv = commandEnvironment(openCodeDatabaseEnv(process.env, databasePath))
+    const invocation = resolveSpawnInvocation('opencode', ['serve', '--hostname', '127.0.0.1', '--port', String(port)], { env: commandEnv })
+    const server = spawn(invocation.command, invocation.args, {
+      cwd,
+      shell: false,
+      detached: processTreeDetached(),
+      windowsHide: true,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+      env: commandEnv,
+    })
+    let tail = ''
+    server.stdout.on('data', (chunk: Buffer) => { tail = `${tail}${decodeProcessOutputChunk(chunk)}`.slice(-2000) })
+    server.stderr.on('data', (chunk: Buffer) => { tail = `${tail}${decodeProcessOutputChunk(chunk)}`.slice(-2000) })
+    server.on('error', (error) => { tail = `${tail}\n${error.message}`.slice(-2000) })
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if (server.exitCode !== null) break
+      try {
+        const health = await fetchWithTimeout(`${url}/global/health`)
+        if (health.ok) return { url, databasePath, stop: () => { if (server.exitCode === null) killProcessTree(server) } }
+      } catch {
+        // server is still starting
+      }
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+    }
+    if (server.exitCode === null) killProcessTree(server)
+    throw new Error(`OPENCODE_SERVER_START_FAILED: ${tail.trim()}`)
+  }
+
+  ipcMain.handle('flow:iterative:agent', async (_event, input: { workspaceId?: string; projectName: string }) => {
+    const state = loadState()
+    const workspace = findWorkspace(state, input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    const runDir = iterativeTaskRunDir(workspace, project)
+    if (iterativeStepInFlight.has(project.name)) {
+      return { ok: false, error: 'STEP_IN_PROGRESS' }
+    }
+    if (!existsSync(join(runDir, 'run.json'))) {
+      return { ok: false, error: 'NO_RUN' }
+    }
+    if (taskStaleness(runDir).stale) {
+      return { ok: false, error: 'TASK_STALE: переустановите ожидаемый результат перед ремонтом' }
+    }
+    const python = resolveExecutable('python')
+    const generator = join(bundledToolDir(), 'iterative_migration.py')
+    const statusResult = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
+    const payload = statusResult.code === 0
+      ? parseIterativeStatusPayload(statusResult.stdout) ?? readIterativeStatus(runDir)
+      : undefined
+    if (!payload) {
+      return { ok: false, error: statusResult.stderr.trim() || 'STATUS_UNREADABLE' }
+    }
+    const decision = decideNextStep(runDir, payload)
+    if (decision.step !== 'agent') {
+      return { ok: false, error: `NO_REPAIR_PENDING: phase=${String(payload.run?.phase ?? '')}` }
+    }
+    const candidate = payload.candidate as Record<string, any> | undefined
+    if (!candidate) return { ok: false, error: 'NO_CANDIDATE' }
+    const refs = (candidate.materializationRefs ?? {}) as Record<string, string>
+    const workspaceRoot = refs.workspaceRoot ?? ''
+    const projectRelative = refs.projectRelative || '.'
+    if (!workspaceRoot || !existsSync(workspaceRoot)) return { ok: false, error: `TRIAL_MISSING: ${workspaceRoot}` }
+    const projectPath = trialProjectPath(workspaceRoot, projectRelative)
+    const repairRequests = (Array.isArray(payload.openRepairRequests) ? payload.openRepairRequests : []) as Array<{
+      requestId?: string; reason?: string; failingCommands?: Array<{ command: string; exitCode: number }>; diagnosticsTail?: string;
+    }>
+    const task = readIterativeCurrentTask(runDir)
+    const taskText = task?.text.ru ?? task?.text.en ?? ''
+
+    const ctx = {
+      runId: String(candidate.runId ?? ''),
+      candidateId: String(candidate.candidateId ?? ''),
+      baseCheckpointId: String(candidate.baseCheckpointId ?? ''),
+      attemptId: Number(candidate.attemptId ?? 0),
+      projectName: project.name,
+      targetLevel: String((payload.config as Record<string, any> | undefined)?.targetLevel ?? ''),
+      workspaceRoot,
+      projectRelative,
+      assignment: Object.entries((candidate.fullAssignment ?? {}) as Record<string, string>).sort(),
+      repairRequests: repairRequests.map((request) => ({
+        requestId: String(request.requestId ?? ''),
+        reason: String(request.reason ?? ''),
+        failingCommands: request.failingCommands ?? [],
+        diagnosticsTail: String(request.diagnosticsTail ?? ''),
+      })),
+      taskText,
+    }
+
+    iterativeStepInFlight.add(project.name)
+    let agentOutputTail = ''
+    try {
+      const baselineFile = trialBaselineFile(runDir)
+      if (!existsSync(baselineFile)) writeTrialBaseline(workspaceRoot, baselineFile)
+      const promptFile = agentPromptFile(runDir)
+      writeFileSync(promptFile, buildIterativeRepairPrompt(ctx), 'utf8')
+
+      const model = workspace.agent === 'opencode' ? workspace.agentModel : undefined
+      const transport = await startStandaloneOpenCodeServer(projectPath)
+      let output = ''
+      try {
+        const agentResult = await spawnCapture(
+          'opencode',
+          buildOpenCodeAgentArgs(projectPath, promptFile, model, undefined, transport?.url),
+          projectPath,
+          900_000,
+          transport ? { OPENCODE_DB: transport.databasePath } : undefined,
+        )
+        output = `${agentResult.stdout}\n${agentResult.stderr}`
+      } finally {
+        transport?.stop()
+      }
+      agentOutputTail = output.slice(-4000)
+      if (!output.trim()) return { ok: false, error: 'AGENT_NO_OUTPUT' }
+
+      const changed = [...new Set([
+        ...changedFilesFromBaseline(workspaceRoot, baselineFile),
+        ...parseChangedFilesFromAgentOutput(output),
+      ])].sort()
+      const feedback = buildFeedbackPayload(ctx, changed, 'READY_FOR_VERIFY', repairRequests[0]?.reason || 'agent repair applied')
+      const feedbackFile = join(runDir, 'trial', 'agent-feedback.json')
+      writeFileSync(feedbackFile, JSON.stringify(feedback), 'utf8')
+      const applied = await spawnCapture(python, iterativeApplyFeedbackInvocation(runDir, feedbackFile, generator, python).args, workspace.path, 120_000)
+      if (applied.code !== 0) {
+        const raw = `${applied.stderr.trim()}\n${applied.stdout.trim()}`.trim() || `APPLY_FEEDBACK_EXIT_${applied.code}`
+        return { ok: false, error: raw.slice(0, 4000), changedFiles: changed, agentOutputTail }
+      }
+      const refresh = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
+      const refreshed = refresh.code === 0
+        ? parseIterativeStatusPayload(refresh.stdout) ?? readIterativeStatus(runDir)
+        : undefined
+      const next = refreshed ? decideNextStep(runDir, refreshed) : undefined
+      return { ok: true, changedFiles: changed, phase: next?.phase, next, agentOutputTail }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error), agentOutputTail }
     } finally {
       iterativeStepInFlight.delete(project.name)
     }

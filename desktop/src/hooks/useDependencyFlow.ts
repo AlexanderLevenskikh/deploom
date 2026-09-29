@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntentPlan, BootstrapPayload, DependencyGraphSnapshot, DownloadSaved, FlowAction, HardwareSnapshot, IterativeStatusOutcome, IterativeStepOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobFinished, JobOutput, ProjectSpec, TargetLevel, ThemePreference, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
+import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntentPlan, BootstrapPayload, DependencyGraphSnapshot, DownloadSaved, FlowAction, HardwareSnapshot, IterativeAgentOutcome, IterativeStatusOutcome, IterativeStepOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobFinished, JobOutput, ProjectSpec, TargetLevel, ThemePreference, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
 import { parseBaselineDecision } from '../data/baselineIntent'
 import { goalSeekingStopReason, nextAutopilotAction, type AutopilotPolicyState } from '../autopilot-policy'
 
@@ -616,6 +616,10 @@ export function useDependencyFlow() {
     if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
     return api.iterativeStep({ workspaceId: selectedWorkspaceId, projectName })
   }, [api, selectedWorkspaceId])
+  const iterativeAgent = useCallback(async (projectName: string): Promise<IterativeAgentOutcome> => {
+    if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
+    return api.iterativeAgent({ workspaceId: selectedWorkspaceId, projectName })
+  }, [api, selectedWorkspaceId])
   const setThemePreference = useCallback(async (preference: ThemePreference) => { setThemePreferenceState(preference); if (!api) return; const result = await api.setThemePreference(preference); setThemePreferenceState(result.preference); document.documentElement.dataset.theme = result.preference === 'system' ? '' : result.preference }, [api])
 
   const cancelJob = useCallback(async () => {
@@ -699,6 +703,6 @@ export function useDependencyFlow() {
   return {
     payload, loading, error, baselineDecision, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch, acknowledgeDraftRun,
     load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, removeProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches,
-    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult, getDependencyGraphSnapshot, getIterativeTask, exportIterativeTask, copyIterativeTask, saveIterativeTask, iterativeStatus, iterativeStep, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
+    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult, getDependencyGraphSnapshot, getIterativeTask, exportIterativeTask, copyIterativeTask, saveIterativeTask, iterativeStatus, iterativeStep, iterativeAgent, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }
 }
