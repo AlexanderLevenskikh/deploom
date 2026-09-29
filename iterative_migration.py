@@ -1335,6 +1335,10 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
         for name in plan.packages
         if str(incumbent.get(name)) != str(assignment.get(name))
     }
+    # D4.5/D4.6: separate, non-fatal diagnostics over the project manifest —
+    # resolution-pin warnings and malformed Git dependency specs are surfaced
+    # alongside the candidate, never converted into install constraints.
+    dependency_diagnostics = _dependency_diagnostics(config.get("projectDir") or "")
     candidate: Dict[str, Any] = {
         "schemaVersion": SCHEMA_VERSION,
         "candidateId": _new_id("cand"),
@@ -1356,6 +1360,7 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
         "budgetConsumed": {},
         "materializationRefs": {},
         "resolverContextKey": "",
+        "dependencyDiagnostics": dependency_diagnostics,
         "createdAt": _now_iso(),
         "updatedAt": _now_iso(),
     }
@@ -1374,6 +1379,7 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
             "cohortPackages": sorted(changed.keys()),
             "assignmentFingerprint": assignment_fingerprint(assignment),
             "changedCount": len(changed),
+            "dependencyDiagnostics": dependency_diagnostics,
         }
     )
     return 0
@@ -1381,6 +1387,107 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
 
 def plan_visible_groups(atomic_groups: Sequence[Sequence[str]]) -> Sequence[Sequence[str]]:
     return atomic_groups
+
+
+def _is_git_dependency(spec: str) -> bool:
+    lowered = spec.lower()
+    return (
+        "git+" in lowered
+        or lowered.startswith("git://")
+        or "git@" in lowered
+        or lowered.startswith(("github:", "gitlab:", "bitbucket:"))
+        or ".git" in lowered
+    )
+
+
+def _git_dependency_issue(name: str, spec: str) -> Dict[str, Any]:
+    """Deterministic, local-only checks for a malformed Git dependency spec
+    (D4.6). Returns {} when the form is plausibly parseable — this is a
+    diagnostic, never an installer."""
+    lowered = spec.lower()
+    if any(ch in spec for ch in (" ", "\t", "\n", "\\", '"', "'")):
+        return {"code": "GIT_URL_WHITESPACE", "detail": "spec contains whitespace or quote characters"}
+    if "git@" in lowered and ":" not in spec:
+        return {"code": "GIT_SSH_WITHOUT_COLON", "detail": "ssh form 'git@<host><path>' must separate host and path with ':'"}
+    if "git+" in lowered and not any(
+        lowered.startswith(prefix) for prefix in ("git+ssh://", "git+https://", "git+http://", "git+file://")
+    ):
+        return {"code": "GIT_PLUS_NO_SCHEME", "detail": "'git+' must be followed by ssh://, https://, http:// or file://"}
+    for prefix in ("git+ssh://", "git+https://", "git+http://", "git://"):
+        if lowered.startswith(prefix):
+            rest = spec[len(prefix):].split("#", 1)[0]
+            if not rest or rest.split("/", 1)[0] in {"", ":", "."}:
+                return {"code": "GIT_URL_NO_HOST", "detail": f"{prefix} carries no host"}
+    return {}
+
+
+def _dependency_diagnostics(project_dir: Any) -> Dict[str, Any]:
+    """D4.5/D4.6: NON-FATAL structured diagnostics over the project manifest.
+
+    ``resolutionWarnings``: pins in `resolutions`/`overrides` that are not a
+    version-looking spec or that pin a package with no direct consumer; they
+    are surfaced separately and never become false install constraints.
+    ``gitUrlWarnings``: deterministically malformed Git dependency specs.
+    A missing/unreadable manifest yields ``manifestReadError``, never an
+    exception, so planning cannot be blocked by diagnostics.
+    """
+    result: Dict[str, Any] = {
+        "resolutionWarnings": [],
+        "gitUrlWarnings": [],
+        "manifestReadError": "",
+    }
+    manifest_path = Path(str(project_dir)) / "package.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never fail planning
+        result["manifestReadError"] = f"{exc}"
+        return result
+
+    pins: Dict[str, Any] = {}
+    for field in ("resolutions", "overrides"):
+        raw = manifest.get(field) or {}
+        if isinstance(raw, dict):
+            pins.update(raw)
+    consumers: Dict[str, Any] = {}
+    for field in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+        raw = manifest.get(field) or {}
+        if isinstance(raw, dict):
+            consumers.update(raw)
+    consumer_names = set(consumers)
+
+    for pin_key, pin_spec in sorted(pins.items()):
+        pin_key_str = str(pin_key)
+        if pin_key_str.startswith("@"):
+            package_part = pin_key_str.split("@", 2)[1] if pin_key_str.count("@") >= 2 else pin_key_str
+        else:
+            package_part = pin_key_str.rsplit("@", 1)[0] if pin_key_str.count("@") == 1 else pin_key_str
+        if not any(ch.isdigit() for ch in str(pin_spec)):
+            result["resolutionWarnings"].append({
+                "pin": pin_key_str,
+                "spec": str(pin_spec),
+                "code": "PIN_SPEC_NOT_VERSION",
+                "detail": "pin value does not look like a version spec",
+            })
+        if not any(
+            name == package_part
+            or (name.startswith(package_part + "@"))
+            for name in consumer_names
+        ):
+            result["resolutionWarnings"].append({
+                "pin": pin_key_str,
+                "spec": str(pin_spec),
+                "code": "PIN_WITHOUT_DIRECT_CONSUMER",
+                "detail": "pin has no direct consumer in the manifest; it cannot be the source of a resolved version",
+            })
+
+    for name, spec in sorted(consumers.items()):
+        spec_str = str(spec)
+        if not _is_git_dependency(spec_str):
+            continue
+        issue = _git_dependency_issue(name, spec_str)
+        if issue:
+            result["gitUrlWarnings"].append({"package": name, "spec": spec_str, **issue})
+    return result
 
 
 def _build_atomic_groups(
