@@ -1632,6 +1632,10 @@ def _precheck_locked(
 
     failing: List[Dict[str, Any]] = []
     first_failure: Optional[Dict[str, Any]] = None
+    runtime_env = _runtime_env(config)
+    base_env: Dict[str, str] = os.environ
+    if runtime_env:
+        base_env = {**base_env, **runtime_env}
     for command in commands:
         env: Dict[str, str] = {
             "CI": "1",
@@ -1642,7 +1646,7 @@ def _precheck_locked(
             project_path,
             timeout_seconds=_clamp_int(args.timeout_seconds, 1200, 120, 4 * 3600),
             env=env,
-            base_env=os.environ,
+            base_env=base_env,
             progress_label=f"iterative migration precheck {command}",
         )
         failed = result.returncode != 0
@@ -2755,6 +2759,7 @@ def _audit_locked(
         max_known_high=int((args.max_known_high if args.max_known_high is not None
                             else audit_policy.get("maxKnownHigh", 1))),
         yarn_audit_engine=args.yarn_audit_engine or "auto",
+        runtime_env=_runtime_env(config),
     )
     # R8: persist the FULL report as JSON/Markdown evidence (not just a status +
     # directory link), then record the coverage/vuln metrics in the checkpoint.

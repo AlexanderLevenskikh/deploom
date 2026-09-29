@@ -344,5 +344,67 @@ class YarnNpmAuditBridgeRegressionTests(unittest.TestCase):
             self.assertTrue(any("YARN_NPM_BRIDGE_DRIFT" in note for note in result["notes"]))
 
 
+    def test_audit_runtime_env_is_merged_into_every_child_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            workspace = Path(tmp) / "audit"
+            project.mkdir()
+            (project / "package.json").write_text(json.dumps({
+                "name": "demo",
+                "dependencies": {"foo": "^1.0.0"},
+            }), encoding="utf-8")
+            (project / "yarn.lock").write_text(
+                'foo@^1.0.0:\n  version "1.0.0"\n',
+                encoding="utf-8",
+            )
+            seen = []
+
+            def fake_run(command, cwd, env=None, timeout=None):
+                seen.append(dict(env or {}))
+                if command[:4] == ["npm", "config", "get", "registry"]:
+                    return 0, "https://nexus.example/repository/npm\n", ""
+                if command[:2] == ["npm", "audit"]:
+                    payload = {
+                        "vulnerabilities": {},
+                        "metadata": {
+                            "vulnerabilities": {
+                                "critical": 0, "high": 0, "moderate": 0,
+                                "low": 0, "unknown": 0,
+                            },
+                        },
+                    }
+                    return 0, json.dumps(payload), ""
+                raise AssertionError(command)
+
+            with patch.object(audit, "run", side_effect=fake_run):
+                result = audit.run_audit(
+                    project,
+                    "yarn",
+                    "https://nexus.example/repository/npm",
+                    workspace,
+                    yarn_audit_engine="yarn-inventory",
+                    runtime_env={"DEPLOOM_TEST_RUNTIME_ENV": "pinned-22"},
+                )
+
+            self.assertTrue(result["complete"])
+            self.assertTrue(seen, "audit must invoke at least one child command")
+            self.assertTrue(
+                all(env.get("DEPLOOM_TEST_RUNTIME_ENV") == "pinned-22" for env in seen),
+                "runtime_env must be merged into every audit child invocation",
+            )
+
+    def test_registry_environment_merges_runtime_env_before_registry(self) -> None:
+        env = audit.registry_environment(
+            "https://registry.example/repository/npm",
+            runtime_env={"DEPLOOM_TEST_RUNTIME_ENV": "pinned-22", "PATH": "/pinned-node"},
+        )
+        self.assertEqual("pinned-22", env["DEPLOOM_TEST_RUNTIME_ENV"])
+        self.assertEqual("/pinned-node", env["PATH"])
+        self.assertEqual("https://registry.example/repository/npm", env["npm_config_registry"])
+        self.assertEqual("https://registry.example/repository/npm", env["NPM_CONFIG_REGISTRY"])
+        base = audit.registry_environment("")
+        self.assertNotIn("DEPLOOM_TEST_RUNTIME_ENV", base)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -435,8 +435,10 @@ def run(command: List[str], cwd: Path, env: Optional[Dict[str, str]] = None, tim
         return 127, "", f"cannot execute {command[0]}: {exc}"
 
 
-def registry_environment(registry: str) -> Dict[str, str]:
+def registry_environment(registry: str, runtime_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = os.environ.copy()
+    if runtime_env:
+        env.update(runtime_env)
     if registry:
         env["npm_config_registry"] = registry
         env["NPM_CONFIG_REGISTRY"] = registry
@@ -871,6 +873,7 @@ def _yarn_inventory_audit(
     project: Path,
     registry: str,
     audit_workspace: Optional[Path] = None,
+    runtime_env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Audit exact Yarn-selected package versions through npm's security API.
 
@@ -898,7 +901,7 @@ def _yarn_inventory_audit(
     try:
         inventory = canonical_yarn_inventory(project)
         path_map = _write_yarn_inventory_lock(workspace, inventory)
-        env = registry_environment(registry)
+        env = registry_environment(registry, runtime_env)
         probe_command = ["npm", "config", "get", "registry"]
         probe_code, probe_stdout, probe_stderr = run(probe_command, workspace, env, timeout=30)
         effective_registry = _registry_from_command_output(
@@ -1002,14 +1005,14 @@ def _yarn_inventory_audit(
             temporary.cleanup()
 
 
-def _native_audit(project: Path, manager: str, registry: str) -> Dict[str, Any]:
+def _native_audit(project: Path, manager: str, registry: str, runtime_env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     if manager == "pnpm":
         command = ["pnpm", "audit", "--json"]
     else:
         command = ["npm", "audit", "--json"]
     if registry:
         command += ["--registry", registry]
-    code, stdout, stderr = run(command, project, registry_environment(registry))
+    code, stdout, stderr = run(command, project, registry_environment(registry, runtime_env))
     packages, totals, notes = parse_audit(manager, stdout)
     details = parse_npm_audit_details(stdout) if manager == "npm" else {
         "packages": {},
@@ -1058,6 +1061,7 @@ def _yarn_classic_native_audit(
     project: Path,
     registry: str,
     audit_workspace: Optional[Path] = None,
+    runtime_env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Audit the canonical Yarn lock directly before considering a bridge.
 
@@ -1071,7 +1075,7 @@ def _yarn_classic_native_audit(
         persisted_workspace = audit_workspace.expanduser().resolve()
         _safe_reset_workspace(persisted_workspace)
 
-    env = registry_environment(registry)
+    env = registry_environment(registry, runtime_env)
     probe_command = ["yarn", "config", "get", "registry"]
     probe_code, probe_stdout, probe_stderr = run(probe_command, project, env, timeout=30)
     effective_registry = _registry_from_command_output(
@@ -1149,7 +1153,12 @@ def _yarn_classic_native_audit(
     return result
 
 
-def _yarn_npm_lock_audit(project: Path, registry: str, audit_workspace: Optional[Path]) -> Dict[str, Any]:
+def _yarn_npm_lock_audit(
+    project: Path,
+    registry: str,
+    audit_workspace: Optional[Path],
+    runtime_env: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     """Run a reproducible npm audit from an isolated lock for a Yarn project.
 
     npm may resolve a slightly different transitive graph than Yarn Classic.
@@ -1181,7 +1190,7 @@ def _yarn_npm_lock_audit(project: Path, registry: str, audit_workspace: Optional
         (workspace / "audit-input.json").write_text(
             json.dumps(input_state, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        env = registry_environment(registry)
+        env = registry_environment(registry, runtime_env)
 
         probe_command = ["npm", "config", "get", "registry"]
         probe_code, probe_stdout, probe_stderr = run(probe_command, workspace, env, timeout=30)
@@ -1372,6 +1381,7 @@ def run_audit(
     registry: str,
     audit_workspace: Optional[Path] = None,
     yarn_audit_engine: Optional[str] = None,
+    runtime_env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     if manager == "yarn":
         mode = str(
@@ -1397,13 +1407,13 @@ def run_audit(
             }
         if mode == "auto":
             _progress("using reproducible isolated package-lock audit for Yarn Classic")
-            return _yarn_npm_lock_audit(project, registry, audit_workspace)
+            return _yarn_npm_lock_audit(project, registry, audit_workspace, runtime_env=runtime_env)
         if mode == "yarn-native":
-            return _yarn_classic_native_audit(project, registry, audit_workspace)
+            return _yarn_classic_native_audit(project, registry, audit_workspace, runtime_env=runtime_env)
         if mode == "yarn-inventory":
-            return _yarn_inventory_audit(project, registry, audit_workspace)
-        return _yarn_npm_lock_audit(project, registry, audit_workspace)
-    return _native_audit(project, manager, registry)
+            return _yarn_inventory_audit(project, registry, audit_workspace, runtime_env=runtime_env)
+        return _yarn_npm_lock_audit(project, registry, audit_workspace, runtime_env=runtime_env)
+    return _native_audit(project, manager, registry, runtime_env=runtime_env)
 
 def _npm_view_json(project: Path, name: str, fields: List[str], registry: str) -> Tuple[Optional[Any], str]:
     command = ["npm", "view", name, *fields, "--json"]
@@ -1960,6 +1970,7 @@ def build_report(
     max_known_high: int = 1,
     max_known_moderate: Optional[int] = None,
     max_known_low: Optional[int] = None,
+    runtime_env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     manager = package_manager(project)
     deps = direct_dependencies(project)
@@ -1971,6 +1982,7 @@ def build_report(
         registry,
         audit_workspace=audit_workspace,
         yarn_audit_engine=yarn_audit_engine,
+        runtime_env=runtime_env,
     )
     lag = check_lag(
         project,
