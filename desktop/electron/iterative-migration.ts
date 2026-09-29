@@ -24,6 +24,7 @@ export interface IterativeTaskManifest {
   schemaVersion: number
   builder: string
   builderVersion: string
+  artifactSource?: string
   artifactId: string
   languages: string[]
   runId: string
@@ -106,7 +107,17 @@ export function taskStaleness(runDir: string): TaskStaleness {
   const pointer = readJson(join(runDir, 'task', 'current.json'))
   const run = readJson(join(runDir, 'run.json'))
   const config = readJson(join(runDir, 'run-config.json'))
-  if (!run || !config) return { stale: true, reason: 'STATE_UNREADABLE: run.json or run-config.json missing' }
+  if (!run || !config) {
+    // R9: a legacy-imported artifact (artifactSource=legacy-baseline) is a
+    // port of the user's OLD saved Baseline result, built without a fresh
+    // run. It stays usable for preview/copy/save while no real run exists;
+    // once a real run.json appears the ordinary identity checks below apply
+    // and a mismatched legacy task becomes history, not a dispatchable scope.
+    if (task.manifest.artifactSource === 'legacy-baseline' && !run) {
+      return { stale: false }
+    }
+    return { stale: true, reason: 'STATE_UNREADABLE: run.json or run-config.json missing' }
+  }
   const activeId = String(run.activeCheckpointId ?? '')
   if (activeId && pointer?.targetCheckpointId && activeId !== String(pointer.targetCheckpointId)) {
     return { stale: true, reason: `CHECKPOINT_DRIFT: task targets ${String(pointer.targetCheckpointId)}, durable state is ${activeId}` }

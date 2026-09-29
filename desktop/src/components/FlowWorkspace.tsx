@@ -48,6 +48,7 @@ type Props = {
   onListAgentModels: (agentProvider: AgentProvider, cwd?: string) => Promise<string[]>
   onGetIterativeTask: (projectName: string) => Promise<IterativeTaskSnapshot>
   onExportIterativeTask: (projectName: string) => Promise<IterativeTaskActionOutcome>
+  onExportLegacyIterativeTask: (projectName: string) => Promise<IterativeTaskActionOutcome>
   onCopyIterativeTask: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onSaveIterativeTask: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onIterativeStatus: (projectName: string) => Promise<IterativeStatusOutcome>
@@ -61,7 +62,7 @@ type Props = {
   onClearLogs?: () => void
 }
 
-export function FlowWorkspace({ details, project, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeStep, onIterativeBegin, onIterativeAgent, logs, onCancelJob, onClearLogs }: Props) {
+export function FlowWorkspace({ details, project, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onExportLegacyIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeStep, onIterativeBegin, onIterativeAgent, logs, onCancelJob, onClearLogs }: Props) {
   const { language, text, t } = useLanguage()
   // The persisted goal drives stage actions and autopilot: a green target set
   // in the Baseline dialog must survive into generate/release instead of
@@ -705,6 +706,7 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
         refreshKey={activeRunId}
         onGet={onGetIterativeTask}
         onExport={onExportIterativeTask}
+        onExportLegacy={onExportLegacyIterativeTask}
         onCopy={onCopyIterativeTask}
         onSave={onSaveIterativeTask}
         onStatus={onIterativeStatus}

@@ -163,6 +163,54 @@ if (invocation.args[1] !== "--run-dir" || invocation.args[2] !== runDir) {
 const subcommandIndex = invocation.args.indexOf("export-task");
 if (subcommandIndex < 3) throw new Error(`export-task must follow --run-dir: ${JSON.stringify(invocation)}`);
 
+// 8. R9 legacy import: the CLI accepts --legacy-dashboard-state on the REAL
+// parser and the produced artifact carries artifactSource=legacy-baseline,
+// so the Desktop consumer keeps it usable (copy/save/preview) even though
+// there is no run.json yet — it must NOT be flagged stale.
+const legacyRunDir = join(root, "legacy");
+const legacyDash = join(root, "legacy-dashboard-state.json");
+writeJson(legacyDash, {
+  schemaVersion: 3,
+  projectName: "LegacyApp",
+  updatedAt: "2026-01-15T12:00:00Z",
+  projects: {
+    LegacyApp: [
+      { package: "is-number", current_version: "1.2.3", lagPolicyTarget: "7.0.0", lagThresholdMonths: 6 },
+      {
+        package: "@example/widgets",
+        current_version: "1.2.0",
+        lagPolicyTarget: "2.1.0",
+        planner_deferred: true,
+        planner_deferred_reason: "PEER_RESOLUTION_DEFERRED: peer cycle unresolved",
+      },
+    ],
+  },
+  issues: [],
+});
+execFileSync(
+  PYTHON,
+  [GENERATOR, "--run-dir", legacyRunDir, "export-task", "--language", "both", "--legacy-dashboard-state", legacyDash, "--project-name", "LegacyApp"],
+  { stdio: "pipe" },
+);
+const legacyTask = currentTask(legacyRunDir);
+if (!legacyTask) throw new Error("Legacy import must publish a task artifact");
+if (legacyTask.manifest.artifactSource !== "legacy-baseline") {
+  throw new Error(`Legacy manifest must carry artifactSource=legacy-baseline, got ${legacyTask.manifest.artifactSource}`);
+}
+if (legacyTask.manifest.verification.status !== "legacy-exported-not-reverified") {
+  throw new Error("Legacy import must not invent approval");
+}
+if (taskStaleness(legacyRunDir).stale) {
+  throw new Error("Legacy artifact with no run.json must stay usable (not stale)");
+}
+const legacyPayload = taskCopyPayload(legacyTask, "ru");
+if (!legacyPayload || !legacyPayload.text.includes("is-number")) {
+  throw new Error("Legacy copy payload must carry the imported target");
+}
+if (!legacyPayload.text.includes("7.0.0")) {
+  throw new Error("Legacy copy payload must show the imported goal version 7.0.0");
+}
+
 console.log("check-iterative-migration: OK");
 
 function readText(path) {

@@ -2536,8 +2536,31 @@ def cmd_export_task(args: argparse.Namespace) -> int:
     run.json / run-config.json / checkpoints / ledger.  Insufficient durable
     JSON is a diagnosed InvalidInputError listing the missing fields, so the
     UI can show the reason and a concrete next action.
+
+    R9: with --legacy-dashboard-state the LEGACY saved Baseline result is
+    imported by the SAME builder (versioned artifactSource=legacy-baseline)
+    into the shared task contract without any rerun or invented proof.
     """
     run_dir = Path(args.run_dir).resolve()
+    legacy_dashboard = (args.legacy_dashboard_state or "").strip()
+    if legacy_dashboard:
+        if not (args.project_name or "").strip():
+            raise InvalidInputError("LEGACY_PROJECT_NAME_REQUIRED: --project-name must name the legacy project")
+        from iterative_task import TaskExportError, export_legacy_task_artifact, verify_task_input_errors
+
+        run_dir.mkdir(parents=True, exist_ok=True)
+        languages = ["ru", "en"] if args.language == "both" else [args.language]
+        try:
+            summary = export_legacy_task_artifact(
+                Path(legacy_dashboard).expanduser().resolve(),
+                (args.project_name or "").strip(),
+                run_dir,
+                languages=languages,
+            )
+        except TaskExportError as exc:
+            raise InvalidInputError(f"{exc.code}: {exc.summary}") from exc
+        _emit_status(summary)
+        return 0
     if not (run_dir / "run.json").exists():
         raise InvalidInputError("RUN_STATE_MISSING: no run.json under the run dir")
     from iterative_task import TaskExportError, export_task_artifact, verify_task_input_errors
@@ -2633,11 +2656,21 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--max-known-high", type=int, default=None)
     audit.add_argument("--yarn-audit-engine", default="auto")
 
-    export_task = sub.add_parser("export-task", help="Сформировать ТЗ (task artifact) из durable state без Baseline")
+    export_task = sub.add_parser("export-task", help="Сформировать ТЗ (task artifact) из durable state или legacy Baseline без Baseline")
     export_task.add_argument("--language", choices=("ru", "en", "both"), default="both")
     export_task.add_argument(
         "--check-only", action="store_true",
         help="Only diagnose input sufficiency; never produces an artifact",
+    )
+    export_task.add_argument(
+        "--legacy-dashboard-state",
+        default="",
+        help="Путь к сохранённому dashboard-state.json старого Baseline; import в общий task-контракт тем же builder",
+    )
+    export_task.add_argument(
+        "--project-name",
+        default="",
+        help="Имя проекта внутри dashboard-state.json (обязательно при --legacy-dashboard-state)",
     )
 
     return parser

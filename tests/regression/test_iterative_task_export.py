@@ -273,5 +273,123 @@ class IterativeTaskExportTests(unittest.TestCase):
         self.assertTrue((second_root / task.TASK_MANIFEST_FILENAME).exists())
 
 
+def make_legacy_dashboard(root: Path, project_name: str = "sample-app") -> Path:
+    """A saved LEGACY Baseline result (tracked dashboard-state shape) with one
+    lagging target and one explicitly deferred package."""
+    dash = {
+        "schemaVersion": 3,
+        "projectName": project_name,
+        "updatedAt": "2026-01-15T12:00:00Z",
+        "projects": {
+            project_name: [
+                {
+                    "name": "is-number",
+                    "current_version": "1.2.3",
+                    "latest": "7.0.0",
+                    "lagPolicyTarget": "7.0.0",
+                    "lag": 5.8,
+                    "color": "yellow",
+                },
+                {
+                    "name": "@example/widgets",
+                    "current_version": "1.2.0",
+                    "latest": "2.1.0",
+                    "lagPolicyTarget": "2.1.0",
+                    "planner_deferred": True,
+                    "planner_deferred_reason": "PEER_RESOLUTION_DEFERRED: peer cycle unresolved",
+                    "color": "red",
+                },
+            ]
+        },
+        "issues": [],
+    }
+    path = root / "legacy-dashboard-state.json"
+    path.write_text(json.dumps(dash), encoding="utf-8")
+    return path
+
+
+class IterativeTaskLegacyExportTests(unittest.TestCase):
+    """R9: the LEGACY saved Baseline result is imported by the SAME task builder
+    into the shared task contract WITHOUT any rerun or invented proof."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_legacy_export_publishes_task_without_run_state(self):
+        run_dir = self.root / "legacy-run"
+        dash = make_legacy_dashboard(self.root)
+        summary = task.export_legacy_task_artifact(dash, "sample-app", run_dir)
+        self.assertEqual(task.ARTIFACT_SOURCE_LEGACY_BASELINE, summary["artifactSource"])
+        self.assertTrue(summary["artifactId"].startswith("task-legacy-"))
+        manifest = task.current_task(run_dir)
+        self.assertIsNotNone(manifest)
+        self.assertEqual("legacy-baseline", manifest.get("artifactSource"))
+        self.assertEqual("legacy-exported-not-reverified", manifest["verification"]["status"])
+        # exactVersions is the FULL ASSIGNMENT ("as-is"), never a fabricated
+        # acceptance: nothing was accepted by this import.
+        self.assertEqual("1.2.3", manifest["exactVersions"]["is-number"])
+        self.assertEqual("1.2.0", manifest["exactVersions"]["@example/widgets"])
+        deferred = [row for row in manifest["deferred"] if row["package"] == "@example/widgets"]
+        self.assertEqual(1, len(deferred))
+        self.assertIn("peer cycle", deferred[0]["reason"])
+        self.assertFalse(manifest["completeness"]["policySatisfied"])
+        self.assertEqual(2, manifest["completeness"]["denominator"])
+        self.assertEqual(2, manifest["completeness"]["remaining"])
+        # The imported TARGET (7.0.0) must remain visible in the published body.
+        body_ru = run_dir / "task" / manifest["artifactId"] / "task.ru.md"
+        self.assertTrue("7.0.0" in body_ru.read_text(encoding="utf-8"))
+        for language in ("ru", "en"):
+            body = run_dir / "task" / manifest["artifactId"] / f"task.{language}.md"
+            self.assertTrue(body.exists(), body)
+
+    def test_legacy_export_preserves_previous_artifacts_as_history(self):
+        run_dir = self.root / "legacy-run"
+        dash = make_legacy_dashboard(self.root)
+        first = task.export_legacy_task_artifact(dash, "sample-app", run_dir)
+        dash.write_text(dash.read_text(encoding="utf-8").replace('"lagPolicyTarget": "7.0.0"', '"lagPolicyTarget": "7.1.0"'), encoding="utf-8")
+        second = task.export_legacy_task_artifact(dash, "sample-app", run_dir)
+        self.assertNotEqual(first["artifactId"], second["artifactId"])
+        self.assertEqual(1, len(second["superseded"]))
+        self.assertEqual(first["artifactId"], second["superseded"][0]["artifactId"])
+
+    def test_legacy_export_insufficient_dashboard_is_diagnosed(self):
+        run_dir = self.root / "legacy-run"
+        dash = make_legacy_dashboard(self.root)
+        parsed = json.loads(dash.read_text(encoding="utf-8"))
+        del parsed["projects"]["sample-app"][0]["lagPolicyTarget"]
+        parsed["projects"]["sample-app"][0]["planned_action_default"] = "latest"
+        dash.write_text(json.dumps(parsed), encoding="utf-8")
+        with self.assertRaises(task.TaskExportError) as ctx:
+            task.export_legacy_task_artifact(dash, "sample-app", run_dir)
+        self.assertEqual("LEGACY_BASELINE_INSUFFICIENT", ctx.exception.code)
+        self.assertTrue(any("no exact target version" in message for message in ctx.exception.missing))
+        self.assertFalse((run_dir / "task").exists(), "No artifact must be published for insufficient input")
+
+    def test_legacy_export_missing_file_never_invents_evidence(self):
+        run_dir = self.root / "legacy-run"
+        with self.assertRaises(task.TaskExportError) as ctx:
+            task.export_legacy_task_artifact(self.root / "absent.json", "sample-app", run_dir)
+        self.assertEqual("LEGACY_BASELINE_INSUFFICIENT", ctx.exception.code)
+        self.assertIn("dashboard-state.json", ctx.exception.missing)
+
+    def test_legacy_marker_target_is_never_exact(self):
+        # 'latest' is a marker, not an exact version: a row with only markers
+        # and no deferral must not produce an executable target.
+        run_dir = self.root / "legacy-run"
+        dash = make_legacy_dashboard(self.root)
+        parsed = json.loads(dash.read_text(encoding="utf-8"))
+        parsed["projects"]["sample-app"][0].update(
+            {"lagPolicyTarget": "latest", "lag_target": "-", "planned_action_default": "latest"}
+        )
+        dash.write_text(json.dumps(parsed), encoding="utf-8")
+        with self.assertRaises(task.TaskExportError) as ctx:
+            task.export_legacy_task_artifact(dash, "sample-app", run_dir)
+        self.assertEqual("LEGACY_BASELINE_INSUFFICIENT", ctx.exception.code)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -32,6 +32,15 @@ CURRENT_FILENAME = "current.json"
 HISTORY_FILENAME = "history.json"
 LANGUAGES = ("ru", "en")
 
+# R9: versioned adapter marker. An artifact is either built from the CURRENT
+# iterative durable state (run.json/checkpoints) or imported from a LEGACY
+# saved Baseline result (tracked dashboard-state JSON) by the SAME builder —
+# never from an HTML preview. The marker lets consumers decide staleness
+# semantics: a legacy artifact stays usable for preview/copy until a real run
+# exists, and becomes history once a run with a different identity appears.
+ARTIFACT_SOURCE_ITERATIVE = "iterative"
+ARTIFACT_SOURCE_LEGACY_BASELINE = "legacy-baseline"
+
 FORBIDDEN_TRIAL_RELATIVES = (
     "package.json",
     "package-lock.json",
@@ -301,6 +310,28 @@ def _build_ru(
         f"- Политика выполнена частично: осталось целей **{remaining}** из **{denominator}**. "
         "Задание не сообщает о полном завершении, пока остаток не равен нулю."
     )
+    if str(verification.get("status") or "") == "legacy-exported-not-reverified":
+        deferred_names = {str(entry.get("package")) for entry in deferred}
+        goals = [
+            (name, assignment.get(str(name), "<absent>"), str(target))
+            for name, target in sorted((config.get("targets") or {}).items())
+            if str(assignment.get(str(name))) != str(target) and str(name) not in deferred_names
+        ]
+        if goals:
+            lines.append("")
+            lines.append("### Импортированные цели legacy Baseline (не подтверждены)")
+            lines.append("")
+            lines.append("| Пакет | current | target |")
+            lines.append("| --- | --- | --- |")
+            for name, current, target in goals:
+                lines.append(f"| `{name}` | `{current}` | `{target}` |")
+            lines.append("")
+            lines.append(
+                "Цели взяты из сохранённого результата Baseline без его повторного запуска. "
+                "Ни одна цель не подтверждена проверкой (legacy-exported-not-reverified): "
+                "точные версии не считаются исполняемыми до verified checkpoint."
+            )
+            lines.append("")
     if deferred:
         lines.append("")
         lines.append("### Явно отложенные пакеты (неизменяемы в этом scope)")
@@ -410,6 +441,28 @@ def _build_en(
         f"- Policy is partially met: **{remaining}** of **{denominator}** goals remain. "
         "Nothing in this task may claim full completion while the remainder is non-zero."
     )
+    if str(verification.get("status") or "") == "legacy-exported-not-reverified":
+        deferred_names = {str(entry.get("package")) for entry in deferred}
+        goals = [
+            (name, assignment.get(str(name), "<absent>"), str(target))
+            for name, target in sorted((config.get("targets") or {}).items())
+            if str(assignment.get(str(name))) != str(target) and str(name) not in deferred_names
+        ]
+        if goals:
+            lines.append("")
+            lines.append("### Goals imported from the legacy Baseline (unverified)")
+            lines.append("")
+            lines.append("| Package | current | target |")
+            lines.append("| --- | --- | --- |")
+            for name, current, target in goals:
+                lines.append(f"| `{name}` | `{current}` | `{target}` |")
+            lines.append("")
+            lines.append(
+                "Goals come from the saved Baseline result without rerunning it. None is "
+                "confirmed by a check (legacy-exported-not-reverified): exact versions are "
+                "NOT executable until a verified checkpoint exists."
+            )
+            lines.append("")
     if deferred:
         lines.append("")
         lines.append("### Explicitly deferred packages (immutable in this scope)")
@@ -483,6 +536,7 @@ def build_task_manifest(
     stale: bool = False,
     stale_reason: str = "",
     created_at: Optional[str] = None,
+    artifact_source: str = ARTIFACT_SOURCE_ITERATIVE,
 ) -> Dict[str, Any]:
     active = _active_checkpoint(checkpoints, run.get("activeCheckpointId"))
     if active is None:
@@ -510,6 +564,7 @@ def build_task_manifest(
         "schemaVersion": SCHEMA_VERSION,
         "builder": BUILDER_NAME,
         "builderVersion": BUILDER_VERSION,
+        "artifactSource": artifact_source,
         "artifactId": artifact_id,
         "languages": languages,
         "runId": str(run.get("runId") or ""),
@@ -740,6 +795,248 @@ def export_task_artifact(
         "languages": pointer["languages"],
         "scopeHash": pointer["scopeHash"],
         "policyHash": pointer["policyHash"],
+        "superseded": [entry for entry in history if entry.get("stale")],
+        "historyTotal": len(history),
+    }
+
+
+def _legacy_target_marker(text: str) -> bool:
+    return text in ("-", "—", "latest", "latest ") or text.strip().lower() in ("latest", "-", "—")
+
+
+def _legacy_row_target_version(row: Mapping[str, Any], target_level: str = "yellow") -> str:
+    """Exact target version a legacy dashboard row plans, mirroring the product's
+    own fallback (lagPolicyTarget -> lag_target -> planned action -> concrete
+    min_lag_<N>m -> min_lag_12m). A marker (latest/- ) is never an exact target."""
+    months = row.get("lag_threshold_months")
+    try:
+        months_val = int(months) if months not in (None, "") else 12
+    except (TypeError, ValueError):
+        months_val = 12
+    for key in (
+        "lagPolicyTarget",
+        "lag_target",
+        "planned_action_default",
+        f"planned_action_{target_level}",
+        f"min_lag_{months_val}m",
+        "min_lag_12m",
+    ):
+        value = row.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and not _legacy_target_marker(text):
+            return text
+    return ""
+
+
+def legacy_dashboard_input_errors(
+    parsed: Mapping[str, Any], project_name: str
+) -> List[str]:
+    """Fields a LEGACY saved Baseline result must carry for the CURRENT task
+    builder to rebuild the task WITHOUT a fresh Baseline. Returns the missing
+    field list (never fabricates evidence)."""
+    missing: List[str] = []
+    if not isinstance(parsed, dict):
+        return ["dashboard-state.json (not an object)"]
+    projects = parsed.get("projects")
+    if not isinstance(projects, dict) or not projects:
+        return ["projects"]
+    rows = projects.get(project_name)
+    if not isinstance(rows, list) or not rows:
+        return [f"projects.{project_name}"]
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            missing.append(f"projects.{project_name}[{index}] (not an object)")
+            continue
+        name = str(row.get("name") or row.get("package") or "").strip()
+        if not name:
+            missing.append(f"projects.{project_name}[{index}].name")
+            continue
+        exact = _legacy_row_target_version(row)
+        deferred = bool(row.get("planner_deferred"))
+        if not exact and not deferred:
+            missing.append(
+                f"projects.{project_name}[{index}].{name} "
+                "(no exact target version and not marked planner_deferred)"
+            )
+    return missing
+
+
+def export_legacy_task_artifact(
+    dashboard_state_path: Path,
+    project_name: str,
+    run_dir: Path,
+    *,
+    languages: Sequence[str] = ("ru", "en"),
+) -> Dict[str, Any]:
+    """R9: import a LEGACY saved Baseline result (tracked dashboard-state.json)
+    into the SAME task contract with the CURRENT builder. No full Baseline and
+    no project checks are ever started; no proof is invented: the synthesized
+    checkpoint is explicitly marked 'legacy-exported-not-reverified', and an
+    insufficient old result raises a diagnosed TASK_INPUT_INSUFFICIENT-style
+    error listing the missing fields."""
+    if not dashboard_state_path.exists():
+        raise TaskExportError(
+            "LEGACY_BASELINE_INSUFFICIENT",
+            ["dashboard-state.json"],
+            "saved dashboard-state file not found; refusing to invent evidence",
+        )
+    try:
+        parsed = json.loads(dashboard_state_path.read_text(encoding="utf-8-sig"))
+    except (ValueError, OSError) as exc:
+        raise TaskExportError(
+            "LEGACY_BASELINE_INSUFFICIENT",
+            ["dashboard-state.json"],
+            f"saved dashboard-state unreadable: {exc}",
+        ) from exc
+    missing = legacy_dashboard_input_errors(parsed, project_name)
+    if missing:
+        raise TaskExportError(
+            "LEGACY_BASELINE_INSUFFICIENT",
+            missing,
+            "legacy Baseline result lacks enough structured JSON/evidence for the current builder; "
+            "missing: " + ", ".join(missing) + ". No fresh Baseline is started.",
+        )
+    rows = parsed["projects"][project_name]
+    targets: Dict[str, str] = {}
+    full_assignment: Dict[str, str] = {}
+    deferrals: List[Dict[str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or row.get("package") or "").strip()
+        if not name:
+            continue
+        current = str(row.get("current_version") or "").strip()
+        if current:
+            full_assignment[name] = current
+        exact = _legacy_row_target_version(row)
+        if bool(row.get("planner_deferred")):
+            reason = (
+                str(row.get("planner_deferred_reason") or "").strip()
+                or "planner deferral recorded by the legacy Baseline"
+            )
+            deferrals.append({"package": name, "reason": reason})
+            if exact:
+                targets[name] = exact
+            continue
+        if exact:
+            targets[name] = exact
+
+    identity = _stable_json({"project": project_name, "targets": targets, "source": "legacy-baseline"})
+    run_id = "legacy-" + _sha256_text(identity)[:12]
+    created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    run: Dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "runId": run_id,
+        "activeCheckpointId": "C0",
+        "projectId": project_name,
+    }
+    config: Dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "projectName": project_name,
+        "projectDir": str(dashboard_state_path),
+        "workspaceId": "",
+        "projectId": project_name,
+        "targetLevel": "yellow",
+        "targets": targets,
+        "policyHash": _sha256_text(identity),
+        "verifyConfig": {"commands": []},
+        "createdAt": created_at,
+    }
+    checkpoints: List[Dict[str, Any]] = [
+        {
+            "schemaVersion": SCHEMA_VERSION,
+            "checkpointId": "C0",
+            "seq": 0,
+            "parentCheckpointId": None,
+            "status": "VERIFIED",
+            "fullAssignment": full_assignment,
+            "acceptedDelta": {"changed": {}, "added": {}, "removed": {}},
+            # R9: never fabricated proof — the imported state was NOT verified
+            # by this run, so dispatch against a real candidate stays gated.
+            "verification": {"status": "legacy-exported-not-reverified"},
+            "audit": {},
+        }
+    ]
+    ledger: Dict[str, Any] = {"blocks": [], "deferrals": deferrals, "feedback": [], "counters": {}}
+
+    root = task_dir(run_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    previous = _current_pointer(root)
+    contents = {
+        language: build_task_markdown(run, config, checkpoints, ledger, language=language)
+        for language in languages
+    }
+    manifest = build_task_manifest(
+        run, config, checkpoints, ledger, contents,
+        created_at=created_at,
+        artifact_source=ARTIFACT_SOURCE_LEGACY_BASELINE,
+    )
+    artifact_root = root / manifest["artifactId"]
+    files: Dict[str, str] = {}
+    for language, text in contents.items():
+        files[f"task.{language}.md"] = text
+    files[TASK_MANIFEST_FILENAME] = json.dumps(manifest, ensure_ascii=False, indent=2)
+    if not (artifact_root.exists() and _read_manifest(artifact_root) is not None):
+        _atomic_write_directory(artifact_root, files)
+
+    pointer = {
+        "schemaVersion": SCHEMA_VERSION,
+        "artifactId": manifest["artifactId"],
+        "runId": manifest["runId"],
+        "targetCheckpointId": manifest["targetCheckpointId"],
+        "scopeHash": manifest["scopeHash"],
+        "policyHash": manifest["policyHash"],
+        "languages": manifest["languages"],
+        "createdAt": created_at,
+        "updatedAt": created_at,
+    }
+    _atomic_write_file(root / CURRENT_FILENAME, json.dumps(pointer, ensure_ascii=False, indent=2))
+
+    history: List[Dict[str, Any]] = []
+    history_path = root / HISTORY_FILENAME
+    if history_path.exists():
+        try:
+            value = json.loads(history_path.read_text(encoding="utf-8"))
+            if isinstance(value, list):
+                history = value
+        except (ValueError, OSError):
+            history = []
+    if previous and previous.get("artifactId") != pointer["artifactId"]:
+        history.append(
+            {
+                "artifactId": previous["artifactId"],
+                "runId": previous.get("runId"),
+                "targetCheckpointId": previous.get("targetCheckpointId"),
+                "scopeHash": previous.get("scopeHash"),
+                "stale": True,
+                "staleReason": "superseded by a newer task artifact",
+                "createdAt": previous.get("createdAt"),
+            }
+        )
+    history.append(
+        {
+            "artifactId": pointer["artifactId"],
+            "runId": pointer["runId"],
+            "targetCheckpointId": pointer["targetCheckpointId"],
+            "scopeHash": pointer["scopeHash"],
+            "stale": False,
+            "createdAt": created_at,
+        }
+    )
+    history_path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {
+        "event": "export-task.done",
+        "artifactId": pointer["artifactId"],
+        "runId": pointer["runId"],
+        "targetCheckpointId": pointer["targetCheckpointId"],
+        "languages": pointer["languages"],
+        "scopeHash": pointer["scopeHash"],
+        "policyHash": pointer["policyHash"],
+        "artifactSource": ARTIFACT_SOURCE_LEGACY_BASELINE,
         "superseded": [entry for entry in history if entry.get("stale")],
         "historyTotal": len(history),
     }

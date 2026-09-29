@@ -19,6 +19,7 @@ const api = {
   getDependencyGraphSnapshot: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:dependency-graph-snapshot', input),
   getIterativeTask: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:task', input),
   exportIterativeTask: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:export', input),
+exportLegacyIterativeTask: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:export-legacy', input),
   copyIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => ipcRenderer.invoke('flow:iterative:copy-task', input),
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => ipcRenderer.invoke('flow:iterative:save-task', input),
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:status', input),

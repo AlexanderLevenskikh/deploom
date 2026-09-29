@@ -10,6 +10,7 @@ type Props = {
   refreshKey?: string
   onGet: (projectName: string) => Promise<IterativeTaskSnapshot>
   onExport: (projectName: string) => Promise<IterativeTaskActionOutcome>
+  onExportLegacy: (projectName: string) => Promise<IterativeTaskActionOutcome>
   onCopy: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onSave: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
@@ -24,7 +25,7 @@ type PanelState =
   | { phase: 'ready'; snapshot: IterativeTaskSnapshot }
   | { phase: 'error'; message: string }
 
-export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, onCopy, onSave, onStatus, onStep, onBegin, onAgent, onOpenPath }: Props) {
+export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, onCopy, onSave, onStatus, onStep, onBegin, onExportLegacy, onAgent, onOpenPath }: Props) {
   const { text, language } = useLanguage()
   const [state, setState] = useState<PanelState>({ phase: 'loading' })
   const [busy, setBusy] = useState<string>()
@@ -141,6 +142,33 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
     }
   }
 
+  // R9: import the user's OLD saved Baseline result (dashboard-state JSON)
+  // into the shared task contract with the CURRENT builder — no rerun, no
+  // invented proof (verification stays "legacy-exported-not-reverified").
+  const exportLegacyNow = async () => {
+    setStepBusy(true)
+    setNote(undefined)
+    try {
+      const outcome = await onExportLegacy(projectName)
+      if (outcome.ok) {
+        setNote(
+          text(
+            `Импортировано из сохранённого результата: ${outcome.artifactId ?? ''}`,
+            `Imported from the saved result: ${outcome.artifactId ?? ''}`,
+          ),
+        )
+      } else {
+        setNote(outcome.error ?? 'Ошибка')
+      }
+    } catch (error) {
+      setNote(error instanceof Error ? error.message : String(error))
+    } finally {
+      setStepBusy(false)
+      void refreshRunner()
+      void load()
+    }
+  }
+
   const agentNow = async () => {
     setStepBusy(true)
     setNote(undefined)
@@ -201,6 +229,9 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
               <footer className="baseline-intent-actions">
                 <button type="button" className="button primary" disabled={stepBusy} onClick={() => void beginNow()}>
                   <Rocket size={16} />{text('Начать миграцию (C0)', 'Start migration (C0)')}
+                </button>
+                <button type="button" className="button secondary" disabled={stepBusy} onClick={() => void exportLegacyNow()}>
+                  <FileText size={16} />{text('Импортировать ТЗ из сохранённого результата', 'Import task from the saved result')}
                 </button>
               </footer>
             </div>

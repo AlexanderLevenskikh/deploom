@@ -422,6 +422,7 @@ export type DependencyFlowApi = {
   getDependencyGraphSnapshot: (input: { workspaceId?: string; projectName: string }) => Promise<DependencyGraphSnapshot>
   getIterativeTask: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeTaskSnapshot>
   exportIterativeTask: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeTaskActionOutcome>
+  exportLegacyIterativeTask: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeTaskActionOutcome>
   copyIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStatusOutcome>

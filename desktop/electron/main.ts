@@ -7332,6 +7332,34 @@ function setupIpc(): void {
     return { ok: true, artifactId: task?.manifest.artifactId, stale: task ? taskStaleness(runDir).stale : undefined }
   })
 
+  // R9: import the user's OLD saved Baseline result (dashboard-state JSON)
+  // into the shared task contract with the CURRENT builder. No rerun and no
+  // invented proof: verification stays "legacy-exported-not-reverified", so
+  // the ТЗ documents exact targets / deferred reasons but never claims green.
+  ipcMain.handle('flow:iterative:export-legacy', async (_event, input: { workspaceId?: string; projectName: string }) => {
+    const state = loadState()
+    const workspace = findWorkspace(state, input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    const dashboardState = artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json')
+    if (!dashboardState || !existsSync(dashboardState)) {
+      return { ok: false, error: 'LEGACY_DASHBOARD_MISSING: нет сохранённого результата Baseline (dashboard-state.json)' }
+    }
+    const runDir = iterativeTaskRunDir(workspace, project)
+    const python = resolveExecutable('python')
+    const generator = join(bundledToolDir(), 'iterative_migration.py')
+    const result = await spawnCapture(
+      python,
+      [generator, '--run-dir', runDir, 'export-task', '--language', 'both', '--legacy-dashboard-state', dashboardState, '--project-name', project.name],
+      workspace.path,
+      120_000,
+    )
+    if (result.code !== 0) {
+      return { ok: false, error: result.stderr.trim() || `LEGACY_EXPORT_EXIT_${result.code}` }
+    }
+    const task = readIterativeCurrentTask(runDir)
+    return { ok: true, artifactId: task?.manifest.artifactId, stale: task ? taskStaleness(runDir).stale : undefined }
+  })
+
   ipcMain.handle(
     'flow:iterative:copy-task',
     async (_event, input: { workspaceId?: string; projectName: string; language?: string }) => {
