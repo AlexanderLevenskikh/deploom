@@ -586,5 +586,172 @@ class IterativeMigrationFinishAuditTests(unittest.TestCase):
             self.assertIn("PARTIAL_VERIFIED", report)
 
 
+class IterativeMigrationReportTests(unittest.TestCase):
+    """R10: the exported docs aggregate the ACTUAL accepted chain — the active
+    checkpoint is resolved by identity/parent chain, never by string-max id
+    (C10 > C9 would silently describe the wrong state), and итог/остаток +
+    coverage/vuln + agent explanations are real content."""
+
+    def test_active_checkpoint_by_identity_not_string_max(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _RunDir(Path(tmp))
+            # C10 sorts BEFORE C9 as a string; the run's active state is C9.
+            root.write_run(_run_dict(activeCheckpointId="C9"))
+            root.write_config(_config_dict(targets={"pkg-a": "1.1.0"}))
+            root.write_checkpoint(
+                _checkpoint_dict(
+                    checkpoint_id="C9",
+                    full_assignment={"pkg-a": "9.9.9"},
+                    verification={"status": "passed", "kind": "passed", "commands": [], "failingCommands": []},
+                )
+            )
+            root.write_checkpoint(
+                _checkpoint_dict(
+                    checkpoint_id="C10",
+                    full_assignment={"pkg-a": "10.0.0"},
+                    verification={"status": "passed", "kind": "passed", "commands": [], "failingCommands": []},
+                )
+            )
+            from iterative_migration import _build_migration_report, _build_developer_upgrade_guide
+
+            report = _build_migration_report(
+                root.root, load_run(root.root), load_config(root.root),
+                [_checkpoint_dict(checkpoint_id="C10", full_assignment={"pkg-a": "10.0.0"}),
+                 _checkpoint_dict(checkpoint_id="C9", full_assignment={"pkg-a": "9.9.9"})],
+                None,
+            )
+            self.assertIn("9.9.9", report)
+            self.assertNotIn("10.0.0", report)
+            guide = _build_developer_upgrade_guide(
+                root.root, load_config(root.root),
+                [_checkpoint_dict(checkpoint_id="C10", full_assignment={"pkg-a": "10.0.0"}),
+                 _checkpoint_dict(checkpoint_id="C9", full_assignment={"pkg-a": "9.9.9"})],
+            )
+            # Neither checkpoint accepted a change, so the guide reports NO
+            # accepted upgrades with REAL content, not a placeholder promise.
+            self.assertIn("Проверенных обновлений зависимостей", guide)
+            self.assertNotIn("описываются по мере", guide)
+
+    def test_report_orders_by_parent_chain_and_aggregates_coverage(self) -> None:
+        from iterative_migration import _build_migration_report
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _RunDir(Path(tmp))
+            root.write_run(_run_dict(activeCheckpointId="C2"))
+            root.write_config(_config_dict(targets={"pkg-a": "1.1.0", "pkg-b": "2.0.0"}))
+            audit = {
+                "status": "PASS", "evidenceRef": str(root.root / "audit" / "C2"),
+                "lagOkPct": 90, "lagOk": 9, "lagLagging": 1, "lagUnknown": 0,
+                "lagTotal": 10, "vulnerabilityPackages": 0,
+            }
+            nodes = [
+                ("C0", None, {"pkg-a": "0.5.0", "pkg-b": "1.0.0"}),
+                ("C1", "C0", {"pkg-a": "1.1.0", "pkg-b": "1.0.0"}),
+                ("C2", "C1", {"pkg-a": "1.1.0", "pkg-b": "2.0.0"}),
+            ]
+            for cid, parent, assignment in nodes:
+                root.write_checkpoint(
+                    _checkpoint_dict(
+                        checkpoint_id=cid,
+                        parentCheckpointId=parent,
+                        seq=int(cid[1:]),
+                        full_assignment=assignment,
+                        audit=audit if cid == "C2" else {},
+                        acceptedDelta=(
+                            {"changed": {"pkg-a": "1.1.0"}, "added": {}, "removed": {}}
+                            if cid == "C1"
+                            else ({"changed": {"pkg-b": "2.0.0"}, "added": {}, "removed": {}}
+                                  if cid == "C2" else {"changed": {}, "added": {}, "removed": {}})
+                        ),
+                    )
+                )
+            (root.root / "ledger.json").write_text(
+                json.dumps({
+                    "blocks": [], "deferrals": [],
+                    "feedback": [{
+                        "schemaVersion": 1, "runId": "iter-000000000001",
+                        "candidateId": "cand-1", "baseCheckpointId": "C1",
+                        "attemptId": 0, "kind": "ADAPTATION",
+                        "reason": "pkg-b needs runtime adapter for v2 API", "changedFiles": ["src/adapter.ts"],
+                        "diagnosticsRefs": [], "proposedScope": {}, "proposedConstraints": {},
+                        "createdAt": "2026-09-29T00:01:00Z",
+                    }],
+                    "counters": {},
+                }),
+                encoding="utf-8",
+            )
+            checkpoints = [root.root / "checkpoints" / f"{cid}.json" for cid, _, _ in nodes]
+            checkpoints = [
+                json.loads(path.read_text(encoding="utf-8")) for path in checkpoints
+            ]
+            report = _build_migration_report(
+                root.root, load_run(root.root), load_config(root.root), checkpoints, None,
+            )
+            # Parent-chain order: C0 before C1 before C2 (not filename order).
+            self.assertLess(report.index("| C0 "), report.index("| C1 "))
+            self.assertLess(report.index("| C1 "), report.index("| C2 "))
+            self.assertIn("Итог миграции", report)
+            self.assertIn("остаток: `0`", report)
+            self.assertIn("lagOkPct", report)
+            self.assertIn("vulnerabilityPackages", report)
+            self.assertIn("runtime adapter", report)
+            chain = [root.root / "checkpoints" / f"{cid}.json" for cid, _, _ in nodes]
+            from iterative_migration import _ordered_checkpoint_chain
+
+            chain, tail = _ordered_checkpoint_chain(
+                [json.loads(p.read_text(encoding="utf-8")) for p in chain]
+            )
+            self.assertEqual([c["checkpointId"] for c in chain], ["C0", "C1", "C2"])
+            self.assertEqual(tail, [])
+
+    def test_guide_aggregates_actual_adaptations_and_deferrals(self) -> None:
+        from iterative_migration import _build_developer_upgrade_guide
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _RunDir(Path(tmp))
+            root.write_config(_config_dict(targets={"pkg-a": "1.1.0"}))
+            root.write_checkpoint(
+                _checkpoint_dict(
+                    checkpoint_id="C1",
+                    parentCheckpointId="C0",
+                    full_assignment={"pkg-a": "1.1.0"},
+                    acceptedDelta={"changed": {"pkg-a": "1.1.0"}, "added": {}, "removed": {}},
+                )
+            )
+            root.write_checkpoint(
+                _checkpoint_dict(
+                    checkpoint_id="C0",
+                    parentCheckpointId=None,
+                    full_assignment={"pkg-a": "0.5.0"},
+                )
+            )
+            (root.root / "ledger.json").write_text(
+                json.dumps({
+                    "blocks": [], "deferrals": [
+                        {"package": "pkg-b", "reason": "PEER_RESOLUTION_DEFERRED: not actionable"}
+                    ],
+                    "feedback": [{
+                        "schemaVersion": 1, "runId": "iter-000000000001",
+                        "candidateId": "cand-1", "baseCheckpointId": "C1",
+                        "attemptId": 0, "kind": "ADAPTATION",
+                        "reason": "pkg-a dropped legacy API; adapter added",
+                        "changedFiles": ["src/adapter.ts"],
+                        "diagnosticsRefs": [], "proposedScope": {}, "proposedConstraints": {},
+                        "createdAt": "2026-09-29T00:01:00Z",
+                    }],
+                    "counters": {},
+                }),
+                encoding="utf-8",
+            )
+            checkpoints = [
+                json.loads((root.root / "checkpoints" / f"{cid}.json").read_text(encoding="utf-8"))
+                for cid in ("C0", "C1")
+            ]
+            guide = _build_developer_upgrade_guide(root.root, load_config(root.root), checkpoints)
+            self.assertIn("| `pkg-a` | `0.5.0` | `1.1.0` |", guide)
+            self.assertIn("dropped legacy API", guide)
+            self.assertIn("PEER_RESOLUTION_DEFERRED", guide)
+
+
 if __name__ == "__main__":
     unittest.main()

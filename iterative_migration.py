@@ -2268,8 +2268,8 @@ def _finish_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str, A
     else:
         outcome = str(existing_outcome.get("outcome") or run.get("terminal") or "")
 
-    report = _build_migration_report(run, config, checkpoints, existing_outcome or run.get("terminalOutcome"))
-    guide = _build_developer_upgrade_guide(config, checkpoints)
+    report = _build_migration_report(run_dir, run, config, checkpoints, existing_outcome or run.get("terminalOutcome"))
+    guide = _build_developer_upgrade_guide(run_dir, config, checkpoints)
     (reports_dir / "MIGRATION_REPORT.md").write_text(report, encoding="utf-8")
     (reports_dir / "DEVELOPER_UPGRADE_GUIDE.md").write_text(guide, encoding="utf-8")
     _emit_status(
@@ -2291,15 +2291,87 @@ def _all_checkpoints(run_dir: Path) -> List[Dict[str, Any]]:
             checkpoint_ids.append(path.stem)
         except Exception:
             continue
-    return [load_checkpoint(run_dir, cid) for cid in checkpoint_ids]
+    checkpoints = [load_checkpoint(run_dir, cid) for cid in checkpoint_ids]
+    chain, tail = _ordered_checkpoint_chain(checkpoints)
+    return chain + tail
+
+
+def _ordered_checkpoint_chain(
+    checkpoints: Sequence[Mapping[str, Any]],
+) -> tuple:
+    """Topological order by parent links: C0 -> C1 -> ... -> deepest accepted
+    checkpoint. A plain filename sort would mis-rank C10 before C9; the ACTIVE
+    checkpoint is resolved by identity (run.activeCheckpointId) with the chain
+    tail as fallback, never by string comparison. Unconnected checkpoints are
+    appended deterministically by id."""
+    by_id = {str(c.get("checkpointId")): c for c in checkpoints}
+    chain: List[Mapping[str, Any]] = []
+    seen = set()
+    current = next(
+        (c for c in by_id.values() if not str(c.get("parentCheckpointId") or "").strip()),
+        None,
+    )
+    while current is not None:
+        cid = str(current.get("checkpointId"))
+        if cid in seen:
+            break
+        seen.add(cid)
+        chain.append(current)
+        current = next(
+            (
+                c
+                for c in by_id.values()
+                if str(c.get("checkpointId")) not in seen
+                and str(c.get("parentCheckpointId") or "") == cid
+            ),
+            None,
+        )
+    tail = [c for c in by_id.values() if str(c.get("checkpointId")) not in seen]
+    tail.sort(key=lambda c: str(c.get("checkpointId")))
+    return chain, tail
+
+
+def _resolve_active_checkpoint(
+    run: Mapping[str, Any], checkpoints: Sequence[Mapping[str, Any]]
+) -> Mapping[str, Any]:
+    """R10: the ACTIVE checkpoint is governed by identity (run.activeCheckpointId),
+    with the deepest accepted chain member as explicit fallback — never the
+    string-max checkpoint id (C10 > C9 would silently describe the wrong state)."""
+    active_id = str(run.get("activeCheckpointId") or "")
+    if active_id:
+        for checkpoint in checkpoints:
+            if str(checkpoint.get("checkpointId")) == active_id:
+                return checkpoint
+    chain, _tail = _ordered_checkpoint_chain(checkpoints)
+    return chain[-1] if chain else (checkpoints[-1] if checkpoints else {})
 
 
 def _build_migration_report(
+    run_dir: Path,
     run: Mapping[str, Any],
     config: Mapping[str, Any],
     checkpoints: Sequence[Mapping[str, Any]],
     terminal_outcome: Optional[Mapping[str, Any]] = None,
 ) -> str:
+    active = _resolve_active_checkpoint(run, checkpoints)
+    targets = {str(k): str(v) for k, v in (config.get("targets") or {}).items()}
+    assignment = {str(k): str(v) for k, v in (active.get("fullAssignment") or {}).items()}
+    satisfied = all(
+        name in assignment and str(targets[name]) == assignment[name] for name in targets
+    )
+    remaining = sum(1 for name in targets if assignment.get(name) != str(targets[name]))
+    active_audit = active.get("audit") or {}
+    ledger: Dict[str, Any] = {}
+    ledger_path = run_dir / "ledger.json"
+    if ledger_path.exists():
+        try:
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            if not isinstance(ledger, dict):
+                ledger = {}
+        except (ValueError, OSError):
+            ledger = {}
+    feedback = [entry for entry in (ledger.get("feedback") or []) if isinstance(entry, dict)]
+
     lines: List[str] = []
     lines.append("# MIGRATION_REPORT")
     lines.append("")
@@ -2307,7 +2379,7 @@ def _build_migration_report(
     lines.append(f"- Project: `{config.get('projectName')}`")
     lines.append(f"- Target level: `{config.get('targetLevel')}`")
     lines.append(f"- Terminal: `{run.get('terminal') or 'in-progress'}`")
-    lines.append(f"- Active checkpoint: `{run.get('activeCheckpointId')}`")
+    lines.append(f"- Active checkpoint: `{active.get('checkpointId')}`")
     lines.append("")
     if terminal_outcome:
         lines.append("## Outcome")
@@ -2318,7 +2390,22 @@ def _build_migration_report(
         lines.append(f"- Accepted checkpoints: `{terminal_outcome.get('acceptedCheckpoints')}`")
         lines.append(f"- Finished at: `{terminal_outcome.get('finishedAt')}`")
         lines.append("")
-    lines.append("## Checkpoints")
+    lines.append("## Итог миграции (остаток и покрытие)")
+    lines.append("")
+    lines.append(
+        f"- Целей по политике: `{len(targets)}`; достигнуто на активном checkpoint "
+        f"`{active.get('checkpointId')}`: `{len(targets) - remaining}`; остаток: `{remaining}`; "
+        f"policy satisfied: `{satisfied}`."
+    )
+    lines.append(
+        f"- Независимый аудит активного checkpoint: статус `{active_audit.get('status') or 'UNKNOWN'}`, "
+        f"lag-ok `{active_audit.get('lagOkPct')}%` (`{active_audit.get('lagOk')}` из "
+        f"`{active_audit.get('lagTotal')}`), отстающих `{active_audit.get('lagLagging')}`, "
+        f"неизвестных `{active_audit.get('lagUnknown')}`, пакетов с уязвимостями "
+        f"`{active_audit.get('vulnerabilityPackages')}`; evidence: `{active_audit.get('evidenceRef') or '-'}`."
+    )
+    lines.append("")
+    lines.append("## Checkpoints (по цепочке parent)")
     lines.append("")
     lines.append("| Checkpoint | Parent | Status | Changed packages | Audit |")
     lines.append("| --- | --- | --- | --- | --- |")
@@ -2342,11 +2429,10 @@ def _build_migration_report(
             f"| {checkpoint.get('status')} | {summary} | {checkpoint.get('audit', {}).get('status', 'UNKNOWN')} |"
         )
     lines.append("")
-    active = checkpoints[-1] if checkpoints else {}
     lines.append("## Accepted dependency state")
     lines.append("")
     lines.append("```json")
-    lines.append(_stable_json(active.get("fullAssignment") or {}))
+    lines.append(_stable_json(assignment))
     lines.append("```")
     lines.append("")
     lines.append("## Evidence")
@@ -2366,13 +2452,30 @@ def _build_migration_report(
                 f"(of `{audit.get('lagTotal')}`), vulnerabilityPackages=`{audit.get('vulnerabilityPackages')}`"
             )
     lines.append("")
+    if feedback:
+        lines.append("## Объяснения агента и release-факты (по принятой цепочке)")
+        lines.append("")
+        for entry in feedback:
+            base = entry.get("baseCheckpointId") or "-"
+            kind = entry.get("kind") or "-"
+            candidate = entry.get("candidateId") or "-"
+            reason = str(entry.get("reason") or "").strip()
+            changed = entry.get("changedFiles") or []
+            lines.append(f"- checkpoint `{base}` / candidate `{candidate}` / kind `{kind}`")
+            if reason:
+                lines.append(f"  - reason: {reason}")
+            if changed:
+                lines.append(f"  - изменённые файлы: {', '.join('`' + str(f) + '`' for f in changed)}")
+        lines.append("")
     return "\n".join(lines)
 
 
 def _build_developer_upgrade_guide(
-    config: Mapping[str, Any], checkpoints: Sequence[Mapping[str, Any]]
+    run_dir: Path, config: Mapping[str, Any], checkpoints: Sequence[Mapping[str, Any]]
 ) -> str:
     upgraded: Dict[str, Dict[str, str]] = {}
+    adaptations: Dict[str, List[str]] = {}
+    changed_files: Dict[str, List[str]] = {}
     for checkpoint in checkpoints:
         delta = checkpoint.get("acceptedDelta") or {}
         for name, new_version in (delta.get("changed") or {}).items():
@@ -2385,14 +2488,54 @@ def _build_developer_upgrade_guide(
                 if parent:
                     old = str((parent.get("fullAssignment") or {}).get(name, old))
             upgraded[name] = {"from": old, "to": str(new_version)}
+    ledger: Dict[str, Any] = {}
+    ledger_path = run_dir / "ledger.json"
+    if ledger_path.exists():
+        try:
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            if not isinstance(ledger, dict):
+                ledger = {}
+        except (ValueError, OSError):
+            ledger = {}
+    # R10: aggregate the ACTUAL agent explanations/adaptations recorded per
+    # candidate — never the "will describe later" placeholder.
+    for entry in (ledger.get("feedback") or []):
+        if not isinstance(entry, dict):
+            continue
+        reason = str(entry.get("reason") or "")
+        files = [str(f) for f in (entry.get("changedFiles") or []) if isinstance(f, str)]
+        for name in upgraded:
+            if name in reason or any(name in f for f in files):
+                adaptations.setdefault(name, [])
+                if reason and reason not in adaptations[name]:
+                    adaptations[name].append(reason)
+        changed_files.setdefault(str(entry.get("baseCheckpointId") or "-"), []).extend(files)
+    deferrals = [
+        entry for entry in (ledger.get("deferrals") or [])
+        if isinstance(entry, dict) and str(entry.get("reason") or "").strip()
+    ]
+
     lines: List[str] = []
     lines.append("# DEVELOPER_UPGRADE_GUIDE")
     lines.append("")
     if not upgraded:
         lines.append(
-            "Проверенных обновлений зависимостей на текущий момент нет. "
-            "Agents/report: уточнять фактическую адаптацию после первого принятого upgrade."
+            "Проверенных обновлений зависимостей на этой цепочке нет: полный assignment "
+            "активного checkpoint совпадает с исходным (ни один пакет не принят к изменению). "
+            "Это НЕ означает завершения миграции: см. MIGRATION_REPORT (остаток целей)."
         )
+        lines.append("")
+        lines.append("- Проверено: принятых изменений `fullAssignment` нет; verified checkpoint только фиксирует состояние.")
+        lines.append("- Ограничения и отложенные пакеты:")
+        if deferrals:
+            for entry in deferrals:
+                lines.append(
+                    f"  - `{entry.get('package') or entry.get('candidateId') or '-'}`: {entry.get('reason')}"
+                )
+        else:
+            lines.append("  - явных отложенных пакетов в ledger нет.")
+        lines.append("- Рекомендация: продолжить план-next/новый cohort по остатку целей; при следующем принятом "
+                     "улучшении guide пополняется фактическими возможностями и breaking changes.")
     else:
         lines.append("## Accepted upgrades")
         lines.append("")
@@ -2401,10 +2544,28 @@ def _build_developer_upgrade_guide(
         for name, versions in sorted(upgraded.items()):
             lines.append(f"| `{name}` | `{versions['from']}` | `{versions['to']}` |")
         lines.append("")
-        lines.append(
-            "Возможности, breaking changes и ограничения toolchain описываются по мере "
-            "реальных upgrade-сессий (см. diagnostics/checkpoint evidence)."
-        )
+        lines.append("## Возможности и адаптации (фактические, по ответам агента)")
+        lines.append("")
+        if adaptations:
+            for name, notes in sorted(adaptations.items()):
+                lines.append(f"- `{name}`:")
+                for note in notes:
+                    lines.append(f"  - {note}")
+        else:
+            lines.append(
+                "Записанных агентских объяснений по этим пакетам в ledger нет; адаптация "
+                "проверялась только через verify-exact на отремонтированных bytes."
+            )
+        lines.append("")
+        lines.append("## Ограничения и отложенные пакеты")
+        lines.append("")
+        if deferrals:
+            for entry in deferrals:
+                lines.append(
+                    f"- `{entry.get('package') or entry.get('candidateId') or '-'}`: {entry.get('reason')}"
+                )
+        else:
+            lines.append("- Явных отложенных пакетов нет; остаток целей см. в MIGRATION_REPORT.")
     lines.append("")
     return "\n".join(lines)
 
