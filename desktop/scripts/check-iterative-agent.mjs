@@ -12,6 +12,7 @@ import {
   buildIterativeRepairPrompt,
   changedFilesFromBaseline,
   clearAgentLease,
+  decideAgentLeaseDispatch,
   forbiddenTrialViolations,
   iterativeApplyFeedbackInvocation,
   parseAgentOutcome,
@@ -265,17 +266,40 @@ if (JSON.stringify(expansionFeedback.proposedScope) !== '{"companions":["is-odd"
 // 10. R6: the durable dispatch lease round-trips, expires and clears.
 const leasePath = agentLeaseFile(runDir);
 if (!leasePath.endsWith(AGENT_LEASE_FILENAME)) throw new Error("Lease path contract broken");
+const leaseNow = Date.now();
 writeAgentLease(leasePath, {
   schemaVersion: 1, sessionId: "abc123", provider: "opencode", databasePath: "/db",
   runId: "iter-agent-1", candidateId: "C2", attemptId: 1, pid: process.pid,
-  startedAt: new Date().toISOString(),
+  startedAt: new Date(leaseNow).toISOString(),
 });
 const leaseBack = readAgentLease(leasePath);
 if (!leaseBack || leaseBack.sessionId !== "abc123" || leaseBack.provider !== "opencode") {
   throw new Error(`Lease did not round-trip: ${JSON.stringify(leaseBack)}`);
 }
 if (!agentLeaseAlive(leaseBack)) throw new Error("Fresh lease must be alive");
-if (agentLeaseAlive(leaseBack, Date.now() + 3 * 60 * 60 * 1000)) throw new Error("Expired lease must not be alive");
+const leaseStart = Date.parse(leaseBack.startedAt);
+if (agentLeaseAlive(leaseBack, leaseStart + 3 * 60 * 60 * 1000)) throw new Error("Expired lease must not be alive");
+
+// 11. #5: the dispatch decision for a durable lease. A live issuing Desktop
+// refuses a second session; a DEAD one (app killed mid-run) resumes the SAME
+// session instead of spending a second attempt; expired/absent starts fresh.
+const stillRunning = { pid: process.pid };
+const inProgress = decideAgentLeaseDispatch({ ...stillRunning, schemaVersion: 1, sessionId: "abc123", provider: "opencode", databasePath: "/db", runId: "iter-agent-1", candidateId: "C2", attemptId: 1, startedAt: new Date().toISOString() }, () => true);
+if (inProgress.action !== "in-progress") throw new Error(`Live owner must refuse a second dispatch: ${JSON.stringify(inProgress)}`);
+const deadOwner = { pid: 1, schemaVersion: 1, sessionId: "abc123", provider: "opencode", databasePath: "/db", runId: "iter-agent-1", candidateId: "C2", attemptId: 1, startedAt: new Date().toISOString() };
+const resumed = decideAgentLeaseDispatch(deadOwner, () => false);
+if (resumed.action !== "resume" || resumed.sessionId !== "abc123") {
+  throw new Error(`Killed owner must resume the same session: ${JSON.stringify(resumed)}`);
+}
+const noLease = decideAgentLeaseDispatch(undefined, () => false);
+if (noLease.action !== "none") throw new Error(`Absent lease must dispatch fresh: ${JSON.stringify(noLease)}`);
+const expiredLease = {
+  pid: 1, schemaVersion: 1, sessionId: "abc123", provider: "opencode", databasePath: "/db",
+  runId: "iter-agent-1", candidateId: "C2", attemptId: 1, startedAt: new Date(leaseStart - 3 * 60 * 60 * 1000).toISOString(),
+};
+const expired = decideAgentLeaseDispatch(expiredLease, () => true);
+if (expired.action !== "none") throw new Error(`Expired lease must dispatch fresh even with a live pid: ${JSON.stringify(expired)}`);
+
 clearAgentLease(leasePath);
 if (existsSync(leasePath)) throw new Error("clearAgentLease must remove the file");
 if (readAgentLease(join(runDir, "trial", "no-such-lease.json")) !== undefined) {

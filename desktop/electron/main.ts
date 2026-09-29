@@ -56,7 +56,7 @@ import { commandEnvironment, decodeProcessOutputChunk, normalizePathForCompariso
 import { currentTask as readIterativeCurrentTask, iterativeRunDirPath, missingTaskExportInput, taskStaleness } from './iterative-migration.js'
 import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
 import { iterativeBeginInvocation, targetsFromDashboardState } from './iterative-begin.js'
-import { agentLeaseAlive, agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, changedFilesFromBaseline, clearAgentLease, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
+import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
@@ -1605,6 +1605,20 @@ function killProcessTree(child: ChildProcessWithoutNullStreams): void {
     try { process.kill(-pid, 'SIGKILL') } catch { try { child.kill('SIGKILL') } catch { /* already gone */ } }
   }, 3_000)
   hardKill.unref()
+}
+
+// Best-effort liveness of a foreign pid, used to tell "the desktop that issued
+// an agent lease is still running" (AGENT_IN_PROGRESS) from "that instance was
+// killed and the lease is a durable crash marker" (safe to resume the same
+// session). EPERM means the process exists but may not be signalled.
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
 }
 
 // A killed process just looks like a non-zero exit to the caller, which for a
@@ -7744,16 +7758,23 @@ function setupIpc(): void {
       if (decision.step !== 'agent') {
         return { ok: false, error: `NO_REPAIR_PENDING: phase=${String(payload.run?.phase ?? '')}` }
       }
-      // R6: refuse a SECOND repair session while the previous attempt (or its
-      // verification) is still in flight, without spending another attempt.
+      // R6/#5: classify the durable lease before dispatching. A fresh lease
+      // whose issuing Desktop is STILL ALIVE means a second window / live run:
+      // refuse without spending an attempt. A fresh lease whose owner is DEAD
+      // means a kill/crash mid-run: resume the exact same provider session
+      // (same attempt, durable trial edits, budget untouched). An absent or
+      // expired lease starts fresh.
       const leasePath = agentLeaseFile(runDir)
       const existingLease = readAgentLease(leasePath)
-      if (existingLease && agentLeaseAlive(existingLease)) {
+      const leaseDecision = decideAgentLeaseDispatch(existingLease, isPidAlive)
+      if (leaseDecision.action === 'in-progress') {
         return {
           ok: false,
-          error: `AGENT_IN_PROGRESS: ремонт от ${existingLease.startedAt} (${existingLease.provider}, сессия ${existingLease.sessionId.slice(0, 8)}…) ещё не завершён; дождитесь завершения`,
+          error: `AGENT_IN_PROGRESS: ремонт от ${existingLease?.startedAt} (${existingLease?.provider}, сессия ${String(existingLease?.sessionId ?? '').slice(0, 8)}…) ещё не завершён; дождитесь завершения`,
         }
       }
+      const resumeSessionId = leaseDecision.action === 'resume' ? leaseDecision.sessionId : undefined
+      const resuming = resumeSessionId !== undefined
       // R7: the bootstrap repair works in the version-neutral C0 trial (run-level
       // bootstrapRefs, no candidate); candidate repair works in the candidate
       // trial. Both branches build the prompt over the durable repair requests.
@@ -7820,7 +7841,9 @@ function setupIpc(): void {
       // agent TEXT alone may never claim a completed repair.
       const provider = workspace.agent === 'claude' ? 'claude' : workspace.agent === 'codex' ? 'codex' : 'opencode'
       const model = workspace.agentModel
-      const sessionId = randomUUID()
+      // #5: after a crash the SAME provider session is resumed (same attempt,
+      // same sessionId, durable trial); a fresh dispatch gets a new session.
+      const sessionId = resuming ? resumeSessionId : randomUUID()
       try {
         const baselineFile = trialBaselineFile(runDir)
         if (!existsSync(baselineFile)) writeTrialBaseline(workspaceRoot, baselineFile)
@@ -7829,6 +7852,7 @@ function setupIpc(): void {
           ? buildIterativeBootstrapPrompt({ ...ctx, checkpointId: ctx.baseCheckpointId })
           : buildIterativeRepairPrompt(ctx)
         writeFileSync(promptFile, promptText, 'utf8')
+        const databasePath = existingLease?.databasePath || ''
 
         let output = ''
         let exitCode = 0
@@ -7837,11 +7861,13 @@ function setupIpc(): void {
           try {
             // R6: the durable dispatch lease is persisted BEFORE the agent is
             // awaited, with the session/provider/database/attempt identities.
+            // On resume it keeps the ORIGINAL sessionId and databasePath so
+            // the exact provider conversation is found and continued.
             writeAgentLease(leasePath, {
               schemaVersion: 1,
               sessionId,
               provider,
-              databasePath: transport?.databasePath ?? '',
+              databasePath: databasePath || (transport?.databasePath ?? ''),
               runId: ctx.runId,
               candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId,
               attemptId: ctx.attemptId,
@@ -7850,10 +7876,12 @@ function setupIpc(): void {
             })
             const agentResult = await spawnCapture(
               'opencode',
-              buildOpenCodeAgentArgs(projectPath, promptFile, model, undefined, transport?.url),
+              resuming
+                ? buildOpenCodeResumeArgs(projectPath, resumeSessionId as string, model, promptFile, undefined, undefined, transport?.url)
+                : buildOpenCodeAgentArgs(projectPath, promptFile, model, undefined, transport?.url),
               projectPath,
               900_000,
-              transport ? { OPENCODE_DB: transport.databasePath } : undefined,
+              transport ? { OPENCODE_DB: databasePath || transport.databasePath } : undefined,
             )
             exitCode = agentResult.code
             output = `${agentResult.stdout}\n${agentResult.stderr}`
@@ -7875,7 +7903,11 @@ function setupIpc(): void {
           })
           const agentResult = await spawnCaptureWithInput(
             provider === 'claude' ? 'claude' : 'codex',
-            provider === 'claude' ? buildClaudeAgentArgs(model) : buildCodexAgentArgs(projectPath, model),
+            resuming
+              ? (provider === 'claude'
+                ? buildClaudeResumeArgs(resumeSessionId as string, model, promptFile)
+                : buildCodexResumeArgs(resumeSessionId as string, model, promptFile))
+              : (provider === 'claude' ? buildClaudeAgentArgs(model) : buildCodexAgentArgs(projectPath, model)),
             projectPath,
             readFileSync(promptFile, 'utf8'),
             900_000,

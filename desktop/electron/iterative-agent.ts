@@ -499,3 +499,28 @@ export function clearAgentLease(file: string): void {
     // best-effort cleanup; a stale lease simply expires via agentLeaseAlive
   }
 }
+
+// #5: what a fresh `flow:iterative:agent` dispatch must do about a durable
+// lease left on disk:
+//   - none: the lease is absent or older than the expiry window -> fresh run.
+//   - in-progress: the lease is fresh AND its issuing Desktop process is still
+//     alive (a second window / a live run) -> refuse without spending attempts.
+//   - resume: the lease is fresh but the issuing Desktop was killed or crashed
+//     mid-run -> resume the SAME provider session (same attempt, durable trial
+//     edits), never a second attempt for the same repair.
+// The owner-liveness probe is injected so the decision is testable without OS
+// process-table races.
+export type AgentLeaseDecision =
+  | { action: 'none' }
+  | { action: 'in-progress' }
+  | { action: 'resume'; sessionId: string }
+
+export function decideAgentLeaseDispatch(
+  lease: AgentLease | undefined,
+  isOwnerAlive: (pid: number) => boolean,
+  now = Date.now(),
+): AgentLeaseDecision {
+  if (!lease || !agentLeaseAlive(lease, now)) return { action: 'none' }
+  if (lease.pid > 0 && isOwnerAlive(lease.pid)) return { action: 'in-progress' }
+  return { action: 'resume', sessionId: lease.sessionId }
+}
