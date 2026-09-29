@@ -725,6 +725,19 @@ def build_run_config(run_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
             if isinstance(name, str) and isinstance(version, str) and name.strip() and version.strip():
                 targets[name] = version
 
+    # #2: bounded target discovery when the caller brought NO roadmap targets
+    # (no dashboard-state and no explicit targets file): derive them from the
+    # direct dependency set's registry dist-tags.latest (yellow lag policy),
+    # without the full generator/solver and without inventing a version. A
+    # saved roadmap still wins when provided.
+    target_discovery: List[Dict[str, Any]] = []
+    if not targets:
+        targets, target_discovery = _discover_targets(
+            project_dir,
+            direct_dependency_assignment(project_dir),
+            None,
+        )
+
     commands = tuple(str(item) for item in (verify_raw.get("commands") or []))
     if not commands:
         commands = discover_baseline_project_checks(project_dir)
@@ -828,6 +841,7 @@ def build_run_config(run_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "dashboardState": str(dashboard_state_path) if dashboard_state_path is not None else "",
         "requestedNode": requested_node,
         "runtime": runtime,
+        "targetDiscovery": target_discovery,
         "createdAt": _now_iso(),
         "toolBuildId": args.tool_build_id or "",
     }
@@ -850,6 +864,20 @@ def _begin_locked(run_dir: Path, config: Mapping[str, Any], args: argparse.Names
             "managedDependencies": len(initial_assignment),
         }
     )
+
+    discovery = config.get("targetDiscovery") or []
+    discovered = [entry for entry in discovery if entry.get("status") == "discovered"]
+    unavailable = [entry for entry in discovery if entry.get("status") == "registry-unavailable"]
+    if discovered or unavailable:
+        _emit_status(
+            {
+                "event": "begin.discovery",
+                "runId": run_id,
+                "source": "registry dist-tags.latest",
+                "discoveredTargets": sorted(str(entry.get("package") or "") for entry in discovered),
+                "registryUnavailable": sorted(str(entry.get("package") or "") for entry in unavailable),
+            }
+        )
 
     snapshot_container = run_dir / SOURCE_DIR / "C0"
     snapshot = capture_durable_source_snapshot(
@@ -1576,6 +1604,76 @@ def _npm_engines_node(
     if isinstance(parsed, dict):
         parsed = parsed.get("node")
     return str(parsed or "").strip()[:256]
+
+
+def _npm_latest_version(
+    project_dir: Path,
+    name: str,
+    runtime_env: Optional[Dict[str, str]],
+) -> str:
+    """Exact registry ``dist-tags.latest`` of a package ('' = no evidence)."""
+    manager = resolve_executable("npm")
+    if not manager:
+        return ""
+    try:
+        completed = _run(
+            [manager, "view", name, "dist-tags.latest", "--json"],
+            project_dir,
+            timeout_seconds=60,
+            env=runtime_env or {},
+            base_env=os.environ,
+            progress_label=f"target discovery {name}",
+        )
+    except Exception:  # noqa: BLE001 - a probe failure is abstention, never a constraint
+        return ""
+    if completed.returncode != 0:
+        return ""
+    text = (completed.stdout or "").strip()
+    if not text or text in ("{}", "null", "undefined"):
+        return ""
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = text
+    if isinstance(parsed, dict):
+        parsed = parsed.get("latest")
+    return str(parsed or "").strip()[:128]
+
+
+def _discover_targets(
+    project_dir: Path,
+    current: Mapping[str, str],
+    runtime_env: Optional[Dict[str, str]],
+) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
+    """#2 bounded target discovery for begin when no roadmap targets exist.
+
+    Yellow lag policy applied WITHOUT the legacy generator or solver: for every
+    direct managed dependency, the registry ``dist-tags.latest`` IS the target.
+    A version is never invented and never inherited from a dashboard: a package
+    whose latest cannot be established from the registry is skipped and
+    reported as evidence, and a package already at latest produces no target.
+    Later planning layers (the #6 engine pre-check) may still defer a target
+    that excludes the run's chosen Node.
+    """
+    targets: Dict[str, str] = {}
+    evidence: List[Dict[str, Any]] = []
+    for name, declared in sorted(current.items()):
+        latest = _npm_latest_version(project_dir, name, runtime_env)
+        if not latest:
+            evidence.append(
+                {"package": name, "declared": declared, "latest": "", "status": "registry-unavailable"}
+            )
+            continue
+        if latest == declared:
+            evidence.append(
+                {"package": name, "declared": declared, "latest": latest, "status": "up-to-date"}
+            )
+            continue
+        targets[name] = latest
+        evidence.append(
+            {"package": name, "declared": declared, "latest": latest, "status": "discovered"}
+        )
+    return targets, evidence
 
 
 def _engine_deferred_targets(
