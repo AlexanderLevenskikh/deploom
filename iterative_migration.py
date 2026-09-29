@@ -1247,6 +1247,42 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
     desired = {name: targets.get(name, version) for name, version in incumbent.items()}
     actionable = [name for name, version in sorted(desired.items()) if name in targets and targets[name] != incumbent.get(name)]
 
+    # #6: runtime-aware candidate selection BEFORE the expensive materialize.
+    # The run's chosen Node (runtime contract effectiveVersion) is the engine
+    # the install/verification will execute under. A direct target whose
+    # registry engines.node excludes it is deferred here — never materialized,
+    # never converted into a false verification outcome. Abstention (no
+    # metadata, missing manager, probe failure) is compatibility, never a
+    # constraint. Transitive incompatibility stays install evidence.
+    engine_deferrals: List[Dict[str, Any]] = []
+    if actionable:
+        node_version = _normalize_effective_node_version(
+            (config.get("runtime") or {}).get("effectiveVersion") or ""
+        )
+        if node_version:
+            engine_requested = {name: targets[name] for name in actionable}
+            effective_targets, engine_deferrals = _engine_deferred_targets(
+                Path(config.get("projectDir") or ""),
+                incumbent,
+                engine_requested,
+                node_version,
+                _runtime_env(config),
+            )
+            if engine_deferrals:
+                ledger = dict(load_ledger(run_dir))
+                _record_engine_deferrals(ledger, checkpoint_id, engine_deferrals)
+                save_ledger(run_dir, ledger)
+            desired = {
+                name: effective_targets.get(name, version)
+                for name, version in incumbent.items()
+            }
+            actionable = [
+                name
+                for name, version in sorted(desired.items())
+                if name in effective_targets and effective_targets[name] != incumbent.get(name)
+            ]
+            targets = effective_targets
+
     if not actionable:
         # Policy is satisfied only when EVERY requested target is present in
         # the current checkpoint at its exact target version. A target that is
@@ -1272,6 +1308,7 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
                 "reason": terminal_name,
                 "remainingActionable": len(actionable),
                 "targets": len(targets),
+                "engineDeferred": len(engine_deferrals),
             }
         )
         return 0
@@ -1380,6 +1417,7 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
             "assignmentFingerprint": assignment_fingerprint(assignment),
             "changedCount": len(changed),
             "dependencyDiagnostics": dependency_diagnostics,
+            "engineDeferred": len(engine_deferrals),
         }
     )
     return 0
@@ -1488,6 +1526,124 @@ def _dependency_diagnostics(project_dir: Any) -> Dict[str, Any]:
         if issue:
             result["gitUrlWarnings"].append({"package": name, "spec": spec_str, **issue})
     return result
+
+
+def _normalize_effective_node_version(value: Any) -> str:
+    """x.y.z from an effective Node version string (v-prefix/build tolerated)."""
+    text = str(value or "").strip().lstrip("vV").split("+", 1)[0]
+    parts = text.split(".")
+    if len(parts) >= 3 and all(part.isdigit() for part in parts[:3]):
+        return ".".join(parts[:3])
+    return text
+
+
+def _npm_engines_node(
+    project_dir: Path,
+    name: str,
+    version: str,
+    runtime_env: Optional[Dict[str, str]],
+) -> str:
+    """Best-effort registry ``engines.node`` of ``name@version``.
+
+    Deliberately evidence-light and safe: a missing manager, a failed probe or
+    an unparsable answer returns '' — an abstention that is treated as
+    COMPATIBLE, never as a false incompatibility constraint. Only an actual
+    engines.node range from the registry may defer a target.
+    """
+    manager = resolve_executable("npm")
+    if not manager:
+        return ""
+    try:
+        completed = _run(
+            [manager, "view", f"{name}@{version}", "engines.node", "--json"],
+            project_dir,
+            timeout_seconds=60,
+            env=runtime_env or {},
+            base_env=os.environ,
+            progress_label=f"engine metadata probe {name}@{version}",
+        )
+    except Exception:  # noqa: BLE001 - a probe failure is abstention, never a constraint
+        return ""
+    if completed.returncode != 0:
+        return ""
+    text = (completed.stdout or "").strip()
+    if not text or text in ("{}", "null", "undefined"):
+        return ""
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = text
+    if isinstance(parsed, dict):
+        parsed = parsed.get("node")
+    return str(parsed or "").strip()[:256]
+
+
+def _engine_deferred_targets(
+    project_dir: Path,
+    incumbent: Mapping[str, str],
+    requested: Mapping[str, str],
+    node_version: str,
+    runtime_env: Optional[Dict[str, str]],
+) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
+    """#6 runtime-aware candidate selection BEFORE the expensive materialization.
+
+    For every requested target whose registry ``engines.node`` excludes the
+    run's chosen Node, the target is excluded from this plan's assignment and
+    returned as a deferral entry — an incompatible install is never
+    materialized and never becomes a false verification result. Transitive
+    incompatibility (introduced by a dependency, not declared on the direct
+    target) is out of scope here and remains a matter for install evidence.
+    Returns ``(effective_targets, deferrals)``.
+    """
+    from project_runtime import node_range_satisfied
+
+    effective: Dict[str, str] = {}
+    deferrals: List[Dict[str, Any]] = []
+    for name, version in sorted(requested.items()):
+        spec = _npm_engines_node(project_dir, name, version, runtime_env)
+        if not spec or node_range_satisfied(spec, node_version):
+            effective[name] = version
+            continue
+        deferrals.append(
+            {
+                "package": name,
+                "requestedVersion": version,
+                "nodeVersion": node_version,
+                "nodeSpec": spec,
+                "kind": "ENGINES_INCOMPATIBLE",
+                "reason": (
+                    f"{name}@{version} requires node {spec}, but the run's chosen "
+                    f"Node is {node_version}; target deferred before materialization"
+                ),
+            }
+        )
+    return effective, deferrals
+
+
+def _record_engine_deferrals(
+    ledger: Dict[str, Any], checkpoint_id: str, deferrals: Sequence[Mapping[str, Any]]
+) -> None:
+    """Persist engine-incompatible deferrals as deterministic ledger input.
+
+    A deferred target stays in the policy remainder/denominator (the config
+    targets are untouched); this is visibility evidence, never acceptance.
+    """
+    now = _now_iso()
+    entries = list(ledger.get("deferrals", []))
+    for entry in deferrals:
+        entries.append(
+            {
+                "baseCheckpointId": checkpoint_id,
+                "candidateId": "",
+                "cohortId": None,
+                "package": str(entry.get("package") or ""),
+                "requestedVersion": str(entry.get("requestedVersion") or ""),
+                "reason": str(entry.get("reason") or "engines.node incompatible with chosen Node"),
+                "kind": str(entry.get("kind") or "ENGINES_INCOMPATIBLE"),
+                "createdAt": now,
+            }
+        )
+    ledger["deferrals"] = entries
 
 
 def _build_atomic_groups(
