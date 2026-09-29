@@ -682,6 +682,24 @@ def build_run_config(run_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
             1200, 120, 4 * 3600,
         ),
     }
+    dashboard_state = (args.dashboard_state or "").strip()
+    dashboard_state_path = Path(dashboard_state).expanduser().resolve() if dashboard_state else None
+    if dashboard_state_path is not None and not dashboard_state_path.exists():
+        raise InvalidInputError(f"DASHBOARD_STATE_MISSING: {dashboard_state_path}")
+    audit_policy = {
+        "lagMonths": _clamp_int(
+            args.lag_months if args.lag_months is not None else 12,
+            12, 1, 60,
+        ),
+        "minLagOkPct": _clamp_int(
+            args.min_lag_ok_pct if args.min_lag_ok_pct is not None else 80,
+            80, 0, 100,
+        ),
+        "maxKnownHigh": _clamp_int(
+            args.max_known_high if args.max_known_high is not None else 1,
+            1, 0, 100,
+        ),
+    }
     return {
         "schemaVersion": SCHEMA_VERSION,
         "projectDir": str(project_dir),
@@ -693,6 +711,8 @@ def build_run_config(run_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
         "verifyConfig": verify_config,
         "policyHash": policy_hash,
         "budget": budget,
+        "auditPolicy": audit_policy,
+        "dashboardState": str(dashboard_state_path) if dashboard_state_path is not None else "",
         "createdAt": _now_iso(),
         "toolBuildId": args.tool_build_id or "",
     }
@@ -2164,15 +2184,91 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _policy_satisfied(config: Mapping[str, Any], checkpoint: Mapping[str, Any]) -> bool:
+    targets = {str(k): str(v) for k, v in (config.get("targets") or {}).items()}
+    if not targets:
+        return False
+    incumbent = checkpoint.get("fullAssignment") or {}
+    return all(
+        name in incumbent and str(targets[name]) == str(incumbent[name])
+        for name in targets
+    )
+
+
+def _terminal_outcome(satisfied: bool, audit_status: str, accepted_count: int) -> str:
+    # R8: durable complete/partial/blocked. A satisfied policy is COMPLETE only
+    # on a PASS audit; any missing/UNKNOWN evidence never yields COMPLETE.
+    if satisfied and audit_status == "PASS":
+        return "COMPLETE"
+    if audit_status not in ("PASS", "FAIL"):
+        return "BLOCKED_BASELINE"
+    if accepted_count > 0:
+        return "PARTIAL_VERIFIED"
+    return "NO_VERIFIED_UPGRADE"
+
+
 def cmd_finish(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
     run = load_run(run_dir)
     config = load_config(run_dir)
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=600)
+    lock.acquire()
+    try:
+        return _finish_locked(run_dir, run, config)
+    finally:
+        lock.release()
+
+
+def _finish_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any]) -> int:
     checkpoints = _all_checkpoints(run_dir)
-    terminal = run.get("terminal")
     reports_dir = run_dir / REPORTS_DIR
     reports_dir.mkdir(parents=True, exist_ok=True)
-    report = _build_migration_report(run, config, checkpoints)
+    existing_outcome = run.get("terminalOutcome")
+
+    # R8: finish is an IDEMPOTENT terminal transition. The durable outcome is
+    # computed once from the audit evidence + acceptance chain; every later call
+    # only re-writes the reports from the same durable state.
+    if not existing_outcome:
+        active_id = str(run["activeCheckpointId"])
+        checkpoint = load_checkpoint(run_dir, active_id)
+        audit = checkpoint.get("audit") or {}
+        audit_status = str(audit.get("status") or "")
+        if audit_status not in ("PASS", "FAIL"):
+            # The independent audit of the EXACT accepted checkpoint is a
+            # precondition of finalizing; UNKNOWN evidence never yields
+            # COMPLETE, so finish runs the audit when the run was finished
+            # before it had evidence.
+            audit_args = argparse.Namespace(
+                registry="",
+                lag_months=None,
+                min_lag_ok_pct=None,
+                max_known_high=None,
+                yarn_audit_engine="auto",
+            )
+            _audit_locked(run_dir, run, config, audit_args)
+            checkpoint = load_checkpoint(run_dir, active_id)
+            audit = checkpoint.get("audit") or {}
+            audit_status = str(audit.get("status") or "")
+        satisfied = _policy_satisfied(config, checkpoint)
+        accepted_count = sum(1 for c in checkpoints if c.get("status") == "VERIFIED")
+        outcome = _terminal_outcome(satisfied, audit_status, accepted_count)
+        run = dict(run)
+        run["terminal"] = outcome
+        run["terminalOutcome"] = {
+            "outcome": outcome,
+            "satisfied": satisfied,
+            "auditStatus": audit_status,
+            "acceptedCheckpoints": accepted_count,
+            "finishedAt": _now_iso(),
+            "activeCheckpointId": active_id,
+        }
+        run["phase"] = "TERMINAL"
+        run["updatedAt"] = _now_iso()
+        save_run(run_dir, run)
+    else:
+        outcome = str(existing_outcome.get("outcome") or run.get("terminal") or "")
+
+    report = _build_migration_report(run, config, checkpoints, existing_outcome or run.get("terminalOutcome"))
     guide = _build_developer_upgrade_guide(config, checkpoints)
     (reports_dir / "MIGRATION_REPORT.md").write_text(report, encoding="utf-8")
     (reports_dir / "DEVELOPER_UPGRADE_GUIDE.md").write_text(guide, encoding="utf-8")
@@ -2180,7 +2276,7 @@ def cmd_finish(args: argparse.Namespace) -> int:
         {
             "event": "finish.done",
             "runId": run["runId"],
-            "terminal": terminal,
+            "terminal": outcome,
             "checkpoints": [c["checkpointId"] for c in checkpoints],
             "reportsDir": str(reports_dir),
         }
@@ -2199,7 +2295,10 @@ def _all_checkpoints(run_dir: Path) -> List[Dict[str, Any]]:
 
 
 def _build_migration_report(
-    run: Mapping[str, Any], config: Mapping[str, Any], checkpoints: Sequence[Mapping[str, Any]]
+    run: Mapping[str, Any],
+    config: Mapping[str, Any],
+    checkpoints: Sequence[Mapping[str, Any]],
+    terminal_outcome: Optional[Mapping[str, Any]] = None,
 ) -> str:
     lines: List[str] = []
     lines.append("# MIGRATION_REPORT")
@@ -2210,6 +2309,15 @@ def _build_migration_report(
     lines.append(f"- Terminal: `{run.get('terminal') or 'in-progress'}`")
     lines.append(f"- Active checkpoint: `{run.get('activeCheckpointId')}`")
     lines.append("")
+    if terminal_outcome:
+        lines.append("## Outcome")
+        lines.append("")
+        lines.append(f"- Verdict: `{terminal_outcome.get('outcome')}`")
+        lines.append(f"- Satisfied policy targets: `{terminal_outcome.get('satisfied')}`")
+        lines.append(f"- Independent audit of the accepted checkpoint: `{terminal_outcome.get('auditStatus')}`")
+        lines.append(f"- Accepted checkpoints: `{terminal_outcome.get('acceptedCheckpoints')}`")
+        lines.append(f"- Finished at: `{terminal_outcome.get('finishedAt')}`")
+        lines.append("")
     lines.append("## Checkpoints")
     lines.append("")
     lines.append("| Checkpoint | Parent | Status | Changed packages | Audit |")
@@ -2244,11 +2352,19 @@ def _build_migration_report(
     lines.append("## Evidence")
     lines.append("")
     for checkpoint in checkpoints:
+        audit = checkpoint.get("audit") or {}
         lines.append(
             f"- {checkpoint.get('checkpointId')}: sourceSnapshotKey=`{checkpoint.get('sourceSnapshotKey')}`, "
             f"manifestHash=`{checkpoint.get('manifestHash')}`, lockfileHash=`{checkpoint.get('lockfileHash') or '-'}`, "
             f"resolvedStateKey=`{checkpoint.get('resolvedStateKey') or '-'}`"
         )
+        if audit.get("status"):
+            lines.append(
+                f"  - audit=`{audit.get('status')}`, evidence=`{audit.get('evidenceRef') or '-'}`, "
+                f"lagOkPct=`{audit.get('lagOkPct')}`, lagOk=`{audit.get('lagOk')}`/"
+                f"{audit.get('lagLagging')}`lagging/`{audit.get('lagUnknown')}`unknown "
+                f"(of `{audit.get('lagTotal')}`), vulnerabilityPackages=`{audit.get('vulnerabilityPackages')}`"
+            )
     lines.append("")
     return "\n".join(lines)
 
@@ -2317,32 +2433,72 @@ def _audit_locked(
     )
     project_path = Path(snapshot.root) / str(checkpoint.get("projectRelative") or ".")
     try:
-        from manual_dependency_audit import build_report
+        from manual_dependency_audit import build_report, markdown
     except Exception as exc:
         raise IterativeMigrationError("AUDIT_UNAVAILABLE", f"{exc}") from exc
     audit_workspace = run_dir / AUDIT_DIR / f"{checkpoint['checkpointId']}"
     audit_workspace.mkdir(parents=True, exist_ok=True)
+    audit_policy = config.get("auditPolicy") or {}
+    dashboard_state_raw = str(config.get("dashboardState") or "").strip()
+    dashboard_state = (
+        Path(dashboard_state_raw).expanduser().resolve()
+        if dashboard_state_raw and Path(dashboard_state_raw).exists()
+        else None
+    )
+    # R8: the independent audit runs over the EXACT accepted checkpoint bytes
+    # with the ACTUAL policy captured at begin (lag window, lag-ok threshold,
+    # known-High limit) plus the user's package lag policy from dashboard state
+    # — never dashboard_state=None.
     report = build_report(
         project_path,
         str(config.get("projectName") or ""),
         registry=args.registry or "",
         lag_months=int(
-            (args.lag_months or config.get("auditPolicy", {}).get("lagMonths", 12))
+            (args.lag_months if args.lag_months is not None
+             else audit_policy.get("lagMonths", 12))
         ),
-        dashboard_state=None,
+        dashboard_state=dashboard_state,
         audit_workspace=audit_workspace,
         target_level=str(config.get("targetLevel") or "yellow"),
         min_lag_ok_pct=int(
-            (args.min_lag_ok_pct or config.get("auditPolicy", {}).get("minLagOkPct", 80))
+            (args.min_lag_ok_pct if args.min_lag_ok_pct is not None
+             else audit_policy.get("minLagOkPct", 80))
         ),
         max_known_high=int((args.max_known_high if args.max_known_high is not None
-                            else config.get("auditPolicy", {}).get("maxKnownHigh", 1))),
+                            else audit_policy.get("maxKnownHigh", 1))),
         yarn_audit_engine=args.yarn_audit_engine or "auto",
     )
+    # R8: persist the FULL report as JSON/Markdown evidence (not just a status +
+    # directory link), then record the coverage/vuln metrics in the checkpoint.
+    evidence_report = audit_workspace / "audit-report.json"
+    evidence_markdown = audit_workspace / "audit-report.md"
+    evidence_report.write_text(
+        _stable_json(report), encoding="utf-8"
+    )
+    try:
+        evidence_markdown.write_text(markdown(report), encoding="utf-8")
+    except Exception as exc:  # the markdown renderer must never hide a finished audit
+        evidence_markdown.write_text(
+            f"# Audit report (markdown render failed: {exc})\n\n" + _stable_json(report),
+            encoding="utf-8",
+        )
     evidence_ref = str(audit_workspace)
     audit_status = _audit_status_from_report(report)
+    audit_metrics = report.get("audit") or {}
     checkpoint = dict(checkpoint)
-    checkpoint["audit"] = {"status": audit_status, "evidenceRef": evidence_ref}
+    checkpoint["audit"] = {
+        "status": audit_status,
+        "evidenceRef": evidence_ref,
+        "auditComplete": bool(report.get("auditComplete")),
+        "lagOkPct": audit_metrics.get("lagOkPct"),
+        "lagOk": audit_metrics.get("lagOk"),
+        "lagLagging": audit_metrics.get("lagLagging"),
+        "lagUnknown": audit_metrics.get("lagUnknown"),
+        "lagTotal": audit_metrics.get("lagTotal"),
+        "vulnerabilityPackages": len(audit_metrics.get("packages") or {}),
+        "policy": report.get("policy") or {},
+        "generatedAt": report.get("generatedAt") or "",
+    }
     save_checkpoint(run_dir, checkpoint)
     _emit_status(
         {
@@ -2351,6 +2507,8 @@ def _audit_locked(
             "checkpointId": checkpoint["checkpointId"],
             "status": audit_status,
             "evidenceRef": evidence_ref,
+            "evidenceJson": str(evidence_report),
+            "evidenceMarkdown": str(evidence_markdown),
         }
     )
     return 0
@@ -2434,6 +2592,14 @@ def build_parser() -> argparse.ArgumentParser:
     begin.add_argument("--max-repair-attempts", type=int, default=None)
     begin.add_argument("--max-infra-retries", type=int, default=None)
     begin.add_argument("--phase-timeout-seconds", type=int, default=None)
+    begin.add_argument(
+        "--dashboard-state",
+        default="",
+        help="Workspace dashboard-state.json carrying the user package lag policy (used by the independent audit)",
+    )
+    begin.add_argument("--lag-months", type=int, default=None)
+    begin.add_argument("--min-lag-ok-pct", type=int, default=None)
+    begin.add_argument("--max-known-high", type=int, default=None)
 
     verify_bootstrap = sub.add_parser("verify-bootstrap", help="Повторная контрольная проверка C0 после bootstrap repair")
     verify_bootstrap.add_argument("--timeout-seconds", type=int, default=1800)

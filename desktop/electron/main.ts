@@ -7439,6 +7439,20 @@ function setupIpc(): void {
       projectId: project.name,
       targetsFile,
       toolBuildId: app.getVersion(),
+      // R8: the run captures the workspace dashboard-state (user package lag
+      // policy) and the goal audit thresholds so the independent audit runs
+      // with the ACTUAL policy, not dashboard_state=None defaults.
+      dashboardStatePath: dashboardState && existsSync(dashboardState) ? dashboardState : undefined,
+      auditPolicy: {
+        lagPolicyMonths: intent.acceptancePolicy?.lagPolicyMonths,
+        minLagOkPct: intent.acceptancePolicy?.minLagOkPct,
+        maxKnownHigh: intent.acceptancePolicy?.maxKnownHigh,
+      },
+    }
+    if (options.dashboardStatePath === undefined) delete (options as { dashboardStatePath?: string }).dashboardStatePath
+    const auditPolicy = options.auditPolicy as { lagPolicyMonths?: number; minLagOkPct?: number; maxKnownHigh?: number }
+    if (auditPolicy.lagPolicyMonths === undefined && auditPolicy.minLagOkPct === undefined && auditPolicy.maxKnownHigh === undefined) {
+      delete (options as { auditPolicy?: object }).auditPolicy
     }
     iterativeStepInFlight.add(project.name)
     try {

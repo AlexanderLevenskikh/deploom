@@ -21,6 +21,12 @@ export type IterativeBeginOptions = {
   projectId?: string
   toolBuildId?: string
   targetsFile?: string
+  // R8: the independent audit runs with the user's ACTUAL package lag policy.
+  // dashboardStatePath points at the workspace dashboard-state.json (the same
+  // file the targets come from); auditPolicy pins the goal thresholds so the
+  // audit evidence is bound to the same numbers the roadmap enforces.
+  dashboardStatePath?: string
+  auditPolicy?: { lagPolicyMonths?: number; minLagOkPct?: number; maxKnownHigh?: number }
 }
 
 /** Extract exact target versions from one dashboard-state row batch.
@@ -77,6 +83,13 @@ export function iterativeBeginInvocation(
   if (options.projectName) args.push('--project-name', options.projectName)
   args.push('--target-level', options.targetLevel)
   if (options.targetsFile) args.push('--targets-file', options.targetsFile)
+  if (options.dashboardStatePath) args.push('--dashboard-state', options.dashboardStatePath)
+  const auditPolicy = options.auditPolicy
+  if (auditPolicy) {
+    if (auditPolicy.lagPolicyMonths !== undefined) args.push('--lag-months', String(auditPolicy.lagPolicyMonths))
+    if (auditPolicy.minLagOkPct !== undefined) args.push('--min-lag-ok-pct', String(auditPolicy.minLagOkPct))
+    if (auditPolicy.maxKnownHigh !== undefined) args.push('--max-known-high', String(auditPolicy.maxKnownHigh))
+  }
   if (options.workspaceId) args.push('--workspace-id', options.workspaceId)
   if (options.projectId) args.push('--project-id', options.projectId)
   if (options.toolBuildId) args.push('--tool-build-id', options.toolBuildId)

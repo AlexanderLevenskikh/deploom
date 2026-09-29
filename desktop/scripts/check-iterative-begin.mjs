@@ -98,4 +98,41 @@ if (withoutTargets.args.some((arg) => /^--run-id=/.test(arg))) {
   throw new Error("--run-id must not be forced by the Desktop (Python owns run identity)");
 }
 
+// 3b. R8: the independent audit needs the ACTUAL user policy — dashboard-state
+// path and the goal audit thresholds are forwarded when the Desktop has them,
+// and never invented when it does not.
+const withPolicy = iterativeBeginInvocation(
+  runDir,
+  {
+    projectDir: "C:/ws/demo",
+    projectName: "DemoApp",
+    targetLevel: "yellow",
+    dashboardStatePath: "C:/ws/.dependency-roadmap/state/dashboard-state.json",
+    auditPolicy: { lagPolicyMonths: 6, minLagOkPct: 90, maxKnownHigh: 2 },
+  },
+  "iterative_migration.py",
+  "python",
+);
+for (const pair of [
+  ["--dashboard-state", "C:/ws/.dependency-roadmap/state/dashboard-state.json"],
+  ["--lag-months", "6"],
+  ["--min-lag-ok-pct", "90"],
+  ["--max-known-high", "2"],
+]) {
+  if (!withPolicy.args.includes(pair[0]) || !withPolicy.args.includes(pair[1])) {
+    throw new Error(`Audit policy arg ${pair[0]} must be forwarded when set`);
+  }
+}
+const withoutPolicy = iterativeBeginInvocation(
+  runDir,
+  { projectDir: "C:/ws/demo", projectName: "DemoApp", targetLevel: "yellow" },
+  "iterative_migration.py",
+  "python",
+);
+for (const flag of ["--dashboard-state", "--lag-months", "--min-lag-ok-pct", "--max-known-high"]) {
+  if (withoutPolicy.args.includes(flag)) {
+    throw new Error(`Audit policy arg ${flag} must be omitted when the Desktop has no policy`);
+  }
+}
+
 console.log("check-iterative-begin: OK");

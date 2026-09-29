@@ -131,7 +131,10 @@ for (const consumedStage of ["ACCEPTED", "REJECTED"]) {
   }
 }
 
-// 4. Policy satisfied on a READY checkpoint -> finish (targets from run-config).
+// 4. Policy satisfied on a READY checkpoint: R8 — the independent audit of the
+// accepted checkpoint must run BEFORE the finish. The first decision is
+// `audit` (no recorded PASS/FAIL yet); only after the audit has written its
+// evidence does the decision become `finish`.
 const satisfiedDir = join(root, "run-satisfied");
 mkdirSync(satisfiedDir, { recursive: true });
 writeFileSync(
@@ -139,11 +142,23 @@ writeFileSync(
   JSON.stringify({ schemaVersion: 1, projectName: "DemoApp", targets: { "is-number": "7.0.0" } }),
   "utf8",
 );
-const satisfied = decideNextStep(satisfiedDir, payload({ phase: "READY", activeCandidateId: null }, {
+const satisfiedUnaudited = decideNextStep(satisfiedDir, payload({ phase: "READY", activeCandidateId: null }, {
   activeCheckpoint: { status: "VERIFIED", fullAssignment: { "is-number": "7.0.0" } },
 }));
-if (satisfied.step !== "finish" || satisfied.satisfied !== true) {
-  throw new Error(`Satisfied policy must finish: ${JSON.stringify(satisfied)}`);
+if (satisfiedUnaudited.step !== "audit" || satisfiedUnaudited.satisfied !== true) {
+  throw new Error(`Satisfied policy must cross the audit first: ${JSON.stringify(satisfiedUnaudited)}`);
+}
+const satisfiedAudited = decideNextStep(satisfiedDir, payload({ phase: "READY", activeCandidateId: null }, {
+  activeCheckpoint: { status: "VERIFIED", fullAssignment: { "is-number": "7.0.0" }, audit: { status: "PASS" } },
+}));
+if (satisfiedAudited.step !== "finish" || satisfiedAudited.satisfied !== true) {
+  throw new Error(`Satisfied policy with PASS audit must finish: ${JSON.stringify(satisfiedAudited)}`);
+}
+const satisfiedAuditedFail = decideNextStep(satisfiedDir, payload({ phase: "READY", activeCandidateId: null }, {
+  activeCheckpoint: { status: "VERIFIED", fullAssignment: { "is-number": "7.0.0" }, audit: { status: "FAIL" } },
+}));
+if (satisfiedAuditedFail.step !== "finish") {
+  throw new Error(`A recorded FAIL audit still lets the terminal finish run: ${JSON.stringify(satisfiedAuditedFail)}`);
 }
 const partial = decideNextStep(satisfiedDir, payload({ phase: "READY", activeCandidateId: null }, {
   activeCheckpoint: { status: "VERIFIED", fullAssignment: { "is-number": "6.0.0" } },

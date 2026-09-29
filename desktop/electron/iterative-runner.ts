@@ -8,10 +8,12 @@
 // parses that and DECIDES the next Python step from BOTH run.phase and
 // candidate.stage (the durable state files stay the single source of truth):
 //
-//   READY             -> plan-next (or finish when the policy is satisfied /
-//                        the run is terminal); an in-flight candidate is
-//                        resumed by its stage, a consumed one (VERIFYING/
-//                        ACCEPTED/REJECTED leftover) is skipped
+//   READY             -> plan-next (or audit, then finish, when the policy is
+//                        satisfied / the run is terminal — R8: a satisfied
+//                        policy crosses the independent audit first, UNKNOWN
+//                        audit evidence never yields COMPLETE); an in-flight
+//                        candidate is resumed by its stage, a consumed one
+//                        (VERIFYING/ACCEPTED/REJECTED leftover) is skipped
 //   BOOTSTRAP_REPAIR  -> bootstrap-materialize (no trial yet) / agent (GATE,
 //                        decision.bootstrap) once the version-neutral trial
 //                        exists
@@ -267,7 +269,18 @@ export function decideNextStep(
       }
       const satisfied = planSatisfied(readTargets(runDir), assignment)
       if (satisfied) {
-        return { step: 'finish', phase, reason: 'policy satisfied; finalize migration reports', satisfied: true }
+        // R8: a satisfied policy is finalized only AFTER the independent audit
+        // of the exact accepted checkpoint (PASS/FAIL recorded in
+        // checkpoint.audit). The first decision is `audit`; after the audit has
+        // written its evidence the decision is `finish`. UNKNOWN audit evidence
+        // never yields a COMPLETE, so a satisfied policy always crosses the
+        // audit first.
+        const audit = (checkpoint.audit ?? {}) as Record<string, any>
+        const auditStatus = String(audit.status ?? '')
+        if (auditStatus !== 'PASS' && auditStatus !== 'FAIL') {
+          return { step: 'audit', phase, reason: 'policy satisfied; run the independent audit of the accepted checkpoint before finalizing', satisfied: true }
+        }
+        return { step: 'finish', phase, reason: 'policy satisfied and audit recorded; finalize migration reports', satisfied: true }
       }
       return { step: 'plan-next', phase, reason: 'remaining targets are actionable; select the next cohort' }
     }

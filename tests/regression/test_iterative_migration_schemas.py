@@ -96,7 +96,7 @@ def _run_dict(**overrides) -> dict:
     return value
 
 
-def _checkpoint_dict(status="VERIFIED", full_assignment=None, checkpoint_id="C0", seq=0) -> dict:
+def _checkpoint_dict(status="VERIFIED", full_assignment=None, checkpoint_id="C0", seq=0, **overrides) -> dict:
     fixture = _fixture()["checkpoint"]
     value = dict(fixture)
     value.update(
@@ -108,6 +108,7 @@ def _checkpoint_dict(status="VERIFIED", full_assignment=None, checkpoint_id="C0"
             "fullAssignment": full_assignment or fixture["fullAssignment"],
         }
     )
+    value.update(overrides)
     return value
 
 
@@ -505,6 +506,84 @@ class IterativeMigrationGuardTests(unittest.TestCase):
             run_dir.write_checkpoint(_checkpoint_dict(status="RED_SOURCE"))
             with self.assertRaises(InvalidInputError):
                 _plan_next_locked(run_dir.root, _run_dict(), _config_dict())
+
+
+class IterativeMigrationFinishAuditTests(unittest.TestCase):
+    """R8: the independent audit of the exact accepted checkpoint precedes the
+    terminal finish; finish is an idempotent terminal transition and UNKNOWN
+    audit evidence never yields COMPLETE."""
+
+    def test_terminal_outcome_table(self) -> None:
+        from iterative_migration import _terminal_outcome
+
+        self.assertEqual(_terminal_outcome(True, "PASS", 2), "COMPLETE")
+        # Satisfied policy with a FAIL audit still made progress: never COMPLETE.
+        self.assertEqual(_terminal_outcome(True, "FAIL", 2), "PARTIAL_VERIFIED")
+        # UNKNOWN evidence blocks the completion claim.
+        self.assertEqual(_terminal_outcome(True, "UNKNOWN", 2), "BLOCKED_BASELINE")
+        self.assertEqual(_terminal_outcome(True, "", 2), "BLOCKED_BASELINE")
+        self.assertEqual(_terminal_outcome(False, "PASS", 2), "PARTIAL_VERIFIED")
+        self.assertEqual(_terminal_outcome(False, "FAIL", 0), "NO_VERIFIED_UPGRADE")
+        self.assertEqual(_terminal_outcome(False, "PASS", 0), "NO_VERIFIED_UPGRADE")
+
+    def test_policy_satisfied_exact(self) -> None:
+        from iterative_migration import _policy_satisfied
+
+        config = _config_dict(targets={"pkg-a": "1.1.0", "pkg-b": "2.0.0"})
+        self.assertTrue(
+            _policy_satisfied(config, _checkpoint_dict(full_assignment={"pkg-a": "1.1.0", "pkg-b": "2.0.0"}))
+        )
+        self.assertFalse(
+            _policy_satisfied(config, _checkpoint_dict(full_assignment={"pkg-a": "1.1.0"}))
+        )
+        self.assertFalse(_policy_satisfied(_config_dict(targets={}), _checkpoint_dict()))
+
+    def test_finish_with_recorded_audit_computes_durable_outcome(self) -> None:
+        from iterative_migration import _finish_locked, load_config, load_run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _RunDir(Path(tmp))
+            audit = {"status": "PASS", "evidenceRef": str(root.root / "audit" / "C0")}
+            root.write_run(_run_dict(phase="READY", terminal=None))
+            root.write_config(_config_dict(targets={"pkg-a": "1.1.0"}))
+            root.write_checkpoint(
+                _checkpoint_dict(full_assignment={"pkg-a": "1.1.0"}, audit=audit)
+            )
+            rc = _finish_locked(root.root, load_run(root.root), load_config(root.root))
+            self.assertEqual(rc, 0)
+            run = load_run(root.root)
+            self.assertEqual(run["phase"], "TERMINAL")
+            self.assertEqual(run["terminal"], "COMPLETE")
+            self.assertEqual(run["terminalOutcome"]["outcome"], "COMPLETE")
+            self.assertEqual(run["terminalOutcome"]["auditStatus"], "PASS")
+            report = (root.root / "reports" / "MIGRATION_REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("COMPLETE", report)
+            self.assertIn("lagOkPct", report)
+
+    def test_finish_idempotent_preserves_terminal_outcome(self) -> None:
+        from iterative_migration import _finish_locked, load_config, load_run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _RunDir(Path(tmp))
+            outcome = {
+                "outcome": "PARTIAL_VERIFIED",
+                "satisfied": False,
+                "auditStatus": "PASS",
+                "acceptedCheckpoints": 1,
+                "finishedAt": "2026-09-28T00:00:00Z",
+                "activeCheckpointId": "C0",
+            }
+            root.write_run(_run_dict(phase="TERMINAL", terminal="PARTIAL_VERIFIED", terminalOutcome=outcome))
+            root.write_config(_config_dict())
+            root.write_checkpoint(_checkpoint_dict())
+            rc = _finish_locked(root.root, load_run(root.root), load_config(root.root))
+            self.assertEqual(rc, 0)
+            run = load_run(root.root)
+            # Idempotent: the durable outcome and its timestamp are untouched.
+            self.assertEqual(run["terminal"], "PARTIAL_VERIFIED")
+            self.assertEqual(run["terminalOutcome"]["finishedAt"], "2026-09-28T00:00:00Z")
+            report = (root.root / "reports" / "MIGRATION_REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("PARTIAL_VERIFIED", report)
 
 
 if __name__ == "__main__":
