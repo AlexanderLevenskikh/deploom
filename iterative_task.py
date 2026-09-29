@@ -263,6 +263,24 @@ def build_task_markdown(
     )
 
 
+def _runtime_summary(config: Mapping[str, Any]) -> str:
+    """One-line Node/CI runtime contract for the task text; '' when the user
+    set no explicit runtime (then the task must not claim one)."""
+    rt = config.get("runtime") or {}
+    if not rt:
+        return ""
+    parts = [
+        f"{rt.get('requested')} \u2192 {rt.get('effectiveVersion')}",
+        f"[{rt.get('source') or ''}]",
+    ]
+    manager = f"{rt.get('packageManager') or ''} {rt.get('packageManagerVersion') or ''}".strip()
+    if manager:
+        parts.append(f"\u00b7 {manager}")
+    if rt.get("platform"):
+        parts.append(f"\u00b7 {rt.get('platform')}/{rt.get('arch') or ''}")
+    return " ".join(parts)
+
+
 def _build_ru(
     *,
     run, config, active, assignment, actions, deferred, satisfied,
@@ -285,7 +303,21 @@ def _build_ru(
         ("Lockfile hash", active.get("lockfileHash") or "-"),
         ("Resolved state", active.get("resolvedStateKey") or "-"),
         ("Проверки (hash)", command_set_hash),
+        ("Node/CI runtime", _runtime_summary(config) or "-"),
     ]))
+    lines.append("")
+    lines.append("## Окружение (не менять)")
+    lines.append("")
+    lines.append(
+        "Рантайм/CI-контракт этого run зафиксирован в строке «Node/CI runtime» выше. "
+        "Не меняй заданный Node-рантайм или CI и не игнорируй его: это часть проверочного контракта."
+    )
+    lines.append(
+        "Если работу блокирует окружение (нет доступа, недоступен реестр/утилита, "
+        "несовместимый рантайм) — верни фидбек `INCONCLUSIVE` или `INFRA_BLOCKED` с точной "
+        "причиной. Запрещено засчитывать проверки «в уме», подменять реальный запуск "
+        "или вносить изменения в конфигурацию окружения ради зелёных проверок."
+    )
     lines.append("")
     lines.append("## Точные версии накопленного состояния (immutable)")
     lines.append("")
@@ -416,7 +448,22 @@ def _build_en(
         ("Lockfile hash", active.get("lockfileHash") or "-"),
         ("Resolved state", active.get("resolvedStateKey") or "-"),
         ("Checks (hash)", command_set_hash),
+        ("Node/CI runtime", _runtime_summary(config) or "-"),
     ]))
+    lines.append("")
+    lines.append("## Environment (do not change)")
+    lines.append("")
+    lines.append(
+        "The Node/CI runtime contract of this run is recorded in the "
+        "\u201cNode/CI runtime\u201d row above. Do not change the pinned Node runtime or "
+        "CI, and do not ignore it: it is part of the verification contract."
+    )
+    lines.append(
+        "If the environment blocks your work (no access, unavailable registry/tool, "
+        "incompatible runtime) return `INCONCLUSIVE` or `INFRA_BLOCKED` feedback with the "
+        "exact reason. Never count checks as green \u201cin your head\u201d, substitute a "
+        "real run, or alter the environment configuration to manufacture green checks."
+    )
     lines.append("")
     lines.append("## Exact versions of the cumulative state (immutable)")
     lines.append("")

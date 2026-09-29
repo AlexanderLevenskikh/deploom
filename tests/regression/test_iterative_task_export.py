@@ -28,7 +28,7 @@ def sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def make_run_dir(root: Path, *, extra_targets=True) -> Path:
+def make_run_dir(root: Path, *, extra_targets=True, runtime: Optional[dict] = None) -> Path:
     run_dir = root / "run"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -49,6 +49,8 @@ def make_run_dir(root: Path, *, extra_targets=True) -> Path:
         "createdAt": "2026-09-29T00:00:00Z",
         "toolBuildId": "",
     }
+    if runtime is not None:
+        config["runtime"] = runtime
     c0 = {
         "schemaVersion": 1, "checkpointId": "C0", "parentCheckpointId": None, "seq": 0,
         "status": "VERIFIED", "sourceSnapshotKey": "snap-c0", "sourceSnapshotContainer": str(root / "snap-c0"),
@@ -306,6 +308,69 @@ def make_legacy_dashboard(root: Path, project_name: str = "sample-app") -> Path:
     path = root / "legacy-dashboard-state.json"
     path.write_text(json.dumps(dash), encoding="utf-8")
     return path
+
+class IterativeTaskRuntimeContractTests(unittest.TestCase):
+    """D3.5: the task text carries the pinned Node/CI runtime contract and the
+    explicit no-environment-change/INFRA_BLOCKED instruction (RU and EN)."""
+
+    RUNTIME = {
+        "requested": "22",
+        "effectiveVersion": "22.18.0",
+        "nodePath": "/opt/node22/bin/node",
+        "npmPath": "/opt/node22/bin/npm",
+        "source": "major-alias",
+        "packageManager": "yarn",
+        "packageManagerVersion": "1.22.19",
+        "platform": "linux",
+        "arch": "x86_64",
+        "contractHash": "rt-hash-123",
+        "hash": "rt-hash-123",
+    }
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _markdown(self, language: str, runtime: Optional[dict]) -> str:
+        run_dir = make_run_dir(self.root, runtime=runtime)
+        task.export_task_artifact(run_dir)
+        manifest = task.current_task(run_dir)
+        name = f"task.{language}.md"
+        return (run_dir / "task" / manifest["artifactId"] / name).read_text(encoding="utf-8")
+
+    def test_runtime_summary_formats_the_contract(self) -> None:
+        self.assertEqual(
+            task._runtime_summary({"runtime": self.RUNTIME}),
+            "22 \u2192 22.18.0 [major-alias] \u00b7 yarn 1.22.19 \u00b7 linux/x86_64",
+        )
+        self.assertEqual(task._runtime_summary({"runtime": {}}), "")
+        self.assertEqual(task._runtime_summary({}), "")
+
+    def test_ru_task_carries_runtime_row_and_environment_section(self) -> None:
+        md = self._markdown("ru", self.RUNTIME)
+        self.assertIn("Node/CI runtime", md)
+        self.assertIn("22 \u2192 22.18.0", md)
+        self.assertIn("yarn 1.22.19", md)
+        self.assertIn("## Окружение (не менять)", md)
+        self.assertIn("INFRA_BLOCKED", md)
+        self.assertIn("Не меняй заданный Node-рантайм", md)
+
+    def test_en_task_carries_runtime_row_and_environment_section(self) -> None:
+        md = self._markdown("en", self.RUNTIME)
+        self.assertIn("Node/CI runtime", md)
+        self.assertIn("22 \u2192 22.18.0", md)
+        self.assertIn("## Environment (do not change)", md)
+        self.assertIn("INFRA_BLOCKED", md)
+
+    def test_unset_runtime_shows_dash_and_no_claim(self) -> None:
+        md = self._markdown("ru", None)
+        self.assertIn("Node/CI runtime", md)
+        self.assertIn("## Окружение (не менять)", md)
+        self.assertNotIn("22 \u2192 22.18.0", md)
+        self.assertNotIn("yarn 1.22.19", md)
 
 
 class IterativeTaskLegacyExportTests(unittest.TestCase):
