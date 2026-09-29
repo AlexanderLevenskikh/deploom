@@ -57,8 +57,25 @@
 - Commits: `a48f50b` (feat: desktop consumer + check-iterative-migration.mjs с РЕАЛЬНЫМ python export→TS handoff), `86db6af` (feat: task panel, typed IPC, verified clipboard + check-task-clipboard.mjs).
 - Проверки Desktop: `npm run build` OK, lint 0 errors; затронутые contract-checks зелёные (flow-state, ui-shell, interaction-contracts, i18n, process-launcher, run-slot-isolation, ui-lifecycle, dashboard-state, baseline-intent, iterative-migration, task-clipboard).
 
+### 2026-09-29 — R5+R6, R8, R9, R10 — готово
+
+- `fa0e1bc` (R5+R6): независимый аудит отключённых/деферренных пакетов и честная доменная цепочка каждый шаг (4 теста).
+- `cb38bea` (R8): независимый аудит принятого checkpoint перед идемпотентным терминальным `finish`; недостижимые цели → INCONCLUSIVE/NO_ACTIONABLE, а не POLICY_SATISFIED.
+- `ceb495f` (R9): импорт сохранённого legacy Baseline результата (dashboard-state) в общий task-контракт — `export-task --legacy-dashboard-state --project-name`, legacy ТЗ при отсутствии run.json НЕ stale для preview/copy/save, но dispatch требует run.json; Desktop-кнопка «Импортировать ТЗ из сохранённого результата»; секция импортированных целей в теле ТЗ.
+- `788215c` (R10): реальные MIGRATION_REPORT/DEVELOPER_UPGRADE_GUIDE — активный checkpoint по identity (`activeCheckpointId` + parent-chain, не по строковому max), остаток/покрытие из аудита, объяснения агента и release-факты из ledger.
+- Проверки: Python iterative-сьюты 39→42→OK; физический acceptance `test_iterative_migration_physical.py` OK (~161s); Desktop tsc/lint/build + 60/60 contract checks.
+
+### 2026-09-29 — D1–D4: явный Node.js для проекта/CI — готово
+
+- Новый модуль `project_runtime.py`: discovery установленных Node (реальный probe бинарника, дедуп по resolved path), `resolve_requested_node` (точная версия / major-alias → единственная установленная точная, явный путь; недоступная → ENVIRONMENT_UNAVAILABLE со списком найденных, БЕЗ fallback на PATH), child-env (node dir первым в PATH/path), semver-мэтчинг `engines.node` (npm ranges), контракт-хэш рантайма, CLI `--list-runtimes` для Desktop-пикера, `installed_runtimes_json()`.
+- Настройка: `settings.projects[].nodeVersion` читается в `ProjectSpec.node_version` (fallback `node`); пусто = не задано (нет заявления о CI-совместимости). Desktop: поле на ProjectSpec, IPC `flow:update-project-node` + `flow:list-node-versions`, UI-контрол в FlowWorkspace (ModelPicker: установленные версии, свободный ввод, очистка = сброс), begin передаёт `--requested-node`.
+- Применение: beginner решает запрошенный рантайм в begin и кладёт `config.runtime` (requested/effective/nodePath/npmPath/source/contractHash); `_runtime_env` применяет рантайм к install и verify; `verify_assignment` принимает `runtime_env` во ВСЕХ слоях (public → cache-aware → uncached → retry → core), а proof identity включает запрошенный рантайм — кэш proof'ов не смешивает ambient и запрошенный Node (D3.3).
+- Planner D4: `DependencyRow.node_version_override` из настройки; `_project_node_versions(package_dir, override)` добавляет settings-pin как наивысший приоритет; `_project_environment_constraint_issue` отклоняет целевой кандидат, чей `engines.node` несовместим, как plan-контрадикцию — НЕ глобальный nogood и не ослабление проверок.
+- Commits: `b4f0578` (14 файлов, 1051 вставка).
+- Проверки: `test_project_runtime.py` 12 OK; `test_iterative_runtime_request.py` 8 OK (deterministic: PATH на фейковый runtime, недоступная версия 999.0.0); `run_tool_tests.py --suite all` 1481 OK (4 skipped); Desktop tsc (electron+renderer), lint 0 errors, build, `check-iterative-begin` (передача/опускание `--requested-node`), `run-all-contract-checks` 60/60.
+
 ### Следующий шаг
-1. Follow-up часть 4: acceptance — synthetic fixtures, kill/restart между checkpoint acceptance и записью ТЗ/между записью и UI-ack, реальный Electron clipboard на synthetic text в UI-тесте (запуск Electron в окружении сборки; mock writeText — только для контракта, реальный clipboard проверяется отдельно).
-2. `docs/ITERATIVE_MIGRATION_ACCEPTANCE.md` — фактический прогон.
-3. Финальный `git diff --check` + sanitization (`check-public-sanitization.py`) для нового `iterative_task.py` и дистрибутива.
-4. Полный прогон: Python `--suite all` + `production-fast`, Desktop lint/build/`check:*`.
+1. Матрица E (acceptance): E7–E10 synthetic evidence (engine boundary planner, ENVIRONMENT_UNAVAILABLE begin, runtime env в install/verify identity, Desktop picker) — покрыто регрессами выше; E13 «живой агент» не прогонялся — задокументировать как ограничение; E12 live 3rd-party бинарники opencode/claude/codex — не проверялись (`gh` недоступен).
+2. Финальный `git diff --check` + sanitization (`check-public-sanitization.py`) перед публикацией, включая новые `project_runtime.py` и тесты.
+3. Полный прогон: Python `--suite all` (выполнен: 1481 OK) + `production-fast` (отдельный CI-гейт), Desktop lint/build/`check:*` (выполнены).
+4. Публикация: `.\push-github-branch-and-tag.ps1` (bump 0.2.151).
