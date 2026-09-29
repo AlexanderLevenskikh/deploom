@@ -56,7 +56,7 @@ import { commandEnvironment, decodeProcessOutputChunk, normalizePathForCompariso
 import { currentTask as readIterativeCurrentTask, iterativeRunDirPath, missingTaskExportInput, taskStaleness } from './iterative-migration.js'
 import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
 import { iterativeBeginInvocation, targetsFromDashboardState } from './iterative-begin.js'
-import { agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, changedFilesFromBaseline, iterativeApplyFeedbackInvocation, parseChangedFilesFromAgentOutput, trialBaselineFile, trialProjectPath, writeTrialBaseline } from './iterative-agent.js'
+import { agentLeaseAlive, agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, changedFilesFromBaseline, clearAgentLease, iterativeApplyFeedbackInvocation, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
@@ -1605,8 +1605,36 @@ function spawnCapture(command: string, args: string[], cwd: string, timeoutMs = 
   })
 }
 
-async function gitOverview(workspacePath: string): Promise<WorkspaceDetails['git']> {
-  const [branchResult, statusResult] = await Promise.all([
+function spawnCaptureWithInput(command: string, args: string[], cwd: string, input: string, timeoutMs = 8_000): Promise<CaptureResult> {
+  return new Promise((resolvePromise) => {
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    let timedOut = false
+    const commandEnv = commandEnvironment(process.env)
+    const invocation = resolveSpawnInvocation(command, args, { env: commandEnv })
+    const child = spawn(invocation.command, invocation.args, { cwd, shell: false, detached: processTreeDetached(), windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments, env: commandEnv })
+    const timer = setTimeout(() => { timedOut = true; killProcessTree(child) }, timeoutMs)
+    child.stdout.on('data', (chunk: Buffer) => { stdout += decodeProcessOutputChunk(chunk) })
+    child.stderr.on('data', (chunk: Buffer) => { stderr += decodeProcessOutputChunk(chunk) })
+    child.on('error', (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolvePromise({ code: 1, stdout, stderr: `${stderr}${error.message}`, timedOut })
+    })
+    child.on('close', (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolvePromise({ code: code ?? 1, stdout, stderr, timedOut })
+    })
+    child.stdin.on('error', () => { /* EPIPE from a provider that does not read stdin is not a failure */ })
+    child.stdin.end(input)
+  })
+}
+
+async function gitOverview(workspacePath: string): Promise<WorkspaceDetails['git']> {  const [branchResult, statusResult] = await Promise.all([
     spawnCapture('git', ['-C', workspacePath, 'branch', '--show-current'], workspacePath),
     spawnCapture('git', ['-C', workspacePath, 'status', '--short'], workspacePath),
   ])
@@ -7448,41 +7476,44 @@ function setupIpc(): void {
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
+    // R6: the per-project in-flight guard is taken BEFORE any await, so two
+    // concurrent requests cannot both pass the check while the first is still
+    // awaiting the status call.
     if (iterativeStepInFlight.has(project.name)) {
       return { ok: false, error: 'STEP_IN_PROGRESS' }
     }
-    if (!existsSync(join(runDir, 'run.json'))) {
-      return { ok: false, error: 'NO_RUN' }
-    }
-    // R3: the coordinator step (plan/materialize/precheck/verify/finish) runs
-    // on the durable Python state and is NOT blocked by task staleness. The
-    // agent gate below returns 'agent' only when the state actually requires
-    // repair; dispatching that repair with a task that no longer matches the
-    // durable state is refused in flow:iterative:agent.
-    const python = resolveExecutable('python')
-    const generator = join(bundledToolDir(), 'iterative_migration.py')
-    const statusResult = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
-    const payload = statusResult.code === 0
-      ? parseIterativeStatusPayload(statusResult.stdout) ?? readIterativeStatus(runDir)
-      : undefined
-    if (!payload) {
-      return { ok: false, error: statusResult.stderr.trim() || 'STATUS_UNREADABLE' }
-    }
-    const decision = decideNextStep(runDir, payload)
-    if (decision.step === 'agent') {
-      return {
-        ok: true,
-        gated: 'agent',
-        phase: decision.phase,
-        repairRequests: decision.repairRequests,
-        reason: decision.reason,
-      }
-    }
-    if (decision.step === null) {
-      return { ok: false, error: decision.reason }
-    }
     iterativeStepInFlight.add(project.name)
     try {
+      if (!existsSync(join(runDir, 'run.json'))) {
+        return { ok: false, error: 'NO_RUN' }
+      }
+      // R3: the coordinator step (plan/materialize/precheck/verify/finish) runs
+      // on the durable Python state and is NOT blocked by task staleness. The
+      // agent gate below returns 'agent' only when the state actually requires
+      // repair; dispatching that repair with a task that no longer matches the
+      // durable state is refused in flow:iterative:agent.
+      const python = resolveExecutable('python')
+      const generator = join(bundledToolDir(), 'iterative_migration.py')
+      const statusResult = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
+      const payload = statusResult.code === 0
+        ? parseIterativeStatusPayload(statusResult.stdout) ?? readIterativeStatus(runDir)
+        : undefined
+      if (!payload) {
+        return { ok: false, error: statusResult.stderr.trim() || 'STATUS_UNREADABLE' }
+      }
+      const decision = decideNextStep(runDir, payload)
+      if (decision.step === 'agent') {
+        return {
+          ok: true,
+          gated: 'agent',
+          phase: decision.phase,
+          repairRequests: decision.repairRequests,
+          reason: decision.reason,
+        }
+      }
+      if (decision.step === null) {
+        return { ok: false, error: decision.reason }
+      }
       const result = await spawnCapture(
         python,
         iterativeStepInvocation(runDir, decision.step, generator, python).args,
@@ -7552,147 +7583,217 @@ function setupIpc(): void {
     if (taskStaleness(runDir).stale) {
       return { ok: false, error: 'TASK_STALE: переустановите ожидаемый результат перед ремонтом' }
     }
-    const python = resolveExecutable('python')
-    const generator = join(bundledToolDir(), 'iterative_migration.py')
-    const statusResult = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
-    const payload = statusResult.code === 0
-      ? parseIterativeStatusPayload(statusResult.stdout) ?? readIterativeStatus(runDir)
-      : undefined
-    if (!payload) {
-      return { ok: false, error: statusResult.stderr.trim() || 'STATUS_UNREADABLE' }
-    }
-    const decision = decideNextStep(runDir, payload)
-    if (decision.step !== 'agent') {
-      return { ok: false, error: `NO_REPAIR_PENDING: phase=${String(payload.run?.phase ?? '')}` }
-    }
-    // R7: the bootstrap repair works in the version-neutral C0 trial (run-level
-    // bootstrapRefs, no candidate); candidate repair works in the candidate
-    // trial. Both branches build the prompt over the durable repair requests.
-    const bootstrap = decision.bootstrap === true
-    let workspaceRoot = ''
-    let projectRelative = '.'
-    let ctx: Parameters<typeof buildIterativeRepairPrompt>[0]
-    if (bootstrap) {
-      const bootstrapRefs = ((payload.run ?? {}) as Record<string, any>).bootstrapRefs as Record<string, string> | undefined
-      workspaceRoot = bootstrapRefs?.workspaceRoot ?? ''
-      projectRelative = bootstrapRefs?.projectRelative || '.'
-      if (!workspaceRoot || !existsSync(workspaceRoot)) return { ok: false, error: `BOOTSTRAP_TRIAL_MISSING: ${workspaceRoot}` }
-      const activeCheckpoint = (payload.activeCheckpoint ?? {}) as Record<string, any>
-      ctx = {
-        runId: String(payload.run?.runId ?? ''),
-        candidateId: '',
-        baseCheckpointId: String(activeCheckpoint.checkpointId ?? 'C0'),
-        attemptId: 0,
-        projectName: project.name,
-        targetLevel: String((payload.config as Record<string, any> | undefined)?.targetLevel ?? ''),
-        workspaceRoot,
-        projectRelative,
-        assignment: Object.entries((activeCheckpoint.fullAssignment ?? {}) as Record<string, string>).sort(),
-        repairRequests: [],
-        taskText: '',
-      }
-    } else {
-      const candidate = payload.candidate as Record<string, any> | undefined
-      if (!candidate) return { ok: false, error: 'NO_CANDIDATE' }
-      const refs = (candidate.materializationRefs ?? {}) as Record<string, string>
-      workspaceRoot = refs.workspaceRoot ?? ''
-      projectRelative = refs.projectRelative || '.'
-      if (!workspaceRoot || !existsSync(workspaceRoot)) return { ok: false, error: `TRIAL_MISSING: ${workspaceRoot}` }
-      ctx = {
-        runId: String(candidate.runId ?? ''),
-        candidateId: String(candidate.candidateId ?? ''),
-        baseCheckpointId: String(candidate.baseCheckpointId ?? ''),
-        attemptId: Number(candidate.attemptId ?? 0),
-        projectName: project.name,
-        targetLevel: String((payload.config as Record<string, any> | undefined)?.targetLevel ?? ''),
-        workspaceRoot,
-        projectRelative,
-        assignment: Object.entries((candidate.fullAssignment ?? {}) as Record<string, string>).sort(),
-        repairRequests: [],
-        taskText: '',
-      }
-    }
-    const projectPath = trialProjectPath(workspaceRoot, projectRelative)
-    const repairRequests = (Array.isArray(payload.openRepairRequests) ? payload.openRepairRequests : []) as Array<{
-      requestId?: string; reason?: string; failingCommands?: Array<{ command: string; exitCode: number }>; diagnosticsTail?: string;
-    }>
-    const task = readIterativeCurrentTask(runDir)
-    const taskText = task?.text.ru ?? task?.text.en ?? ''
-    ctx.repairRequests = repairRequests.map((request) => ({
-      requestId: String(request.requestId ?? ''),
-      reason: String(request.reason ?? ''),
-      failingCommands: request.failingCommands ?? [],
-      diagnosticsTail: String(request.diagnosticsTail ?? ''),
-    }))
-    ctx.taskText = taskText
-
+    // R6: the per-project in-flight guard is taken BEFORE any await. Together
+    // with the durable lease below it prevents double dispatch within one
+    // process lifetime and across an app restart.
     iterativeStepInFlight.add(project.name)
     let agentOutputTail = ''
     try {
-      const baselineFile = trialBaselineFile(runDir)
-      if (!existsSync(baselineFile)) writeTrialBaseline(workspaceRoot, baselineFile)
-      const promptFile = agentPromptFile(runDir)
-      const promptText = bootstrap
-        ? buildIterativeBootstrapPrompt({ ...ctx, checkpointId: ctx.baseCheckpointId })
-        : buildIterativeRepairPrompt(ctx)
-      writeFileSync(promptFile, promptText, 'utf8')
-
-      const model = workspace.agent === 'opencode' ? workspace.agentModel : undefined
-      const transport = await startStandaloneOpenCodeServer(projectPath)
-      let output = ''
-      try {
-        const agentResult = await spawnCapture(
-          'opencode',
-          buildOpenCodeAgentArgs(projectPath, promptFile, model, undefined, transport?.url),
-          projectPath,
-          900_000,
-          transport ? { OPENCODE_DB: transport.databasePath } : undefined,
-        )
-        output = `${agentResult.stdout}\n${agentResult.stderr}`
-      } finally {
-        transport?.stop()
+      const python = resolveExecutable('python')
+      const generator = join(bundledToolDir(), 'iterative_migration.py')
+      const statusResult = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
+      const payload = statusResult.code === 0
+        ? parseIterativeStatusPayload(statusResult.stdout) ?? readIterativeStatus(runDir)
+        : undefined
+      if (!payload) {
+        return { ok: false, error: statusResult.stderr.trim() || 'STATUS_UNREADABLE' }
       }
-      agentOutputTail = output.slice(-4000)
-      if (!output.trim()) return { ok: false, error: 'AGENT_NO_OUTPUT' }
-
-      const changed = [...new Set([
-        ...changedFilesFromBaseline(workspaceRoot, baselineFile),
-        ...parseChangedFilesFromAgentOutput(output),
-      ])].sort()
+      const decision = decideNextStep(runDir, payload)
+      if (decision.step !== 'agent') {
+        return { ok: false, error: `NO_REPAIR_PENDING: phase=${String(payload.run?.phase ?? '')}` }
+      }
+      // R6: refuse a SECOND repair session while the previous attempt (or its
+      // verification) is still in flight, without spending another attempt.
+      const leasePath = agentLeaseFile(runDir)
+      const existingLease = readAgentLease(leasePath)
+      if (existingLease && agentLeaseAlive(existingLease)) {
+        return {
+          ok: false,
+          error: `AGENT_IN_PROGRESS: ремонт от ${existingLease.startedAt} (${existingLease.provider}, сессия ${existingLease.sessionId.slice(0, 8)}…) ещё не завершён; дождитесь завершения`,
+        }
+      }
+      // R7: the bootstrap repair works in the version-neutral C0 trial (run-level
+      // bootstrapRefs, no candidate); candidate repair works in the candidate
+      // trial. Both branches build the prompt over the durable repair requests.
+      const bootstrap = decision.bootstrap === true
+      let workspaceRoot = ''
+      let projectRelative = '.'
+      let ctx: Parameters<typeof buildIterativeRepairPrompt>[0]
       if (bootstrap) {
-        // No candidate/feedback for bootstrap: the agent gate is a repair run;
-        // re-run the C0 control on the repaired trial right away.
-        const verify = await spawnCapture(
-          python,
-          iterativeStepInvocation(runDir, 'verify-bootstrap', generator, python).args,
-          workspace.path,
-          1_800_000,
-        )
-        if (verify.code !== 0) {
-          const raw = (verify.stderr.trim() || verify.stdout.trim() || `VERIFY_BOOTSTRAP_EXIT_${verify.code}`).slice(0, 4000)
-          return { ok: false, step: 'verify-bootstrap', error: raw, changedFiles: changed, agentOutputTail }
+        const bootstrapRefs = ((payload.run ?? {}) as Record<string, any>).bootstrapRefs as Record<string, string> | undefined
+        workspaceRoot = bootstrapRefs?.workspaceRoot ?? ''
+        projectRelative = bootstrapRefs?.projectRelative || '.'
+        if (!workspaceRoot || !existsSync(workspaceRoot)) return { ok: false, error: `BOOTSTRAP_TRIAL_MISSING: ${workspaceRoot}` }
+        const activeCheckpoint = (payload.activeCheckpoint ?? {}) as Record<string, any>
+        ctx = {
+          runId: String(payload.run?.runId ?? ''),
+          candidateId: '',
+          baseCheckpointId: String(activeCheckpoint.checkpointId ?? 'C0'),
+          attemptId: 0,
+          projectName: project.name,
+          targetLevel: String((payload.config as Record<string, any> | undefined)?.targetLevel ?? ''),
+          workspaceRoot,
+          projectRelative,
+          assignment: Object.entries((activeCheckpoint.fullAssignment ?? {}) as Record<string, string>).sort(),
+          repairRequests: [],
+          taskText: '',
+        }
+      } else {
+        const candidate = payload.candidate as Record<string, any> | undefined
+        if (!candidate) return { ok: false, error: 'NO_CANDIDATE' }
+        const refs = (candidate.materializationRefs ?? {}) as Record<string, string>
+        workspaceRoot = refs.workspaceRoot ?? ''
+        projectRelative = refs.projectRelative || '.'
+        if (!workspaceRoot || !existsSync(workspaceRoot)) return { ok: false, error: `TRIAL_MISSING: ${workspaceRoot}` }
+        ctx = {
+          runId: String(candidate.runId ?? ''),
+          candidateId: String(candidate.candidateId ?? ''),
+          baseCheckpointId: String(candidate.baseCheckpointId ?? ''),
+          attemptId: Number(candidate.attemptId ?? 0),
+          projectName: project.name,
+          targetLevel: String((payload.config as Record<string, any> | undefined)?.targetLevel ?? ''),
+          workspaceRoot,
+          projectRelative,
+          assignment: Object.entries((candidate.fullAssignment ?? {}) as Record<string, string>).sort(),
+          repairRequests: [],
+          taskText: '',
+        }
+      }
+      const projectPath = trialProjectPath(workspaceRoot, projectRelative)
+      const repairRequests = (Array.isArray(payload.openRepairRequests) ? payload.openRepairRequests : []) as Array<{
+        requestId?: string; reason?: string; failingCommands?: Array<{ command: string; exitCode: number }>; diagnosticsTail?: string;
+      }>
+      const task = readIterativeCurrentTask(runDir)
+      const taskText = task?.text.ru ?? task?.text.en ?? ''
+      ctx.repairRequests = repairRequests.map((request) => ({
+        requestId: String(request.requestId ?? ''),
+        reason: String(request.reason ?? ''),
+        failingCommands: request.failingCommands ?? [],
+        diagnosticsTail: String(request.diagnosticsTail ?? ''),
+      }))
+      ctx.taskText = taskText
+
+      // R5: route to the provider actually selected in the workspace instead of
+      // always launching opencode. The agent process exit code is kept, because
+      // agent TEXT alone may never claim a completed repair.
+      const provider = workspace.agent === 'claude' ? 'claude' : workspace.agent === 'codex' ? 'codex' : 'opencode'
+      const model = workspace.agentModel
+      const sessionId = randomUUID()
+      try {
+        const baselineFile = trialBaselineFile(runDir)
+        if (!existsSync(baselineFile)) writeTrialBaseline(workspaceRoot, baselineFile)
+        const promptFile = agentPromptFile(runDir)
+        const promptText = bootstrap
+          ? buildIterativeBootstrapPrompt({ ...ctx, checkpointId: ctx.baseCheckpointId })
+          : buildIterativeRepairPrompt(ctx)
+        writeFileSync(promptFile, promptText, 'utf8')
+
+        let output = ''
+        let exitCode = 0
+        if (provider === 'opencode') {
+          const transport = await startStandaloneOpenCodeServer(projectPath)
+          try {
+            // R6: the durable dispatch lease is persisted BEFORE the agent is
+            // awaited, with the session/provider/database/attempt identities.
+            writeAgentLease(leasePath, {
+              schemaVersion: 1,
+              sessionId,
+              provider,
+              databasePath: transport?.databasePath ?? '',
+              runId: ctx.runId,
+              candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId,
+              attemptId: ctx.attemptId,
+              pid: process.pid,
+              startedAt: new Date().toISOString(),
+            })
+            const agentResult = await spawnCapture(
+              'opencode',
+              buildOpenCodeAgentArgs(projectPath, promptFile, model, undefined, transport?.url),
+              projectPath,
+              900_000,
+              transport ? { OPENCODE_DB: transport.databasePath } : undefined,
+            )
+            exitCode = agentResult.code
+            output = `${agentResult.stdout}\n${agentResult.stderr}`
+          } finally {
+            transport?.stop()
+          }
+        } else {
+          // claude/codex are one-shot: the prompt file is piped to stdin.
+          writeAgentLease(leasePath, {
+            schemaVersion: 1,
+            sessionId,
+            provider,
+            databasePath: '',
+            runId: ctx.runId,
+            candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId,
+            attemptId: ctx.attemptId,
+            pid: process.pid,
+            startedAt: new Date().toISOString(),
+          })
+          const agentResult = await spawnCaptureWithInput(
+            provider === 'claude' ? 'claude' : 'codex',
+            provider === 'claude' ? buildClaudeAgentArgs(model) : buildCodexAgentArgs(projectPath, model),
+            projectPath,
+            readFileSync(promptFile, 'utf8'),
+            900_000,
+          )
+          exitCode = agentResult.code
+          output = `${agentResult.stdout}\n${agentResult.stderr}`
+        }
+        agentOutputTail = output.slice(-4000)
+        if (exitCode !== 0 && !output.trim()) {
+          return { ok: false, error: `AGENT_PROVIDER_FAILURE (exit ${exitCode}): агент не запустился и не выдал вывод; попробуйте другой провайдер` }
+        }
+
+        const changed = [...new Set([
+          ...changedFilesFromBaseline(workspaceRoot, baselineFile),
+          ...parseChangedFilesFromAgentOutput(output),
+        ])].sort()
+        // R5: the TYPED outcome drives the feedback. A zero exit AND real file
+        // changes are required for READY_FOR_VERIFY; scheduling kinds carry
+        // proposals and deliberately no changed files.
+        const parsed = parseAgentOutcome(output, exitCode, changed)
+        if (bootstrap) {
+          // No candidate/feedback for bootstrap: the agent gate is a repair run;
+          // re-run the C0 control on the repaired trial right away.
+          const verify = await spawnCapture(
+            python,
+            iterativeStepInvocation(runDir, 'verify-bootstrap', generator, python).args,
+            workspace.path,
+            1_800_000,
+          )
+          if (verify.code !== 0) {
+            const raw = (verify.stderr.trim() || verify.stdout.trim() || `VERIFY_BOOTSTRAP_EXIT_${verify.code}`).slice(0, 4000)
+            return { ok: false, step: 'verify-bootstrap', error: raw, changedFiles: parsed.changedFiles, agentOutputTail }
+          }
+          const refresh = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
+          const refreshed = refresh.code === 0
+            ? parseIterativeStatusPayload(refresh.stdout) ?? readIterativeStatus(runDir)
+            : undefined
+          const next = refreshed ? decideNextStep(runDir, refreshed) : undefined
+          return { ok: true, changedFiles: parsed.changedFiles, phase: next?.phase, next, agentOutputTail }
+        }
+        const proposedScope = parsed.proposals.length > 0
+          ? (parsed.kind === 'NEEDS_COHORT_EXPANSION' ? { companions: parsed.proposals } : { alternatives: parsed.proposals })
+          : {}
+        const feedback = buildFeedbackPayload(ctx, parsed.changedFiles, parsed.kind, parsed.reason || repairRequests[0]?.reason || 'agent repair', proposedScope)
+        const feedbackFile = join(runDir, 'trial', 'agent-feedback.json')
+        writeFileSync(feedbackFile, JSON.stringify(feedback), 'utf8')
+        const applied = await spawnCapture(python, iterativeApplyFeedbackInvocation(runDir, feedbackFile, generator, python).args, workspace.path, 120_000)
+        if (applied.code !== 0) {
+          const raw = `${applied.stderr.trim()}\n${applied.stdout.trim()}`.trim() || `APPLY_FEEDBACK_EXIT_${applied.code}`
+          return { ok: false, error: raw.slice(0, 4000), changedFiles: parsed.changedFiles, agentOutputTail }
         }
         const refresh = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
         const refreshed = refresh.code === 0
           ? parseIterativeStatusPayload(refresh.stdout) ?? readIterativeStatus(runDir)
           : undefined
         const next = refreshed ? decideNextStep(runDir, refreshed) : undefined
-        return { ok: true, changedFiles: changed, phase: next?.phase, next, agentOutputTail }
+        return { ok: true, changedFiles: parsed.changedFiles, phase: next?.phase, next, agentOutputTail }
+      } finally {
+        clearAgentLease(leasePath)
       }
-      const feedback = buildFeedbackPayload(ctx, changed, 'READY_FOR_VERIFY', repairRequests[0]?.reason || 'agent repair applied')
-      const feedbackFile = join(runDir, 'trial', 'agent-feedback.json')
-      writeFileSync(feedbackFile, JSON.stringify(feedback), 'utf8')
-      const applied = await spawnCapture(python, iterativeApplyFeedbackInvocation(runDir, feedbackFile, generator, python).args, workspace.path, 120_000)
-      if (applied.code !== 0) {
-        const raw = `${applied.stderr.trim()}\n${applied.stdout.trim()}`.trim() || `APPLY_FEEDBACK_EXIT_${applied.code}`
-        return { ok: false, error: raw.slice(0, 4000), changedFiles: changed, agentOutputTail }
-      }
-      const refresh = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
-      const refreshed = refresh.code === 0
-        ? parseIterativeStatusPayload(refresh.stdout) ?? readIterativeStatus(runDir)
-        : undefined
-      const next = refreshed ? decideNextStep(runDir, refreshed) : undefined
-      return { ok: true, changedFiles: changed, phase: next?.phase, next, agentOutputTail }
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error), agentOutputTail }
     } finally {

@@ -4,13 +4,20 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  AGENT_LEASE_FILENAME,
+  agentLeaseAlive,
+  agentLeaseFile,
   agentPromptFile,
   buildFeedbackPayload,
   buildIterativeRepairPrompt,
   changedFilesFromBaseline,
+  clearAgentLease,
   iterativeApplyFeedbackInvocation,
+  parseAgentOutcome,
   parseChangedFilesFromAgentOutput,
+  readAgentLease,
   trialBaselineFile,
+  writeAgentLease,
   writeTrialBaseline,
 } from "../dist-electron/iterative-agent.js";
 import { parseIterativeStatusPayload, readIterativeStatus } from "../dist-electron/iterative-runner.js";
@@ -167,5 +174,72 @@ if (parseChangedFilesFromAgentOutput("no marker").length !== 0) {
 // 8. Path helpers live under the durable trial dir.
 if (existsSync(trialBaselineFile(runDir)) === false) throw new Error("Baseline file must exist");
 if (!agentPromptFile(runDir).endsWith("agent-prompt.md")) throw new Error("Agent prompt path contract broken");
+
+// 9. R5: parseAgentOutcome turns raw agent output + exit code + file changes
+// into a TYPED kind. Agent text alone never claims a completed repair: a
+// READY_FOR_VERIFY marker with a non-zero exit or no real changes degrades to
+// INCONCLUSIVE, and scheduling kinds strip changed files.
+const files = ["src/app.js"];
+const ready = parseAgentOutcome("FEEDBACK_KIND: READY_FOR_VERIFY\nREASON: done", 0, files);
+if (ready.kind !== "READY_FOR_VERIFY" || ready.changedFiles.length !== 1) {
+  throw new Error(`Ready outcome misparsed: ${JSON.stringify(ready)}`);
+}
+if (parseAgentOutcome("FEEDBACK_KIND: READY_FOR_VERIFY\nall good", 1, files).kind !== "INCONCLUSIVE") {
+  throw new Error("READY_FOR_VERIFY with non-zero exit must degrade to INCONCLUSIVE");
+}
+if (parseAgentOutcome("FEEDBACK_KIND: READY_FOR_VERIFY", 0, []).kind !== "INCONCLUSIVE") {
+  throw new Error("READY_FOR_VERIFY without file changes must degrade to INCONCLUSIVE");
+}
+const expansion = parseAgentOutcome(
+  "FEEDBACK_KIND: NEEDS_COHORT_EXPANSION\nPROPOSALS:\n- is-odd\n- is-even\nREASON: сосед",
+  0,
+  files,
+);
+if (expansion.kind !== "NEEDS_COHORT_EXPANSION") throw new Error("NEEDS_COHORT_EXPANSION kind lost");
+if (expansion.changedFiles.length !== 0) throw new Error("Scheduling kinds must not carry changed files");
+if (expansion.proposals.length !== 2 || expansion.proposals[0] !== "is-odd") {
+  throw new Error(`Proposals misparsed: ${JSON.stringify(expansion.proposals)}`);
+}
+if (parseAgentOutcome("FEEDBACK_KIND: INFRA_BLOCKED\nREASON: disk", 0, files).kind !== "INFRA_BLOCKED") {
+  throw new Error("INFRA_BLOCKED kind lost");
+}
+if (parseAgentOutcome("FEEDBACK_KIND: NEEDS_ALTERNATIVE\nPROPOSALS:\nlib = 2.0.0", 0, files).kind !== "NEEDS_ALTERNATIVE") {
+  throw new Error("NEEDS_ALTERNATIVE kind lost");
+}
+if (parseAgentOutcome("no marker at all", 0, files).kind !== "READY_FOR_VERIFY") {
+  throw new Error("Missing marker must default to READY_FOR_VERIFY (then degrade by files/exit)");
+}
+// Proposals ride into the feedback for NEEDS_COHORT_EXPANSION (companions).
+const expansionFeedback = buildFeedbackPayload(
+  ctx,
+  expansion.changedFiles,
+  expansion.kind,
+  expansion.reason,
+  { companions: expansion.proposals },
+);
+if (expansionFeedback.kind !== "NEEDS_COHORT_EXPANSION") throw new Error("Feedback kind lost");
+if (JSON.stringify(expansionFeedback.proposedScope) !== '{"companions":["is-odd","is-even"]}') {
+  throw new Error(`Companion proposals lost: ${JSON.stringify(expansionFeedback.proposedScope)}`);
+}
+
+// 10. R6: the durable dispatch lease round-trips, expires and clears.
+const leasePath = agentLeaseFile(runDir);
+if (!leasePath.endsWith(AGENT_LEASE_FILENAME)) throw new Error("Lease path contract broken");
+writeAgentLease(leasePath, {
+  schemaVersion: 1, sessionId: "abc123", provider: "opencode", databasePath: "/db",
+  runId: "iter-agent-1", candidateId: "C2", attemptId: 1, pid: process.pid,
+  startedAt: new Date().toISOString(),
+});
+const leaseBack = readAgentLease(leasePath);
+if (!leaseBack || leaseBack.sessionId !== "abc123" || leaseBack.provider !== "opencode") {
+  throw new Error(`Lease did not round-trip: ${JSON.stringify(leaseBack)}`);
+}
+if (!agentLeaseAlive(leaseBack)) throw new Error("Fresh lease must be alive");
+if (agentLeaseAlive(leaseBack, Date.now() + 3 * 60 * 60 * 1000)) throw new Error("Expired lease must not be alive");
+clearAgentLease(leasePath);
+if (existsSync(leasePath)) throw new Error("clearAgentLease must remove the file");
+if (readAgentLease(join(runDir, "trial", "no-such-lease.json")) !== undefined) {
+  throw new Error("Missing lease file must read as undefined");
+}
 
 console.log("check-iterative-agent: OK");
