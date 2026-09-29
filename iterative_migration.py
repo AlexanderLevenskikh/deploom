@@ -2255,6 +2255,42 @@ def _audit_status_from_report(report: Mapping[str, Any]) -> str:
     return "PASS" if exit_code == 0 else "FAIL"
 
 
+def cmd_export_task(args: argparse.Namespace) -> int:
+    """Publish the ТЗ (task) artifact from durable state only.
+
+    Never starts a Baseline and never runs project checks: the builder reads
+    run.json / run-config.json / checkpoints / ledger.  Insufficient durable
+    JSON is a diagnosed InvalidInputError listing the missing fields, so the
+    UI can show the reason and a concrete next action.
+    """
+    run_dir = Path(args.run_dir).resolve()
+    if not (run_dir / "run.json").exists():
+        raise InvalidInputError("RUN_STATE_MISSING: no run.json under the run dir")
+    from iterative_task import TaskExportError, export_task_artifact, verify_task_input_errors
+
+    languages = ["ru", "en"] if args.language == "both" else [args.language]
+    if args.check_only:
+        missing = verify_task_input_errors(run_dir)
+        if missing:
+            raise InvalidInputError(
+                "TASK_INPUT_INSUFFICIENT: " + "; ".join(missing)
+            )
+        _emit_status(
+            {
+                "event": "export-task.check",
+                "runId": str(json.loads((run_dir / "run.json").read_text(encoding="utf-8")).get("runId") or ""),
+                "sufficient": True,
+            }
+        )
+        return 0
+    try:
+        summary = export_task_artifact(run_dir, languages=languages)
+    except TaskExportError as exc:
+        raise InvalidInputError(f"{exc.code}: {exc.summary}")
+    _emit_status(summary)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -2309,6 +2345,13 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--max-known-high", type=int, default=None)
     audit.add_argument("--yarn-audit-engine", default="auto")
 
+    export_task = sub.add_parser("export-task", help="Сформировать ТЗ (task artifact) из durable state без Baseline")
+    export_task.add_argument("--language", choices=("ru", "en", "both"), default="both")
+    export_task.add_argument(
+        "--check-only", action="store_true",
+        help="Only diagnose input sufficiency; never produces an artifact",
+    )
+
     return parser
 
 
@@ -2323,6 +2366,7 @@ COMMANDS = {
     "status": cmd_status,
     "finish": cmd_finish,
     "audit": cmd_audit,
+    "export-task": cmd_export_task,
 }
 
 
