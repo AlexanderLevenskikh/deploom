@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,7 @@ import {
   buildIterativeRepairPrompt,
   changedFilesFromBaseline,
   clearAgentLease,
+  forbiddenTrialViolations,
   iterativeApplyFeedbackInvocation,
   parseAgentOutcome,
   parseChangedFilesFromAgentOutput,
@@ -96,18 +97,57 @@ for (const needle of [
   if (!prompt.includes(needle)) throw new Error(`Prompt must mention "${needle}"`);
 }
 
-// 3. Baseline hash diff: package.json is never counted, edits and new files are.
+// 3. Baseline hash diff covers EVERY significant file (only node_modules/.git
+// is skipped), so planner-owned manifests are detected when mutated or
+// deleted. Edits, adds AND removes are reported; planner-forbidden mutations
+// are classified separately and NEVER ride the changed list.
 const baselineFile = trialBaselineFile(runDir);
 const baselineCount = writeTrialBaseline(workspace, baselineFile);
-if (baselineCount !== 2) throw new Error(`Baseline must cover 2 source files, got ${baselineCount}`);
+if (baselineCount !== 3) throw new Error(`Baseline must cover 3 files (manifest + 2 sources), got ${baselineCount}`);
+if (forbiddenTrialViolations(workspace, baselineFile).length !== 0) {
+  throw new Error(`Pristine baseline must have no forbidden mutations: ${JSON.stringify(forbiddenTrialViolations(workspace, baselineFile))}`);
+}
 writeFileSync(join(workspace, "src", "app.js"), "module.exports = 42; // repaired\n", "utf8");
 writeFileSync(join(workspace, "src", "new.js"), "module.exports = 3;\n", "utf8");
 const changed = changedFilesFromBaseline(workspace, baselineFile);
-if (changed.includes("package.json")) throw new Error(`Manifest must never be an agent change: ${JSON.stringify(changed)}`);
+if (changed.includes("package.json")) throw new Error(`Unchanged manifest must not appear in changed: ${JSON.stringify(changed)}`);
 if (!changed.includes("src/app.js") || !changed.includes("src/new.js")) {
   throw new Error(`Edited and new files must be reported: ${JSON.stringify(changed)}`);
 }
 if (changed.includes("src/util.js")) throw new Error(`Untouched file must stay clean: ${JSON.stringify(changed)}`);
+if (forbiddenTrialViolations(workspace, baselineFile).length !== 0) {
+  throw new Error(`Edited sources must not be forbidden violations: ${JSON.stringify(forbiddenTrialViolations(workspace, baselineFile))}`);
+}
+// b) editing OR deleting a planner-owned manifest is a FORBIDDEN mutation.
+const manifestPath = join(workspace, "package.json");
+writeFileSync(manifestPath, JSON.stringify({ dependencies: { "is-number": "7.0.1" } }), "utf8");
+const violations = forbiddenTrialViolations(workspace, baselineFile);
+if (violations.length !== 1 || !violations.includes("modified:package.json")) {
+  throw new Error(`Manifest edit must be a forbidden mutation: ${JSON.stringify(violations)}`);
+}
+if (changedFilesFromBaseline(workspace, baselineFile).includes("package.json")) {
+  throw new Error(`Forbidden paths must never ride the changed list: ${JSON.stringify(changedFilesFromBaseline(workspace, baselineFile))}`);
+}
+writeFileSync(manifestPath, JSON.stringify({ dependencies: { "is-number": "7.0.0" } }), "utf8");
+if (forbiddenTrialViolations(workspace, baselineFile).length !== 0) {
+  throw new Error(`Restored manifest must clear violations: ${JSON.stringify(forbiddenTrialViolations(workspace, baselineFile))}`);
+}
+// c) deleting a source file is a REAL agent change (removed); deleting the
+// manifest is a violation.
+rmSync(join(workspace, "src", "util.js"));
+if (!changedFilesFromBaseline(workspace, baselineFile).includes("src/util.js")) {
+  throw new Error(`Removed source file must be reported as a change: ${JSON.stringify(changedFilesFromBaseline(workspace, baselineFile))}`);
+}
+writeFileSync(join(workspace, "src", "util.js"), "module.exports = 2;\n", "utf8");
+rmSync(manifestPath);
+const removedViolations = forbiddenTrialViolations(workspace, baselineFile);
+if (removedViolations.length !== 1 || !removedViolations.includes("removed:package.json")) {
+  throw new Error(`Deleted manifest must be a forbidden mutation: ${JSON.stringify(removedViolations)}`);
+}
+writeFileSync(manifestPath, JSON.stringify({ dependencies: { "is-number": "7.0.0" } }), "utf8");
+if (forbiddenTrialViolations(workspace, baselineFile).length !== 0) {
+  throw new Error(`Restored manifest must clear violations: ${JSON.stringify(forbiddenTrialViolations(workspace, baselineFile))}`);
+}
 
 // 4. Feedback payload carries ONLY the durable candidate identity.
 const feedback = buildFeedbackPayload(ctx, changed, "READY_FOR_VERIFY", "source adapted to is-number 7.0.0");

@@ -233,13 +233,97 @@ function fileHash(filePath: string): string {
   return createHash('sha256').update(readFileSync(filePath)).digest('hex')
 }
 
-function skipEntry(name: string): boolean {
-  return name === 'node_modules' || name === '.git' || ITERATIVE_FORBIDDEN_NAMES.has(name)
+function walkSkip(name: string): boolean {
+  // Installation/dependency state (node_modules, .git) is never agent work.
+  // Everything else — INCLUDING planner-owned manifest/lock files — is hashed
+  // so a forbidden mutation is detected, never skipped (the controller is the
+  // only writer of dependency state, but the detection must not trust that).
+  return name === 'node_modules' || name === '.git'
+}
+
+/** True when any path segment is a planner-owned forbidden name. */
+export function isForbiddenTrialRelative(relativePath: string): boolean {
+  for (const segment of relativePath.split('/')) {
+    if (ITERATIVE_FORBIDDEN_NAMES.has(segment)) return true
+  }
+  return false
+}
+
+export type TrialMutationKind = 'modified' | 'added' | 'removed'
+export type TrialMutation = { path: string; kind: TrialMutationKind; forbidden: boolean }
+
+/** Classify every significant trial mutation against the durable baseline:
+ * modified / added / removed, each flagged as planner-forbidden when the path
+ * name matches ITERATIVE_FORBIDDEN_NAMES. The agent text is never the source
+ * of truth — this hash diff is. */
+export function classifyTrialMutations(workspaceRoot: string, baselineFile: string): TrialMutation[] {
+  let baseline: Record<string, string>
+  try {
+    baseline = JSON.parse(readFileSync(baselineFile, 'utf8')) as Record<string, string>
+  } catch {
+    return []
+  }
+  const mutations: TrialMutation[] = []
+  const seen = new Set<string>()
+  for (const [relativePath, expected] of Object.entries(baseline)) {
+    const key = relativePath.replace(/\\/g, '/')
+    seen.add(key)
+    const absolute = join(workspaceRoot, relativePath.split('/').join(sep))
+    let actual: string | undefined
+    try {
+      actual = fileHash(absolute)
+    } catch {
+      actual = undefined
+    }
+    if (actual === undefined && !existsSync(absolute)) {
+      mutations.push({ path: key, kind: 'removed', forbidden: isForbiddenTrialRelative(key) })
+    } else if (actual !== undefined && actual !== expected) {
+      mutations.push({ path: key, kind: 'modified', forbidden: isForbiddenTrialRelative(key) })
+    }
+  }
+  const stack: string[] = ['']
+  while (stack.length > 0) {
+    const relativeDir = stack.pop()!
+    const absoluteDir = join(workspaceRoot, relativeDir)
+    let names: string[]
+    try {
+      names = readdirSync(absoluteDir)
+    } catch {
+      continue
+    }
+    for (const name of names) {
+      if (walkSkip(name)) continue
+      const absolute = join(absoluteDir, name)
+      let stats
+      try {
+        stats = statSync(absolute)
+      } catch {
+        continue
+      }
+      const relativePath = relativeDir ? `${relativeDir}${sep}${name}` : name
+      const key = relativePath.replace(/\\/g, '/')
+      if (stats.isDirectory()) {
+        stack.push(relativePath)
+      } else if (stats.isFile() && !seen.has(key)) {
+        mutations.push({ path: key, kind: 'added', forbidden: isForbiddenTrialRelative(key) })
+      }
+    }
+  }
+  return mutations
+}
+
+/** Planner-owned files the agent changed or deleted. A non-empty result MUST
+ * reject the repair before feedback/verification. */
+export function forbiddenTrialViolations(workspaceRoot: string, baselineFile: string): string[] {
+  return classifyTrialMutations(workspaceRoot, baselineFile)
+    .filter((mutation) => mutation.forbidden)
+    .map((mutation) => `${mutation.kind}:${mutation.path}`)
+    .sort()
 }
 
 /** Durable baseline of the trial project: relative path -> sha256. Written
  * ONCE per agent run; a restart re-uses it, so the coordinator's own files
- * are never counted as agent changes. */
+ * are never counted as agent changes. Covers planner-owned manifests too. */
 export function writeTrialBaseline(workspaceRoot: string, baselineFile: string): number {
   const entries: Record<string, string> = {}
   const stack = ['']
@@ -253,7 +337,7 @@ export function writeTrialBaseline(workspaceRoot: string, baselineFile: string):
       continue
     }
     for (const name of names) {
-      if (skipEntry(name)) continue
+      if (walkSkip(name)) continue
       const absolute = join(absoluteDir, name)
       let stats
       try {
@@ -282,60 +366,15 @@ export function agentPromptFile(runDir: string): string {
   return join(runDir, 'trial', AGENT_PROMPT_FILENAME)
 }
 
-/** Changed files = baseline entries whose content moved. New files are
- * reported too; removed files are ignored (deleting a source file is not a
- * repair). Paths are relative to workspaceRoot, matching apply-feedback's
- * scope check. */
+/** Real agent trial changes (modified + added + removed), EXCLUDING
+ * planner-forbidden paths (those are violations, see
+ * forbiddenTrialViolations) and installation noise. Paths are relative to
+ * workspaceRoot, matching apply-feedback's scope check. */
 export function changedFilesFromBaseline(workspaceRoot: string, baselineFile: string): string[] {
-  let baseline: Record<string, string>
-  try {
-    baseline = JSON.parse(readFileSync(baselineFile, 'utf8')) as Record<string, string>
-  } catch {
-    return []
-  }
-  const changed: string[] = []
-  for (const [relativePath, expected] of Object.entries(baseline)) {
-    const absolute = join(workspaceRoot, relativePath.split('/').join(sep))
-    if (!existsSync(absolute)) continue
-    let actual
-    try {
-      actual = fileHash(absolute)
-    } catch {
-      continue
-    }
-    if (actual !== expected) changed.push(relativePath)
-  }
-  // Newly added files (not in the baseline) are also agent changes.
-  const baselinePaths = new Set(Object.keys(baseline))
-  const stack: string[] = ['']
-  while (stack.length > 0) {
-    const relativeDir = stack.pop()!
-    const absoluteDir = join(workspaceRoot, relativeDir)
-    let names: string[]
-    try {
-      names = readdirSync(absoluteDir)
-    } catch {
-      continue
-    }
-    for (const name of names) {
-      if (skipEntry(name)) continue
-      const absolute = join(absoluteDir, name)
-      let stats
-      try {
-        stats = statSync(absolute)
-      } catch {
-        continue
-      }
-      const relativePath = relativeDir ? `${relativeDir}${sep}${name}` : name
-      const key = relativePath.replace(/\\/g, '/')
-      if (stats.isDirectory()) {
-        stack.push(relativePath)
-      } else if (stats.isFile() && !baselinePaths.has(key)) {
-        changed.push(key)
-      }
-    }
-  }
-  return [...new Set(changed)].sort()
+  return classifyTrialMutations(workspaceRoot, baselineFile)
+    .filter((mutation) => !mutation.forbidden)
+    .map((mutation) => mutation.path)
+    .sort()
 }
 
 /** Path of the project inside the trial, relative to the durable run dir. */

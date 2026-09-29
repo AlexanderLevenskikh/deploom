@@ -56,7 +56,7 @@ import { commandEnvironment, decodeProcessOutputChunk, normalizePathForCompariso
 import { currentTask as readIterativeCurrentTask, iterativeRunDirPath, missingTaskExportInput, taskStaleness } from './iterative-migration.js'
 import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
 import { iterativeBeginInvocation, targetsFromDashboardState } from './iterative-begin.js'
-import { agentLeaseAlive, agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, changedFilesFromBaseline, clearAgentLease, iterativeApplyFeedbackInvocation, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
+import { agentLeaseAlive, agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, changedFilesFromBaseline, clearAgentLease, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
@@ -7892,6 +7892,19 @@ function setupIpc(): void {
           ...changedFilesFromBaseline(workspaceRoot, baselineFile),
           ...parseChangedFilesFromAgentOutput(output),
         ])].sort()
+        // #4: the baseline hash diff is the source of truth for agent edits.
+        // A planner-owned file (manifest/lock/.npmrc/...) that was modified,
+        // added or removed is a violation and REJECTS the repair BEFORE any
+        // feedback reaches Python and before any verification is attempted.
+        const forbidden = forbiddenTrialViolations(workspaceRoot, baselineFile)
+        if (forbidden.length > 0) {
+          return {
+            ok: false,
+            error: `FORBIDDEN_MUTATION: агент изменил файлы, принадлежащие планировщику: ${forbidden.join(', ')}. Manifest/lockfile и другие forbidden-файлы не могут быть правкой агента; откатите их в trial вручную и повторите ремонт.`,
+            forbiddenMutations: forbidden,
+            agentOutputTail,
+          }
+        }
         // R5: the TYPED outcome drives the feedback. A zero exit AND real file
         // changes are required for READY_FOR_VERIFY; scheduling kinds carry
         // proposals and deliberately no changed files.

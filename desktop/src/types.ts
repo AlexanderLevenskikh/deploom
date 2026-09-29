@@ -405,6 +405,9 @@ export type IterativeStepOutcome = {
 export type IterativeAgentOutcome = {
   ok: boolean
   changedFiles?: string[]
+  // #4: planner-owned files the agent mutated (modified/added/removed). Non-empty
+  // means the repair was REJECTED with FORBIDDEN_MUTATION before feedback/verify.
+  forbiddenMutations?: string[]
   phase?: string
   next?: IterativeRunnerDecision
   agentOutputTail?: string
