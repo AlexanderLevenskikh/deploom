@@ -42,15 +42,46 @@ const empty = decideNextStep(runDir, {});
 if (empty.step !== "begin" || !empty.reason.includes("NO_RUN")) throw new Error("Run-less dir must decide begin");
 
 // 2. Phase -> step mapping, grounding on the Python status contract.
-expectDecision({ phase: "BOOTSTRAP_REPAIR" }, {}, "verify-bootstrap", "verify");
+const bootstrap = expectDecision(
+  { phase: "BOOTSTRAP_REPAIR", activeCandidateId: null },
+  { openRepairRequests: [{ requestId: "boot-1", summary: "C0 control verification failed" }] },
+  "agent",
+  "repair",
+);
+if (bootstrap.bootstrap !== true || bootstrap.repairRequests.length !== 1) {
+  throw new Error(`Bootstrap repair must be an agent GATE with the request bytes: ${JSON.stringify(bootstrap)}`);
+}
 expectDecision({ phase: "PLANNING", activeCandidateId: "C2" }, {}, "materialize", "materialize");
 expectDecision({ phase: "MATERIALIZING" }, {}, "materialize", "resume");
+// R2: a MATERIALIZED candidate moves to precheck, never re-materialize.
+const materialized = expectDecision(
+  { phase: "MATERIALIZING", activeCandidateId: "C2" },
+  { candidate: { candidateId: "C2", stage: "MATERIALIZED" } },
+  "precheck",
+  "diagnostic",
+);
+if (materialized.bootstrap === true) throw new Error("MATERIALIZING+MATERIALIZED must not be a bootstrap gate");
 expectDecision({ phase: "PRECHECK" }, {}, "precheck", "diagnostic");
+// A passed precheck (stage PRECHECKED) proceeds to the authoritative verify.
+expectDecision(
+  { phase: "PRECHECK", activeCandidateId: "C2" },
+  { candidate: { candidateId: "C2", stage: "PRECHECKED" } },
+  "verify-exact",
+  "precheck passed",
+);
 expectDecision(
   { phase: "VERIFYING" },
   {},
   "verify-exact",
   "authoritative",
+);
+// R4: a VERIFYING-stage candidate left after a kill/restart resumes the SAME
+// candidate through verify-exact (re-entrant on the durable candidate identity).
+expectDecision(
+  { phase: "VERIFYING", activeCandidateId: "C2" },
+  { candidate: { candidateId: "C2", stage: "VERIFYING" } },
+  "verify-exact",
+  "same exact candidate",
 );
 expectDecision({ phase: "TERMINAL", terminal: "BUDGET_EXHAUSTED", activeCandidateId: null }, {}, "finish", "BUDGET_EXHAUSTED");
 expectDecision(
@@ -68,6 +99,28 @@ const inflight = expectDecision(
   "in-flight",
 );
 if (inflight.satisfied !== undefined) throw new Error("In-flight candidate must not report satisfied");
+
+// 3b. A consumed leftover (VERIFYING/ACCEPTED/REJECTED) in READY is skipped:
+// the acceptance transaction already moved the pointer, the next action is
+// fresh planning for the remaining targets.
+const leftover = expectDecision(
+  { phase: "READY", activeCandidateId: "C2" },
+  { candidate: { candidateId: "C2", stage: "VERIFYING" } },
+  "plan-next",
+  "actionable",
+);
+if (leftover.step !== "plan-next") throw new Error(`Consumed leftover must fall through to plan-next: ${JSON.stringify(leftover)}`);
+for (const consumedStage of ["ACCEPTED", "REJECTED"]) {
+  const consumed = expectDecision(
+    { phase: "READY", activeCandidateId: "C2" },
+    { candidate: { candidateId: "C2", stage: consumedStage } },
+    "plan-next",
+    "actionable",
+  );
+  if (consumed.step !== "plan-next") {
+    throw new Error(`READY + ${consumedStage} leftover must plan-next: ${JSON.stringify(consumed)}`);
+  }
+}
 
 // 4. Policy satisfied on a READY checkpoint -> finish (targets from run-config).
 const satisfiedDir = join(root, "run-satisfied");

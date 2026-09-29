@@ -168,16 +168,33 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
           <span>{state.message}</span>
         </div>
       ) : !task ? (
-        <div className="resume-notice">
-          <strong>{text('Задание ещё не сформировано', 'The assignment is not ready yet')}</strong>
-          {insufficient ? (
-            <span>
-              {text('Недостаточно данных durable-состояния:', 'Durable state lacks:')} {snapshot?.missing.join(', ')}. {text('Сначала выполните миграцию до verified checkpoint.', 'Run the migration to a verified checkpoint first.')}
-            </span>
-          ) : (
-            <span>{text('Сначала выполните миграцию до verified checkpoint — задание появится здесь.', 'Run the migration to a verified checkpoint — the assignment appears here.')}</span>
-          )}
-        </div>
+        <>
+          <div className="resume-notice">
+            <strong>{text('Задание ещё не сформировано', 'The assignment is not ready yet')}</strong>
+            {insufficient ? (
+              <span>
+                {text('Недостаточно данных durable-состояния:', 'Durable state lacks:')} {snapshot?.missing.join(', ')}. {text('Сначала выполните миграцию до verified checkpoint.', 'Run the migration to a verified checkpoint first.')}
+              </span>
+            ) : (
+              <span>{text('Сначала выполните миграцию до verified checkpoint — задание появится здесь.', 'Run the migration to a verified checkpoint — the assignment appears here.')}</span>
+            )}
+          </div>
+          {runner && runner.present ? (
+            <div className="resume-notice">
+              <strong>{text('Состояние прогона', 'Run state')}: {runner.phase ?? '—'}</strong>
+              {runner.decision ? (
+                <span>{text('Следующий шаг', 'Next step')}: {runner.decision.step ?? '—'} · {runner.decision.reason}</span>
+              ) : null}
+            </div>
+          ) : null}
+          {runner?.decision?.step === 'agent' ? (
+            <footer className="baseline-intent-actions">
+              <button type="button" className="button primary" disabled={busy !== undefined || stepBusy || Boolean(snapshot?.stale)} onClick={() => void agentNow()}>
+                <Wrench size={16} />{text('Исправить агентом', 'Repair with agent')}
+              </button>
+            </footer>
+          ) : null}
+        </>
       ) : (
         <>
           <div className="roadmap-summary-grid">
@@ -198,7 +215,7 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
           {snapshot?.stale ? (
             <div className="resume-notice warning">
               <strong>{text('Задание устарело', 'The assignment is stale')}</strong>
-              <span>{snapshot.staleReason} {text('Переэкспортируйте перед отправкой.', 'Re-export before sending.')}</span>
+              <span>{snapshot.staleReason} {text('Переэкспортируйте перед отправкой агенту.', 'Re-export before dispatching to the agent.')}</span>
             </div>
           ) : null}
 
@@ -217,7 +234,7 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
 
           {note ? <div className="resume-notice"><span>{note}</span></div> : null}
 
-          {runner && runner.present && !runner.stale ? (
+          {runner && runner.present ? (
             <div className="resume-notice">
               <strong>{text('Состояние прогона', 'Run state')}: {runner.phase ?? '—'}</strong>
               {runner.decision ? (
@@ -228,7 +245,7 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
 
           <footer className="baseline-intent-actions">
             {runner?.decision?.step === 'agent' ? (
-              <button type="button" className="button primary" disabled={busy !== undefined || stepBusy} onClick={() => void agentNow()}>
+              <button type="button" className="button primary" disabled={busy !== undefined || stepBusy || Boolean(snapshot?.stale)} onClick={() => void agentNow()}>
                 <Wrench size={16} />{text('Исправить агентом', 'Repair with agent')}
               </button>
             ) : null}

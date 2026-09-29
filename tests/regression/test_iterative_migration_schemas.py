@@ -409,6 +409,37 @@ class IterativeMigrationGuardTests(unittest.TestCase):
             with self.assertRaises(InvalidInputError):
                 cmd_verify_exact(args)
 
+    def test_verify_exact_resumes_verifying_stage_candidate(self) -> None:
+        # R4: a kill/restart in the middle of verify-exact leaves stage=VERIFYING.
+        # The guard must ACCEPT that stage so the SAME durable candidate can be
+        # re-verified (idempotent acceptance), instead of refusing the resume.
+        from iterative_migration import cmd_verify_exact
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = _RunDir(Path(tmp))
+            run_dir.write_run(_run_dict(phase="VERIFYING"))
+            run_dir.write_config()
+            run_dir.write_checkpoint()
+            candidate = _candidate_dict()
+            candidate["stage"] = "VERIFYING"
+            candidate["materializationRefs"] = {
+                "workspaceRoot": str(trial_workspace_root(run_dir.root)),
+                "projectRelative": ".",
+            }
+            run_dir.write_candidate(candidate)
+            import argparse
+
+            args = argparse.Namespace(run_dir=str(run_dir.root), owner="test")
+            with self.assertRaises(InvalidInputError) as ctx:
+                cmd_verify_exact(args)
+            # The VERIFYING stage passed the guard; the next concrete error is
+            # the absent trial materialization, NOT a stage refusal.
+            self.assertNotIn(
+                "CANDIDATE_STAGE_NOT_READY_FOR_VERIFY",
+                str(ctx.exception),
+            )
+            self.assertIn("TRIAL_PROJECT_MISSING", str(ctx.exception))
+
     def test_plan_next_with_red_checkpoint_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = _RunDir(Path(tmp))

@@ -7356,7 +7356,10 @@ function setupIpc(): void {
     let phase: string | undefined
     let decision: ReturnType<typeof decideNextStep> | undefined
     let error: string | undefined
-    if (present && !stale) {
+    // R3: the coordinator runs on the durable Python state regardless of the
+    // task artifact; task staleness only blocks DISPATCHING the old task to the
+    // agent, never planning/materializing/verifying the state itself.
+    if (present) {
       const python = resolveExecutable('python')
       const generator = join(bundledToolDir(), 'iterative_migration.py')
       const result = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
@@ -7384,9 +7387,11 @@ function setupIpc(): void {
     if (!existsSync(join(runDir, 'run.json'))) {
       return { ok: false, error: 'NO_RUN' }
     }
-    if (taskStaleness(runDir).stale) {
-      return { ok: false, error: 'TASK_STALE: переустановите ожидаемый результат перед продолжением' }
-    }
+    // R3: the coordinator step (plan/materialize/precheck/verify/finish) runs
+    // on the durable Python state and is NOT blocked by task staleness. The
+    // agent gate below returns 'agent' only when the state actually requires
+    // repair; dispatching that repair with a task that no longer matches the
+    // durable state is refused in flow:iterative:agent.
     const python = resolveExecutable('python')
     const generator = join(bundledToolDir(), 'iterative_migration.py')
     const statusResult = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)

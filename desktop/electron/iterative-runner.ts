@@ -5,17 +5,22 @@
 // state of its own, so a relaunched app resumes the exact same place
 // (restart-safe, no attempt is re-spent). `status` (iterative_migration.py)
 // emits the full state as JSON and writes <runDir>/status.json; the driver
-// parses that and DECIDES the next Python step:
+// parses that and DECIDES the next Python step from BOTH run.phase and
+// candidate.stage (the durable state files stay the single source of truth):
 //
-//   READY          -> plan-next (or finish when the policy is satisfied /
-//                     the run is terminal)
-//   BOOTSTRAP_REPAIR-> verify-bootstrap
-//   PLANNING       -> materialize          MATERIALIZING -> materialize (resume)
-//   PRECHECK       -> precheck             VERIFYING     -> verify-exact
-//   REPAIRING      -> agent                (agent works in the isolated trial
-//                                           on the repair request bytes, then
-//                                           apply-feedback re-checks its JSON)
-//   TERMINAL       -> finish
+//   READY             -> plan-next (or finish when the policy is satisfied /
+//                        the run is terminal); an in-flight candidate is
+//                        resumed by its stage, a consumed one (VERIFYING/
+//                        ACCEPTED/REJECTED leftover) is skipped
+//   BOOTSTRAP_REPAIR  -> agent (GATE over the C0 bytes; decision.bootstrap)
+//   PLANNING          -> materialize
+//   MATERIALIZING     -> materialize (PLANNED) / precheck (MATERIALIZED) [R2]
+//   PRECHECK          -> precheck (MATERIALIZED) / verify-exact (PRECHECKED)
+//   VERIFYING         -> verify-exact (R4: re-entrant on the VERIFYING stage)
+//   REPAIRING         -> agent (agent works in the isolated trial on the
+//                        repair request bytes, then apply-feedback re-checks
+//                        its JSON)
+//   TERMINAL          -> finish
 //
 // The agent step is a GATE: the driver tells the caller exactly which repair
 // request must be answered and where the isolated trial lives, but executing
@@ -41,6 +46,7 @@ export type IterativeDecision = {
   reason: string
   repairRequests?: Array<{ requestId: string; summary: string }>
   satisfied?: boolean
+  bootstrap?: boolean
 }
 
 export const ITERATIVE_STATUS_FILENAME = 'status.json'
@@ -118,8 +124,23 @@ function readTargets(runDir: string): Record<string, string> {
   }
 }
 
-/** Decide the next step from the durable status payload. Pure: no fs besides
- * the caller-provided targets, so the decision table is unit-checkable. */
+/**
+ * Decide the next step from the durable status payload. Pure: no fs besides
+ * the caller-provided targets, so the decision table is unit-checkable.
+ *
+ * The phase is the run's top-level state machine; candidate.stage is the
+ * sub-state of the in-flight candidate. Both come from the SAME durable files
+ * (run.json + candidate.json), so a restart resumes exactly where Python
+ * stopped:
+ *
+ *   PLANNING/MATERIALIZING+PLANNED          -> materialize (resume)
+ *   MATERIALIZING/PRECHECK? + MATERIALIZED  -> precheck   (R2: never re-materialize)
+ *   PRECHECK/REPAIRING? + PRECHECKED        -> verify-exact
+ *   VERIFYING (+VERIFYING/REPAIRING)        -> verify-exact (R4: idempotent resume)
+ *   REPAIRING/BOOTSTRAP_REPAIR (+requests)  -> agent (GATE)
+ *   READY + in-flight candidate             -> resume by stage (or plan-next when
+ *                                              the candidate is an accepted leftover)
+ */
 export function decideNextStep(
   runDir: string,
   payload: Record<string, any>,
@@ -128,6 +149,7 @@ export function decideNextStep(
   const checkpoint = (payload.activeCheckpoint ?? {}) as Record<string, any>
   const candidate = (payload.candidate ?? undefined) as Record<string, any> | undefined
   const phase = String(run.phase ?? '')
+  const candidateStage = candidate ? String(candidate.stage ?? '') : ''
   const assignment = (checkpoint.fullAssignment ?? undefined) as Record<string, string> | undefined
   const repairRequests = Array.isArray(payload.openRepairRequests) ? payload.openRepairRequests : []
   const repairSummaries = repairRequests
@@ -142,13 +164,37 @@ export function decideNextStep(
     case '':
       return { step: 'begin', phase, reason: 'NO_RUN: run.json is absent; capture C0' }
     case 'BOOTSTRAP_REPAIR':
-      return { step: 'verify-bootstrap', phase, reason: 'C0 needs a control re-verify after bootstrap repair' }
+      // C0 failed control verification. The bootstrap repair is an AGENT GATE
+      // over the C0 bytes (version-neutral): the driver must dispatch the
+      // repair agent in an isolated bootstrap trial BEFORE verify-bootstrap
+      // re-runs the control. The decision names the repair request bytes.
+      return {
+        step: 'agent',
+        phase,
+        reason: repairSummaries.length > 0
+          ? `bootstrap C0 repair required on ${repairSummaries.length} request(s)`
+          : 'bootstrap C0 repair required in an isolated trial',
+        repairRequests: repairSummaries,
+        bootstrap: true,
+      }
     case 'PLANNING':
       return { step: 'materialize', phase, reason: 'candidate is planned; materialize exact versions into the isolated trial' }
-    case 'MATERIALIZING':
-      return { step: 'materialize', phase, reason: 'materialization was interrupted; resume from durable candidate state' }
-    case 'PRECHECK':
-      return { step: 'precheck', phase, reason: 'run the diagnostic check pass in the materialized trial' }
+    case 'MATERIALIZING': {
+      // R2: a candidate that is already MATERIALIZED must go to precheck, not
+      // re-materialize (Python refuses a MATERIALIZED candidate with
+      // CANDIDATE_STAGE_NOT_PLANNED).
+      return candidateStage === 'MATERIALIZED'
+        ? { step: 'precheck', phase, reason: 'candidate is materialized; run the diagnostic check pass in the trial' }
+        : { step: 'materialize', phase, reason: 'materialization was interrupted; resume from durable candidate state' }
+    }
+    case 'PRECHECK': {
+      // A passed precheck leaves phase=PRECHECK + stage=PRECHECKED; the next
+      // step is the authoritative cumulative verify, never a precheck re-run
+      // (precheck requires stage MATERIALIZED).
+      return candidateStage === 'PRECHECKED'
+        ? { step: 'verify-exact', phase, reason: 'precheck passed; run the authoritative cumulative verify' }
+        : { step: 'precheck', phase, reason: 'run the diagnostic check pass in the materialized trial' }
+    }
     case 'REPAIRING': {
       // The trial needs agent work on the repair-request bytes. This is a GATE:
       // the decision names the exact request(s); executing the agent is the
@@ -164,6 +210,10 @@ export function decideNextStep(
       }
     }
     case 'VERIFYING':
+      // R4: verify-exact is safely re-entrant on the VERIFYING stage (Python
+      // accepts PRECHECKED/REPAIRING/VERIFYING and the acceptance is an
+      // idempotent transaction keyed by the durable candidate identity), so a
+      // kill/restart in the middle of the verify resumes the SAME candidate.
       return { step: 'verify-exact', phase, reason: 'authoritative full verify of the same exact candidate on repaired bytes' }
     case 'TERMINAL':
       return { step: 'finish', phase, reason: String(run.terminal ?? ''), satisfied: false }
@@ -171,8 +221,36 @@ export function decideNextStep(
       if (run.terminal) {
         return { step: 'finish', phase, reason: String(run.terminal), satisfied: false }
       }
-      if (candidate && candidate.stage && candidate.stage !== 'ACCEPTED') {
-        return { step: 'precheck', phase, reason: `in-flight candidate stage ${String(candidate.stage)}` }
+      if (candidate && candidateStage) {
+        // READY means the pointer already moved (phase was normalised after
+        // accept/reject). A VERIFYING/REJECTED/ACCEPTED leftover is the accepted
+        // candidate awaiting cleanup by the next Python step; a PLAN/MATERIAL/
+        // PRECHECKED/REPAIRING leftover is genuinely in-flight work to resume.
+        switch (candidateStage) {
+          case 'PLANNED':
+            return { step: 'materialize', phase, reason: 'in-flight candidate is planned; resume materialization' }
+          case 'MATERIALIZED':
+            return { step: 'precheck', phase, reason: 'in-flight candidate is materialized; run the diagnostic check pass' }
+          case 'PRECHECKED':
+            return { step: 'verify-exact', phase, reason: 'in-flight candidate passed precheck; run the authoritative verify' }
+          case 'REPAIRING':
+            return {
+              step: 'agent',
+              phase,
+              reason: repairSummaries.length > 0
+                ? `in-flight candidate needs repair on ${repairSummaries.length} request(s)`
+                : 'in-flight candidate needs trial re-verification after repair',
+              repairRequests: repairSummaries,
+            }
+          case 'VERIFYING':
+          case 'ACCEPTED':
+          case 'REJECTED':
+            // Candidate was consumed by the acceptance/rejection transaction;
+            // the next action is a fresh planning for the remaining targets.
+            break
+          default:
+            break
+        }
       }
       const satisfied = planSatisfied(readTargets(runDir), assignment)
       if (satisfied) {

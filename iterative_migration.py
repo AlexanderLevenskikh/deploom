@@ -1514,7 +1514,7 @@ def _verify_exact_locked(
     candidate = load_candidate(run_dir)
     if candidate is None:
         raise InvalidInputError("NO_ACTIVE_CANDIDATE")
-    if candidate.get("stage") not in {"PRECHECKED", "REPAIRING"}:
+    if candidate.get("stage") not in {"PRECHECKED", "REPAIRING", "VERIFYING"}:
         raise InvalidInputError(
             f"CANDIDATE_STAGE_NOT_READY_FOR_VERIFY: {candidate.get('stage')}"
         )
