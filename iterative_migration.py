@@ -33,8 +33,10 @@ import dataclasses
 import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -551,6 +553,68 @@ def _runtime_env(config: Mapping[str, Any]) -> Optional[Dict[str, str]]:
     return runtime_env_for_path(node_path)
 
 
+def _runtime_contract_hash(config: Mapping[str, Any]) -> str:
+    """Durable identity of the run's runtime contract ('' when unset)."""
+    runtime = config.get("runtime") or {}
+    return str(runtime.get("contractHash") or "")
+
+
+def _assert_runtime_unchanged(config: Mapping[str, Any]) -> None:
+    """D3.4: a step must not silently continue an old run under a CHANGED
+    runtime. The requested Node is re-resolved against the current installation
+    set; if it no longer maps to the same exact executable+version (the runtime
+    was replaced, upgraded in place, or removed), the step refuses with
+    RUNTIME_CHANGED. Old checkpoints stay on disk, verified under the OLD
+    runtime — evidence is never re-labelled for the new environment."""
+    runtime = config.get("runtime") or {}
+    requested = str(runtime.get("requested") or "").strip()
+    if not requested:
+        return
+    from project_runtime import resolve_requested_node
+
+    resolution = resolve_requested_node(requested)
+    if not resolution.found:
+        raise InvalidInputError(
+            f"RUNTIME_CHANGED: requested Node {requested!r} is no longer installed; "
+            + resolution.unavailable_reason
+        )
+    same_version = resolution.effective_version == str(runtime.get("effectiveVersion") or "")
+    same_node = os.path.normcase(str(resolution.node_path)) == os.path.normcase(str(runtime.get("nodePath") or ""))
+    if not (same_version and same_node):
+        raise InvalidInputError(
+            f"RUNTIME_CHANGED: requested Node {requested!r} resolved to "
+            f"{resolution.effective_version} ({resolution.node_path}) at begin, but now to "
+            f"{resolution.effective_version} ({resolution.node_path}); restart with a new "
+            "begin — the stored checkpoints stay proven under the previous runtime"
+        )
+
+
+def _manager_runtime_identity(project_dir: Path) -> Tuple[str, str]:
+    """(manager, manager_version) for the project topology root; best-effort —
+    an unresolvable manager yields ('', '') rather than failing begin."""
+    try:
+        manager, executable, _install = _manager_and_install(project_dir)
+    except Exception:  # noqa: BLE001 - manager discovery must never block begin
+        return "", ""
+    if not executable:
+        return manager or "", ""
+    try:
+        completed = _run(
+            [executable, "--version"],
+            project_dir,
+            timeout_seconds=15,
+            env={},
+            base_env=os.environ,
+            progress_label="iterative migration manager version probe",
+        )
+    except Exception:  # noqa: BLE001 - version probe is best-effort evidence
+        return manager or "", ""
+    if completed.returncode != 0:
+        return manager or "", ""
+    first = ((completed.stdout or "").strip().splitlines() or [""])[0].strip()
+    return manager or "", first[:64]
+
+
 def _run_install(project_dir: Path, *, timeout_seconds: int, progress_label: str, runtime_env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess[str]:
     manager, executable, install_args = _manager_and_install(project_dir)
     if not executable:
@@ -725,6 +789,16 @@ def build_run_config(run_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
             "source": resolution.source,
             "contractHash": resolution.contract_hash(),
         }
+        # D3.3: the full runtime contract also pins the package manager and the
+        # executing platform. The durable contractHash covers every field of the
+        # block, so a manager swap or a different OS invalidates the identity.
+        runtime["packageManager"], runtime["packageManagerVersion"] = _manager_runtime_identity(project_dir)
+        runtime["platform"] = sys.platform
+        runtime["arch"] = platform.machine()
+        runtime["hash"] = hashlib.sha256(
+            _stable_json({k: v for k, v in runtime.items() if k != "hash"}).encode("utf-8")
+        ).hexdigest()
+        runtime["contractHash"] = runtime["hash"]
     audit_policy = {
         "lagMonths": _clamp_int(
             args.lag_months if args.lag_months is not None else 12,
@@ -834,6 +908,7 @@ def _begin_locked(run_dir: Path, config: Mapping[str, Any], args: argparse.Names
             "resolvedStateKey": result.resolved_state_key or "",
             "preparationProofKey": result.preparation_proof_key or "",
         },
+        "runtimeContractHash": _runtime_contract_hash(config),
         "audit": {"status": "UNKNOWN", "evidenceRef": ""},
         "createdAt": _now_iso(),
         "updatedAt": _now_iso(),
@@ -1143,6 +1218,7 @@ def cmd_plan_next(args: argparse.Namespace) -> int:
 def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any]) -> int:
     if not run_budget_ok(config, run):
         raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+    _assert_runtime_unchanged(config)
     active_candidate = load_candidate(run_dir)
     if active_candidate is not None and active_candidate.get("stage") in {
         "PLANNED",
@@ -1387,6 +1463,7 @@ def _materialize_locked(
 ) -> int:
     if not run_budget_ok(config, run):
         raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+    _assert_runtime_unchanged(config)
     candidate = load_candidate(run_dir)
     if candidate is None:
         raise InvalidInputError("NO_ACTIVE_CANDIDATE")
@@ -1541,6 +1618,7 @@ def _precheck_locked(
 ) -> int:
     if not run_budget_ok(config, run):
         raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+    _assert_runtime_unchanged(config)
     candidate = load_candidate(run_dir)
     if candidate is None or candidate.get("stage") != "MATERIALIZED":
         raise InvalidInputError("CANDIDATE_NOT_MATERIALIZED")
@@ -1692,6 +1770,7 @@ def _verify_exact_locked(
 ) -> int:
     if not run_budget_ok(config, run):
         raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+    _assert_runtime_unchanged(config)
     candidate = load_candidate(run_dir)
     if candidate is None:
         raise InvalidInputError("NO_ACTIVE_CANDIDATE")
@@ -1938,6 +2017,7 @@ def _accept_checkpoint(
             "resolvedStateKey": result.resolved_state_key or "",
             "preparationProofKey": result.preparation_proof_key or "",
         },
+        "runtimeContractHash": _runtime_contract_hash(config),
         "audit": {"status": "UNKNOWN", "evidenceRef": ""},
         "createdAt": _now_iso(),
         "toolBuildId": config.get("toolBuildId") or "",
@@ -2632,6 +2712,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
 def _audit_locked(
     run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], args: argparse.Namespace
 ) -> int:
+    _assert_runtime_unchanged(config)
     checkpoint = load_checkpoint(run_dir, str(run["activeCheckpointId"]))
     snapshot = open_source_snapshot(
         Path(str(checkpoint["sourceSnapshotContainer"])),

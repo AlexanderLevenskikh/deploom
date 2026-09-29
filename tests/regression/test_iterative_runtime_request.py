@@ -29,7 +29,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from iterative_migration import InvalidInputError, build_run_config, _runtime_env  # noqa: E402
+from iterative_migration import (  # noqa: E402
+    InvalidInputError,
+    build_run_config,
+    _runtime_env,
+    _runtime_contract_hash,
+    _assert_runtime_unchanged,
+    _stable_json,
+)
+import hashlib as _hashlib
 from dependency_live_roadmap_generator import (  # noqa: E402
     _project_node_versions,
     _normalized_node_version,
@@ -173,6 +181,79 @@ class IterativeRuntimeRequestTests(unittest.TestCase):
         signature = inspect.signature(verify_assignment)
         self.assertIn("runtime_env", signature.parameters)
         self.assertIsNone(signature.parameters["runtime_env"].default)
+
+
+class IterativeRuntimeContractTests(unittest.TestCase):
+    """D3.3/D3.4: the runtime contract carries the manager + platform identity
+    behind a durable hash (so a manager/OS swap invalidates the identity), and a
+    step refuses to continue a run whose requested runtime no longer resolves to
+    the same exact executable+version."""
+
+    def setUp(self) -> None:
+        self._tmp = Path(tempfile.mkdtemp(prefix="iter-runtime-contract-"))
+        self.addCleanup(lambda: _rmtree(self._tmp))
+        self.project = _make_project(self._tmp)
+        self.fake_node = _make_fake_node(self._tmp / "fake-node")
+        original_path = os.environ.get("PATH", "")
+        patch_path = str(self.fake_node) + os.pathsep + original_path
+        self._path_patch = mock.patch.dict(os.environ, {"PATH": patch_path})
+        self._path_patch.start()
+        self.addCleanup(self._path_patch.stop)
+        import project_runtime as pr
+
+        self._real_probe = pr.probe_node_version
+
+        def _fake_probe(executable, timeout_seconds=5):
+            path = Path(executable).resolve()
+            if os.path.normcase(str(path)) == os.path.normcase(str((self.fake_node / "node").resolve())):
+                return pr.normalize_node_version(FAKE_NODE_VERSION)
+            return self._real_probe(executable, timeout_seconds=timeout_seconds)
+
+        self._probe_patch = mock.patch("project_runtime.probe_node_version", side_effect=_fake_probe)
+        self._probe_patch.start()
+        self.addCleanup(self._probe_patch.stop)
+
+    def _requested_config(self) -> dict:
+        return build_run_config(self._tmp, _base_args(str(self.project), requested_node=FAKE_MAJOR))
+
+    def test_runtime_block_carries_manager_platform_and_hash(self) -> None:
+        runtime = self._requested_config()["runtime"]
+        self.assertIn("packageManager", runtime)
+        self.assertIn("packageManagerVersion", runtime)
+        self.assertIn("platform", runtime)
+        self.assertIn("arch", runtime)
+        self.assertTrue(runtime["hash"])
+        self.assertEqual(runtime["contractHash"], runtime["hash"])
+
+    def test_contract_hash_covers_every_block_field(self) -> None:
+        runtime = self._requested_config()["runtime"]
+        altered = dict(runtime)
+        altered["effectiveVersion"] = "99.0.0"
+        recomputed = _hashlib.sha256(
+            _stable_json({k: v for k, v in altered.items() if k != "hash"}).encode("utf-8")
+        ).hexdigest()
+        self.assertNotEqual(recomputed, runtime["hash"])
+
+    def test_contract_hash_empty_when_no_runtime(self) -> None:
+        config = build_run_config(self._tmp, _base_args(str(self.project)))
+        self.assertEqual(_runtime_contract_hash(config), "")
+
+    def test_runtime_unchanged_guard_passes_for_fresh_config(self) -> None:
+        _assert_runtime_unchanged(self._requested_config())
+
+    def test_runtime_unchanged_guard_detects_version_swap(self) -> None:
+        config = self._requested_config()
+        config["runtime"]["effectiveVersion"] = "99.0.0"
+        with self.assertRaises(InvalidInputError) as ctx:
+            _assert_runtime_unchanged(config)
+        self.assertIn("RUNTIME_CHANGED", str(ctx.exception))
+
+    def test_runtime_unchanged_guard_detects_node_path_swap(self) -> None:
+        config = self._requested_config()
+        config["runtime"]["nodePath"] = str(config["runtime"]["nodePath"]) + ".x"
+        with self.assertRaises(InvalidInputError) as ctx:
+            _assert_runtime_unchanged(config)
+        self.assertIn("RUNTIME_CHANGED", str(ctx.exception))
 
 
 class IterativePlannerEngineGateTests(unittest.TestCase):
