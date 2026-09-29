@@ -55,6 +55,7 @@ import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:chil
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
 import { currentTask as readIterativeCurrentTask, iterativeRunDirPath, missingTaskExportInput, taskStaleness } from './iterative-migration.js'
 import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
+import { iterativeBeginInvocation, targetsFromDashboardState } from './iterative-begin.js'
 import { agentPromptFile, buildFeedbackPayload, buildIterativeRepairPrompt, changedFilesFromBaseline, iterativeApplyFeedbackInvocation, parseChangedFilesFromAgentOutput, trialBaselineFile, trialProjectPath, writeTrialBaseline } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
@@ -7374,6 +7375,72 @@ function setupIpc(): void {
       }
     }
     return { ok: error === undefined, present, stale, staleReason: taskStaleness(runDir).reason, phase, decision, error }
+  })
+
+  ipcMain.handle('flow:iterative:begin', async (_event, input: { workspaceId?: string; projectName: string }) => {
+    const state = loadState()
+    const workspace = findWorkspace(state, input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    const runDir = iterativeTaskRunDir(workspace, project)
+    if (existsSync(join(runDir, 'run.json'))) {
+      return { ok: false, error: 'RUN_ALREADY_EXISTS: сможете продолжить на план/шаг с существующего состояния' }
+    }
+    if (iterativeStepInFlight.has(project.name)) {
+      return { ok: false, error: 'STEP_IN_PROGRESS' }
+    }
+    // R1: the Desktop produces a NEW durable run. The target map mirrors the
+    // roadmap's own accepted versions (dashboard-state rows), so the run plans
+    // toward the versions the product already committed to. An empty map means
+    // nothing actionable yet: begin still captures C0, and plan-next reports
+    // NO_ACTIONABLE until a roadmap provides concrete targets.
+    const intent = loadBaselineIntent(workspace, project.name)
+    const targetLevel = intent.acceptancePolicy?.targetLevel ?? 'yellow'
+    const dashboardState = artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json')
+    const targets = targetsFromDashboardState(dashboardState, project.name)
+    const beginDir = join(app.getPath('temp'), `iter-begin-${randomUUID()}`)
+    mkdirSync(beginDir, { recursive: true })
+    const targetsFile = join(beginDir, 'targets.json')
+    writeFileSync(targetsFile, JSON.stringify(targets), 'utf8')
+    const python = resolveExecutable('python')
+    const generator = join(bundledToolDir(), 'iterative_migration.py')
+    const options = {
+      projectDir: project.path,
+      projectName: project.name,
+      targetLevel,
+      workspaceId: workspace.id,
+      projectId: project.name,
+      targetsFile,
+      toolBuildId: app.getVersion(),
+    }
+    iterativeStepInFlight.add(project.name)
+    try {
+      const result = await spawnCapture(
+        python,
+        iterativeBeginInvocation(runDir, options, generator, python).args,
+        workspace.path,
+        20 * 60_000,
+      )
+      if (result.code !== 0) {
+        const raw = (result.stderr.trim() || result.stdout.trim() || `BEGIN_EXIT_${result.code}`)
+        return { ok: false, step: 'begin', error: raw.slice(0, 4000) }
+      }
+      const refresh = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
+      const refreshed = refresh.code === 0
+        ? parseIterativeStatusPayload(refresh.stdout) ?? readIterativeStatus(runDir)
+        : undefined
+      const next = refreshed ? decideNextStep(runDir, refreshed) : undefined
+      return {
+        ok: true,
+        step: 'begin',
+        phase: next?.phase,
+        next,
+        targetsCount: Object.keys(targets).length,
+        targetLevel,
+      }
+    } finally {
+      iterativeStepInFlight.delete(project.name)
+      try { rmSync(beginDir, { recursive: true, force: true }) } catch { /* temp cleanup is best-effort */ }
+    }
   })
 
   ipcMain.handle('flow:iterative:step', async (_event, input: { workspaceId?: string; projectName: string }) => {

@@ -394,6 +394,15 @@ export type IterativeAgentOutcome = {
   error?: string
 }
 
+export type IterativeBeginOutcome = {
+  ok: boolean
+  step?: string
+  phase?: string
+  next?: IterativeRunnerDecision
+  targetsCount?: number
+  targetLevel?: string
+  error?: string
+}
 export type DependencyFlowApi = {
   bootstrap: () => Promise<BootstrapPayload>
   pickDirectory: () => Promise<string | undefined>
@@ -417,6 +426,7 @@ export type DependencyFlowApi = {
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStatusOutcome>
   iterativeStep: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStepOutcome>
+  iterativeBegin: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeBeginOutcome>
   iterativeAgent: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeAgentOutcome>
   runAction: (input: ActionInput) => Promise<{ jobId: string; runId?: string; preview: string[] }>
   cancelJob: (jobId: string) => Promise<boolean>

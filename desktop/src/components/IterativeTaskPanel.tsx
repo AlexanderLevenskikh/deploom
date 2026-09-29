@@ -1,8 +1,8 @@
-import { Check, Clipboard, ExternalLink, FileText, Play, RefreshCw, Save, Wrench, X } from 'lucide-react'
+import { Check, Clipboard, ExternalLink, FileText, Play, RefreshCw, Save, Wrench, X, Rocket } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useLanguage } from '../i18n'
-import type { IterativeAgentOutcome, IterativeStatusOutcome, IterativeStepOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
+import type { IterativeAgentOutcome, IterativeBeginOutcome, IterativeStatusOutcome, IterativeStepOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
 
 type Props = {
   workspaceId?: string
@@ -14,6 +14,7 @@ type Props = {
   onSave: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
   onStep: (projectName: string) => Promise<IterativeStepOutcome>
+  onBegin: (projectName: string) => Promise<IterativeBeginOutcome>
   onAgent: (projectName: string) => Promise<IterativeAgentOutcome>
   onOpenPath: (path?: string) => Promise<void>
 }
@@ -23,7 +24,7 @@ type PanelState =
   | { phase: 'ready'; snapshot: IterativeTaskSnapshot }
   | { phase: 'error'; message: string }
 
-export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, onCopy, onSave, onStatus, onStep, onAgent, onOpenPath }: Props) {
+export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, onCopy, onSave, onStatus, onStep, onBegin, onAgent, onOpenPath }: Props) {
   const { text, language } = useLanguage()
   const [state, setState] = useState<PanelState>({ phase: 'loading' })
   const [busy, setBusy] = useState<string>()
@@ -116,6 +117,30 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
     }
   }
 
+  const beginNow = async () => {
+    setStepBusy(true)
+    setNote(undefined)
+    try {
+      const outcome = await onBegin(projectName)
+      if (outcome.ok) {
+        setNote(
+          text(
+            `Начат прогон: C0${outcome.targetsCount !== undefined ? `, целей из roadmap: ${outcome.targetsCount}` : ''}${outcome.next ? ` · далее: ${outcome.next.step ?? '—'}` : ''}`,
+            `Run started: C0${outcome.targetsCount !== undefined ? `, roadmap targets: ${outcome.targetsCount}` : ''}${outcome.next ? ` · next: ${outcome.next.step ?? '—'}` : ''}`,
+          ),
+        )
+      } else {
+        setNote(outcome.error ?? 'Ошибка')
+      }
+    } catch (error) {
+      setNote(error instanceof Error ? error.message : String(error))
+    } finally {
+      setStepBusy(false)
+      void refreshRunner()
+      void load()
+    }
+  }
+
   const agentNow = async () => {
     setStepBusy(true)
     setNote(undefined)
@@ -169,6 +194,17 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
         </div>
       ) : !task ? (
         <>
+          {!runner?.present ? (
+            <div className="resume-notice">
+              <strong>{text('Прогон ещё не начат', 'No run state yet')}</strong>
+              <span>{text('Зафиксируйте C0: базовый снимок и контрольную проверку текущих зависимостей. Цели берутся из последнего roadmap (dashboard-state).', 'Capture C0: the baseline snapshot and control verification of current dependencies. Targets come from the last roadmap (dashboard-state).')}</span>
+              <footer className="baseline-intent-actions">
+                <button type="button" className="button primary" disabled={stepBusy} onClick={() => void beginNow()}>
+                  <Rocket size={16} />{text('Начать миграцию (C0)', 'Start migration (C0)')}
+                </button>
+              </footer>
+            </div>
+          ) : null}
           <div className="resume-notice">
             <strong>{text('Задание ещё не сформировано', 'The assignment is not ready yet')}</strong>
             {insufficient ? (

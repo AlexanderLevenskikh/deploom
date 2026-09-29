@@ -12,7 +12,7 @@ import { PromptPreviewDialog } from './PromptPreviewDialog'
 import { IterativeTaskPanel } from './IterativeTaskPanel'
 import { normalizeBaselineIntentPlan } from '../data/baselineIntent'
 import type { DraftProgressPayload } from '../hooks/useDependencyFlow'
-import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, DraftResultSnapshot, EnvironmentInfo, FlowAction, IterativeAgentOutcome, IterativeStatusOutcome, IterativeStepOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobOutput, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
+import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, DraftResultSnapshot, EnvironmentInfo, FlowAction, IterativeAgentOutcome, IterativeBeginOutcome, IterativeStatusOutcome, IterativeStepOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobOutput, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
 
 const AUTOPILOT_HELP = {
   ru: '«Продолжить» автономно доводит текущий этап. Автопилот дополнительно проходит весь FLOW до принятого результата: после audit он возвращается в migration только при реальном acceptance blocker, а не ради процента freshness.',
@@ -52,6 +52,7 @@ type Props = {
   onSaveIterativeTask: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onIterativeStatus: (projectName: string) => Promise<IterativeStatusOutcome>
   onIterativeStep: (projectName: string) => Promise<IterativeStepOutcome>
+  onIterativeBegin: (projectName: string) => Promise<IterativeBeginOutcome>
   onIterativeAgent: (projectName: string) => Promise<IterativeAgentOutcome>
   // Live log window (activity bubbles) for the current run, rendered below all
   // the flow content so failures can be inspected in place.
@@ -60,7 +61,7 @@ type Props = {
   onClearLogs?: () => void
 }
 
-export function FlowWorkspace({ details, project, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeStep, onIterativeAgent, logs, onCancelJob, onClearLogs }: Props) {
+export function FlowWorkspace({ details, project, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeStep, onIterativeBegin, onIterativeAgent, logs, onCancelJob, onClearLogs }: Props) {
   const { language, text, t } = useLanguage()
   // The persisted goal drives stage actions and autopilot: a green target set
   // in the Baseline dialog must survive into generate/release instead of
@@ -708,6 +709,7 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
         onSave={onSaveIterativeTask}
         onStatus={onIterativeStatus}
         onStep={onIterativeStep}
+        onBegin={onIterativeBegin}
         onAgent={onIterativeAgent}
         onOpenPath={onOpenPath}
       />

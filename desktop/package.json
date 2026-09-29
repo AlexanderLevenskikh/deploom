@@ -80,6 +80,8 @@
     "check:artifact-token": "node scripts/check-artifact-token.mjs",
     "precheck:iterative-runner": "tsc -p tsconfig.electron.json",
     "check:iterative-runner": "node scripts/check-iterative-runner.mjs",
+    "precheck:iterative-begin": "tsc -p tsconfig.electron.json",
+    "check:iterative-begin": "node scripts/check-iterative-begin.mjs",
     "precheck:iterative-agent": "tsc -p tsconfig.electron.json",
     "check:iterative-agent": "node scripts/check-iterative-agent.mjs"
   },
