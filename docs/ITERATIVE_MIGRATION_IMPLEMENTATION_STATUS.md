@@ -32,10 +32,33 @@
 
 Открытые пункты: (см. следующий шаг)
 
+### 2026-09-29 — Python-координатор: накопительный цикл C0→C1→C2 + drain + restart — готово
+
+- Определён и проверен физически полный вертикальный цикл: `begin` (C0 control verify) → `plan-next` → `materialize` (реальный `npm install` exact версий, offline из сеянного кэша) → `precheck` → scripted repair → `verify-exact` на repaired bytes → принятие C1 → вторая когорта wrong→right (attempt 0→1) → C2 → недостижимая версия → INCONCLUSIVE/NO_ACTIONABLE → `finish` с MIGRATION_REPORT и DEVELOPER_UPGRADE_GUIDE. Каждый шаг — отдельный subprocess (restart boundary).
+- Ключевые границы, выловленные физическим тестом: снимки-контейнеры read-only → после materialize нужно снимать write-protection в trial; deadline в `run_budget_ok` трактовался как local time (фикс — UTC-парсинг); снапшоты активного checkpoint пишутся в `run_dir/sources/<checkpointId>`; verify-exact RED агрегирует `tail` из `BaselineProjectFailure.output`; `satisfied` = точное совпадение target в incumbent (деферренные/недостижимые → NO_ACTIONABLE, не POLICY_SATISFIED); отчёты строятся от parent checkpoints.
+- Commits: `f979283` (feat: iterative migration Python coordinator, 8 файлов, 3921 вставка), `692bf8d` (fix: accept explicit PEER_RESOLUTION_DEFERRED в export дорожной карты; regression 4 теста).
+- Проверки: `run_tool_tests.py --suite production-fast` OK; `--suite all` 1438 OK (4 skipped); физический acceptance `test_iterative_migration_physical.py` OK (~27s).
+- Открытый пункт: eligibility и запуск repair-агента в Desktop-coordinator (репозиторий `repair-dispatch` уже умеет; в фоллоу-апе — соединение с task artifact'ом).
+
+### 2026-09-29 — ТЗ-артефакт (task export) из durable state без Baseline — готово (follow-up, часть 1)
+
+- Новый модуль `iterative_task.py`: RU/EN «Задание на адаптацию зависимостей» строится ТОЛЬКО из durable JSON (run.json/run-config.json/checkpoints/ledger); атомарная публикация `task/<artifactId>/{task.ru.md, task.en.md, task-manifest.json}` + указатель `current.json` (флипается последним, предыдущий набор сохраняется и помечается stale в history).
+- Манифест: schemaVersion/builder/artifactId, идентичности (run/workspace/project/checkpoint), хэши (scope/policy/command-set/source snapshot/manifest/lockfile/resolved state), exact принятых версий, actions, deferred (явные отложенные с reason), completeness{policySatisfied, denominator, remaining}, verification/audit, per-language content-hash «связан» с телом.
+- Контракт: отложенный пакет остаётся неизменяемым в знаменателе, lagPolicyTarget не подставляется в исполняемый target; policySatisfied=false. Недостаточный durable JSON → `TASK_INPUT_INSUFFICIENT` со списком полей, без запуска Baseline. `task_staleness` — идентичность (runId/checkpoint/policy) против живого состояния.
+- CLI: `iterative_migration.py export-task [--language ru|en|both] [--check-only]`.
+- Commits: `fa5bc3e` (feat: export task artifact..., 6 regression-тестов).
+- Проверки: `--suite all` 1444 OK (4 skipped); regression `test_iterative_task_export.py` 6 OK.
+
+### 2026-09-29 — Desktop: потребитель артефакта, панель «План обновления», typed IPC, verified clipboard — готово (follow-up, части 2–3)
+
+- `desktop/electron/iterative-migration.ts` — строго потребитель: `currentTask`, `taskStaleness`, `missingTaskExportInput`, `taskCopyPayload` + лимит 512 КБ, `iterativeExportInvocation`; run dir контракт `<base>/.dependency-roadmap/iterative/<token>`.
+- `desktop/electron/task-clipboard.ts` — DI-запись в clipboard с read-back проверкой: «Скопировано» только после подтверждения `clipboard.readText() ==` записанному; отказ при oversized/missing-language/stale.
+- `main.ts`: `flow:iterative:task|export|copy-task|save-task` (python через `resolveExecutable`, бюджет 120s, `TASK_INPUT_INSUFFICIENT` без Baseline, stale-отказ копирования). Preload + `DependencyFlowApi` + `useDependencyFlow` + компонент `IterativeTaskPanel` (сумма принятых/отложенных/остатка, stale warning, список deferrals, действия Посмотреть/Скопировать/Сохранить/Переэкспортировать/Открыть папку, reload при смене run).
+- Commits: `a48f50b` (feat: desktop consumer + check-iterative-migration.mjs с РЕАЛЬНЫМ python export→TS handoff), `86db6af` (feat: task panel, typed IPC, verified clipboard + check-task-clipboard.mjs).
+- Проверки Desktop: `npm run build` OK, lint 0 errors; затронутые contract-checks зелёные (flow-state, ui-shell, interaction-contracts, i18n, process-launcher, run-slot-isolation, ui-lifecycle, dashboard-state, baseline-intent, iterative-migration, task-clipboard).
+
 ### Следующий шаг
-1. Написать `iterative_migration.py` (schemas/identities/authority matrix, begin/plan-next/materialize/precheck/verify-exact/feedback/status/finish/audit, ledger, budget/lease).
-2. Юнит-тесты схема/identity/stale-rejection + cross-language fixture.
-3. Desktop-координатор `iterative-migration.ts`, check-скрипт, opt-in маршрут.
-4. Физический acceptance test (offline npm cache) + scripted agent.
-5. Прогон `run_tool_tests.py --suite all` + `production-fast`, Desktop lint/build/`check:*`.
-6. `docs/ITERATIVE_MIGRATION_ACCEPTANCE.md`.
+1. Follow-up часть 4: acceptance — synthetic fixtures, kill/restart между checkpoint acceptance и записью ТЗ/между записью и UI-ack, реальный Electron clipboard на synthetic text в UI-тесте (запуск Electron в окружении сборки; mock writeText — только для контракта, реальный clipboard проверяется отдельно).
+2. `docs/ITERATIVE_MIGRATION_ACCEPTANCE.md` — фактический прогон.
+3. Финальный `git diff --check` + sanitization (`check-public-sanitization.py`) для нового `iterative_task.py` и дистрибутива.
+4. Полный прогон: Python `--suite all` + `production-fast`, Desktop lint/build/`check:*`.
