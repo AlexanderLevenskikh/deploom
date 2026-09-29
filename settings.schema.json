@@ -45,6 +45,11 @@
               "path": {
                 "type": "string"
               },
+              "nodeVersion": {
+                "type": "string",
+                "pattern": "^(v?\\d+(\\.\\d+){0,2})$",
+                "description": "Explicit Node.js for this project/CI: an exact version (22.18.0) or a major (22). Empty means no fixed runtime — the host's ambient Node is used and no CI-compatibility claim is made. Durable runtime contract: chainbegin resolves it to ONE installed executable and every step (materialize/verify/audit) re-checks it is unchanged."
+              },
               "sourceBranch": {
                 "type": "string"
               },

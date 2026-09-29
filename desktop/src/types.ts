@@ -31,6 +31,9 @@ export type ProjectLevel = { status: 'red' | 'yellow' | 'green'; lagOkPct?: numb
 export type ProjectSpec = {
   name: string
   path: string
+  // D2.4: display-only Node hints from repo pins (engines.node, .nvmrc,
+  // .node-version). The UI may suggest them, never auto-fills the runtime.
+  nodeHints?: string[]
   git?: {
     sourceBranch?: string
     baseBranch?: string
@@ -367,6 +370,15 @@ export type IterativeRunnerDecision = {
   repairRequests?: IterativeRunnerRepairRequest[]
   satisfied?: boolean
 }
+export type IterativeRuntimeView = {
+  requested?: string
+  effectiveVersion?: string
+  source?: string
+  packageManager?: string
+  packageManagerVersion?: string
+  platform?: string
+  arch?: string
+}
 export type IterativeStatusOutcome = {
   ok: boolean
   present: boolean
@@ -374,6 +386,10 @@ export type IterativeStatusOutcome = {
   staleReason?: string
   phase?: string
   decision?: IterativeRunnerDecision
+  // D2.4: display-only view of the durable runtime contract (requested vs
+  // effective + CI evidence source). The UI renders it, never decides by it.
+  requestedNode?: string
+  runtime?: IterativeRuntimeView
   error?: string
 }
 export type IterativeStepOutcome = {

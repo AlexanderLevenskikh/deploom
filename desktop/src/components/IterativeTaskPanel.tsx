@@ -36,6 +36,22 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
   const [stepBusy, setStepBusy] = useState(false)
   const loadSeq = useRef(0)
 
+  // D2.4: display-only view of the durable runtime contract — requested vs
+  // effective + the CI evidence source (installed runtime that committed).
+  const runtimeLine = (runner?: IterativeStatusOutcome) => {
+    const rt = runner?.runtime
+    if (!runner?.present || !rt?.effectiveVersion) return null
+    const manager = [rt.packageManager, rt.packageManagerVersion].filter(Boolean).join(' ')
+    const platform = [rt.platform, rt.arch].filter(Boolean).join('/')
+    const evidence = [rt.source, manager, platform].filter(Boolean).join(' · ')
+    return (
+      <span>
+        {text('Node/CI', 'Node/CI')}: {rt.requested || text('не задан', 'unset')} → {rt.effectiveVersion}
+        {evidence ? ` · ${evidence}` : ''}
+      </span>
+    )
+  }
+
   const refreshRunner = useCallback(async () => {
     try {
       const status = await onStatus(projectName)
@@ -252,6 +268,7 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
               {runner.decision ? (
                 <span>{text('Следующий шаг', 'Next step')}: {runner.decision.step ?? '—'} · {runner.decision.reason}</span>
               ) : null}
+              {runtimeLine(runner)}
             </div>
           ) : null}
           {runner?.decision?.step === 'agent' ? (
@@ -307,6 +324,7 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
               {runner.decision ? (
                 <span>{text('Следующий шаг', 'Next step')}: {runner.decision.step ?? '—'} · {runner.decision.reason}</span>
               ) : null}
+              {runtimeLine(runner)}
             </div>
           ) : null}
 

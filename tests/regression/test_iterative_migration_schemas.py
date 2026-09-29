@@ -8,6 +8,7 @@ both sides.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import tempfile
 import unittest
@@ -22,6 +23,7 @@ from iterative_migration import (
     _plan_next_locked,
     _record_block,
     assignment_fingerprint,
+    cmd_status,
     load_candidate,
     load_checkpoint,
     load_config,
@@ -751,6 +753,65 @@ class IterativeMigrationReportTests(unittest.TestCase):
             self.assertIn("| `pkg-a` | `0.5.0` | `1.1.0` |", guide)
             self.assertIn("dropped legacy API", guide)
             self.assertIn("PEER_RESOLUTION_DEFERRED", guide)
+
+
+class IterativeRuntimeStatusViewTests(unittest.TestCase):
+    """D2.4: `cmd_status` exposes the durable runtime contract (requested vs
+    effective + manager/platform) as a display-only `config` view for the UI,
+    and omits it when the run makes no runtime commitment."""
+
+    def _status_payload(self, root: _RunDir) -> dict:
+        with tempfile.TemporaryDirectory() as _stdout_dir:
+            args = argparse.Namespace(run_dir=str(root.root))
+            code = cmd_status(args)
+            self.assertEqual(0, code)
+        import json as _json
+
+        payload = _json.loads((root.root / "status.json").read_text(encoding="utf-8"))
+        self.assertEqual("C0", payload["run"]["activeCheckpointId"])
+        return payload
+
+    def test_status_payload_carries_requested_and_runtime_view(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _RunDir(Path(tmp))
+            root.write_run()
+            runtime = {
+                "requested": "22",
+                "effectiveVersion": "22.18.0",
+                "nodePath": "C:/node22/node.exe",
+                "npmPath": "C:/node22/npm.cmd",
+                "source": "major-alias",
+                "packageManager": "npm",
+                "packageManagerVersion": "10.9.2",
+                "platform": "win32",
+                "arch": "AMD64",
+                "contractHash": "rt-hash-1",
+                "hash": "rt-hash-1",
+            }
+            root.write_config(_config_dict(requestedNode="22", runtime=runtime))
+            root.write_checkpoint()
+            payload = self._status_payload(root)
+            self.assertEqual("22", payload["config"]["requestedNode"])
+            view = payload["config"]["runtime"]
+            self.assertEqual("22", view["requested"])
+            self.assertEqual("22.18.0", view["effectiveVersion"])
+            self.assertEqual("npm", view["packageManager"])
+            self.assertEqual("10.9.2", view["packageManagerVersion"])
+            self.assertEqual("win32", view["platform"])
+            # the durable contract keeps raw paths; the display view does not
+            # need them, but they must stay intact on the durable side.
+            stored = load_config(root.root)
+            self.assertEqual("C:/node22/node.exe", stored["runtime"]["nodePath"])
+
+    def test_status_payload_omits_runtime_when_uncommitted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _RunDir(Path(tmp))
+            root.write_run()
+            root.write_config(_config_dict())
+            root.write_checkpoint()
+            payload = self._status_payload(root)
+            self.assertEqual(payload["config"]["requestedNode"], "")
+            self.assertEqual(payload["config"]["runtime"], {})
 
 
 if __name__ == "__main__":

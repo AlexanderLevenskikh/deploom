@@ -109,6 +109,9 @@ type ProjectSpec = {
   // means "no CI-compatibility claim" — the child runtime stays the host
   // ambient one and verification makes no requested-runtime commitment.
   nodeVersion?: string
+  // D2.4: display-only Node hints from repo pins (engines.node, .nvmrc,
+  // .node-version). The UI may suggest them, never auto-fills the runtime.
+  nodeHints?: string[]
 }
 
 type WorkspaceRecord = {
@@ -1087,11 +1090,40 @@ function readProjects(workspace: WorkspaceRecord): ProjectSpec[] {
       : workspace.path
     return settings.projects.map((project) => {
       const absolute = isAbsolute(project.path) ? resolve(project.path) : resolve(configuredRoot, project.path)
-      return { ...project, path: resolveProjectPackageDirectory(absolute) }
+      const path = resolveProjectPackageDirectory(absolute)
+      // D2.4: display-only Node hints from the repo pins (engines.node and
+      // .nvmrc/.node-version). The UI may suggest them, never auto-fills.
+      return { ...project, path, nodeHints: projectNodeHints(path) }
     })
   } catch {
     return []
   }
+}
+
+function projectNodeHints(projectPath: string): string[] {
+  const hints: string[] = []
+  const packagePath = join(projectPath, 'package.json')
+  if (existsSync(packagePath)) {
+    try {
+      const manifest = JSON.parse(readFileSync(packagePath, 'utf8')) as Record<string, any>
+      const enginesNode = manifest?.engines?.node
+      if (typeof enginesNode === 'string' && enginesNode.trim()) hints.push(enginesNode.trim())
+    } catch {
+      // hint discovery must never fail project loading
+    }
+  }
+  for (const name of ['.nvmrc', '.node-version']) {
+    const pinPath = join(projectPath, name)
+    if (existsSync(pinPath)) {
+      try {
+        const value = readFileSync(pinPath, 'utf8').trim()
+        if (value) hints.push(value)
+      } catch {
+        // ignore unreadable pin files
+      }
+    }
+  }
+  return [...new Set(hints)]
 }
 
 // Draft Baseline artifacts. The planner publishes
@@ -7452,6 +7484,10 @@ function setupIpc(): void {
     let phase: string | undefined
     let decision: ReturnType<typeof decideNextStep> | undefined
     let error: string | undefined
+    let requestedNode: string | undefined
+    let runtimeView: Record<string, any> | undefined
+    const scalar = (value: unknown): string | undefined =>
+      typeof value === 'string' && value ? value : undefined
     // R3: the coordinator runs on the durable Python state regardless of the
     // task artifact; task staleness only blocks DISPATCHING the old task to the
     // agent, never planning/materializing/verifying the state itself.
@@ -7466,10 +7502,26 @@ function setupIpc(): void {
         if (payload) {
           phase = String(payload.run?.phase ?? '')
           decision = decideNextStep(runDir, payload)
+          const config = (payload.config ?? {}) as Record<string, any>
+          const runtime = (config.runtime ?? undefined) as Record<string, any> | undefined
+          if (runtime && typeof runtime === 'object' && Object.keys(runtime).length > 0) {
+            // D2.4: expose only the DISPLAY fields of the runtime contract; raw
+            // executable paths stay in the durable state, never in the renderer.
+            requestedNode = String(config.requestedNode ?? '')
+            runtimeView = {
+              requested: scalar(runtime.requested),
+              effectiveVersion: scalar(runtime.effectiveVersion),
+              source: scalar(runtime.source),
+              packageManager: scalar(runtime.packageManager),
+              packageManagerVersion: scalar(runtime.packageManagerVersion),
+              platform: scalar(runtime.platform),
+              arch: scalar(runtime.arch),
+            }
+          }
         }
       }
     }
-    return { ok: error === undefined, present, stale, staleReason: taskStaleness(runDir).reason, phase, decision, error }
+    return { ok: error === undefined, present, stale, staleReason: taskStaleness(runDir).reason, phase, decision, requestedNode, runtime: runtimeView, error }
   })
 
   ipcMain.handle('flow:iterative:begin', async (_event, input: { workspaceId?: string; projectName: string }) => {

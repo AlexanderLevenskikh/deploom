@@ -2412,6 +2412,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             "targetLevel": config.get("targetLevel"),
             "budget": config.get("budget"),
             "verifyConfigCommands": config.get("verifyConfig", {}).get("commands", []),
+            # D2.4: the UI needs the requested-vs-effective runtime contract and
+            # the CI evidence source to render, not to decide. The durable
+            # runtime block lives in run-config.json; this is its view.
+            "requestedNode": config.get("requestedNode") or "",
+            "runtime": config.get("runtime") or {},
         },
     }
     status_path = run_dir / "status.json"
