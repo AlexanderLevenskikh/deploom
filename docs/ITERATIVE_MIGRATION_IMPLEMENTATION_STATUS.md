@@ -87,3 +87,46 @@
 1. Полные гейты перед релизом: Python `--suite all` + `production-fast`, sanitization, Desktop `run-all-contract-checks`.
 2. Релиз: `.\push-github-branch-and-tag.ps1` (bump с 0.2.152).
 3. Открытые ограничения (не входят в релиз): E13 real-agent pilot (нужен provider/изолированный проект), E12 live-бинарники opencode/claude/codex (`gh` недоступен), E9 физический «real install под выбранным Node» — только synthetic fake (запланирован).
+
+### 2026-09-30 — повторная приёмка v0.2.153→v0.2.154: закрыты 7 блокеров ревью
+
+Ревью HEAD `089c702` (v0.2.153) выставило 7 блокирующих замечаний (см.
+`docs/ITERATIVE_MIGRATION_REVIEW_V02153_2026-09-29.md`). Все закрыты, каждый
+фикс — отдельным коммитом поверх `089c702`:
+
+- `eba6f98` (#3/#7): промежуточный `progress.preview`-релей по durable-состоянию;
+  stale/missing task позволяется переэкспортировать; вся копируемость ТЗ —
+  через Electron IPC (web Clipboard API из renderer убран).
+- `2e9798b` (#4): forbidden-мутации планировщика — полный baseline hash diff:
+  `classifyTrialMutations`/`forbiddenTrialViolations`, removal-детекция,
+  FORBIDDEN_MUTATION отклоняется ДО feedback/verify; `check-iterative-agent.mjs`
+  переписан; Python `_validate_changed_files` остаётся defense-in-depth.
+- `93b2377` (#5): `decideAgentLeaseDispatch` — живой/мёртвый владелец lease →
+  in-progress/resume той же сессии (PID alive-проверка с EPERM-обработкой);
+  resume собирает те же sessionId + OPENCODE_DB из lease.
+- `6aec594` (#6): runtime pre-check `_npm_engines_node` перед materialize;
+  несовместимые цели → ENGINES_INCOMPATIBLE-деферрал (kind/package/reason);
+  `engineDeferred` в событиях plan-next; `_normalize_effective_node_version`
+  корректно обрабатывает build metadata.
+- `5a24117` (#2): bounded discovery при пустом roadmap — `_discover_targets`
+  (yellow lag-policy по прямым deps, dist-tags.latest, evidence), версии не
+  выдумываются; begin получает `targetDiscovery` + событие `begin.discovery`.
+- `aedf8d7` (#1): durable supervisor — `flow:iterative:drive` гонит
+  plan-next→materialize→precheck→verify-exact→следующая когорта до
+  агент-гейта/finish/ошибки/бюджета (50 итераций, 45 мин, per-step 30 мин);
+  begin и успешный repair автоматически продолжают до следующего гейта/
+  финиша; одношаговый `flow:iterative:step` удалён end-to-end; `check:iterative-runner`
+  секция 10 пинит контракт супервизора (stop-условия, NO_RUN, пересчёт решения
+  из durable-состояния).
+
+Проверки на HEAD повторной приёмки: `run_tool_tests.py --suite all` **1510 OK
+(4 skipped)**, `--suite production-fast` **64 OK**; физический acceptance
+`test_iterative_migration_physical.py` PASS; Desktop tsc (electron) + vite build +
+lint (15 pre-existing warnings, 0 errors); check:iterative-runner/agent/begin/
+task-clipboard/i18n/ui-lifecycle OK; sanitization OK.
+
+Честные BLOCKED (фиксируются, не маскируются): E12/E13 live-агент на живом
+проекте (провайдер и частный проект не предоставлены — покрытие только
+scripted-агент + contract-чеки), E9 реальный install под выбранным Node вне
+fake-фикстуры, наблюдение GitHub Actions после публикации тега (`gh`
+недоступен — статус CI фиксируется отдельным шагом после релиза).

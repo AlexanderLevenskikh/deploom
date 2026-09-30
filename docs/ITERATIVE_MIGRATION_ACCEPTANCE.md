@@ -44,7 +44,7 @@ git/npm/check.js, без подмены npm:
 
 ## Regression-набор (Python)
 
-- `tests/regression/test_iterative_migration_schemas.py` — 19 тестов: контракт
+- `tests/regression/test_iterative_migration_schemas.py` — 31 тестов: контракт
   run/checkpoint/ledger/candidate/feedback, схема, ожидания.
 - `tests/regression/test_explicit_planner_deferral_export.py` — 4 теста:
   явный PEER_RESOLUTION_DEFERRED принимается в export без ROADMAP_TARGET_DESYNC;
@@ -57,8 +57,9 @@ git/npm/check.js, без подмены npm:
   checkpoint, **kill/restart**: потеря указателя → идемпотентный повторный
   экспорт той же папки артефакта; частичный набор → свежий полный набор.
 
-Полный прогон `python run_tool_tests.py --suite all`: **1446 OK (4 skipped)**
-(fresh run после всех правок). `--suite production-fast`: **64 OK**.
+Полный прогон `python run_tool_tests.py --suite all` на HEAD повторной
+приёмки (2026-09-30): **1510 OK (4 skipped)**. `--suite production-fast`:
+**64 OK**.
 
 ## Desktop: потребитель артефакта, IPC, clipboard, UI
 
@@ -95,8 +96,51 @@ desktop-check-inventory.
   dashboard-пути сохранён web Clipboard API + ручной fallback
   (PromptPreviewDialog не трогали по этой задаче) — если сбой воспроизведётся,
   перевести и его на confirmed-запись.
-- Полноценный «агент исполняет ТЗ и присылает репорт» — следующий этап:
-  coordinator (Desktop) получил чтение/экспорт/отправку артефакта, но
-  запуск repair-агента по артефакту не соединял (это отдельный пункт
-  follow-up, surface уже есть в `repair-dispatch.ts`).
+- Полноценный «агент исполняет ТЗ и присылает репорт» теперь соединён в
+  Desktop: `flow:iterative:agent` диспатчит выбранного провайдера (open code /
+  claude / codex) с durable lease (возобновление той же сессии после убийства
+  владельца), принимает репорт-объект ремонта и отвергает forbidden-мутации
+  планировщика через baseline hash diff до вердикта. Реальный провайдерский
+  бинарь на живом проекте в этом окружении не прогонялся (BLOCKED, см. ниже).
 - Реальную миграцию пользовательского проекта (не фикстуру) не гоняли.
+
+## Повторная приёмка v0.2.154 (2026-09-30): 7 блокеров закрыты
+
+Повторная ревью v0.2.153 (HEAD `089c702`, см.
+`docs/ITERATIVE_MIGRATION_REVIEW_V02153_2026-09-29.md`) выставила 7
+блокирующих замечаний. Все закрыты сверху `089c702`:
+
+| # | Блокер | Фикс |
+| --- | --- | --- |
+| 1 | Одношаговая ручная механика («выполнить следующий шаг») | Durable supervisor `flow:iterative:drive` (commit `aedf8d7`): один вызов гонит plan-next → materialize → precheck → verify-exact → следующая когорта до агент-гейта / finish / ошибки / бюджета (50 итераций, 45 мин); begin и успешный repair автоматически продолжают до следующего гейта/финиша; одношаговый `flow:iterative:step` удалён end-to-end. Restart-safe: решение пересчитывается из durable-состояния Python на каждой итерации. |
+| 2 | Bounded target discovery при пустом roadmap | `_discover_targets` на begin: жёлтый lag-policy по прямым зависимостям из npm dist-tags (commit `5a24117`), версии не выдумываются, evidence пишется в событие. |
+| 3 | Промежуточные сводки (лаг/health) | `progress.preview`-релей ревью-прогресса на каждую когорту по durable-состоянию (commit `eba6f98`). |
+| 4 | Forbidden-мутации планировщика агентом | Full-baseline hash diff: `classifyTrialMutations`/`forbiddenTrialViolations`, removal-детекция, FORBIDDEN_MUTATION до feedback/verify (commit `2e9798b`); Python `_validate_changed_files` остаётся defense-in-depth. |
+| 5 | После убийства владельца lease не возобновлялся | `decideAgentLeaseDispatch`: живой/мёртвый PID → in-progress/resume той же сессии (commit `93b2377`). |
+| 6 | Планирование без учёта совместимости движка | Runtime pre-check `_npm_engines_node` + ENGINES_INCOMPATIBLE-деферрал до materialize (commit `6aec594`). |
+| 7 | Финальные экраны/повторная проверка evidence | Phase/end-экраны в панели + переэкспорт при stale/missing + вся копируемость через Electron IPC (commit `eba6f98`). |
+
+### Гейты, фактически прогнанные на этой ревизии
+
+- Python: `tests/regression/test_iterative_*.py` — 68 OK; новые
+  `test_iterative_engine_precheck.py` (6), `test_iterative_target_discovery.py`
+  (4), `test_iterative_runtime_request.py` (14, повторный) — OK; физический
+  acceptance `test_iterative_migration_physical.py` — PASS (~103s).
+- Desktop: `tsc -p tsconfig.electron.json` OK; `npm run build` (vite) OK;
+  `npm run lint` — 15 pre-existing warnings, 0 errors.
+- Контракт-чеки OK: check:iterative-runner (включая новую секцию 10 —
+  durable-supervisor), check:iterative-agent, check:iterative-begin,
+  check:task-clipboard, check:i18n, check:ui-lifecycle.
+
+### Честный BLOCKED (фиксируется, а не маскируется)
+
+- **E12/E13**: реальный провайдерский бинарь (opencode/claude/codex) и
+  согласованный изолированный частный проект для live-ремонта не
+  предоставлены — live-агент на живом проекте не прогнан; покрытие — только
+  синтетический scripted-агент и contract-чеки.
+- **E9**: физический `npm install` под выбранным Node вне fake-фикстуры с
+  реальным сетевым кэшем не гонялся (в физическом acceptance используется
+  `npm_config_offline=true` + сеянный кэш).
+- **CI по тегу**: наблюдение GitHub Actions из этого окружения недоступно
+  (`gh` отсутствует) — CI-статус публикуемого тега фиксируется отдельно после
+  релиза.
