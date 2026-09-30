@@ -216,5 +216,30 @@ if (!statusInvocation.args.includes("status") || !statusInvocation.args.includes
   throw new Error(`Status invocation malformed: ${JSON.stringify(statusInvocation)}`);
 }
 
+// 10. #1 durable supervisor: the DRIVE IPC must exist, the one-shot STEP IPC
+// must be gone (drive replaces it), and the loop must stop ONLY at an agent
+// gate / finish / error / budget — never invent a step and never fabricate a
+// run. Static contract on the owning source so a regression in the loop's
+// stop conditions is caught here, not in a dialog.
+{
+  const { readFileSync } = await import("node:fs");
+  const main = readFileSync(new URL("../electron/main.ts", import.meta.url), "utf8");
+  const types = readFileSync(new URL("../src/types.ts", import.meta.url), "utf8");
+  if (!/ipcMain\.handle\('flow:iterative:drive'/.test(main)) throw new Error("flow:iterative:drive handler must exist in main.ts");
+  if (/ipcMain\.handle\('flow:iterative:step'/.test(main)) throw new Error("one-shot flow:iterative:step must be REMOVED (drive replaces it)");
+  const drive = main.slice(main.indexOf("flow:iterative:drive"));
+  if (!drive.includes("stopped: 'agent-gate'")) throw new Error("drive must stop at the agent GATE");
+  if (!drive.includes("stopped: 'finished'")) throw new Error("drive must stop at finish");
+  if (!drive.includes("stopped: 'error'")) throw new Error("drive must stop on error");
+  if (!drive.includes("45 * 60 * 1000")) throw new Error("drive must have a wall-clock budget");
+  if (!drive.includes("iteration < 50")) throw new Error("drive must have an iteration budget");
+  if (!drive.includes("'NO_RUN'")) throw new Error("drive must refuse a missing run (NO_RUN), never fabricate begin");
+  if (!/(?:decideNextStep\(runDir, payload\))/.test(drive)) throw new Error("drive must recompute the decision from durable state each iteration");
+  if (!/IterativeDriveOutcome/.test(types)) throw new Error("IterativeDriveOutcome must exist in types.ts");
+  if (!/'agent-gate' \| 'finished' \| 'error' \| 'time-budget' \| 'iteration-budget'/.test(types)) {
+    throw new Error("IterativeDriveOutcome.stopped union must list every stop reason");
+  }
+}
+
 if (!existsSync(runDir)) throw new Error("fixture missing");
 console.log("check-iterative-runner: OK");

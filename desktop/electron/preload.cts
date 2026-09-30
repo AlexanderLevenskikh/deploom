@@ -26,7 +26,7 @@ exportLegacyIterativeTask: (input: { workspaceId?: string; projectName: string }
   copyIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => ipcRenderer.invoke('flow:iterative:copy-task', input),
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => ipcRenderer.invoke('flow:iterative:save-task', input),
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:status', input),
-  iterativeStep: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:step', input),
+  iterativeDrive: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:drive', input),
   iterativeBegin: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:begin', input),
   iterativeAgent: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:agent', input),
   runAction: (input: unknown) => ipcRenderer.invoke('flow:run-action', input),

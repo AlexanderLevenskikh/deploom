@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntentPlan, BootstrapPayload, DependencyGraphSnapshot, DownloadSaved, FlowAction, HardwareSnapshot, IterativeAgentOutcome, IterativeBeginOutcome, IterativeStatusOutcome, IterativeStepOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobFinished, JobOutput, ProjectSpec, TargetLevel, ThemePreference, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
+import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntentPlan, BootstrapPayload, DependencyGraphSnapshot, DownloadSaved, FlowAction, HardwareSnapshot, IterativeAgentOutcome, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobFinished, JobOutput, ProjectSpec, TargetLevel, ThemePreference, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
 import { parseBaselineDecision } from '../data/baselineIntent'
 import { goalSeekingStopReason, nextAutopilotAction, type AutopilotPolicyState } from '../autopilot-policy'
 
@@ -635,9 +635,9 @@ export function useDependencyFlow() {
     if (!api) return { ok: false, present: false, stale: false, error: 'NO_DESKTOP_API' }
     return api.iterativeStatus({ workspaceId: selectedWorkspaceId, projectName })
   }, [api, selectedWorkspaceId])
-  const iterativeStep = useCallback(async (projectName: string): Promise<IterativeStepOutcome> => {
-    if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
-    return api.iterativeStep({ workspaceId: selectedWorkspaceId, projectName })
+  const iterativeDrive = useCallback(async (projectName: string): Promise<IterativeDriveOutcome> => {
+    if (!api) return { ok: false, steps: [], stopped: 'error', error: 'NO_DESKTOP_API' }
+    return api.iterativeDrive({ workspaceId: selectedWorkspaceId, projectName })
   }, [api, selectedWorkspaceId])
   const iterativeBegin = useCallback(async (projectName: string): Promise<IterativeBeginOutcome> => {
     if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
@@ -730,6 +730,6 @@ export function useDependencyFlow() {
   return {
     payload, loading, error, baselineDecision, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch, acknowledgeDraftRun,
     load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, removeProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches, updateProjectNode, listNodeVersions,
-    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult,     getDependencyGraphSnapshot, getIterativeTask, exportIterativeTask, exportLegacyIterativeTask, copyIterativeTask, saveIterativeTask, iterativeStatus, iterativeStep, iterativeBegin, iterativeAgent, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
+    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult,     getDependencyGraphSnapshot, getIterativeTask, exportIterativeTask, exportLegacyIterativeTask, copyIterativeTask, saveIterativeTask, iterativeStatus, iterativeDrive, iterativeBegin, iterativeAgent, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }
 }

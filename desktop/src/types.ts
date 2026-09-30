@@ -392,14 +392,21 @@ export type IterativeStatusOutcome = {
   runtime?: IterativeRuntimeView
   error?: string
 }
-export type IterativeStepOutcome = {
+// #1: durable supervisor outcome. drive runs the Python steps in a loop and
+// stops ONLY at an agent gate (repair needed — the caller dispatches the
+// agent), at finish, or on error/budget; every intermediate step (plan-next
+// -> materialize -> precheck -> verify-exact -> next cohort) happens without
+// a human click. Restart-safe: each iteration recomputes the decision from the
+// durable Python state.
+export type IterativeDriveOutcome = {
   ok: boolean
-  step?: string
+  steps: string[]
+  stopped: 'agent-gate' | 'finished' | 'error' | 'time-budget' | 'iteration-budget'
   phase?: string
-  gated?: 'agent'
-  repairRequests?: IterativeRunnerRepairRequest[]
+  step?: string
   reason?: string
-  next?: IterativeRunnerDecision
+  bootstrap?: boolean
+  repairRequests?: IterativeRunnerRepairRequest[]
   error?: string
 }
 export type IterativeAgentOutcome = {
@@ -449,7 +456,7 @@ export type DependencyFlowApi = {
   copyIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStatusOutcome>
-  iterativeStep: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStepOutcome>
+  iterativeDrive: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeDriveOutcome>
   iterativeBegin: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeBeginOutcome>
   iterativeAgent: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeAgentOutcome>
   runAction: (input: ActionInput) => Promise<{ jobId: string; runId?: string; preview: string[] }>

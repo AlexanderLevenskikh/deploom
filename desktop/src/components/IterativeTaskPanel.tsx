@@ -1,8 +1,8 @@
-import { Check, Clipboard, ExternalLink, FileText, Play, RefreshCw, Save, Wrench, X, Rocket } from 'lucide-react'
+import { Check, Clipboard, ExternalLink, FileText, Forward, RefreshCw, Save, Wrench, X, Rocket } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useLanguage } from '../i18n'
-import type { IterativeAgentOutcome, IterativeBeginOutcome, IterativeStatusOutcome, IterativeStepOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
+import type { IterativeAgentOutcome, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
 
 type Props = {
   workspaceId?: string
@@ -14,7 +14,7 @@ type Props = {
   onCopy: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onSave: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
-  onStep: (projectName: string) => Promise<IterativeStepOutcome>
+  onDrive: (projectName: string) => Promise<IterativeDriveOutcome>
   onBegin: (projectName: string) => Promise<IterativeBeginOutcome>
   onAgent: (projectName: string) => Promise<IterativeAgentOutcome>
   onOpenPath: (path?: string) => Promise<void>
@@ -25,7 +25,7 @@ type PanelState =
   | { phase: 'ready'; snapshot: IterativeTaskSnapshot }
   | { phase: 'error'; message: string }
 
-export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, onCopy, onSave, onStatus, onStep, onBegin, onExportLegacy, onAgent, onOpenPath }: Props) {
+export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, onCopy, onSave, onStatus, onDrive, onBegin, onExportLegacy, onAgent, onOpenPath }: Props) {
   const { text, language } = useLanguage()
   const [state, setState] = useState<PanelState>({ phase: 'loading' })
   const [busy, setBusy] = useState<string>()
@@ -103,27 +103,33 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
     }
   }
 
-  const stepNow = async () => {
+  // #1: the durable supervisor drives plan-next -> materialize -> precheck ->
+  // verify-exact -> next cohort WITHOUT manual internal steps, stopping ONLY
+  // at an agent gate, finish, error or budget. Restart-safe: every iteration
+  // re-reads the durable Python state.
+  const driveNow = async () => {
     setStepBusy(true)
     setNote(undefined)
     try {
-      const outcome = await onStep(projectName)
-      if (outcome.ok && outcome.gated === 'agent') {
-        setNote(
-          text(
-            `Нужен агент: ${outcome.reason ?? ''}`,
-            `Agent required: ${outcome.reason ?? ''}`,
-          ),
-        )
-      } else if (outcome.ok) {
-        setNote(
-          text(
-            `Шаг «${outcome.step ?? ''}» выполнен${outcome.next ? ` · далее: ${outcome.next.step ?? '—'}` : ''}`,
-            `Step "${outcome.step ?? ''}" done${outcome.next ? ` · next: ${outcome.next.step ?? '—'}` : ''}`,
-          ),
-        )
-      } else {
+      const outcome = await onDrive(projectName)
+      if (!outcome.ok) {
         setNote(outcome.error ?? 'Ошибка')
+      } else if (outcome.stopped === 'agent-gate') {
+        setNote(
+          text(
+            `Пауза на агенте: ${outcome.reason ?? 'нужен ремонт'}${outcome.steps.length ? ` · выполнено шагов: ${outcome.steps.length}` : ''}`,
+            `Agent gate: ${outcome.reason ?? 'repair needed'}${outcome.steps.length ? ` · steps done: ${outcome.steps.length}` : ''}`,
+          ),
+        )
+      } else if (outcome.stopped === 'finished') {
+        setNote(text('Миграция завершена: финальные отчёты сформированы.', 'Migration finished: final reports written.'))
+      } else {
+        setNote(
+          text(
+            `Супервизор остановился: ${outcome.reason ?? ''}`,
+            `Supervisor stopped: ${outcome.reason ?? ''}`,
+          ),
+        )
       }
     } catch (error) {
       setNote(error instanceof Error ? error.message : String(error))
@@ -142,10 +148,12 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
       if (outcome.ok) {
         setNote(
           text(
-            `Начат прогон: C0${outcome.targetsCount !== undefined ? `, целей из roadmap: ${outcome.targetsCount}` : ''}${outcome.next ? ` · далее: ${outcome.next.step ?? '—'}` : ''}`,
-            `Run started: C0${outcome.targetsCount !== undefined ? `, roadmap targets: ${outcome.targetsCount}` : ''}${outcome.next ? ` · next: ${outcome.next.step ?? '—'}` : ''}`,
+            `Начат прогон: C0${outcome.targetsCount !== undefined ? `, целей из roadmap: ${outcome.targetsCount}` : ''}`,
+            `Run started: C0${outcome.targetsCount !== undefined ? `, roadmap targets: ${outcome.targetsCount}` : ''}`,
           ),
         )
+        // Continuous migration: keep driving until the first gate/finish.
+        await driveNow()
       } else {
         setNote(outcome.error ?? 'Ошибка')
       }
@@ -198,6 +206,9 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
             `Agent repaired ${changed} file(s)${outcome.next ? ` · next: ${outcome.next.step ?? '—'}` : ''}`,
           ),
         )
+        // Continuous migration: after the repair is accepted, the supervisor
+        // verifies the exact candidate and moves to the next cohort on its own.
+        await driveNow()
       } else {
         setNote(outcome.error ?? 'Ошибка')
       }
@@ -334,14 +345,14 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
           ) : null}
 
           <footer className="baseline-intent-actions">
+            <button type="button" className="button primary" disabled={busy !== undefined || stepBusy || Boolean(snapshot?.stale)} onClick={() => void driveNow()}>
+              <Forward size={16} />{text('Продолжить', 'Continue')}
+            </button>
             {runner?.decision?.step === 'agent' ? (
               <button type="button" className="button primary" disabled={busy !== undefined || stepBusy || Boolean(snapshot?.stale)} onClick={() => void agentNow()}>
                 <Wrench size={16} />{text('Исправить агентом', 'Repair with agent')}
               </button>
             ) : null}
-            <button type="button" className="button secondary" disabled={busy !== undefined || stepBusy} onClick={() => void stepNow()}>
-              <Play size={16} />{text('Выполнить следующий шаг', 'Run next step')}
-            </button>
             <button type="button" className="button secondary" disabled={busy !== undefined} onClick={() => setShowDialog(true)}>
               <FileText size={16} />{text('Посмотреть', 'View')}
             </button>

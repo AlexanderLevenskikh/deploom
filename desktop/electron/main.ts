@@ -7627,65 +7627,79 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('flow:iterative:step', async (_event, input: { workspaceId?: string; projectName: string }) => {
+  // #1: the durable supervisor. ONE call drives the run's Python steps in a
+  // loop until it MUST stop: an agent gate (repair needed — dispatching the
+  // agent is the caller's job), finish, an error, or a bounded budget. No
+  // manual internal step is needed between begin and the first gate, nor
+  // between an accepted cohort and the next one. Restart-safe by design:
+  // every iteration recomputes the decision from the DURABLE Python state, so
+  // a killed app simply resumes from where the files say the run stands.
+  ipcMain.handle('flow:iterative:drive', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
-    // R6: the per-project in-flight guard is taken BEFORE any await, so two
-    // concurrent requests cannot both pass the check while the first is still
-    // awaiting the status call.
     if (iterativeStepInFlight.has(project.name)) {
-      return { ok: false, error: 'STEP_IN_PROGRESS' }
+      return { ok: false, steps: [], stopped: 'error', error: 'STEP_IN_PROGRESS' }
     }
     iterativeStepInFlight.add(project.name)
+    const steps: string[] = []
+    const startedAt = Date.now()
     try {
       if (!existsSync(join(runDir, 'run.json'))) {
-        return { ok: false, error: 'NO_RUN' }
+        return { ok: false, steps, stopped: 'error', error: 'NO_RUN' }
       }
-      // R3: the coordinator step (plan/materialize/precheck/verify/finish) runs
-      // on the durable Python state and is NOT blocked by task staleness. The
-      // agent gate below returns 'agent' only when the state actually requires
-      // repair; dispatching that repair with a task that no longer matches the
-      // durable state is refused in flow:iterative:agent.
       const python = resolveExecutable('python')
       const generator = join(bundledToolDir(), 'iterative_migration.py')
-      const statusResult = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
-      const payload = statusResult.code === 0
-        ? parseIterativeStatusPayload(statusResult.stdout) ?? readIterativeStatus(runDir)
-        : undefined
-      if (!payload) {
-        return { ok: false, error: statusResult.stderr.trim() || 'STATUS_UNREADABLE' }
-      }
-      const decision = decideNextStep(runDir, payload)
-      if (decision.step === 'agent') {
-        return {
-          ok: true,
-          gated: 'agent',
-          phase: decision.phase,
-          repairRequests: decision.repairRequests,
-          reason: decision.reason,
+      for (let iteration = 0; iteration < 50; iteration += 1) {
+        if (Date.now() - startedAt > 45 * 60 * 1000) {
+          return { ok: true, steps, stopped: 'time-budget', reason: '45-минутный бюджет супервизора исчерпан; продолжайте нажатием «Продолжить»' }
+        }
+        const statusResult = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
+        const payload = statusResult.code === 0
+          ? parseIterativeStatusPayload(statusResult.stdout) ?? readIterativeStatus(runDir)
+          : undefined
+        if (!payload) {
+          return { ok: false, steps, stopped: 'error', error: statusResult.stderr.trim() || 'STATUS_UNREADABLE' }
+        }
+        const phase = String((payload.run ?? {}).phase ?? '')
+        const decision = decideNextStep(runDir, payload)
+        // GATE: the repair agent is a human/provider action, never auto-run.
+        if (decision.step === 'agent') {
+          return {
+            ok: true,
+            steps,
+            stopped: 'agent-gate',
+            phase,
+            reason: decision.reason,
+            bootstrap: decision.bootstrap,
+            repairRequests: decision.repairRequests,
+          }
+        }
+        if (decision.step === 'begin') {
+          // The supervisor never fabricates a run: begin (C0 capture) is a
+          // user action with a target policy; drive only continues an opened run.
+          return { ok: false, steps, stopped: 'error', error: 'NO_RUN: создайте прогон (Начать миграцию) перед «Продолжить»' }
+        }
+        if (decision.step === null) {
+          return { ok: false, steps, stopped: 'error', error: decision.reason }
+        }
+        const result = await spawnCapture(
+          python,
+          iterativeStepInvocation(runDir, decision.step, generator, python).args,
+          workspace.path,
+          1_800_000,
+        )
+        if (result.code !== 0) {
+          const raw = (result.stderr.trim() || result.stdout.trim() || `STEP_EXIT_${result.code}`)
+          return { ok: false, steps, stopped: 'error', step: decision.step, error: raw.slice(0, 4000) }
+        }
+        steps.push(decision.step)
+        if (decision.step === 'finish') {
+          return { ok: true, steps, stopped: 'finished', phase: 'TERMINAL', reason: decision.reason }
         }
       }
-      if (decision.step === null) {
-        return { ok: false, error: decision.reason }
-      }
-      const result = await spawnCapture(
-        python,
-        iterativeStepInvocation(runDir, decision.step, generator, python).args,
-        workspace.path,
-        1_200_000,
-      )
-      if (result.code !== 0) {
-        const raw = (result.stderr.trim() || result.stdout.trim() || `STEP_EXIT_${result.code}`)
-        return { ok: false, step: decision.step, error: raw.slice(0, 4000) }
-      }
-      const refresh = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
-      const refreshed = refresh.code === 0
-        ? parseIterativeStatusPayload(refresh.stdout) ?? readIterativeStatus(runDir)
-        : undefined
-      const next = refreshed ? decideNextStep(runDir, refreshed) : undefined
-      return { ok: true, step: decision.step, phase: next?.phase, next }
+      return { ok: true, steps, stopped: 'iteration-budget', reason: 'супервизор остановлен по лимиту итераций; продолжите нажатием «Продолжить»' }
     } finally {
       iterativeStepInFlight.delete(project.name)
     }
