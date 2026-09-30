@@ -144,3 +144,16 @@ desktop-check-inventory.
 - **CI по тегу**: наблюдение GitHub Actions из этого окружения недоступно
   (`gh` отсутствует) — CI-статус публикуемого тега фиксируется отдельно после
   релиза.
+
+## Второй раунд ревью v0.2.154 (2026-09-30): P1.1/P1.2 → публикация
+
+Параллельная ревизия перед публикацией (`docs/ITERATIVE_MIGRATION_REVIEW_V02154_2026-09-30.md`) выставила 2 приоритетных замечания. Оба закрыты одним коммитом `87ae4ac` до публикации:
+
+| # | Замечание | Фикс |
+| --- | --- | --- |
+| P1.1 | Экспортированный task-артефакт блокировал coordinator: агент требовал ТЗ, экспорт недоступен при его отсутствии, кнопки панели disabled при stale | Task — человекочитаемый вид durable-состояния, гейтом не является. `refreshIterativeTaskArtifact()` пересобирает ТЗ из текущего durable-состояния перед диспатчем агента, на выходе в agent-gate и в copy-task; отклонение `TASK_STALE` убрано из repair-пути; «Продолжить»/«Исправить агентом» не блокируются staleness (уведомление информационное: «пересобирается автоматически»). Контракт закреплён в check-iterative-runner (секция 10). |
+| P1.2 | Discovery не учитывал совместимость с движком: брался dist-tags.latest, deferral честным не был | Engine-aware bounded discovery: резолюция эффективной версии Node перенесена до discovery и передаётся в `_discover_targets(node_version)`; `_npm_versions` (bounded, top-12). При registry-известном несовместимом latest bounded-поиск выбирает наивысшую VERIFIED-compatible версию (`discovered-compatible` + evidence в событии); при отсутствии альтернативы latest остаётся целью, а #6 пре-чек деферралит честно (ENGINES_INCOMPATIBLE + reason); неизвестные engines — abstention (enginesUnknown), unpinned Node — engineUnchecked. Ложная совместимость и выдуманные версии исключены. 4 новых теста. |
+
+Гейты на финальной ревизии `87ae4ac`: `test_iterative_target_discovery.py` 8 OK, `test_iterative_*.py` 76 OK, физический acceptance PASS (~50s), Desktop tsc (electron) + lint (15 pre-existing warnings, 0 errors) + vite build, check:iterative-runner / iterative-agent / iterative-begin / i18n OK.
+
+**Публикация v0.2.154**: `push-branch-and-tag.ps1 -Tag v0.2.154` — локальная валидация release-коммита в чистом worktree **PASSED** (npm ci, lint, build, все check:*), ветка `master` и аннотированный тег `v0.2.154` запушены на SSH-origin. Source SHA фиксов `87ae4ac`; release-коммит `0108caf` (дополнительно включает ревью-док V02154); тег `a03ab53` → `0108caf`; удалённый `master` = `0108caf`. Публикацией тега запущен `.github/workflows/release.yml`; сборка установочников и статус CI из этого окружения не наблюдаемы (`gh` отсутствует) — фиксируются отдельным шагом.

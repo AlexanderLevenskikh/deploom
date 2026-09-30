@@ -130,3 +130,32 @@ task-clipboard/i18n/ui-lifecycle OK; sanitization OK.
 scripted-агент + contract-чеки), E9 реальный install под выбранным Node вне
 fake-фикстуры, наблюдение GitHub Actions после публикации тега (`gh`
 недоступен — статус CI фиксируется отдельным шагом после релиза).
+
+### 2026-09-30 — релиз v0.2.154: второй раунд ревью (P1.1/P1.2) и публикация
+
+Параллельная ревизия `docs/ITERATIVE_MIGRATION_REVIEW_V02154_2026-09-30.md`
+(перед публикацией) выставила 2 приоритетных замечания; закрыты одним
+коммитом `87ae4ac`:
+
+- **P1.1**: task-артефакт перестал быть гейтом coordinator'а —
+  `refreshIterativeTaskArtifact()` пересобирает ТЗ из durable-состояния перед
+  диспатчем агента, на выходе в agent-gate и в copy-task; отказ `TASK_STALE`
+  убран из repair-пути; «Продолжить»/«Исправить агентом» не блокируются
+  staleness; контракт — в check-iterative-runner (секция 10).
+- **P1.2**: engine-aware discovery — резолюция эффективной версии Node до
+  discovery; `_npm_versions` (bounded top-12) + `_discover_targets(node_version)`:
+  verified-compatible вместо несовместимого latest, честный deferral через #6
+  пре-чек при отсутствии альтернативы, abstention при неизвестных engines;
+  `begin.discovery` несёт discovered-compatible / noCompatibleAlternative;
+  4 новых теста.
+
+Гейты: `test_iterative_target_discovery.py` 8 OK, `test_iterative_*.py` 76 OK,
+физический acceptance PASS (~50s), Desktop tsc (electron) + lint (15 pre-existing)
++ vite build, check:iterative-runner/agent/begin/i18n OK.
+
+Публикация: `push-branch-and-tag.ps1 -Tag v0.2.154` — локальная валидация
+release-коммита в чистом worktree PASSED; `master` и аннотированный тег
+`v0.2.154` запушены на SSH-origin. Source SHA `87ae4ac`, release-коммит
+`0108caf` (включает ревью-док V02154), тег `a03ab53` → `0108caf`, удалённый
+`master` = `0108caf`. Статус GitHub Actions после публикации тега —
+отдельным шагом (`gh` недоступен). BLOCKED не изменился: E12/E13, E9, CI-наблюдение.
