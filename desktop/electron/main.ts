@@ -53,7 +53,7 @@ import { summarizeUpdaterError } from './updater-error.js'
 import { flowNotificationContent, type FlowNotificationEvent } from './notifications.js'
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
-import { currentTask as readIterativeCurrentTask, iterativeRunDirPath, missingTaskExportInput, taskStaleness } from './iterative-migration.js'
+import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
 import { iterativeBeginInvocation, targetsFromDashboardState } from './iterative-begin.js'
 import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
@@ -7751,10 +7751,22 @@ function setupIpc(): void {
   // dispatch we rebuild it best-effort from the CURRENT durable state, so the
   // task text the agent and the user see always matches the exact
   // run/candidate/checkpoint — a stale C0-bound artifact no longer counts.
-  async function refreshIterativeTaskArtifact(runDir: string, generator: string, python: string, workspacePath: string): Promise<boolean> {
-    if (missingTaskExportInput(runDir).length > 0) return false
+  // Postfix P1 (#2): the result distinguishes a MISSING exportable state
+  // (dispatch may still proceed with a self-sufficient durable prompt) from an
+  // OPERATIONAL export failure (recoverable error — old bytes are never reused).
+  async function refreshIterativeTaskArtifact(
+    runDir: string,
+    generator: string,
+    python: string,
+    workspacePath: string,
+  ): Promise<IterativeTaskRefreshResult> {
+    const missing = missingTaskExportInput(runDir)
+    if (missing.length > 0) return { status: 'input-missing', missing }
     const result = await spawnCapture(python, [generator, '--run-dir', runDir, 'export-task', '--language', 'both'], workspacePath, 120_000)
-    return result.code === 0
+    if (result.code !== 0) {
+      return { status: 'export-failed', exitCode: result.code, stderr: (result.stderr || '').trim().slice(0, 800) }
+    }
+    return { status: 'ok' }
   }
 
   ipcMain.handle('flow:iterative:agent', async (_event, input: { workspaceId?: string; projectName: string }) => {
@@ -7780,7 +7792,17 @@ function setupIpc(): void {
       // dispatch instead of refusing a stale artifact — task state never blocks
       // the repair, and the prompt's taskText always matches the exact
       // run/candidate/checkpoint the repair is pinned to.
-      await refreshIterativeTaskArtifact(runDir, generator, python, workspace.path)
+      // Postfix P1 (#2): an OPERATIONAL export failure is a recoverable error —
+      // the attempt never starts on old bytes; only input-missing (no
+      // exportable state) proceeds, and then the prompt is self-sufficient
+      // from the durable assignment without the task artifact.
+      const taskRefresh = await refreshIterativeTaskArtifact(runDir, generator, python, workspace.path)
+      if (taskRefresh.status === 'export-failed') {
+        return {
+          ok: false,
+          error: `TASK_EXPORT_FAILED: export-task завершился с кодом ${taskRefresh.exitCode}${taskRefresh.stderr ? `: ${taskRefresh.stderr}` : ''}; ремонт не диспатчится — повторите попытку`,
+        }
+      }
       const statusResult = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
       const payload = statusResult.code === 0
         ? parseIterativeStatusPayload(statusResult.stdout) ?? readIterativeStatus(runDir)
@@ -7860,14 +7882,22 @@ function setupIpc(): void {
       const repairRequests = (Array.isArray(payload.openRepairRequests) ? payload.openRepairRequests : []) as Array<{
         requestId?: string; reason?: string; failingCommands?: Array<{ command: string; exitCode: number }>; diagnosticsTail?: string;
       }>
-      const task = readIterativeCurrentTask(runDir)
-      const taskText = task?.text.ru ?? task?.text.en ?? ''
       ctx.repairRequests = repairRequests.map((request) => ({
         requestId: String(request.requestId ?? ''),
         reason: String(request.reason ?? ''),
         failingCommands: request.failingCommands ?? [],
         diagnosticsTail: String(request.diagnosticsTail ?? ''),
       }))
+      // Postfix P1 (#2): NEVER dispatch stale task text. Only a task whose
+      // manifest is verified CURRENT (run/policy/checkpoint identity AND
+      // content hashes) may seed the prompt; anything else yields an empty ТЗ —
+      // the prompt itself is exact and self-sufficient from the durable
+      // assignment and the repair requests, so an attempt never starts with a
+      // C0-bound text that contradicts the candidate's assignment.
+      const dispatchable = taskDispatchable(runDir)
+      const taskText = dispatchable.ok
+        ? (dispatchable.task.text.ru ?? dispatchable.task.text.en ?? '')
+        : ''
       ctx.taskText = taskText
 
       // R5: route to the provider actually selected in the workspace instead of

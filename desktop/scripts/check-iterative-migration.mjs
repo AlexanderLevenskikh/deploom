@@ -10,7 +10,9 @@ import {
   iterativeRunDirPath,
   iterativeRunDirRelativePath,
   missingTaskExportInput,
+  taskContentMismatch,
   taskCopyPayload,
+  taskDispatchable,
   taskStaleness,
 } from "../dist-electron/iterative-migration.js";
 
@@ -115,8 +117,27 @@ if (copied.text.length === 0 || !copied.text.includes("@scope/deferred")) {
 if (!copied.fingerprint.startsWith(m.artifactId)) throw new Error("Copy fingerprint must carry the artifact id");
 if (m.contents.ru.contentHash === "") throw new Error("Content hash must be bound per language");
 
-// 2. Staleness: alive durable state matching the pointer is NOT stale.
+// 2. Staleness: alive durable state matching the pointer is NOT stale; the
+// refreshed artifact is DISPATCHABLE (identity + verified content hashes).
 if (taskStaleness(runDir).stale) throw new Error(`Fresh task must not be stale: ${JSON.stringify(taskStaleness(runDir))}`);
+const dispatchable = taskDispatchable(runDir);
+if (!dispatchable.ok) throw new Error(`Fresh exported task must be dispatchable: ${JSON.stringify(dispatchable)}`);
+if (dispatchable.ok && taskContentMismatch(dispatchable.task)) {
+  throw new Error(`Exported task bodies must hash to the manifest: ${taskContentMismatch(dispatchable.task)}`);
+}
+
+// 2b. Postfix P1 (#2): corrupting a published body breaks the content hash, so
+// the artifact is no longer dispatchable (never old/corrupt text to the agent).
+const ruPath = join(runDir, "task", m.artifactId, "task.ru.md");
+const ruBytes = readFileSync(ruPath, "utf8");
+writeFileSync(ruPath, `${ruBytes}\n<!-- tampered -->`, "utf8");
+const tampered = taskDispatchable(runDir);
+if (tampered.ok) throw new Error("A body whose content hash does not match must not be dispatchable");
+if (!tampered.ok && !tampered.reason.includes("CONTENT_HASH_MISMATCH")) {
+  throw new Error(`Corrupted body must be refused by content hash: ${JSON.stringify(tampered)}`);
+}
+writeFileSync(ruPath, ruBytes, "utf8");
+if (!taskDispatchable(runDir).ok) throw new Error("Restoring the exact bytes must restore dispatchability");
 
 // 3. Drift -> stale, dispatch refused.
 const configPath = join(runDir, "run-config.json");
@@ -124,6 +145,14 @@ const config = JSON.parse(readText(configPath));
 config.policyHash = "ph-2";
 writeJson(configPath, config);
 if (!taskStaleness(runDir).stale) throw new Error("Policy drift must be flagged stale");
+const drifted = taskDispatchable(runDir);
+if (drifted.ok) throw new Error("A drifted (stale) task must not be dispatchable");
+if (drifted.ok === false && !drifted.reason.includes("POLICY_DRIFT")) {
+  throw new Error(`Dispatch refusal must name the drift reason: ${JSON.stringify(drifted)}`);
+}
+config.policyHash = "ph-1";
+writeJson(configPath, config);
+if (!taskDispatchable(runDir).ok) throw new Error("Restoring the policy must restore dispatchability");
 
 // 4. Insufficient durable state is a concrete diagnosis, not a Baseline start.
 const bare = mkdtempSync(join(tmpdir(), "iter-migration-bare-"));

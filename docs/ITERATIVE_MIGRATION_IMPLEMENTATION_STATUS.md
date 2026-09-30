@@ -159,3 +159,37 @@ release-коммита в чистом worktree PASSED; `master` и анноти
 `0108caf` (включает ревью-док V02154), тег `a03ab53` → `0108caf`, удалённый
 `master` = `0108caf`. Статус GitHub Actions после публикации тега —
 отдельным шагом (`gh` недоступен). BLOCKED не изменился: E12/E13, E9, CI-наблюдение.
+
+### 2026-09-30 — постфикс-раунд после публикации: downgrade-guard, task-refresh, runtime-env discovery
+
+Постфикс-ревью `docs/ITERATIVE_MIGRATION_REVIEW_V02154_POSTFIX_2026-09-30.md`
+(непубликованное HEAD) + падающий на Linux CI `test_runtime_env_prepends_node_dir`:
+
+- **P1 downgrade**: `_discover_targets` больше никогда не понижает пакет.
+  Кандидат принимается ТОЛЬКО если npm-semver доказывает его строго новее
+  declared-пола (`_declared_floor`/`_strictly_newer`; `||`/`-`/частичные
+  диапазоны, prerelease по настоящему semver, не по sort-key). Если в bounded
+  окне нет подтверждённо совместимой версии новее текущей — цель НЕ выставляется
+  (текущая сохраняется), пишется честный `no-newer-compatible` (declared/latest/
+  rejected/reason), begin.discovery включает её в noCompatibleAlternative;
+  plan-next тогда видит NO_ACTIONABLE, а не ложный downgrade/complete.
+- **P1 task-refresh**: диспатч агента теперь различает отсутствие exportable
+  state (input-missing — продолжаем, промпт самодостаточен из durable
+  assignment) и операционный сбой export (export-failed → recoverable
+  `TASK_EXPORT_FAILED`, старый текст не переиспользуется). Текст ТЗ в промпт
+  попадает только через `taskDispatchable` (идентичность run/policy/checkpoint
+  + проверенные content-hashes). Продюсер `iterative_task.py` теперь пишет
+  task-файлы точными UTF-8 байтами (без CRLF-трансляции) и хэширует те же байты
+  — contentHash совпадает с диском на любой платформе.
+- **CI-фикс**: `test_runtime_env_prepends_node_dir` переведён на
+  платформо-корректные пути (`os.pathsep`, без Windows-путей в POSIX-ветке).
+- **D3.1**: discovery-пробы (`npm view ...`) выполняются ПОД выбранным runtime
+  (node-директория в PATH через `runtime_env_for_path`), а не ambient PATH.
+
+Гейты: `test_iterative_target_discovery.py` 15 OK (новые: exact/range/prerelease
+downgrade-regressions, no-newer через begin→plan-next `_plan_next_locked`,
+runtime-env прокидывание), `test_project_runtime.py` + engine_precheck +
+runtime_request + schemas 63 OK, `test_iterative_*.py` 83 OK, full `--suite all`
+**1521 OK (4 skipped)**, `--suite production-fast` **64 OK**, физический
+acceptance PASS (~105s); Desktop tsc (electron) OK, lint 15 pre-existing / 0
+errors, vite build OK, check:iterative-migration/runner/agent/begin/task-clipboard/i18n/ui-lifecycle OK.

@@ -155,6 +155,48 @@ export function currentTask(runDir: string): IterativeTaskView | undefined {
   return { manifest, text }
 }
 
+/** Consumer-side content verification: every published body must hash to the
+ * manifest's own per-language contentHash (the producer binds these). A task
+ * whose bytes were corrupted or replaced after export is never dispatchable —
+ * it could silently hand the agent a scope the manifest did not sign. */
+export function taskContentMismatch(task: IterativeTaskView): string | undefined {
+  for (const language of Object.keys(task.text)) {
+    const expected = task.manifest.contents?.[language]?.contentHash
+    if (!expected) return `CONTENT_HASH_MISSING:${language}`
+    const actual = createHash('sha256').update(task.text[language], 'utf8').digest('hex')
+    if (actual !== expected) return `CONTENT_HASH_MISMATCH:${language}`
+  }
+  return undefined
+}
+
+/** The dispatch guard. Only a task whose manifest identity matches the alive
+ * durable state (run / policy / active checkpoint) AND whose published bodies
+ * hash to the manifest may seed the agent prompt. Anything else is refused;
+ * the repair prompt is exact and self-sufficient from the durable assignment
+ * and repair requests, so a refused task never starts an attempt with stale or
+ * contradictory text. */
+export function taskDispatchable(
+  runDir: string,
+): { ok: true; task: IterativeTaskView } | { ok: false; reason: string } {
+  const staleness = taskStaleness(runDir)
+  if (staleness.stale) return { ok: false, reason: staleness.reason ?? 'STALE' }
+  const task = currentTask(runDir)
+  if (!task) return { ok: false, reason: 'NO_TASK' }
+  const mismatch = taskContentMismatch(task)
+  if (mismatch) return { ok: false, reason: mismatch }
+  return { ok: true, task }
+}
+
+/** Result of a best-effort export-task refresh: 'ok' produced a fresh
+ * artifact; 'input-missing' — the durable state has no exportable bits (the
+ * prompt is still self-sufficient from the durable assignment); 'export-failed'
+ * — an OPERATIONAL write/generation failure, which must never fall back to old
+ * task bytes. */
+export type IterativeTaskRefreshResult =
+  | { status: 'ok' }
+  | { status: 'input-missing'; missing: string[] }
+  | { status: 'export-failed'; exitCode: number; stderr: string }
+
 /** The bytes meant for the OS clipboard: markdown body plus the manifest
  * fingerprint the UI can echo back ("task <runId> <artifactId>, hash …"). */
 export function taskCopyPayload(

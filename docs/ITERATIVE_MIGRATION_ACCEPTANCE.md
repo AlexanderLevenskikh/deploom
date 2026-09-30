@@ -157,3 +157,27 @@ desktop-check-inventory.
 Гейты на финальной ревизии `87ae4ac`: `test_iterative_target_discovery.py` 8 OK, `test_iterative_*.py` 76 OK, физический acceptance PASS (~50s), Desktop tsc (electron) + lint (15 pre-existing warnings, 0 errors) + vite build, check:iterative-runner / iterative-agent / iterative-begin / i18n OK.
 
 **Публикация v0.2.154**: `push-branch-and-tag.ps1 -Tag v0.2.154` — локальная валидация release-коммита в чистом worktree **PASSED** (npm ci, lint, build, все check:*), ветка `master` и аннотированный тег `v0.2.154` запушены на SSH-origin. Source SHA фиксов `87ae4ac`; release-коммит `0108caf` (дополнительно включает ревью-док V02154); тег `a03ab53` → `0108caf`; удалённый `master` = `0108caf`. Публикацией тега запущен `.github/workflows/release.yml`; сборка установочников и статус CI из этого окружения не наблюдаемы (`gh` отсутствует) — фиксируются отдельным шагом.
+
+## Постфикс-раунд после публикации (2026-09-30): P1 downgrade, P1 task-refresh, D3.1, CI-фикс
+
+Постфикс-ревью `docs/ITERATIVE_MIGRATION_REVIEW_V02154_POSTFIX_2026-09-30.md`
+(HEAD до публикации) + падение `test_runtime_env_prepends_node_dir` на Linux CI
+выставили 3 замечания и 1 платформенный дефект. Все закрыты:
+
+| # | Замечание | Фикс |
+| --- | --- | --- |
+| P1 (downgrade) | `_discover_targets` мог выбрать версию НИЖЕ текущей (candidate новее не проверялся; unknown engines пропускались) | Строгий never-downgrade: кандидат предлагается только если npm-semver доказывает его строго новее declared-пола (`_declared_floor`/`_strictly_newer`, `||`/`-`/частичные диапазоны и prerelease по настоящему semver). Нет подтверждённо совместимой версии новее текущей в bounded окне → текущая сохраняется, цель НЕ выставляется, пишется `no-newer-compatible` (declared/latest/rejected/reason), begin.discovery включает её в noCompatibleAlternative; plan-next видит NO_ACTIONABLE — без downgrade и без ложной complete. Regression: exact/equal/older/range/prerelease + через begin→plan-next (`_plan_next_locked`). |
+| P1 (task-refresh) | Диспатч игнорировал результат refresh и мог отправить старое ТЗ (или пустое) | Диспатч различает input-missing (нет exportable state — продолжаем, промпт самодостаточен из durable assignment) и операционный export-failed (recoverable `TASK_EXPORT_FAILED`, старый текст не используется). Текст ТЗ в промпт — только через `taskDispatchable` (run/policy/checkpoint identity + проверенные content-hashes). `iterative_task.py` пишет task-файлы точными UTF-8 байтами и хэширует те же байты (contentHash совпадает с диском на любой платформе, включая Windows CRLF). |
+| D3.1 (runtime/evidence) | Discovery-пробы шли через ambient npm/PATH, а не через выбранный runtime | `build_run_config` передаёт `runtime_env_for_path(nodePath)` (node-директория в PATH) в `_discover_targets` — пробы `npm view` выполняются тем же инструментом, что install/verify. |
+| CI-фикс | `test_runtime_env_prepends_node_dir` падал на Linux (Windows-пути `X:/...` и жёсткий `;`) | Тест переведён на платформо-корректные пути (`os.pathsep`, POSIX-ветка `/opt/...`); контракт «node_dir в начале PATH, остальные entry сохранены» сохранён. |
+
+Гейты постфикс-ревизии: `test_iterative_target_discovery.py` 15 OK,
+`test_project_runtime.py` + engine_precheck + runtime_request + schemas 63 OK,
+`test_iterative_*.py` 83 OK, `--suite all` **1521 OK (4 skipped)**,
+`--suite production-fast` **64 OK**, физический acceptance PASS (~105s);
+Desktop tsc (electron) OK, lint 15 pre-existing warnings / 0 errors, vite build
+OK, check:iterative-migration/runner/agent/begin/task-clipboard/i18n/ui-lifecycle OK.
+
+Честные ограничения не изменились: E12/E13 live-агент на реальном проекте,
+E9 физический install под выбранным Node вне fake-фикстуры, наблюдение GitHub
+Actions после публикации тега — отдельным шагом.

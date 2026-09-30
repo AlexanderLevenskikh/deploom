@@ -34,6 +34,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +43,11 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+try:  # pragma: no cover - import parity with project_runtime
+    from semantic_version import Version  # type: ignore
+except Exception:  # pragma: no cover
+    Version = None  # type: ignore
 
 from baseline_constraint_verifier import (
     BaselineVerifyConfig,
@@ -769,10 +775,20 @@ def build_run_config(run_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
     # still wins when provided.
     target_discovery: List[Dict[str, Any]] = []
     if not targets:
+        # D3.1/postfix: the discovery probes must run UNDER the same selected
+        # runtime that install/verify will use (the resolved node's directory
+        # prepended to PATH), never the ambient PATH — otherwise npm metadata
+        # could come from a different toolchain/registry context than the one
+        # the migration actually executes with.
+        discovery_env: Optional[Dict[str, str]] = None
+        if runtime.get("nodePath"):
+            from project_runtime import runtime_env_for_path
+
+            discovery_env = runtime_env_for_path(str(runtime["nodePath"]))
         targets, target_discovery = _discover_targets(
             project_dir,
             direct_dependency_assignment(project_dir),
-            None,
+            discovery_env,
             runtime.get("effectiveVersion"),
         )
 
@@ -878,7 +894,7 @@ def _begin_locked(run_dir: Path, config: Mapping[str, Any], args: argparse.Names
     unavailable = [entry for entry in discovery if entry.get("status") == "registry-unavailable"]
     incompatible_no_alt = [
         entry for entry in discovery
-        if entry.get("status") == "latest-incompatible-no-alternative"
+        if entry.get("status") in ("latest-incompatible-no-alternative", "no-newer-compatible")
     ]
     if discovered or unavailable or incompatible_no_alt:
         _emit_status(
@@ -1705,6 +1721,74 @@ def _version_sort_key(value: str) -> Tuple[int, ...]:
     return tuple(key)
 
 
+def _exact_version(value: str) -> Optional["Version"]:
+    """Strict npm-semver parse of an exact published version ('' on failure)."""
+    if Version is None:
+        return None
+    text = str(value or "").strip().lstrip("vV")
+    if not text:
+        return None
+    try:
+        return Version(text)
+    except ValueError:
+        return None
+
+
+def _declared_floor(spec: str) -> Optional["Version"]:
+    """Lowest version the declared spec admits, or None when undecidable.
+
+    The "never downgrade" guard of target discovery: a candidate may be
+    proposed ONLY when it is provably strictly newer than this floor, so a
+    migration can never silently downgrade a package below its declared range.
+    Conservative by construction: an undecidable floor (upper-bound-only or
+    negative spec) yields None, which refuses any alternative — keeping the
+    current version instead of risking a downgrade. ``||`` takes the smallest
+    clause floor; bare ``*``/``x`` admits every version, so its floor is 0.0.0.
+    """
+    if Version is None:
+        return None
+    text = str(spec or "").strip()
+    if not text:
+        return None
+    if "||" in text:
+        floors = [f for f in (_declared_floor(part) for part in text.split("||")) if f is not None]
+        return min(floors) if floors else None
+    if " - " in text:
+        return _declared_floor(text.split(" - ", 1)[0].strip())
+    candidate = text
+    for op in ("^", "~", ">=", "<=", ">", "<", "=", "!"):
+        if candidate.startswith(op):
+            if op in ("<", "<=", "!"):
+                return None  # upper-bound/negative-only ranges have no floor
+            candidate = candidate[len(op):].strip()
+            break
+    if candidate in ("", "*", "x", "X"):
+        if str(spec).strip() in ("*", "x", "X"):
+            return Version("0.0.0")
+        return None
+    match = re.fullmatch(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", candidate)
+    if match:
+        major, minor, patch = match.groups()
+        return Version(".".join([major, minor or "0", patch or "0"]))
+    return _exact_version(candidate)
+
+
+def _strictly_newer(candidate: str, declared_spec: str) -> bool:
+    """True ONLY when ``candidate`` is provably newer than the declared floor.
+
+    An undecidable floor or an unparsable candidate refuses the proposal
+    (returns False) — a discovery that cannot prove an upgrade is an upgrade
+    must keep the current version rather than downgrade or invent anything.
+    """
+    floor = _declared_floor(declared_spec)
+    if floor is None:
+        return False
+    parsed = _exact_version(candidate)
+    if parsed is None:
+        return False
+    return parsed > floor
+
+
 def _discover_targets(
     project_dir: Path,
     current: Mapping[str, str],
@@ -1717,13 +1801,17 @@ def _discover_targets(
     direct managed dependency, the registry ``dist-tags.latest`` is the target,
     unless the run pins a concrete Node and the registry KNOWS latest excludes
     it. In that case a bounded search over the newest published versions picks
-    the highest VERIFIED-compatible version and that version becomes the target
-    — the user gets an upgrade that actually installs under the chosen Node
-    instead of a stale deferral. A version is never invented, and a package
-    whose latest cannot be established is skipped as evidence. When no
-    compatible alternative exists in the bounded window, latest stays the
-    target and the #6 engine pre-check defers it honestly (ENGINES_INCOMPATIBLE
-    with an explicit reason). Unknown engines are an abstention, never a false
+    the highest VERIFIED-compatible version that is STRICTLY NEWER than the
+    declared range floor and that version becomes the target — the user gets an
+    upgrade that actually installs under the chosen Node instead of a stale
+    deferral. A version is never invented, and a package whose latest cannot be
+    established is skipped as evidence. Downgrades are refused: a candidate may
+    only be proposed when npm-semver proves it newer than the declared floor.
+    When no strictly-newer verified-compatible version exists in the bounded
+    window, the CURRENT version is kept (the package is NOT added to the
+    targets) and an honest ``no-newer-compatible`` evidence row records the
+    unfulfilled upgrade intent with the reason — never a downgrade and never a
+    false completion. Unknown engines are an abstention, never a false
     incompatibility claim; without a pinned Node the choice is engine-unchecked.
     """
     targets: Dict[str, str] = {}
@@ -1769,6 +1857,11 @@ def _discover_targets(
         for candidate in _npm_versions(project_dir, name, runtime_env, top=12):
             if candidate == latest:
                 continue
+            if candidate == declared or not _strictly_newer(candidate, declared):
+                # Postfix-review P1: never downgrade. A candidate at or below
+                # the declared floor cannot be an upgrade, whatever its engines.
+                rejected.append({"version": candidate, "nodeSpec": "", "status": "not-newer-than-current"})
+                continue
             candidate_spec = _npm_engines_node(project_dir, name, candidate, runtime_env)
             if not candidate_spec:
                 rejected.append({"version": candidate, "nodeSpec": "", "status": "engines-unknown"})
@@ -1785,19 +1878,26 @@ def _discover_targets(
                     "package": name, "declared": declared, "latest": latest,
                     "latestNodeSpec": latest_spec, "nodeVersion": node_version,
                     "target": chosen, "targetNodeSpec": chosen_spec,
-                    "status": "discovered-compatible",
+                    "rejected": rejected, "status": "discovered-compatible",
                 }
             )
             continue
-        # No compatible alternative in the bounded window: keep the upgrade
-        # intent and let the #6 pre-check record an honest ENGINES_INCOMPATIBLE
-        # deferral (ledger + events) — never a false compatibility claim.
-        targets[name] = latest
+        # No strictly-newer verified-compatible alternative in the bounded
+        # window: KEEP the current version (no downgrade, no false plan entry)
+        # and record the unfulfilled upgrade intent with an honest reason. The
+        # deferred/blocked package stays visible in the discovery evidence and
+        # in the begin.discovery event; it is never an invented completion.
         evidence.append(
             {
                 "package": name, "declared": declared, "latest": latest,
                 "latestNodeSpec": latest_spec, "nodeVersion": node_version,
-                "rejected": rejected, "status": "latest-incompatible-no-alternative",
+                "rejected": rejected, "status": "no-newer-compatible",
+                "reason": (
+                    f"latest {latest} requires node {latest_spec}, but the run's "
+                    f"chosen Node is {node_version}; no verified-compatible version "
+                    f"strictly newer than current {declared} exists within the "
+                    "bounded window — keeping the current version"
+                ),
             }
         )
     return targets, evidence

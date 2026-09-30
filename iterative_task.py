@@ -76,6 +76,10 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
 def run_input_errors(
     run: Mapping[str, Any], config: Mapping[str, Any], checkpoints: Sequence[Mapping[str, Any]]
 ) -> List[str]:
@@ -601,7 +605,11 @@ def build_task_manifest(
     languages = sorted(contents.keys())
     contents_view = {
         language: {
-            "contentHash": _sha256_text(contents[language]),
+            # The content hash covers the EXACT bytes that will be written to
+            # task.<language>.md (UTF-8, no newline translation), so a consumer
+            # can re-hash the on-disk file and verify the artifact identically
+            # on every platform — CRLF/LF translation must never break the check.
+            "contentHash": _sha256_bytes(contents[language].encode("utf-8")),
             "contentBytes": len(contents[language].encode("utf-8")),
         }
         for language in languages
@@ -658,7 +666,9 @@ def task_dir(run_dir: Path) -> Path:
 def _atomic_write_file(target: Path, text: str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     stage = target.with_name(f".{target.name}.tmp-{os.getpid()}")
-    stage.write_text(text, encoding="utf-8")
+    # Write the exact UTF-8 bytes (no newline translation): durable text files
+    # keep byte-identical content on every platform, matching the content hashes.
+    stage.write_bytes(text.encode("utf-8"))
     os.replace(stage, target)
 
 
@@ -674,7 +684,7 @@ def _atomic_write_directory(target: Path, files: Dict[str, str]) -> None:
     stage.mkdir(parents=True, exist_ok=True)
     try:
         for name, text in files.items():
-            (stage / name).write_text(text, encoding="utf-8")
+            (stage / name).write_bytes(text.encode("utf-8"))
         os.replace(stage, target)
     except Exception:
         import shutil

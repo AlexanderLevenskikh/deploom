@@ -247,6 +247,19 @@ if (!statusInvocation.args.includes("status") || !statusInvocation.args.includes
   if (!main.includes("await refreshIterativeTaskArtifact(runDir, generator, python, workspace.path)")) {
     throw new Error("agent/dispatch paths must rebuild the task artifact from durable state (P1.1)");
   }
+  // Postfix P1 (#2): the DISPATCH path must tell a missing exportable state
+  // from an OPERATIONAL export failure, and must never seed the attempt with
+  // stale task bytes. An export failure is a recoverable TASK_EXPORT_FAILED
+  // error; only taskDispatchable (run/policy/checkpoint identity + verified
+  // content hashes) may supply the task text, otherwise the prompt is
+  // self-sufficient from the durable assignment with an empty ТЗ.
+  if (!main.includes("taskRefresh.status === 'export-failed'")) {
+    throw new Error("repair dispatch must refuse on an operational export failure (postfix P1 #2)");
+  }
+  if (!main.includes("TASK_EXPORT_FAILED")) throw new Error("the export failure must surface as recoverable TASK_EXPORT_FAILED (postfix P1 #2)");
+  if (!main.includes("taskDispatchable(runDir)")) {
+    throw new Error("dispatch must verify the task manifest (identity + content hashes) before seeding the prompt (postfix P1 #2)");
+  }
 }
 
 if (!existsSync(runDir)) throw new Error("fixture missing");

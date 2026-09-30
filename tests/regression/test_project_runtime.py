@@ -115,15 +115,21 @@ class ProjectRuntimeTests(unittest.TestCase):
 
     def test_runtime_env_prepends_node_dir(self) -> None:
         node = "node.cmd" if os.name == "nt" else "node"
+        # A Windows drive-letter path can never be a PATH entry on POSIX (':' is
+        # the separator there), so the fixture must be platform-appropriate —
+        # otherwise splitting the joined PATH truncates the node dir.
+        runtime_dir = "X:/runtimes/22.18.0" if os.name == "nt" else "/opt/runtimes/22.18.0"
         resolution = resolve_requested_node(
             "22.18.0",
-            discovered=[(str(Path("X:/runtimes/22.18.0") / node), "22.18.0")],
+            discovered=[(str(Path(runtime_dir) / node), "22.18.0")],
         )
-        env = runtime_env(resolution, base_env={"PATH": "C:/other;D:/bin", "npm_config_registry": "https://r"})
+        extra = ["C:/other", "D:/bin"] if os.name == "nt" else ["/usr/other", "/usr/bin"]
+        env = runtime_env(resolution, base_env={"PATH": os.pathsep.join(extra), "npm_config_registry": "https://r"})
         entries = env["PATH"].split(os.pathsep)
         node_dir = str(Path(resolution.node_path).parent)
         self.assertEqual(os.path.normcase(node_dir), os.path.normcase(entries[0]))
-        self.assertIn(os.path.normcase("C:/other"), [os.path.normcase(e) for e in entries])
+        for entry in extra:
+            self.assertIn(os.path.normcase(entry), [os.path.normcase(e) for e in entries])
         self.assertEqual("https://r", env["npm_config_registry"])
 
     def test_contract_hash_binds_runtime(self) -> None:
