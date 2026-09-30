@@ -1789,6 +1789,199 @@ def _strictly_newer(candidate: str, declared_spec: str) -> bool:
     return parsed > floor
 
 
+def _installed_version(project_dir: Path, package_name: str, declared_spec: Optional[str] = None) -> Optional[str]:
+    """The exact version of a direct dependency RESOLVED by the canonical
+    lockfile — the real installed version the never-downgrade guard compares a
+    candidate against.
+
+    Background: the declared spec in package.json is a RANGE (``^8.0.0``), not
+    an installed version; the project is actually installed at whatever the
+    lockfile resolved (say 8.5.0). Comparing a candidate with the range floor
+    would accept 8.1.0 as an "upgrade" and silently downgrade the installed
+    package. The lockfile is the reliable source of what is installed. For
+    yarn.lock the DECLARED spec of the direct dependency is needed to select
+    the direct resolution among several selectors of the same package name
+    (see ``_yarn_lock_installed_version``). ``None`` means the installed
+    version cannot be proven reliably (no canonical lockfile, unreadable file,
+    ambiguous resolution) — the caller MUST abstain for the package instead of
+    choosing against a guess.
+    """
+    lock = find_lockfile(project_dir)
+    if lock is None or not lock.is_file():
+        return None
+    name = str(package_name)
+    try:
+        if lock.name in ("package-lock.json", "npm-shrinkwrap.json"):
+            return _npm_lock_installed_version(lock, name)
+        if lock.name == "yarn.lock":
+            return _yarn_lock_installed_version(lock, name, declared_spec)
+        if lock.name == "pnpm-lock.yaml":
+            return _pnpm_lock_installed_version(lock, name)
+    except Exception:  # noqa: BLE001 - a lockfile read failure is abstention
+        return None
+    return None
+
+
+def _yarn_direct_selectors(package_name: str, declared_spec: Optional[str]) -> List[str]:
+    """The yarn.lock block-key selector(s) that identify the DIRECT dependency.
+
+    Yarn v1 keys a direct dependency by its verbatim declared spec
+    (``sample@^8.0.0``), possibly routed through an explicit ``npm:``
+    protocol. Empty when the declared spec is unknown — the caller then falls
+    back to a unique resolution across every selector of the package.
+    """
+    if not declared_spec:
+        return []
+    name = str(package_name)
+    spec = str(declared_spec).strip()
+    raw = spec[len("npm:"):].strip() if spec.startswith("npm:") else spec
+    return [f"{name}@{raw}", f"{name}@npm:{raw}"]
+
+
+def _npm_lock_installed_version(lock_path: Path, package_name: str) -> Optional[str]:
+    """package-lock.json / npm-shrinkwrap.json exact direct resolution."""
+    try:
+        data = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    packages = data.get("packages")
+    if isinstance(packages, dict):
+        entry = packages.get(f"node_modules/{package_name}")
+        if isinstance(entry, dict):
+            version = entry.get("version")
+            if isinstance(version, str) and version:
+                return version
+    dependencies = data.get("dependencies")
+    if isinstance(dependencies, dict):
+        entry = dependencies.get(package_name)
+        if isinstance(entry, dict):
+            version = entry.get("version")
+            if isinstance(version, str) and version:
+                return version
+    return None
+
+
+def _split_yarn_selectors(value: str) -> List[str]:
+    """Split a yarn.lock block key (one or more selectors separated by commas,
+    each optionall quoted) into individual selectors."""
+    parts: List[str] = []
+    buf: List[str] = []
+    quote = ""
+    for ch in str(value or ""):
+        if ch in ('"', "'"):
+            if not quote:
+                quote = ch
+            elif quote == ch:
+                quote = ""
+            else:
+                buf.append(ch)
+            continue
+        if ch == "," and not quote:
+            if "".join(buf).strip():
+                parts.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    if "".join(buf).strip():
+        parts.append("".join(buf).strip())
+    return parts
+
+
+def _yarn_selector_for(selector: str, package_name: str) -> bool:
+    """True when a yarn selector names this package (``name@range``,
+    ``@scope/name@range``, with or without an explicit ``npm:`` protocol)."""
+    text = str(selector).strip().strip('"')
+    return text == package_name or text.startswith(f"{package_name}@")
+
+
+def _yarn_lock_installed_version(lock_path: Path, package_name: str, declared_spec: Optional[str] = None) -> Optional[str]:
+    """yarn.lock (v1) exact direct resolution by selector-key matching.
+
+    A block key joins one or more selectors; a DIRECT dependency resolves to
+    one version. When the DIRECT spec is known (``declared_spec`` from
+    package.json) the matching selector is ``<name>@<declared>`` — yarn v1 keys
+    the direct dependency by its verbatim declared spec — and only blocks with
+    that selector are counted, so a TRANSITIVE resolution of the same package
+    name (e.g. ``sample@^7.0.0`` under a direct ``sample@^8.0.0``) can never
+    shadow or merge with the direct one and silently unmount the project's
+    installed version. Several DIFFERENT resolutions for the same selector are
+    ambiguous and yield None (abstention, never a guess); without a declared
+    spec a single resolution across all selectors of the package is accepted.
+    """
+    try:
+        lines = lock_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    name = str(package_name)
+    selectors = _yarn_direct_selectors(name, declared_spec)
+    blocks: List[Tuple[List[str], str]] = []
+    keys: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not line.startswith(" "):
+            # A block header: a line ending with ':' carries the selectors;
+            # other top-level lines (e.g. "# yarn lockfile v1") start a keyless
+            # region that can not record a version.
+            keys = _split_yarn_selectors(stripped[:-1]) if stripped.endswith(":") else []
+            continue
+        match = re.match(r'\s*version\s+"([^"]+)"', line)
+        if match and keys and any(_yarn_selector_for(key, name) for key in keys):
+            blocks.append((list(keys), match.group(1)))
+    if selectors:
+        # Review re-check P1: a TRANSITIVE resolution of the same package name
+        # (e.g. `sample@^7.0.0` -> 7.2.0) must never be mixed into the DIRECT
+        # dependency's installed version (`sample@^8.0.0` -> 8.5.0): that
+        # ambiguity made the whole project abstain and lose every target. Pick
+        # only the block(s) whose selector names the DIRECT declared spec.
+        direct_versions: set = set()
+        for block_keys, version in blocks:
+            if any(key in selectors for key in block_keys):
+                direct_versions.add(version)
+        if direct_versions:
+            return direct_versions.pop() if len(direct_versions) == 1 else None
+        # No block matched the declared spec verbatim (e.g. a stale lockfile or
+        # a normalized range): fall through to the unique-across-all-selectors
+        # rule so the common single-resolution case still works.
+    versions: set = set()
+    for _block_keys, version in blocks:
+        versions.add(version)
+    return versions.pop() if len(versions) == 1 else None
+
+
+def _pnpm_lock_installed_version(lock_path: Path, package_name: str) -> Optional[str]:
+    """pnpm-lock.yaml exact direct resolution (best-effort textual parse).
+
+    pnpm keys direct resolvers under ``packages:`` as ``/<name>@<version>:``
+    (scoped: ``/@scope/name@<version>:``, peer suffixes in parens). A single
+    version for the package is accepted; ambiguity yields None.
+    """
+    try:
+        lines = lock_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    pattern = re.compile(rf"^\s*/({re.escape(str(package_name))})@([^:()]+)")
+    versions: set = set()
+    for line in lines:
+        match = pattern.match(line.rstrip())
+        if match:
+            versions.add(match.group(2))
+    return versions.pop() if len(versions) == 1 else None
+
+
+def _newer_than_installed(candidate: str, installed: str) -> bool:
+    """True ONLY when ``candidate`` is provably strictly newer than the EXACT
+    installed version. An unparsable candidate or baseline refuses the
+    proposal (False) — a discovery that cannot prove an upgrade is an upgrade
+    keeps the current version rather than downgrading or inventing anything."""
+    parsed = _exact_version(candidate)
+    base = _exact_version(installed)
+    return parsed is not None and base is not None and parsed > base
+
+
 def _discover_targets(
     project_dir: Path,
     current: Mapping[str, str],
@@ -1802,37 +1995,94 @@ def _discover_targets(
     unless the run pins a concrete Node and the registry KNOWS latest excludes
     it. In that case a bounded search over the newest published versions picks
     the highest VERIFIED-compatible version that is STRICTLY NEWER than the
-    declared range floor and that version becomes the target — the user gets an
-    upgrade that actually installs under the chosen Node instead of a stale
-    deferral. A version is never invented, and a package whose latest cannot be
+    INSTALLED version (lockfile-exact, see ``_installed_version``) and that
+    version becomes the target — the user gets an upgrade that actually
+    installs under the chosen Node instead of a stale deferral. The declared
+    spec alone is never the baseline: a range floor (``^8.0.0``) would accept
+    8.1.0 as an "upgrade" while 8.5.0 is installed, silently downgrading the
+    package. A version is never invented, and a package whose latest cannot be
     established is skipped as evidence. Downgrades are refused: a candidate may
-    only be proposed when npm-semver proves it newer than the declared floor.
+    only be proposed when npm-semver proves it newer than the installed
+    version, and the SAME guard runs BEFORE any direct acceptance of the
+    registry ``latest`` — a dist-tag that lags the installed version (installed
+    8.5.0, latest 8.1.0) is recorded as ``no-newer-compatible``, never proposed
+    as a target. Discovery abstains entirely (``installed-version-unknown``)
+    when the installed version cannot be read from the canonical lockfile.
     When no strictly-newer verified-compatible version exists in the bounded
     window, the CURRENT version is kept (the package is NOT added to the
     targets) and an honest ``no-newer-compatible`` evidence row records the
     unfulfilled upgrade intent with the reason — never a downgrade and never a
-    false completion. Unknown engines are an abstention, never a false
-    incompatibility claim; without a pinned Node the choice is engine-unchecked.
+    false completion; the task builder surfaces that intent in the remainder.
+    Unknown engines are an abstention, never a false incompatibility claim;
+    without a pinned Node the choice is engine-unchecked.
     """
     targets: Dict[str, str] = {}
     evidence: List[Dict[str, Any]] = []
     for name, declared in sorted(current.items()):
+        installed = _installed_version(project_dir, name, declared)
+        if installed is None:
+            evidence.append(
+                {
+                    "package": name, "declared": declared,
+                    "status": "installed-version-unknown",
+                    "reason": (
+                        f"the exact installed version of {name} cannot be read "
+                        "from the canonical lockfile; the never-downgrade guard "
+                        "abstains instead of choosing a target against an "
+                        "unverifiable baseline"
+                    ),
+                }
+            )
+            continue
         latest = _npm_latest_version(project_dir, name, runtime_env)
         if not latest:
             evidence.append(
-                {"package": name, "declared": declared, "latest": "", "status": "registry-unavailable"}
+                {
+                    "package": name, "declared": declared, "installed": installed,
+                    "latest": "", "status": "registry-unavailable",
+                }
             )
             continue
-        if latest == declared:
+        if latest == installed:
             evidence.append(
-                {"package": name, "declared": declared, "latest": latest, "status": "up-to-date"}
+                {
+                    "package": name, "declared": declared, "installed": installed,
+                    "latest": latest, "status": "up-to-date",
+                }
+            )
+            continue
+        # Review re-check P1: NEVER accept the registry `latest` until it is
+        # provably STRICTLY newer than the INSTALLED version. This guard runs
+        # BEFORE every direct acceptance of `latest` (both the unpinned-Node and
+        # the pinned-Node/engine-compatible shortcuts): a dist-tag that lags the
+        # installed version (installed 8.5.0, latest 8.1.0) would otherwise be
+        # proposed as a target and roll the package back. When `latest` is not an
+        # upgrade nothing is proposed — the bounded search below (which applies
+        # the same guard per candidate) is the only remaining way a strictly
+        # newer verified version can be chosen — and the unfulfilled intent is
+        # recorded as no-newer-compatible instead of a false completion.
+        if not _newer_than_installed(latest, installed):
+            evidence.append(
+                {
+                    "package": name, "declared": declared, "installed": installed,
+                    "latest": latest, "status": "no-newer-compatible",
+                    "rejected": [
+                        {"version": latest, "nodeSpec": "", "status": "not-newer-than-current"}
+                    ],
+                    "reason": (
+                        f"registry latest {latest} is not strictly newer than the "
+                        f"INSTALLED {installed}; accepting it would roll the package "
+                        "back, so the current version is kept"
+                    ),
+                }
             )
             continue
         if not node_version:
             targets[name] = latest
             evidence.append(
                 {
-                    "package": name, "declared": declared, "latest": latest,
+                    "package": name, "declared": declared, "installed": installed,
+                    "latest": latest,
                     "status": "discovered", "engineUnchecked": True,
                 }
             )
@@ -1844,8 +2094,8 @@ def _discover_targets(
             targets[name] = latest
             evidence.append(
                 {
-                    "package": name, "declared": declared, "latest": latest,
-                    "nodeVersion": node_version, "latestNodeSpec": latest_spec,
+                    "package": name, "declared": declared, "installed": installed,
+                    "latest": latest, "nodeVersion": node_version, "latestNodeSpec": latest_spec,
                     "status": "discovered",
                     **({"enginesUnknown": True} if not latest_spec else {}),
                 }
@@ -1857,9 +2107,12 @@ def _discover_targets(
         for candidate in _npm_versions(project_dir, name, runtime_env, top=12):
             if candidate == latest:
                 continue
-            if candidate == declared or not _strictly_newer(candidate, declared):
+            if candidate == installed or not _newer_than_installed(candidate, installed):
                 # Postfix-review P1: never downgrade. A candidate at or below
-                # the declared floor cannot be an upgrade, whatever its engines.
+                # the INSTALLED version (lockfile-exact) cannot be an upgrade,
+                # whatever its engines — the declared range floor alone would
+                # accept a lower-than-installed version (e.g. 8.1.0 under
+                # ^8.0.0 with 8.5.0 installed) and roll the package back.
                 rejected.append({"version": candidate, "nodeSpec": "", "status": "not-newer-than-current"})
                 continue
             candidate_spec = _npm_engines_node(project_dir, name, candidate, runtime_env)
@@ -1875,27 +2128,29 @@ def _discover_targets(
             targets[name] = chosen
             evidence.append(
                 {
-                    "package": name, "declared": declared, "latest": latest,
-                    "latestNodeSpec": latest_spec, "nodeVersion": node_version,
+                    "package": name, "declared": declared, "installed": installed,
+                    "latest": latest, "latestNodeSpec": latest_spec, "nodeVersion": node_version,
                     "target": chosen, "targetNodeSpec": chosen_spec,
                     "rejected": rejected, "status": "discovered-compatible",
                 }
             )
             continue
         # No strictly-newer verified-compatible alternative in the bounded
-        # window: KEEP the current version (no downgrade, no false plan entry)
+        # window: KEEP the installed version (no downgrade, no false plan entry)
         # and record the unfulfilled upgrade intent with an honest reason. The
-        # deferred/blocked package stays visible in the discovery evidence and
-        # in the begin.discovery event; it is never an invented completion.
+        # deferred/blocked package stays visible in the discovery evidence, in
+        # the begin.discovery event and in the task remainder (via the task
+        # builder's no-newer-compatible intents); it is never an invented
+        # completion and never silently dropped to "0 of 0" in the task.
         evidence.append(
             {
-                "package": name, "declared": declared, "latest": latest,
-                "latestNodeSpec": latest_spec, "nodeVersion": node_version,
+                "package": name, "declared": declared, "installed": installed,
+                "latest": latest, "latestNodeSpec": latest_spec, "nodeVersion": node_version,
                 "rejected": rejected, "status": "no-newer-compatible",
                 "reason": (
                     f"latest {latest} requires node {latest_spec}, but the run's "
                     f"chosen Node is {node_version}; no verified-compatible version "
-                    f"strictly newer than current {declared} exists within the "
+                    f"strictly newer than the INSTALLED {installed} exists within the "
                     "bounded window — keeping the current version"
                 ),
             }

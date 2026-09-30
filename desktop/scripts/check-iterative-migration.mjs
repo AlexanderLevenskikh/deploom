@@ -10,6 +10,7 @@ import {
   iterativeRunDirPath,
   iterativeRunDirRelativePath,
   missingTaskExportInput,
+  repairPromptTaskText,
   taskContentMismatch,
   taskCopyPayload,
   taskDispatchable,
@@ -138,6 +139,22 @@ if (!tampered.ok && !tampered.reason.includes("CONTENT_HASH_MISMATCH")) {
 }
 writeFileSync(ruPath, ruBytes, "utf8");
 if (!taskDispatchable(runDir).ok) throw new Error("Restoring the exact bytes must restore dispatchability");
+
+// 2c. Review P1 (contradictory versions): a CANDIDATE repair works in a trial
+// whose exact assignment DIFFERS from the accepted checkpoint the exported ТЗ
+// is authored over, so it must NEVER attach that checkpoint-ТЗ (two version
+// sets in one message). Only the version-neutral BOOTSTRAP repair (same C0
+// assignment as the ТЗ) attaches the task text.
+{
+  const dispatchable = taskDispatchable(runDir);
+  if (!dispatchable.ok) throw new Error(`fresh task must be dispatchable for the repair-text contract: ${JSON.stringify(dispatchable)}`);
+  if (repairPromptTaskText(false, dispatchable) !== "") {
+    throw new Error("candidate repair must NOT attach the checkpoint-built ТЗ (contradictory versions)");
+  }
+  if (repairPromptTaskText(true, dispatchable) === "") {
+    throw new Error("bootstrap repair must attach the dispatchable checkpoint task text");
+  }
+}
 
 // 3. Drift -> stale, dispatch refused.
 const configPath = join(runDir, "run-config.json");

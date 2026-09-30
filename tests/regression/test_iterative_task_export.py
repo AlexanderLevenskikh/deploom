@@ -107,6 +107,139 @@ def make_run_dir(root: Path, *, extra_targets=True, runtime: Optional[dict] = No
     return run_dir
 
 
+def make_discovery_deferral_run_dir(root: Path) -> Path:
+    """A run whose bounded discovery found NO newer compatible version for the
+    only direct dependency (status ``no-newer-compatible``) — the review P2
+    repro. The package is deliberately ABSENT from config.targets (there is no
+    executable target version), so without surfacing the intent the task would
+    read "0 of 0" and hide the unfulfilled upgrade and its reason."""
+    run_dir = root / "run"
+    (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    config = {
+        "schemaVersion": 1,
+        "projectDir": str(root / "sample-app"),
+        "projectName": "sample-app",
+        "workspaceId": "ws-1",
+        "projectId": "sample-app",
+        "targetLevel": "yellow",
+        "targets": {},
+        "targetDiscovery": [
+            {
+                "package": "sample",
+                "declared": "^8.0.0",
+                "installed": "8.5.0",
+                "latest": "9.0.0",
+                "nodeVersion": "20.11.0",
+                "latestNodeSpec": ">=22",
+                "rejected": [
+                    {"version": "8.1.0", "nodeSpec": "", "status": "not-newer-than-current"},
+                    {"version": "8.5.0", "nodeSpec": "", "status": "not-newer-than-current"},
+                ],
+                "status": "no-newer-compatible",
+                "reason": (
+                    "latest 9.0.0 requires node >=22, but the run's chosen Node is "
+                    "20.11.0; no verified-compatible version strictly newer than the "
+                    "INSTALLED 8.5.0 exists within the bounded window — keeping the "
+                    "current version"
+                ),
+            }
+        ],
+        "verifyConfig": {"commands": ["node check.js"]},
+        "policyHash": "policy-hash-abc",
+        "budget": {},
+        "createdAt": "2026-09-30T00:00:00Z",
+        "toolBuildId": "",
+    }
+    c0 = {
+        "schemaVersion": 1, "checkpointId": "C0", "parentCheckpointId": None, "seq": 0,
+        "status": "VERIFIED", "sourceSnapshotKey": "snap-c0", "sourceSnapshotContainer": str(root / "snap-c0"),
+        "sourceHead": "", "projectRelative": ".", "manifestHash": "mh-1", "lockfileHash": "lh-1",
+        "resolvedStateKey": "rsk-c0", "observedResolvedHash": "orh-c0",
+        "fullAssignment": {"sample": "8.5.0"},
+        "acceptedDelta": {"added": {}, "changed": {}, "removed": {}},
+        "cohortId": None,
+        "verification": {"status": "passed", "kind": "passed", "commands": ["node check.js"], "failingCommands": []},
+        "proofRefs": {"resolvedStateKey": "rsk-c0", "preparationProofKey": ""},
+        "audit": {"status": "UNKNOWN", "evidenceRef": ""},
+        "createdAt": "2026-09-30T00:01:00Z",
+    }
+    run = {
+        "schemaVersion": 1, "runId": "iter-defer-1", "workspaceId": "ws-1", "projectId": "sample-app",
+        "generation": 1, "targetPolicyHash": "policy-hash-abc", "initialSnapshotKey": "snap-c0",
+        "activeCheckpointId": "C0", "activeCandidateId": None, "phase": "READY", "terminal": None,
+        "budgetLedger": {}, "leaseOwner": "", "deadlineAt": "2026-09-30T02:00:00Z",
+        "heartbeatAt": "2026-09-30T00:06:00Z", "createdAt": "2026-09-30T00:00:00Z",
+        "updatedAt": "2026-09-30T00:06:00Z", "toolBuildId": "",
+    }
+    (run_dir / "run.json").write_text(json.dumps(run), encoding="utf-8")
+    (run_dir / "run-config.json").write_text(json.dumps(config), encoding="utf-8")
+    (run_dir / "checkpoints" / "C0.json").write_text(json.dumps(c0), encoding="utf-8")
+    (run_dir / "ledger.json").write_text(json.dumps({"schemaVersion": 1, "blocks": [], "deferrals": []}), encoding="utf-8")
+    return run_dir
+
+
+def make_installed_unknown_run_dir(root: Path) -> Path:
+    """A run whose bounded discovery ABSTAINED for the only direct dependency
+    (status ``installed-version-unknown`` — the exact installed version cannot
+    be read from the lockfile). The review re-check P2 repro: an unresolved
+    uncertainty must stay visible in the remainder ("1 of 1", not "0 of 0") as
+    an explicit unknown-goals section, WITHOUT claiming a proven lag."""
+    run_dir = root / "run"
+    (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    config = {
+        "schemaVersion": 1,
+        "projectDir": str(root / "sample-app"),
+        "projectName": "sample-app",
+        "workspaceId": "ws-1",
+        "projectId": "sample-app",
+        "targetLevel": "yellow",
+        "targets": {},
+        "targetDiscovery": [
+            {
+                "package": "sample",
+                "declared": "^8.0.0",
+                "status": "installed-version-unknown",
+                "reason": (
+                    "the exact installed version of sample cannot be read from the "
+                    "canonical lockfile; the never-downgrade guard abstains instead of "
+                    "choosing a target against an unverifiable baseline"
+                ),
+            }
+        ],
+        "verifyConfig": {"commands": ["node check.js"]},
+        "policyHash": "policy-hash-abc",
+        "budget": {},
+        "createdAt": "2026-09-30T00:00:00Z",
+        "toolBuildId": "",
+    }
+    c0 = {
+        "schemaVersion": 1, "checkpointId": "C0", "parentCheckpointId": None, "seq": 0,
+        "status": "VERIFIED", "sourceSnapshotKey": "snap-c0", "sourceSnapshotContainer": str(root / "snap-c0"),
+        "sourceHead": "", "projectRelative": ".", "manifestHash": "mh-1", "lockfileHash": "lh-1",
+        "resolvedStateKey": "rsk-c0", "observedResolvedHash": "orh-c0",
+        "fullAssignment": {},
+        "acceptedDelta": {"added": {}, "changed": {}, "removed": {}},
+        "cohortId": None,
+        "verification": {"status": "passed", "kind": "passed", "commands": ["node check.js"], "failingCommands": []},
+        "proofRefs": {"resolvedStateKey": "rsk-c0", "preparationProofKey": ""},
+        "audit": {"status": "UNKNOWN", "evidenceRef": ""},
+        "createdAt": "2026-09-30T00:01:00Z",
+    }
+    run = {
+        "schemaVersion": 1, "runId": "iter-unknown-1", "workspaceId": "ws-1", "projectId": "sample-app",
+        "generation": 1, "targetPolicyHash": "policy-hash-abc", "initialSnapshotKey": "snap-c0",
+        "activeCheckpointId": "C0", "activeCandidateId": None, "phase": "READY", "terminal": None,
+        "budgetLedger": {}, "leaseOwner": "", "deadlineAt": "2026-09-30T02:00:00Z",
+        "heartbeatAt": "2026-09-30T00:06:00Z", "createdAt": "2026-09-30T00:00:00Z",
+        "updatedAt": "2026-09-30T00:06:00Z", "toolBuildId": "",
+    }
+    (run_dir / "run.json").write_text(json.dumps(run), encoding="utf-8")
+    (run_dir / "run-config.json").write_text(json.dumps(config), encoding="utf-8")
+    (run_dir / "checkpoints" / "C0.json").write_text(json.dumps(c0), encoding="utf-8")
+    (run_dir / "ledger.json").write_text(json.dumps({"schemaVersion": 1, "blocks": [], "deferrals": []}), encoding="utf-8")
+    return run_dir
+
+
 class IterativeTaskExportTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -241,6 +374,65 @@ class IterativeTaskExportTests(unittest.TestCase):
         manifest_path = run_dir / "task" / manifest["artifactId"] / task.TASK_MANIFEST_FILENAME
         on_disk = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(on_disk, manifest)
+
+    def test_no_newer_compatible_deferral_visible_in_final_remainder(self) -> None:
+        # Review P2: discovery found no strictly-newer compatible version, the
+        # package has NO executable target and is absent from config.targets.
+        # The unfulfilled upgrade must stay visible: remainder "1 of 1" (not
+        # "0 of 0"), with the reason in the manifest AND in the final ТЗ.
+        run_dir = make_discovery_deferral_run_dir(self.root)
+        task.export_task_artifact(run_dir)
+        manifest = task.current_task(run_dir)
+        self.assertIsNotNone(manifest)
+        self.assertFalse(manifest["completeness"]["policySatisfied"])
+        self.assertEqual(1, manifest["completeness"]["denominator"])
+        self.assertEqual(1, manifest["completeness"]["remaining"])
+        deferred = [row for row in manifest["deferred"] if row["package"] == "sample"]
+        self.assertEqual(1, len(deferred), manifest["deferred"])
+        self.assertEqual("8.5.0", deferred[0]["current"])
+        self.assertEqual("9.0.0", deferred[0]["lagPolicyTarget"])
+        self.assertIn("keeping the current version", deferred[0]["reason"])
+        root = run_dir / "task" / manifest["artifactId"]
+        ru = (root / "task.ru.md").read_text(encoding="utf-8")
+        en = (root / "task.en.md").read_text(encoding="utf-8")
+        self.assertIn("**1** из **1**", ru)
+        self.assertIn("**1** of **1**", en)
+        self.assertIn("sample", ru)
+        self.assertIn("keeping the current version", ru)
+        self.assertIn("keeping the current version", en)
+        self.assertIn("no verified-compatible version strictly newer", en)
+
+    def test_installed_version_unknown_surfaces_in_remainder_not_zero_of_zero(self) -> None:
+        # Review re-check P2: discovery ABSTAINED (installed-version-unknown) —
+        # the exact installed version cannot be read from the lockfile, so no
+        # target is provable. That unresolved uncertainty must keep the task
+        # from reading "0 of 0": it counts into the remainder ("1 of 1") and
+        # appears in an explicit unknown-goals section in the manifest and the
+        # final ТЗ, WITHOUT claiming a proven lag.
+        run_dir = make_installed_unknown_run_dir(self.root)
+        task.export_task_artifact(run_dir)
+        manifest = task.current_task(run_dir)
+        self.assertIsNotNone(manifest)
+        self.assertFalse(manifest["completeness"]["policySatisfied"])
+        self.assertEqual(1, manifest["completeness"]["denominator"])
+        self.assertEqual(1, manifest["completeness"]["remaining"])
+        unknown = [row for row in manifest["unknownGoals"] if row["package"] == "sample"]
+        self.assertEqual(1, len(unknown), manifest["unknownGoals"])
+        self.assertEqual("^8.0.0", unknown[0]["declared"])
+        self.assertIn("cannot be read from the canonical lockfile", unknown[0]["reason"])
+        self.assertEqual([], manifest["deferred"])
+        root = run_dir / "task" / manifest["artifactId"]
+        ru = (root / "task.ru.md").read_text(encoding="utf-8")
+        en = (root / "task.en.md").read_text(encoding="utf-8")
+        self.assertIn("**1** из **1**", ru)
+        self.assertIn("**1** of **1**", en)
+        self.assertIn("### Неопределённые цели (установленная версия неизвестна)", ru)
+        self.assertIn("### Unknown goals (installed version not readable)", en)
+        # The uncertainty must NOT be dressed up as a confirmed lag or deferral.
+        self.assertIn("отставание НЕ подтверждено", ru)
+        self.assertIn("NO lag is proven", en)
+        self.assertNotIn("Явно отложенные пакеты", ru)
+        self.assertNotIn("Explicitly deferred packages", en)
 
     def test_reexport_after_lost_pointer_is_idempotent(self):
         # Kill between artifact write and pointer flip: the pointer is gone,

@@ -187,6 +187,25 @@ export function taskDispatchable(
   return { ok: true, task }
 }
 
+/** The task text that may seed a REPAIR prompt.
+
+ * Only the version-neutral BOOTSTRAP repair may attach the checkpoint-built ТЗ:
+ * its isolated trial carries the SAME C0 assignment the ТЗ describes, so the
+ * two version sets agree. A CANDIDATE repair works in a trial whose exact
+ * assignment DIFFERS from the accepted checkpoint the exported ТЗ is built
+ * from — attaching that ТЗ would hand the agent two contradictory version sets
+ * in one message (the active-checkpoint identity check cannot see the trial
+ * combination). A candidate repair therefore gets NO task text; its prompt is
+ * exact and self-sufficient from the durable candidate assignment and the open
+ * repair requests. */
+export function repairPromptTaskText(
+  bootstrap: boolean,
+  dispatchable: { ok: true; task: IterativeTaskView } | { ok: false; reason: string },
+): string {
+  if (!bootstrap || !dispatchable.ok) return ''
+  return dispatchable.task.text.ru ?? dispatchable.task.text.en ?? ''
+}
+
 /** Result of a best-effort export-task refresh: 'ok' produced a fresh
  * artifact; 'input-missing' — the durable state has no exportable bits (the
  * prompt is still self-sufficient from the durable assignment); 'export-failed'

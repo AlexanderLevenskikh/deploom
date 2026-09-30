@@ -32,11 +32,47 @@ from iterative_migration import (
 )
 
 
-def _make_project(root: Path, dependencies: dict) -> Path:
+def _declared_floor_value(spec: str) -> str:
+    """The minimal version the declared spec admits (test stand-in for the
+    discovery baseline): exact specs stay themselves, ^/~/comparison ranges
+    lose their prefix. The lockfile normally resolves at or above this floor."""
+    text = str(spec or "").strip()
+    for op in ("^", "~", ">=", "<=", ">", "<", "=", "!"):
+        if text.startswith(op):
+            return text[len(op):].strip()
+    return text
+
+
+def _make_project(root: Path, dependencies: dict, installed: Optional[dict] = None) -> Path:
+    """A synthetic project with a REAL package-lock.json (lockfileVersion 3):
+    the never-downgrade guard reads the installed version from the lockfile,
+    so the test must pin it. ``installed`` overrides the resolved version per
+    package (default: the declared floor); pass a None value to leave that
+    package WITHOUT a lockfile record (installed version unknown -> abstain)."""
     project = root / "project"
     project.mkdir(parents=True, exist_ok=True)
     (project / "package.json").write_text(
         json.dumps({"name": "discovery-probe", "private": True, "version": "1.0.0", "dependencies": dependencies}),
+        encoding="utf-8",
+    )
+    packages: dict = {"": {"name": "discovery-probe", "version": "1.0.0", "dependencies": dependencies}}
+    for name, spec in dependencies.items():
+        resolved = _declared_floor_value(spec)
+        if installed is not None and name in installed:
+            resolved = installed[name]
+        if resolved is None:
+            continue
+        packages[f"node_modules/{name}"] = {"version": resolved}
+    (project / "package-lock.json").write_text(
+        json.dumps(
+            {
+                "name": "discovery-probe",
+                "version": "1.0.0",
+                "lockfileVersion": 3,
+                "requires": True,
+                "packages": packages,
+            }
+        ),
         encoding="utf-8",
     )
     return project
@@ -128,7 +164,7 @@ class IterativeTargetDiscoveryTests(unittest.TestCase):
             config = build_run_config(self._tmp, _base_args(str(project)))
 
         self.assertEqual(config["targets"], {})
-        self.assertEqual(config["targetDiscovery"], [{"package": "is-number", "declared": "7.0.0", "latest": "7.0.0", "status": "up-to-date"}])
+        self.assertEqual(config["targetDiscovery"], [{"package": "is-number", "declared": "7.0.0", "installed": "7.0.0", "latest": "7.0.0", "status": "up-to-date"}])
 
     # P1.2: with a pinned Node, a registry-known-incompatible latest must NOT
     # silently become a deferred target — a bounded search picks the highest
@@ -139,12 +175,17 @@ class IterativeTargetDiscoveryTests(unittest.TestCase):
     def _patch_node_resolution(self, effective_version: str):
         from project_runtime import NodeRuntimeResolution
 
+        # A Windows drive-letter path can never be a PATH entry on POSIX (':' is
+        # the separator there, so splitting the joined PATH truncates the node
+        # dir); the fixture must be platform-appropriate on every runner.
+        runtime_dir = "C:/fake" if os.name == "nt" else "/opt/fake"
+
         def fake_resolve(requested: str) -> NodeRuntimeResolution:
             return NodeRuntimeResolution(
                 requested=requested,
                 effective_version=effective_version,
-                node_path="C:/fake/node.exe",
-                npm_path="C:/fake/npm.exe",
+                node_path=f"{runtime_dir}/node.exe",
+                npm_path=f"{runtime_dir}/npm.exe",
                 source="requested",
             )
 
@@ -391,10 +432,11 @@ class IterativeTargetDiscoveryTests(unittest.TestCase):
             config = build_run_config(self._tmp, self._args_with_node(project, "20.11.0"))
 
         self.assertTrue(captured, "discovery probes must receive a runtime env")
+        runtime_dir = "C:/fake" if os.name == "nt" else "/opt/fake"
         head = os.pathsep.join(
             (captured[0] or {}).get("PATH", "").split(os.pathsep)[:1]
         )
-        self.assertEqual(os.path.normcase(head), os.path.normcase("C:/fake"))
+        self.assertEqual(os.path.normcase(head), os.path.normcase(runtime_dir))
         self.assertTrue(all(env and env.get("PATH", "").split(os.pathsep)[0] != "" for env in captured))
 
     def test_no_newer_compatible_reaches_plan_next_as_no_actionable(self) -> None:
@@ -497,6 +539,310 @@ class IterativeTargetDiscoveryTests(unittest.TestCase):
         entry = config["targetDiscovery"][0]
         self.assertEqual(entry["status"], "discovered")
         self.assertTrue(entry.get("engineUnchecked"))
+
+    def test_installed_version_above_range_floor_never_downgrades_to_it(self) -> None:
+        # Review P1: with ^8.0.0 DECLARED the range floor is 8.0.0, but the
+        # lockfile proves 8.5.0 is INSTALLED. 8.1.0 is newer than the floor yet
+        # OLDER than the installed version — it MUST be refused, never proposed
+        # as an "upgrade" that rolls the package back.
+        project = _make_project(self._tmp, {"sample": "^8.0.0"}, installed={"sample": "8.5.0"})
+
+        def fake_latest(project_dir, name, runtime_env):
+            return "9.0.0"
+
+        def fake_versions(project_dir, name, runtime_env, top=12):
+            return ["9.0.0", "8.1.0", "8.5.0", "8.0.0"]
+
+        def fake_engines(project_dir, name, version, runtime_env):
+            return {
+                "9.0.0": ">=22", "8.1.0": ">=18", "8.5.0": ">=18", "8.0.0": ">=18",
+            }[version]
+
+        with self._patch_node_resolution("20.11.0"), \
+             mock.patch("iterative_migration._manager_runtime_identity", return_value=("npm", "10.0.0")), \
+             mock.patch("iterative_migration._npm_latest_version", side_effect=fake_latest), \
+             mock.patch("iterative_migration._npm_versions", side_effect=fake_versions), \
+             mock.patch("iterative_migration._npm_engines_node", side_effect=fake_engines):
+            config = build_run_config(self._tmp, self._args_with_node(project, "20.11.0"))
+
+        # 8.1.0 is NOT newer than the installed 8.5.0 -> refused; nothing
+        # compatible-but-newer exists -> the installed version is KEPT.
+        self.assertEqual(config["targets"], {})
+        entry = config["targetDiscovery"][0]
+        self.assertEqual(entry["status"], "no-newer-compatible")
+        self.assertEqual(entry["installed"], "8.5.0")
+        self.assertEqual(entry["declared"], "^8.0.0")
+        self.assertIn("keeping the current version", entry["reason"])
+        self.assertIn("8.5.0", entry["reason"])
+        not_newer = {
+            row["version"] for row in entry["rejected"]
+            if row.get("status") == "not-newer-than-current"
+        }
+        self.assertIn("8.1.0", not_newer)
+        self.assertIn("8.5.0", not_newer)
+
+    def test_installed_version_above_range_floor_still_allows_a_real_upgrade(self) -> None:
+        # A candidate that IS strictly newer than the installed 8.5.0 (8.6.0)
+        # is still proposed; only the below-installed 8.1.0 is refused. The fix
+        # protects against rollbacks without blocking genuine upgrades.
+        project = _make_project(self._tmp, {"sample": "^8.0.0"}, installed={"sample": "8.5.0"})
+
+        def fake_latest(project_dir, name, runtime_env):
+            return "9.0.0"
+
+        def fake_versions(project_dir, name, runtime_env, top=12):
+            return ["9.0.0", "8.6.0", "8.1.0", "8.5.0"]
+
+        def fake_engines(project_dir, name, version, runtime_env):
+            return {
+                "9.0.0": ">=22", "8.6.0": ">=18", "8.1.0": ">=18", "8.5.0": ">=18",
+            }[version]
+
+        with self._patch_node_resolution("20.11.0"), \
+             mock.patch("iterative_migration._manager_runtime_identity", return_value=("npm", "10.0.0")), \
+             mock.patch("iterative_migration._npm_latest_version", side_effect=fake_latest), \
+             mock.patch("iterative_migration._npm_versions", side_effect=fake_versions), \
+             mock.patch("iterative_migration._npm_engines_node", side_effect=fake_engines):
+            config = build_run_config(self._tmp, self._args_with_node(project, "20.11.0"))
+
+        self.assertEqual(config["targets"], {"sample": "8.6.0"})
+        entry = config["targetDiscovery"][0]
+        self.assertEqual(entry["status"], "discovered-compatible")
+        self.assertEqual(entry["target"], "8.6.0")
+        self.assertEqual(entry["installed"], "8.5.0")
+        # The chosen 8.6.0 is strictly newer than the installed 8.5.0 — a real
+        # upgrade is still proposed even though the ^8.0.0 floor is only 8.0.0.
+        from iterative_migration import _newer_than_installed
+
+        self.assertTrue(_newer_than_installed(entry["target"], entry["installed"]))
+        # A below-installed candidate (8.1.0) is refused whenever it is visited:
+        # with 8.6.0 listed first the loop short-circuits, so reject it in the
+        # refused matrix of the no-upgrade scenario instead of here.
+        self.assertNotIn("8.1.0", {row["version"] for row in entry["rejected"]})
+
+    def test_installed_version_unknown_abstains_never_guesses(self) -> None:
+        # The lockfile exists but has NO record for the package: the installed
+        # version cannot be proven, so the discovery ABSTAINS (no target)
+        # instead of comparing against the declared range floor (a guess that
+        # would accept a below-installed candidate as an "upgrade").
+        project = _make_project(self._tmp, {"sample": "^8.0.0"}, installed={"sample": None})
+
+        def fake_latest(project_dir, name, runtime_env):
+            return "9.0.0"
+
+        with self._patch_node_resolution("20.11.0"), \
+             mock.patch("iterative_migration._manager_runtime_identity", return_value=("npm", "10.0.0")), \
+             mock.patch("iterative_migration._npm_latest_version", side_effect=fake_latest):
+            config = build_run_config(self._tmp, self._args_with_node(project, "20.11.0"))
+
+        self.assertEqual(config["targets"], {})
+        entry = config["targetDiscovery"][0]
+        self.assertEqual(entry["status"], "installed-version-unknown")
+        self.assertIn("abstains", entry["reason"])
+
+    def test_installed_version_reads_npm_lockfile_records(self) -> None:
+        from iterative_migration import _installed_version
+
+        project = self._tmp / "npm-lockfile"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": "x", "version": "1.0.0",
+                    "dependencies": {"@scope/a": "^2.0.0", "sample": "^8.0.0"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (project / "package-lock.json").write_text(
+            json.dumps(
+                {
+                    "name": "x", "version": "1.0.0", "lockfileVersion": 3, "requires": True,
+                    "packages": {
+                        "": {"name": "x", "version": "1.0.0", "dependencies": {"@scope/a": "^2.0.0", "sample": "^8.0.0"}},
+                        "node_modules/sample": {"version": "8.5.0"},
+                        "node_modules/@scope/a": {"version": "2.3.1"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(_installed_version(project, "sample"), "8.5.0")
+        self.assertEqual(_installed_version(project, "@scope/a"), "2.3.1")
+        self.assertIsNone(_installed_version(project, "absent"))
+
+    def test_installed_version_reads_yarn_lockfile_selectors(self) -> None:
+        from iterative_migration import _installed_version
+
+        project = self._tmp / "yarn-lockfile"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "package.json").write_text(
+            json.dumps(
+                {
+                    "name": "x", "version": "1.0.0",
+                    "dependencies": {"@scope/a": "^2.0.0", "sample": "^8.0.0"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (project / "yarn.lock").write_text(
+            "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n"
+            "# yarn lockfile v1\n"
+            '\n'
+            '"sample@^8.0.0":\n'
+            '  version "8.5.0"\n'
+            '  resolved "https://registry.yarnpkg.com/sample/-/sample-8.5.0.tgz"\n'
+            '  integrity sha512-abc\n'
+            '\n'
+            '"@scope/a@^2.0.0, @scope/a@^2.2.0":\n'
+            '  version "2.3.1"\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(_installed_version(project, "sample"), "8.5.0")
+        self.assertEqual(_installed_version(project, "@scope/a"), "2.3.1")
+        self.assertIsNone(_installed_version(project, "missing"))
+
+    def test_installed_version_reads_pnpm_lockfile_packages(self) -> None:
+        from iterative_migration import _installed_version
+
+        project = self._tmp / "pnpm-lockfile"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "package.json").write_text(
+            json.dumps({"name": "x", "version": "1.0.0", "dependencies": {"sample": "^8.0.0"}}),
+            encoding="utf-8",
+        )
+        (project / "pnpm-lock.yaml").write_text(
+            "lockfileVersion: '9.0'\n"
+            "\n"
+            "importers:\n"
+            "  .:\n"
+            "    dependencies:\n"
+            "      sample:\n"
+            "        specifier: ^8.0.0\n"
+            "        version: 8.5.0\n"
+            "\n"
+            "packages:\n"
+            "  /sample@8.5.0:\n"
+            "    resolution: {integrity: sha512-abc}\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(_installed_version(project, "sample"), "8.5.0")
+
+    def test_registry_latest_below_installed_never_proposed_unpinned(self) -> None:
+        # Review re-check P1 (downgrade via `latest`): the registry dist-tag
+        # lags the installed version (installed 8.5.0, latest 8.1.0 — e.g. the
+        # newer line got yanked/unpublished). The direct-latest shortcut must
+        # NOT propose 8.1.0 as a "target": the never-downgrade guard runs
+        # BEFORE any acceptance of `latest`.
+        project = _make_project(self._tmp, {"sample": "^8.0.0"}, installed={"sample": "8.5.0"})
+
+        def fake_latest(project_dir, name, runtime_env):
+            return "8.1.0"
+
+        with mock.patch("iterative_migration._npm_latest_version", side_effect=fake_latest):
+            config = build_run_config(self._tmp, _base_args(str(project)))
+
+        self.assertEqual(config["targets"], {})
+        entry = config["targetDiscovery"][0]
+        self.assertEqual(entry["status"], "no-newer-compatible")
+        self.assertEqual(entry["installed"], "8.5.0")
+        self.assertEqual(entry["latest"], "8.1.0")
+        self.assertIn("roll the package back", entry["reason"])
+
+    def test_registry_latest_below_installed_never_proposed_pinned_engine_ok(self) -> None:
+        # Same downgrade scenario under a pinned Node where the lagger's engines
+        # WOULD be satisfied (>=18 on Node 20.11.0): the guard must still
+        # refuse it — the installed 8.5.0 is a rollback away from latest 8.1.0,
+        # and engine compatibility is irrelevant to a proposed downgrade.
+        project = _make_project(self._tmp, {"sample": "^8.0.0"}, installed={"sample": "8.5.0"})
+
+        def fake_latest(project_dir, name, runtime_env):
+            return "8.1.0"
+
+        def fake_engines(project_dir, name, version, runtime_env):
+            return {"8.1.0": ">=18"}[version]
+
+        with self._patch_node_resolution("20.11.0"), \
+             mock.patch("iterative_migration._manager_runtime_identity", return_value=("npm", "10.0.0")), \
+             mock.patch("iterative_migration._npm_latest_version", side_effect=fake_latest), \
+             mock.patch("iterative_migration._npm_engines_node", side_effect=fake_engines):
+            config = build_run_config(self._tmp, self._args_with_node(project, "20.11.0"))
+
+        self.assertEqual(config["targets"], {})
+        entry = config["targetDiscovery"][0]
+        self.assertEqual(entry["status"], "no-newer-compatible")
+        self.assertEqual(entry["installed"], "8.5.0")
+        self.assertIn("roll the package back", entry["reason"])
+
+    def test_yarn_installed_version_selects_direct_selector_over_transitive(self) -> None:
+        # Review re-check P1 (yarn): the DIRECT dependency `sample@^8.0.0`
+        # resolves to 8.5.0, a TRANSITIVE `sample@^7.0.0` to 7.2.0. Without the
+        # direct selector the two resolutions collide and the reader abstains
+        # (installed unknown) — losing the installed-version baseline. Passing
+        # the declared spec must pick the DIRECT block only.
+        from iterative_migration import _installed_version
+
+        project = self._tmp / "yarn-selector-disambiguation"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "package.json").write_text(
+            json.dumps(
+                {"name": "x", "version": "1.0.0", "dependencies": {"sample": "^8.0.0"}}
+            ),
+            encoding="utf-8",
+        )
+        (project / "yarn.lock").write_text(
+            "# yarn lockfile v1\n"
+            '\n'
+            '"sample@^7.0.0":\n'
+            '  version "7.2.0"\n'
+            '\n'
+            '"sample@^8.0.0":\n'
+            '  version "8.5.0"\n',
+            encoding="utf-8",
+        )
+        # Without the declared spec the two sample resolutions are ambiguous ->
+        # abstain (no guess); with the DIRECT selector the direct 8.5.0 wins.
+        self.assertIsNone(_installed_version(project, "sample"))
+        self.assertEqual(_installed_version(project, "sample", "^8.0.0"), "8.5.0")
+
+    def test_yarn_project_with_transitive_sibling_keeps_discovery_targets(self) -> None:
+        # End-to-end repro of the review's "yarn project may be left without
+        # targets": before the fix the transitive `sample@^7.0.0` collided with
+        # the direct `sample@^8.0.0`, discovery abstained (installed-version-
+        # unknown) and the package lost its upgrade. With the direct selector
+        # read, the registry latest is still proposed for the direct dependency.
+        project = self._tmp / "yarn-e2e"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "package.json").write_text(
+            json.dumps(
+                {"name": "x", "version": "1.0.0", "dependencies": {"sample": "^8.0.0"}}
+            ),
+            encoding="utf-8",
+        )
+        (project / "yarn.lock").write_text(
+            "# yarn lockfile v1\n"
+            '\n'
+            '"sample@^7.0.0":\n'
+            '  version "7.2.0"\n'
+            '\n'
+            '"sample@^8.0.0":\n'
+            '  version "8.5.0"\n',
+            encoding="utf-8",
+        )
+
+        def fake_latest(project_dir, name, runtime_env):
+            return "9.0.0"
+
+        with mock.patch("iterative_migration._npm_latest_version", side_effect=fake_latest):
+            config = build_run_config(self._tmp, _base_args(str(project)))
+
+        self.assertEqual(config["targets"], {"sample": "9.0.0"})
+        entry = config["targetDiscovery"][0]
+        self.assertEqual(entry["status"], "discovered")
+        self.assertEqual(entry["installed"], "8.5.0")
+        self.assertFalse(
+            any(e["status"] == "installed-version-unknown" for e in config["targetDiscovery"])
+        )
 
 
 def _rmtree(path: Path) -> None:

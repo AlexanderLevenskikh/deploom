@@ -181,3 +181,58 @@ OK, check:iterative-migration/runner/agent/begin/task-clipboard/i18n/ui-lifecycl
 Честные ограничения не изменились: E12/E13 live-агент на реальном проекте,
 E9 физический install под выбранным Node вне fake-фикстуры, наблюдение GitHub
 Actions после публикации тега — отдельным шагом.
+
+## Третий раунд ревью v0.2.156 (2026-09-30): 3 расхождения закрыты
+
+Ревью v0.2.156 (HEAD `1e9402d`) выставило 3 расхождения. Все закрыты:
+
+| # | Замечание | Фикс |
+| --- | --- | --- |
+| P1 | Поиск сравнивал кандидата с нижней границей диапазона `package.json` (`^8.0.0` → пол 8.0.0), а не с установленной версией из lockfile — при установленной 8.5.0 версия 8.1.0 считалась обновлением (откат) | `_discover_targets` берёт достоверную установленную версию из канонического lockfile (`_installed_version`: package-lock/shrinkwrap `.packages`/legacy `.dependencies`, yarn.lock v1 по selector-ключам, pnpm-lock.yaml `/name@version`); кандидат принимается только если npm-semver доказывает его строго новее УСТАНОВЛЕННОЙ версии (`_newer_than_installed`), up-to-date сравнивается с установленной, а при невозможности установить версию discovery воздерживается (`installed-version-unknown` + reason), не угадывая. `installed` заносится в evidence/reasons. Regression: installed-версия выше пола диапазона (8.1.0 отвергнут, 8.6.0 принят), installed-unknown. |
+| P1 | При ремонте пробной комбинации промпт содержит её точный `assignment`, но приложенное ТЗ построено по последнему принятому checkpoint — оба набора версий могли попасть в одно сообщение; проверка актуальности не видела пробную комбинацию | Диспатч больше не прикладывает checkpoint-ТЗ к ремонту КАНДИДАТА: `repairPromptTaskText(bootstrap, taskDispatchable(...))` отдаёт текст ТЗ только для version-neutral bootstrap-ремонта (его assignment совпадает с ТЗ), а кандидатный ремонт самодостаточен из durable assignment + repair requests (вариант «не прикладывать checkpoint-ТЗ при ремонте кандидата»). Contract-чеки: ремонт кандидата после C0 не содержит версий checkpoint, только версии trial. |
+| P2 | Статус `no-newer-compatible` писался в свидетельства поиска, но пакет исключался из `targets`; ТЗ считало остаток только по `targets` → «0 из 0», хотя намерение обновить пакет оставалось невыполненным (терминал честно `NO_ACTIONABLE`) | `iterative_task.py` переносит `no-newer-compatible` строки из `config.targetDiscovery` (durable) в остаток и знаменатель (`_discovery_intents`), добавляет их в deferred-таблицу с причиной и `latest` как lagPolicyTarget; «1 из 1» вместо «0 из 0», причина видна в манифесте и RU/EN ТЗ. |
+
+Гейты этой ревизии: `test_iterative_target_discovery.py` 21 OK (включая 6 новых:
+2 на installed-версию выше пола диапазона, installed-unknown, 3 на чтение
+lockfile npm/yarn/pnpm), `test_iterative_task_export.py` 18 OK (включая
+`no-newer-compatible` в итоговом остатке), `test_iterative_*.py` 96 OK,
+`--suite all` **1528 OK (4 skipped)**, `--suite production-fast` **64 OK**,
+физический acceptance `test_iterative_migration_physical.py` PASS (~47s);
+Desktop tsc (electron) OK, lint 15 pre-existing warnings / 0 errors, vite build
+OK, check:iterative-migration/runner/agent/task-clipboard OK (check:
+iterative-runner дополнительно статически проверяет маршрутизацию ТЗ
+`repairPromptTaskText(bootstrap, taskDispatchable(runDir))`).
+
+Честные ограничения не изменились: E12/E13 live-агент на реальном проекте,
+E9 физический install под выбранным Node вне fake-фикстуры, наблюдение GitHub
+Actions после публикации тега — отдельным шагом; реальный прогон проекта и
+релизный CI этой проверкой не подтверждались.
+
+## Третий раунд, повторная ревизия (2026-09-30): 3 расхождения прежнего фикса закрыты
+
+Ревью после первой ревизии v0.2.156 вернуло 3 новых расхождения (откат всё
+равно был возможен через `latest`; yarn-проект мог остаться без целей из-за
+столкновения прямой и транзитивной резолюций; `installed-version-unknown`
+снова выглядел как «0 из 0»). Первая ревизия фиксила три исходных пункта, но
+guard «строго новее установленного» стоял только у bounded-search кандидатов —
+обе ветки прямого принятия `latest` обходили его. Закрыто:
+
+| # | Замечание | Фикс |
+| --- | --- | --- |
+| P1 | Откат всё ещё возможен через `latest`: при установленной 8.5.0 и registry `latest=8.1.0` (`dist-tag` отстаёт) обе ветки, где `latest` принимается напрямую (без pinned Node и pinned+engine-ok), возвращали цель 8.1.0 — без проверки «строго новее установленной» | Guard `_newer_than_installed(latest, installed)` поднят ПЕРЕД любым прямым принятием `latest` (и unpinned, и pinned/engine-ok): `latest`, не доказуемо строго новее установленного, фиксируется как `no-newer-compatible` (reason «roll the package back» + rejected[-сторока]), целей нет; bounded search остаётся единственным путём выбрать доказуемо более новую версию. Regression: `latest=8.1.0` ниже установленной 8.5.0 — unpinned и pinned+engine-ok — цель не выдаётся (2 теста). |
+| P1 | Yarn-чтение собирало ВСЕ версии пакета по всем селекторам: прямая `sample@^8.0.0 → 8.5.0` и транзитивная `sample@^7.0.0 → 7.2.0` давали `None` (два значения) → discovery воздерживался, и проекту доставалось ноль целей | `_yarn_lock_installed_version(lock, name, declared_spec)` принимает declared спецификацию прямой зависимости и раньше считает только блоки с её селектором (`sample@^8.0.0`, или `npm:`-вариант) — транзитивный 7.2.0 не смешивается с прямой 8.5.0. Без declared (fallback) сохраняется старое правило «одна версия по всем селекторам». Regression: unit (без declared → None, с declared → 8.5.0) и end-to-end (yarn-проект не теряет целей, target = registry latest). |
+| P2 | `installed-version-unknown` не попадал в остаток: воспроизведённый расчёт давал `(policySatisfied=False, denominator=0, remaining=0)` — та же «0 из 0», неразрешённая неопределённость исчезала | `iterative_task.py`: новый `_discovery_unknowns(config)` переносит `installed-version-unknown` в знаменатель/остаток (`_targets_satisfied`) и в манифест (`unknownGoals`) и в RU/EN ТЗ отдельным разделом «Неопределённые цели (установленная версия неизвестна)» / «Unknown goals (installed version not readable)» — явно БЕЗ заявления, что отставание доказано («отставание НЕ подтверждено» / «NO lag is proven»); цель остаётся в знаменателе как неразрешённая неопределённость, `deferred` остаётся пустым. Regression: remainder «1 из 1», неизвестный раздел в манифесте и RU/EN ТЗ. |
+
+Гейты этой ревизии: `test_iterative_target_discovery.py` 25 OK (добавлены 4:
+latest-ниже-installed unpinned и pinned+engine-ok, yarn-выбор прямой резолюции
+unit и end-to-end), `test_iterative_task_export.py` 19 OK (добавлен
+`installed-version-unknown` в остатке), `test_iterative_*.py` 95 OK,
+`--suite all` **1533 OK (4 skipped)**, `--suite production-fast` **64 OK**,
+физический acceptance `test_iterative_migration_physical.py` PASS (~42s);
+Desktop tsc (electron) OK, lint 15 pre-existing warnings / 0 errors, vite build
+OK, check:iterative-migration/runner/agent/task-clipboard OK.
+
+Честные ограничения не изменились: E12/E13 live-агент на реальном проекте,
+E9 физический install под выбранным Node вне fake-фикстуры, наблюдение GitHub
+Actions после публикации тега — отдельным шагом; реальный прогон проекта и
+релизный CI этой проверкой не подтверждались.

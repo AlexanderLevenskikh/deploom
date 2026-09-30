@@ -7,10 +7,10 @@ hashes -- published atomically, so an interrupted export never replaces the
 last valid set and a stale set can not silently travel to another candidate.
 
 The builder consumes ONLY durable state (run.json, run-config.json,
-checkpoints/*, ledger.json, targets). It never runs a Baseline, never performs
-project checks and never invents proof: evidence fields come from the
-checkpoints, and anything absent is reported as a specific missing-field
-diagnostic instead of being fabricated.
+checkpoints/*, ledger.json, targets, targetDiscovery). It never runs a
+Baseline, never performs project checks and never invents proof: evidence
+fields come from the checkpoints, and anything absent is reported as a
+specific missing-field diagnostic instead of being fabricated.
 """
 
 from __future__ import annotations
@@ -121,8 +121,95 @@ def _targets_satisfied(config: Mapping[str, Any], active: Mapping[str, Any]) -> 
         for name, version in targets.items()
         if assignment.get(name) != version or name not in assignment
     )
-    satisfied = len(targets) > 0 and unmet == 0
-    return satisfied, len(targets), unmet
+    intents = _discovery_intents(config)
+    unknowns = _discovery_unknowns(config)
+    # An unfulfilled discovery intent (``no-newer-compatible``) has NO
+    # executable target, so no assignment can ever satisfy it: it stays in the
+    # remainder and denominator. Without this a project whose discovery found
+    # no compatible upgrade for its packages read as "0 of 0" although the
+    # intent to upgrade each package was unfulfilled. ``installed-version-unknown``
+    # goals (review re-check P2) are the same kind of unresolved uncertainty and
+    # are counted here too — an unknown installed version is still an unfulfilled
+    # goal, never a proven lag and never a licence to guess a version.
+    unmet += len(intents) + len(unknowns)
+    denominator = len(targets) + len(intents) + len(unknowns)
+    satisfied = denominator > 0 and unmet == 0
+    return satisfied, denominator, unmet
+
+
+def _discovery_intents(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Unfulfilled upgrade intents captured by bounded target discovery.
+
+    ``_discover_targets`` records a ``no-newer-compatible`` row (with the
+    registry ``latest`` and an honest reason) when no verified-compatible
+    version strictly newer than the INSTALLED one exists, and deliberately
+    does NOT add the package to ``config.targets`` — there is no executable
+    target version. Those rows are durable in run-config.json
+    (``targetDiscovery``), so the task builder surfaces them in the remainder
+    and the deferred table instead of letting an all-deferred project read as
+    an empty "0 of 0". They are deferrals-with-reason, never invented targets.
+    """
+    rows: List[Dict[str, Any]] = []
+    discovery = config.get("targetDiscovery")
+    if not isinstance(discovery, list):
+        return rows
+    for entry in discovery:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("status") or "") != "no-newer-compatible":
+            continue
+        name = str(entry.get("package") or "")
+        if not name:
+            continue
+        rows.append(
+            {
+                "package": name,
+                "declared": str(entry.get("declared") or ""),
+                "installed": str(entry.get("installed") or ""),
+                "latest": str(entry.get("latest") or ""),
+                "reason": (
+                    str(entry.get("reason") or "")
+                    or "no verified-compatible version strictly newer than the installed one"
+                ),
+            }
+        )
+    return rows
+
+
+def _discovery_unknowns(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Goals whose INSTALLED version could not be read from the lockfile.
+
+    ``_discover_targets`` abstains (``installed-version-unknown`` — no target,
+    never a downgrade guess) when the exact installed version cannot be proven
+    from the canonical lockfile. Such a goal is an UNRESOLVED uncertainty, not
+    a proven lag: it must stay in the remainder and denominator so the task
+    does not read "0 of 0" again, but it must never be presented as a confirmed
+    deferral nor as evidence that the package is behind — the exactly installed
+    version is unknown and no lag is proven.
+    """
+    rows: List[Dict[str, Any]] = []
+    discovery = config.get("targetDiscovery")
+    if not isinstance(discovery, list):
+        return rows
+    for entry in discovery:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("status") or "") != "installed-version-unknown":
+            continue
+        name = str(entry.get("package") or "")
+        if not name:
+            continue
+        rows.append(
+            {
+                "package": name,
+                "declared": str(entry.get("declared") or ""),
+                "reason": (
+                    str(entry.get("reason") or "")
+                    or "the exact installed version cannot be read from the canonical lockfile"
+                ),
+            }
+        )
+    return rows
 
 
 def _accepted_actions(checkpoints: Sequence[Mapping[str, Any]]) -> List[Dict[str, str]]:
@@ -216,6 +303,24 @@ def _deferred_rows(
                 "reason": reason,
             }
         )
+    # Discovery intents (``no-newer-compatible``) are unfulfilled upgrades with
+    # NO executable target: they are surfaced as deferrals WITH their reason
+    # even though the package is absent from ``config.targets`` (the review P2
+    # fix — an unavailable compatible goal must not vanish from the remainder).
+    seen = {str(entry.get("package")) for entry in deferred}
+    for entry in _discovery_intents(config):
+        name = str(entry["package"])
+        if name in seen:
+            continue
+        seen.add(name)
+        deferred.append(
+            {
+                "package": name,
+                "current": assignment.get(name) or "<absent>",
+                "lagPolicyTarget": entry["latest"] or "-",
+                "reason": entry["reason"],
+            }
+        )
     return deferred
 
 
@@ -239,6 +344,7 @@ def build_task_markdown(
     assignment = {str(k): str(v) for k, v in (active.get("fullAssignment") or {}).items()}
     actions = _accepted_actions(checkpoints)
     deferred = _deferred_rows(ledger, config, active)
+    unknown_goals = _discovery_unknowns(config)
     satisfied, denominator, remaining = _targets_satisfied(config, active)
     verification = active.get("verification") or {}
     audit = active.get("audit") or {}
@@ -253,14 +359,16 @@ def build_task_markdown(
     if language == "ru":
         return _build_ru(
             run=run, config=config, active=active, assignment=assignment,
-            actions=actions, deferred=deferred, satisfied=satisfied,
+            actions=actions, deferred=deferred, unknown_goals=unknown_goals,
+            satisfied=satisfied,
             denominator=denominator, remaining=remaining,
             verification=verification, audit=audit, command_set_hash=command_set_hash,
             commands=commands, fm=fm, table=table,
         )
     return _build_en(
         run=run, config=config, active=active, assignment=assignment,
-        actions=actions, deferred=deferred, satisfied=satisfied,
+        actions=actions, deferred=deferred, unknown_goals=unknown_goals,
+        satisfied=satisfied,
         denominator=denominator, remaining=remaining,
         verification=verification, audit=audit, command_set_hash=command_set_hash,
         commands=commands, fm=fm, table=table,
@@ -287,7 +395,7 @@ def _runtime_summary(config: Mapping[str, Any]) -> str:
 
 def _build_ru(
     *,
-    run, config, active, assignment, actions, deferred, satisfied,
+    run, config, active, assignment, actions, deferred, unknown_goals, satisfied,
     denominator, remaining, verification, audit, command_set_hash, commands, fm, table,
 ) -> str:
     lines: List[str] = []
@@ -388,6 +496,24 @@ def _build_ru(
     else:
         lines.append("")
         lines.append("Явных отложенных пакетов нет.")
+    if unknown_goals:
+        lines.append("")
+        lines.append("### Неопределённые цели (установленная версия неизвестна)")
+        lines.append("")
+        lines.append("| Пакет | declared | Причина |")
+        lines.append("| --- | --- | --- |")
+        for entry in unknown_goals:
+            lines.append(
+                f"| `{entry['package']}` | `{entry['declared']}` | {entry['reason']} |"
+            )
+        lines.append("")
+        lines.append(
+            "По этим целям отставание НЕ подтверждено: точная установленная версия не "
+            "читается из канонического lockfile, поэтому обновление не доказуемо. Не "
+            "утверждай, что пакет отстаёт, не подставляй в цель произвольную версию и не "
+            "вычёркивай пакет из scope; цель остаётся в знаменателе как неразрешённая "
+            "неопределённость."
+        )
     lines.append("")
     lines.append("## Статус проверок и аудита")
     lines.append("")
@@ -432,7 +558,7 @@ def _build_ru(
 
 def _build_en(
     *,
-    run, config, active, assignment, actions, deferred, satisfied,
+    run, config, active, assignment, actions, deferred, unknown_goals, satisfied,
     denominator, remaining, verification, audit, command_set_hash, commands, fm, table,
 ) -> str:
     lines: List[str] = []
@@ -534,6 +660,23 @@ def _build_en(
     else:
         lines.append("")
         lines.append("No explicit deferrals.")
+    if unknown_goals:
+        lines.append("")
+        lines.append("### Unknown goals (installed version not readable)")
+        lines.append("")
+        lines.append("| Package | declared | Reason |")
+        lines.append("| --- | --- | --- |")
+        for entry in unknown_goals:
+            lines.append(
+                f"| `{entry['package']}` | `{entry['declared']}` | {entry['reason']} |"
+            )
+        lines.append("")
+        lines.append(
+            "NO lag is proven for these goals: the exact installed version cannot be read "
+            "from the canonical lockfile, so an update is not provable. Do not claim the "
+            "package is behind, do not invent a target version, and do not scope-exclude "
+            "the package; it stays in the denominator as an unresolved uncertainty."
+        )
     lines.append("")
     lines.append("## Check and audit status")
     lines.append("")
@@ -598,6 +741,7 @@ def build_task_manifest(
         )
     assignment = {str(k): str(v) for k, v in (active.get("fullAssignment") or {}).items()}
     deferred = _deferred_rows(ledger, config, active)
+    unknown_goals = _discovery_unknowns(config)
     satisfied, denominator, remaining = _targets_satisfied(config, active)
     commands = list((config.get("verifyConfig") or {}).get("commands") or ())
     command_set_hash = _sha256_text(_stable_json(commands))
@@ -634,6 +778,7 @@ def build_task_manifest(
         "exactVersions": assignment,
         "actions": _accepted_actions(checkpoints),
         "deferred": deferred,
+        "unknownGoals": unknown_goals,
         "completeness": {
             "policySatisfied": satisfied,
             "denominator": int(denominator),

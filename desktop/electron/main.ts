@@ -53,7 +53,7 @@ import { summarizeUpdaterError } from './updater-error.js'
 import { flowNotificationContent, type FlowNotificationEvent } from './notifications.js'
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
-import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, taskDispatchable, taskStaleness } from './iterative-migration.js'
+import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
 import { iterativeBeginInvocation, targetsFromDashboardState } from './iterative-begin.js'
 import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
@@ -7888,16 +7888,15 @@ function setupIpc(): void {
         failingCommands: request.failingCommands ?? [],
         diagnosticsTail: String(request.diagnosticsTail ?? ''),
       }))
-      // Postfix P1 (#2): NEVER dispatch stale task text. Only a task whose
-      // manifest is verified CURRENT (run/policy/checkpoint identity AND
-      // content hashes) may seed the prompt; anything else yields an empty ТЗ —
-      // the prompt itself is exact and self-sufficient from the durable
-      // assignment and the repair requests, so an attempt never starts with a
-      // C0-bound text that contradicts the candidate's assignment.
-      const dispatchable = taskDispatchable(runDir)
-      const taskText = dispatchable.ok
-        ? (dispatchable.task.text.ru ?? dispatchable.task.text.en ?? '')
-        : ''
+      // Postfix P1 (#2) + review P1: NEVER dispatch stale task text, and never
+      // attach a CHECKPOINT-built ТЗ to a CANDIDATE repair. The exported ТЗ is
+      // authored over the last accepted checkpoint — the candidate's trial
+      // assignment differs from it, so attaching both would hand the agent two
+      // contradictory version sets in one message. Only the version-neutral
+      // BOOTSTRAP repair (same C0 assignment as the ТЗ) attaches task text; a
+      // candidate repair is exact and self-sufficient from the durable
+      // candidate assignment and the open repair requests.
+      const taskText = repairPromptTaskText(bootstrap, taskDispatchable(runDir))
       ctx.taskText = taskText
 
       // R5: route to the provider actually selected in the workspace instead of

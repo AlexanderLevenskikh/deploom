@@ -98,6 +98,22 @@ for (const needle of [
   if (!prompt.includes(needle)) throw new Error(`Prompt must mention "${needle}"`);
 }
 
+// 2b. Review P1 (contradictory versions): a CANDIDATE repair reworks the trial
+// C2 on top of base checkpoint C1 whose fullAssignment is is-number=6.0.0. The
+// checkpoint-built ТЗ would carry that 6.0.0 while the trial installs 7.0.0 —
+// so the dispatch withholds the ТЗ for a candidate repair (taskText="").
+// The prompt must stay self-sufficient and carry ONLY the trial assignment.
+const candidatePrompt = buildIterativeRepairPrompt({ ...ctx, taskText: "" });
+if (candidatePrompt.includes("is-number = 6.0.0")) {
+  throw new Error("candidate repair prompt must not carry the contradictory checkpoint assignment (is-number = 6.0.0)");
+}
+if (!candidatePrompt.includes("is-number = 7.0.0")) {
+  throw new Error(`candidate repair prompt must carry the exact trial assignment: ${candidatePrompt}`);
+}
+for (const needle of ["repair-1", "CHANGED_FILES:", "is-number = 7.0.0", "package-lock.json"]) {
+  if (!candidatePrompt.includes(needle)) throw new Error(`Candidate repair prompt must stay self-sufficient (${needle})`);
+}
+
 // 3. Baseline hash diff covers EVERY significant file (only node_modules/.git
 // is skipped), so planner-owned manifests are detected when mutated or
 // deleted. Edits, adds AND removes are reported; planner-forbidden mutations

@@ -260,6 +260,14 @@ if (!statusInvocation.args.includes("status") || !statusInvocation.args.includes
   if (!main.includes("taskDispatchable(runDir)")) {
     throw new Error("dispatch must verify the task manifest (identity + content hashes) before seeding the prompt (postfix P1 #2)");
   }
+  // Review P1 (contradictory versions): a CANDIDATE repair must never be
+  // seeded with the checkpoint-built ТЗ (its trial assignment differs), only
+  // the version-neutral bootstrap repair attaches task text. The routing must
+  // go through the pure repairPromptTaskText(bootstrap, taskDispatchable(...))
+  // contract so the decision is checkable without an Electron run.
+  if (!main.includes("repairPromptTaskText(bootstrap, taskDispatchable(runDir))")) {
+    throw new Error("repair dispatch must route task text by bootstrap vs candidate (review P1: no checkpoint ТЗ for a candidate repair)");
+  }
 }
 
 if (!existsSync(runDir)) throw new Error("fixture missing");
