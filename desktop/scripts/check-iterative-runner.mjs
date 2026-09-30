@@ -239,6 +239,14 @@ if (!statusInvocation.args.includes("status") || !statusInvocation.args.includes
   if (!/'agent-gate' \| 'finished' \| 'error' \| 'time-budget' \| 'iteration-budget'/.test(types)) {
     throw new Error("IterativeDriveOutcome.stopped union must list every stop reason");
   }
+  // P1.1: the task artifact (human-facing) must never block the coordinator.
+  // The agent handler and the drive gate rebuild it from the DURABLE state
+  // before a gate; copy-task reuses the same refresh. A TASK_STALE rejection
+  // on the repair path is a regression.
+  if (/TASK_STALE/.test(main)) throw new Error("repair path must not reject a stale task artifact (P1.1: TASK_STALE removed)");
+  if (!main.includes("await refreshIterativeTaskArtifact(runDir, generator, python, workspace.path)")) {
+    throw new Error("agent/dispatch paths must rebuild the task artifact from durable state (P1.1)");
+  }
 }
 
 if (!existsSync(runDir)) throw new Error("fixture missing");

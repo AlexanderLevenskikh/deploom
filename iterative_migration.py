@@ -725,17 +725,55 @@ def build_run_config(run_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
             if isinstance(name, str) and isinstance(version, str) and name.strip() and version.strip():
                 targets[name] = version
 
-    # #2: bounded target discovery when the caller brought NO roadmap targets
-    # (no dashboard-state and no explicit targets file): derive them from the
-    # direct dependency set's registry dist-tags.latest (yellow lag policy),
-    # without the full generator/solver and without inventing a version. A
-    # saved roadmap still wins when provided.
+    # D3: an explicitly requested project/CI Node runtime is resolved to ONE
+    # concrete installed executable+exact-version at begin. Empty means "not
+    # set by the user" — no CI-compatibility claim, no automatic latest; a set
+    # but unavailable version is ENVIRONMENT_UNAVAILABLE, never a PATH fallback.
+    requested_node = (args.requested_node or "").strip()
+    runtime: Dict[str, Any] = {}
+    if requested_node:
+        from project_runtime import resolve_requested_node
+
+        resolution = resolve_requested_node(requested_node)
+        if not resolution.found:
+            raise InvalidInputError(
+                f"ENVIRONMENT_UNAVAILABLE: requested Node {requested_node!r} is not installed; "
+                + resolution.unavailable_reason
+            )
+        runtime = {
+            "requested": requested_node,
+            "effectiveVersion": resolution.effective_version,
+            "nodePath": resolution.node_path,
+            "npmPath": resolution.npm_path,
+            "source": resolution.source,
+            "contractHash": resolution.contract_hash(),
+        }
+        # D3.3: the full runtime contract also pins the package manager and the
+        # executing platform. The durable contractHash covers every field of the
+        # block, so a manager swap or a different OS invalidates the identity.
+        runtime["packageManager"], runtime["packageManagerVersion"] = _manager_runtime_identity(project_dir)
+        runtime["platform"] = sys.platform
+        runtime["arch"] = platform.machine()
+        runtime["hash"] = hashlib.sha256(
+            _stable_json({k: v for k, v in runtime.items() if k != "hash"}).encode("utf-8")
+        ).hexdigest()
+        runtime["contractHash"] = runtime["hash"]
+
+    # #2/P1.2: bounded target discovery when the caller brought NO roadmap
+    # targets (no dashboard-state and no explicit targets file): derive them
+    # from the direct dependency set's registry dist-tags.latest (yellow lag
+    # policy), without the full generator/solver and without inventing a
+    # version. When the run pins a concrete Node, the choice is engine-aware:
+    # a latest known to exclude that Node triggers a bounded search for the
+    # highest COMPATIBLE version instead of a silent deferral. A saved roadmap
+    # still wins when provided.
     target_discovery: List[Dict[str, Any]] = []
     if not targets:
         targets, target_discovery = _discover_targets(
             project_dir,
             direct_dependency_assignment(project_dir),
             None,
+            runtime.get("effectiveVersion"),
         )
 
     commands = tuple(str(item) for item in (verify_raw.get("commands") or []))
@@ -779,39 +817,6 @@ def build_run_config(run_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
     if dashboard_state_path is not None and not dashboard_state_path.exists():
         raise InvalidInputError(f"DASHBOARD_STATE_MISSING: {dashboard_state_path}")
 
-    # D3: an explicitly requested project/CI Node runtime is resolved to ONE
-    # concrete installed executable+exact-version at begin. Empty means "not
-    # set by the user" — no CI-compatibility claim, no automatic latest; a set
-    # but unavailable version is ENVIRONMENT_UNAVAILABLE, never a PATH fallback.
-    requested_node = (args.requested_node or "").strip()
-    runtime: Dict[str, Any] = {}
-    if requested_node:
-        from project_runtime import resolve_requested_node
-
-        resolution = resolve_requested_node(requested_node)
-        if not resolution.found:
-            raise InvalidInputError(
-                f"ENVIRONMENT_UNAVAILABLE: requested Node {requested_node!r} is not installed; "
-                + resolution.unavailable_reason
-            )
-        runtime = {
-            "requested": requested_node,
-            "effectiveVersion": resolution.effective_version,
-            "nodePath": resolution.node_path,
-            "npmPath": resolution.npm_path,
-            "source": resolution.source,
-            "contractHash": resolution.contract_hash(),
-        }
-        # D3.3: the full runtime contract also pins the package manager and the
-        # executing platform. The durable contractHash covers every field of the
-        # block, so a manager swap or a different OS invalidates the identity.
-        runtime["packageManager"], runtime["packageManagerVersion"] = _manager_runtime_identity(project_dir)
-        runtime["platform"] = sys.platform
-        runtime["arch"] = platform.machine()
-        runtime["hash"] = hashlib.sha256(
-            _stable_json({k: v for k, v in runtime.items() if k != "hash"}).encode("utf-8")
-        ).hexdigest()
-        runtime["contractHash"] = runtime["hash"]
     audit_policy = {
         "lagMonths": _clamp_int(
             args.lag_months if args.lag_months is not None else 12,
@@ -866,16 +871,24 @@ def _begin_locked(run_dir: Path, config: Mapping[str, Any], args: argparse.Names
     )
 
     discovery = config.get("targetDiscovery") or []
-    discovered = [entry for entry in discovery if entry.get("status") == "discovered"]
+    discovered = [
+        entry for entry in discovery
+        if entry.get("status") in ("discovered", "discovered-compatible")
+    ]
     unavailable = [entry for entry in discovery if entry.get("status") == "registry-unavailable"]
-    if discovered or unavailable:
+    incompatible_no_alt = [
+        entry for entry in discovery
+        if entry.get("status") == "latest-incompatible-no-alternative"
+    ]
+    if discovered or unavailable or incompatible_no_alt:
         _emit_status(
             {
                 "event": "begin.discovery",
                 "runId": run_id,
-                "source": "registry dist-tags.latest",
+                "source": "registry dist-tags.latest (engine-aware)",
                 "discoveredTargets": sorted(str(entry.get("package") or "") for entry in discovered),
                 "registryUnavailable": sorted(str(entry.get("package") or "") for entry in unavailable),
+                "noCompatibleAlternative": sorted(str(entry.get("package") or "") for entry in incompatible_no_alt),
             }
         )
 
@@ -1640,20 +1653,78 @@ def _npm_latest_version(
     return str(parsed or "").strip()[:128]
 
 
+def _npm_versions(
+    project_dir: Path,
+    name: str,
+    runtime_env: Optional[Dict[str, str]],
+    top: int = 12,
+) -> List[str]:
+    """Registry version list of a package, newest-first, bounded ([] = none).
+
+    Best-effort, evidence-light and safe: any probe failure returns an empty
+    list — abstention, never a constraint. The bound keeps engine-affinity
+    discovery cheap even for packages with thousands of published versions.
+    """
+    manager = resolve_executable("npm")
+    if not manager:
+        return []
+    try:
+        completed = _run(
+            [manager, "view", name, "versions", "--json"],
+            project_dir,
+            timeout_seconds=60,
+            env=runtime_env or {},
+            base_env=os.environ,
+            progress_label=f"version discovery {name}",
+        )
+    except Exception:  # noqa: BLE001 - a probe failure is abstention, never a constraint
+        return []
+    if completed.returncode != 0:
+        return []
+    text = (completed.stdout or "").strip()
+    if not text or text in ("{}", "null", "undefined"):
+        return []
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = text
+    if not isinstance(parsed, list):
+        parsed = [parsed] if isinstance(parsed, str) else []
+    versions = [str(item).strip()[:128] for item in parsed if isinstance(item, str) and item.strip()]
+    return sorted(versions, key=_version_sort_key, reverse=True)[:top]
+
+
+def _version_sort_key(value: str) -> Tuple[int, ...]:
+    """Best-effort descending version key (x.y.z, prerelease/beta tolerated)."""
+    key: List[int] = []
+    for part in str(value).lstrip("vV").split("."):
+        try:
+            key.append(int(part.split("-")[0]))
+        except ValueError:
+            key.append(0)
+    return tuple(key)
+
+
 def _discover_targets(
     project_dir: Path,
     current: Mapping[str, str],
     runtime_env: Optional[Dict[str, str]],
+    node_version: Optional[str] = None,
 ) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
-    """#2 bounded target discovery for begin when no roadmap targets exist.
+    """#2/P1.2 bounded target discovery for begin when no roadmap targets exist.
 
     Yellow lag policy applied WITHOUT the legacy generator or solver: for every
-    direct managed dependency, the registry ``dist-tags.latest`` IS the target.
-    A version is never invented and never inherited from a dashboard: a package
-    whose latest cannot be established from the registry is skipped and
-    reported as evidence, and a package already at latest produces no target.
-    Later planning layers (the #6 engine pre-check) may still defer a target
-    that excludes the run's chosen Node.
+    direct managed dependency, the registry ``dist-tags.latest`` is the target,
+    unless the run pins a concrete Node and the registry KNOWS latest excludes
+    it. In that case a bounded search over the newest published versions picks
+    the highest VERIFIED-compatible version and that version becomes the target
+    — the user gets an upgrade that actually installs under the chosen Node
+    instead of a stale deferral. A version is never invented, and a package
+    whose latest cannot be established is skipped as evidence. When no
+    compatible alternative exists in the bounded window, latest stays the
+    target and the #6 engine pre-check defers it honestly (ENGINES_INCOMPATIBLE
+    with an explicit reason). Unknown engines are an abstention, never a false
+    incompatibility claim; without a pinned Node the choice is engine-unchecked.
     """
     targets: Dict[str, str] = {}
     evidence: List[Dict[str, Any]] = []
@@ -1669,9 +1740,65 @@ def _discover_targets(
                 {"package": name, "declared": declared, "latest": latest, "status": "up-to-date"}
             )
             continue
+        if not node_version:
+            targets[name] = latest
+            evidence.append(
+                {
+                    "package": name, "declared": declared, "latest": latest,
+                    "status": "discovered", "engineUnchecked": True,
+                }
+            )
+            continue
+        from project_runtime import node_range_satisfied
+
+        latest_spec = _npm_engines_node(project_dir, name, latest, runtime_env)
+        if not latest_spec or node_range_satisfied(latest_spec, node_version):
+            targets[name] = latest
+            evidence.append(
+                {
+                    "package": name, "declared": declared, "latest": latest,
+                    "nodeVersion": node_version, "latestNodeSpec": latest_spec,
+                    "status": "discovered",
+                    **({"enginesUnknown": True} if not latest_spec else {}),
+                }
+            )
+            continue
+        chosen: Optional[str] = None
+        chosen_spec = ""
+        rejected: List[Dict[str, Any]] = []
+        for candidate in _npm_versions(project_dir, name, runtime_env, top=12):
+            if candidate == latest:
+                continue
+            candidate_spec = _npm_engines_node(project_dir, name, candidate, runtime_env)
+            if not candidate_spec:
+                rejected.append({"version": candidate, "nodeSpec": "", "status": "engines-unknown"})
+                continue
+            if node_range_satisfied(candidate_spec, node_version):
+                chosen = candidate
+                chosen_spec = candidate_spec
+                break
+            rejected.append({"version": candidate, "nodeSpec": candidate_spec, "status": "engines-incompatible"})
+        if chosen:
+            targets[name] = chosen
+            evidence.append(
+                {
+                    "package": name, "declared": declared, "latest": latest,
+                    "latestNodeSpec": latest_spec, "nodeVersion": node_version,
+                    "target": chosen, "targetNodeSpec": chosen_spec,
+                    "status": "discovered-compatible",
+                }
+            )
+            continue
+        # No compatible alternative in the bounded window: keep the upgrade
+        # intent and let the #6 pre-check record an honest ENGINES_INCOMPATIBLE
+        # deferral (ledger + events) — never a false compatibility claim.
         targets[name] = latest
         evidence.append(
-            {"package": name, "declared": declared, "latest": latest, "status": "discovered"}
+            {
+                "package": name, "declared": declared, "latest": latest,
+                "latestNodeSpec": latest_spec, "nodeVersion": node_version,
+                "rejected": rejected, "status": "latest-incompatible-no-alternative",
+            }
         )
     return targets, evidence
 

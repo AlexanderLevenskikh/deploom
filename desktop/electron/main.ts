@@ -7459,13 +7459,17 @@ function setupIpc(): void {
       const state = loadState()
       const workspace = findWorkspace(state, input.workspaceId)
       const project = findProject(workspace, input.projectName)
-      const task = readIterativeCurrentTask(iterativeTaskRunDir(workspace, project))
+      const runDir = iterativeTaskRunDir(workspace, project)
+      const task = readIterativeCurrentTask(runDir)
       if (!task) return { ok: false, error: 'NO_TASK' }
-      if (taskStaleness(iterativeTaskRunDir(workspace, project)).stale) {
-        return { ok: false, error: 'TASK_STALE: переэкспортируйте задание перед отправкой' }
-      }
+      // P1.1: reuse the same auto-refresh as the agent gate — the copied ТЗ is
+      // rebuilt from the current durable state, never a stale C0-bound artifact.
+      const python = resolveExecutable('python')
+      const generator = join(bundledToolDir(), 'iterative_migration.py')
+      await refreshIterativeTaskArtifact(runDir, generator, python, workspace.path)
+      const refreshed = readIterativeCurrentTask(runDir) ?? task
       const writer: ClipboardWriter = { writeText: (text) => clipboard.writeText(text), readText: () => clipboard.readText() }
-      return copyTaskWithVerification(task, input.language ?? 'ru', writer)
+      return copyTaskWithVerification(refreshed, input.language ?? 'ru', writer)
     },
   )
 
@@ -7666,6 +7670,9 @@ function setupIpc(): void {
         const decision = decideNextStep(runDir, payload)
         // GATE: the repair agent is a human/provider action, never auto-run.
         if (decision.step === 'agent') {
+          // P1.1: keep the human-facing ТЗ fresh at the gate — rebuilt from the
+          // current durable state, never a stale C0-bound artifact.
+          await refreshIterativeTaskArtifact(runDir, generator, python, workspace.path)
           return {
             ok: true,
             steps,
@@ -7739,6 +7746,17 @@ function setupIpc(): void {
     throw new Error(`OPENCODE_SERVER_START_FAILED: ${tail.trim()}`)
   }
 
+  // P1.1: the exported task artifact is a HUMAN-facing view over the durable
+  // state; it must never block the coordinator. Before an agent gate / agent
+  // dispatch we rebuild it best-effort from the CURRENT durable state, so the
+  // task text the agent and the user see always matches the exact
+  // run/candidate/checkpoint — a stale C0-bound artifact no longer counts.
+  async function refreshIterativeTaskArtifact(runDir: string, generator: string, python: string, workspacePath: string): Promise<boolean> {
+    if (missingTaskExportInput(runDir).length > 0) return false
+    const result = await spawnCapture(python, [generator, '--run-dir', runDir, 'export-task', '--language', 'both'], workspacePath, 120_000)
+    return result.code === 0
+  }
+
   ipcMain.handle('flow:iterative:agent', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
@@ -7750,9 +7768,6 @@ function setupIpc(): void {
     if (!existsSync(join(runDir, 'run.json'))) {
       return { ok: false, error: 'NO_RUN' }
     }
-    if (taskStaleness(runDir).stale) {
-      return { ok: false, error: 'TASK_STALE: переустановите ожидаемый результат перед ремонтом' }
-    }
     // R6: the per-project in-flight guard is taken BEFORE any await. Together
     // with the durable lease below it prevents double dispatch within one
     // process lifetime and across an app restart.
@@ -7761,6 +7776,11 @@ function setupIpc(): void {
     try {
       const python = resolveExecutable('python')
       const generator = join(bundledToolDir(), 'iterative_migration.py')
+      // P1.1: the exported ТЗ is rebuilt from the current durable state before
+      // dispatch instead of refusing a stale artifact — task state never blocks
+      // the repair, and the prompt's taskText always matches the exact
+      // run/candidate/checkpoint the repair is pinned to.
+      await refreshIterativeTaskArtifact(runDir, generator, python, workspace.path)
       const statusResult = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
       const payload = statusResult.code === 0
         ? parseIterativeStatusPayload(statusResult.stdout) ?? readIterativeStatus(runDir)

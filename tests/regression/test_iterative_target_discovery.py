@@ -119,6 +119,105 @@ class IterativeTargetDiscoveryTests(unittest.TestCase):
         self.assertEqual(config["targets"], {})
         self.assertEqual(config["targetDiscovery"], [{"package": "is-number", "declared": "7.0.0", "latest": "7.0.0", "status": "up-to-date"}])
 
+    # P1.2: with a pinned Node, a registry-known-incompatible latest must NOT
+    # silently become a deferred target — a bounded search picks the highest
+    # VERIFIED-compatible published version instead.
+    def _args_with_node(self, project_dir: str, node_version: str) -> object:
+        return _base_args(str(project_dir), requested_node=node_version)
+
+    def _patch_node_resolution(self, effective_version: str):
+        from project_runtime import NodeRuntimeResolution
+
+        def fake_resolve(requested: str) -> NodeRuntimeResolution:
+            return NodeRuntimeResolution(
+                requested=requested,
+                effective_version=effective_version,
+                node_path="C:/fake/node.exe",
+                npm_path="C:/fake/npm.exe",
+                source="requested",
+            )
+
+        return mock.patch("project_runtime.resolve_requested_node", side_effect=fake_resolve)
+
+    def test_pinned_node_prefers_highest_compatible_over_incompatible_latest(self) -> None:
+        project = _make_project(self._tmp, {"is-number": "6.0.0"})
+
+        def fake_latest(project_dir, name, runtime_env):
+            return "9.0.0"
+
+        def fake_versions(project_dir, name, runtime_env, top=12):
+            return ["9.0.0", "8.0.0", "7.0.0", "6.0.0"]
+
+        def fake_engines(project_dir, name, version, runtime_env):
+            return {"9.0.0": ">=22", "8.0.0": ">=22", "7.0.0": ">=18", "6.0.0": ">=12"}[version]
+
+        with self._patch_node_resolution("20.11.0"), \
+             mock.patch("iterative_migration._manager_runtime_identity", return_value=("npm", "10.0.0")), \
+             mock.patch("iterative_migration._npm_latest_version", side_effect=fake_latest), \
+             mock.patch("iterative_migration._npm_versions", side_effect=fake_versions), \
+             mock.patch("iterative_migration._npm_engines_node", side_effect=fake_engines):
+            config = build_run_config(self._tmp, self._args_with_node(project, "20.11.0"))
+
+        # 9.0.0/8.0.0 require Node 22+; 7.0.0 is the highest compatible -> target.
+        self.assertEqual(config["targets"], {"is-number": "7.0.0"})
+        entry = config["targetDiscovery"][0]
+        self.assertEqual(entry["status"], "discovered-compatible")
+        self.assertEqual(entry["target"], "7.0.0")
+        self.assertEqual(entry["latest"], "9.0.0")
+
+    def test_pinned_node_keeps_latest_when_no_compatible_alternative(self) -> None:
+        project = _make_project(self._tmp, {"is-number": "6.0.0"})
+
+        def fake_latest(project_dir, name, runtime_env):
+            return "9.0.0"
+
+        def fake_versions(project_dir, name, runtime_env, top=12):
+            return ["9.0.0", "8.0.0", "7.0.0", "6.0.0"]
+
+        def fake_engines(project_dir, name, version, runtime_env):
+            return {"9.0.0": ">=22", "8.0.0": ">=22", "7.0.0": ">=22", "6.0.0": ">=22"}[version]
+
+        with self._patch_node_resolution("20.11.0"), \
+             mock.patch("iterative_migration._manager_runtime_identity", return_value=("npm", "10.0.0")), \
+             mock.patch("iterative_migration._npm_latest_version", side_effect=fake_latest), \
+             mock.patch("iterative_migration._npm_versions", side_effect=fake_versions), \
+             mock.patch("iterative_migration._npm_engines_node", side_effect=fake_engines):
+            config = build_run_config(self._tmp, self._args_with_node(project, "20.11.0"))
+
+        # No compatible upgrade exists: keep the upgrade intent on latest; the
+        # #6 pre-check records the ENGINES_INCOMPATIBLE deferral with a reason.
+        self.assertEqual(config["targets"], {"is-number": "9.0.0"})
+        entry = config["targetDiscovery"][0]
+        self.assertEqual(entry["status"], "latest-incompatible-no-alternative")
+        self.assertTrue(any(rejected["version"] == "8.0.0" for rejected in entry["rejected"]))
+
+    def test_pinned_node_unknown_latest_engines_is_never_false_incompatibility(self) -> None:
+        project = _make_project(self._tmp, {"is-number": "6.0.0"})
+
+        with self._patch_node_resolution("20.11.0"), \
+             mock.patch("iterative_migration._manager_runtime_identity", return_value=("npm", "10.0.0")), \
+             mock.patch("iterative_migration._npm_latest_version", return_value="9.0.0"), \
+             mock.patch("iterative_migration._npm_engines_node", return_value=""):
+            config = build_run_config(self._tmp, self._args_with_node(project, "20.11.0"))
+
+        # Unknown engines = abstention (compatible per the #6 contract), target
+        # stays latest with the evidence flag; never a false incompatibility.
+        self.assertEqual(config["targets"], {"is-number": "9.0.0"})
+        entry = config["targetDiscovery"][0]
+        self.assertEqual(entry["status"], "discovered")
+        self.assertTrue(entry.get("enginesUnknown"))
+
+    def test_unpinned_node_marks_discovery_engine_unchecked(self) -> None:
+        project = _make_project(self._tmp, {"is-number": "6.0.0"})
+
+        with mock.patch("iterative_migration._npm_latest_version", return_value="9.0.0"):
+            config = build_run_config(self._tmp, _base_args(str(project)))
+
+        self.assertEqual(config["targets"], {"is-number": "9.0.0"})
+        entry = config["targetDiscovery"][0]
+        self.assertEqual(entry["status"], "discovered")
+        self.assertTrue(entry.get("engineUnchecked"))
+
 
 def _rmtree(path: Path) -> None:
     import shutil

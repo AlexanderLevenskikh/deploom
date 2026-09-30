@@ -289,7 +289,7 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
           ) : null}
           {runner?.decision?.step === 'agent' ? (
             <footer className="baseline-intent-actions">
-              <button type="button" className="button primary" disabled={busy !== undefined || stepBusy || Boolean(snapshot?.stale)} onClick={() => void agentNow()}>
+              <button type="button" className="button primary" disabled={busy !== undefined || stepBusy} onClick={() => void agentNow()}>
                 <Wrench size={16} />{text('Исправить агентом', 'Repair with agent')}
               </button>
             </footer>
@@ -314,8 +314,8 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
 
           {snapshot?.stale ? (
             <div className="resume-notice warning">
-              <strong>{text('Задание устарело', 'The assignment is stale')}</strong>
-              <span>{snapshot.staleReason} {text('Переэкспортируйте перед отправкой агенту.', 'Re-export before dispatching to the agent.')}</span>
+              <strong>{text('ТЗ устарело', 'The assignment is stale')}</strong>
+              <span>{snapshot.staleReason} {text('Перед диспатчем агента и на агент-гейте ТЗ пересобирается из текущего durable-состояния автоматически — ручная переэкспорт не обязателен.', 'Before dispatching the agent and at the agent gate the assignment is rebuilt from the current durable state automatically — manual re-export is not required.')}</span>
             </div>
           ) : null}
 
@@ -345,11 +345,11 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
           ) : null}
 
           <footer className="baseline-intent-actions">
-            <button type="button" className="button primary" disabled={busy !== undefined || stepBusy || Boolean(snapshot?.stale)} onClick={() => void driveNow()}>
+            <button type="button" className="button primary" disabled={busy !== undefined || stepBusy} onClick={() => void driveNow()}>
               <Forward size={16} />{text('Продолжить', 'Continue')}
             </button>
             {runner?.decision?.step === 'agent' ? (
-              <button type="button" className="button primary" disabled={busy !== undefined || stepBusy || Boolean(snapshot?.stale)} onClick={() => void agentNow()}>
+              <button type="button" className="button primary" disabled={busy !== undefined || stepBusy} onClick={() => void agentNow()}>
                 <Wrench size={16} />{text('Исправить агентом', 'Repair with agent')}
               </button>
             ) : null}
