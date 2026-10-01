@@ -410,6 +410,10 @@ export type IterativeStatusOutcome = {
   staleReason?: string
   phase?: string
   decision?: IterativeRunnerDecision
+  // Review P1: Electron-authoritative liveness — a REAL begin/drive child is
+  // in-flight for this project, independent of any React component's local busy
+  // flag. The panel relies on it across tab switches and remounts.
+  inFlight?: boolean
   // D2.4: display-only view of the durable runtime contract (requested vs
   // effective + CI evidence source). The UI renders it, never decides by it.
   requestedNode?: string
@@ -448,6 +452,13 @@ export type IterativeAgentOutcome = {
   error?: string
 }
 
+export type IterativeDiscoveryReport = {
+  discovered: string[]
+  unavailable: string[]
+  budgetSkipped: string[]
+  noCompatibleAlternative: string[]
+}
+
 export type IterativeBeginOutcome = {
   ok: boolean
   step?: string
@@ -458,6 +469,16 @@ export type IterativeBeginOutcome = {
   // L2: begin did NOT create a run because there are no saved roadmap targets
   // (the user must pick Draft/scope setup or an explicit bounded discovery).
   noTargets?: boolean
+  // P-review: the registry discovery outcome, so the UI can distinguish
+  // "updates are not needed" from "registry data could not be fetched" and
+  // "the discovery budget was exhausted" — the last two are NOT a completed
+  // migration.
+  discovery?: {
+    discovered: string[]
+    unavailable: string[]
+    budgetSkipped: string[]
+    noCompatibleAlternative: string[]
+  }
   attempt?: IterativeAttemptView
   error?: string
 }

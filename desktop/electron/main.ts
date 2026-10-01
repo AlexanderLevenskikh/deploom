@@ -7608,6 +7608,10 @@ function setupIpc(): void {
       staleReason: taskStaleness(runDir).reason,
       phase,
       decision,
+      // Review P1: Electron-authoritative liveness, available from every status
+      // refresh — a remounted panel learns about the running child from HERE,
+      // not from a local `stepBusy`.
+      inFlight: iterativeStepInFlight.has(project.name),
       requestedNode,
       runtime: runtimeView,
       attempt: readAttempt(runDir),
@@ -7649,8 +7653,10 @@ function setupIpc(): void {
       // L2: NOTHING long runs. There are no saved roadmap targets, so begin
       // neither creates a run nor fires the sequential registry probes; the UI
       // explains the two paths (Draft/scope setup, or bounded discovery).
+      // P-review: this is NOT a successful empty run — the record is a
+      // non-terminal blocker so the panel shows the choice, never "done".
       startAttempt(runDir, project.name, 'none', undefined, 0)
-      updateAttempt(runDir, { status: 'done', stage: 'begin', reason: 'no roadmap targets; nothing was run', lastStep: 'no-targets' })
+      updateAttempt(runDir, { status: 'failed', stage: 'begin', reason: 'no roadmap targets — nothing was run; выберите авто-поиск или настройку обновления', lastStep: 'no-targets' })
       publishIterativeAttempt(runDir)
       return { ok: true, step: 'begin', noTargets: true, targetsCount: 0, targetLevel, attempt: readAttempt(runDir) }
     }
@@ -7714,6 +7720,11 @@ function setupIpc(): void {
         invocation.args.push('--discover-max-packages', String(discovery.maxPackages))
       }
       const beginIo = iterativeStreamIo(runDir)
+      // P-review: the registry discovery outcome (begin.discovery event) is
+      // carried into the outcome so the UI can tell "no updates needed" from
+      // "registry unavailable / budget exhausted" (those are not completion).
+      let discoveryReport: { discovered: string[]; unavailable: string[]; budgetSkipped: string[]; noCompatibleAlternative: string[] } | undefined
+      const strings = (value: unknown): string[] => Array.isArray(value) ? value.map((item) => String(item)) : []
       const result = await spawnIterativeStreamed(runDir, invocation.command, invocation.args, workspace.path, 20 * 60_000, beginIo, iterativeStreamPlatform, (event) => {
         if (event.event === 'begin.capture' && typeof event.managedDependencies === 'number') {
           updateAttempt(runDir, { packageProgress: { processed: 0, total: event.managedDependencies } })
@@ -7722,6 +7733,13 @@ function setupIpc(): void {
           const progress = readAttempt(runDir)?.packageProgress
           updateAttempt(runDir, { packageProgress: { processed: event.processed, total: Math.max(event.total, progress?.total ?? event.total) } })
           publishIterativeAttempt(runDir)
+        } else if (event.event === 'begin.discovery') {
+          discoveryReport = {
+            discovered: strings(event.discoveredTargets),
+            unavailable: strings(event.registryUnavailable),
+            budgetSkipped: strings(event.budgetSkipped),
+            noCompatibleAlternative: strings(event.noCompatibleAlternative),
+          }
         }
       })
       if (result.code !== 0) {
@@ -7772,6 +7790,7 @@ function setupIpc(): void {
         step: 'begin',
         phase: next?.phase,
         next,
+        discovery: discoveryReport,
         targetsCount: Object.keys(targets).length,
         targetLevel,
         attempt: readAttempt(runDir),

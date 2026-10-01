@@ -75,6 +75,7 @@ from source_snapshot import (
     SourceSnapshot,
     capture_durable_source_snapshot,
     capture_source_snapshot,
+    incomplete_submodules,
     open_source_snapshot,
 )
 from verification_workspace_backend import materialize_private_tree
@@ -167,6 +168,21 @@ class StaleFeedbackError(IterativeMigrationError):
 class InvalidInputError(IterativeMigrationError):
     def __init__(self, message: str) -> None:
         super().__init__("INVALID_INPUT", message)
+
+
+class ProjectUnreadyError(IterativeMigrationError):
+    """A fixable local readiness blocker found BEFORE the expensive phases.
+
+    ``code`` is the durable machine-readable blocker (e.g.
+    SOURCE_SUBMODULE_INCOMPLETE); ``command`` is the exact Git command for the
+    confirmed repository root, offered to the user but NEVER executed
+    automatically — it may touch private Git and alters the checkout.
+    """
+
+    def __init__(self, code: str, message: str, command: str = "") -> None:
+        super().__init__(code, message)
+        self.command = command
+        self.fixable = True
 
 
 class BudgetExceededError(IterativeMigrationError):
@@ -691,6 +707,23 @@ def resolve_project_relative(project_dir: Path, source: SourceSnapshot) -> Path:
 # begin: C0 «Исходный замер»
 # ---------------------------------------------------------------------------
 
+# P5: cheap LOCAL readiness checks run BEFORE the expensive registry discovery
+# and source snapshot. They share the SAME verification code as the
+# authoritative capture-time check (source_snapshot.incomplete_submodules), so
+# the preflight and capture can never diverge; the capture-time check is kept.
+def project_readiness_preflight(project_dir: Path) -> None:
+    submodule_issues = incomplete_submodules(project_dir)
+    if submodule_issues:
+        state, path = submodule_issues[0]
+        verb = "не инициализирован" if state == "-" else "в конфликтном состоянии"
+        command = f'git submodule update --init --recursive -- "{path}"'
+        raise ProjectUnreadyError(
+            "SOURCE_SUBMODULE_INCOMPLETE",
+            f"Git submodule {path} {verb}. Подготовьте submodule и повторите проверку.",
+            command=command,
+        )
+
+
 def cmd_begin(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
     owner = args.owner or f"pid-{os.getpid()}"
@@ -711,6 +744,10 @@ def build_run_config(run_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
     project_dir = Path(args.project_dir).expanduser().resolve()
     if not (project_dir / "package.json").exists():
         raise InvalidInputError(f"PROJECT_PACKAGE_JSON_MISSING: {project_dir}")
+    # P5: fail fast on local readiness blockers BEFORE registry discovery, the
+    # snapshot and the control verification (the real repro spent ~30s on
+    # discovery only to fail on an uninitialized submodule).
+    project_readiness_preflight(project_dir)
     project_name = (args.project_name or project_dir.name).strip()
     target_level = (args.target_level or "yellow").strip().lower()
     if target_level not in ("yellow", "green"):
@@ -908,6 +945,7 @@ def _begin_locked(run_dir: Path, config: Mapping[str, Any], args: argparse.Names
     )
 
     discovery = config.get("targetDiscovery") or []
+    roadmap_targets = dict(config.get("targets") or {})
     discovered = [
         entry for entry in discovery
         if entry.get("status") in ("discovered", "discovered-compatible")
@@ -929,6 +967,20 @@ def _begin_locked(run_dir: Path, config: Mapping[str, Any], args: argparse.Names
                 "noCompatibleAlternative": sorted(str(entry.get("package") or "") for entry in incompatible_no_alt),
                 "budgetSkipped": sorted(str(entry.get("package") or "") for entry in budget_skipped),
             }
+        )
+
+    # P-review: when the ONLY discovery outcomes are "registry data unavailable"
+    # or "budget exhausted", no update was actually established — the run must
+    # NOT be created as a fake success ("nothing to do"). No run, no state files
+    # to delete manually: the user simply retries the search or configures the
+    # scope. "genuinely up to date" (discovered==0, unavailable==0, budget==0)
+    # still proceeds (that IS an updates-not-needed outcome).
+    if not roadmap_targets and not discovered and (unavailable or budget_skipped):
+        raise ProjectUnreadyError(
+            "DISCOVERY_UNSETTLED",
+            "Не удалось установить доступные обновления: данные registry недоступны или бюджет поиска исчерпан. "
+            "Результат не засчитывается как завершённая миграция. Повторите поиск или настройте состав обновления.",
+            command="",
         )
 
     snapshot_container = run_dir / SOURCE_DIR / "C0"
@@ -4139,6 +4191,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         configure_utf8_stdio()
         return int(COMMANDS[args.command](args) or 0)
+    except ProjectUnreadyError as exc:
+        print(f"ITERATIVE_MIGRATION_FAILURE_V1 {json.dumps({'code': exc.code, 'summary': str(exc), 'command': exc.command, 'fixable': True})}")
+        return 2
     except (StaleFeedbackError, InvalidInputError) as exc:
         print(f"ITERATIVE_MIGRATION_FAILURE_V1 {json.dumps({'code': exc.code, 'summary': str(exc)})}")
         return 2

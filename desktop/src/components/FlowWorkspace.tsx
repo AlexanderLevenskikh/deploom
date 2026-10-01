@@ -22,6 +22,7 @@ const AUTOPILOT_HELP = {
 type Props = {
   details: WorkspaceDetails
   project: ProjectSpec
+  appVersion?: string
   activeAction?: FlowAction
   activeRunId?: string
   activeRunStartedAt?: number
@@ -67,7 +68,7 @@ type Props = {
   onClearLogs?: () => void
 }
 
-export function FlowWorkspace({ details, project, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onUpdateProjectNode, onListNodeVersions, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onExportLegacyIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeDrive, onIterativeBegin, onIterativeAgent, onIterativeAttempt, onIterativeCancel, liveIterativeAttempt, logs, onCancelJob, onClearLogs }: Props) {
+export function FlowWorkspace({ details, project, appVersion, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onUpdateProjectNode, onListNodeVersions, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onExportLegacyIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeDrive, onIterativeBegin, onIterativeAgent, onIterativeAttempt, onIterativeCancel, liveIterativeAttempt, logs, onCancelJob, onClearLogs }: Props) {
   const { language, text, t } = useLanguage()
   // The persisted goal drives stage actions and autopilot: a green target set
   // in the Baseline dialog must survive into generate/release instead of
@@ -734,7 +735,10 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
       {baselineIntentDialog ? <BaselineIntentDialog mode={baselineIntentDialog.mode} resume={baselineIntentDialog.resume} plan={baselineIntentDialog.plan} decision={baselineIntentDialog.decision} onCancel={() => { setBaselineIntentDialog(undefined); if (baselineIntentDialog.mode === 'decision') setBaselineDecisionDismissed(true) }} onSubmit={runBaselineIntent} /> : null}
       {draftPromptPreview ? <PromptPreviewDialog preview={draftPromptPreview} onClose={() => setDraftPromptPreview(undefined)} onOpenPath={onOpenPath} /> : null}
       <IterativeTaskPanel
+        key={`${details.workspace.id}:${project.name}`}
+        workspaceId={details.workspace.id}
         projectName={project.name}
+        appVersion={appVersion}
         refreshKey={activeRunId}
         onGet={onGetIterativeTask}
         onExport={onExportIterativeTask}

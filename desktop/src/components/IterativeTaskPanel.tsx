@@ -1,13 +1,15 @@
-import { Check, Clipboard, ExternalLink, FileText, Forward, RefreshCw, Save, Wrench, X, Rocket } from 'lucide-react'
+import { Check, ChevronDown, ChevronUp, Clipboard, ExternalLink, FileText, RefreshCw, Rocket, Save, Wrench, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useLanguage } from '../i18n'
+import { deriveMainAction, parseIterativeFailure, type ScenarioMainActionState } from '../../electron/iterative-scenario'
 import type { IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
 
 type Props = {
   workspaceId?: string
   projectName: string
   refreshKey?: string
+  appVersion?: string
   onGet: (projectName: string) => Promise<IterativeTaskSnapshot>
   onExport: (projectName: string) => Promise<IterativeTaskActionOutcome>
   onExportLegacy: (projectName: string) => Promise<IterativeTaskActionOutcome>
@@ -29,18 +31,6 @@ type PanelState =
   | { phase: 'ready'; snapshot: IterativeTaskSnapshot }
   | { phase: 'error'; message: string }
 
-const stageLabel = (stage?: string, text?: (ru: string, en: string) => string) => {
-  const t = text ?? ((ru: string) => ru)
-  switch (stage) {
-    case 'preflight': return t('предварительная проверка', 'preflight')
-    case 'begin': return t('C0-старт', 'begin')
-    case 'drive': return t('супервизор', 'supervisor')
-    case 'agent': return t('агент', 'agent')
-    case 'none': return t('—', '—')
-    default: return stage
-  }
-}
-
 const fmtElapsed = (ms: number): string => {
   const total = Math.max(0, Math.floor(ms / 1000))
   const m = Math.floor(total / 60)
@@ -48,7 +38,49 @@ const fmtElapsed = (ms: number): string => {
   return `${m}:${String(s).padStart(2, '0')}`
 }
 
-export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, onCopy, onSave, onStatus, onDrive, onBegin, onExportLegacy, onAgent, onAttempt, onCancel, liveAttempt, onConfigureScope, onOpenPath }: Props) {
+/** One primary label per scenario state (user-facing; internal terms only in
+ * the diagnostics below). */
+const MAIN_LABEL: Record<ScenarioMainActionState, [string, string]> = {
+  check: ['Проверить проект', 'Check project'],
+  'retry-check': ['Повторить проверку', 'Re-check'],
+  'no-targets': ['Подобрать обновления автоматически', 'Find updates automatically'],
+  'start-run': ['Начать обновление', 'Start the update'],
+  'continue-run': ['Продолжить обновление', 'Continue the update'],
+  running: ['Остановить', 'Stop'],
+  'recovered-running': ['Продолжить обновление', 'Continue the update'],
+  agent: ['Исправить агентом', 'Repair with an agent'],
+  result: ['Посмотреть результат', 'View the result'],
+}
+
+/** User-facing explanation under the main button (no internal step names). */
+const MAIN_DESCRIPTION: Record<ScenarioMainActionState, [string, string]> = {
+  check: ['Проверка зафиксирует текущее состояние проекта и найдёт доступные обновления.', 'The check records the current project state and finds available updates.'],
+  'retry-check': ['Исправьте причину и повторите проверку — состояние не требует ручной чистки.', 'Fix the cause and re-check — no state files need manual cleanup.'],
+  'no-targets': ['Выберите, как найти обновления: подобрать автоматически или настроить состав и политику.', 'Choose how to find updates: automatically, or by configuring scope and policy.'],
+  'start-run': ['Проект проверен. Начните обновление — применим и проверим изменения по группам.', 'The project is verified. Start the update — changes will be applied and verified in groups.'],
+  'continue-run': ['Работа приостановлена. Продолжите — применим и проверим следующую группу.', 'The update is paused. Continue — the next group will be applied and verified.'],
+  running: ['Идёт работа. Остановить можно в любой момент; проверенный результат сохраняется.', 'Work is running. You can stop at any time; the verified result is kept.'],
+  'recovered-running': ['Работа была прервана перезапуском; процесс не запущен. Продолжите, чтобы возобновить её.', 'Work was interrupted by a restart; no process is running. Continue to resume it.'],
+  agent: ['Нужны исправления в изолированном окружении. Запустите агента.', 'Repairs are needed in an isolated environment. Run the agent.'],
+  result: ['Обновления проверены. Откройте результат и задание.', 'The updates are verified. Open the result and the assignment.'],
+}
+
+/** User-facing activity phrase for a live attempt. */
+const activityText = (attempt?: IterativeAttemptView, text?: (ru: string, en: string) => string): string => {
+  const t = text ?? ((ru: string) => ru)
+  if (!attempt) return t('Подготовка…', 'Preparing…')
+  const stage = attempt.stage
+  if (stage === 'begin') {
+    if (attempt.targetSource === 'discovery') return t('Подбираем версии…', 'Finding versions…')
+    return t('Проверяем текущие зависимости', 'Checking current dependencies')
+  }
+  if (stage === 'drive') return t('Обновляем пакеты и проверяем результат', 'Updating packages and verifying the result')
+  if (stage === 'agent') return t('Нужны исправления (агент работает в изолированном окружении)', 'Repairs needed (agent works in an isolated environment)')
+  if (stage === 'preflight') return t('Предварительная проверка проекта', 'Pre-flight project check')
+  return t('Работа выполняется', 'Work is in progress')
+}
+
+export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVersion, onGet, onExport, onCopy, onSave, onStatus, onDrive, onBegin, onExportLegacy, onAgent, onAttempt, onCancel, liveAttempt, onConfigureScope, onOpenPath }: Props) {
   const { text, language } = useLanguage()
   const [state, setState] = useState<PanelState>({ phase: 'loading' })
   const [busy, setBusy] = useState<string>()
@@ -64,6 +96,7 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
   const [attemptLog, setAttemptLog] = useState<string>()
   const [showLog, setShowLog] = useState(false)
   const [noTargetsStep, setNoTargetsStep] = useState(false)
+  const [showDiag, setShowDiag] = useState(false)
   const [nowTick, setNowTick] = useState(Date.now())
   const loadSeq = useRef(0)
 
@@ -115,6 +148,25 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
     void refreshRunner()
   }, [load, refreshRunner, refreshKey])
 
+  // Review P2: the component is NOT remounted by project identity, so a switch
+  // must RESET every per-project view — a foreign attempt/log/note must never
+  // leak into the next project. Combined with the late-response guards below, a
+  // stale answer cannot overwrite the new project's state.
+  const projectKey = `${workspaceId ?? ''}:${projectName}`
+  const prevProjectKey = useRef(projectKey)
+  useEffect(() => {
+    if (prevProjectKey.current === projectKey) return
+    prevProjectKey.current = projectKey
+    setAttempt(undefined)
+    setAttemptLog(undefined)
+    setShowLog(false)
+    setNoTargetsStep(false)
+    setNote(undefined)
+    setRunnerError(undefined)
+    setCopied(false)
+    setShowDiag(false)
+  }, [projectKey])
+
   // L1: the journal survives a Desktop restart — re-seed from disk on mount.
   useEffect(() => {
     let alive = true
@@ -122,11 +174,13 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
       try {
         const result = await onAttempt(projectName)
         if (!alive) return
-        if (result.attempt) {
+        // Guard late responses: only apply an attempt that belongs to THIS
+        // project (the read may have been issued for the previous project).
+        if (result.attempt && result.attempt.projectName === projectName) {
           setAttempt(result.attempt)
           if (result.attemptLog) setAttemptLog(result.attemptLog)
         }
-        if (result.attempt?.lastStep === 'no-targets' || result.attempt?.reason?.startsWith('no roadmap targets')) setNoTargetsStep(true)
+        if (result.attempt?.projectName === projectName && result.attempt?.lastStep === 'no-targets') setNoTargetsStep(true)
       } catch {
         // journal read is best-effort; the live event stream still updates us
       }
@@ -138,7 +192,7 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
   useEffect(() => {
     if (!liveAttempt || liveAttempt.projectName !== projectName) return
     setAttempt(liveAttempt)
-    if (liveAttempt.reason?.startsWith('no roadmap targets') || liveAttempt.lastStep === 'no-targets') setNoTargetsStep(true)
+    if (liveAttempt.lastStep === 'no-targets') setNoTargetsStep(true)
   }, [liveAttempt, projectName])
 
   // Elapsed counter while an attempt is alive.
@@ -149,29 +203,28 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
     return () => window.clearInterval(timer)
   }, [attemptAlive, attempt?.status, attempt?.attemptId])
 
-  // Review re-check P1#4: a durable 'running' attempt restored after a restart
-  // has NO live process behind it — main.ts re-spawns the child only on the
-  // NEXT drive. Cancel can only reach a child created by an IN-FLIGHT
-  // begin/drive call of THIS panel, so it is gated on `stepBusy` (honest
-  // liveness), never on the journal status alone.
-  const childAlive = stepBusy
+  // Review P1: liveness comes from ELECTRON, where the real in-flight begin/drive
+  // child is known — never from a locally remounted React component. `stepBusy`
+  // covers THIS panel's own in-flight call; `runner.inFlight` restores control
+  // after FLOW → Graph → FLOW (the component remounts, the child keeps running).
+  const childAlive = stepBusy || runner?.inFlight === true
 
   // Review re-check P2#5: while the output log is open and a run is actively
   // emitting, re-read the journal tail periodically so the user sees live
   // progress even though the child's stdout only lands in the journal.
   useEffect(() => {
-    if (!showLog || !(attemptAlive || stepBusy)) return
+    if (!showLog || !(attemptAlive || childAlive)) return
     const timer = window.setInterval(() => {
       void (async () => {
         try {
           const result = await onAttempt(projectName)
-          if (result.attemptLog) setAttemptLog(result.attemptLog)
-          if (result.attempt) setAttempt(result.attempt)
+          if (result.attempt?.projectName === projectName && result.attemptLog) setAttemptLog(result.attemptLog)
+          if (result.attempt?.projectName === projectName && result.attempt) setAttempt(result.attempt)
         } catch { /* diagnostics best-effort */ }
       })()
     }, 2000)
     return () => window.clearInterval(timer)
-  }, [showLog, attemptAlive, stepBusy, onAttempt, projectName])
+  }, [showLog, attemptAlive, childAlive, onAttempt, projectName])
 
   const run = async (kind: string, action: () => Promise<IterativeTaskActionOutcome>) => {
     setBusy(kind)
@@ -199,6 +252,10 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
   // verify-exact -> next cohort WITHOUT manual internal steps, stopping ONLY
   // at an agent gate, finish, error or budget. Restart-safe: every iteration
   // re-reads the durable Python state.
+  // Review re-check P1#4: a durable run whose ТЗ does not exist yet is
+  // CONTINUABLE — the supervisor drives plan-next/…/gate and the gate rebuilds
+  // the task artifact itself, so the coordinator must stay reachable from the
+  // single main action, not from a separate technical button.
   const driveNow = async () => {
     setStepBusy(true)
     setNote(undefined)
@@ -209,19 +266,19 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
       } else if (outcome.stopped === 'agent-gate') {
         setNote(
           text(
-            `Пауза на агенте: ${outcome.reason ?? 'нужен ремонт'}${outcome.steps.length ? ` · выполнено шагов: ${outcome.steps.length}` : ''}`,
-            `Agent gate: ${outcome.reason ?? 'repair needed'}${outcome.steps.length ? ` · steps done: ${outcome.steps.length}` : ''}`,
+            `Нужны исправления: ${outcome.reason ?? 'агент ждёт запуска'}`,
+            `Repairs needed: ${outcome.reason ?? 'awaiting the agent'}`,
           ),
         )
       } else if (outcome.stopped === 'canceled') {
-        setNote(text(`Остановлено пользователем. ${outcome.reason ?? 'verified checkpoint сохранён; можно продолжить позже.'}`, `Canceled by user. ${outcome.reason ?? 'verified checkpoint kept; you can continue later.'}`))
+        setNote(text(`Остановлено пользователем. Проверенный результат сохранён — продолжить можно позже.`, `Canceled by user. The verified result is kept — you can continue later.`))
       } else if (outcome.stopped === 'finished') {
-        setNote(text('Миграция завершена: финальные отчёты сформированы.', 'Migration finished: final reports written.'))
+        setNote(text('Обновление завершено: изменения применены и проверены.', 'The update finished: changes are applied and verified.'))
       } else {
         setNote(
           text(
-            `Супервизор остановился: ${outcome.reason ?? ''}`,
-            `Supervisor stopped: ${outcome.reason ?? ''}`,
+            `Остановлено: ${outcome.reason ?? ''}`,
+            `Stopped: ${outcome.reason ?? ''}`,
           ),
         )
       }
@@ -234,9 +291,6 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
     }
   }
 
-  // L2: begin with the EXPLICIT path. Default is roadmap-only ('none') so an
-  // empty target map is reported honestly (noTargets) instead of running the
-  // long sequential registry discovery inside a blocking IPC.
   const beginNow = async (discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }) => {
     setStepBusy(true)
     setNote(undefined)
@@ -247,20 +301,25 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
           setNoTargetsStep(true)
           setNote(
             text(
-              'Сохранённых целей roadmap нет — прогон не создан. Выберите: настроить состав (Draft) или ограниченный авто-поиск.',
-              'No saved roadmap targets — no run created. Choose: configure scope (Draft) or bounded auto-discovery.',
+              'Сохранённых целей нет — выберите, как подобрать обновления.',
+              'No saved targets — choose how to find updates.',
             ),
           )
         } else {
           setNoTargetsStep(false)
-          setNote(
-            text(
-              `Начат прогон: C0${outcome.targetsCount !== undefined ? `, целей из roadmap: ${outcome.targetsCount}` : ''}`,
-              `Run started: C0${outcome.targetsCount !== undefined ? `, roadmap targets: ${outcome.targetsCount}` : ''}`,
-            ),
-          )
-          // Continuous migration: keep driving until the first gate/finish.
-          await driveNow()
+          const report = outcome.discovery
+          const unsettled = Boolean(report && report.discovered.length === 0 && (report.unavailable.length > 0 || report.budgetSkipped.length > 0))
+          if (unsettled) {
+            setNote(
+              text(
+                'Не удалось установить доступные обновления (registry недоступен или бюджет поиска исчерпан). Результат не засчитан как завершённая миграция.',
+                'Could not establish available updates (registry unavailable or the search budget was exhausted). Not counted as a completed migration.',
+              ),
+            )
+          } else {
+            setNote(text('Проверка завершена — продолжаю обновление.', 'Check finished — continuing the update.'))
+            await driveNow()
+          }
         }
       } else if ((outcome.error ?? '').startsWith('RUN_ALREADY_EXISTS')) {
         setNote(text('Прогон уже существует — продолжите с его состояния.', 'A run already exists — continue from its state.'))
@@ -283,7 +342,7 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
     setNote(undefined)
     try {
       await onCancel(projectName)
-      setNote(text('Отправлен запрос остановки…', 'Cancel requested…'))
+      setNote(text('Отправлен запрос остановки…', 'Stop requested…'))
     } catch (error) {
       setNote(error instanceof Error ? error.message : String(error))
     }
@@ -325,8 +384,8 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
         const changed = (outcome.changedFiles ?? []).length
         setNote(
           text(
-            `Агент исправил ${changed} файлов${outcome.next ? ` · далее: ${outcome.next.step ?? '—'}` : ''}`,
-            `Agent repaired ${changed} file(s)${outcome.next ? ` · next: ${outcome.next.step ?? '—'}` : ''}`,
+            `Агент исправил ${changed} файлов — продолжаю проверку.`,
+            `Agent repaired ${changed} file(s) — continuing the verification.`,
           ),
         )
         // Continuous migration: after the repair is accepted, the supervisor
@@ -345,13 +404,10 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
   }
 
   const toggleLog = async () => {
-    // Re-read the journal tail on every OPEN so the freshly appended lines of a
-    // running child are shown immediately; while open, the interval effect keeps
-    // it current.
     if (showLog || attemptLog === undefined) {
       try {
         const result = await onAttempt(projectName)
-        if (result.attemptLog) setAttemptLog(result.attemptLog)
+        if (result.attempt?.projectName === projectName && result.attemptLog) setAttemptLog(result.attemptLog)
       } catch {
         // diagnostics are best-effort
       }
@@ -363,71 +419,140 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
   const task = snapshot?.task
   const insufficient = Boolean(snapshot && !snapshot.present && snapshot.missing.length > 0)
 
-  const attemptFailure = attempt && (attempt.status === 'failed' || attempt.status === 'canceled')
-    ? (attempt.lastError || attempt.reason || undefined)
-    : undefined
+  // Machine-readable blocker (e.g. uninitialized submodule) surfaced ONCE.
+  const blocker = parseIterativeFailure(attempt?.lastError) ?? parseIterativeFailure(attempt?.reason)
+  const mainAction = deriveMainAction({
+    inFlight: childAlive,
+    attempt,
+    runner,
+    taskPresent: Boolean(task),
+    noTargets: noTargetsStep,
+  })
+  const retryIsDiscoverySearch = blocker?.code === 'DISCOVERY_UNSETTLED'
+  const mainLabel = mainAction.state === 'retry-check' && retryIsDiscoverySearch
+    ? text('Повторить поиск обновлений', 'Retry the update search')
+    : text(...MAIN_LABEL[mainAction.state])
+  const mainDescription = retryIsDiscoverySearch
+    ? text(
+        'Registry-данные не получены или бюджет поиска исчерпан — результат не засчитан. Повторите поиск или настройте состав обновления.',
+        'Registry data was not obtained or the search budget was exhausted — not counted. Retry the search or configure the update scope.',
+      )
+    : text(...MAIN_DESCRIPTION[mainAction.state])
+
   const elapsedMs = attempt?.startedAt && nowTick > attempt.startedAt ? nowTick - attempt.startedAt : 0
   const progress = attempt?.packageProgress
   const showLogTail = showLog && attemptLog
+  const attemptFailure = attempt && (attempt.status === 'failed' || attempt.status === 'canceled')
+    ? (attempt.lastError || attempt.reason || undefined)
+    : undefined
+  const decisionText = runner?.decision ? `${runner.decision.step ?? '—'} · ${runner.decision.reason}` : undefined
+
+  const copyDiagnostics = () => {
+    const reason = attempt?.reason || attempt?.lastError || mainAction.reasonShort || '—'
+    const diagnostic =
+      `DepLoom ${appVersion ?? '?'}\n` +
+      `Проект: ${projectName}\n` +
+      `Этап: ${attempt?.stage ?? '—'}${attempt?.phase ? ` (${attempt.phase})` : ''}\n` +
+      `Попытка: ${attempt?.attemptId ?? '—'}\n` +
+      `Причина: ${reason}\n` +
+      `Решение: ${decisionText ?? '—'}\n` +
+      `Статус журнала: ${attempt?.status ?? '—'}`
+    const textarea = document.createElement('textarea')
+    textarea.value = diagnostic
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    try {
+      document.execCommand('copy')
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1600)
+    } finally {
+      document.body.removeChild(textarea)
+    }
+  }
+
+  const runMainAction = () => {
+    switch (mainAction.state) {
+      case 'check':
+      case 'retry-check':
+        void beginNow(retryIsDiscoverySearch ? { mode: 'auto' } : { mode: 'none' })
+        break
+      case 'no-targets':
+        void beginNow({ mode: 'auto' })
+        break
+      case 'start-run':
+      case 'continue-run':
+      case 'recovered-running':
+        void driveNow()
+        break
+      case 'running':
+        void cancelNow()
+        break
+      case 'agent':
+        void agentNow()
+        break
+      case 'result':
+        if (task) setShowDialog(true)
+        else void run('export', () => onExport(projectName))
+        break
+    }
+  }
+
+  const busyLocked = stepBusy || busy !== undefined
 
   return (
     <section className="roadmap-card" data-testid="iterative-task-panel">
       <header className="roadmap-card-header">
         <div>
-          <strong>{text('План обновления (ТЗ для миграции)', 'Update assignment (migration task)')}</strong>
+          <strong>{text('Обновление проекта', 'Project update')}</strong>
           <span>
             {text(
-              'Точные версии принятых обновлений и явные отложенные пакеты. Формируется из verified checkpoint, без запуска Baseline.',
-              'Exact accepted update versions and explicit deferred packages. Built from the verified checkpoint, no Baseline run.',
+              'Один последовательный процесс: проверка → подбор версий → применение и проверка изменений.',
+              'One continuous process: check → find versions → apply and verify changes.',
             )}
           </span>
         </div>
         <button type="button" className="icon-button" aria-label={text('Обновить', 'Reload')} onClick={() => { void load(); void refreshRunner() }} disabled={busy === 'load'}><RefreshCw size={16} /></button>
       </header>
 
-      {/* L1: the durable attempt strip — visible from the very first click, after
-          a restart, and during a long preflight/discovery/cohort. */}
+      {/* L1: durable attempt strip — visible from the very first click, after a
+          restart, and during a long check/discovery/cohort. User-facing wording;
+          raw status/stage/steps live in the diagnostics below. */}
       {attempt ? (
         <div className={`attempt-strip ${attempt.status}`} data-testid="attempt-strip">
           <div className="attempt-strip-row">
-            <strong className={`attempt-status ${attempt.status}`}>{text('Попытка', 'Attempt')}: {attempt.status}</strong>
+            <strong className={`attempt-status ${attempt.status}`}>{activityText(attempt, text)}</strong>
             <span className="attempt-meta">
-              {stageLabel(attempt.stage, text)} · {text('этап', 'stage')} {attempt.stage === 'begin' || attempt.stage === 'drive' ? attempt.phase ?? '—' : ''}
               · {text('прошло', 'elapsed')} {fmtElapsed(elapsedMs)}
               {attempt.targetSource === 'roadmap'
-                ? ` · ${text('цели: roadmap', 'targets: roadmap')}`
+                ? ` · ${text('версии: по составу', 'versions: from scope')}`
                 : attempt.targetSource === 'discovery'
-                  ? ` · ${text('цели: авто-поиск', 'targets: auto-discovery')}`
-                  : ` · ${text('цели: нет', 'no targets')}`}
+                  ? ` · ${text('версии: авто-поиск', 'versions: auto')}`
+                  : attempt.targetSource === 'none'
+                    ? ` · ${text('версии: не заданы', 'versions: none')}`
+                    : ''}
             </span>
             {attempt && childAlive ? (
               <button type="button" className="button danger" data-testid="iterative-cancel" onClick={() => void cancelNow()}>
-                <X size={15} />{text('Остановить', 'Cancel')}
+                <X size={15} />{text('Остановить', 'Stop')}
               </button>
             ) : null}
           </div>
           <div className="attempt-strip-row">
-            {attempt.discovery ? (
+            {progress && progress.total > 0 && attempt.targetSource === 'discovery' ? (
               <span className="attempt-meta">
-                {text('бюджет поиска', 'discovery budget')}: {attempt.discovery.parallelism} {text('потоков', 'threads')} · {attempt.discovery.timeoutSeconds}с · {text('макс', 'max')} {attempt.discovery.maxPackages} {text('пакетов', 'packages')}
-              </span>
-            ) : null}
-            {progress && progress.total > 0 ? (
-              <span className="attempt-meta">
-                {text('прогресс', 'progress')}: {progress.processed}/{progress.total}
+                {text('Подбор версий', 'Finding versions')}: {progress.processed}/{progress.total}
                 <span className="attempt-progress"><span style={{ width: `${Math.min(100, Math.round((progress.processed / progress.total) * 100))}%` }} /></span>
               </span>
             ) : null}
-            {attempt.stepsDone.length > 0 ? (
-              <span className="attempt-meta">{text('шаги', 'steps')}: {attempt.stepsDone.join(' → ')}</span>
+            {attempt.status === 'running' && !childAlive ? (
+              <span className="attempt-meta attempt-reason">
+                {text('Работа была прервана перезапуском; процесс не запущен — продолжите, чтобы возобновить её.', 'Work was interrupted by a restart; the process is not running — continue to resume it.')}
+              </span>
             ) : null}
             {attempt.reason ? (
               <span className="attempt-meta attempt-reason">{attempt.reason}</span>
-            ) : null}
-            {attempt.status === 'running' && !childAlive ? (
-              <span className="attempt-meta attempt-reason">
-                {text('Попытка восстановлена после перезапуска; супервизор не запущен — нажмите «Продолжить».', 'Attempt restored after restart; the supervisor is not running — press «Continue».')}
-              </span>
             ) : null}
             {attempt ? (
               <button type="button" className="linklike" onClick={() => void toggleLog()}>
@@ -441,196 +566,141 @@ export function IterativeTaskPanel({ projectName, refreshKey, onGet, onExport, o
         </div>
       ) : null}
 
+      {note ? <div className="resume-notice"><span>{note}</span></div> : null}
+
+      {/* Single error surface: a short reason + next step up front, the full
+          technical reason in the expandable diagnostics, and a copy button that
+          includes the app version / stage / attempt id / technical reason.
+          The no-targets and running states are DECISIONS, not errors — no red
+          card, the main action explains itself. */}
+      {mainAction.state !== 'no-targets' && (attemptFailure || runnerError || blocker) ? (
+        <div className="resume-notice danger">
+          <strong>{attempt?.status === 'canceled' ? text('Работа остановлена', 'Work was stopped') : text('Работа не завершилась', 'Work did not finish')}</strong>
+          <span>
+            {blocker?.summary || (attemptFailure && !blocker ? attemptFailure : undefined) || runnerError || text('Неизвестная причина.', 'Unknown cause.')}
+          </span>
+          {blocker?.command ? (
+            <pre className="attempt-log" style={{ margin: '6px 0 0' }}>{blocker.command}</pre>
+          ) : null}
+          <footer className="baseline-intent-actions">
+            <button type="button" className="linklike" onClick={() => setShowDiag((value) => !value)}>
+              {showDiag ? <ChevronUp size={15} /> : <ChevronDown size={15} />}{text('Подробности', 'Details')}
+            </button>
+            <button type="button" className="linklike" onClick={copyDiagnostics}>
+              {copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? text('Скопировано', 'Copied') : text('Скопировать диагностику', 'Copy diagnostics')}
+            </button>
+          </footer>
+          {showDiag ? (
+            <pre className="attempt-log">{attemptFailure}{attempt?.attemptId ? `\nattemptId: ${attempt.attemptId}` : ''}{attempt?.stage ? `\nstage: ${attempt.stage}` : ''}{decisionText ? `\ndecision: ${decisionText}` : ''}</pre>
+          ) : null}
+        </div>
+      ) : null}
+
       {state.phase === 'loading' ? (
-        <div className="resume-notice"><span>{text('Загружаю задание…', 'Loading the assignment…')}</span></div>
+        <div className="resume-notice"><span>{text('Загружаю…', 'Loading…')}</span></div>
       ) : state.phase === 'error' ? (
         <div className="resume-notice danger">
           <strong>{text('Не удалось прочитать задание', 'Could not read the assignment')}</strong>
           <span>{state.message}</span>
         </div>
-      ) : !task ? (
+      ) : (
         <>
-          {/* L4: begin/drive/agent failures are visible in the pre-run branch too.
-              RUN_ALREADY_EXISTS pulls the user toward «Продолжить» below. */}
-          {attemptFailure ? (
-            <div className="resume-notice danger">
-              <strong>{text(attempt?.status === 'canceled' ? 'Попытка остановлена' : 'Попытка завершилась ошибкой', attempt?.status === 'canceled' ? 'Attempt canceled' : 'Attempt failed')}</strong>
-              <span>{attemptFailure}</span>
-              {attempt?.status === 'canceled' ? <span>{text('Verified checkpoint не тронут — можно продолжить позже.', 'The verified checkpoint was kept — you can continue later.')}</span> : null}
-            </div>
-          ) : null}
-          {runnerError ? (
-            <div className="resume-notice danger">
-              <strong>{text('Не удалось прочитать статус прогона', 'Could not read run status')}</strong>
-              <span>{runnerError}</span>
-            </div>
-          ) : null}
-          {note ? <div className="resume-notice"><span>{note}</span></div> : null}
+          {/* THE single main action for the current scenario state. */}
+          <div className="resume-notice">
+            <span>{mainDescription}</span>
+            <footer className="baseline-intent-actions">
+              <button
+                type="button"
+                className="button primary"
+                data-testid="iterative-main-action"
+                disabled={busyLocked}
+                onClick={() => void runMainAction()}
+              >
+                {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' ? <Wrench size={16} /> : mainAction.state === 'result' ? <FileText size={16} /> : <Rocket size={16} />}
+                {mainLabel}
+              </button>
+              {mainAction.state === 'no-targets' ? (
+                <button type="button" className="button secondary" disabled={busyLocked} onClick={() => onConfigureScope?.()}>
+                  <Wrench size={16} />{text('Настроить обновление', 'Configure the update')}
+                </button>
+              ) : null}
+              {!busyLocked && !runner?.present && !noTargetsStep ? (
+                <>
+                  <button type="button" className="button secondary" onClick={() => onConfigureScope?.()}>
+                    <Wrench size={16} />{text('Настроить состав и политику / Draft', 'Configure scope & policy / Draft')}
+                  </button>
+                  <button type="button" className="button secondary" onClick={() => void exportLegacyNow()}>
+                    <FileText size={16} />{text('Импортировать сохранённый результат', 'Import a saved result')}
+                  </button>
+                </>
+              ) : null}
+            </footer>
+            {runtimeLine(runner) ? <span className="attempt-meta">{runtimeLine(runner)}</span> : null}
+          </div>
 
           {!runner?.present ? (
             <div className="resume-notice">
-              <strong>{text('Прогон ещё не начат', 'No run state yet')}</strong>
-              {noTargetsStep ? (
+              <strong>{text('Перед запуском', 'Before you start')}</strong>
+              <span>
+                {text(
+                  'Draft предлагает план обновления; запуск применяет и проверяет изменения. Состав, политика и версия Node (по умолчанию не задана) настраиваются здесь и в настройках проекта выше.',
+                  'The Draft proposes an update plan; the launch applies and verifies the changes. Scope, policy and the Node version (unset by default) are configured here and in the project settings above.',
+                )}
+              </span>
+            </div>
+          ) : null}
+
+          {!task ? (
+            <div className="resume-notice">
+              <strong>{text('Задание ещё не сформировано', 'The assignment is not ready yet')}</strong>
+              {insufficient ? (
                 <span>
-                  {text('Сохранённых целей roadmap нет. Дальше — на ваш выбор:', 'No saved roadmap targets. Your move:')}
+                  {text('Недостаточно данных durable-состояния:', 'Durable state lacks:')} {snapshot?.missing.join(', ')}. {text('Сначала выполните проверку до результатов.', 'Run the check to results first.')}
                 </span>
               ) : (
-                <span>{text('Зафиксируйте C0: базовый снимок и контрольную проверку текущих зависимостей. Цели берутся из последнего roadmap (dashboard-state).', 'Capture C0: the baseline snapshot and control verification of current dependencies. Targets come from the last roadmap (dashboard-state).')}</span>
+                <span>{text('После проверки и обновлений задание появится здесь — его можно посмотреть и скопировать.', 'After the check and updates, the assignment appears here — you can view and copy it.')}</span>
               )}
+            </div>
+          ) : (
+            <>
+              <div className="roadmap-summary-grid">
+                <div>
+                  <strong>{task.completeness.remaining}</strong>
+                  <span>{text('осталось', 'remaining')}</span>
+                </div>
+                <div>
+                  <strong>{task.actions.length}</strong>
+                  <span>{text('принято обновлений', 'accepted updates')}</span>
+                </div>
+                <div>
+                  <strong>{task.deferred.length}</strong>
+                  <span>{text('отложено', 'deferred')}</span>
+                </div>
+              </div>
+
+              {snapshot?.stale ? (
+                <div className="resume-notice warning">
+                  <strong>{text('ТЗ устарело', 'The assignment is stale')}</strong>
+                  <span>{snapshot.staleReason}</span>
+                </div>
+              ) : null}
+
               <footer className="baseline-intent-actions">
-                <button type="button" className="button primary" disabled={stepBusy} onClick={() => void beginNow({ mode: 'none' })}>
-                  <Rocket size={16} />{text('Начать миграцию (C0)', 'Start migration (C0)')}
+                <button type="button" className="button secondary" disabled={busyLocked} onClick={() => setShowDialog(true)}>
+                  <FileText size={16} />{text('Посмотреть', 'View')}
                 </button>
-                {noTargetsStep ? (
-                  <>
-                    <button type="button" className="button secondary" disabled={stepBusy} onClick={() => void beginNow({ mode: 'auto' })}>
-                      <RefreshCw size={16} />{text('Ограниченный авто-поиск целей', 'Bounded auto-discovery of targets')}
-                    </button>
-                    {onConfigureScope ? (
-                      <button type="button" className="button secondary" disabled={stepBusy} onClick={() => onConfigureScope()}>
-                        <Wrench size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}
-                      </button>
-                    ) : null}
-                  </>
-                ) : null}
-                <button type="button" className="button secondary" disabled={stepBusy || noTargetsStep} onClick={() => void exportLegacyNow()}>
-                  <FileText size={16} />{text('Импортировать ТЗ из сохранённого результата', 'Import task from the saved result')}
+                <button type="button" className="button secondary" disabled={busyLocked} onClick={() => void run('copy', () => onCopy(projectName, language))}>
+                  {copied && !showDiag ? <Check size={16} /> : <Clipboard size={16} />}{text('Скопировать задание', 'Copy the assignment')}
+                </button>
+                <button type="button" className="button secondary" disabled={busyLocked} onClick={() => void run('save', () => onSave(projectName, language))}>
+                  <Save size={16} />{text('Сохранить…', 'Save…')}
+                </button>
+                <button type="button" className="button secondary" disabled={busyLocked} onClick={() => void run('export', () => onExport(projectName))}>
+                  <RefreshCw size={16} />{text('Пересформировать', 'Rebuild')}
                 </button>
               </footer>
-            </div>
-          ) : null}
-          <div className="resume-notice">
-            <strong>{text('Задание ещё не сформировано', 'The assignment is not ready yet')}</strong>
-            {insufficient ? (
-              <span>
-                {text('Недостаточно данных durable-состояния:', 'Durable state lacks:')} {snapshot?.missing.join(', ')}. {text('Сначала выполните миграцию до verified checkpoint.', 'Run the migration to a verified checkpoint first.')}
-              </span>
-            ) : (
-              <span>{text('Сначала выполните миграцию до verified checkpoint — задание появится здесь.', 'Run the migration to a verified checkpoint — the assignment appears here.')}</span>
-            )}
-          </div>
-          {runner && runner.present ? (
-            <div className="resume-notice">
-              <strong>{text('Состояние прогона', 'Run state')}: {runner.phase ?? '—'}</strong>
-              {runner.decision ? (
-                <span>{text('Следующий шаг', 'Next step')}: {runner.decision.step ?? '—'} · {runner.decision.reason}</span>
-              ) : null}
-              {runtimeLine(runner)}
-              <footer className="baseline-intent-actions">
-                {/* Review re-check P1#4: a durable run whose ТЗ does not exist yet
-                    is CONTINUABLE — the supervisor drives plan-next/…/gate and the
-                    gate rebuilds the task artifact itself, so the coordinator
-                    must be reachable here, not only «Сформировать задание». */}
-                <button type="button" className="button primary" disabled={busy !== undefined || stepBusy} onClick={() => void driveNow()}>
-                  <Forward size={16} />{text('Продолжить', 'Continue')}
-                </button>
-                <button type="button" className="button secondary" disabled={busy !== undefined || stepBusy} onClick={() => void run('export', () => onExport(projectName))}>
-                  <RefreshCw size={16} />{text('Сформировать задание', 'Build the assignment')}
-                </button>
-              </footer>
-            </div>
-          ) : null}
-          {runner?.decision?.step === 'agent' ? (
-            <footer className="baseline-intent-actions">
-              <button type="button" className="button primary" disabled={busy !== undefined || stepBusy} onClick={() => void agentNow()}>
-                <Wrench size={16} />{text('Исправить агентом', 'Repair with agent')}
-              </button>
-            </footer>
-          ) : null}
-        </>
-      ) : (
-        <>
-          <div className="roadmap-summary-grid">
-            <div>
-              <strong>{task.completeness.remaining}</strong>
-              <span>{text('осталось', 'remaining')}</span>
-            </div>
-            <div>
-              <strong>{task.actions.length}</strong>
-              <span>{text('принято обновлений', 'accepted updates')}</span>
-            </div>
-            <div>
-              <strong>{task.deferred.length}</strong>
-              <span>{text('отложено', 'deferred')}</span>
-            </div>
-          </div>
-
-          {snapshot?.stale ? (
-            <div className="resume-notice warning">
-              <strong>{text('ТЗ устарело', 'The assignment is stale')}</strong>
-              <span>{snapshot.staleReason} {text('Перед диспатчем агента и на агент-гейте ТЗ пересобирается из текущего durable-состояния автоматически — ручная переэкспорт не обязателен.', 'Before dispatching the agent and at the agent gate the assignment is rebuilt from the current durable state automatically — manual re-export is not required.')}</span>
-            </div>
-          ) : null}
-
-          {task.deferred.length > 0 ? (
-            <ul className="plain-list">
-              {task.deferred.map((item) => (
-                <li key={item.package} title={item.reason}>
-                  <strong>{item.package}</strong>
-                  <span>
-                    {item.current} → {item.lagPolicyTarget} · {text('отложено:', 'deferred:')} {item.reason}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          ) : null}
-
-          {/* L4: the failure note is inside the task branch AND next to the action
-              buttons, so a failed step is never hidden behind the ТЗ. */}
-          {attemptFailure ? (
-            <div className="resume-notice danger">
-              <strong>{text(attempt?.status === 'canceled' ? 'Попытка остановлена' : 'Попытка завершилась ошибкой', attempt?.status === 'canceled' ? 'Attempt canceled' : 'Attempt failed')}</strong>
-              <span>{attemptFailure}</span>
-              {attempt?.status === 'canceled' ? <span>{text('Verified checkpoint не тронут — продолжите нажатием «Продолжить».', 'The verified checkpoint was kept — continue via «Continue».')}</span> : null}
-            </div>
-          ) : null}
-          {runnerError ? (
-            <div className="resume-notice danger">
-              <strong>{text('Не удалось прочитать статус прогона', 'Could not read run status')}</strong>
-              <span>{runnerError}</span>
-            </div>
-          ) : null}
-
-          {note ? <div className="resume-notice"><span>{note}</span></div> : null}
-
-          {runner && runner.present ? (
-            <div className="resume-notice">
-              <strong>{text('Состояние прогона', 'Run state')}: {runner.phase ?? '—'}</strong>
-              {runner.decision ? (
-                <span>{text('Следующий шаг', 'Next step')}: {runner.decision.step ?? '—'} · {runner.decision.reason}</span>
-              ) : null}
-              {runtimeLine(runner)}
-            </div>
-          ) : null}
-
-          <footer className="baseline-intent-actions">
-            {childAlive ? (
-              <button type="button" className="button danger" disabled={stepBusy} onClick={() => void cancelNow()}>
-                <X size={16} />{text('Остановить', 'Cancel')}
-              </button>
-            ) : (
-              <button type="button" className="button primary" disabled={busy !== undefined || stepBusy} onClick={() => void driveNow()}>
-                <Forward size={16} />{text('Продолжить', 'Continue')}
-              </button>
-            )}
-            {runner?.decision?.step === 'agent' ? (
-              <button type="button" className="button primary" disabled={busy !== undefined || stepBusy} onClick={() => void agentNow()}>
-                <Wrench size={16} />{text('Исправить агентом', 'Repair with agent')}
-              </button>
-            ) : null}
-            <button type="button" className="button secondary" disabled={busy !== undefined} onClick={() => setShowDialog(true)}>
-              <FileText size={16} />{text('Посмотреть', 'View')}
-            </button>
-            <button type="button" className="button secondary" disabled={busy !== undefined} onClick={() => void run('copy', () => onCopy(projectName, language))}>
-              {copied ? <Check size={16} /> : <Clipboard size={16} />}{copied ? text('Скопировано', 'Copied') : text('Скопировать', 'Copy')}
-            </button>
-            <button type="button" className="button secondary" disabled={busy !== undefined} onClick={() => void run('save', () => onSave(projectName, language))}>
-              <Save size={16} />{text('Сохранить', 'Save…')}
-            </button>
-            <button type="button" className="button secondary" disabled={busy !== undefined || stepBusy} onClick={() => void run('export', () => onExport(projectName))}>
-              <RefreshCw size={16} />{text('Переэкспортировать', 'Re-export')}
-            </button>
-          </footer>
+            </>
+          )}
         </>
       )}
 

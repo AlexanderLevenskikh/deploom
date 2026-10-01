@@ -483,28 +483,49 @@ def _validate_git_layout(
                 )
 
 
-def _submodule_preflight(capture_root: Path) -> None:
+def _submodule_line_path(line: str) -> str:
+    rest = line[1:].strip()
+    parts = rest.split(None, 1)
+    if len(parts) == 2 and len(parts[0]) == 40 and all(c in "0123456789abcdefABCDEF" for c in parts[0]):
+        return parts[1].strip()
+    return parts[0]
+
+
+def incomplete_submodules(capture_root: Path) -> list[tuple[str, str]]:
+    """Incomplete (uninitialized `-` or conflicted `U`) submodule entries.
+
+    One shared helper for BOTH the cheap local readiness preflight at begin and
+    the authoritative capture-time check, so the two can never diverge. Returns
+    (state, path) pairs with the gitlink SHA stripped; `+` (checked-out commit
+    differs from the superproject gitlink) is allowed: Source Truth is the
+    actual checked-out bytes, which the canonical manifest hashes below.
+    """
     if not (capture_root / ".gitmodules").is_file():
-        return
+        return []
     result = _run_git(capture_root, ["submodule", "status", "--recursive"])
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()
         raise SourceCaptureError(f"SOURCE_SUBMODULE_STATUS_FAILED: {detail}")
+    issues: list[tuple[str, str]] = []
     for line in result.stdout.splitlines():
         if not line:
             continue
         state = line[0]
+        if state in ("-", "U"):
+            issues.append((state, _submodule_line_path(line)))
+    return issues
+
+
+def _submodule_preflight(capture_root: Path) -> None:
+    for state, path in incomplete_submodules(capture_root):
         if state == "-":
             raise SourceCaptureError(
-                f"SOURCE_SUBMODULE_INCOMPLETE: uninitialized submodule: {line[1:].strip()}"
+                f"SOURCE_SUBMODULE_INCOMPLETE: uninitialized submodule: {path}"
             )
         if state == "U":
             raise SourceCaptureError(
-                f"SOURCE_SUBMODULE_INCOMPLETE: conflicted submodule: {line[1:].strip()}"
+                f"SOURCE_SUBMODULE_INCOMPLETE: conflicted submodule: {path}"
             )
-        # '+' (checked-out commit differs from superproject gitlink) is
-        # allowed: Source Truth is the actual checked-out bytes, which the
-        # canonical manifest hashes below.
 
 
 def _local_dependency_preflight(project_path: Path, capture_root: Path) -> None:

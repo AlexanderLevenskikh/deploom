@@ -194,6 +194,7 @@ jobs:
           npm run check:iterative-begin
           npm run check:iterative-attempt
           npm run check:iterative-stream
+          npm run check:iterative-scenario
           npm run check:iterative-agent
           npm run check:task-clipboard
           npm run check:electron-clipboard
