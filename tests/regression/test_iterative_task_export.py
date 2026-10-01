@@ -426,11 +426,101 @@ class IterativeTaskExportTests(unittest.TestCase):
         en = (root / "task.en.md").read_text(encoding="utf-8")
         self.assertIn("**1** из **1**", ru)
         self.assertIn("**1** of **1**", en)
-        self.assertIn("### Неопределённые цели (установленная версия неизвестна)", ru)
-        self.assertIn("### Unknown goals (installed version not readable)", en)
+        self.assertIn("### Неопределённые цели (обновление не доказуемо)", ru)
+        self.assertIn("### Unknown goals (upgrade not provable)", en)
         # The uncertainty must NOT be dressed up as a confirmed lag or deferral.
-        self.assertIn("отставание НЕ подтверждено", ru)
-        self.assertIn("NO lag is proven", en)
+        self.assertIn("обновление НЕ подтверждено", ru)
+        self.assertIn("NO upgrade is proven", en)
+        self.assertNotIn("Явно отложенные пакеты", ru)
+        self.assertNotIn("Explicitly deferred packages", en)
+
+    def test_registry_unavailable_surfaces_in_remainder_not_zero_of_zero(self) -> None:
+        # Review P2 (latest round): discovery could not read the registry for the
+        # only direct dependency (status ``registry-unavailable``; the installed
+        # version IS known from the lockfile). That is unknown EVIDENCE, not a
+        # proven lag — it must keep the task from reading "0 of 0" ("1 of 1"),
+        # and the reason must NOT claim the package is behind.
+        run_dir = make_run_dir(self.root)
+        config_path = run_dir / "run-config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["targets"] = {}
+        config["targetDiscovery"] = [
+            {
+                "package": "sample",
+                "declared": "^8.0.0",
+                "installed": "8.5.0",
+                "latest": "",
+                "status": "registry-unavailable",
+                "reason": "the registry metadata for sample is unavailable; the upgrade cannot be assessed, so no lag is claimed",
+            }
+        ]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        c0_path = run_dir / "checkpoints" / "C0.json"
+        c0 = json.loads(c0_path.read_text(encoding="utf-8"))
+        c0["fullAssignment"] = {}
+        c0["acceptedDelta"] = {"added": {}, "changed": {}, "removed": {}}
+        c0_path.write_text(json.dumps(c0), encoding="utf-8")
+
+        task.export_task_artifact(run_dir)
+        manifest = task.current_task(run_dir)
+        self.assertIsNotNone(manifest)
+        self.assertFalse(manifest["completeness"]["policySatisfied"])
+        self.assertEqual(1, manifest["completeness"]["denominator"])
+        self.assertEqual(1, manifest["completeness"]["remaining"])
+        unknown = [row for row in manifest["unknownGoals"] if row["package"] == "sample"]
+        self.assertEqual(1, len(unknown), manifest["unknownGoals"])
+        self.assertIn("registry metadata", unknown[0]["reason"])
+        self.assertEqual([], manifest["deferred"])
+        root = run_dir / "task" / manifest["artifactId"]
+        ru = (root / "task.ru.md").read_text(encoding="utf-8")
+        en = (root / "task.en.md").read_text(encoding="utf-8")
+        self.assertIn("**1** из **1**", ru)
+        self.assertIn("**1** of **1**", en)
+        # No proven-lag claim: the reason and section must not assert the lag.
+        self.assertIn("registry-метаданные недоступны", ru)
+        self.assertIn("registry metadata is unavailable", en)
+        self.assertNotIn("Явно отложенные пакеты", ru)
+        self.assertNotIn("Explicitly deferred packages", en)
+
+    def test_discovery_budget_skipped_surfaces_in_remainder_not_zero_of_zero(self) -> None:
+        # L2: the bounded discovery did not probe the only direct dependency
+        # (status ``discovery-budget-skipped`` — cap/deadline/failure). That is
+        # unknown EVIDENCE, not a proven lag: the task must NOT read "0 of 0"
+        # and must NOT claim the package is behind or invented a target.
+        run_dir = make_run_dir(self.root)
+        config_path = run_dir / "run-config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["targets"] = {}
+        config["targetDiscovery"] = [
+            {
+                "package": "sample",
+                "declared": "^8.0.0",
+                "status": "discovery-budget-skipped",
+                "reason": "wall-clock budget exhausted; sample was not probed, so its upgrade is not assessed and no lag is claimed",
+            }
+        ]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        c0_path = run_dir / "checkpoints" / "C0.json"
+        c0 = json.loads(c0_path.read_text(encoding="utf-8"))
+        c0["fullAssignment"] = {}
+        c0["acceptedDelta"] = {"added": {}, "changed": {}, "removed": {}}
+        c0_path.write_text(json.dumps(c0), encoding="utf-8")
+
+        task.export_task_artifact(run_dir)
+        manifest = task.current_task(run_dir)
+        self.assertIsNotNone(manifest)
+        self.assertFalse(manifest["completeness"]["policySatisfied"])
+        self.assertEqual(1, manifest["completeness"]["denominator"])
+        self.assertEqual(1, manifest["completeness"]["remaining"])
+        unknown = [row for row in manifest["unknownGoals"] if row["package"] == "sample"]
+        self.assertEqual(1, len(unknown), manifest["unknownGoals"])
+        self.assertIn("not probed", unknown[0]["reason"])
+        self.assertEqual([], manifest["deferred"])
+        root = run_dir / "task" / manifest["artifactId"]
+        ru = (root / "task.ru.md").read_text(encoding="utf-8")
+        en = (root / "task.en.md").read_text(encoding="utf-8")
+        self.assertIn("**1** из **1**", ru)
+        self.assertIn("**1** of **1**", en)
         self.assertNotIn("Явно отложенные пакеты", ru)
         self.assertNotIn("Explicitly deferred packages", en)
 

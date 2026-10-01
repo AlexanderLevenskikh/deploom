@@ -27,7 +27,7 @@ import { BaselineWorkerPool, WORKER_CANCEL } from '../dist-electron/baseline-wor
 
 const source = fs.readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8')
 const sliceStart = source.indexOf('function killProcessTree(')
-const sliceEnd = source.indexOf('type CaptureResult =', sliceStart)
+const sliceEnd = source.indexOf('function spawnCapture(', sliceStart)
 if (sliceStart < 0 || sliceEnd < 0) throw new Error('R3: killProcessTree slice not found in main.ts')
 const trans = (text) => ts.transpileModule(text, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },

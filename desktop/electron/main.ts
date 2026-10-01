@@ -51,11 +51,13 @@ import { acceptanceVerdictFromManualAudit, dependencyInputIdentity, mergeTargetP
 import { normalizeBudgetField } from './baseline-intent.js'
 import { summarizeUpdaterError } from './updater-error.js'
 import { flowNotificationContent, type FlowNotificationEvent } from './notifications.js'
-import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
 import { iterativeBeginInvocation, targetsFromDashboardState } from './iterative-begin.js'
+import { beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, recordAttemptLog, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
+import { spawnIterativeStreamed, type CaptureResult, type StreamAttemptIo, type StreamPlatform } from './iterative-stream.js'
 import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
@@ -1626,7 +1628,6 @@ function isPidAlive(pid: number): boolean {
 // `timedOut` lets callers tell "the answer is no" from "we never got one" —
 // the difference between reporting real progress and erasing it because the
 // machine was busy.
-type CaptureResult = { code: number; stdout: string; stderr: string; timedOut: boolean }
 
 function spawnCapture(command: string, args: string[], cwd: string, timeoutMs = 8_000, envOverrides?: NodeJS.ProcessEnv): Promise<CaptureResult> {
   return new Promise((resolvePromise) => {
@@ -1683,6 +1684,25 @@ function spawnCaptureWithInput(command: string, args: string[], cwd: string, inp
     child.stdin.end(input)
   })
 }
+
+// Adoption helpers for the TESTABLE streaming runner in iterative-stream.ts.
+// main.ts keeps only the bindings to the local platform primitives and the
+// attempt journal; the runner itself (timeout/cancel/watchdog semantics, line
+// buffering, journaling, status-event forwarding) lives in the module so the
+// Desktop contract checks can exercise it with a real child.
+const iterativeStreamPlatform: StreamPlatform = {
+  processTreeDetached: () => processTreeDetached(),
+  commandEnvironment: (env: NodeJS.ProcessEnv) => commandEnvironment(env),
+  resolveSpawnInvocation: (command: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => resolveSpawnInvocation(command, args, opts),
+  killProcessTree: (child: ChildProcess) => killProcessTree(child as ChildProcessWithoutNullStreams),
+  decodeChunk: (chunk: Buffer) => decodeProcessOutputChunk(chunk),
+}
+
+const iterativeStreamIo = (_runDir: string): StreamAttemptIo => ({
+  cancelRequested: (dir: string) => readAttempt(dir)?.cancelRequested === true,
+  recordLine: (dir: string, text: string) => recordAttemptLog(dir, text),
+  trimLog: (dir: string) => trimAttemptLog(dir),
+})
 
 async function gitOverview(workspacePath: string): Promise<WorkspaceDetails['git']> {  const [branchResult, statusResult] = await Promise.all([
     spawnCapture('git', ['-C', workspacePath, 'branch', '--show-current'], workspacePath),
@@ -7500,6 +7520,40 @@ function setupIpc(): void {
 
   const iterativeStepInFlight = new Set<string>()
 
+  // L1: after every durable attempt mutation a fresh event reaches the renderer,
+  // so the very first click is observable and a restart restores the reason the
+  // attempt stopped (the record and log live in the run dir, not in memory).
+  function publishIterativeAttempt(runDir: string): void {
+    const attempt = readAttempt(runDir)
+    if (attempt) send('flow:iterative:attempt', attempt)
+  }
+
+  ipcMain.handle('flow:iterative:attempt', async (_event, input: { workspaceId?: string; projectName: string }) => {
+    const state = loadState()
+    const workspace = findWorkspace(state, input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    const runDir = iterativeTaskRunDir(workspace, project)
+    const present = existsSync(join(runDir, 'run.json'))
+    const attempt = readAttempt(runDir)
+    return {
+      ok: attempt !== undefined || present,
+      present,
+      attempt,
+      attemptLog: readAttemptLogTail(runDir),
+      error: !attempt && !present ? 'NO_ATTEMPT' : undefined,
+    }
+  })
+
+  ipcMain.handle('flow:iterative:cancel', async (_event, input: { workspaceId?: string; projectName: string }) => {
+    const state = loadState()
+    const workspace = findWorkspace(state, input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    const runDir = iterativeTaskRunDir(workspace, project)
+    requestCancel(runDir)
+    publishIterativeAttempt(runDir)
+    return { ok: true }
+  })
+
   ipcMain.handle('flow:iterative:status', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
@@ -7547,76 +7601,172 @@ function setupIpc(): void {
         }
       }
     }
-    return { ok: error === undefined, present, stale, staleReason: taskStaleness(runDir).reason, phase, decision, requestedNode, runtime: runtimeView, error }
+    return {
+      ok: error === undefined,
+      present,
+      stale,
+      staleReason: taskStaleness(runDir).reason,
+      phase,
+      decision,
+      requestedNode,
+      runtime: runtimeView,
+      attempt: readAttempt(runDir),
+      attemptLog: readAttemptLogTail(runDir),
+      error,
+    }
   })
 
-  ipcMain.handle('flow:iterative:begin', async (_event, input: { workspaceId?: string; projectName: string }) => {
+  ipcMain.handle('flow:iterative:begin', async (_event, input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number } }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
-    if (existsSync(join(runDir, 'run.json'))) {
-      return { ok: false, error: 'RUN_ALREADY_EXISTS: сможете продолжить на план/шаг с существующего состояния' }
-    }
-    if (iterativeStepInFlight.has(project.name)) {
-      return { ok: false, error: 'STEP_IN_PROGRESS' }
-    }
-    // R1: the Desktop produces a NEW durable run. The target map mirrors the
-    // roadmap's own accepted versions (dashboard-state rows), so the run plans
-    // toward the versions the product already committed to. An empty map means
-    // nothing actionable yet: begin still captures C0, and plan-next reports
-    // NO_ACTIONABLE until a roadmap provides concrete targets.
+    const runPresent = existsSync(join(runDir, 'run.json'))
     const intent = loadBaselineIntent(workspace, project.name)
     const targetLevel = intent.acceptancePolicy?.targetLevel ?? 'yellow'
     const dashboardState = artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json')
     const targets = targetsFromDashboardState(dashboardState, project.name)
-    const beginDir = join(app.getPath('temp'), `iter-begin-${randomUUID()}`)
-    mkdirSync(beginDir, { recursive: true })
-    const targetsFile = join(beginDir, 'targets.json')
-    writeFileSync(targetsFile, JSON.stringify(targets), 'utf8')
-    const python = resolveExecutable('python')
-    const generator = join(bundledToolDir(), 'iterative_migration.py')
-    const options = {
-      projectDir: project.path,
-      projectName: project.name,
-      targetLevel,
-      workspaceId: workspace.id,
-      projectId: project.name,
-      targetsFile,
-      toolBuildId: app.getVersion(),
-      requestedNode: project.nodeVersion || undefined,
-      // R8: the run captures the workspace dashboard-state (user package lag
-      // policy) and the goal audit thresholds so the independent audit runs
-      // with the ACTUAL policy, not dashboard_state=None defaults.
-      dashboardStatePath: dashboardState && existsSync(dashboardState) ? dashboardState : undefined,
-      auditPolicy: {
-        lagPolicyMonths: intent.acceptancePolicy?.lagPolicyMonths,
-        minLagOkPct: intent.acceptancePolicy?.minLagOkPct,
-        maxKnownHigh: intent.acceptancePolicy?.maxKnownHigh,
-      },
+    const discoveryMode = input.discovery?.mode ?? 'none'
+    // Pure begin-plan decision (L2): an empty roadmap target map NEVER launches
+    // the long discovery inside a blocking IPC by itself — the user must pick a
+    // path (Draft/scope setup, or an EXPLICIT bounded discovery with a budget).
+    const plan = beginPlan({
+      runPresent,
+      stepInFlight: iterativeStepInFlight.has(project.name),
+      targetsCount: Object.keys(targets).length,
+      discoveryMode,
+    })
+    if (plan.kind === 'in-progress') {
+      return { ok: false, step: 'begin', error: 'STEP_IN_PROGRESS' }
     }
-    if (options.dashboardStatePath === undefined) delete (options as { dashboardStatePath?: string }).dashboardStatePath
-    const auditPolicy = options.auditPolicy as { lagPolicyMonths?: number; minLagOkPct?: number; maxKnownHigh?: number }
-    if (auditPolicy.lagPolicyMonths === undefined && auditPolicy.minLagOkPct === undefined && auditPolicy.maxKnownHigh === undefined) {
-      delete (options as { auditPolicy?: object }).auditPolicy
+    if (plan.kind === 'already-exists') {
+      // Resume/recovery, not a dead end: the durable run exists, so the panel
+      // switches to the existing run state ("Продолжить") instead of repeating
+      // capture or inventing a new run.
+      return { ok: false, step: 'begin', error: 'RUN_ALREADY_EXISTS: прогон уже существует — продолжите с его состояния (Продолжить)' }
     }
+    if (plan.kind === 'no-targets') {
+      // L2: NOTHING long runs. There are no saved roadmap targets, so begin
+      // neither creates a run nor fires the sequential registry probes; the UI
+      // explains the two paths (Draft/scope setup, or bounded discovery).
+      startAttempt(runDir, project.name, 'none', undefined, 0)
+      updateAttempt(runDir, { status: 'done', stage: 'begin', reason: 'no roadmap targets; nothing was run', lastStep: 'no-targets' })
+      publishIterativeAttempt(runDir)
+      return { ok: true, step: 'begin', noTargets: true, targetsCount: 0, targetLevel, attempt: readAttempt(runDir) }
+    }
+    // plan.kind === 'discovery' | 'start' — the user explicitly chose the path.
+    // R1: the Desktop produces a NEW durable run. The target map mirrors the
+    // roadmap's own accepted versions (dashboard-state rows), so the run plans
+    // toward the versions the product already committed to.
+    const discovery = plan.kind === 'discovery'
+      ? {
+          parallelism: Math.min(8, Math.max(1, input.discovery?.parallelism ?? 8)),
+          timeoutSeconds: Math.min(600, Math.max(5, input.discovery?.timeoutSeconds ?? 240)),
+          maxPackages: Math.min(200, Math.max(1, input.discovery?.maxPackages ?? 60)),
+        }
+      : undefined
+    // Review re-check P1: the in-flight lock is taken FIRST, so EVERY step
+    // after it — journal write, temp-dir creation, invocation build, the spawn
+    // itself — runs in ONE try/catch/finally. A preparation failure (e.g. an
+    // unwritable temp dir) records a failed attempt and RELEASES the lock
+    // instead of leaking it with a 'running' journal and no durable trace.
     iterativeStepInFlight.add(project.name)
+    const beginDir = join(app.getPath('temp'), `iter-begin-${randomUUID()}`)
+    let beginDirReady = false
     try {
-      const result = await spawnCapture(
-        python,
-        iterativeBeginInvocation(runDir, options, generator, python).args,
-        workspace.path,
-        20 * 60_000,
-      )
-      if (result.code !== 0) {
-        const raw = (result.stderr.trim() || result.stdout.trim() || `BEGIN_EXIT_${result.code}`)
-        return { ok: false, step: 'begin', error: raw.slice(0, 4000) }
+      startAttempt(runDir, project.name, discovery ? 'discovery' : 'roadmap', discovery, Object.keys(targets).length)
+      updateAttempt(runDir, { status: 'running', stage: 'begin' })
+      publishIterativeAttempt(runDir)
+      mkdirSync(beginDir, { recursive: true })
+      beginDirReady = true
+      const targetsFile = join(beginDir, 'targets.json')
+      writeFileSync(targetsFile, JSON.stringify(targets), 'utf8')
+      const python = resolveExecutable('python')
+      const generator = join(bundledToolDir(), 'iterative_migration.py')
+      const options = {
+        projectDir: project.path,
+        projectName: project.name,
+        targetLevel,
+        workspaceId: workspace.id,
+        projectId: project.name,
+        targetsFile,
+        toolBuildId: app.getVersion(),
+        requestedNode: project.nodeVersion || undefined,
+        // R8: the run captures the workspace dashboard-state (user package lag
+        // policy) and the goal audit thresholds so the independent audit runs
+        // with the ACTUAL policy, not dashboard_state=None defaults.
+        dashboardStatePath: dashboardState && existsSync(dashboardState) ? dashboardState : undefined,
+        auditPolicy: {
+          lagPolicyMonths: intent.acceptancePolicy?.lagPolicyMonths,
+          minLagOkPct: intent.acceptancePolicy?.minLagOkPct,
+          maxKnownHigh: intent.acceptancePolicy?.maxKnownHigh,
+        },
       }
+      if (options.dashboardStatePath === undefined) delete (options as { dashboardStatePath?: string }).dashboardStatePath
+      const auditPolicy = options.auditPolicy as { lagPolicyMonths?: number; minLagOkPct?: number; maxKnownHigh?: number }
+      if (auditPolicy.lagPolicyMonths === undefined && auditPolicy.minLagOkPct === undefined && auditPolicy.maxKnownHigh === undefined) {
+        delete (options as { auditPolicy?: object }).auditPolicy
+      }
+      const invocation = iterativeBeginInvocation(runDir, options, generator, python)
+      if (discovery) {
+        invocation.args.push('--discover-parallelism', String(discovery.parallelism))
+        invocation.args.push('--discover-timeout-s', String(discovery.timeoutSeconds))
+        invocation.args.push('--discover-max-packages', String(discovery.maxPackages))
+      }
+      const beginIo = iterativeStreamIo(runDir)
+      const result = await spawnIterativeStreamed(runDir, invocation.command, invocation.args, workspace.path, 20 * 60_000, beginIo, iterativeStreamPlatform, (event) => {
+        if (event.event === 'begin.capture' && typeof event.managedDependencies === 'number') {
+          updateAttempt(runDir, { packageProgress: { processed: 0, total: event.managedDependencies } })
+          publishIterativeAttempt(runDir)
+        } else if (event.event === 'begin.discovery-progress' && typeof event.processed === 'number' && typeof event.total === 'number') {
+          const progress = readAttempt(runDir)?.packageProgress
+          updateAttempt(runDir, { packageProgress: { processed: event.processed, total: Math.max(event.total, progress?.total ?? event.total) } })
+          publishIterativeAttempt(runDir)
+        }
+      })
+      if (result.code !== 0) {
+        // Review re-check P1: a watchdog kill (timeout or cancel) NEVER counts
+        // as success. The stream runner reports a non-zero code for any kill,
+        // and a timeout is additionally distinguishable from a user cancel so
+        // the panel gets an honest reason instead of a generic stderr splice.
+        const raw = result.timedOut
+          ? (readAttempt(runDir)?.cancelRequested === true ? 'CANCELED: begin terminated by user cancel' : 'BEGIN_TIMEOUT: begin exceeded its 20-minute budget; no run was created')
+          : (result.stderr.trim() || result.stdout.trim() || `BEGIN_EXIT_${result.code}`)
+        const canceledByUser = readAttempt(runDir)?.cancelRequested === true
+        if (canceledByUser) clearCancelRequest(runDir)
+        updateAttempt(runDir, {
+          status: 'failed',
+          stage: 'begin',
+          lastError: raw.slice(0, 4000),
+          reason: canceledByUser ? 'cancelled by user; no run was created' : result.timedOut ? 'begin timed out; no run was created' : 'begin failed',
+          lastStep: 'begin',
+        })
+        publishIterativeAttempt(runDir)
+        return {
+          ok: false,
+          step: 'begin',
+          error: raw.slice(0, 4000),
+          attempt: readAttempt(runDir),
+        }
+      }
+      // Review re-check P1: an exit code of 0 from the child is NOT proof a
+      // run was created. "C0 captured" is true only when a durable status
+      // payload (run.json/checkpoint C0) is actually readable afterwards.
       const refresh = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
       const refreshed = refresh.code === 0
         ? parseIterativeStatusPayload(refresh.stdout) ?? readIterativeStatus(runDir)
         : undefined
-      const next = refreshed ? decideNextStep(runDir, refreshed) : undefined
+      if (!refreshed) {
+        const raw = refresh.timedOut
+          ? 'STATUS_TIMEOUT: begin exited but the durable run could not be confirmed'
+          : (refresh.stderr.trim() || refresh.stdout.trim() || 'STATUS_UNREADABLE')
+        updateAttempt(runDir, { status: 'failed', stage: 'begin', lastError: raw.slice(0, 4000), reason: 'begin exited but no run is readable', lastStep: 'begin' })
+        publishIterativeAttempt(runDir)
+        return { ok: false, step: 'begin', error: raw.slice(0, 4000), attempt: readAttempt(runDir) }
+      }
+      const next = decideNextStep(runDir, refreshed)
+      updateAttempt(runDir, { status: 'done', stage: 'begin', runCreated: true, phase: next?.phase, lastStep: next?.step ?? undefined, reason: 'C0 captured' })
+      publishIterativeAttempt(runDir)
       return {
         ok: true,
         step: 'begin',
@@ -7624,10 +7774,18 @@ function setupIpc(): void {
         next,
         targetsCount: Object.keys(targets).length,
         targetLevel,
+        attempt: readAttempt(runDir),
       }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      try {
+        updateAttempt(runDir, { status: 'failed', stage: 'begin', lastError: message.slice(0, 4000), reason: 'begin preparation failed', lastStep: 'begin' })
+        publishIterativeAttempt(runDir)
+      } catch { /* journal is best-effort during failure handling */ }
+      return { ok: false, step: 'begin', error: `BEGIN_PREP_FAILED: ${message.slice(0, 4000)}`, attempt: readAttempt(runDir) }
     } finally {
       iterativeStepInFlight.delete(project.name)
-      try { rmSync(beginDir, { recursive: true, force: true }) } catch { /* temp cleanup is best-effort */ }
+      if (beginDirReady) { try { rmSync(beginDir, { recursive: true, force: true }) } catch { /* temp cleanup is best-effort */ } }
     }
   })
 
@@ -7649,30 +7807,53 @@ function setupIpc(): void {
     iterativeStepInFlight.add(project.name)
     const steps: string[] = []
     const startedAt = Date.now()
+    const publish = () => publishIterativeAttempt(runDir)
+    const updateSteps = () => updateAttempt(runDir, { stepsDone: [...steps] })
     try {
       if (!existsSync(join(runDir, 'run.json'))) {
-        return { ok: false, steps, stopped: 'error', error: 'NO_RUN' }
+        return { ok: false, steps, stopped: 'error', error: 'NO_RUN', attempt: readAttempt(runDir) }
       }
+      // L1: rebuild the journal after a restart — same attemptId, status running.
+      resumeAttempt(runDir, project.name)
+      updateAttempt(runDir, { status: 'running', stage: 'drive', lastError: undefined, cancelRequested: false })
+      publish()
       const python = resolveExecutable('python')
       const generator = join(bundledToolDir(), 'iterative_migration.py')
       for (let iteration = 0; iteration < 50; iteration += 1) {
-        if (Date.now() - startedAt > 45 * 60 * 1000) {
-          return { ok: true, steps, stopped: 'time-budget', reason: '45-минутный бюджет супервизора исчерпан; продолжайте нажатием «Продолжить»' }
+        if (readAttempt(runDir)?.cancelRequested) {
+          // L1: a user cancel STOPS the drive loop without touching the durable
+          // run/checkpoint state, so the last verified checkpoint is preserved.
+          clearCancelRequest(runDir)
+          updateAttempt(runDir, { status: 'canceled', stage: 'drive', reason: 'отменено пользователем; verified checkpoint сохранён', lastStep: 'canceled' })
+          publish()
+          return { ok: true, steps, stopped: 'canceled', reason: 'отменено пользователем; verified checkpoint сохранён (продолжите нажатием «Продолжить»)', attempt: readAttempt(runDir) }
         }
-        const statusResult = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
+        if (Date.now() - startedAt > 45 * 60 * 1000) {
+          updateAttempt(runDir, { status: 'done', stage: 'drive', reason: '45-минутный бюджет супервизора исчерпан' })
+          publish()
+          return { ok: true, steps, stopped: 'time-budget', reason: '45-минутный бюджет супервизора исчерпан; продолжайте нажатием «Продолжить»', attempt: readAttempt(runDir) }
+        }
+        const statusResult = await spawnIterativeStreamed(runDir, python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000, iterativeStreamIo(runDir), iterativeStreamPlatform)
         const payload = statusResult.code === 0
           ? parseIterativeStatusPayload(statusResult.stdout) ?? readIterativeStatus(runDir)
           : undefined
         if (!payload) {
-          return { ok: false, steps, stopped: 'error', error: statusResult.stderr.trim() || 'STATUS_UNREADABLE' }
+          const raw = statusResult.timedOut ? 'STATUS_TIMEOUT' : (statusResult.stderr.trim() || 'STATUS_UNREADABLE')
+          updateAttempt(runDir, { status: 'failed', stage: 'drive', lastError: raw.slice(0, 4000), lastStep: 'status' })
+          publish()
+          return { ok: false, steps, stopped: 'error', error: raw.slice(0, 4000), attempt: readAttempt(runDir) }
         }
         const phase = String((payload.run ?? {}).phase ?? '')
         const decision = decideNextStep(runDir, payload)
+        updateAttempt(runDir, { status: 'running', stage: 'drive', phase, lastStep: decision.step ?? undefined })
+        publish()
         // GATE: the repair agent is a human/provider action, never auto-run.
         if (decision.step === 'agent') {
           // P1.1: keep the human-facing ТЗ fresh at the gate — rebuilt from the
           // current durable state, never a stale C0-bound artifact.
           await refreshIterativeTaskArtifact(runDir, generator, python, workspace.path)
+          updateAttempt(runDir, { status: 'done', stage: 'drive', reason: decision.reason, lastStep: 'agent' })
+          publish()
           return {
             ok: true,
             steps,
@@ -7681,32 +7862,49 @@ function setupIpc(): void {
             reason: decision.reason,
             bootstrap: decision.bootstrap,
             repairRequests: decision.repairRequests,
+            attempt: readAttempt(runDir),
           }
         }
         if (decision.step === 'begin') {
           // The supervisor never fabricates a run: begin (C0 capture) is a
           // user action with a target policy; drive only continues an opened run.
-          return { ok: false, steps, stopped: 'error', error: 'NO_RUN: создайте прогон (Начать миграцию) перед «Продолжить»' }
+          updateAttempt(runDir, { status: 'failed', stage: 'drive', lastError: 'NO_RUN', lastStep: 'begin' })
+          publish()
+          return { ok: false, steps, stopped: 'error', error: 'NO_RUN: создайте прогон (Начать миграцию) перед «Продолжить»', attempt: readAttempt(runDir) }
         }
         if (decision.step === null) {
-          return { ok: false, steps, stopped: 'error', error: decision.reason }
+          updateAttempt(runDir, { status: 'failed', stage: 'drive', lastError: decision.reason, lastStep: 'unknown' })
+          publish()
+          return { ok: false, steps, stopped: 'error', error: decision.reason, attempt: readAttempt(runDir) }
         }
-        const result = await spawnCapture(
-          python,
-          iterativeStepInvocation(runDir, decision.step, generator, python).args,
-          workspace.path,
-          1_800_000,
-        )
+        const result = await spawnIterativeStreamed(runDir, python, iterativeStepInvocation(runDir, decision.step, generator, python).args, workspace.path, 1_800_000, iterativeStreamIo(runDir), iterativeStreamPlatform)
         if (result.code !== 0) {
-          const raw = (result.stderr.trim() || result.stdout.trim() || `STEP_EXIT_${result.code}`)
-          return { ok: false, steps, stopped: 'error', step: decision.step, error: raw.slice(0, 4000) }
+          const raw = result.timedOut
+            ? (readAttempt(runDir)?.cancelRequested === true ? 'CANCELED: step terminated by user cancel' : `STEP_TIMEOUT: step ${decision.step} exceeded its 30-minute budget`)
+            : (result.stderr.trim() || result.stdout.trim() || `STEP_EXIT_${result.code}`)
+          const canceledByUser = readAttempt(runDir)?.cancelRequested === true
+          if (canceledByUser) clearCancelRequest(runDir)
+          updateAttempt(runDir, {
+            status: canceledByUser ? 'canceled' : 'failed',
+            stage: 'drive',
+            lastError: raw.slice(0, 4000),
+            reason: canceledByUser ? 'степень отменена пользователем; verified checkpoint сохранён' : result.timedOut ? `шаг ${decision.step} превысил бюджет времени` : `step ${decision.step} failed`,
+            lastStep: decision.step,
+          })
+          publish()
+          return { ok: false, steps, stopped: canceledByUser ? 'canceled' : 'error', step: decision.step, error: raw.slice(0, 4000), attempt: readAttempt(runDir) }
         }
         steps.push(decision.step)
+        updateSteps()
         if (decision.step === 'finish') {
-          return { ok: true, steps, stopped: 'finished', phase: 'TERMINAL', reason: decision.reason }
+          updateAttempt(runDir, { status: 'done', stage: 'drive', phase: 'TERMINAL', reason: decision.reason, lastStep: 'finish' })
+          publish()
+          return { ok: true, steps, stopped: 'finished', phase: 'TERMINAL', reason: decision.reason, attempt: readAttempt(runDir) }
         }
       }
-      return { ok: true, steps, stopped: 'iteration-budget', reason: 'супервизор остановлен по лимиту итераций; продолжите нажатием «Продолжить»' }
+      updateAttempt(runDir, { status: 'done', stage: 'drive', reason: 'супервизор остановлен по лимиту итераций' })
+      publish()
+      return { ok: true, steps, stopped: 'iteration-budget', reason: 'супервизор остановлен по лимиту итераций; продолжите нажатием «Продолжить»', attempt: readAttempt(runDir) }
     } finally {
       iterativeStepInFlight.delete(project.name)
     }
@@ -7784,6 +7982,11 @@ function setupIpc(): void {
     // with the durable lease below it prevents double dispatch within one
     // process lifetime and across an app restart.
     iterativeStepInFlight.add(project.name)
+    // L1: journal the agent dispatch so the panel can show "ремонт у агента"
+    // and the last error survives a restart.
+    resumeAttempt(runDir, project.name)
+    updateAttempt(runDir, { status: 'running', stage: 'agent' })
+    publishIterativeAttempt(runDir)
     let agentOutputTail = ''
     try {
       const python = resolveExecutable('python')
@@ -8045,8 +8248,13 @@ function setupIpc(): void {
         clearAgentLease(leasePath)
       }
     } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error), agentOutputTail }
+      const message = error instanceof Error ? error.message : String(error)
+      updateAttempt(runDir, { status: 'failed', stage: 'agent', lastError: message.slice(0, 4000), lastStep: 'agent' })
+      publishIterativeAttempt(runDir)
+      return { ok: false, error: message, agentOutputTail }
     } finally {
+      updateAttempt(runDir, { lastHeartbeatAt: Date.now() })
+      publishIterativeAttempt(runDir)
       iterativeStepInFlight.delete(project.name)
     }
   })

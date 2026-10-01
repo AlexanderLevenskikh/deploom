@@ -379,6 +379,30 @@ export type IterativeRuntimeView = {
   platform?: string
   arch?: string
 }
+// L1: display snapshot of the durable attempt journal (runDir/attempt.json +
+// attempt.log). The journal is written BEFORE the long begin/drive spawns, so
+// the first click is observable immediately and a Desktop restart restores
+// both the current state and the reason the attempt stopped.
+export type IterativeAttemptView = {
+  attemptId: string
+  projectName: string
+  status: 'starting' | 'running' | 'done' | 'failed' | 'canceled'
+  stage: 'preflight' | 'begin' | 'drive' | 'agent' | 'none'
+  phase?: string
+  startedAt: number
+  finishedAt?: number
+  lastHeartbeatAt: number
+  targetSource: 'none' | 'roadmap' | 'discovery'
+  discovery?: { parallelism: number; timeoutSeconds: number; maxPackages: number }
+  targetsCount?: number
+  packageProgress?: { processed: number; total: number }
+  stepsDone: string[]
+  reason?: string
+  lastError?: string
+  lastStep?: string
+  runCreated: boolean
+  cancelRequested?: boolean
+}
 export type IterativeStatusOutcome = {
   ok: boolean
   present: boolean
@@ -390,6 +414,8 @@ export type IterativeStatusOutcome = {
   // effective + CI evidence source). The UI renders it, never decides by it.
   requestedNode?: string
   runtime?: IterativeRuntimeView
+  attempt?: IterativeAttemptView
+  attemptLog?: string
   error?: string
 }
 // #1: durable supervisor outcome. drive runs the Python steps in a loop and
@@ -401,12 +427,13 @@ export type IterativeStatusOutcome = {
 export type IterativeDriveOutcome = {
   ok: boolean
   steps: string[]
-  stopped: 'agent-gate' | 'finished' | 'error' | 'time-budget' | 'iteration-budget'
+  stopped: 'agent-gate' | 'finished' | 'error' | 'time-budget' | 'iteration-budget' | 'canceled'
   phase?: string
   step?: string
   reason?: string
   bootstrap?: boolean
   repairRequests?: IterativeRunnerRepairRequest[]
+  attempt?: IterativeAttemptView
   error?: string
 }
 export type IterativeAgentOutcome = {
@@ -428,6 +455,10 @@ export type IterativeBeginOutcome = {
   next?: IterativeRunnerDecision
   targetsCount?: number
   targetLevel?: string
+  // L2: begin did NOT create a run because there are no saved roadmap targets
+  // (the user must pick Draft/scope setup or an explicit bounded discovery).
+  noTargets?: boolean
+  attempt?: IterativeAttemptView
   error?: string
 }
 export type DependencyFlowApi = {
@@ -457,7 +488,7 @@ export type DependencyFlowApi = {
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStatusOutcome>
   iterativeDrive: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeDriveOutcome>
-  iterativeBegin: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeBeginOutcome>
+  iterativeBegin: (input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number } }) => Promise<IterativeBeginOutcome>
   iterativeAgent: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeAgentOutcome>
   runAction: (input: ActionInput) => Promise<{ jobId: string; runId?: string; preview: string[] }>
   cancelJob: (jobId: string) => Promise<boolean>
@@ -477,6 +508,9 @@ export type DependencyFlowApi = {
   onMigrationProgressChanged: (handler: (event: { jobId: string; workspaceId?: string; projectName?: string; branch: string; phase?: MigrationBranchRuntimePhase }) => void) => () => void
   onJobFinished: (handler: (event: JobFinished) => void) => () => void
   onDownloadSaved: (handler: (event: DownloadSaved) => void) => () => void
+  iterativeAttempt: (input: { workspaceId?: string; projectName: string }) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
+  iterativeCancel: (input: { workspaceId?: string; projectName: string }) => Promise<{ ok: boolean }>
+  onIterativeAttempt: (handler: (payload: IterativeAttemptView) => void) => () => void
 }
 
 declare global {

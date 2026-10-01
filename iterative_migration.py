@@ -785,11 +785,32 @@ def build_run_config(run_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
             from project_runtime import runtime_env_for_path
 
             discovery_env = runtime_env_for_path(str(runtime["nodePath"]))
+        # Desktop bring their own budget because a bounded registry discovery is
+        # still the user's explicit choice (L2: no silent 97-package sequential
+        # probe in a blocking IPC). ``getattr`` keeps legacy callers (tests, the
+        # CLI without the new flags) on the single-threaded, unlimited default.
+        discovery_parallelism = int(getattr(args, "discover_parallelism", None) or 1)
+        discovery_timeout_s = max(0, int(getattr(args, "discover_timeout_s", None) or 0))
+        discovery_max_packages = max(0, int(getattr(args, "discover_max_packages", None) or 0))
+
+        def _discovery_progress(processed: int, total: int) -> None:
+            _emit_status(
+                {
+                    "event": "begin.discovery-progress",
+                    "processed": processed,
+                    "total": total,
+                }
+            )
+
         targets, target_discovery = _discover_targets(
             project_dir,
             direct_dependency_assignment(project_dir),
             discovery_env,
             runtime.get("effectiveVersion"),
+            parallelism=discovery_parallelism,
+            wall_budget_s=discovery_timeout_s,
+            max_packages=discovery_max_packages,
+            progress=_discovery_progress,
         )
 
     commands = tuple(str(item) for item in (verify_raw.get("commands") or []))
@@ -896,7 +917,8 @@ def _begin_locked(run_dir: Path, config: Mapping[str, Any], args: argparse.Names
         entry for entry in discovery
         if entry.get("status") in ("latest-incompatible-no-alternative", "no-newer-compatible")
     ]
-    if discovered or unavailable or incompatible_no_alt:
+    budget_skipped = [entry for entry in discovery if entry.get("status") == "discovery-budget-skipped"]
+    if discovered or unavailable or incompatible_no_alt or budget_skipped:
         _emit_status(
             {
                 "event": "begin.discovery",
@@ -905,6 +927,7 @@ def _begin_locked(run_dir: Path, config: Mapping[str, Any], args: argparse.Names
                 "discoveredTargets": sorted(str(entry.get("package") or "") for entry in discovered),
                 "registryUnavailable": sorted(str(entry.get("package") or "") for entry in unavailable),
                 "noCompatibleAlternative": sorted(str(entry.get("package") or "") for entry in incompatible_no_alt),
+                "budgetSkipped": sorted(str(entry.get("package") or "") for entry in budget_skipped),
             }
         )
 
@@ -1585,6 +1608,36 @@ def _dependency_diagnostics(project_dir: Any) -> Dict[str, Any]:
     return result
 
 
+# The wall-clock deadline shared by ALL registry probe threads of one
+# `_discover_targets` phase. A module-level "active phase" value is deliberate:
+# it is the mechanism that passes the discovery budget INTO every request, so
+# an in-flight probe bounds its own subprocess to the time remaining until the
+# deadline instead of running a full fixed timeout PAST it. 0.0 means "no
+# bounded discovery phase active" (the probe keeps its default timeout). It is
+# set for the duration of the probe phase only and restored in ``finally``.
+_ACTIVE_DISCOVERY_DEADLINE: float = 0.0
+
+
+def _probe_budget_timeout(default_seconds: int = 60) -> Optional[int]:
+    """Subprocess timeout for ONE registry probe under the active discovery
+    deadline.
+
+    Returns ``None`` when the budget is already exhausted — the probe is
+    SKIPPED without spawning anything (abstention, never a constraint). When a
+    deadline is active the returned timeout is the smaller of ``default_seconds``
+    and the wall time remaining until the deadline, clamped to at least 1s, so
+    a parallel probe that starts near the deadline is killed AT the deadline
+    instead of continuing a full default past it.
+    """
+    deadline = _ACTIVE_DISCOVERY_DEADLINE
+    if deadline <= 0.0:
+        return default_seconds
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return int(max(1, min(default_seconds, remaining)))
+
+
 def _normalize_effective_node_version(value: Any) -> str:
     """x.y.z from an effective Node version string (v-prefix/build tolerated)."""
     text = str(value or "").strip().lstrip("vV").split("+", 1)[0]
@@ -1610,11 +1663,14 @@ def _npm_engines_node(
     manager = resolve_executable("npm")
     if not manager:
         return ""
+    probe_timeout = _probe_budget_timeout()
+    if probe_timeout is None:
+        return ""
     try:
         completed = _run(
             [manager, "view", f"{name}@{version}", "engines.node", "--json"],
             project_dir,
-            timeout_seconds=60,
+            timeout_seconds=probe_timeout,
             env=runtime_env or {},
             base_env=os.environ,
             progress_label=f"engine metadata probe {name}@{version}",
@@ -1644,11 +1700,14 @@ def _npm_latest_version(
     manager = resolve_executable("npm")
     if not manager:
         return ""
+    probe_timeout = _probe_budget_timeout()
+    if probe_timeout is None:
+        return ""
     try:
         completed = _run(
             [manager, "view", name, "dist-tags.latest", "--json"],
             project_dir,
-            timeout_seconds=60,
+            timeout_seconds=probe_timeout,
             env=runtime_env or {},
             base_env=os.environ,
             progress_label=f"target discovery {name}",
@@ -1684,11 +1743,14 @@ def _npm_versions(
     manager = resolve_executable("npm")
     if not manager:
         return []
+    probe_timeout = _probe_budget_timeout()
+    if probe_timeout is None:
+        return []
     try:
         completed = _run(
             [manager, "view", name, "versions", "--json"],
             project_dir,
-            timeout_seconds=60,
+            timeout_seconds=probe_timeout,
             env=runtime_env or {},
             base_env=os.environ,
             progress_label=f"version discovery {name}",
@@ -1906,9 +1968,12 @@ def _yarn_lock_installed_version(lock_path: Path, package_name: str, declared_sp
     that selector are counted, so a TRANSITIVE resolution of the same package
     name (e.g. ``sample@^7.0.0`` under a direct ``sample@^8.0.0``) can never
     shadow or merge with the direct one and silently unmount the project's
-    installed version. Several DIFFERENT resolutions for the same selector are
-    ambiguous and yield None (abstention, never a guess); without a declared
-    spec a single resolution across all selectors of the package is accepted.
+    installed version. If NO block carries the declared selector the DIRECT
+    resolution is not proven and None is returned (abstention — a transitive
+    version is never mistaken for the installed direct one). Several DIFFERENT
+    resolutions for the same selector are ambiguous and yield None (abstention,
+    never a guess). Without a declared spec (pure helper use) a single
+    resolution across all selectors of the package is accepted.
     """
     try:
         lines = lock_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -1943,27 +2008,101 @@ def _yarn_lock_installed_version(lock_path: Path, package_name: str, declared_sp
                 direct_versions.add(version)
         if direct_versions:
             return direct_versions.pop() if len(direct_versions) == 1 else None
-        # No block matched the declared spec verbatim (e.g. a stale lockfile or
-        # a normalized range): fall through to the unique-across-all-selectors
-        # rule so the common single-resolution case still works.
+        # Review P1 (latest round): the DIRECT resolution is NOT proven when no
+        # block carries the declared selector (e.g. the lockfile only has the
+        # transitive `sample@^7.0.0` -> 7.2.0). Taking the transitive version as
+        # the INSTALLED direct one would let discovery plan an "upgrade" on top
+        # of a version the project never directly resolved — abstain instead.
+        return None
+    # No declared spec (pure helper call outside discovery): accept a single
+    # resolution across every selector of the package, abstain on ambiguity.
     versions: set = set()
     for _block_keys, version in blocks:
         versions.add(version)
     return versions.pop() if len(versions) == 1 else None
 
 
-def _pnpm_lock_installed_version(lock_path: Path, package_name: str) -> Optional[str]:
-    """pnpm-lock.yaml exact direct resolution (best-effort textual parse).
+def _pnpm_importer_direct_version(lines: Sequence[str], package_name: str) -> Optional[str]:
+    """The resolved version of a DIRECT dependency from the pnpm importer.
 
-    pnpm keys direct resolvers under ``packages:`` as ``/<name>@<version>:``
-    (scoped: ``/@scope/name@<version>:``, peer suffixes in parens). A single
-    version for the package is accepted; ambiguity yields None.
+    pnpm v9 (lockfileFormat 9.0) records the exact resolved version of every
+    direct dependency in the root importer (see the pnpm lockfile spec)::
+
+        importers:
+          .:
+            dependencies:
+              sample:
+                specifier: ^8.0.0
+                version: 8.5.0
+
+    The importer record IS the direct resolution (unique, no ambiguity with
+    transitive copies), so it wins over the packages snapshot. A version with a
+    peer-dependency suffix (``8.5.0(react@18.0.0)``) is reduced to the bare
+    version. Workspace/link entries (no version, or a ``link:`` value) yield
+    None — abstention, never a guess.
+    """
+    in_importers = False
+    in_root = False
+    in_deps = False
+    pending: Optional[str] = None
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            in_importers = stripped == "importers:"
+            in_root = False
+            in_deps = False
+            pending = None
+            continue
+        if not in_importers:
+            continue
+        if indent == 2:
+            # Importer key: '.' is the root project itself; other keys are
+            # workspace members and are NOT this project's direct dependencies.
+            in_root = stripped.startswith(".") and not stripped.startswith("..")
+            in_deps = False
+            pending = None
+            continue
+        if not in_root:
+            continue
+        if indent == 4 and stripped in ("dependencies:", "devDependencies:", "optionalDependencies:"):
+            in_deps = True
+            pending = None
+            continue
+        if not in_deps:
+            continue
+        if indent == 6 and stripped.endswith(":"):
+            pending = stripped[:-1]
+            continue
+        if indent == 8 and pending == str(package_name) and stripped.startswith("version:"):
+            raw = stripped[len("version:"):].strip().strip('"').strip("'")
+            match = re.match(r"^[^()]+", raw)
+            return match.group(0).strip() if match and match.group(0).strip() else None
+    return None
+
+
+def _pnpm_lock_installed_version(lock_path: Path, package_name: str) -> Optional[str]:
+    """pnpm-lock.yaml exact DIRECT resolution (best-effort textual parse).
+
+    pnpm v9 (lockfileFormat 9.0) records the resolved version of every direct
+    dependency in the importer section (``importers: ... .: dependencies:
+    <name>: version: 8.5.0``) and keys the packages snapshot WITHOUT a leading
+    slash (``sample@8.5.0``); v6-style lockfiles key it WITH one
+    (``/sample@8.5.0``). The importer record is authoritative (the direct
+    resolution), so it is read first; the packages snapshot is the fallback for
+    older files and accepts a single resolution of the package name — any
+    ambiguity yields None, never a guess.
     """
     try:
         lines = lock_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return None
-    pattern = re.compile(rf"^\s*/({re.escape(str(package_name))})@([^:()]+)")
+    importer_version = _pnpm_importer_direct_version(lines, package_name)
+    if importer_version is not None:
+        return importer_version
+    pattern = re.compile(rf"^\s*/?({re.escape(str(package_name))})@([^:()]+)")
     versions: set = set()
     for line in lines:
         match = pattern.match(line.rstrip())
@@ -1982,11 +2121,145 @@ def _newer_than_installed(candidate: str, installed: str) -> bool:
     return parsed is not None and base is not None and parsed > base
 
 
+def _discover_one_target(
+    project_dir: Path,
+    name: str,
+    declared: str,
+    runtime_env: Optional[Dict[str, str]],
+    node_version: Optional[str],
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Probe ONE direct dependency for a bounded target (see ``_discover_targets``).
+
+    Returns ``(target_version_or_None, evidence_row)``. A target is produced
+    only when the registry proves a STRICTLY NEWER version that is compatible
+    with the run's chosen Node (or when no Node is pinned and the choice is
+    engine-unchecked). Abstractions are evidence rows, never targets.
+    """
+    installed = _installed_version(project_dir, name, declared)
+    if installed is None:
+        return None, {
+            "package": name, "declared": declared,
+            "status": "installed-version-unknown",
+            "reason": (
+                f"the exact installed version of {name} cannot be read "
+                "from the canonical lockfile; the never-downgrade guard "
+                "abstains instead of choosing a target against an "
+                "unverifiable baseline"
+            ),
+        }
+    latest = _npm_latest_version(project_dir, name, runtime_env)
+    if not latest:
+        return None, {
+            "package": name, "declared": declared, "installed": installed,
+            "latest": "", "status": "registry-unavailable",
+            "reason": (
+                f"the registry metadata for {name} is unavailable; the upgrade "
+                "cannot be assessed, so no lag is claimed"
+            ),
+        }
+    if latest == installed:
+        return None, {
+            "package": name, "declared": declared, "installed": installed,
+            "latest": latest, "status": "up-to-date",
+        }
+    # Review re-check P1: NEVER accept the registry `latest` until it is
+    # provably STRICTLY newer than the INSTALLED version. This guard runs
+    # BEFORE every direct acceptance of `latest` (both the unpinned-Node and
+    # the pinned-Node/engine-compatible shortcuts): a dist-tag that lags the
+    # installed version (installed 8.5.0, latest 8.1.0) would otherwise be
+    # proposed as a target and roll the package back. When `latest` is not an
+    # upgrade nothing is proposed — the bounded search below (which applies
+    # the same guard per candidate) is the only remaining way a strictly
+    # newer verified version can be chosen — and the unfulfilled intent is
+    # recorded as no-newer-compatible instead of a false completion.
+    if not _newer_than_installed(latest, installed):
+        return None, {
+            "package": name, "declared": declared, "installed": installed,
+            "latest": latest, "status": "no-newer-compatible",
+            "rejected": [
+                {"version": latest, "nodeSpec": "", "status": "not-newer-than-current"}
+            ],
+            "reason": (
+                f"registry latest {latest} is not strictly newer than the "
+                f"INSTALLED {installed}; accepting it would roll the package "
+                "back, so the current version is kept"
+            ),
+        }
+    if not node_version:
+        return latest, {
+            "package": name, "declared": declared, "installed": installed,
+            "latest": latest,
+            "status": "discovered", "engineUnchecked": True,
+        }
+    from project_runtime import node_range_satisfied
+
+    latest_spec = _npm_engines_node(project_dir, name, latest, runtime_env)
+    if not latest_spec or node_range_satisfied(latest_spec, node_version):
+        return latest, {
+            "package": name, "declared": declared, "installed": installed,
+            "latest": latest, "nodeVersion": node_version, "latestNodeSpec": latest_spec,
+            "status": "discovered",
+            **({"enginesUnknown": True} if not latest_spec else {}),
+        }
+    chosen: Optional[str] = None
+    chosen_spec = ""
+    rejected: List[Dict[str, Any]] = []
+    for candidate in _npm_versions(project_dir, name, runtime_env, top=12):
+        if candidate == latest:
+            continue
+        if candidate == installed or not _newer_than_installed(candidate, installed):
+            # Postfix-review P1: never downgrade. A candidate at or below
+            # the INSTALLED version (lockfile-exact) cannot be an upgrade,
+            # whatever its engines — the declared range floor alone would
+            # accept a lower-than-installed version (e.g. 8.1.0 under
+            # ^8.0.0 with 8.5.0 installed) and roll the package back.
+            rejected.append({"version": candidate, "nodeSpec": "", "status": "not-newer-than-current"})
+            continue
+        candidate_spec = _npm_engines_node(project_dir, name, candidate, runtime_env)
+        if not candidate_spec:
+            rejected.append({"version": candidate, "nodeSpec": "", "status": "engines-unknown"})
+            continue
+        if node_range_satisfied(candidate_spec, node_version):
+            chosen = candidate
+            chosen_spec = candidate_spec
+            break
+        rejected.append({"version": candidate, "nodeSpec": candidate_spec, "status": "engines-incompatible"})
+    if chosen:
+        return chosen, {
+            "package": name, "declared": declared, "installed": installed,
+            "latest": latest, "latestNodeSpec": latest_spec, "nodeVersion": node_version,
+            "target": chosen, "targetNodeSpec": chosen_spec,
+            "rejected": rejected, "status": "discovered-compatible",
+        }
+    # No strictly-newer verified-compatible alternative in the bounded
+    # window: KEEP the installed version (no downgrade, no false plan entry)
+    # and record the unfulfilled upgrade intent with an honest reason. The
+    # deferred/blocked package stays visible in the discovery evidence, in
+    # the begin.discovery event and in the task remainder (via the task
+    # builder's no-newer-compatible intents); it is never an invented
+    # completion and never silently dropped to "0 of 0" in the task.
+    return None, {
+        "package": name, "declared": declared, "installed": installed,
+        "latest": latest, "latestNodeSpec": latest_spec, "nodeVersion": node_version,
+        "rejected": rejected, "status": "no-newer-compatible",
+        "reason": (
+            f"latest {latest} requires node {latest_spec}, but the run's "
+            f"chosen Node is {node_version}; no verified-compatible version "
+            f"strictly newer than the INSTALLED {installed} exists within the "
+            "bounded window — keeping the current version"
+        ),
+    }
+
+
 def _discover_targets(
     project_dir: Path,
     current: Mapping[str, str],
     runtime_env: Optional[Dict[str, str]],
     node_version: Optional[str] = None,
+    parallelism: int = 1,
+    wall_budget_s: int = 0,
+    max_packages: int = 0,
+    progress: Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
     """#2/P1.2 bounded target discovery for begin when no roadmap targets exist.
 
@@ -2015,147 +2288,150 @@ def _discover_targets(
     false completion; the task builder surfaces that intent in the remainder.
     Unknown engines are an abstention, never a false incompatibility claim;
     without a pinned Node the choice is engine-unchecked.
+
+    Discovery is BOUNDED so a Desktop click never blocks on many minutes of
+    sequential registry probes: `parallelism` probes run concurrently,
+    `wall_budget_s` caps the phase wall-clock time (>=1 enforces a deadline),
+    and `max_packages` caps how many direct dependencies are probed at all.
+    Packages cut off by the cap or the deadline are recorded as honest
+    ``discovery-budget-skipped`` evidence — their upgrade is NOT assessed and
+    NOT claimed, and the task builder keeps them in the remainder; a missing
+    probe never becomes a proven lag, an invented version or zero findings.
+    `progress(processed, total)` is called after each completed probe.
     """
+    global _ACTIVE_DISCOVERY_DEADLINE
     targets: Dict[str, str] = {}
     evidence: List[Dict[str, Any]] = []
-    for name, declared in sorted(current.items()):
-        installed = _installed_version(project_dir, name, declared)
-        if installed is None:
+    names = sorted(current.items())
+    if max_packages > 0 and len(names) > max_packages:
+        for name, declared in names[max_packages:]:
             evidence.append(
                 {
                     "package": name, "declared": declared,
-                    "status": "installed-version-unknown",
-                    "reason": (
-                        f"the exact installed version of {name} cannot be read "
-                        "from the canonical lockfile; the never-downgrade guard "
-                        "abstains instead of choosing a target against an "
-                        "unverifiable baseline"
-                    ),
+                    "status": "discovery-budget-skipped",
+                    "reason": _budget_skip_reason(name, f"discovery budget cap ({max_packages}) reached"),
                 }
             )
-            continue
-        latest = _npm_latest_version(project_dir, name, runtime_env)
-        if not latest:
-            evidence.append(
-                {
-                    "package": name, "declared": declared, "installed": installed,
-                    "latest": "", "status": "registry-unavailable",
-                }
-            )
-            continue
-        if latest == installed:
-            evidence.append(
-                {
-                    "package": name, "declared": declared, "installed": installed,
-                    "latest": latest, "status": "up-to-date",
-                }
-            )
-            continue
-        # Review re-check P1: NEVER accept the registry `latest` until it is
-        # provably STRICTLY newer than the INSTALLED version. This guard runs
-        # BEFORE every direct acceptance of `latest` (both the unpinned-Node and
-        # the pinned-Node/engine-compatible shortcuts): a dist-tag that lags the
-        # installed version (installed 8.5.0, latest 8.1.0) would otherwise be
-        # proposed as a target and roll the package back. When `latest` is not an
-        # upgrade nothing is proposed — the bounded search below (which applies
-        # the same guard per candidate) is the only remaining way a strictly
-        # newer verified version can be chosen — and the unfulfilled intent is
-        # recorded as no-newer-compatible instead of a false completion.
-        if not _newer_than_installed(latest, installed):
-            evidence.append(
-                {
-                    "package": name, "declared": declared, "installed": installed,
-                    "latest": latest, "status": "no-newer-compatible",
-                    "rejected": [
-                        {"version": latest, "nodeSpec": "", "status": "not-newer-than-current"}
-                    ],
-                    "reason": (
-                        f"registry latest {latest} is not strictly newer than the "
-                        f"INSTALLED {installed}; accepting it would roll the package "
-                        "back, so the current version is kept"
-                    ),
-                }
-            )
-            continue
-        if not node_version:
-            targets[name] = latest
-            evidence.append(
-                {
-                    "package": name, "declared": declared, "installed": installed,
-                    "latest": latest,
-                    "status": "discovered", "engineUnchecked": True,
-                }
-            )
-            continue
-        from project_runtime import node_range_satisfied
+        names = names[:max_packages]
+    total = len(names)
 
-        latest_spec = _npm_engines_node(project_dir, name, latest, runtime_env)
-        if not latest_spec or node_range_satisfied(latest_spec, node_version):
-            targets[name] = latest
-            evidence.append(
-                {
-                    "package": name, "declared": declared, "installed": installed,
-                    "latest": latest, "nodeVersion": node_version, "latestNodeSpec": latest_spec,
-                    "status": "discovered",
-                    **({"enginesUnknown": True} if not latest_spec else {}),
+    def hard_deadline() -> Optional[float]:
+        if wall_budget_s <= 0:
+            return None
+        import time as _time
+
+        return _time.monotonic() + wall_budget_s
+
+    deadline = hard_deadline()
+    processed = 0
+
+    def record(target_version: Optional[str], name: str, row: Dict[str, Any]) -> None:
+        nonlocal processed
+        if target_version is not None:
+            targets[name] = target_version
+        evidence.append(row)
+        processed += 1
+        if progress is not None:
+            progress(processed, total)
+
+    # The wall budget is passed INTO every registry probe for the whole phase:
+    # each request bounds its own subprocess to the time remaining until the
+    # deadline (see `_probe_budget_timeout`), so probes that started before the
+    # deadline are killed AT it instead of overrunning it by a full default — a
+    # 1s budget finishes in ~1s, never in 1s + one full npm view. The deadline
+    # is restored in `finally` so later phases (e.g. engine prechecks) keep
+    # their own fixed timeouts.
+    previous_discovery_deadline = _ACTIVE_DISCOVERY_DEADLINE
+    if deadline is not None:
+        _ACTIVE_DISCOVERY_DEADLINE = deadline
+    try:
+        if parallelism <= 1:
+            for name, declared in names:
+                if deadline is not None and _after_deadline(deadline):
+                    evidence.append(
+                        {
+                            "package": name, "declared": declared,
+                            "status": "discovery-budget-skipped",
+                            "reason": _budget_skip_reason(name, "wall-clock budget exhausted"),
+                        }
+                    )
+                    processed += 1
+                    if progress is not None:
+                        progress(processed, total)
+                    continue
+                target, row = _discover_one_target(project_dir, name, declared, runtime_env, node_version)
+                record(target, name, row)
+            _order_discovery(targets, evidence)
+            return targets, evidence
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
+        lock = threading.Lock()
+
+        def probe(item: Tuple[str, str]) -> Tuple[Optional[str], str, Dict[str, Any]]:
+            name, declared = item
+            if deadline is not None and _after_deadline(deadline):
+                return None, name, {
+                    "package": name, "declared": declared,
+                    "status": "discovery-budget-skipped",
+                    "reason": _budget_skip_reason(name, "wall-clock budget exhausted"),
                 }
-            )
-            continue
-        chosen: Optional[str] = None
-        chosen_spec = ""
-        rejected: List[Dict[str, Any]] = []
-        for candidate in _npm_versions(project_dir, name, runtime_env, top=12):
-            if candidate == latest:
-                continue
-            if candidate == installed or not _newer_than_installed(candidate, installed):
-                # Postfix-review P1: never downgrade. A candidate at or below
-                # the INSTALLED version (lockfile-exact) cannot be an upgrade,
-                # whatever its engines — the declared range floor alone would
-                # accept a lower-than-installed version (e.g. 8.1.0 under
-                # ^8.0.0 with 8.5.0 installed) and roll the package back.
-                rejected.append({"version": candidate, "nodeSpec": "", "status": "not-newer-than-current"})
-                continue
-            candidate_spec = _npm_engines_node(project_dir, name, candidate, runtime_env)
-            if not candidate_spec:
-                rejected.append({"version": candidate, "nodeSpec": "", "status": "engines-unknown"})
-                continue
-            if node_range_satisfied(candidate_spec, node_version):
-                chosen = candidate
-                chosen_spec = candidate_spec
-                break
-            rejected.append({"version": candidate, "nodeSpec": candidate_spec, "status": "engines-incompatible"})
-        if chosen:
-            targets[name] = chosen
-            evidence.append(
-                {
-                    "package": name, "declared": declared, "installed": installed,
-                    "latest": latest, "latestNodeSpec": latest_spec, "nodeVersion": node_version,
-                    "target": chosen, "targetNodeSpec": chosen_spec,
-                    "rejected": rejected, "status": "discovered-compatible",
+            try:
+                target, row = _discover_one_target(project_dir, name, declared, runtime_env, node_version)
+                return target, name, row
+            except Exception:  # noqa: BLE001 - a probe failure is an abstention, never a constraint
+                return None, name, {
+                    "package": name, "declared": declared,
+                    "status": "discovery-budget-skipped",
+                    "reason": _budget_skip_reason(name, "probe failed unexpectedly"),
                 }
-            )
-            continue
-        # No strictly-newer verified-compatible alternative in the bounded
-        # window: KEEP the installed version (no downgrade, no false plan entry)
-        # and record the unfulfilled upgrade intent with an honest reason. The
-        # deferred/blocked package stays visible in the discovery evidence, in
-        # the begin.discovery event and in the task remainder (via the task
-        # builder's no-newer-compatible intents); it is never an invented
-        # completion and never silently dropped to "0 of 0" in the task.
-        evidence.append(
-            {
-                "package": name, "declared": declared, "installed": installed,
-                "latest": latest, "latestNodeSpec": latest_spec, "nodeVersion": node_version,
-                "rejected": rejected, "status": "no-newer-compatible",
-                "reason": (
-                    f"latest {latest} requires node {latest_spec}, but the run's "
-                    f"chosen Node is {node_version}; no verified-compatible version "
-                    f"strictly newer than the INSTALLED {installed} exists within the "
-                    "bounded window — keeping the current version"
-                ),
-            }
-        )
-    return targets, evidence
+
+        with ThreadPoolExecutor(max_workers=parallelism) as pool:
+            futures = {pool.submit(probe, item): item for item in names}
+            for future in as_completed(futures):
+                target, name, row = future.result()
+                if deadline is not None and _after_deadline(deadline):
+                    # Review re-check P1.2: a result that only ARRIVED after the
+                    # deadline is not evidence the run stayed within its budget,
+                    # so it is never accepted as a target or a finished probe —
+                    # it becomes an honest budget-skipped row instead.
+                    _, declared = futures[future]
+                    target = None
+                    row = {
+                        "package": name, "declared": declared,
+                        "status": "discovery-budget-skipped",
+                        "reason": _budget_skip_reason(name, "wall-clock budget exhausted before the probe finished"),
+                    }
+                with lock:
+                    record(target, name, row)
+        _order_discovery(targets, evidence)
+        return targets, evidence
+    finally:
+        _ACTIVE_DISCOVERY_DEADLINE = previous_discovery_deadline
+
+
+def _budget_skip_reason(name: str, why: str) -> str:
+    return (
+        f"{why}; {name} was not probed, so its upgrade is not assessed "
+        "and no lag is claimed"
+    )
+
+
+def _after_deadline(deadline: float) -> bool:
+    import time as _time
+
+    return _time.monotonic() >= deadline
+
+
+def _order_discovery(targets: Dict[str, str], evidence: List[Dict[str, Any]]) -> None:
+    """Deterministic discovery output: stable ordering by package name so a
+    bounded/parallel discovery produces the SAME evidence rows as a sequential
+    one (reproducibility, never run-order)."""
+    ordered = {name: targets[name] for name in sorted(targets)}
+    targets.clear()
+    targets.update(ordered)
+    evidence.sort(key=lambda e: (str(e.get("package") or ""), str(e.get("status") or "")))
 
 
 def _engine_deferred_targets(
@@ -3769,6 +4045,24 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Явный Node.js для проекта/CI (точная версия или major). Пусто = не задано пользователем; "
         "недоступная версия даёт ENVIRONMENT_UNAVAILABLE, а не fallback на PATH",
+    )
+    begin.add_argument(
+        "--discover-parallelism",
+        type=int,
+        default=1,
+        help="Сколько registry-проб discovery выполнять параллельно (Desktop передаёт ограниченный бюджет; 1 = строго последовательно, как раньше)",
+    )
+    begin.add_argument(
+        "--discover-timeout-s",
+        type=int,
+        default=0,
+        help="Wall-clock бюджет фазы discovery в секундах; 0 = без жёсткого дедлайна",
+    )
+    begin.add_argument(
+        "--discover-max-packages",
+        type=int,
+        default=0,
+        help="Сколько прямых зависимостей максимум пробовать в discovery; 0 = без капа",
     )
 
     verify_bootstrap = sub.add_parser("verify-bootstrap", help="Повторная контрольная проверка C0 после bootstrap repair")

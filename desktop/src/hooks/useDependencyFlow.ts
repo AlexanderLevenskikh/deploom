@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntentPlan, BootstrapPayload, DependencyGraphSnapshot, DownloadSaved, FlowAction, HardwareSnapshot, IterativeAgentOutcome, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobFinished, JobOutput, ProjectSpec, TargetLevel, ThemePreference, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
+import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntentPlan, BootstrapPayload, DependencyGraphSnapshot, DownloadSaved, FlowAction, HardwareSnapshot, IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobFinished, JobOutput, ProjectSpec, TargetLevel, ThemePreference, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
 import { parseBaselineDecision } from '../data/baselineIntent'
 import { goalSeekingStopReason, nextAutopilotAction, type AutopilotPolicyState } from '../autopilot-policy'
 
@@ -205,6 +205,11 @@ export function useDependencyFlow() {
     return pending
   }, [api])
 
+  // L1: live snapshot of the iterative attempt journal pushed by main.ts during
+  // begin/drive. The panel seeds from the IPC read and mixes this event stream,
+  // so the first click is observable without a poll.
+  const [iterativeAttempt, setIterativeAttempt] = useState<IterativeAttemptView>()
+
   useEffect(() => {
     if (!api) return
     const intervalMs = anyActiveJob ? 3_000 : 10_000
@@ -374,6 +379,9 @@ export function useDependencyFlow() {
       })
     })
     const removeUpdateStatus = api.onUpdateStatus(setUpdateStatus)
+    const removeIterativeAttempt = api.onIterativeAttempt((payload) => {
+      setIterativeAttempt(payload as IterativeAttemptView)
+    })
     const removeDownload = api.onDownloadSaved((event) => {
       setLastDownload(event)
       setLogs((current) => [...current.slice(-999), { jobId: 'download', stream: 'system', workspaceId: event.workspaceId, projectName: event.projectName, line: `Сохранено: ${event.path}` }])
@@ -392,7 +400,7 @@ export function useDependencyFlow() {
       }
       void refresh()
     })
-    return () => { removeOutput(); removeMigrationProgress(); removeFinished(); removeDownload(); removeUpdateStatus() }
+    return () => { removeOutput(); removeMigrationProgress(); removeFinished(); removeDownload(); removeUpdateStatus(); removeIterativeAttempt() }
   }, [api, refresh, selectedProjectName, selectedWorkspaceId])
 
 
@@ -639,13 +647,21 @@ export function useDependencyFlow() {
     if (!api) return { ok: false, steps: [], stopped: 'error', error: 'NO_DESKTOP_API' }
     return api.iterativeDrive({ workspaceId: selectedWorkspaceId, projectName })
   }, [api, selectedWorkspaceId])
-  const iterativeBegin = useCallback(async (projectName: string): Promise<IterativeBeginOutcome> => {
+  const iterativeBegin = useCallback(async (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }): Promise<IterativeBeginOutcome> => {
     if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
-    return api.iterativeBegin({ workspaceId: selectedWorkspaceId, projectName })
+    return api.iterativeBegin({ workspaceId: selectedWorkspaceId, projectName, discovery })
   }, [api, selectedWorkspaceId])
   const iterativeAgent = useCallback(async (projectName: string): Promise<IterativeAgentOutcome> => {
     if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
     return api.iterativeAgent({ workspaceId: selectedWorkspaceId, projectName })
+  }, [api, selectedWorkspaceId])
+  const iterativeAttemptRead = useCallback(async (projectName: string): Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }> => {
+    if (!api) return { ok: false, present: false, error: 'NO_DESKTOP_API' }
+    return api.iterativeAttempt({ workspaceId: selectedWorkspaceId, projectName })
+  }, [api, selectedWorkspaceId])
+  const iterativeCancel = useCallback(async (projectName: string): Promise<{ ok: boolean }> => {
+    if (!api) return { ok: false }
+    return api.iterativeCancel({ workspaceId: selectedWorkspaceId, projectName })
   }, [api, selectedWorkspaceId])
   const setThemePreference = useCallback(async (preference: ThemePreference) => { setThemePreferenceState(preference); if (!api) return; const result = await api.setThemePreference(preference); setThemePreferenceState(result.preference); document.documentElement.dataset.theme = result.preference === 'system' ? '' : result.preference }, [api])
 
@@ -730,6 +746,6 @@ export function useDependencyFlow() {
   return {
     payload, loading, error, baselineDecision, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch, acknowledgeDraftRun,
     load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, removeProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches, updateProjectNode, listNodeVersions,
-    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult,     getDependencyGraphSnapshot, getIterativeTask, exportIterativeTask, exportLegacyIterativeTask, copyIterativeTask, saveIterativeTask, iterativeStatus, iterativeDrive, iterativeBegin, iterativeAgent, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
+    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult,     getDependencyGraphSnapshot, getIterativeTask, exportIterativeTask, exportLegacyIterativeTask, copyIterativeTask, saveIterativeTask, iterativeStatus, iterativeDrive, iterativeBegin, iterativeAgent, iterativeAttemptRead, iterativeCancel, iterativeAttempt, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }
 }

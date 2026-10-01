@@ -268,6 +268,19 @@ if (!statusInvocation.args.includes("status") || !statusInvocation.args.includes
   if (!main.includes("repairPromptTaskText(bootstrap, taskDispatchable(runDir))")) {
     throw new Error("repair dispatch must route task text by bootstrap vs candidate (review P1: no checkpoint ТЗ for a candidate repair)");
   }
+  // Review re-check (launch boundaries): begin/drive adopt the TESTABLE stream
+  // runner; a watchdog KILL never surfaces as success — both handlers branch on
+  // result.timedOut (explicit timeout reasons), the begin handler confirms a
+  // DURABLE C0 payload before success (never trusts a bare exit 0), and the
+  // begin in-flight lock is held inside ONE try/catch/finally so a preparation
+  // failure releases it and records a failed attempt.
+  const begin = main.slice(main.indexOf("flow:iterative:begin"), main.indexOf("flow:iterative:drive"));
+  if (!main.includes("./iterative-stream.js")) throw new Error("main must adopt the testable stream runner (iterative-stream.js)");
+  if (!begin.includes("result.timedOut")) throw new Error("begin must branch on a watchdog timeout, never claim success");
+  if (!begin.includes("!refreshed")) throw new Error("begin must confirm a durable C0 payload before success, never trust a bare exit 0");
+  if (!/BEGIN_TIMEOUT/.test(begin)) throw new Error("begin must name the timeout explicitly (BEGIN_TIMEOUT)");
+  if (!begin.includes("BEGIN_PREP_FAILED")) throw new Error("begin must turn a preparation failure into a clear BEGIN_PREP_FAILED error");
+  if (!/finally\s*\{[\s\S]*iterativeStepInFlight\.delete/.test(begin)) throw new Error("begin must release the in-flight lock in a finally");
 }
 
 if (!existsSync(runDir)) throw new Error("fixture missing");

@@ -99,6 +99,10 @@ def _base_args(project_dir: str, **overrides) -> object:
         max_known_high=None,
         tool_build_id="tool-test",
         run_id=None,
+        # L2 bounded-discovery budget (Desktop-owned; absent in legacy callers).
+        discover_parallelism=None,
+        discover_timeout_s=None,
+        discover_max_packages=None,
     )
     values.update(overrides)
     return type("Args", (), values)()
@@ -139,6 +143,10 @@ class IterativeTargetDiscoveryTests(unittest.TestCase):
         self.assertEqual(config["targets"], {"is-number": "7.0.0"})
         unavailable = [e for e in config["targetDiscovery"] if e["status"] == "registry-unavailable"]
         self.assertEqual([e["package"] for e in unavailable], ["private-lib"])
+        # Review P2: the unavailable goal carries an honest reason so the task
+        # builder can show it as an unknown WITHOUT claiming a proven lag.
+        self.assertIn("registry metadata", unavailable[0]["reason"])
+        self.assertEqual(unavailable[0]["installed"], "0.1.0")
 
     def test_explicit_targets_file_wins_over_discovery(self) -> None:
         project = _make_project(self._tmp, {"is-number": "6.0.0"})
@@ -702,17 +710,26 @@ class IterativeTargetDiscoveryTests(unittest.TestCase):
         self.assertEqual(_installed_version(project, "@scope/a"), "2.3.1")
         self.assertIsNone(_installed_version(project, "missing"))
 
-    def test_installed_version_reads_pnpm_lockfile_packages(self) -> None:
+    def test_installed_version_reads_pnpm_v9_importer_and_v6_packages(self) -> None:
         from iterative_migration import _installed_version
 
-        project = self._tmp / "pnpm-lockfile"
-        project.mkdir(parents=True, exist_ok=True)
-        (project / "package.json").write_text(
+        # pnpm v9 (lockfileFormat 9.0, per the pnpm lockfile spec): the root
+        # importer records the DIRECT resolved version; the packages snapshot
+        # keys have NO leading slash (`sample@8.5.0`). A transitive copy
+        # (`sample@7.2.0`) in the same snapshot must not confuse the direct
+        # read — the importer is authoritative.
+        v9 = self._tmp / "pnpm-lockfile-v9"
+        v9.mkdir(parents=True, exist_ok=True)
+        (v9 / "package.json").write_text(
             json.dumps({"name": "x", "version": "1.0.0", "dependencies": {"sample": "^8.0.0"}}),
             encoding="utf-8",
         )
-        (project / "pnpm-lock.yaml").write_text(
+        (v9 / "pnpm-lock.yaml").write_text(
             "lockfileVersion: '9.0'\n"
+            "\n"
+            "settings:\n"
+            "  autoInstallPeers: true\n"
+            "  excludeLinksFromLockfile: false\n"
             "\n"
             "importers:\n"
             "  .:\n"
@@ -722,11 +739,82 @@ class IterativeTargetDiscoveryTests(unittest.TestCase):
             "        version: 8.5.0\n"
             "\n"
             "packages:\n"
+            "  sample@8.5.0:\n"
+            "    resolution: {integrity: sha512-abc}\n"
+            "  sample@7.2.0:\n"
+            "    resolution: {integrity: sha512-def}\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(_installed_version(v9, "sample"), "8.5.0")
+
+        # v6-style lockfile: no importer `version`, packages key WITH a leading
+        # slash (`/sample@8.5.0`); the fallback still resolves the direct dep.
+        v6 = self._tmp / "pnpm-lockfile-v6"
+        v6.mkdir(parents=True, exist_ok=True)
+        (v6 / "package.json").write_text(
+            json.dumps({"name": "x", "version": "1.0.0", "dependencies": {"sample": "^8.0.0"}}),
+            encoding="utf-8",
+        )
+        (v6 / "pnpm-lock.yaml").write_text(
+            "lockfileVersion: 6.0\n"
+            "\n"
+            "packages:\n"
             "  /sample@8.5.0:\n"
             "    resolution: {integrity: sha512-abc}\n",
             encoding="utf-8",
         )
-        self.assertEqual(_installed_version(project, "sample"), "8.5.0")
+        self.assertEqual(_installed_version(v6, "sample"), "8.5.0")
+
+    def test_yarn_transitive_only_never_mistaken_for_direct_installed(self) -> None:
+        # Review P1 (latest round): the lockfile holds ONLY a TRANSITIVE
+        # `sample@^7.0.0` -> 7.2.0 and no block with the DIRECT declared
+        # selector `sample@^8.0.0`. The direct resolution is NOT proven, so the
+        # reader must abstain (None) — taking 7.2.0 as the installed direct
+        # version would let discovery plan an "upgrade" on top of a version the
+        # project never directly resolved.
+        from iterative_migration import _installed_version
+
+        project = self._tmp / "yarn-transitive-only"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "package.json").write_text(
+            json.dumps({"name": "x", "version": "1.0.0", "dependencies": {"sample": "^8.0.0"}}),
+            encoding="utf-8",
+        )
+        (project / "yarn.lock").write_text(
+            "# yarn lockfile v1\n"
+            "sample@^7.0.0:\n"
+            '  version "7.2.0"\n',
+            encoding="utf-8",
+        )
+        self.assertIsNone(_installed_version(project, "sample", "^8.0.0"))
+
+    def test_yarn_transitive_only_discovery_abstains(self) -> None:
+        # End-to-end: with only a transitive `sample@^7.0.0`, discovery cannot
+        # read the direct installed version and ABSTAINS (installed-version-
+        # unknown) instead of planning a pseudo-upgrade on top of 7.2.0.
+        project = self._tmp / "yarn-transitive-only-e2e"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "package.json").write_text(
+            json.dumps({"name": "x", "version": "1.0.0", "dependencies": {"sample": "^8.0.0"}}),
+            encoding="utf-8",
+        )
+        (project / "yarn.lock").write_text(
+            "# yarn lockfile v1\n"
+            "sample@^7.0.0:\n"
+            '  version "7.2.0"\n',
+            encoding="utf-8",
+        )
+
+        def fake_latest(project_dir, name, runtime_env):
+            return "9.0.0"
+
+        with mock.patch("iterative_migration._npm_latest_version", side_effect=fake_latest):
+            config = build_run_config(self._tmp, _base_args(str(project)))
+
+        self.assertEqual(config["targets"], {})
+        entry = config["targetDiscovery"][0]
+        self.assertEqual(entry["status"], "installed-version-unknown")
+        self.assertIn("cannot be read", entry["reason"])
 
     def test_registry_latest_below_installed_never_proposed_unpinned(self) -> None:
         # Review re-check P1 (downgrade via `latest`): the registry dist-tag
@@ -842,6 +930,152 @@ class IterativeTargetDiscoveryTests(unittest.TestCase):
         self.assertEqual(entry["installed"], "8.5.0")
         self.assertFalse(
             any(e["status"] == "installed-version-unknown" for e in config["targetDiscovery"])
+        )
+
+    def test_discovery_budget_cap_skips_untouched_packages_honestly(self) -> None:
+        # L2: a Desktop-requested discovery budget caps how many direct deps are
+        # probed. The packages beyond the cap are NOT "up-to-date", NOT targets
+        # and NOT silently dropped — they are recorded as honest
+        # `discovery-budget-skipped` evidence ("no lag is claimed").
+        project = _make_project(
+            self._tmp,
+            {"a": "1.0.0", "b": "2.0.0", "c": "3.0.0"},
+            installed={"a": "1.0.0", "b": "2.0.0", "c": "3.0.0"},
+        )
+
+        def fake_latest(project_dir, name, runtime_env):
+            return {"a": "9.0.0", "b": "9.0.0", "c": "9.0.0"}[name]
+
+        with mock.patch("iterative_migration._npm_latest_version", side_effect=fake_latest):
+            config = build_run_config(self._tmp, _base_args(str(project), discover_max_packages=1))
+
+        self.assertEqual(config["targets"], {"a": "9.0.0"})
+        skipped = [e for e in config["targetDiscovery"] if e["status"] == "discovery-budget-skipped"]
+        self.assertEqual(sorted(e["package"] for e in skipped), ["b", "c"])
+        self.assertTrue(all("no lag is claimed" in e["reason"] for e in skipped), skipped)
+        self.assertFalse(
+            any(e["status"] == "up-to-date" for e in config["targetDiscovery"]),
+            "a skipped package must NEVER look fresh/up-to-date",
+        )
+
+    def test_discovery_parallelism_matches_sequential_result(self) -> None:
+        # L2: parallel bounded discovery must be deterministic — same targets
+        # and the same evidence statuses in the same package order as the
+        # sequential default (never run-order dependent).
+        deps = {f"pkg{i}": f"{i}.0.0" for i in range(6)}
+        project = _make_project(self._tmp, deps, installed=dict(deps))
+        latest = {f"pkg{i}": f"9.{i}.0" for i in range(6)}
+
+        def fake_latest(project_dir, name, runtime_env):
+            return latest[name]
+
+        with mock.patch("iterative_migration._npm_latest_version", side_effect=fake_latest):
+            sequential = build_run_config(self._tmp, _base_args(str(project)))
+            parallel = build_run_config(self._tmp, _base_args(str(project), discover_parallelism=8))
+
+        self.assertEqual(sequential["targets"], parallel["targets"])
+        self.assertEqual(
+            [(e["package"], e["status"]) for e in sequential["targetDiscovery"]],
+            [(e["package"], e["status"]) for e in parallel["targetDiscovery"]],
+        )
+
+    def test_discovery_wall_clock_budget_skips_remaining_packages(self) -> None:
+        # L2: a wall-clock discovery budget stops probing once the deadline
+        # passes; the rest are recorded as `discovery-budget-skipped`, never as
+        # a false completion. (Blocks ~1.5s on purpose.)
+        project = _make_project(
+            self._tmp,
+            {"a": "1.0.0", "b": "2.0.0"},
+            installed={"a": "1.0.0", "b": "2.0.0"},
+        )
+        probed = []
+
+        def slow_latest(project_dir, name, runtime_env):
+            probed.append(name)
+            import time
+
+            time.sleep(1.5)
+            return "9.0.0"
+
+        with mock.patch("iterative_migration._npm_latest_version", side_effect=slow_latest):
+            config = build_run_config(self._tmp, _base_args(str(project), discover_timeout_s=1))
+
+        self.assertEqual(probed, ["a"], "the 1s wall-clock budget must stop probing after the first package")
+        self.assertEqual(config["targets"], {"a": "9.0.0"})
+        skipped = [e for e in config["targetDiscovery"] if e["status"] == "discovery-budget-skipped"]
+        self.assertEqual([e["package"] for e in skipped], ["b"])
+
+    def test_probe_budget_timeout_bounds_in_flight_probes(self) -> None:
+        # Review re-check P1.2 (parallel overrun): the wall deadline must be
+        # passed INTO every registry request so an in-flight probe is bounded
+        # by the time remaining — never a full fixed 60s past a 1s budget.
+        import time
+
+        import iterative_migration as im
+
+        self.assertEqual(im._probe_budget_timeout(), 60, "no active discovery deadline keeps the default timeout")
+        previous = im._ACTIVE_DISCOVERY_DEADLINE
+        try:
+            im._ACTIVE_DISCOVERY_DEADLINE = time.monotonic() + 1.0
+            self.assertEqual(im._probe_budget_timeout(), 1, "the probe timeout must be clamped to the remaining budget")
+            self.assertEqual(im._probe_budget_timeout(default_seconds=5), 1)
+            im._ACTIVE_DISCOVERY_DEADLINE = time.monotonic() - 0.1
+            self.assertIsNone(im._probe_budget_timeout(), "an already-exhausted budget must skip the probe entirely")
+        finally:
+            im._ACTIVE_DISCOVERY_DEADLINE = previous
+
+    def test_discovery_sets_and_restores_active_deadline(self) -> None:
+        # The budget must be visible to every in-flight probe for the WHOLE
+        # phase (not only the pre-start check) and restored afterwards so later
+        # phases (engine prechecks) keep their own fixed timeouts.
+        import iterative_migration as im
+
+        project = _make_project(self._tmp, {"a": "1.0.0"}, installed={"a": "1.0.0"})
+        seen = []
+
+        def fake_latest(project_dir, name, runtime_env):
+            seen.append(im._ACTIVE_DISCOVERY_DEADLINE)
+            return "9.0.0"
+
+        with mock.patch("iterative_migration._npm_latest_version", side_effect=fake_latest):
+            build_run_config(self._tmp, _base_args(str(project), discover_timeout_s=5))
+
+        self.assertTrue(seen and all(value > 0 for value in seen), "the deadline must be active while probes run")
+        self.assertEqual(im._ACTIVE_DISCOVERY_DEADLINE, 0.0, "the deadline must be restored after discovery")
+
+    def test_parallel_discovery_never_accepts_results_after_deadline(self) -> None:
+        # Review re-check repro: "1s budget finished in 2s, accepting results
+        # AFTER the deadline". A parallel probe may START within the budget but
+        # only FINISH after it — the run must NOT accept that as a target or a
+        # probed assessment (it is an honest budget-skipped row instead).
+        # (Blocks ~1.5s on purpose.)
+        project = _make_project(
+            self._tmp,
+            {"a": "1.0.0", "b": "2.0.0", "c": "3.0.0"},
+            installed={"a": "1.0.0", "b": "2.0.0", "c": "3.0.0"},
+        )
+
+        def slow_latest(project_dir, name, runtime_env):
+            import time
+
+            time.sleep(1.5)
+            return "9.0.0"
+
+        with mock.patch("iterative_migration._npm_latest_version", side_effect=slow_latest):
+            config = build_run_config(
+                self._tmp,
+                _base_args(str(project), discover_parallelism=3, discover_timeout_s=1),
+            )
+
+        self.assertEqual(
+            config["targets"], {},
+            "a probe that only finished after the deadline must never become a target",
+        )
+        skipped = [e for e in config["targetDiscovery"] if e["status"] == "discovery-budget-skipped"]
+        self.assertEqual(sorted(e["package"] for e in skipped), ["a", "b", "c"])
+        self.assertTrue(
+            all("before the probe finished" in e["reason"] for e in skipped),
+            skipped,
         )
 
 

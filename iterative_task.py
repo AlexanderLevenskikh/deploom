@@ -176,16 +176,41 @@ def _discovery_intents(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
-def _discovery_unknowns(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    """Goals whose INSTALLED version could not be read from the lockfile.
+# Discovery statuses whose upgrade is NOT provable ("unknown goals"): the goal
+# stays in the remainder and denominator, but a proven lag is NEVER claimed for
+# it. ``installed-version-unknown`` — the exact installed version cannot be read
+# from the lockfile; ``registry-unavailable`` — the registry metadata could not
+# be read (the installed version IS known from the lockfile, but no newer
+# assessment is possible, so nothing is claimed about lag either);
+# ``discovery-budget-skipped`` — the bounded discovery did not probe the package
+# (cap/deadline/failure), so its upgrade is not assessed at all.
+_UNKNOWN_GOAL_STATUSES = ("installed-version-unknown", "registry-unavailable", "discovery-budget-skipped")
 
-    ``_discover_targets`` abstains (``installed-version-unknown`` — no target,
-    never a downgrade guess) when the exact installed version cannot be proven
-    from the canonical lockfile. Such a goal is an UNRESOLVED uncertainty, not
-    a proven lag: it must stay in the remainder and denominator so the task
-    does not read "0 of 0" again, but it must never be presented as a confirmed
-    deferral nor as evidence that the package is behind — the exactly installed
-    version is unknown and no lag is proven.
+_DEFAULT_UNKNOWN_REASONS = {
+    "installed-version-unknown": "the exact installed version cannot be read from the canonical lockfile",
+    "registry-unavailable": "the registry metadata could not be read; the upgrade cannot be assessed",
+    "discovery-budget-skipped": "bounded discovery did not probe the package; its upgrade is not assessed",
+}
+
+
+def _discovery_unknowns(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Goals whose UPGRADE is not provable (unresolved uncertainties, never a
+    proven lag).
+
+    ``_discover_targets`` records three such statuses:
+    - ``installed-version-unknown`` — no target, never a downgrade guess, when
+      the exact installed version cannot be proven from the canonical lockfile;
+    - ``registry-unavailable`` — the registry dist-tags/newest metadata could
+      not be read (the lockfile gives the installed version, but no assessment
+      of newer versions is possible);
+    - ``discovery-budget-skipped`` — the bounded discovery (budget/parallelism
+      cap, wall-clock deadline or a failed probe) did not assess the package,
+      so no upgrade and no lag can be claimed for it.
+    Such a goal must stay in the remainder and denominator so the task does not
+    read "0 of 0" again, but it must never be presented as a confirmed deferral
+    nor as evidence that the package is behind — no lag is proven either when
+    the installed version is unknown, when the registry is unreadable or when
+    the package was never probed.
     """
     rows: List[Dict[str, Any]] = []
     discovery = config.get("targetDiscovery")
@@ -194,7 +219,8 @@ def _discovery_unknowns(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
     for entry in discovery:
         if not isinstance(entry, dict):
             continue
-        if str(entry.get("status") or "") != "installed-version-unknown":
+        status = str(entry.get("status") or "")
+        if status not in _UNKNOWN_GOAL_STATUSES:
             continue
         name = str(entry.get("package") or "")
         if not name:
@@ -205,7 +231,7 @@ def _discovery_unknowns(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
                 "declared": str(entry.get("declared") or ""),
                 "reason": (
                     str(entry.get("reason") or "")
-                    or "the exact installed version cannot be read from the canonical lockfile"
+                    or _DEFAULT_UNKNOWN_REASONS.get(status, "the upgrade cannot be assessed")
                 ),
             }
         )
@@ -498,7 +524,7 @@ def _build_ru(
         lines.append("Явных отложенных пакетов нет.")
     if unknown_goals:
         lines.append("")
-        lines.append("### Неопределённые цели (установленная версия неизвестна)")
+        lines.append("### Неопределённые цели (обновление не доказуемо)")
         lines.append("")
         lines.append("| Пакет | declared | Причина |")
         lines.append("| --- | --- | --- |")
@@ -508,11 +534,12 @@ def _build_ru(
             )
         lines.append("")
         lines.append(
-            "По этим целям отставание НЕ подтверждено: точная установленная версия не "
-            "читается из канонического lockfile, поэтому обновление не доказуемо. Не "
-            "утверждай, что пакет отстаёт, не подставляй в цель произвольную версию и не "
-            "вычёркивай пакет из scope; цель остаётся в знаменателе как неразрешённая "
-            "неопределённость."
+            "По этим целям обновление НЕ подтверждено: точная установленная версия не "
+            "читается из канонического lockfile, registry-метаданные недоступны либо "
+            "пакет не был проверен ограниченной discovery (бюджет исчерпан), поэтому "
+            "движение вперёд не доказуемо. Не утверждай, что пакет отстаёт, не "
+            "подставляй в цель произвольную версию и не вычёркивай пакет из scope; цель "
+            "остаётся в знаменателе как неразрешённая неопределённость."
         )
     lines.append("")
     lines.append("## Статус проверок и аудита")
@@ -662,7 +689,7 @@ def _build_en(
         lines.append("No explicit deferrals.")
     if unknown_goals:
         lines.append("")
-        lines.append("### Unknown goals (installed version not readable)")
+        lines.append("### Unknown goals (upgrade not provable)")
         lines.append("")
         lines.append("| Package | declared | Reason |")
         lines.append("| --- | --- | --- |")
@@ -672,10 +699,12 @@ def _build_en(
             )
         lines.append("")
         lines.append(
-            "NO lag is proven for these goals: the exact installed version cannot be read "
-            "from the canonical lockfile, so an update is not provable. Do not claim the "
-            "package is behind, do not invent a target version, and do not scope-exclude "
-            "the package; it stays in the denominator as an unresolved uncertainty."
+            "NO upgrade is proven for these goals: the exact installed version cannot be "
+            "read from the canonical lockfile, the registry metadata is unavailable, or the "
+            "package was not probed by the bounded discovery (budget exhausted), so "
+            "forward movement is not provable. Do not claim the package is behind, do not "
+            "invent a target version, and do not scope-exclude the package; it stays in the "
+            "denominator as an unresolved uncertainty."
         )
     lines.append("")
     lines.append("## Check and audit status")

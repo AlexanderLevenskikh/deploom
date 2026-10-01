@@ -12,7 +12,7 @@ import { PromptPreviewDialog } from './PromptPreviewDialog'
 import { IterativeTaskPanel } from './IterativeTaskPanel'
 import { normalizeBaselineIntentPlan } from '../data/baselineIntent'
 import type { DraftProgressPayload } from '../hooks/useDependencyFlow'
-import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, DraftResultSnapshot, EnvironmentInfo, FlowAction, IterativeAgentOutcome, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobOutput, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
+import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, DraftResultSnapshot, EnvironmentInfo, FlowAction, IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobOutput, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
 
 const AUTOPILOT_HELP = {
   ru: '«Продолжить» автономно доводит текущий этап. Автопилот дополнительно проходит весь FLOW до принятого результата: после audit он возвращается в migration только при реальном acceptance blocker, а не ради процента freshness.',
@@ -55,8 +55,11 @@ type Props = {
   onSaveIterativeTask: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onIterativeStatus: (projectName: string) => Promise<IterativeStatusOutcome>
   onIterativeDrive: (projectName: string) => Promise<IterativeDriveOutcome>
-  onIterativeBegin: (projectName: string) => Promise<IterativeBeginOutcome>
+  onIterativeBegin: (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }) => Promise<IterativeBeginOutcome>
   onIterativeAgent: (projectName: string) => Promise<IterativeAgentOutcome>
+  onIterativeAttempt: (projectName: string) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
+  onIterativeCancel: (projectName: string) => Promise<{ ok: boolean }>
+  liveIterativeAttempt?: IterativeAttemptView
   // Live log window (activity bubbles) for the current run, rendered below all
   // the flow content so failures can be inspected in place.
   logs?: JobOutput[]
@@ -64,7 +67,7 @@ type Props = {
   onClearLogs?: () => void
 }
 
-export function FlowWorkspace({ details, project, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onUpdateProjectNode, onListNodeVersions, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onExportLegacyIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeDrive, onIterativeBegin, onIterativeAgent, logs, onCancelJob, onClearLogs }: Props) {
+export function FlowWorkspace({ details, project, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onUpdateProjectNode, onListNodeVersions, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onExportLegacyIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeDrive, onIterativeBegin, onIterativeAgent, onIterativeAttempt, onIterativeCancel, liveIterativeAttempt, logs, onCancelJob, onClearLogs }: Props) {
   const { language, text, t } = useLanguage()
   // The persisted goal drives stage actions and autopilot: a green target set
   // in the Baseline dialog must survive into generate/release instead of
@@ -495,7 +498,10 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
         <div className="human-flow-actions">
           {!flowComplete && !active && humanPrimaryStage.action ? <button className="button primary" disabled={humanPrimaryStage.action === 'release' && !acceptanceAccepted} onClick={() => baselineRestartRequired && humanPrimaryStage.action === 'baseline' ? restartBaseline(activeIndex) : void execute(activeIndex, undefined, undefined, humanPrimaryStage.action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}><Play size={16} />{baselineRestartRequired && humanPrimaryStage.action === 'baseline' ? text('Начать новый поиск', 'Start a new search') : humanPrimaryStage.action === 'baseline' && details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Продолжить работу', 'Continue')}</button> : null}
           {!flowComplete && !active && humanPrimaryStage.action === 'baseline' && (details.baselineRecovery?.available || run?.lastAction === 'baseline') ? <button className="button secondary" onClick={() => restartBaseline(activeIndex)}><RotateCcw size={16} />{text('Начать заново', 'Start over')}</button> : null}
-          {!active && humanPrimaryStage.action === 'baseline' ? <button className="button secondary" onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button> : null}
+          {/* L3: Draft/scope stays reachable right after project selection — on
+              Preflight and after a failed C0 — not only when the FLOW stage is
+              Baseline. The planner still guards what a Draft may do. */}
+          {!active ? <button className="button secondary" onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button> : null}
           {flowComplete && acceptanceAccepted ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} />{text('Продолжить улучшение', 'Continue improving')}</button> : null}
           {draftResult ? <button className="button secondary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Последний Draft / История', 'Last Draft / History')}</button> : null}
           <button className="button secondary" disabled={!run && !activeAction} onClick={() => void onOpenPath(artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
@@ -739,6 +745,10 @@ export function FlowWorkspace({ details, project, activeAction, activeRunId, act
         onDrive={onIterativeDrive}
         onBegin={onIterativeBegin}
         onAgent={onIterativeAgent}
+        onAttempt={onIterativeAttempt}
+        onCancel={onIterativeCancel}
+        liveAttempt={liveIterativeAttempt}
+        onConfigureScope={() => void openBaselineIntentDialog('prepare', 'auto')}
         onOpenPath={onOpenPath}
       />
     </section>

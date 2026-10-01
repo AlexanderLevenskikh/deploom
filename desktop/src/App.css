@@ -882,6 +882,51 @@ textarea::placeholder {
 .human-flow-remaining { margin: 11px 0 0; color: var(--text-muted); font-size: 11px; }
 .human-flow-actions { margin-top: 17px; display: flex; flex-wrap: wrap; gap: 8px; }
 
+/* L5: the iterative panel lives in its own card aligned with .human-flow-card
+   (same 980px column), so a wide window does not stretch it. */
+.roadmap-card { max-width: 980px; margin: 0 auto 18px; padding: 18px 20px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-raised); box-shadow: 0 4px 18px rgb(0 0 0 / 5%); }
+.roadmap-card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 12px; }
+.roadmap-card-header > div { display: flex; flex-direction: column; gap: 3px; }
+.roadmap-card-header strong { font-size: 14px; }
+.roadmap-card-header span { color: var(--text-muted); font-size: 10px; line-height: 1.45; }
+.roadmap-summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+.roadmap-summary-grid > div { min-width: 0; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
+.roadmap-summary-grid strong { font-size: 20px; line-height: 1.05; }
+.roadmap-summary-grid span { color: var(--text-muted); font-size: 10px; }
+.plain-list { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 6px; max-height: 210px; overflow: auto; }
+.plain-list li { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); font-size: 11px; }
+.plain-list span { color: var(--text-muted); }
+
+/* L4: destructive action and diagnostic-link affordances used by the panel. */
+.button.danger { border-color: var(--red); background: var(--red); color: #fff; }
+.button.danger:hover:not(:disabled) { background: var(--red); filter: brightness(1.08); }
+.linklike { background: none; border: none; padding: 0; color: var(--blue); cursor: pointer; font-size: 10px; text-decoration: underline; }
+
+/* L1: the durable attempt strip — alive while begin/drive runs, restored after
+   a Desktop restart (read from runDir/attempt.json), and colour-coded by the
+   journal status so success, failure and cancel look different. */
+.attempt-strip { margin: 0 0 12px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; border: 1px solid var(--border); border-left-width: 3px; border-radius: 9px; background: var(--surface); font-size: 11px; }
+.attempt-strip.running { border-left-color: var(--blue); }
+.attempt-strip.failed { border-left-color: var(--red); background: var(--red-soft); }
+.attempt-strip.canceled { border-left-color: var(--amber); background: var(--amber-soft); }
+.attempt-strip.done { border-left-color: var(--green); }
+.attempt-strip-row { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 12px; }
+.attempt-status.starting, .attempt-status.running { color: var(--blue); }
+.attempt-status.failed { color: var(--red); }
+.attempt-status.canceled { color: var(--amber); }
+.attempt-status.done { color: var(--green); }
+.attempt-meta { color: var(--text-muted); }
+.attempt-reason { color: inherit; font-weight: 600; }
+.attempt-progress { display: inline-block; width: 90px; height: 6px; margin-left: 6px; border-radius: 3px; background: var(--border); overflow: hidden; vertical-align: middle; }
+.attempt-progress > span { display: block; height: 100%; background: var(--blue); }
+.attempt-log { margin: 2px 0 0; max-height: 180px; overflow: auto; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel, rgba(0, 0, 0, .08)); color: var(--text-muted); font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+
+@media (max-width: 640px) {
+  .roadmap-summary-grid { grid-template-columns: 1fr; }
+  .roadmap-card { padding: 14px; }
+  .attempt-strip-row { align-items: flex-start; flex-direction: column; }
+}
+
 .draft-result-card { margin-top: 14px; padding: 13px 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
 .draft-result-card.fresh { border-color: var(--blue); background: var(--blue-soft); }
 .draft-result-heading { display: grid; gap: 3px; }
