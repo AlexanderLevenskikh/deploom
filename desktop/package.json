@@ -86,6 +86,8 @@
     "check:iterative-attempt": "node scripts/check-iterative-attempt.mjs",
     "precheck:iterative-stream": "tsc -p tsconfig.electron.json",
     "check:iterative-stream": "node scripts/check-iterative-stream.mjs",
+    "precheck:iterative-scenario": "tsc -p tsconfig.electron.json",
+    "check:iterative-scenario": "node scripts/check-iterative-scenario.mjs",
     "precheck:iterative-agent": "tsc -p tsconfig.electron.json",
     "check:iterative-agent": "node scripts/check-iterative-agent.mjs"
   },
