@@ -279,6 +279,7 @@ LOCK_FILENAME = "run.lock"
 # leave run.json archived while a checkpoint or the source snapshot is not.
 REPAIR_HANDOFF_FILENAME = "repair-handoff.json"
 REPAIR_ARCHIVE_DIR = "repair-archive"
+REPAIR_ARCHIVE_TRANSACTION = "repair-archive-transaction.json"
 # Machine-readable result envelope for the archive step (Electron parses it).
 ARCHIVE_RESULT_EVENT = "ITERATIVE_ARCHIVE_RESULT_V1"
 
@@ -310,6 +311,35 @@ def _read_json(path: Path, *, required: bool = True) -> Optional[Dict[str, Any]]
     if not isinstance(value, dict):
         raise InvalidInputError(f"STATE_FILE_NOT_OBJECT: {path}")
     return value
+
+
+def _process_owner_dead(pid: int) -> bool:
+    """Reclaim a killed writer without signalling a Windows process."""
+    if pid <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        return False
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == 87  # nonexistent PID; denied is not dead
+    try:
+        code = wintypes.DWORD()
+        return bool(kernel.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value != 259
+    finally:
+        kernel.CloseHandle(handle)
 
 
 class _RunLock:
@@ -361,6 +391,8 @@ class _RunLock:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             owner = str(payload.get("owner") or "")
+            if _process_owner_dead(int(payload.get("pid") or 0)):
+                return True
             started = str(payload.get("startedAt") or "")
             started_at = time.strptime(started, "%Y-%m-%dT%H:%M:%SZ")
             age = time.time() - time.mktime(started_at)
@@ -1355,9 +1387,9 @@ def _begin_adopted_locked(
     identity; the migration therefore continues from the FIXED bytes, never from
     a fresh capture of the still-red developer checkout.
 
-    No control re-run here: the repair run already verified the EXACT bytes and
-    the handoff references the archived evidence. Before adoption the snapshot
-    is RE-OPENED and key-validated (integrity), so a moved/deleted/corrupted
+    Control is repeated in the current environment; old repair proof and audit
+    stay in the archive and never grant authority to the new runtime or policy.
+    Before adoption the snapshot is RE-OPENED and key-validated (integrity), so a moved/deleted/corrupted
     container is a hard error, never a silent fallback to the red checkout.
     """
     project_name = str(config["projectName"])
@@ -1371,12 +1403,33 @@ def _begin_adopted_locked(
             f"REPAIR_SOURCE_INTEGRITY_FAILED: исправленный снимок недоступен/испорчен: {exc}"
         ) from exc
 
-    verified_c0 = handoff.get("verifiedC0") or {}
-    audit = handoff.get("audit") or {}
     full_assignment = dict(source_refs.get("fullAssignment") or {})
     manifest_hash = str(source_refs.get("manifestHash") or "")
     lock_hash = str(source_refs.get("lockfileHash") or "")
     project_relative = Path(str(source_refs.get("projectRelative") or "."))
+    # Snapshot integrity is source evidence, not proof for a new runtime,
+    # command set or policy. Always control the repaired bytes afresh.
+    control_root = run_dir / f"adoption-control-{_new_id('trial')}"
+    try:
+        _materialize_trial_tree(source, control_root, 1800)
+        control_project = control_root / project_relative
+        control_project.resolve().relative_to(control_root.resolve())
+        verify_config = dataclasses.replace(
+            verify_config_from(config["verifyConfig"], run_dir), verification_purpose="baseline-control"
+        )
+        result = verify_assignment(
+            control_project, full_assignment, config=verify_config,
+            run_project_checks=True, runtime_env=_runtime_env(config),
+            progress_label="adopt repaired source: fresh current-environment control",
+        )
+        if not result.ok:
+            raise ProjectUnreadyError(
+                "REPAIR_ADOPTION_CONTROL_FAILED" if result.hard_failure else "REPAIR_ADOPTION_INCONCLUSIVE",
+                f"Исправленные исходники не подтверждены в текущем окружении: {result.kind}: {result.summary}",
+                command="",
+            )
+    finally:
+        _force_remove_tree(control_root)
     status = "VERIFIED"
     checkpoint_id = "C0"
 
@@ -1393,25 +1446,25 @@ def _begin_adopted_locked(
         "projectRelative": str(project_relative),
         "manifestHash": manifest_hash,
         "lockfileHash": lock_hash,
-        "resolvedStateKey": str(source_refs.get("resolvedStateKey") or ""),
-        "observedResolvedHash": str(source_refs.get("observedResolvedHash") or ""),
+        "resolvedStateKey": result.resolved_state_key or "",
+        "observedResolvedHash": result.observed_resolved_hash or observed_resolved_hash(result.observed_resolved_versions or {}),
         "fullAssignment": full_assignment,
         "acceptedDelta": {"added": {}, "changed": {}, "removed": {}},
         "cohortId": None,
         "verification": {
-            "status": str(verified_c0.get("verificationStatus") or "passed"),
-            "kind": str(verified_c0.get("kind") or ""),
-            "commands": list(verified_c0.get("commands") or []),
-            "failingCommands": list(verified_c0.get("failingCommands") or []),
+            "status": "passed",
+            "kind": result.kind,
+            "commands": list(verify_config.commands),
+            "failingCommands": [],
         },
         "proofRefs": {
-            "resolvedStateKey": str(source_refs.get("resolvedStateKey") or ""),
-            "preparationProofKey": "",
+            "resolvedStateKey": result.resolved_state_key or "",
+            "preparationProofKey": result.preparation_proof_key or "",
         },
         "runtimeContractHash": _runtime_contract_hash(config),
         "audit": {
-            "status": str(audit.get("status") or "PASS"),
-            "evidenceRef": str(audit.get("evidenceRef") or ""),
+            "status": "UNKNOWN",
+            "evidenceRef": "",
         },
         "createdAt": _now_iso(),
         "updatedAt": _now_iso(),
@@ -1538,73 +1591,88 @@ def _write_bootstrap_repair_request(
 # lightweight journal moves into repair-archive/<runId>-<timestamp>/. On ANY
 # failure the already-moved entries are renamed back so the run stays exactly
 # as it was — an interrupted archive is recoverable, never corrupted.
+def _archive_metadata_bytes(path: Path, value: bytes) -> None:
+    temporary = path.with_name(path.name + f".restore-{os.getpid()}")
+    temporary.write_bytes(value)
+    os.replace(temporary, path)
+
+
+def _recover_repair_archive(run_dir: Path) -> None:
+    """Called under the run lock. A planned move is recoverable even if killed
+    between rename and recording completion; publications roll back together."""
+    journal_path = run_dir / REPAIR_ARCHIVE_TRANSACTION
+    if not journal_path.exists():
+        return
+    journal = _read_json(journal_path)
+    archive_relative = Path(str(journal["archiveRelative"]))
+    if (not archive_relative.parts or archive_relative.is_absolute()
+            or ".." in archive_relative.parts or archive_relative.parts[0] != REPAIR_ARCHIVE_DIR):
+        raise InvalidInputError("REPAIR_ARCHIVE_JOURNAL_INVALID")
+    archive_root = run_dir / archive_relative
+    if journal.get("phase") == "committed":
+        journal_path.unlink()
+        return
+    for name in reversed(journal["entries"]):
+        if Path(name).name != name or name in (".", ".."):
+            raise InvalidInputError("REPAIR_ARCHIVE_JOURNAL_INVALID")
+        source, target = run_dir / name, archive_root / name
+        if target.exists() or target.is_symlink():
+            if source.exists() or source.is_symlink():
+                raise InvalidInputError(f"REPAIR_ARCHIVE_RECOVERY_CONFLICT: {name}")
+            os.rename(target, source)
+    for name in (REPAIR_HANDOFF_FILENAME, PROJECT_CHECK_FILENAME):
+        previous = journal["metadata"][name]
+        path = run_dir / name
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            _archive_metadata_bytes(path, bytes.fromhex(previous))
+    journal_path.unlink()
+
+
 def _archive_repair_run_locked(
     run_dir: Path, run: Mapping[str, Any]
 ) -> Dict[str, Any]:
-    run_id = str(run.get("runId") or "run")
+    _recover_repair_archive(run_dir)
     config = load_config(run_dir)
     c0 = load_checkpoint(run_dir, "C0")
-    archive_root = (
-        run_dir / REPAIR_ARCHIVE_DIR / f"{run_id}-{int(time.time() * 1000)}"
-    )
-    archive_root.mkdir(parents=True, exist_ok=True)
-    moved: List[Tuple[Path, Path]] = []
+    archive_root = run_dir / REPAIR_ARCHIVE_DIR / _new_id("archive")
+    archive_root.mkdir(parents=True, exist_ok=False)
+    skip = {REPAIR_ARCHIVE_DIR, SOURCE_DIR, REPAIR_HANDOFF_FILENAME,
+            PROJECT_CHECK_FILENAME, REPAIR_ARCHIVE_TRANSACTION, LOCK_FILENAME,
+            "attempt.json", "attempt.log"}
+    entries = [entry.name for entry in sorted(run_dir.iterdir(), key=lambda p: p.name)
+               if entry.name not in skip and (entry.is_dir() or entry.is_file())]
+    journal = {
+        "phase": "moving",
+        "archiveRelative": str(archive_root.relative_to(run_dir)),
+        "entries": entries,
+        "metadata": {name: (run_dir / name).read_bytes().hex() if (run_dir / name).exists() else None
+                     for name in (REPAIR_HANDOFF_FILENAME, PROJECT_CHECK_FILENAME)},
+    }
+    journal_path = run_dir / REPAIR_ARCHIVE_TRANSACTION
+    _write_json_atomic(journal_path, journal)
     try:
-        skip = {
-            REPAIR_ARCHIVE_DIR,
-            SOURCE_DIR,
-            REPAIR_HANDOFF_FILENAME,
-            PROJECT_CHECK_FILENAME,
-            LOCK_FILENAME,
-            "attempt.json",
-            "attempt.log",
-        }
-        for entry in sorted(run_dir.iterdir(), key=lambda p: p.name):
-            if entry.name in skip or not (entry.is_dir() or entry.is_file()):
-                continue
-            target = archive_root / entry.name
-            os.rename(str(entry), str(target))
-            moved.append((entry, target))
-        # Preserve a COPY of the repaired C0 snapshot as IN-ARCHIVE evidence.
-        # The live sources/C0 stays put for the next migration to adopt; if the
-        # user later re-captures from the developer checkout (no adopt), the
-        # live copy is replaced but the fixed bytes remain under the archive.
+        for name in entries:
+            os.rename(run_dir / name, archive_root / name)
         live_snapshot = run_dir / SOURCE_DIR / "C0"
         if live_snapshot.is_dir():
-            shutil.copytree(live_snapshot, archive_root / SOURCE_DIR / "C0", dirs_exist_ok=True, symlinks=True)
+            shutil.copytree(live_snapshot, archive_root / SOURCE_DIR / "C0", symlinks=True)
         _verify_repair_archive(run_dir, archive_root, c0)
+        handoff = _build_repair_handoff(run, config, c0, archive_root, run_dir)
+        _write_json_atomic(run_dir / REPAIR_HANDOFF_FILENAME, handoff)
+        _write_project_check_ready(run_dir, config, handoff)
+        _write_json_atomic(journal_path, {**journal, "phase": "committed"})
     except Exception as exc:
-        # Roll back the WHOLE transaction before reporting: the run must remain
-        # continuable (run.json + checkpoints + sources all back in place).
-        for entry, target in reversed(moved):
-            try:
-                if target.exists() or target.is_symlink():
-                    os.rename(str(target), str(entry))
-            except OSError:
-                pass
-        evidence_copy = archive_root / SOURCE_DIR
         try:
-            if evidence_copy.exists():
-                _force_remove_tree(evidence_copy)
-        except OSError:
-            pass
-        try:
-            if not any(archive_root.iterdir()):
-                archive_root.rmdir()
-        except OSError:
-            pass
-        raise InvalidInputError(
-            f"REPAIR_ARCHIVE_FAILED_ROLLED_BACK: {type(exc).__name__}: {exc}"
-        ) from exc
-    handoff = _build_repair_handoff(run, config, c0, archive_root, run_dir)
-    _write_json_atomic(run_dir / REPAIR_HANDOFF_FILENAME, handoff)
-    _write_project_check_ready(run_dir, config, handoff)
-    return {
-        "archived": True,
-        "runId": run_id,
-        "archiveDir": str(archive_root),
-        "handoffPath": str(run_dir / REPAIR_HANDOFF_FILENAME),
-    }
+            _recover_repair_archive(run_dir)
+        except Exception as recovery_error:
+            raise InvalidInputError(f"REPAIR_ARCHIVE_RECOVERY_REQUIRED: {recovery_error}") from exc
+        raise InvalidInputError(f"REPAIR_ARCHIVE_FAILED_ROLLED_BACK: {type(exc).__name__}: {exc}") from exc
+    # Once committed, interruption during cleanup must never undo publications.
+    journal_path.unlink(missing_ok=True)
+    return {"archived": True, "runId": str(run.get("runId") or ""),
+            "archiveDir": str(archive_root), "handoffPath": str(run_dir / REPAIR_HANDOFF_FILENAME)}
 
 
 def _verify_repair_archive(run_dir: Path, archive_root: Path, c0: Mapping[str, Any]) -> None:
@@ -4879,6 +4947,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         configure_utf8_stdio()
+        recovery_dir = Path(args.run_dir).resolve()
+        if (recovery_dir / REPAIR_ARCHIVE_TRANSACTION).exists():
+            recovery_lock = _RunLock(recovery_dir, args.owner or f"pid-{os.getpid()}")
+            recovery_lock.acquire()
+            try:
+                _recover_repair_archive(recovery_dir)
+            finally:
+                recovery_lock.release()
         return int(COMMANDS[args.command](args) or 0)
     except ProjectUnreadyError as exc:
         print(f"ITERATIVE_MIGRATION_FAILURE_V1 {json.dumps({'code': exc.code, 'summary': str(exc), 'command': exc.command, 'fixable': True})}")

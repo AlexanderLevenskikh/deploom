@@ -7465,18 +7465,21 @@ function setupIpc(): void {
   // surfaced distinctly so the begin flow never hides a half-done archive.
   async function archiveFinishedRepairRun(runDir: string): Promise<{ archived: boolean; error?: string }> {
     const runPath = join(runDir, 'run.json')
-    if (!existsSync(runPath)) return { archived: false }
+    const recoveryPending = existsSync(join(runDir, 'repair-archive-transaction.json'))
+    if (!existsSync(runPath) && !recoveryPending) return { archived: false }
     try {
-      const run = JSON.parse(readFileSync(runPath, 'utf8')) as Record<string, any>
-      const terminalOutcome = (run.terminalOutcome ?? null) as Record<string, any> | null
-      const repairDone = run.phase === 'TERMINAL' && (terminalOutcome?.outcome === 'REPAIR_VERIFIED' || run.terminal === 'REPAIR_VERIFIED')
-      if (!repairDone) return { archived: false }
+      if (!recoveryPending) {
+        const run = JSON.parse(readFileSync(runPath, 'utf8')) as Record<string, any>
+        const terminalOutcome = (run.terminalOutcome ?? null) as Record<string, any> | null
+        const repairDone = run.phase === 'TERMINAL' && (terminalOutcome?.outcome === 'REPAIR_VERIFIED' || run.terminal === 'REPAIR_VERIFIED')
+        if (!repairDone) return { archived: false }
+      }
       const python = resolveExecutable('python')
       const generator = join(bundledToolDir(), 'iterative_migration.py')
       const result = await spawnCapture(python, iterativeArchiveInvocation(runDir, generator), dirname(runDir), 180_000)
       if (result.code !== 0) {
         const raw = result.timedOut
-          ? 'REPAIR_ARCHIVE_TIMEOUT: archive exceeded its 3-minute budget; the run was rolled back and stays continuable'
+          ? 'REPAIR_ARCHIVE_TIMEOUT: archive exceeded its 3-minute budget; its durable journal will recover on the next launch'
           : (result.stderr.trim() || result.stdout.trim() || `REPAIR_ARCHIVE_EXIT_${result.code}`)
         return { archived: false, error: raw.slice(0, 4000) }
       }
@@ -7753,6 +7756,11 @@ function setupIpc(): void {
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
+    if (existsSync(join(runDir, 'repair-archive-transaction.json'))) {
+      if (iterativeStepInFlight.has(stepLockKey(workspace.id, project.name))) return { ok: false, step: 'begin', error: 'STEP_IN_PROGRESS' }
+      const recovery = await archiveFinishedRepairRun(runDir)
+      if (recovery.error) return { ok: false, step: 'begin', error: recovery.error }
+    }
     let runPresent = existsSync(join(runDir, 'run.json'))
     // P1#4: "Проверить проект" is a REAL separate action. It runs the same CLI,
     // but with `--check-only`: the Python preflight + the control verification of
