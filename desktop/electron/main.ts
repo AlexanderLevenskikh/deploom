@@ -56,6 +56,7 @@ import { commandEnvironment, decodeProcessOutputChunk, normalizePathForCompariso
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
 import { iterativeBeginInvocation, targetsFromDashboardState } from './iterative-begin.js'
+import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
 import { beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, recordAttemptLog, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
 import { spawnIterativeStreamed, type CaptureResult, type StreamAttemptIo, type StreamPlatform } from './iterative-stream.js'
 import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
@@ -7453,45 +7454,42 @@ function setupIpc(): void {
   // migration: this helper archives every durable artifact of the finished
   // repair into <runDir>/repair-archive/<runId>-<ts>/ (evidence preserved) and
   // frees the migration run slot. On top of the freed slot it writes a durable,
-  // honest "project ready" verdict so the panel can offer "Начать обновление".
-  // Returns true only when a TERMINAL REPAIR_VERIFIED run was archived; any
-  // other state (active run, error) is left untouched.
-  function archiveFinishedRepairRun(runDir: string): boolean {
+  // honest "project ready" verdict so the panel can offer "Начать обновление",
+  // and a repair-handoff.json that lets the NEXT migration continue from the
+  // VERIFIED REPAIRED source (P1 #1). The archive is a RECOVERABLE TRANSACTION
+  // owned by the Python `archive-repair-run` step: the moved artifacts stay in
+  // the run dir if any move fails, and the repaired C0 source snapshot
+  // (sources/C0) + an in-archive copy remain as the fixed bytes (P1 #2).
+  // Returns { archived: true } only for a TERMINAL REPAIR_VERIFIED run; any
+  // other state (active run, no run) is left untouched. An archive ERROR is
+  // surfaced distinctly so the begin flow never hides a half-done archive.
+  async function archiveFinishedRepairRun(runDir: string): Promise<{ archived: boolean; error?: string }> {
     const runPath = join(runDir, 'run.json')
-    if (!existsSync(runPath)) return false
+    if (!existsSync(runPath)) return { archived: false }
     try {
       const run = JSON.parse(readFileSync(runPath, 'utf8')) as Record<string, any>
       const terminalOutcome = (run.terminalOutcome ?? null) as Record<string, any> | null
       const repairDone = run.phase === 'TERMINAL' && (terminalOutcome?.outcome === 'REPAIR_VERIFIED' || run.terminal === 'REPAIR_VERIFIED')
-      if (!repairDone) return false
-      const archiveRoot = join(runDir, 'repair-archive', `${String(run.runId ?? 'run')}-${Date.now()}`)
-      mkdirSync(archiveRoot, { recursive: true })
-      let projectName = ''
-      let projectDir = ''
-      try {
-        const config = JSON.parse(readFileSync(join(runDir, 'run-config.json'), 'utf8')) as Record<string, any>
-        projectName = String(config.projectName ?? '')
-        projectDir = String(config.projectDir ?? '')
-      } catch { /* verdict above already freed the slot; fields are best-effort */ }
-      const archiveMarker = join(runDir, 'repair-archive')
-      for (const entry of readdirSync(runDir, { withFileTypes: true })) {
-        const from = join(runDir, entry.name)
-        if (from === archiveMarker || entry.name === 'attempt.json' || entry.name === 'attempt.log') continue
-        renameSync(from, join(archiveRoot, entry.name))
+      if (!repairDone) return { archived: false }
+      const python = resolveExecutable('python')
+      const generator = join(bundledToolDir(), 'iterative_migration.py')
+      const result = await spawnCapture(python, iterativeArchiveInvocation(runDir, generator), dirname(runDir), 180_000)
+      if (result.code !== 0) {
+        const raw = result.timedOut
+          ? 'REPAIR_ARCHIVE_TIMEOUT: archive exceeded its 3-minute budget; the run was rolled back and stays continuable'
+          : (result.stderr.trim() || result.stdout.trim() || `REPAIR_ARCHIVE_EXIT_${result.code}`)
+        return { archived: false, error: raw.slice(0, 4000) }
       }
-      writeFileSync(join(runDir, 'project-check.json'), JSON.stringify({
-        schemaVersion: 1,
-        projectDir,
-        projectName,
-        checkedAt: new Date().toISOString(),
-        ok: true,
-        managedDependencies: 0,
-        control: { status: 'passed', kind: 'repair', summary: 'Исходное состояние проекта исправлено и подтверждено (ремонт).' },
-      } as Record<string, unknown>, null, 2), 'utf8')
-      return true
-    } catch {
-      // Never destroy a run we cannot prove is a finished repair.
-      return false
+      const payload = parseIterativeArchiveResult(result.stdout || '')
+      if (!payload || payload.archived !== true) {
+        // archived:false with a clean exit is a legitimate "not a finished
+        // repair" — no error, the caller keeps the slot occupied.
+        return { archived: false }
+      }
+      return { archived: true }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return { archived: false, error: `REPAIR_ARCHIVE_PREP_FAILED: ${message.slice(0, 4000)}` }
     }
   }
 
@@ -7857,9 +7855,17 @@ function setupIpc(): void {
         return { ok: false, step: 'repair', error: 'STEP_IN_PROGRESS' }
       }
       // A FINISHED repair leaves the run slot free for a real migration; any
-      // other existing run stays an exclusive resource.
-      if (runPresent && !archiveFinishedRepairRun(runDir)) {
-        return { ok: false, step: 'repair', error: 'RUN_ALREADY_EXISTS: прогон уже существует — продолжите с его состояния (Продолжить)' }
+      // other existing run stays an exclusive resource. An archive ERROR is
+      // surfaced (the run was rolled back and stays continuable), not hidden
+      // behind the generic "already exists" message.
+      if (runPresent) {
+        const archived = await archiveFinishedRepairRun(runDir)
+        if (archived.error) {
+          return { ok: false, step: 'repair', error: `REPAIR_ARCHIVE_FAILED: ${archived.error}` }
+        }
+        if (!archived.archived) {
+          return { ok: false, step: 'repair', error: 'RUN_ALREADY_EXISTS: прогон уже существует — продолжите с его состояния (Продолжить)' }
+        }
       }
       const repairIntent = loadBaselineIntent(workspace, project.name)
       const repairLevel = repairIntent.acceptancePolicy?.targetLevel ?? 'yellow'
@@ -7929,12 +7935,27 @@ function setupIpc(): void {
     }
     // P2 (#1): after a successful repair-only run reached its TERMINAL
     // REPAIR_VERIFIED, "Начать обновление" archives that auxiliary run (its
-    // durable verdict is preserved under repair-archive/ and the slot is freed
+    // durable verdict is preserved under repair-archive/, the slot is freed
     // into a durable "project ready" check) and then starts the REAL migration
     // from a fresh slot — a finished repair is a precondition, not a leftover
     // to continue.
-    if (runPresent && archiveFinishedRepairRun(runDir)) {
-      runPresent = false
+    let adoptRepairSource = false
+    if (runPresent) {
+      const archived = await archiveFinishedRepairRun(runDir)
+      if (archived.error) {
+        return { ok: false, step: 'begin', error: `REPAIR_ARCHIVE_FAILED: ${archived.error}` }
+      }
+      if (archived.archived) {
+        runPresent = false
+      }
+    }
+    // P1 (#1): a PENDING (neither adopted nor superseded) repair handoff means
+    // the verified fixed bytes are still waiting to seed the NEXT migration.
+    // This also covers the no-targets detour, where the archive already freed
+    // the slot but begin stopped before creating a run — the follow-up begin
+    // with targets set must still adopt, not re-capture the red checkout.
+    if (!runPresent && isRepairHandoffPending(runDir)) {
+      adoptRepairSource = true
     }
     const intent = loadBaselineIntent(workspace, project.name)
     const targetLevel = intent.acceptancePolicy?.targetLevel ?? 'yellow'
@@ -8008,6 +8029,8 @@ function setupIpc(): void {
         targetsFile,
         toolBuildId: app.getVersion(),
         requestedNode: project.nodeVersion || undefined,
+        // P1 (#1): carry the verified repaired source into the new migration.
+        adoptRepairSource: adoptRepairSource || undefined,
         // R8: the run captures the workspace dashboard-state (user package lag
         // policy) and the goal audit thresholds so the independent audit runs
         // with the ACTUAL policy, not dashboard_state=None defaults.

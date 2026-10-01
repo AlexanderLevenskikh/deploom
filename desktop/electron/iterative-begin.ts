@@ -30,6 +30,11 @@ export type IterativeBeginOptions = {
   // D3: explicit Node.js for project/CI (exact or major). Empty = no claim —
   // no --requested-node is passed and the run makes no CI-runtime commitment.
   requestedNode?: string
+  // P1 (v0.2.163 #1): start the migration from the VERIFIED REPAIRED source.
+  // Set ONLY when a finished repair (TERMINAL REPAIR_VERIFIED) was just
+  // archived; begin then reads repair-handoff.json and carries the fixed C0
+  // forward instead of re-capturing the (still red) developer checkout.
+  adoptRepairSource?: boolean
 }
 
 /** Extract exact target versions from one dashboard-state row batch.
@@ -97,5 +102,6 @@ export function iterativeBeginInvocation(
   if (options.projectId) args.push('--project-id', options.projectId)
   if (options.toolBuildId) args.push('--tool-build-id', options.toolBuildId)
   if (options.requestedNode) args.push('--requested-node', options.requestedNode)
+  if (options.adoptRepairSource) args.push('--adopt-repair-source')
   return { command: python, args }
 }

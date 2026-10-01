@@ -72,6 +72,7 @@ from package_manager_profile import (
 )
 from project_topology import ProjectTopologyError, resolve_project_topology
 from source_snapshot import (
+    SourceCaptureError,
     SourceSnapshot,
     capture_durable_source_snapshot,
     capture_source_snapshot,
@@ -269,6 +270,17 @@ REPAIR_REQUESTS_FILENAME = "repair-requests.json"
 REPORTS_DIR = "reports"
 AUDIT_DIR = "audit"
 LOCK_FILENAME = "run.lock"
+# P1 (v0.2.163 #1/#2): the durable handoff between a finished repair run and
+# the NEXT migration. `archive-repair-run` writes it and keeps the repaired C0
+# source snapshot (sources/C0) in place; `begin --adopt-repair-source` consumes
+# it so the new migration continues from the VERIFIED FIXED bytes instead of
+# re-capturing the still-red developer checkout. The archive itself is a
+# recoverable transaction: an interrupted archive rolls back — it must never
+# leave run.json archived while a checkpoint or the source snapshot is not.
+REPAIR_HANDOFF_FILENAME = "repair-handoff.json"
+REPAIR_ARCHIVE_DIR = "repair-archive"
+# Machine-readable result envelope for the archive step (Electron parses it).
+ARCHIVE_RESULT_EVENT = "ITERATIVE_ARCHIVE_RESULT_V1"
 
 
 def _trial_dir(run_dir: Path) -> Path:
@@ -736,6 +748,40 @@ def cmd_begin(args: argparse.Namespace) -> int:
     owner = args.owner or f"pid-{os.getpid()}"
     if (run_dir / RUN_FILENAME).exists():
         raise InvalidInputError(f"RUN_ALREADY_EXISTS: {run_dir}")
+    if getattr(args, "adopt_repair_source", False):
+        # P1 (v0.2.163 #1): the READY run adopts the terminal repair's source —
+        # this is a NORMAL migration, not the repair track; combining the two is
+        # a caller error, never a silent fallback.
+        if getattr(args, "repair_only", False) or getattr(args, "check_only", False):
+            raise InvalidInputError(
+                "ADOPT_CONFLICT: --adopt-repair-source cannot be combined with --repair-only/--check-only"
+            )
+        handoff_path = run_dir / REPAIR_HANDOFF_FILENAME
+        if not handoff_path.exists():
+            raise InvalidInputError(
+                f"REPAIR_HANDOFF_MISSING: no {REPAIR_HANDOFF_FILENAME} under {run_dir} — "
+                "запустите archive-repair-run после завершённого ремонта"
+            )
+        handoff = _read_json(handoff_path)
+        if str(handoff.get("terminal") or "") != "REPAIR_VERIFIED":
+            raise InvalidInputError(
+                "REPAIR_HANDOFF_NOT_VERIFIED: "
+                "только подтверждённый ремонт (REPAIR_VERIFIED) может стать исходником новой миграции"
+            )
+        if handoff.get("adopted"):
+            raise InvalidInputError(
+                "REPAIR_HANDOFF_ALREADY_ADOPTED: исправленные исходники уже перенесены в миграцию"
+            )
+        if handoff.get("superseded"):
+            raise InvalidInputError(
+                "REPAIR_HANDOFF_SUPERSEDED: исправленные исходники устарели — "
+                "проект был переснят заново; начните миграцию обычным begin"
+            )
+        if not handoff.get("source") or not handoff["source"].get("container") or not handoff["source"].get("key"):
+            raise InvalidInputError("REPAIR_HANDOFF_SOURCE_INVALID: handoff не содержит снимок исправленных исходников")
+        adopt = handoff
+    else:
+        adopt = None
     if getattr(args, "repair_only", False):
         return _cmd_begin_repair(run_dir, args, owner)
     if getattr(args, "check_only", False):
@@ -746,7 +792,7 @@ def cmd_begin(args: argparse.Namespace) -> int:
     lock = _RunLock(run_dir, owner)
     lock.acquire()
     try:
-        return _begin_locked(run_dir, config, args)
+        return _begin_locked(run_dir, config, args, adopt=adopt)
     finally:
         lock.release()
 
@@ -1081,23 +1127,35 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
     }
 
 
-def _begin_locked(run_dir: Path, config: Mapping[str, Any], args: argparse.Namespace) -> int:
+def _begin_locked(
+    run_dir: Path,
+    config: Mapping[str, Any],
+    args: argparse.Namespace,
+    adopt: Optional[Mapping[str, Any]] = None,
+) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     _write_json_atomic(run_dir / CONFIG_FILENAME, dict(config))
     run_id = (args.run_id or "").strip() or _new_id("iter")
     project_dir = Path(config["projectDir"])
     project_name = str(config["projectName"])
-    initial_assignment = direct_dependency_assignment(project_dir)
-    manifest_hash, lock_hash, lock_path = manifest_and_lock_hashes(project_dir)
+    if adopt is None:
+        # P1 (v0.2.163 #1): for an ADOPTED run these project.path reads and the
+        # "capture" signal are skipped — the source is the verified repaired
+        # snapshot, never a fresh capture of the (still red) checkout.
+        initial_assignment = direct_dependency_assignment(project_dir)
+        manifest_hash, lock_hash, lock_path = manifest_and_lock_hashes(project_dir)
 
-    _emit_status(
-        {
-            "event": "begin.capture",
-            "runId": run_id,
-            "project": project_name,
-            "managedDependencies": len(initial_assignment),
-        }
-    )
+        _emit_status(
+            {
+                "event": "begin.capture",
+                "runId": run_id,
+                "project": project_name,
+                "managedDependencies": len(initial_assignment),
+            }
+        )
+    else:
+        initial_assignment: Dict[str, str] = {}
+        manifest_hash = lock_hash = lock_path = ""
 
     discovery = config.get("targetDiscovery") or []
     roadmap_targets = dict(config.get("targets") or {})
@@ -1137,6 +1195,30 @@ def _begin_locked(run_dir: Path, config: Mapping[str, Any], args: argparse.Names
             "Результат не засчитывается как завершённая миграция. Повторите поиск или настройте состав обновления.",
             command="",
         )
+
+    if adopt is not None:
+        # P1 (v0.2.163 #1): continue the migration from the VERIFIED REPAIRED
+        # bytes, not from the still-red developer checkout.
+        return _begin_adopted_locked(run_dir, config, args, run_id, adopt)
+
+    # A fresh (non-adopt) begin after an archived repair re-captures C0 from the
+    # developer checkout. The preserved repaired snapshot (sources/C0) lives on
+    # only as a copy under the repair archive, so clearing the live leftover is
+    # safe — it is the user's explicit choice to re-capture, never silent loss.
+    # The handoff is marked SUPERSEDED so a later begin never adopts stale bytes.
+    if adopt is None and (run_dir / REPAIR_HANDOFF_FILENAME).exists():
+        stale = run_dir / SOURCE_DIR / "C0"
+        if stale.exists():
+            _force_remove_tree(stale)
+        try:
+            handoff = _read_json(run_dir / REPAIR_HANDOFF_FILENAME, required=False)
+        except InvalidInputError:
+            handoff = None
+        if handoff and not handoff.get("adopted") and not handoff.get("superseded"):
+            handoff["superseded"] = True
+            handoff["supersededBy"] = "recapture"
+            handoff["supersededAt"] = _now_iso()
+            _write_json_atomic(run_dir / REPAIR_HANDOFF_FILENAME, handoff)
 
     snapshot_container = run_dir / SOURCE_DIR / "C0"
     snapshot = capture_durable_source_snapshot(
@@ -1260,6 +1342,145 @@ def _begin_locked(run_dir: Path, config: Mapping[str, Any], args: argparse.Names
     return 0
 
 
+def _begin_adopted_locked(
+    run_dir: Path,
+    config: Mapping[str, Any],
+    args: argparse.Namespace,
+    run_id: str,
+    handoff: Mapping[str, Any],
+) -> int:
+    """P1 (v0.2.163 #1): a REAL migration carrying FORWARD the verified repaired
+    source. The repaired C0 snapshot (sealed by verify-bootstrap, confirmed by
+    finish's audit PASS → REPAIR_VERIFIED) becomes the new run's C0 source
+    identity; the migration therefore continues from the FIXED bytes, never from
+    a fresh capture of the still-red developer checkout.
+
+    No control re-run here: the repair run already verified the EXACT bytes and
+    the handoff references the archived evidence. Before adoption the snapshot
+    is RE-OPENED and key-validated (integrity), so a moved/deleted/corrupted
+    container is a hard error, never a silent fallback to the red checkout.
+    """
+    project_name = str(config["projectName"])
+    source_refs = handoff.get("source") or {}
+    container = Path(str(source_refs.get("container") or ""))
+    key = str(source_refs.get("key") or "")
+    try:
+        source = open_source_snapshot(container, expected_key=key, timeout_seconds=1800)
+    except SourceCaptureError as exc:
+        raise InvalidInputError(
+            f"REPAIR_SOURCE_INTEGRITY_FAILED: исправленный снимок недоступен/испорчен: {exc}"
+        ) from exc
+
+    verified_c0 = handoff.get("verifiedC0") or {}
+    audit = handoff.get("audit") or {}
+    full_assignment = dict(source_refs.get("fullAssignment") or {})
+    manifest_hash = str(source_refs.get("manifestHash") or "")
+    lock_hash = str(source_refs.get("lockfileHash") or "")
+    project_relative = Path(str(source_refs.get("projectRelative") or "."))
+    status = "VERIFIED"
+    checkpoint_id = "C0"
+
+    checkpoint: Dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "checkpointId": checkpoint_id,
+        "parentCheckpointId": None,
+        "seq": 0,
+        "status": status,
+        "projectName": project_name,
+        "sourceSnapshotKey": source.key,
+        "sourceSnapshotContainer": str(source.container),
+        "sourceHead": source.git_head or str(source_refs.get("sourceHead") or ""),
+        "projectRelative": str(project_relative),
+        "manifestHash": manifest_hash,
+        "lockfileHash": lock_hash,
+        "resolvedStateKey": str(source_refs.get("resolvedStateKey") or ""),
+        "observedResolvedHash": str(source_refs.get("observedResolvedHash") or ""),
+        "fullAssignment": full_assignment,
+        "acceptedDelta": {"added": {}, "changed": {}, "removed": {}},
+        "cohortId": None,
+        "verification": {
+            "status": str(verified_c0.get("verificationStatus") or "passed"),
+            "kind": str(verified_c0.get("kind") or ""),
+            "commands": list(verified_c0.get("commands") or []),
+            "failingCommands": list(verified_c0.get("failingCommands") or []),
+        },
+        "proofRefs": {
+            "resolvedStateKey": str(source_refs.get("resolvedStateKey") or ""),
+            "preparationProofKey": "",
+        },
+        "runtimeContractHash": _runtime_contract_hash(config),
+        "audit": {
+            "status": str(audit.get("status") or "PASS"),
+            "evidenceRef": str(audit.get("evidenceRef") or ""),
+        },
+        "createdAt": _now_iso(),
+        "updatedAt": _now_iso(),
+        "toolBuildId": config.get("toolBuildId") or "",
+        "adoptedFromRepairRunId": str(handoff.get("repairRunId") or ""),
+        "adoptedRepairArchiveDir": str(handoff.get("evidence", {}).get("archiveDir") or ""),
+    }
+    save_checkpoint(run_dir, checkpoint)
+
+    run: Dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "runId": run_id,
+        "workspaceId": str(config.get("workspaceId") or ""),
+        "projectId": str(config.get("projectId") or ""),
+        "generation": 1,
+        "targetPolicyHash": str(config["policyHash"]),
+        "initialSnapshotKey": source.key,
+        "activeCheckpointId": "C0",
+        "activeCandidateId": None,
+        "phase": "READY",
+        "terminal": None,
+        "budgetLedger": {
+            "candidateAttempts": 0,
+            "repairAttempts": 0,
+            "repairAttemptsForRevision": 0,
+            "infraRetries": 0,
+            "repeatedAttempts": 0,
+        },
+        "leaseOwner": "",
+        "deadlineAt": _deadline_iso(int(config["budget"]["runBudgetMinutes"])),
+        "heartbeatAt": _now_iso(),
+        "createdAt": _now_iso(),
+        "updatedAt": _now_iso(),
+        "toolBuildId": config.get("toolBuildId") or "",
+        "adoptedFromRepairRunId": str(handoff.get("repairRunId") or ""),
+        "adoptedRepairArchiveDir": str(handoff.get("evidence", {}).get("archiveDir") or ""),
+        "adoptedAt": _now_iso(),
+    }
+    save_run(run_dir, run)
+
+    # Mark the handoff adopted ONLY after the run is durable: a crash in between
+    # leaves RUN_ALREADY_EXISTS instead of silently re-capturing the red source.
+    handoff_marked = dict(handoff)
+    handoff_marked["adopted"] = True
+    handoff_marked["adoptedAt"] = _now_iso()
+    _write_json_atomic(run_dir / REPAIR_HANDOFF_FILENAME, handoff_marked)
+
+    _emit_status(
+        {
+            "event": "begin.adopted",
+            "runId": run_id,
+            "phase": "READY",
+            "repairedRunId": str(handoff.get("repairRunId") or ""),
+            "sourceSnapshotKey": source.key,
+            "managedDependencies": len(full_assignment),
+        }
+    )
+    _emit_status(
+        {
+            "event": "begin.done",
+            "runId": run_id,
+            "checkpointId": checkpoint_id,
+            "phase": "READY",
+            "managedDependencies": len(full_assignment),
+        }
+    )
+    return 0
+
+
 def classify_c0_result(result: BaselineVerifyResult) -> str:
     if result.kind == "project" or is_structural_project_failure(result):
         return "RED_SOURCE"
@@ -1305,6 +1526,228 @@ def _write_bootstrap_repair_request(
         run_dir,
         [dict(request.to_json()) | {"bootstrap": True, "checkpointId": "C0"}],
     )
+
+
+# ---------------------------------------------------------------------------
+# archive-repair-run: transactional archive + the durable repair handoff
+# ---------------------------------------------------------------------------
+
+# P1 (v0.2.163 #2): a FINISHED repair run must never block a real migration,
+# and freeing its slot must never be half-done. Every artifact except the
+# repaired C0 source snapshot (the fixed bytes the next run adopts) and the
+# lightweight journal moves into repair-archive/<runId>-<timestamp>/. On ANY
+# failure the already-moved entries are renamed back so the run stays exactly
+# as it was — an interrupted archive is recoverable, never corrupted.
+def _archive_repair_run_locked(
+    run_dir: Path, run: Mapping[str, Any]
+) -> Dict[str, Any]:
+    run_id = str(run.get("runId") or "run")
+    config = load_config(run_dir)
+    c0 = load_checkpoint(run_dir, "C0")
+    archive_root = (
+        run_dir / REPAIR_ARCHIVE_DIR / f"{run_id}-{int(time.time() * 1000)}"
+    )
+    archive_root.mkdir(parents=True, exist_ok=True)
+    moved: List[Tuple[Path, Path]] = []
+    try:
+        skip = {
+            REPAIR_ARCHIVE_DIR,
+            SOURCE_DIR,
+            REPAIR_HANDOFF_FILENAME,
+            PROJECT_CHECK_FILENAME,
+            LOCK_FILENAME,
+            "attempt.json",
+            "attempt.log",
+        }
+        for entry in sorted(run_dir.iterdir(), key=lambda p: p.name):
+            if entry.name in skip or not (entry.is_dir() or entry.is_file()):
+                continue
+            target = archive_root / entry.name
+            os.rename(str(entry), str(target))
+            moved.append((entry, target))
+        # Preserve a COPY of the repaired C0 snapshot as IN-ARCHIVE evidence.
+        # The live sources/C0 stays put for the next migration to adopt; if the
+        # user later re-captures from the developer checkout (no adopt), the
+        # live copy is replaced but the fixed bytes remain under the archive.
+        live_snapshot = run_dir / SOURCE_DIR / "C0"
+        if live_snapshot.is_dir():
+            shutil.copytree(live_snapshot, archive_root / SOURCE_DIR / "C0", dirs_exist_ok=True, symlinks=True)
+        _verify_repair_archive(run_dir, archive_root, c0)
+    except Exception as exc:
+        # Roll back the WHOLE transaction before reporting: the run must remain
+        # continuable (run.json + checkpoints + sources all back in place).
+        for entry, target in reversed(moved):
+            try:
+                if target.exists() or target.is_symlink():
+                    os.rename(str(target), str(entry))
+            except OSError:
+                pass
+        evidence_copy = archive_root / SOURCE_DIR
+        try:
+            if evidence_copy.exists():
+                _force_remove_tree(evidence_copy)
+        except OSError:
+            pass
+        try:
+            if not any(archive_root.iterdir()):
+                archive_root.rmdir()
+        except OSError:
+            pass
+        raise InvalidInputError(
+            f"REPAIR_ARCHIVE_FAILED_ROLLED_BACK: {type(exc).__name__}: {exc}"
+        ) from exc
+    handoff = _build_repair_handoff(run, config, c0, archive_root, run_dir)
+    _write_json_atomic(run_dir / REPAIR_HANDOFF_FILENAME, handoff)
+    _write_project_check_ready(run_dir, config, handoff)
+    return {
+        "archived": True,
+        "runId": run_id,
+        "archiveDir": str(archive_root),
+        "handoffPath": str(run_dir / REPAIR_HANDOFF_FILENAME),
+    }
+
+
+def _verify_repair_archive(run_dir: Path, archive_root: Path, c0: Mapping[str, Any]) -> None:
+    """Cheap integrity gate AFTER the move, BEFORE any handoff/verdict write:
+    the slot is proven free (no run.json in the run dir), the move landed
+    (run.json + config under the archive) and the repaired source snapshot
+    stayed reachable under the key the C0 checkpoint expects."""
+    if (run_dir / RUN_FILENAME).exists():
+        raise InvalidInputError("REPAIR_ARCHIVE_RUN_STILL_PRESENT")
+    if not (archive_root / RUN_FILENAME).exists():
+        raise InvalidInputError("REPAIR_ARCHIVE_RUN_MISSING")
+    if not (archive_root / CONFIG_FILENAME).exists():
+        raise InvalidInputError("REPAIR_ARCHIVE_CONFIG_MISSING")
+    manifest_path = run_dir / SOURCE_DIR / "C0" / "manifest.json"
+    if not manifest_path.exists():
+        raise InvalidInputError("REPAIR_ARCHIVE_SOURCE_SNAPSHOT_MISSING")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise InvalidInputError(f"REPAIR_ARCHIVE_SOURCE_MANIFEST_INVALID: {exc}") from exc
+    observed_key = str(manifest.get("sourceSnapshotKey") or "")
+    expected_key = str(c0.get("sourceSnapshotKey") or "")
+    if observed_key != expected_key:
+        raise InvalidInputError(
+            "REPAIR_ARCHIVE_SOURCE_KEY_MISMATCH: "
+            f"expected={expected_key}; observed={observed_key}"
+        )
+
+
+def _build_repair_handoff(
+    run: Mapping[str, Any],
+    config: Mapping[str, Any],
+    c0: Mapping[str, Any],
+    archive_root: Path,
+    run_dir: Path,
+) -> Dict[str, Any]:
+    """The single durable record the NEXT migration reads to continue from the
+    verified repaired bytes. `source` points at the fixed C0 snapshot that stays
+    at run_dir/sources/C0; `evidence` keeps WORKING references into the archive
+    so repair proof remains reachable after the slot is freed."""
+    terminal_outcome = run.get("terminalOutcome") or {}
+    verification = c0.get("verification") or {}
+    audit = c0.get("audit") or {}
+    source_head = str(c0.get("sourceHead") or "")
+    return {
+        "schemaVersion": 1,
+        "repairRunId": str(run.get("runId") or ""),
+        "projectName": str(config.get("projectName") or ""),
+        "projectDir": str(config.get("projectDir") or ""),
+        "workspaceId": str(config.get("workspaceId") or ""),
+        "terminal": "REPAIR_VERIFIED",
+        "repairedAt": str(terminal_outcome.get("finishedAt") or _now_iso()),
+        "source": {
+            "container": str(run_dir / SOURCE_DIR / "C0"),
+            "key": str(c0.get("sourceSnapshotKey") or ""),
+            "projectRelative": str(c0.get("projectRelative") or "."),
+            "sourceHead": source_head,
+            "manifestHash": str(c0.get("manifestHash") or ""),
+            "lockfileHash": str(c0.get("lockfileHash") or ""),
+            "resolvedStateKey": str(c0.get("resolvedStateKey") or ""),
+            "observedResolvedHash": str(c0.get("observedResolvedHash") or ""),
+            "fullAssignment": dict(c0.get("fullAssignment") or {}),
+        },
+        "verifiedC0": {
+            "status": str(c0.get("status") or ""),
+            "verificationStatus": str(verification.get("status") or ""),
+            "kind": str(verification.get("kind") or ""),
+            "commands": list(verification.get("commands") or []),
+            "failingCommands": list(verification.get("failingCommands") or []),
+        },
+        "audit": {
+            "status": str(audit.get("status") or ""),
+            "evidenceRef": str(audit.get("evidenceRef") or ""),
+        },
+        "evidence": {
+            "archiveDir": str(archive_root),
+            "sourceSnapshotCopy": str(archive_root / SOURCE_DIR / "C0"),
+            "repairRequestsPath": str(archive_root / REPAIR_REQUESTS_FILENAME),
+            "reportsDir": str(archive_root / REPORTS_DIR),
+        },
+        "adopted": False,
+    }
+
+
+def _write_project_check_ready(run_dir: Path, config: Mapping[str, Any], handoff: Mapping[str, Any]) -> None:
+    """The durable 'project ready' verdict the panel shows after a finished
+    repair — with WORKING references to the repair evidence, so the handoff and
+    the archived artifacts never point at a path that disappeared."""
+    _write_json_atomic(
+        run_dir / PROJECT_CHECK_FILENAME,
+        {
+            "schemaVersion": 1,
+            "projectDir": str(config.get("projectDir") or ""),
+            "projectName": str(config.get("projectName") or ""),
+            "checkedAt": _now_iso(),
+            "ok": True,
+            "managedDependencies": 0,
+            "control": {
+                "status": "passed",
+                "kind": "repair",
+                "summary": "Исходное состояние проекта исправлено и подтверждено (ремонт).",
+            },
+            "repair": {
+                "handoffPath": str(run_dir / REPAIR_HANDOFF_FILENAME),
+                "archiveDir": str(handoff.get("evidence", {}).get("archiveDir") or ""),
+                "repairRunId": str(handoff.get("repairRunId") or ""),
+            },
+        },
+    )
+
+
+def cmd_archive_repair_run(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    if not (run_dir / RUN_FILENAME).exists():
+        _emit_archive_result({"archived": False, "reason": "NO_RUN"})
+        return 0
+    run = load_run(run_dir)
+    terminal_outcome = run.get("terminalOutcome") or {}
+    repair_done = run.get("phase") == "TERMINAL" and (
+        terminal_outcome.get("outcome") == "REPAIR_VERIFIED"
+        or run.get("terminal") == "REPAIR_VERIFIED"
+    )
+    if not repair_done:
+        _emit_archive_result(
+            {"archived": False, "reason": "NOT_REPAIR_VERIFIED", "phase": str(run.get("phase") or "")}
+        )
+        return 0
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}")
+    lock.acquire()
+    try:
+        result = _archive_repair_run_locked(run_dir, run)
+        _emit_archive_result(result)
+        return 0
+    finally:
+        lock.release()
+
+
+def _emit_archive_result(result: Mapping[str, Any]) -> None:
+    print(
+        f"{ARCHIVE_RESULT_EVENT} "
+        f"{json.dumps(dict(result), ensure_ascii=False, separators=(',', ':'))}"
+    )
+    sys_stdout_flush()
 
 
 def cmd_bootstrap_materialize(args: argparse.Namespace) -> int:
@@ -1383,6 +1826,62 @@ def _bootstrap_materialize_locked(
     return 0
 
 
+def _force_remove_tree(path: Path) -> None:
+    """Remove a private tree that may be write-protected.
+
+    A sealed snapshot container is read-only, and `shutil.rmtree(ignore_errors=
+    True)` would silently fail to remove it on Windows — exactly the failure
+    `source_snapshot._force_rmtree` exists for, mirrored here via the imported
+    `apply_tree_write_protection`.
+    """
+    try:
+        apply_tree_write_protection(path, readonly=False)
+    except OSError:
+        pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _replace_c0_source_snapshot(
+    run_dir: Path, project_path: Path, timeout_seconds: int = 1800
+) -> SourceSnapshot:
+    """P1 (v0.2.163 #1): atomically replace the C0 source snapshot container
+    with a fresh capture of `project_path` (the repaired bootstrap trial).
+
+    The durable snapshots are immutable and `persist_source_snapshot` refuses an
+    existing destination, so the old red C0 cannot be captured over. The new
+    snapshot is staged + validated FIRST, then the old container is moved aside
+    and the staged one swapped into `sources/C0` — on any failure the old
+    container is restored, so checkpoint C0 never dangles.
+    """
+    c0_container = run_dir / SOURCE_DIR / "C0"
+    stamp = f"{os.getpid()}-{int(time.time() * 1000)}"
+    stage = run_dir / SOURCE_DIR / f"C0.stage-{stamp}"
+    old = run_dir / SOURCE_DIR / f"C0.old-{stamp}"
+    try:
+        staged = capture_durable_source_snapshot(
+            project_path, stage, timeout_seconds=timeout_seconds
+        )
+        if c0_container.is_dir():
+            os.rename(str(c0_container), str(old))
+        os.replace(str(stage), str(c0_container))
+    except Exception:
+        if not c0_container.exists() and old.is_dir():
+            try:
+                os.rename(str(old), str(c0_container))
+            except OSError:
+                pass
+        if stage.exists():
+            _force_remove_tree(stage)
+        raise
+    if old.is_dir():
+        _force_remove_tree(old)
+    # Re-open the FINAL location so the returned snapshot carries the durable
+    # container path (the staged path is gone) and re-validates the key there.
+    return open_source_snapshot(
+        c0_container, expected_key=staged.key, timeout_seconds=timeout_seconds
+    )
+
+
 def cmd_verify_bootstrap(args: argparse.Namespace) -> int:
     """Re-run the C0 control verification on the REPAIRED bootstrap trial
     (version-neutral). On success the trial's repaired bytes become the NEW C0
@@ -1423,10 +1922,13 @@ def cmd_verify_bootstrap(args: argparse.Namespace) -> int:
         if result.ok:
             # The repaired trial becomes the authoritative C0 source identity:
             # capture a NEW durable snapshot at the SAME checkpoint slot (C0) so
-            # the source key/container point at the repaired bytes.
-            snapshot_container = run_dir / SOURCE_DIR / "C0"
-            new_snapshot = capture_durable_source_snapshot(
-                project_path, snapshot_container, timeout_seconds=1800
+            # the source key/container point at the repaired bytes. The old
+            # (red) C0 container is swapped out TRANSACTIONALLY — a failed
+            # capture must never leave checkpoint C0 pointing at a removed
+            # container (the verify-bootstrap success path was previously
+            # unreachable: persist_source_snapshot refused the existing target).
+            new_snapshot = _replace_c0_source_snapshot(
+                run_dir, project_path, timeout_seconds=1800
             )
             project_relative = resolve_project_relative(project_path, new_snapshot)
             manifest_hash, lock_hash, _lock = manifest_and_lock_hashes(project_path)
@@ -4253,6 +4755,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="repair текущего состояния: контроль текущих версий БЕЗ целей и discovery (обход roadmap); красный C0 → BOOTSTRAP_REPAIR, зелёный → READY/REPAIR_VERIFIED",
     )
+    begin.add_argument(
+        "--adopt-repair-source",
+        action="store_true",
+        help="начать миграцию С исправленных исходников завершённого ремонта (REPAIR_VERIFIED): C0 наследует проверенный снимок repair-handoff.json вместо повторного снятия с красного project-dir",
+    )
     begin.add_argument("--targets-file", default="", help="JSON {package: exact version} policy targets")
     begin.add_argument("--verify-config", default="", help="BaselineVerifyConfig JSON file (commands, projectChecks, ...)")
     begin.add_argument("--tool-build-id", default="")
@@ -4295,6 +4802,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify_bootstrap = sub.add_parser("verify-bootstrap", help="Повторная контрольная проверка C0 после bootstrap repair")
     verify_bootstrap.add_argument("--timeout-seconds", type=int, default=1800)
+
+    archive_repair = sub.add_parser(
+        "archive-repair-run",
+        help="Транзакционная архивация TERMINAL REPAIR_VERIFIED прогона: фиксирует repair-handoff.json + project-check.json, исправленный снимок sources/C0 остаётся для следующей миграции",
+    )
 
     bootstrap_materialize = sub.add_parser(
         "bootstrap-materialize",
@@ -4349,6 +4861,7 @@ COMMANDS = {
     "begin": cmd_begin,
     "verify-bootstrap": cmd_verify_bootstrap,
     "bootstrap-materialize": cmd_bootstrap_materialize,
+    "archive-repair-run": cmd_archive_repair_run,
     "plan-next": cmd_plan_next,
     "materialize": cmd_materialize,
     "precheck": cmd_precheck,

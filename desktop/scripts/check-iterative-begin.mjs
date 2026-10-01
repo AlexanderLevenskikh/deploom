@@ -165,4 +165,34 @@ if (withoutNode.args.includes("--requested-node")) {
   throw new Error("--requested-node must be omitted when the project has no explicit Node.js");
 }
 
+// 4. P1 (#1): --adopt-repair-source is forwarded ONLY when the migration must
+// continue from a just-archived verified repair — never invented by the builder.
+const withAdopt = iterativeBeginInvocation(
+  runDir,
+  { projectDir: "C:/ws/demo", projectName: "DemoApp", targetLevel: "yellow", adoptRepairSource: true },
+  "iterative_migration.py",
+  "python",
+);
+if (!withAdopt.args.includes("--adopt-repair-source")) {
+  throw new Error("--adopt-repair-source must be forwarded when the repair was just archived");
+}
+const withoutAdopt = iterativeBeginInvocation(
+  runDir,
+  { projectDir: "C:/ws/demo", projectName: "DemoApp", targetLevel: "yellow" },
+  "iterative_migration.py",
+  "python",
+);
+if (withoutAdopt.args.includes("--adopt-repair-source")) {
+  throw new Error("--adopt-repair-source must be omitted when no finished repair was archived");
+}
+const adoptedWithNode = iterativeBeginInvocation(
+  runDir,
+  { projectDir: "C:/ws/demo", projectName: "DemoApp", targetLevel: "yellow", requestedNode: "22", adoptRepairSource: true },
+  "iterative_migration.py",
+  "python",
+);
+if (!adoptedWithNode.args.includes("--adopt-repair-source") || !adoptedWithNode.args.includes("--requested-node")) {
+  throw new Error("adopt and requested-node are independent flags and must both be forwarded");
+}
+
 console.log("check-iterative-begin: OK");

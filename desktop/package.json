@@ -26,6 +26,8 @@
     "check:i18n": "node scripts/check-i18n.mjs",
     "precheck:iterative-migration": "tsc -p tsconfig.electron.json",
     "check:iterative-migration": "node scripts/check-iterative-migration.mjs",
+    "precheck:iterative-archive": "tsc -p tsconfig.electron.json",
+    "check:iterative-archive": "node scripts/check-iterative-archive.mjs",
     "precheck:task-clipboard": "tsc -p tsconfig.electron.json",
     "check:task-clipboard": "node scripts/check-task-clipboard.mjs",
     "precheck:electron-clipboard": "tsc -p tsconfig.electron.json",
