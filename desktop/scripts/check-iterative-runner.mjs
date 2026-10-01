@@ -93,6 +93,34 @@ expectDecision(
   "same exact candidate",
 );
 expectDecision({ phase: "TERMINAL", terminal: "BUDGET_EXHAUSTED", activeCandidateId: null }, {}, "finish", "BUDGET_EXHAUSTED");
+// P2 (#4): the saved structured terminalOutcome decides satisfaction. COMPLETE
+// is satisfied (a finished, independently-audited, policy-satisfied migration);
+// PARTIAL_VERIFIED / BLOCKED_BASELINE stay unsatisfied — never "проверено".
+const completeTerminal = decideNextStep(
+  runDir,
+  payload({ phase: "TERMINAL", terminal: "COMPLETE", terminalOutcome: { outcome: "COMPLETE", satisfied: true, auditStatus: "PASS", acceptedCheckpoints: 3 }, activeCandidateId: null }),
+);
+if (completeTerminal.step !== "finish" || completeTerminal.satisfied !== true) {
+  throw new Error(`COMPLETE terminal must be satisfied finish: ${JSON.stringify(completeTerminal)}`);
+}
+if (!completeTerminal.reason.includes("COMPLETE")) throw new Error(`reason must carry the outcome: ${completeTerminal.reason}`);
+for (const partialOutcome of ["PARTIAL_VERIFIED", "BLOCKED_BASELINE", "NO_VERIFIED_UPGRADE"]) {
+  const partialTerminal = decideNextStep(
+    runDir,
+    payload({ phase: "TERMINAL", terminal: partialOutcome, terminalOutcome: { outcome: partialOutcome, satisfied: false }, activeCandidateId: null }),
+  );
+  if (partialTerminal.step !== "finish" || partialTerminal.satisfied !== false) {
+    throw new Error(`${partialOutcome} terminal must NOT be satisfied: ${JSON.stringify(partialTerminal)}`);
+  }
+}
+// READY-normalised terminal (the same durable outcome, phase folded to READY).
+const completeReadyTerminal = decideNextStep(
+  runDir,
+  payload({ phase: "READY", terminal: "COMPLETE", terminalOutcome: { outcome: "COMPLETE", satisfied: true, auditStatus: "PASS" }, activeCandidateId: null }),
+);
+if (completeReadyTerminal.step !== "finish" || completeReadyTerminal.satisfied !== true) {
+  throw new Error(`READY+terminal COMPLETE must be satisfied finish: ${JSON.stringify(completeReadyTerminal)}`);
+}
 expectDecision(
   { phase: "READY", activeCandidateId: null, activeCheckpointId: "C1" },
   {},

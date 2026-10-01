@@ -37,6 +37,9 @@ function runner(over) {
 const envelope =
   'ITERATIVE_MIGRATION_FAILURE_V1 {"code": "SOURCE_SUBMODULE_INCOMPLETE", "summary": "Git submodule vendor/sub не инициализирован. Подготовьте submodule и повторите проверку.", "command": "git submodule update --init --recursive -- \\"vendor/sub\\"", "fixable": true}';
 
+const controlEnvelope =
+  'ITERATIVE_MIGRATION_FAILURE_V1 {"code": "PROJECT_CONTROL_FAILED", "summary": "Контроль текущих зависимостей не пройден: npm run test (exit 1).", "command": "", "fixable": true}';
+
 // 1. New project, nothing run → explicit «Check project» first step.
 expect("fresh project acts as check (Проверить проект)", () => {
   const a = deriveMainAction({ inFlight: false, runner: undefined, taskPresent: false, noTargets: false, attempt: undefined });
@@ -152,6 +155,35 @@ expect("fresh fixable blocker beats old no-targets (P2#5)", () => {
 expect("no fresh blocker keeps the no-targets choice", () => {
   const a = deriveMainAction({ inFlight: false, runner: undefined, taskPresent: false, noTargets: true, checked: false, attempt: attempt({ status: "failed", lastError: "BEGIN_PREP_FAILED: bad temp", lastStep: "no-targets" }) });
   if (a.state !== "no-targets") throw new Error(`expected no-targets, got ${a.state}`);
+});
+
+// 17. P2 (#2): a RED current-state control (PROJECT_CONTROL_FAILED) must reach
+//     the repair agent, not a dead-end re-check.
+expect("red current-state control offers the repair agent (P2#2)", () => {
+  const a = deriveMainAction({ inFlight: false, runner: undefined, taskPresent: false, noTargets: false, checked: false, attempt: attempt({ status: "failed", lastError: controlEnvelope }) });
+  if (a.state !== "repair-current") throw new Error(`expected repair-current, got ${a.state}`);
+  if (!a.blocker || a.blocker.code !== "PROJECT_CONTROL_FAILED") throw new Error("control blocker not parsed");
+});
+
+// 18. P2 (#2): the fresh red control beats an OLD no-targets explanation.
+expect("red control beats old no-targets (P2#2)", () => {
+  const a = deriveMainAction({ inFlight: false, runner: undefined, taskPresent: false, noTargets: true, checked: false, attempt: attempt({ status: "failed", lastError: controlEnvelope, lastStep: "no-targets" }) });
+  if (a.state !== "repair-current") throw new Error(`expected repair-current, got ${a.state}`);
+});
+
+// 19. P2 (#2): a red run (BOOTSTRAP_REPAIR) first materializes the trial — the
+//     action stays the repair flow, never "Начать обновление".
+expect("bootstrap-materialize keeps the repair action (P2#2)", () => {
+  const a = deriveMainAction({ inFlight: false, runner: runner({ phase: "BOOTSTRAP_REPAIR", decision: { step: "bootstrap-materialize", satisfied: false, reason: "bootstrap C0 repair needs an isolated trial" } }), taskPresent: false, noTargets: false, checked: false, attempt: attempt({ status: "done", runCreated: true }) });
+  if (a.state !== "repair-current") throw new Error(`expected repair-current, got ${a.state}`);
+});
+
+// 20. P2 (#4): an unsatisfied finish whose saved terminalOutcome is COMPLETE
+//     resolves to the verified result (the runner now reads COMPLETE as
+//     satisfied; this pins the derive side of that contract).
+expect("COMPLETE terminal outcome shows the verified result (P2#4)", () => {
+  const a = deriveMainAction({ inFlight: false, runner: runner({ phase: "TERMINAL", decision: { step: "finish", satisfied: true, reason: "COMPLETE" } }), taskPresent: true, noTargets: false, checked: false, attempt: undefined });
+  if (a.state !== "result") throw new Error(`expected result, got ${a.state}`);
 });
 
 if (failures > 0) {

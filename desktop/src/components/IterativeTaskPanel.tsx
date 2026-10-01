@@ -50,6 +50,7 @@ const fmtElapsed = (ms: number): string => {
 const MAIN_LABEL: Record<ScenarioMainActionState, [string, string]> = {
   check: ['Проверить проект', 'Check project'],
   'retry-check': ['Повторить проверку', 'Re-check'],
+  'repair-current': ['Исправить текущий проект агентом', 'Repair the project with an agent'],
   'no-targets': ['Подобрать обновления автоматически', 'Find updates automatically'],
   ready: ['Начать обновление', 'Start the update'],
   'start-run': ['Начать обновление', 'Start the update'],
@@ -66,6 +67,7 @@ const MAIN_LABEL: Record<ScenarioMainActionState, [string, string]> = {
 const MAIN_DESCRIPTION: Record<ScenarioMainActionState, [string, string]> = {
   check: ['Проверка зафиксирует текущее состояние проекта и найдёт доступные обновления.', 'The check records the current project state and finds available updates.'],
   'retry-check': ['Исправьте причину и повторите проверку — состояние не требует ручной чистки.', 'Fix the cause and re-check — no state files need manual cleanup.'],
+  'repair-current': ['Контроль текущих зависимостей не проходит. Откроем прогон: агент исправит проект в изолированном окружении, авторитетная проверка повторится на исправленных байтах.', 'The current-state control fails. We will open the run: the agent repairs the project in an isolated checkout and the authoritative check re-runs on the repaired bytes.'],
   'no-targets': ['Выберите, как найти обновления: подобрать автоматически или настроить состав и политику.', 'Choose how to find updates: automatically, or by configuring scope and policy.'],
   ready: ['Проверка пройдена — обновление ещё не запускалось. Начните, когда будете готовы.', 'The check passed — the migration has not started yet. Start when ready.'],
   'start-run': ['Проект проверен. Начните обновление — применим и проверим изменения по группам.', 'The project is verified. Start the update — changes will be applied and verified in groups.'],
@@ -202,11 +204,22 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   }, [onAttempt, projectName, refreshKey])
 
   // L1: live event stream carries the newest journal snapshot for THIS project.
+  // Review re-check (#3): when a launch FOREIGN to this component instance
+  // finishes (e.g. the panel was remounted while the child ran), its terminal
+  // attempt event must ALSO release the Electron in-flight lock on this side —
+  // otherwise a remounted panel would show «Остановить» forever. The status
+  // re-read refreshes runner.inFlight (and the decision) from Electron.
+  const liveAttemptStatus = useRef<string | undefined>(undefined)
   useEffect(() => {
     if (!liveAttempt || liveAttempt.projectName !== projectName) return
+    const previous = liveAttemptStatus.current
+    liveAttemptStatus.current = liveAttempt.status
     setAttempt(liveAttempt)
     if (liveAttempt.lastStep === 'no-targets') setNoTargetsStep(true)
-  }, [liveAttempt, projectName])
+    const nowTerminal = liveAttempt.status === 'done' || liveAttempt.status === 'failed' || liveAttempt.status === 'canceled'
+    const leftLive = (previous === 'running' || previous === 'starting') && liveAttempt.status !== previous
+    if (nowTerminal || leftLive) void refreshRunner()
+  }, [liveAttempt, projectName, refreshRunner])
 
   // Elapsed counter while an attempt is alive.
   const attemptAlive = Boolean(attempt && (attempt.status === 'starting' || attempt.status === 'running'))
@@ -220,7 +233,12 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   // child is known — never from a locally remounted React component. `stepBusy`
   // covers THIS panel's own in-flight call; `runner.inFlight` restores control
   // after FLOW → Graph → FLOW (the component remounts, the child keeps running).
-  const childAlive = stepBusy || runner?.inFlight === true
+  // Review re-check (#3): the in-flight snapshot can outlive the child in a
+  // foreign launch. The durable attempt journal is the completion signal: once
+  // it is terminal (done/failed/canceled) the lock is released here even before
+  // the async status re-read lands, so «Остановить» can never stick forever.
+  const attemptTerminal = Boolean(attempt && (attempt.status === 'done' || attempt.status === 'failed' || attempt.status === 'canceled'))
+  const childAlive = stepBusy || (runner?.inFlight === true && !attemptTerminal)
 
   // Review re-check P2#5: while the output log is open and a run is actively
   // emitting, re-read the journal tail periodically so the user sees live
@@ -339,6 +357,16 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
                 'Could not establish available updates (registry unavailable or the search budget was exhausted). Not counted as a completed migration.',
               ),
             )
+          } else if (outcome.phase === 'BOOTSTRAP_REPAIR') {
+            // P2 (#2): the red C0 just opened the repair track — the run exists
+            // and the isolated trial gets materialized up to the agent gate.
+            setNote(
+              text(
+                'Контроль текущих зависимостей не пройден. Открыт прогон ремонта: готовим изолированное окружение, затем агент исправит проект.',
+                'The current-state control fails. The repair run is open: preparing the isolated checkout, then the agent repairs the project.',
+              ),
+            )
+            await driveNow()
           } else {
             setNote(text('Проверка завершена — продолжаю обновление.', 'Check finished — continuing the update.'))
             await driveNow()
@@ -505,6 +533,14 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         // run, no discovery. Discovery is only (re)attempted for the specific
         // DISCOVERY_UNSETTLED blocker that it can actually clear.
         void beginNow(retryIsDiscoverySearch ? { mode: 'auto' } : { mode: 'none', checkOnly: true })
+        break
+      case 'repair-current':
+        // P2 (#2): a red current-state control reaches the repair agent through
+        // the durable BOOTSTRAP_REPAIR track. With no run yet we open one (the
+        // red C0 lands in BOOTSTRAP_REPAIR); with a red run we materialize the
+        // isolated trial up to the agent gate. Never a dead-end re-check.
+        if (!runner?.present) void beginNow({ mode: 'none' })
+        else void driveNow()
         break
       case 'no-targets':
         void beginNow({ mode: 'auto' })
@@ -674,7 +710,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
                 disabled={mainAction.state === 'running' ? false : busyLocked}
                 onClick={() => void runMainAction()}
               >
-                {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' ? <Wrench size={16} /> : mainAction.state === 'result' || mainAction.state === 'partial' || mainAction.state === 'budget-stop' ? <FileText size={16} /> : <Rocket size={16} />}
+                {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' || mainAction.state === 'repair-current' ? <Wrench size={16} /> : mainAction.state === 'result' || mainAction.state === 'partial' || mainAction.state === 'budget-stop' ? <FileText size={16} /> : <Rocket size={16} />}
                 {mainLabel}
               </button>
               {mainAction.state === 'no-targets' ? (

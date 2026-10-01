@@ -76,7 +76,8 @@ export type ScenarioInput = {
 
 export type ScenarioMainActionState =
   | "check" // проект ещё не проверен → Проверить проект (реальный preflight+контроль)
-  | "retry-check" // проверка выявила исправимый локальный блокер → Повторить проверку
+  | "retry-check" // проверка не дала результата / исправимый локальный блокер → Повторить проверку
+  | "repair-current" // P2 (#2): контроль текущих зависимостей красный → Исправить проект агентом
   | "no-targets" // сохранённых целей нет → предложить авто-поиск / настройку
   | "ready" // P1#4: проверка пройдена, миграция ещё не начата → Начать обновление
   | "start-run" // проект готов, ничего ещё не гонялось → Начать обновление
@@ -142,10 +143,23 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
 
   // 3. No durable run yet: the project has never been verified.
   if (!runner?.present) {
+    // P2 (#2): a RED current-state control (PROJECT_CONTROL_FAILED) must reach
+    // the repair agent, not a dead-end re-check: clicking this opens the durable
+    // run whose red C0 puts the coordinator on the BOOTSTRAP_REPAIR track
+    // (isolated checkout → agent → authoritative re-verify). A fresh error
+    // beats an OLD "no targets" explanation (P2#5).
+    if (attemptFailed && blocker?.code === "PROJECT_CONTROL_FAILED") {
+      return {
+        state: "repair-current",
+        blocker,
+        firstRun: false,
+        reasonShort:
+          "Контроль текущих зависимостей не пройден. Агент исправит проект в изолированном окружении, затем проверка повторится авторитетно.",
+      }
+    }
     // P2#5: a fresh fixable blocker (uninitialized submodule / unsettled
-    // discovery / failing project control) takes priority over an OLD "no
-    // roadmap targets" decision — a new error must never hide behind the
-    // previous state ("Продолжить показывать отсутствие целей").
+    // discovery) takes priority over an OLD "no roadmap targets" decision — a
+    // new error must never hide behind the previous state.
     if (attemptFailed && blocker && (blocker.fixable || FIXABLE_CODES.has(blocker.code))) {
       return {
         state: "retry-check",
@@ -193,6 +207,18 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
   // 4. A durable run exists.
   if (decisionStep === "agent") {
     return { state: "agent", blocker, firstRun: false, reasonShort: "Нужны исправления — выпустите агента в изолированный trial." }
+  }
+  // P2 (#2): a red run (BOOTSTRAP_REPAIR) first materializes the
+  // version-neutral trial; the action stays the repair flow, never
+  // "Начать обновление".
+  if (decisionStep === "bootstrap-materialize") {
+    return {
+      state: "repair-current",
+      blocker,
+      firstRun: false,
+      reasonShort:
+        "Исправим текущий проект в изолированном окружении: сперва подготовим trial, затем агент и повторная авторитетная проверка.",
+    }
   }
   // P1#3: never call an unfinished result "проверено". The run is fully done
   // ONLY when the decision explicitly says the policy is satisfied AND the

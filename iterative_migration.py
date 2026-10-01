@@ -801,16 +801,33 @@ def _begin_check_only_locked(
         runtime_env=_runtime_env(config),
     )
     observed = dict(result.observed_resolved_versions or {})
+    result_kind = str(getattr(result, "kind", "") or "")
+    result_summary = str(getattr(result, "summary", "") or "")
     failing_commands = [
         {"command": failure.command, "exitCode": failure.exit_code}
         for failure in result.project_failures
     ]
-    # P1#4: this is a PRE-RUN gate, not a C0 checkpoint. The control blocks only
-    # on actual failures / a hard environment failure; a "passed" verify and an
-    # "unknown" verify with NO failures (e.g. a project with nothing installed to
-    # check yet) are both "проблем не найдено" — forcing a bootstrap-repair gate
-    # here would turn a fresh project into a fake blocker.
-    check_ok = result.ok or (not result.project_failures and not result.hard_failure)
+    # P1#4: this is a PRE-RUN gate, not a C0 checkpoint. Three honest verdicts:
+    #   passed       – the control verification genuinely PASSED → the project is
+    #                  ready ("Проект проверен" is only written here).
+    #   failed       – project-level failures (red current state) →
+    #                  PROJECT_CONTROL_FAILED; the panel offers the repair-agent
+    #                  path, never a false "готово".
+    #   inconclusive – infrastructure / unknown / budget / preparation /
+    #                  dependency: the check could NOT establish a definitive
+    #                  verdict. It is kept INCOMPLETE (ok:false), NEVER written
+    #                  as "Проект проверен", and the panel offers a retry — an
+    #                  infra/unknown outcome must not look like a verified green
+    #                  project just because no *project* command failed.
+    if result.ok:
+        check_ok = True
+        control_status = "passed"
+    elif result_kind == "project" or result.project_failures or is_structural_project_failure(result):
+        check_ok = False
+        control_status = "failed"
+    else:
+        check_ok = False
+        control_status = "inconclusive"
     project_check: Dict[str, Any] = {
         "schemaVersion": SCHEMA_VERSION,
         "projectDir": str(project_dir),
@@ -820,7 +837,9 @@ def _begin_check_only_locked(
         "managedDependencies": len(initial_assignment),
         "manifestHash": manifest_hash,
         "control": {
-            "status": ("passed" if result.ok else ("failed" if result.hard_failure or result.project_failures else "unknown")),
+            "status": control_status,
+            "kind": result_kind,
+            "summary": result_summary,
             "failingCommands": failing_commands,
             "resolvedStateKey": result.resolved_state_key or "",
             "observedResolvedHash": result.observed_resolved_hash or observed_resolved_hash(observed),
@@ -840,9 +859,15 @@ def _begin_check_only_locked(
             f"{failure.command} (exit {failure.exit_code})"
             for failure in result.project_failures[:3]
         ) or "проверки проекта не проходят"
+        if control_status == "failed":
+            raise ProjectUnreadyError(
+                "PROJECT_CONTROL_FAILED",
+                f"Контроль текущих зависимостей не пройден: {failing}. ",
+                command="",
+            )
         raise ProjectUnreadyError(
-            "PROJECT_CONTROL_FAILED",
-            f"Контроль текущих зависимостей не пройден: {failing}. ",
+            "PROJECT_CHECK_INCONCLUSIVE",
+            f"Проверка не дала определённого результата ({result.kind}): {result.summary or 'результат неизвестен'} — обновление не запущено. Повторите проверку.",
             command="",
         )
     return 0

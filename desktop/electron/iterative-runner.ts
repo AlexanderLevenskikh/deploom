@@ -129,6 +129,22 @@ function readTargets(runDir: string): Record<string, string> {
   }
 }
 
+// P2 (#4): the durable terminal verdict. Python writes a structured
+// `run.terminalOutcome.outcome` (COMPLETE / BLOCKED_BASELINE / PARTIAL_VERIFIED /
+// NO_VERIFIED_UPGRADE) and mirrors it in `run.terminal`; earlier coordination
+// phases also mark `run.terminal` with transient names (NO_ACTIONABLE /
+// SCOPE_EXHAUSTED / POLICY_SATISFIED_NEEDS_AUDIT). The structured outcome wins,
+// the plain terminal string is the fallback.
+function terminalReason(run: Record<string, any>): string {
+  const structured = (run.terminalOutcome ?? null) as Record<string, any> | null
+  return String(structured?.outcome ?? run.terminal ?? '')
+}
+
+function terminalSatisfied(run: Record<string, any>): boolean {
+  const reason = terminalReason(run)
+  return reason === 'COMPLETE'
+}
+
 /**
  * Decide the next step from the durable status payload. Pure: no fs besides
  * the caller-provided targets, so the decision table is unit-checkable.
@@ -230,11 +246,27 @@ export function decideNextStep(
       // idempotent transaction keyed by the durable candidate identity), so a
       // kill/restart in the middle of the verify resumes the SAME candidate.
       return { step: 'verify-exact', phase, reason: 'authoritative full verify of the same exact candidate on repaired bytes' }
-    case 'TERMINAL':
-      return { step: 'finish', phase, reason: String(run.terminal ?? ''), satisfied: false }
+    case 'TERMINAL': {
+      // P2 (#4): a TERMINAL phase is NOT automatically a failure. The durable
+      // run records a structured terminalOutcome (COMPLETE / BLOCKED_BASELINE /
+      // PARTIAL_VERIFIED / NO_VERIFIED_UPGRADE) and a mirrored run.terminal; a
+      // COMPLETE migration is satisfied (the UI shows the verified result), the
+      // other terminals are honest partial/blocked (never "проверено").
+      return {
+        step: 'finish',
+        phase,
+        reason: terminalReason(run),
+        satisfied: terminalSatisfied(run),
+      }
+    }
     case 'READY': {
       if (run.terminal) {
-        return { step: 'finish', phase, reason: String(run.terminal), satisfied: false }
+        return {
+          step: 'finish',
+          phase,
+          reason: terminalReason(run),
+          satisfied: terminalSatisfied(run),
+        }
       }
       if (candidate && candidateStage) {
         // READY means the pointer already moved (phase was normalised after

@@ -89,6 +89,18 @@ def make_repo_with_passing_check(root: Path) -> Path:
         }),
         encoding="utf-8",
     )
+    # A real current-state control needs an OWNING lockfile: without one the
+    # topology gate answers infrastructure ("owning lockfile missing") and the
+    # honest verdict is INCONCLUSIVE, never "проект проверен". With a minimal
+    # lockfile (and no deps) the control genuinely passes.
+    (root / "package-lock.json").write_text(
+        json.dumps({
+            "name": "preflight-plain", "version": "1.0.0", "lockfileVersion": 3,
+            "requires": True,
+            "packages": {"": {"name": "preflight-plain", "version": "1.0.0", "dependencies": {}}},
+        }),
+        encoding="utf-8",
+    )
     (root / "src.txt").write_text("committed", encoding="utf-8")
     git(root, "add", ".")
     git(root, "commit", "-m", "init")
@@ -150,6 +162,8 @@ class IterativePreflightReadinessTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             check = json.loads((Path(runtmp) / "project-check.json").read_text(encoding="utf-8"))
             self.assertTrue(check["ok"])
+            self.assertEqual(check["control"]["status"], "passed")
+            self.assertEqual(check["control"]["kind"], "passed")
             self.assertFalse((Path(runtmp) / "run.json").exists(),
                              "a check must not create a run — 'Начать обновление' stays a separate step")
             self.assertFalse((Path(runtmp) / "run-config.json").exists())
@@ -222,6 +236,80 @@ class IterativePreflightReadinessTests(unittest.TestCase):
             full = self._cli(project)
             self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
             self.assertIn("begin.capture", full.stdout)
+
+    def test_check_only_infrastructure_is_inconclusive_not_ok(self) -> None:
+        # P1 (#1): an infrastructure / unknown / budget outcome must NEVER be
+        # written as "Проект проверен". Absence of *project-command* failures is
+        # not proof the check passed: the verdict is kept INCOMPLETE (ok:false,
+        # control.status="inconclusive") and the panel offers a retry.
+        if shutil.which("git") is None:
+            self.skipTest("git unavailable")
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as runtmp:
+            project = make_plain_repo(Path(tmp))
+            run_dir = Path(runtmp)
+
+            def infra_result(_project_dir, _assignment, **_kwargs):
+                return SimpleNamespace(
+                    ok=False,
+                    hard_failure=False,
+                    project_failures=(),
+                    observed_resolved_versions={},
+                    resolved_state_key="",
+                    observed_resolved_hash=None,
+                    preparation_proof_key="",
+                    kind="infrastructure",
+                    summary="npm registry unreachable (ECONNREFUSED)",
+                )
+
+            args = Namespace()
+            check_config = {
+                "projectDir": str(project),
+                "projectName": "PreflightDemo",
+                "requestedNode": "",
+                "runtime": {},
+                "verifyConfig": {"commands": []},
+            }
+            with mock.patch.object(iterative_migration, "verify_assignment", side_effect=infra_result):
+                with self.assertRaises(ProjectUnreadyError) as ctx:
+                    iterative_migration._begin_check_only_locked(run_dir, args, check_config)
+            self.assertEqual(ctx.exception.code, "PROJECT_CHECK_INCONCLUSIVE")
+            check = json.loads((run_dir / "project-check.json").read_text(encoding="utf-8"))
+            self.assertFalse(check["ok"], "an inconclusive check must never be ok:true")
+            self.assertEqual(check["control"]["status"], "inconclusive")
+            self.assertEqual(check["control"]["kind"], "infrastructure")
+            self.assertFalse((run_dir / "run.json").exists(), "an inconclusive check must not create a run")
+
+    def test_check_only_unknown_kind_is_inconclusive_not_ok(self) -> None:
+        # The same honest rule for `unknown` (and budget): no definitive verdict
+        # recorded as a pass.
+        if shutil.which("git") is None:
+            self.skipTest("git unavailable")
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as runtmp:
+            project = make_plain_repo(Path(tmp))
+            run_dir = Path(runtmp)
+            args = Namespace()
+            check_config = {
+                "projectDir": str(project),
+                "projectName": "PreflightDemo",
+                "requestedNode": "",
+                "runtime": {},
+                "verifyConfig": {"commands": []},
+            }
+            for kind in ("unknown", "budget"):
+                def inconclusive_result(_project_dir, _assignment, **_kwargs):
+                    return SimpleNamespace(
+                        ok=False, hard_failure=False, project_failures=(),
+                        observed_resolved_versions={}, resolved_state_key="",
+                        observed_resolved_hash=None, preparation_proof_key="",
+                        kind=kind, summary=f"{kind} outcome: no definitive verdict",
+                    )
+                with mock.patch.object(iterative_migration, "verify_assignment", side_effect=inconclusive_result):
+                    with self.assertRaises(ProjectUnreadyError) as ctx:
+                        iterative_migration._begin_check_only_locked(run_dir, args, check_config)
+                self.assertEqual(ctx.exception.code, "PROJECT_CHECK_INCONCLUSIVE")
+                check = json.loads((run_dir / "project-check.json").read_text(encoding="utf-8"))
+                self.assertFalse(check["ok"])
+                self.assertEqual(check["control"]["kind"], kind)
 
     def test_preflight_blocks_uninitialized_submodule_before_discovery(self) -> None:
         if shutil.which("git") is None:
