@@ -70,18 +70,23 @@ export type ScenarioInput = {
   taskPresent: boolean
   /** journal lastStep 'no-targets' / roadmap-empty path */
   noTargets: boolean
+  /** P1#4: a real standalone "Проверить проект" passed (durable, non-run). */
+  checked: boolean
 }
 
 export type ScenarioMainActionState =
-  | "check" // проект ещё не проверен → Проверить проект
+  | "check" // проект ещё не проверен → Проверить проект (реальный preflight+контроль)
   | "retry-check" // проверка выявила исправимый локальный блокер → Повторить проверку
   | "no-targets" // сохранённых целей нет → предложить авто-поиск / настройку
+  | "ready" // P1#4: проверка пройдена, миграция ещё не начата → Начать обновление
   | "start-run" // проект готов, ничего ещё не гонялось → Начать обновление
   | "continue-run" // работа приостановлена → Продолжить обновление
   | "running" // реальный процесс выполняется → Остановить
   | "recovered-running" // журнал running, но живого процесса нет → Продолжить
   | "agent" // требуется ремонт агентом → Исправить агентом
-  | "result" // результат проверен → Посмотреть результат
+  | "result" // результат ПОЛНОСТЬЮ проверен и принят → Посмотреть результат
+  | "partial" // P1#3: завершено, но не все цели выполнены → Посмотреть результат (честно)
+  | "budget-stop" // P1#3: остановлено бюджетом → Посмотреть результат (честно)
 
 export type ScenarioMainAction = {
   state: ScenarioMainActionState
@@ -93,6 +98,18 @@ export type ScenarioMainAction = {
   reasonShort: string
 }
 
+/** P1#1: the single scenario action, mirrorable by the enclosing workspace hero
+ * so the legacy FLOW button and the panel stop competing: ONE control, ONE
+ * state machine. `act` is the panel's own handler. */
+export type ScenarioSignal = {
+  state: ScenarioMainActionState
+  label: string
+  description: string
+  running: boolean
+  enabled: boolean
+  act: () => void
+}
+
 const FIXABLE_CODES = new Set(["SOURCE_SUBMODULE_INCOMPLETE", "SOURCE_SUBMODULE_STATUS_FAILED"])
 
 export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
@@ -102,6 +119,8 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
   const attemptLive = attempt?.status === "running" || attempt?.status === "starting"
   const attemptFailed = attempt?.status === "failed" || attempt?.status === "canceled"
   const decisionStep = runner?.decision?.step ?? null
+  const decisionSatisfied = Boolean(runner?.decision?.satisfied)
+  const decisionReason = runner?.decision?.reason ?? ""
 
   // 1. A REAL child is running → the only sensible action is Stop. This state
   //    overrides everything (including a fresh remount), because it comes from
@@ -123,6 +142,18 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
 
   // 3. No durable run yet: the project has never been verified.
   if (!runner?.present) {
+    // P2#5: a fresh fixable blocker (uninitialized submodule / unsettled
+    // discovery / failing project control) takes priority over an OLD "no
+    // roadmap targets" decision — a new error must never hide behind the
+    // previous state ("Продолжить показывать отсутствие целей").
+    if (attemptFailed && blocker && (blocker.fixable || FIXABLE_CODES.has(blocker.code))) {
+      return {
+        state: "retry-check",
+        blocker,
+        firstRun: false,
+        reasonShort: blocker.summary || "Проверка нашла исправимую проблему подготовки проекта.",
+      }
+    }
     // The roadmap has no concrete targets yet — offer the understandable choice
     // (auto-discovery / configure scope) BEFORE any run is claimed.
     if (input.noTargets || attempt?.lastStep === "no-targets") {
@@ -133,17 +164,6 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
         reasonShort: "Сохранённых целей обновления нет — выберите, как их подобрать.",
       }
     }
-    // A fixable LOCAL readiness blocker (e.g. dangling git submodule) found by
-    // the cheap preflight → offer to re-check AFTER the user fixes it; the
-    // exact command is shown in the diagnostics, never auto-run.
-    if (attemptFailed && blocker && (blocker.fixable || FIXABLE_CODES.has(blocker.code))) {
-      return {
-        state: "retry-check",
-        blocker,
-        firstRun: false,
-        reasonShort: blocker.summary || "Проверка нашла исправимую проблему подготовки проекта.",
-      }
-    }
     if (attemptFailed) {
       return {
         state: "check",
@@ -152,11 +172,21 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
         reasonShort: attempt?.lastError ?? attempt?.reason ?? "Проверка не завершилась. Повторите проверку.",
       }
     }
+    // P1#4: a real "Проверить проект" already passed (durable verdict) and the
+    // migration has not started — STARTING is a separate, explicit action.
+    if (input.checked) {
+      return {
+        state: "ready",
+        blocker,
+        firstRun: false,
+        reasonShort: "Проект проверен — можно начать обновление.",
+      }
+    }
     return {
       state: "check",
       blocker,
       firstRun: false,
-      reasonShort: "Проект ещё не проверен: зафиксируем текущее состояние и найдём доступные обновления.",
+      reasonShort: "Проект ещё не проверен: проверим подготовку и текущие зависимости. Обновление не запускается.",
     }
   }
 
@@ -164,9 +194,29 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
   if (decisionStep === "agent") {
     return { state: "agent", blocker, firstRun: false, reasonShort: "Нужны исправления — выпустите агента в изолированный trial." }
   }
-  const satisfied = decisionStep === "finish" || Boolean(runner.decision?.satisfied) || runner.phase === "TERMINAL"
-  if (satisfied) {
+  // P1#3: never call an unfinished result "проверено". The run is fully done
+  // ONLY when the decision explicitly says the policy is satisfied AND the
+  // finish step was reached (independent audit recorded). A terminal without
+  // satisfaction is a PARTIAL result (blocked / not-all-goals / no-upgrade)
+  // or a BUDGET stop — both are surfaced honestly, never as a verified success.
+  if (decisionSatisfied && decisionStep === "finish") {
     return { state: "result", blocker, firstRun: false, reasonShort: "Обновления проверены — откройте результат." }
+  }
+  if (decisionStep === "finish" || runner?.phase === "TERMINAL") {
+    if (/budget|исчерпан бюджет|бюджет/i.test(decisionReason)) {
+      return {
+        state: "budget-stop",
+        blocker,
+        firstRun: false,
+        reasonShort: "Работа остановилась по бюджету: применённое и проверенное сохранено, но не все цели выполнены.",
+      }
+    }
+    return {
+      state: "partial",
+      blocker,
+      firstRun: false,
+      reasonShort: "Частичный результат: часть обновлений применена и проверена, остальные цели не выполнены.",
+    }
   }
   const firstRun = Boolean(attempt?.runCreated) && !(attempt?.stepsDone?.length)
   return {

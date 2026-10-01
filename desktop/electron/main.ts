@@ -7374,6 +7374,25 @@ function setupIpc(): void {
     return iterativeRunDirPath(workspace.path, project.name)
   }
 
+  // P1#4: read the durable standalone "Проверить проект" verdict written by
+  // `begin --check-only`. It is NOT a run (no run.json/snapshot/checkpoint) — a
+  // successful check means "project is ready", so the UI can offer a distinct
+  // "Начать обновление" instead of a single button that silently starts the
+  // migration. A missing/unreadable artifact is simply "not checked yet".
+  function readProjectCheckArtifact(runDir: string): { ok: boolean; checkedAt?: string } | undefined {
+    const checkPath = join(runDir, 'project-check.json')
+    if (!existsSync(checkPath)) return undefined
+    try {
+      const parsed = JSON.parse(readFileSync(checkPath, 'utf8')) as { ok?: unknown; checkedAt?: unknown }
+      if (parsed && typeof parsed === 'object') {
+        return { ok: parsed.ok === true, checkedAt: typeof parsed.checkedAt === 'string' ? parsed.checkedAt : undefined }
+      }
+    } catch {
+      // not a valid check artifact — treat as "not checked"
+    }
+    return undefined
+  }
+
   // Iterative migration ТЗ (task) surface. The Desktop is a pure CONSUMER of
   // the artifact the Python export-task step publishes under the durable run
   // dir (.dependency-roadmap/iterative/<token>/task). Reading never starts a
@@ -7612,6 +7631,10 @@ function setupIpc(): void {
       // refresh — a remounted panel learns about the running child from HERE,
       // not from a local `stepBusy`.
       inFlight: iterativeStepInFlight.has(project.name),
+      // P1#4: durable "Проверить проект" verdict (only meaningful while no run
+      // exists). Lets the panel show a distinct "ready → Начать обновление"
+      // state after a real check instead of conflating check with start.
+      checked: readProjectCheckArtifact(runDir),
       requestedNode,
       runtime: runtimeView,
       attempt: readAttempt(runDir),
@@ -7620,12 +7643,80 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('flow:iterative:begin', async (_event, input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number } }) => {
+  ipcMain.handle('flow:iterative:begin', async (_event, input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; checkOnly?: boolean }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
     const runPresent = existsSync(join(runDir, 'run.json'))
+    // P1#4: "Проверить проект" is a REAL separate action. It runs the same CLI,
+    // but with `--check-only`: the Python preflight + the control verification of
+    // the CURRENT dependencies happen, and a durable non-run verdict is recorded.
+    // No run.json / snapshot / checkpoint and NO discovery ever start here, so
+    // "Начать обновление" stays a separate, fresh begin.
+    if (input.checkOnly === true) {
+      if (iterativeStepInFlight.has(project.name)) {
+        return { ok: false, step: 'check', error: 'STEP_IN_PROGRESS' }
+      }
+      if (runPresent) {
+        return { ok: false, step: 'check', error: 'RUN_ALREADY_EXISTS: прогон уже существует — продолжите с его состояния (Продолжить)' }
+      }
+      const checkIntent = loadBaselineIntent(workspace, project.name)
+      const checkLevel = checkIntent.acceptancePolicy?.targetLevel ?? 'yellow'
+      iterativeStepInFlight.add(project.name)
+      try {
+        startAttempt(runDir, project.name, 'none', undefined, 0)
+        updateAttempt(runDir, { status: 'running', stage: 'begin' })
+        publishIterativeAttempt(runDir)
+        const python = resolveExecutable('python')
+        const generator = join(bundledToolDir(), 'iterative_migration.py')
+        const options = {
+          projectDir: project.path,
+          projectName: project.name,
+          targetLevel: checkLevel,
+          workspaceId: workspace.id,
+          projectId: project.name,
+          toolBuildId: app.getVersion(),
+          requestedNode: project.nodeVersion || undefined,
+        }
+        const invocation = iterativeBeginInvocation(runDir, options, generator, python)
+        invocation.args.push('--check-only')
+        const beginIo = iterativeStreamIo(runDir)
+        const result = await spawnIterativeStreamed(runDir, invocation.command, invocation.args, workspace.path, 20 * 60_000, beginIo, iterativeStreamPlatform, (event) => {
+          if (event.event === 'begin.check' && typeof event.managedDependencies === 'number') {
+            updateAttempt(runDir, { packageProgress: { processed: 0, total: event.managedDependencies } })
+            publishIterativeAttempt(runDir)
+          }
+        })
+        if (result.code !== 0) {
+          const raw = result.timedOut
+            ? (readAttempt(runDir)?.cancelRequested === true ? 'CANCELED: check terminated by user cancel' : 'CHECK_TIMEOUT: check exceeded its 20-minute budget')
+            : (result.stderr.trim() || result.stdout.trim() || `CHECK_EXIT_${result.code}`)
+          const canceledByUser = readAttempt(runDir)?.cancelRequested === true
+          if (canceledByUser) clearCancelRequest(runDir)
+          updateAttempt(runDir, {
+            status: 'failed',
+            stage: 'begin',
+            lastError: raw.slice(0, 4000),
+            reason: canceledByUser ? 'cancelled by user; the project was not checked' : result.timedOut ? 'check timed out' : 'check failed',
+            lastStep: 'check',
+          })
+          publishIterativeAttempt(runDir)
+          return { ok: false, step: 'check', error: raw.slice(0, 4000), attempt: readAttempt(runDir) }
+        }
+        const checked = readProjectCheckArtifact(runDir)
+        if (!checked) {
+          updateAttempt(runDir, { status: 'failed', stage: 'begin', lastError: 'CHECK_UNREADABLE: check exited 0 but no project-check.json is readable', reason: 'check exited but no verdict is readable', lastStep: 'check' })
+          publishIterativeAttempt(runDir)
+          return { ok: false, step: 'check', error: 'CHECK_UNREADABLE', attempt: readAttempt(runDir) }
+        }
+        updateAttempt(runDir, { status: 'done', stage: 'begin', lastStep: 'checked', reason: checked.ok ? 'project is ready' : 'project check found issues', runCreated: false })
+        publishIterativeAttempt(runDir)
+        return { ok: true, step: 'check', checked, attempt: readAttempt(runDir) }
+      } finally {
+        iterativeStepInFlight.delete(project.name)
+      }
+    }
     const intent = loadBaselineIntent(workspace, project.name)
     const targetLevel = intent.acceptancePolicy?.targetLevel ?? 'yellow'
     const dashboardState = artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json')

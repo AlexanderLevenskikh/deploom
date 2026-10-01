@@ -14,9 +14,13 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
+import baseline_constraint_verifier
+import iterative_migration
 import source_snapshot
-from iterative_migration import ProjectUnreadyError, project_readiness_preflight, _begin_locked
+from iterative_migration import ProjectUnreadyError, project_readiness_preflight
 from source_snapshot import incomplete_submodules
 
 
@@ -76,6 +80,21 @@ def make_plain_repo(root: Path) -> Path:
     return root
 
 
+def make_repo_with_passing_check(root: Path) -> Path:
+    init_repo(root)
+    (root / "package.json").write_text(
+        json.dumps({
+            "name": "preflight-plain", "private": True, "dependencies": {},
+            "scripts": {"test": "node -e \"0\""},
+        }),
+        encoding="utf-8",
+    )
+    (root / "src.txt").write_text("committed", encoding="utf-8")
+    git(root, "add", ".")
+    git(root, "commit", "-m", "init")
+    return root
+
+
 class IterativePreflightReadinessTests(unittest.TestCase):
     def _cli(self, project: Path) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory(prefix="deploom-preflight-run-") as runtmp:
@@ -87,6 +106,122 @@ class IterativePreflightReadinessTests(unittest.TestCase):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=300, check=False,
             )
+
+    # P1#4: "Проверить проект" is a REAL separate step — the same CLI `begin`,
+    # but `--check-only`. It runs the readiness preflight AND the control
+    # verification of the CURRENT dependencies, then records a durable non-run
+    # verdict (project-check.json). No run.json/config/snapshot are created, so
+    # the later "Начать обновление" begin is still a fresh run. The caller owns
+    # `run_dir` (kept alive while it asserts on the artifacts).
+    def _cli_check(self, project: Path, run_dir: Path, verify_config: str = "") -> subprocess.CompletedProcess[str]:
+        args = [sys.executable, "iterative_migration.py", "--run-dir", str(run_dir), "begin",
+                "--project-dir", str(project), "--project-name", "PreflightDemo", "--check-only"]
+        if verify_config:
+            args += ["--verify-config", verify_config]
+        return subprocess.run(
+            args,
+            cwd=str(Path(__file__).resolve().parents[2]),
+            text=True, encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=300, check=False,
+        )
+
+    def test_check_only_blocks_uninitialized_submodule_without_creating_a_run(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git unavailable")
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as subtmp:
+            project = make_repo_with_uninitialized_submodule(Path(tmp), Path(subtmp))
+            with tempfile.TemporaryDirectory() as runtmp:
+                run_dir = Path(runtmp) / "run"
+            result = self._cli_check(project, run_dir)
+            self.assertNotEqual(result.returncode, 0)
+            combined = result.stdout + result.stderr
+            payload = json.loads(combined.split("ITERATIVE_MIGRATION_FAILURE_V1 ", 1)[1].strip())
+            self.assertEqual(payload["code"], "SOURCE_SUBMODULE_INCOMPLETE")
+            self.assertIn("--init --recursive --", payload["command"])
+            self.assertFalse(run_dir.exists(), "a blocked check must not create a run directory")
+
+    def test_check_only_records_ok_without_a_run(self) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git unavailable")
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as runtmp:
+            project = make_repo_with_passing_check(Path(tmp))
+            result = self._cli_check(project, Path(runtmp))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            check = json.loads((Path(runtmp) / "project-check.json").read_text(encoding="utf-8"))
+            self.assertTrue(check["ok"])
+            self.assertFalse((Path(runtmp) / "run.json").exists(),
+                             "a check must not create a run — 'Начать обновление' stays a separate step")
+            self.assertFalse((Path(runtmp) / "run-config.json").exists())
+            self.assertFalse((Path(runtmp) / "SOURCE").exists())
+
+    def test_check_only_reports_failing_control_then_real_begin_is_fresh(self) -> None:
+        # A project that does not pass its own checks is surfaced as a fixable
+        # check verdict (PROJECT_CONTROL_FAILED) with a durable ok:false check
+        # file and NO run. After the verify "passes", the SAME check command
+        # succeeds and a real `begin` proceeds to create the durable run.
+        # (The verify verdict is stubbed: a 0-dependency fixture cannot install a
+        # real resolved state, so this asserts the check-only gate logic, and the
+        # end-to-end real-begin path is covered by the CLI check below.)
+        if shutil.which("git") is None:
+            self.skipTest("git unavailable")
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as runtmp:
+            project = make_plain_repo(Path(tmp))
+            run_dir = Path(runtmp)
+
+            def failing_result(*_args, **_kwargs):
+                return SimpleNamespace(
+                    ok=False,
+                    hard_failure=False,
+                    project_failures=(
+                        baseline_constraint_verifier.BaselineProjectFailure(
+                            command="npm run test", exit_code=1, output="FAILED",
+                        ),
+                    ),
+                    observed_resolved_versions={},
+                    resolved_state_key="",
+                    observed_resolved_hash=None,
+                    preparation_proof_key="",
+                    kind="project-check",
+                )
+
+            args = Namespace()
+            check_config = {
+                "projectDir": str(project),
+                "projectName": "PreflightDemo",
+                "requestedNode": "",
+                "runtime": {},
+                "verifyConfig": {"commands": []},
+            }
+            with mock.patch.object(iterative_migration, "verify_assignment", side_effect=failing_result):
+                with self.assertRaises(ProjectUnreadyError) as ctx:
+                    iterative_migration._begin_check_only_locked(run_dir, args, check_config)
+            self.assertEqual(ctx.exception.code, "PROJECT_CONTROL_FAILED")
+            check = json.loads((run_dir / "project-check.json").read_text(encoding="utf-8"))
+            self.assertFalse(check["ok"])
+            self.assertEqual(check["control"]["status"], "failed")
+            self.assertFalse((run_dir / "run.json").exists(), "a failed check must not create a run")
+
+            # "Fix": the same verify now passes — the check succeeds.
+            passing = SimpleNamespace(
+                ok=True,
+                hard_failure=False,
+                project_failures=(),
+                observed_resolved_versions={},
+                resolved_state_key="",
+                observed_resolved_hash=None,
+                preparation_proof_key="",
+                kind="project-check",
+            )
+            with mock.patch.object(iterative_migration, "verify_assignment", return_value=passing):
+                self.assertEqual(iterative_migration._begin_check_only_locked(run_dir, args, check_config), 0)
+            check = json.loads((run_dir / "project-check.json").read_text(encoding="utf-8"))
+            self.assertTrue(check["ok"])
+            # A real begin now proceeds end-to-end (its C0 control on the plain
+            # repo is unknown-but-not-blocking; the run is still created).
+            full = self._cli(project)
+            self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
+            self.assertIn("begin.capture", full.stdout)
 
     def test_preflight_blocks_uninitialized_submodule_before_discovery(self) -> None:
         if shutil.which("git") is None:
@@ -176,7 +311,7 @@ class IterativePreflightReadinessTests(unittest.TestCase):
                 ],
             }
             with self.assertRaises(ProjectUnreadyError) as ctx:
-                _begin_locked(run_dir, config, Namespace(run_id="iter-unsettled"))
+                iterative_migration._begin_locked(run_dir, config, Namespace(run_id="iter-unsettled"))
             self.assertEqual(ctx.exception.code, "DISCOVERY_UNSETTLED")
             self.assertFalse((run_dir / "run.json").exists(), "an unsettled discovery must not create a run")
             self.assertFalse((run_dir / "SOURCE").exists(), "no expensive capture must happen on an unsettled discovery")

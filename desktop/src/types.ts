@@ -420,6 +420,10 @@ export type IterativeStatusOutcome = {
   runtime?: IterativeRuntimeView
   attempt?: IterativeAttemptView
   attemptLog?: string
+  // P1#4: durable standalone "Проверить проект" verdict (present only while no
+  // run exists). A check is a REAL preflight + current-dependencies control and
+  // never creates/starts the migration — the UI shows "ready → Начать обновление".
+  checked?: { ok: boolean; checkedAt?: string }
   error?: string
 }
 // #1: durable supervisor outcome. drive runs the Python steps in a loop and
@@ -479,6 +483,9 @@ export type IterativeBeginOutcome = {
     budgetSkipped: string[]
     noCompatibleAlternative: string[]
   }
+  // P1#4: this begin was a "--check-only" project check. A check records a
+  // durable non-run verdict and NEVER starts the migration.
+  checked?: { ok: boolean; checkedAt?: string }
   attempt?: IterativeAttemptView
   error?: string
 }
@@ -509,7 +516,7 @@ export type DependencyFlowApi = {
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStatusOutcome>
   iterativeDrive: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeDriveOutcome>
-  iterativeBegin: (input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number } }) => Promise<IterativeBeginOutcome>
+  iterativeBegin: (input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; checkOnly?: boolean }) => Promise<IterativeBeginOutcome>
   iterativeAgent: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeAgentOutcome>
   runAction: (input: ActionInput) => Promise<{ jobId: string; runId?: string; preview: string[] }>
   cancelJob: (jobId: string) => Promise<boolean>

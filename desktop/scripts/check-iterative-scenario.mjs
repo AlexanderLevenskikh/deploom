@@ -116,6 +116,44 @@ expect("failure envelope parses command/fixable", () => {
   if (!parsed.command.includes("vendor/sub")) throw new Error("command wrong");
 });
 
+// 11. P1#4: a REAL standalone check passed (durable, non-run) → ready to start.
+expect("checked project (no run yet) acts as ready → Начать обновление", () => {
+  const a = deriveMainAction({ inFlight: false, runner: undefined, taskPresent: false, noTargets: false, checked: true, attempt: attempt({ status: "done", lastStep: "checked" }) });
+  if (a.state !== "ready") throw new Error(`expected ready, got ${a.state}`);
+});
+
+// 12. P1#3: budget-exhausted terminal is NOT a verified result — honest stop.
+expect("budget-exhausted terminal is budget-stop, not result", () => {
+  const a = deriveMainAction({ inFlight: false, runner: runner({ phase: "TERMINAL", decision: { step: "finish", satisfied: false, reason: "BUDGET_EXHAUSTED: time budget 120s exhausted; applied+verified kept" } }), taskPresent: true, noTargets: false, checked: false, attempt: undefined });
+  if (a.state !== "budget-stop") throw new Error(`expected budget-stop, got ${a.state}`);
+});
+
+// 13. P1#3: other unsatisfied terminals (blocked / no-upgrade) are PARTIAL.
+expect("unsatisfied non-budget terminal is partial, not result", () => {
+  const a = deriveMainAction({ inFlight: false, runner: runner({ phase: "TERMINAL", decision: { step: "finish", satisfied: false, reason: "BLOCKED_BASELINE" } }), taskPresent: true, noTargets: false, checked: false, attempt: undefined });
+  if (a.state !== "partial") throw new Error(`expected partial, got ${a.state}`);
+});
+
+// 14. P1#3: policy satisfied but the independent audit is still pending → the
+//     migration is NOT done yet; the action continues, never claims a result.
+expect("satisfied policy with pending audit continues, never result", () => {
+  const a = deriveMainAction({ inFlight: false, runner: runner({ phase: "READY", decision: { step: "audit", satisfied: true, reason: "policy satisfied; run the independent audit before finalizing" } }), taskPresent: true, noTargets: false, checked: false, attempt: attempt({ status: "done", runCreated: true, stepsDone: ["plan-next"] }) });
+  if (a.state !== "continue-run") throw new Error(`expected continue-run, got ${a.state}`);
+});
+
+// 15. P2#5: a FRESH fixable blocker must win over an OLD "no targets" state —
+//     a new error never hides behind the previous no-targets explanation.
+expect("fresh fixable blocker beats old no-targets (P2#5)", () => {
+  const a = deriveMainAction({ inFlight: false, runner: undefined, taskPresent: false, noTargets: true, checked: false, attempt: attempt({ status: "failed", lastError: envelope, lastStep: "no-targets" }) });
+  if (a.state !== "retry-check") throw new Error(`expected retry-check, got ${a.state}`);
+});
+
+// 16. P2#5: without a fresh blocker the old no-targets choice still stands.
+expect("no fresh blocker keeps the no-targets choice", () => {
+  const a = deriveMainAction({ inFlight: false, runner: undefined, taskPresent: false, noTargets: true, checked: false, attempt: attempt({ status: "failed", lastError: "BEGIN_PREP_FAILED: bad temp", lastStep: "no-targets" }) });
+  if (a.state !== "no-targets") throw new Error(`expected no-targets, got ${a.state}`);
+});
+
 if (failures > 0) {
   console.error(`${failures} scenario contract check(s) FAILED`);
   process.exit(1);

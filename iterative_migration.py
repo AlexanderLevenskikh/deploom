@@ -252,6 +252,13 @@ def _clamp_int(value: Any, default: int, low: int, high: int) -> int:
 RUN_FILENAME = "run.json"
 LEDGER_FILENAME = "ledger.json"
 CONFIG_FILENAME = "run-config.json"
+# P1#4: the standalone "Проверить проект" verdict. Written by begin --check-only
+# (a real prep AND control verification of the CURRENT dependencies) WITHOUT a
+# run: no run.json/snapshot/checkpoint are created, so the later "Начать
+# обновление" begin is a fresh run. The status handler exposes its `ok` so the
+# UI can offer a distinct "ready → start" state instead of a single button that
+# silently starts the migration.
+PROJECT_CHECK_FILENAME = "project-check.json"
 CHECKPOINT_DIR = "checkpoints"
 SOURCE_DIR = "sources"
 TRIAL_DIR = "trial"
@@ -729,6 +736,8 @@ def cmd_begin(args: argparse.Namespace) -> int:
     owner = args.owner or f"pid-{os.getpid()}"
     if (run_dir / RUN_FILENAME).exists():
         raise InvalidInputError(f"RUN_ALREADY_EXISTS: {run_dir}")
+    if getattr(args, "check_only", False):
+        return _cmd_begin_check_only(run_dir, args, owner)
 
     config = build_run_config(run_dir, args)
 
@@ -740,7 +749,106 @@ def cmd_begin(args: argparse.Namespace) -> int:
         lock.release()
 
 
-def build_run_config(run_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
+# P1#4: a REAL standalone "Проверить проект". Runs the cheap readiness
+# preflight (shared with capture) AND the control verification of the CURRENT
+# dependencies — the same shared machinery begin's C0 uses — then records a
+# durable, non-run verdict (project-check.json). No registry discovery, no
+# run.json, no source snapshot, no checkpoint: the project is verified, NOT
+# migrated. A local blocker (`SOURCE_SUBMODULE_INCOMPLETE`, ...) or a failing
+# current-state control (`PROJECT_CONTROL_FAILED`) exits with the machine
+# envelope so the panel offers "Повторить проверку" after the user fixes it.
+def _cmd_begin_check_only(run_dir: Path, args: argparse.Namespace, owner: str) -> int:
+    # The preflight (inside build_run_config) runs BEFORE any lock / mkdir, so a
+    # blocked check leaves nothing behind (no run dir, no lock file).
+    config = build_run_config(run_dir, args, discover=False)
+    lock = _RunLock(run_dir, owner)
+    lock.acquire()
+    try:
+        return _begin_check_only_locked(run_dir, args, config)
+    finally:
+        lock.release()
+
+
+def _begin_check_only_locked(
+    run_dir: Path, args: argparse.Namespace, config: Optional[Mapping[str, Any]] = None,
+) -> int:
+    if config is None:
+        config = build_run_config(run_dir, args, discover=False)
+    project_dir = Path(config["projectDir"])
+    project_name = str(config["projectName"])
+    initial_assignment = direct_dependency_assignment(project_dir)
+    manifest_hash, lock_hash, _lock_path = manifest_and_lock_hashes(project_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    verify_config = verify_config_from(config["verifyConfig"], run_dir)
+    verify_config = dataclasses.replace(
+        verify_config, verification_purpose="baseline-control"
+    )
+    _emit_status(
+        {
+            "event": "begin.check",
+            "runId": "",
+            "project": project_name,
+            "managedDependencies": len(initial_assignment),
+        }
+    )
+    result = verify_assignment(
+        project_dir,
+        initial_assignment,
+        config=verify_config,
+        run_project_checks=True,
+        progress_label="iterative migration project check",
+        runtime_env=_runtime_env(config),
+    )
+    observed = dict(result.observed_resolved_versions or {})
+    failing_commands = [
+        {"command": failure.command, "exitCode": failure.exit_code}
+        for failure in result.project_failures
+    ]
+    # P1#4: this is a PRE-RUN gate, not a C0 checkpoint. The control blocks only
+    # on actual failures / a hard environment failure; a "passed" verify and an
+    # "unknown" verify with NO failures (e.g. a project with nothing installed to
+    # check yet) are both "проблем не найдено" — forcing a bootstrap-repair gate
+    # here would turn a fresh project into a fake blocker.
+    check_ok = result.ok or (not result.project_failures and not result.hard_failure)
+    project_check: Dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "projectDir": str(project_dir),
+        "projectName": project_name,
+        "checkedAt": _now_iso(),
+        "ok": check_ok,
+        "managedDependencies": len(initial_assignment),
+        "manifestHash": manifest_hash,
+        "control": {
+            "status": ("passed" if result.ok else ("failed" if result.hard_failure or result.project_failures else "unknown")),
+            "failingCommands": failing_commands,
+            "resolvedStateKey": result.resolved_state_key or "",
+            "observedResolvedHash": result.observed_resolved_hash or observed_resolved_hash(observed),
+        },
+    }
+    _write_json_atomic(run_dir / PROJECT_CHECK_FILENAME, project_check)
+    _emit_status(
+        {
+            "event": "begin.check-done",
+            "runId": "",
+            "ok": check_ok,
+            "managedDependencies": len(initial_assignment),
+        }
+    )
+    if not check_ok:
+        failing = "; ".join(
+            f"{failure.command} (exit {failure.exit_code})"
+            for failure in result.project_failures[:3]
+        ) or "проверки проекта не проходят"
+        raise ProjectUnreadyError(
+            "PROJECT_CONTROL_FAILED",
+            f"Контроль текущих зависимостей не пройден: {failing}. ",
+            command="",
+        )
+    return 0
+
+
+def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = True) -> Dict[str, Any]:
     project_dir = Path(args.project_dir).expanduser().resolve()
     if not (project_dir / "package.json").exists():
         raise InvalidInputError(f"PROJECT_PACKAGE_JSON_MISSING: {project_dir}")
@@ -811,7 +919,7 @@ def build_run_config(run_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
     # highest COMPATIBLE version instead of a silent deferral. A saved roadmap
     # still wins when provided.
     target_discovery: List[Dict[str, Any]] = []
-    if not targets:
+    if not targets and discover:
         # D3.1/postfix: the discovery probes must run UNDER the same selected
         # runtime that install/verify will use (the resolved node's directory
         # prepended to PATH), never the ambient PATH — otherwise npm metadata
@@ -4077,6 +4185,11 @@ def build_parser() -> argparse.ArgumentParser:
     begin.add_argument("--project-id", default="")
     begin.add_argument("--run-id", default="")
     begin.add_argument("--target-level", choices=("yellow", "green"), default="yellow")
+    begin.add_argument(
+        "--check-only",
+        action="store_true",
+        help="standalone 'Проверить проект': preflight + контроль текущих зависимостей, без run.json/discovery/снапшота",
+    )
     begin.add_argument("--targets-file", default="", help="JSON {package: exact version} policy targets")
     begin.add_argument("--verify-config", default="", help="BaselineVerifyConfig JSON file (commands, projectChecks, ...)")
     begin.add_argument("--tool-build-id", default="")

@@ -1,4 +1,4 @@
-import { AlertCircle, AlertTriangle, Check, ChevronDown, Circle, CircleHelp, ExternalLink, FileText, LoaderCircle, Pause, Play, RotateCcw, Send, ShieldCheck } from 'lucide-react'
+import { AlertCircle, AlertTriangle, Check, ChevronDown, Circle, CircleHelp, ExternalLink, FileText, LoaderCircle, Pause, Play, RotateCcw, Send, ShieldCheck, X } from 'lucide-react'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ACTION_ORDER, FLOW_STAGES } from '../data/flow'
@@ -11,6 +11,7 @@ import { LogPanel } from './LogPanel'
 import { PromptPreviewDialog } from './PromptPreviewDialog'
 import { IterativeTaskPanel } from './IterativeTaskPanel'
 import { normalizeBaselineIntentPlan } from '../data/baselineIntent'
+import type { ScenarioSignal } from '../../electron/iterative-scenario'
 import type { DraftProgressPayload } from '../hooks/useDependencyFlow'
 import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, DraftResultSnapshot, EnvironmentInfo, FlowAction, IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobOutput, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
 
@@ -56,7 +57,7 @@ type Props = {
   onSaveIterativeTask: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onIterativeStatus: (projectName: string) => Promise<IterativeStatusOutcome>
   onIterativeDrive: (projectName: string) => Promise<IterativeDriveOutcome>
-  onIterativeBegin: (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }) => Promise<IterativeBeginOutcome>
+  onIterativeBegin: (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; checkOnly?: boolean }) => Promise<IterativeBeginOutcome>
   onIterativeAgent: (projectName: string) => Promise<IterativeAgentOutcome>
   onIterativeAttempt: (projectName: string) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
   onIterativeCancel: (projectName: string) => Promise<{ ok: boolean }>
@@ -178,6 +179,11 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   const activeIndex = currentIndex < 0 ? FLOW_STAGES.length - 1 : currentIndex
   const displayedIndex = selectedStageIndex ?? activeIndex
   const active = Boolean(activeAction)
+  // P1#1: the deterministic iterative scenario owns the ONE main action. The
+  // panel mirrors it here; while a signal is present, the hero never renders
+  // its own competing legacy FLOW primary.
+  const [scenarioSignal, setScenarioSignal] = useState<ScenarioSignal | undefined>(undefined)
+  const scenarioOnScenario = setScenarioSignal
   const displayedAction = FLOW_STAGES[displayedIndex].action
   const releaseBlocked = displayedAction === 'release' && !acceptanceAccepted
   const acceptanceTone = acceptanceAccepted ? 'success' : acceptanceNeedsRemediation ? 'danger' : 'muted'
@@ -497,7 +503,16 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         {typeof humanRemainingUpdates === 'number' && humanRemainingUpdates > 0 ? <p className="human-flow-remaining">{text(`Осталось разобрать: ${humanRemainingUpdates}. Они не обнуляют уже проверенный результат.`, `Remaining to address: ${humanRemainingUpdates}. They do not invalidate the already verified result.`)}</p> : null}
         {draftLaunchActive ? <DraftLiveProgress startedAt={activeRunStartedAt} progress={activeDraftProgress} runId={activeRunId} /> : null}
         <div className="human-flow-actions">
-          {!flowComplete && !active && humanPrimaryStage.action ? <button className="button primary" disabled={humanPrimaryStage.action === 'release' && !acceptanceAccepted} onClick={() => baselineRestartRequired && humanPrimaryStage.action === 'baseline' ? restartBaseline(activeIndex) : void execute(activeIndex, undefined, undefined, humanPrimaryStage.action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}><Play size={16} />{baselineRestartRequired && humanPrimaryStage.action === 'baseline' ? text('Начать новый поиск', 'Start a new search') : humanPrimaryStage.action === 'baseline' && details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Продолжить работу', 'Continue')}</button> : null}
+          {/* P1#1: ONE primary. When the iterative scenario panel is mounted it
+              owns the main action and mirrors it here (same state/label/enabled,
+              Stop stays clickable while running); the legacy FLOW "Продолжить
+              работу" only appears when NO panel scenario exists. */}
+          {!flowComplete && !active && scenarioSignal ? (
+            <button className="button primary" data-testid="hero-scenario-primary" disabled={!scenarioSignal.enabled} onClick={() => scenarioSignal.act()}>
+              {scenarioSignal.running ? <X size={16} /> : <Play size={16} />}
+              {scenarioSignal.label}
+            </button>
+          ) : !flowComplete && !active && humanPrimaryStage.action ? <button className="button primary" disabled={humanPrimaryStage.action === 'release' && !acceptanceAccepted} onClick={() => baselineRestartRequired && humanPrimaryStage.action === 'baseline' ? restartBaseline(activeIndex) : void execute(activeIndex, undefined, undefined, humanPrimaryStage.action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}><Play size={16} />{baselineRestartRequired && humanPrimaryStage.action === 'baseline' ? text('Начать новый поиск', 'Start a new search') : humanPrimaryStage.action === 'baseline' && details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Продолжить работу', 'Continue')}</button> : null}
           {!flowComplete && !active && humanPrimaryStage.action === 'baseline' && (details.baselineRecovery?.available || run?.lastAction === 'baseline') ? <button className="button secondary" onClick={() => restartBaseline(activeIndex)}><RotateCcw size={16} />{text('Начать заново', 'Start over')}</button> : null}
           {/* L3: Draft/scope stays reachable right after project selection — on
               Preflight and after a failed C0 — not only when the FLOW stage is
@@ -754,6 +769,10 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         liveAttempt={liveIterativeAttempt}
         onConfigureScope={() => void openBaselineIntentDialog('prepare', 'auto')}
         onOpenPath={onOpenPath}
+        // P1#1: the panel mirrors the one main action to the hero and must not
+        // allow a start while a legacy activeAction owns the checkout.
+        onScenario={scenarioOnScenario}
+        disabledExternal={active}
       />
     </section>
   )

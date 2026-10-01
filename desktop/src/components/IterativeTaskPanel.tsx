@@ -2,7 +2,7 @@ import { Check, ChevronDown, ChevronUp, Clipboard, ExternalLink, FileText, Refre
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useLanguage } from '../i18n'
-import { deriveMainAction, parseIterativeFailure, type ScenarioMainActionState } from '../../electron/iterative-scenario'
+import { deriveMainAction, parseIterativeFailure, type ScenarioMainActionState, type ScenarioSignal } from '../../electron/iterative-scenario'
 import type { IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
 
 type Props = {
@@ -17,13 +17,20 @@ type Props = {
   onSave: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
   onDrive: (projectName: string) => Promise<IterativeDriveOutcome>
-  onBegin: (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }) => Promise<IterativeBeginOutcome>
+  onBegin: (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; checkOnly?: boolean }) => Promise<IterativeBeginOutcome>
   onAgent: (projectName: string) => Promise<IterativeAgentOutcome>
   onAttempt: (projectName: string) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
   onCancel: (projectName: string) => Promise<{ ok: boolean }>
   liveAttempt?: IterativeAttemptView
   onConfigureScope?: () => void
   onOpenPath: (path?: string) => Promise<void>
+  // P1#1: the panel is the single scenario owner; it mirrors the ONE main action
+  // to the enclosing workspace hero so the legacy FLOW button and the panel stop
+  // being two competing launchers.
+  onScenario?: (signal: ScenarioSignal | undefined) => void
+  // P1#1: an external (legacy) job is running for the same checkout — the single
+  // control must not let the user start a second, conflicting scenario.
+  disabledExternal?: boolean
 }
 
 type PanelState =
@@ -44,12 +51,15 @@ const MAIN_LABEL: Record<ScenarioMainActionState, [string, string]> = {
   check: ['Проверить проект', 'Check project'],
   'retry-check': ['Повторить проверку', 'Re-check'],
   'no-targets': ['Подобрать обновления автоматически', 'Find updates automatically'],
+  ready: ['Начать обновление', 'Start the update'],
   'start-run': ['Начать обновление', 'Start the update'],
   'continue-run': ['Продолжить обновление', 'Continue the update'],
   running: ['Остановить', 'Stop'],
   'recovered-running': ['Продолжить обновление', 'Continue the update'],
   agent: ['Исправить агентом', 'Repair with an agent'],
   result: ['Посмотреть результат', 'View the result'],
+  partial: ['Посмотреть результат', 'View the result'],
+  'budget-stop': ['Посмотреть результат', 'View the result'],
 }
 
 /** User-facing explanation under the main button (no internal step names). */
@@ -57,12 +67,15 @@ const MAIN_DESCRIPTION: Record<ScenarioMainActionState, [string, string]> = {
   check: ['Проверка зафиксирует текущее состояние проекта и найдёт доступные обновления.', 'The check records the current project state and finds available updates.'],
   'retry-check': ['Исправьте причину и повторите проверку — состояние не требует ручной чистки.', 'Fix the cause and re-check — no state files need manual cleanup.'],
   'no-targets': ['Выберите, как найти обновления: подобрать автоматически или настроить состав и политику.', 'Choose how to find updates: automatically, or by configuring scope and policy.'],
+  ready: ['Проверка пройдена — обновление ещё не запускалось. Начните, когда будете готовы.', 'The check passed — the migration has not started yet. Start when ready.'],
   'start-run': ['Проект проверен. Начните обновление — применим и проверим изменения по группам.', 'The project is verified. Start the update — changes will be applied and verified in groups.'],
   'continue-run': ['Работа приостановлена. Продолжите — применим и проверим следующую группу.', 'The update is paused. Continue — the next group will be applied and verified.'],
   running: ['Идёт работа. Остановить можно в любой момент; проверенный результат сохраняется.', 'Work is running. You can stop at any time; the verified result is kept.'],
   'recovered-running': ['Работа была прервана перезапуском; процесс не запущен. Продолжите, чтобы возобновить её.', 'Work was interrupted by a restart; no process is running. Continue to resume it.'],
   agent: ['Нужны исправления в изолированном окружении. Запустите агента.', 'Repairs are needed in an isolated environment. Run the agent.'],
   result: ['Обновления проверены. Откройте результат и задание.', 'The updates are verified. Open the result and the assignment.'],
+  partial: ['Часть обновлений применена и проверена, но не все цели выполнены. Откройте результат.', 'Some updates were applied and verified, but not all goals were reached. Open the result.'],
+  'budget-stop': ['Работа остановилась по бюджету; проверенное сохранено, часть целей не выполнена. Откройте результат.', 'Stopped by the budget; the verified work is kept, some goals were not reached. Open the result.'],
 }
 
 /** User-facing activity phrase for a live attempt. */
@@ -80,7 +93,7 @@ const activityText = (attempt?: IterativeAttemptView, text?: (ru: string, en: st
   return t('Работа выполняется', 'Work is in progress')
 }
 
-export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVersion, onGet, onExport, onCopy, onSave, onStatus, onDrive, onBegin, onExportLegacy, onAgent, onAttempt, onCancel, liveAttempt, onConfigureScope, onOpenPath }: Props) {
+export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVersion, onGet, onExport, onCopy, onSave, onStatus, onDrive, onBegin, onExportLegacy, onAgent, onAttempt, onCancel, liveAttempt, onConfigureScope, onOpenPath, onScenario, disabledExternal }: Props) {
   const { text, language } = useLanguage()
   const [state, setState] = useState<PanelState>({ phase: 'loading' })
   const [busy, setBusy] = useState<string>()
@@ -291,13 +304,24 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     }
   }
 
-  const beginNow = async (discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }) => {
+  const beginNow = async (discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; checkOnly?: boolean }) => {
     setStepBusy(true)
     setNote(undefined)
+    // P2#5: a fresh attempt supersedes the previous "no targets" explanation.
+    setNoTargetsStep(false)
     try {
       const outcome = await onBegin(projectName, discovery)
       if (outcome.ok) {
-        if (outcome.noTargets) {
+        if (outcome.checked) {
+          // P1#4: standalone "Проверить проект" — nothing was started. Show the
+          // durable verdict and let the user explicitly pick "Начать обновление".
+          setNoTargetsStep(false)
+          setNote(
+            outcome.checked.ok
+              ? text('Проект проверен — можно начать обновление.', 'The project is checked — you can start the update.')
+              : text('Проверка выявила проблемы; обновление не запускалось. Откройте результат проверки.', 'The check found issues; nothing was started. Open the check verdict.'),
+          )
+        } else if (outcome.noTargets) {
           setNoTargetsStep(true)
           setNote(
             text(
@@ -306,7 +330,6 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
             ),
           )
         } else {
-          setNoTargetsStep(false)
           const report = outcome.discovery
           const unsettled = Boolean(report && report.discovered.length === 0 && (report.unavailable.length > 0 || report.budgetSkipped.length > 0))
           if (unsettled) {
@@ -427,6 +450,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     runner,
     taskPresent: Boolean(task),
     noTargets: noTargetsStep,
+    checked: runner?.checked?.ok === true,
   })
   const retryIsDiscoverySearch = blocker?.code === 'DISCOVERY_UNSETTLED'
   const mainLabel = mainAction.state === 'retry-check' && retryIsDiscoverySearch
@@ -476,10 +500,19 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     switch (mainAction.state) {
       case 'check':
       case 'retry-check':
-        void beginNow(retryIsDiscoverySearch ? { mode: 'auto' } : { mode: 'none' })
+        // P1#4: "Проверить проект" / "Повторить проверку" run the REAL separate
+        // check (`--check-only`): preflight + current-dependencies control, no
+        // run, no discovery. Discovery is only (re)attempted for the specific
+        // DISCOVERY_UNSETTLED blocker that it can actually clear.
+        void beginNow(retryIsDiscoverySearch ? { mode: 'auto' } : { mode: 'none', checkOnly: true })
         break
       case 'no-targets':
         void beginNow({ mode: 'auto' })
+        break
+      case 'ready':
+        // P1#4: the check passed; starting the migration is a separate, explicit
+        // action that creates the durable run.
+        void beginNow({ mode: 'none' })
         break
       case 'start-run':
       case 'continue-run':
@@ -493,13 +526,36 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         void agentNow()
         break
       case 'result':
+      case 'partial':
+      case 'budget-stop':
+        // P1#3: an unfinished result opens the SAME honest surface — the result
+        // dialog + diagnostics — without claiming it was fully verified.
         if (task) setShowDialog(true)
         else void run('export', () => onExport(projectName))
         break
     }
   }
 
-  const busyLocked = stepBusy || busy !== undefined
+  const busyLocked = stepBusy || busy !== undefined || disabledExternal === true
+
+  // P1#1: the panel is the SINGLE owner of the scenario main action. Mirror it
+  // outward so the enclosing workspace hero renders exactly the same control
+  // (label/state/enabled) instead of running its own legacy FLOW action. When
+  // the panel unmounts we emit nothing, so the hero must not keep a stale
+  // control for a panel that no longer exists.
+  const runMainActionRef = useRef<() => void>(runMainAction)
+  runMainActionRef.current = runMainAction
+  useEffect(() => {
+    if (!onScenario) return
+    onScenario({
+      state: mainAction.state,
+      label: mainLabel,
+      description: mainDescription,
+      running: mainAction.state === 'running',
+      enabled: mainAction.state === 'running' ? true : !busyLocked,
+      act: () => runMainActionRef.current(),
+    })
+  }, [onScenario, mainAction.state, mainLabel, mainDescription, busyLocked])
 
   return (
     <section className="roadmap-card" data-testid="iterative-task-panel">
@@ -613,10 +669,12 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
                 type="button"
                 className="button primary"
                 data-testid="iterative-main-action"
-                disabled={busyLocked}
+                // P1#2: Stop must stay AVAILABLE while work is running — the
+                // busy lock disables everything EXCEPT the in-flight Stop.
+                disabled={mainAction.state === 'running' ? false : busyLocked}
                 onClick={() => void runMainAction()}
               >
-                {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' ? <Wrench size={16} /> : mainAction.state === 'result' ? <FileText size={16} /> : <Rocket size={16} />}
+                {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' ? <Wrench size={16} /> : mainAction.state === 'result' || mainAction.state === 'partial' || mainAction.state === 'budget-stop' ? <FileText size={16} /> : <Rocket size={16} />}
                 {mainLabel}
               </button>
               {mainAction.state === 'no-targets' ? (
