@@ -736,11 +736,33 @@ def cmd_begin(args: argparse.Namespace) -> int:
     owner = args.owner or f"pid-{os.getpid()}"
     if (run_dir / RUN_FILENAME).exists():
         raise InvalidInputError(f"RUN_ALREADY_EXISTS: {run_dir}")
+    if getattr(args, "repair_only", False):
+        return _cmd_begin_repair(run_dir, args, owner)
     if getattr(args, "check_only", False):
         return _cmd_begin_check_only(run_dir, args, owner)
 
     config = build_run_config(run_dir, args)
 
+    lock = _RunLock(run_dir, owner)
+    lock.acquire()
+    try:
+        return _begin_locked(run_dir, config, args)
+    finally:
+        lock.release()
+
+
+def _cmd_begin_repair(run_dir: Path, args: argparse.Namespace, owner: str) -> int:
+    # P2 (#1): the repair launch is INDEPENDENT of the update roadmap. It fixes
+    # the CURRENT state: `discover=False` keeps targets empty and skips registry
+    # discovery, so missing roadmap targets can never block a red project from
+    # reaching the isolated repair. `_begin_locked` then captures C0 and runs the
+    # current-state control:
+    #   - a RED verdict opens the durable BOOTSTRAP_REPAIR run + bootstrap repair
+    #     request (isolated checkout -> agent -> authoritative re-verification);
+    #   - a GREEN verdict opens a READY run that the coordinator finishes as
+    #     REPAIR_VERIFIED (control passed, no migration targets in this run).
+    config = build_run_config(run_dir, args, discover=False)
+    config = {**config, "repairOnly": True}
     lock = _RunLock(run_dir, owner)
     lock.acquire()
     try:
@@ -3663,6 +3685,10 @@ def _finish_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str, A
     reports_dir = run_dir / REPORTS_DIR
     reports_dir.mkdir(parents=True, exist_ok=True)
     existing_outcome = run.get("terminalOutcome")
+    # P2 (#1): a repair-only run carries NO migration targets. Its terminal is not
+    # a partial migration when the current-state control passes — the repair goal
+    # (project passes its own checks) is what got satisfied.
+    repair_only = bool(config.get("repairOnly")) and not (config.get("targets") or {})
 
     # R8: finish is an IDEMPOTENT terminal transition. The durable outcome is
     # computed once from the audit evidence + acceptance chain; every later call
@@ -3691,6 +3717,13 @@ def _finish_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str, A
         satisfied = _policy_satisfied(config, checkpoint)
         accepted_count = sum(1 for c in checkpoints if c.get("status") == "VERIFIED")
         outcome = _terminal_outcome(satisfied, audit_status, accepted_count)
+        # P2 (#1): a repair-only run whose CURRENT-state control passes the audit
+        # is a repair SUCCESS — never a partial migration ("0 verified UPGRADES"
+        # must not read as "часть обновлений применена"). The audit gates it
+        # exactly like a real migration: UNKNOWN evidence stays BLOCKED_BASELINE.
+        if repair_only and audit_status == "PASS" and str(checkpoint.get("status")) == "VERIFIED":
+            outcome = "REPAIR_VERIFIED"
+            satisfied = True
         run = dict(run)
         run["terminal"] = outcome
         run["terminalOutcome"] = {
@@ -4214,6 +4247,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--check-only",
         action="store_true",
         help="standalone 'Проверить проект': preflight + контроль текущих зависимостей, без run.json/discovery/снапшота",
+    )
+    begin.add_argument(
+        "--repair-only",
+        action="store_true",
+        help="repair текущего состояния: контроль текущих версий БЕЗ целей и discovery (обход roadmap); красный C0 → BOOTSTRAP_REPAIR, зелёный → READY/REPAIR_VERIFIED",
     )
     begin.add_argument("--targets-file", default="", help="JSON {package: exact version} policy targets")
     begin.add_argument("--verify-config", default="", help="BaselineVerifyConfig JSON file (commands, projectChecks, ...)")

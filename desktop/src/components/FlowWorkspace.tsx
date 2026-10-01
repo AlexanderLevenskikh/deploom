@@ -1,4 +1,4 @@
-import { AlertCircle, AlertTriangle, Check, ChevronDown, Circle, CircleHelp, ExternalLink, FileText, LoaderCircle, Pause, Play, RotateCcw, Send, ShieldCheck, X } from 'lucide-react'
+import { AlertCircle, AlertTriangle, Check, ChevronDown, Circle, CircleHelp, ExternalLink, FileText, LoaderCircle, Pause, Play, RotateCcw, Send, ShieldCheck } from 'lucide-react'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ACTION_ORDER, FLOW_STAGES } from '../data/flow'
@@ -489,6 +489,20 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
           </span>
           <div><h2>{humanStatusTitle}</h2><p>{humanStatusBody}</p></div>
         </div>
+        {/* User UX: with the iterative panel active, the hero is a COMPACT status
+            header — the panel owns the pipeline, the metrics and the ONE main
+            action. This slim utility row keeps the functional fallbacks always
+            on screen (Draft creation first-class, history, artifacts, deferred
+            improvements) without duplicating the primary action or the metrics. */}
+        {scenarioSignal ? (
+          <div className="human-flow-utility">
+            <button className="button secondary" disabled={active} onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button>
+            {draftResult ? <button className="button secondary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Последний Draft / История', 'Last Draft / History')}</button> : null}
+            <button className="button secondary" disabled={!run && !activeAction} onClick={() => void onOpenPath(artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
+            {flowComplete && acceptanceAccepted ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} />{text('Продолжить улучшение', 'Continue improving')}</button> : null}
+          </div>
+        ) : (
+          <>
         <div className="human-flow-metrics">
           <div><span>{text('Проверено', 'Verified')}</span><strong>{humanVerifiedUpdates}</strong><small>{text('обновлений', 'updates')}</small></div>
           <div><span>{text('Сейчас пробуем', 'Trying now')}</span><strong>{typeof humanActiveUpdates === 'number' ? humanActiveUpdates : activeAction === 'baseline' ? '…' : '—'}</strong><small>{activeAction === 'baseline' && humanActiveUpdates === undefined ? text('идёт проверка', 'verification running') : text('обновлений', 'updates')}</small></div>
@@ -503,16 +517,12 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         {typeof humanRemainingUpdates === 'number' && humanRemainingUpdates > 0 ? <p className="human-flow-remaining">{text(`Осталось разобрать: ${humanRemainingUpdates}. Они не обнуляют уже проверенный результат.`, `Remaining to address: ${humanRemainingUpdates}. They do not invalidate the already verified result.`)}</p> : null}
         {draftLaunchActive ? <DraftLiveProgress startedAt={activeRunStartedAt} progress={activeDraftProgress} runId={activeRunId} /> : null}
         <div className="human-flow-actions">
-          {/* P1#1: ONE primary. When the iterative scenario panel is mounted it
-              owns the main action and mirrors it here (same state/label/enabled,
-              Stop stays clickable while running); the legacy FLOW "Продолжить
-              работу" only appears when NO panel scenario exists. */}
-          {!flowComplete && !active && scenarioSignal ? (
-            <button className="button primary" data-testid="hero-scenario-primary" disabled={!scenarioSignal.enabled} onClick={() => scenarioSignal.act()}>
-              {scenarioSignal.running ? <X size={16} /> : <Play size={16} />}
-              {scenarioSignal.label}
-            </button>
-          ) : !flowComplete && !active && humanPrimaryStage.action ? <button className="button primary" disabled={humanPrimaryStage.action === 'release' && !acceptanceAccepted} onClick={() => baselineRestartRequired && humanPrimaryStage.action === 'baseline' ? restartBaseline(activeIndex) : void execute(activeIndex, undefined, undefined, humanPrimaryStage.action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}><Play size={16} />{baselineRestartRequired && humanPrimaryStage.action === 'baseline' ? text('Начать новый поиск', 'Start a new search') : humanPrimaryStage.action === 'baseline' && details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Продолжить работу', 'Continue')}</button> : null}
+          {/* P1#1 / User UX: when the iterative panel is active the compact hero
+              (above) is just a status header with the fallback utility row; the
+              panel owns the ONE main action. This legacy action row only runs on
+              the no-panel path (scenarioSignal absent), where the legacy FLOW
+              primary applies. */}
+          {!flowComplete && !active && humanPrimaryStage.action ? <button className="button primary" disabled={humanPrimaryStage.action === 'release' && !acceptanceAccepted} onClick={() => baselineRestartRequired && humanPrimaryStage.action === 'baseline' ? restartBaseline(activeIndex) : void execute(activeIndex, undefined, undefined, humanPrimaryStage.action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}><Play size={16} />{baselineRestartRequired && humanPrimaryStage.action === 'baseline' ? text('Начать новый поиск', 'Start a new search') : humanPrimaryStage.action === 'baseline' && details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Продолжить работу', 'Continue')}</button> : null}
           {!flowComplete && !active && humanPrimaryStage.action === 'baseline' && (details.baselineRecovery?.available || run?.lastAction === 'baseline') ? <button className="button secondary" onClick={() => restartBaseline(activeIndex)}><RotateCcw size={16} />{text('Начать заново', 'Start over')}</button> : null}
           {/* L3: Draft/scope stays reachable right after project selection — on
               Preflight and after a failed C0 — not only when the FLOW stage is
@@ -610,6 +620,8 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
             {draftResultFresh ? <button className="button secondary" onClick={acknowledgeDraftResult}>{text('Принято', 'Acknowledge')}</button> : null}
           </div>
         </div> : null}
+          </>
+        )}
       </section>
 
       <details className="flow-technical-details">

@@ -50,6 +50,16 @@ if (freshResume.attemptId === first.attemptId || freshResume.projectName !== "Ne
   throw new Error("resumeAttempt without a journal must start a NEW attempt");
 }
 
+// 3b. P2 (#2): the attempt record is WORKSPACE-scoped — workspaceId survives
+// start and resume so the live stream can partition same-named projects.
+const wsDir = join(root, "run-ws");
+const wsAttempt = startAttempt(wsDir, "DemoApp", "roadmap", undefined, 0, "ws-7");
+if (wsAttempt.workspaceId !== "ws-7") throw new Error("startAttempt must persist workspaceId");
+const wsResumed = resumeAttempt(wsDir, "DemoApp", "ws-7");
+if (wsResumed.workspaceId !== "ws-7" || wsResumed.attemptId !== wsAttempt.attemptId) {
+  throw new Error("resumeAttempt must keep the workspace-scoped record");
+}
+
 // 4. Cooperative cancel: requestCancel is durable and visible; clearCancelRequest
 // removes it; neither ever touches the run/checkpoint state.
 requestCancel(runA);

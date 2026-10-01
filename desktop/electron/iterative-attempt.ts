@@ -26,6 +26,11 @@ export type IterativeDiscoveryBudget = {
 export type IterativeAttemptRecord = {
   attemptId: string
   projectName: string
+  // P2 (#2): the attempt is scoped to the WORKSPACE, not just the project name —
+  // the durable run dir is already per (workspace.path, project); carrying the
+  // workspace id end-to-end stops the live event stream and the UI from
+  // cross-writing two workspaces that contain the same project name.
+  workspaceId?: string
   status: IterativeAttemptStatus
   stage: 'preflight' | 'begin' | 'drive' | 'agent' | 'none'
   phase?: string
@@ -94,6 +99,7 @@ export function startAttempt(
   targetSource: IterativeTargetSource,
   discovery?: IterativeDiscoveryBudget,
   targetsCount?: number,
+  workspaceId?: string,
 ): IterativeAttemptRecord {
   const now = Date.now()
   // A NEW attempt means a fresh diagnostic log: a previous child's output must
@@ -102,6 +108,7 @@ export function startAttempt(
   return writeAttempt(runDir, {
     attemptId: randomUUID(),
     projectName,
+    workspaceId,
     status: 'starting',
     stage: 'preflight',
     startedAt: now,
@@ -117,9 +124,9 @@ export function startAttempt(
 
 /** Rebuild the journal after a Desktop restart: keep the ORIGINAL attemptId
  * (the source of truth for the run) and just flip status back to running. */
-export function resumeAttempt(runDir: string, projectName: string): IterativeAttemptRecord | undefined {
+export function resumeAttempt(runDir: string, projectName: string, workspaceId?: string): IterativeAttemptRecord | undefined {
   const current = readAttempt(runDir)
-  if (!current) return startAttempt(runDir, projectName, 'none')
+  if (!current) return startAttempt(runDir, projectName, 'none', undefined, 0, workspaceId)
   return updateAttempt(runDir, { status: 'running', stage: 'drive', lastError: undefined, cancelRequested: false })
 }
 

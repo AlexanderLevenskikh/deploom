@@ -88,6 +88,9 @@ export type ScenarioMainActionState =
   | "result" // результат ПОЛНОСТЬЮ проверен и принят → Посмотреть результат
   | "partial" // P1#3: завершено, но не все цели выполнены → Посмотреть результат (честно)
   | "budget-stop" // P1#3: остановлено бюджетом → Посмотреть результат (честно)
+  | "repair-done" // P2 (#1): ремонт текущего состояния завершён и подтверждён → Начать обновление
+  | "blocked" // P2 (#3): терминал-блокер без подтверждающего результата → Посмотреть результат (честно)
+  | "no-upgrade" // P2 (#3): проверенных обновлений не найдено — НЕ «частичное обновление» → Посмотреть результат
 
 export type ScenarioMainAction = {
   state: ScenarioMainActionState
@@ -229,6 +232,35 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
     return { state: "result", blocker, firstRun: false, reasonShort: "Обновления проверены — откройте результат." }
   }
   if (decisionStep === "finish" || runner?.phase === "TERMINAL") {
+    // P2 (#3): the terminal reason is the durable DURABLE verdict keyword from
+    // the authoritative layer (COMPLETE / REPAIR_VERIFIED / BLOCKED_BASELINE /
+    // PARTIAL_VERIFIED / NO_VERIFIED_UPGRADE / NO_ACTIONABLE / SCOPE_EXHAUSTED).
+    // Each gets its own HONEST state — a repair success is NOT a partial
+    // migration, and "no verified upgrade" is NOT "часть обновлений применена".
+    if (decisionReason === "REPAIR_VERIFIED") {
+      return {
+        state: "repair-done",
+        blocker,
+        firstRun: false,
+        reasonShort: "Ремонт завершён: текущее состояние подтверждено. Начните обновление.",
+      }
+    }
+    if (decisionReason === "BLOCKED_BASELINE") {
+      return {
+        state: "blocked",
+        blocker,
+        firstRun: false,
+        reasonShort: "Обновление заблокировано — авторитетная проверка не подтвердила результат.",
+      }
+    }
+    if (decisionReason === "NO_VERIFIED_UPGRADE" || decisionReason === "NO_ACTIONABLE" || decisionReason === "SCOPE_EXHAUSTED") {
+      return {
+        state: "no-upgrade",
+        blocker,
+        firstRun: false,
+        reasonShort: "Проверенных обновлений не найдено — обновление не выполнено (это не частичный результат).",
+      }
+    }
     if (/budget|исчерпан бюджет|бюджет/i.test(decisionReason)) {
       return {
         state: "budget-stop",
@@ -264,4 +296,55 @@ export function activityReason(attempt: ScenarioAttemptShape): string {
   }
   if (stage === "preflight") return "Предварительная проверка проекта"
   return "Работа выполняется"
+}
+
+// User UX (one-card pipeline): the migration is a LINEAR flow the user should be
+// able to read at a glance — Проверка → Подбор версий → Обновление → Результат.
+// `scenarioPipeline(state, checked)` maps the single scenario action to which
+// stage is CURRENT and which stages are already DONE, so the interface always
+// shows progress and never a dead end. PURE — the panel renders it, the check
+// script pins it.
+export type PipelineStage = "check" | "plan" | "upgrade" | "result"
+
+export const PIPELINE_STAGES: ReadonlyArray<{ stage: PipelineStage; ru: string; en: string }> = [
+  { stage: "check", ru: "Проверка", en: "Check" },
+  { stage: "plan", ru: "Подбор версий", en: "Plan" },
+  { stage: "upgrade", ru: "Обновление", en: "Update" },
+  { stage: "result", ru: "Результат", en: "Result" },
+]
+
+export function scenarioPipeline(state: ScenarioMainActionState, checked: boolean): { current: PipelineStage; completed: PipelineStage[] } {
+  switch (state) {
+    case "result":
+      // a finished, independently-audited, policy-satisfied migration.
+      return { current: "result", completed: ["check", "plan", "upgrade"] }
+    case "partial":
+    case "budget-stop":
+      // verified work was applied, but the goal was not reached — the flow is
+      // at the result, honestly labelled partial.
+      return { current: "result", completed: ["check", "plan", "upgrade"] }
+    case "blocked":
+    case "no-upgrade":
+      // the flow ended WITHOUT a confirmed upgrade — result, honestly.
+      return { current: "result", completed: ["check", "plan"] }
+    case "repair-done":
+      // the CURRENT state was fixed and verified — the real update starts next.
+      return { current: "plan", completed: ["check"] }
+    case "ready":
+      // checked, migration not started yet — next is starting the update.
+      return { current: "plan", completed: ["check"] }
+    case "no-targets":
+      // choosing how to find versions; the check may or may not have run yet.
+      return { current: "plan", completed: checked ? ["check"] : [] }
+    case "start-run":
+    case "continue-run":
+    case "running":
+    case "recovered-running":
+    case "agent":
+      return { current: "upgrade", completed: ["check", "plan"] }
+    default:
+      // check / retry-check / repair-current / fresh — the project is being
+      // checked (repair is part of making that check pass).
+      return { current: "check", completed: [] }
+  }
 }

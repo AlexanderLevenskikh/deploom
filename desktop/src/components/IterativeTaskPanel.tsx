@@ -2,7 +2,7 @@ import { Check, ChevronDown, ChevronUp, Clipboard, ExternalLink, FileText, Refre
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useLanguage } from '../i18n'
-import { deriveMainAction, parseIterativeFailure, type ScenarioMainActionState, type ScenarioSignal } from '../../electron/iterative-scenario'
+import { deriveMainAction, parseIterativeFailure, scenarioPipeline, PIPELINE_STAGES, type ScenarioMainActionState, type ScenarioSignal } from '../../electron/iterative-scenario'
 import type { IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
 
 type Props = {
@@ -17,7 +17,7 @@ type Props = {
   onSave: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
   onDrive: (projectName: string) => Promise<IterativeDriveOutcome>
-  onBegin: (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; checkOnly?: boolean }) => Promise<IterativeBeginOutcome>
+  onBegin: (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; checkOnly?: boolean; repair?: boolean }) => Promise<IterativeBeginOutcome>
   onAgent: (projectName: string) => Promise<IterativeAgentOutcome>
   onAttempt: (projectName: string) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
   onCancel: (projectName: string) => Promise<{ ok: boolean }>
@@ -61,6 +61,12 @@ const MAIN_LABEL: Record<ScenarioMainActionState, [string, string]> = {
   result: ['Посмотреть результат', 'View the result'],
   partial: ['Посмотреть результат', 'View the result'],
   'budget-stop': ['Посмотреть результат', 'View the result'],
+  // P2 (#1): the repair of the CURRENT state is done and confirmed — the next
+  // explicit step is starting the real migration (a fresh run).
+  'repair-done': ['Начать обновление', 'Start the update'],
+  // P2 (#3): an honest terminal — the run ended WITHOUT a confirmed upgrade.
+  blocked: ['Посмотреть результат', 'View the result'],
+  'no-upgrade': ['Посмотреть результат', 'View the result'],
 }
 
 /** User-facing explanation under the main button (no internal step names). */
@@ -78,6 +84,13 @@ const MAIN_DESCRIPTION: Record<ScenarioMainActionState, [string, string]> = {
   result: ['Обновления проверены. Откройте результат и задание.', 'The updates are verified. Open the result and the assignment.'],
   partial: ['Часть обновлений применена и проверена, но не все цели выполнены. Откройте результат.', 'Some updates were applied and verified, but not all goals were reached. Open the result.'],
   'budget-stop': ['Работа остановилась по бюджету; проверенное сохранено, часть целей не выполнена. Откройте результат.', 'Stopped by the budget; the verified work is kept, some goals were not reached. Open the result.'],
+  // P2 (#1): the repaired current state is an honest precondition for the
+  // migration, not a partial upgrade — starting is a separate, explicit action.
+  'repair-done': ['Исходное состояние исправлено и подтверждено. Начните обновление.', 'The current state is fixed and confirmed. Start the update.'],
+  // P2 (#3): blocked / no-upgrade are NOT "часть обновлений применена" — the
+  // run ended without a confirmed upgrade.
+  blocked: ['Обновление заблокировано: подтверждающая проверка не пройдена. Откройте результат.', 'The update is blocked: no confirming check passed. Open the result.'],
+  'no-upgrade': ['Проверенных обновлений не найдено — обновление не выполнялось. Откройте результат.', 'No verified updates were found — the update did not run. Open the result.'],
 }
 
 /** User-facing activity phrase for a live attempt. */
@@ -209,9 +222,12 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   // attempt event must ALSO release the Electron in-flight lock on this side —
   // otherwise a remounted panel would show «Остановить» forever. The status
   // re-read refreshes runner.inFlight (and the decision) from Electron.
+  // P2 (#2): the stream is WORKSPACE-scoped — a same-named project of a
+  // different workspace must never leak into this panel.
   const liveAttemptStatus = useRef<string | undefined>(undefined)
   useEffect(() => {
     if (!liveAttempt || liveAttempt.projectName !== projectName) return
+    if (workspaceId !== undefined && liveAttempt.workspaceId !== undefined && liveAttempt.workspaceId !== workspaceId) return
     const previous = liveAttemptStatus.current
     liveAttemptStatus.current = liveAttempt.status
     setAttempt(liveAttempt)
@@ -219,7 +235,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     const nowTerminal = liveAttempt.status === 'done' || liveAttempt.status === 'failed' || liveAttempt.status === 'canceled'
     const leftLive = (previous === 'running' || previous === 'starting') && liveAttempt.status !== previous
     if (nowTerminal || leftLive) void refreshRunner()
-  }, [liveAttempt, projectName, refreshRunner])
+  }, [liveAttempt, projectName, workspaceId, refreshRunner])
 
   // Elapsed counter while an attempt is alive.
   const attemptAlive = Boolean(attempt && (attempt.status === 'starting' || attempt.status === 'running'))
@@ -322,7 +338,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     }
   }
 
-  const beginNow = async (discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; checkOnly?: boolean }) => {
+  const beginNow = async (discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; checkOnly?: boolean; repair?: boolean }) => {
     setStepBusy(true)
     setNote(undefined)
     // P2#5: a fresh attempt supersedes the previous "no targets" explanation.
@@ -332,12 +348,17 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       if (outcome.ok) {
         if (outcome.checked) {
           // P1#4: standalone "Проверить проект" — nothing was started. Show the
-          // durable verdict and let the user explicitly pick "Начать обновление".
+          // durable verdict and let the user explicitly pick the next step: a
+          // green verdict → "Начать обновление"; a failed control → the repair
+          // agent; an inconclusive result → repeat the check. The scenario
+          // reacts to the journal, this note just explains.
           setNoTargetsStep(false)
           setNote(
             outcome.checked.ok
               ? text('Проект проверен — можно начать обновление.', 'The project is checked — you can start the update.')
-              : text('Проверка выявила проблемы; обновление не запускалось. Откройте результат проверки.', 'The check found issues; nothing was started. Open the check verdict.'),
+              : outcome.checked.control?.status === 'failed'
+                ? text('Контроль текущих зависимостей не пройден; обновление не запускалось. Можно исправить проект агентом.', 'The current-dependencies control fails; nothing was started. The project can be repaired by an agent.')
+                : text('Проверка не дала определённого результата; обновление не запускалось. Повторите проверку.', 'The check was inconclusive; nothing was started. Re-run the check.'),
           )
         } else if (outcome.noTargets) {
           setNoTargetsStep(true)
@@ -500,7 +521,10 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   const decisionText = runner?.decision ? `${runner.decision.step ?? '—'} · ${runner.decision.reason}` : undefined
 
   const copyDiagnostics = () => {
-    const reason = attempt?.reason || attempt?.lastError || mainAction.reasonShort || '—'
+    // Prefer the raw technical detail (lastError) over the short UI reason so
+    // the copied diagnostic actually explains WHY (the short reason alone, e.g.
+    // "check failed", is useless for triage).
+    const reason = attempt?.lastError || attempt?.reason || mainAction.reasonShort || '—'
     const diagnostic =
       `DepLoom ${appVersion ?? '?'}\n` +
       `Проект: ${projectName}\n` +
@@ -536,10 +560,11 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         break
       case 'repair-current':
         // P2 (#2): a red current-state control reaches the repair agent through
-        // the durable BOOTSTRAP_REPAIR track. With no run yet we open one (the
-        // red C0 lands in BOOTSTRAP_REPAIR); with a red run we materialize the
-        // isolated trial up to the agent gate. Never a dead-end re-check.
-        if (!runner?.present) void beginNow({ mode: 'none' })
+        // the durable BOOTSTRAP_REPAIR track. With no run yet we open one via
+        // the repair-only begin (the red C0 lands in BOOTSTRAP_REPAIR); with a
+        // red run we materialize the isolated trial up to the agent gate. Never
+        // a dead-end re-check and never blocked by missing roadmap targets.
+        if (!runner?.present) void beginNow({ mode: 'none', repair: true })
         else void driveNow()
         break
       case 'no-targets':
@@ -548,6 +573,13 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       case 'ready':
         // P1#4: the check passed; starting the migration is a separate, explicit
         // action that creates the durable run.
+        void beginNow({ mode: 'none' })
+        break
+      case 'repair-done':
+        // P2 (#1): the repair of the current state is done and confirmed.
+        // Starting the real migration is a separate, explicit action — the begin
+        // handler archives the finished repair-only run (verdict preserved) and
+        // opens a fresh migration run.
         void beginNow({ mode: 'none' })
         break
       case 'start-run':
@@ -564,8 +596,11 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       case 'result':
       case 'partial':
       case 'budget-stop':
-        // P1#3: an unfinished result opens the SAME honest surface — the result
-        // dialog + diagnostics — without claiming it was fully verified.
+      case 'blocked':
+      case 'no-upgrade':
+        // P1#3 / P2 (#3): an unfinished OR blocked / no-upgrade result opens the
+        // SAME honest surface — the result dialog + diagnostics — without
+        // claiming it was fully verified.
         if (task) setShowDialog(true)
         else void run('export', () => onExport(projectName))
         break
@@ -607,6 +642,30 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         </div>
         <button type="button" className="icon-button" aria-label={text('Обновить', 'Reload')} onClick={() => { void load(); void refreshRunner() }} disabled={busy === 'load'}><RefreshCw size={16} /></button>
       </header>
+
+      {/* User UX: the one-card pipeline. The migration is a linear flow the user
+          reads at a glance — Проверка → Подбор версий → Обновление → Результат.
+          Which stage is DONE and which is CURRENT comes from the same pure
+          scenario mapping as the single main action, so the stepper and the
+          button can never disagree about where the project is. */}
+      {(() => {
+        const pipeline = scenarioPipeline(mainAction.state, runner?.checked?.ok === true)
+        return (
+          <div className="iterative-pipeline" data-testid="iterative-pipeline">
+            {PIPELINE_STAGES.map((stage, index) => {
+              const done = pipeline.completed.includes(stage.stage)
+              const active = stage.stage === pipeline.current
+              return (
+                <div key={stage.stage} className={`iterative-pipeline-step ${done ? 'done' : ''} ${active ? 'active' : ''}`}>
+                  {index > 0 ? <span className={`iterative-pipeline-connector ${done || active ? 'on' : ''}`} aria-hidden="true" /> : null}
+                  <span className="iterative-pipeline-dot" aria-hidden="true">{done ? <Check size={12} /> : index + 1}</span>
+                  <span className="iterative-pipeline-name">{language === 'ru' ? stage.ru : stage.en}</span>
+                </div>
+              )
+            })}
+          </div>
+        )
+      })()}
 
       {/* L1: durable attempt strip — visible from the very first click, after a
           restart, and during a long check/discovery/cohort. User-facing wording;
@@ -710,7 +769,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
                 disabled={mainAction.state === 'running' ? false : busyLocked}
                 onClick={() => void runMainAction()}
               >
-                {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' || mainAction.state === 'repair-current' ? <Wrench size={16} /> : mainAction.state === 'result' || mainAction.state === 'partial' || mainAction.state === 'budget-stop' ? <FileText size={16} /> : <Rocket size={16} />}
+                {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' || mainAction.state === 'repair-current' ? <Wrench size={16} /> : mainAction.state === 'result' || mainAction.state === 'partial' || mainAction.state === 'budget-stop' || mainAction.state === 'blocked' || mainAction.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}
                 {mainLabel}
               </button>
               {mainAction.state === 'no-targets' ? (
@@ -720,9 +779,6 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
               ) : null}
               {!busyLocked && !runner?.present && !noTargetsStep ? (
                 <>
-                  <button type="button" className="button secondary" onClick={() => onConfigureScope?.()}>
-                    <Wrench size={16} />{text('Настроить состав и политику / Draft', 'Configure scope & policy / Draft')}
-                  </button>
                   <button type="button" className="button secondary" onClick={() => void exportLegacyNow()}>
                     <FileText size={16} />{text('Импортировать сохранённый результат', 'Import a saved result')}
                   </button>

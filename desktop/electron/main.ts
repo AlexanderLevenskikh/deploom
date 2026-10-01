@@ -7379,18 +7379,120 @@ function setupIpc(): void {
   // successful check means "project is ready", so the UI can offer a distinct
   // "Начать обновление" instead of a single button that silently starts the
   // migration. A missing/unreadable artifact is simply "not checked yet".
-  function readProjectCheckArtifact(runDir: string): { ok: boolean; checkedAt?: string } | undefined {
+  // Python persists the full structured verdict (control.status/summary and the
+  // failing project commands) BEFORE exiting — even a non-zero exit leaves a
+  // real verdict here, so a failed/inconclusive check is NEVER a bare
+  // "check failed" without a cause.
+  function readProjectCheckArtifact(runDir: string): { ok: boolean; checkedAt?: string; control?: { status?: string; kind?: string; summary?: string; failingCommands?: { command: string; exitCode: number }[] } } | undefined {
     const checkPath = join(runDir, 'project-check.json')
     if (!existsSync(checkPath)) return undefined
     try {
-      const parsed = JSON.parse(readFileSync(checkPath, 'utf8')) as { ok?: unknown; checkedAt?: unknown }
+      const parsed = JSON.parse(readFileSync(checkPath, 'utf8')) as Record<string, any>
       if (parsed && typeof parsed === 'object') {
-        return { ok: parsed.ok === true, checkedAt: typeof parsed.checkedAt === 'string' ? parsed.checkedAt : undefined }
+        const control = parsed.control as Record<string, any> | undefined
+        return {
+          ok: parsed.ok === true,
+          checkedAt: typeof parsed.checkedAt === 'string' ? parsed.checkedAt : undefined,
+          control: control && typeof control === 'object'
+            ? {
+                status: typeof control.status === 'string' ? control.status : undefined,
+                kind: typeof control.kind === 'string' ? control.kind : undefined,
+                summary: typeof control.summary === 'string' ? control.summary : undefined,
+                failingCommands: Array.isArray(control.failingCommands)
+                  ? control.failingCommands
+                      .filter((item): item is { command: string; exitCode: number } => Boolean(item) && typeof item === 'object' && typeof (item as { command?: unknown }).command === 'string')
+                      .map((item) => ({ command: String((item as { command: string }).command), exitCode: Number((item as { exitCode?: unknown }).exitCode ?? 0) }))
+                  : undefined,
+              }
+            : undefined,
+        }
       }
     } catch {
       // not a valid check artifact — treat as "not checked"
     }
     return undefined
+  }
+
+  // P1#4 / user report: the check CLI prints ITERATIVE_MIGRATION_FAILURE_V1 on
+  // STDOUT — dependency noise on stderr must never hide it. Recover the machine
+  // envelope from a combined stream so the scenario can parse it (a red control
+  // must map to the repair agent, not a dead-end re-check).
+  function extractIterativeFailureEnvelope(text: string): string | undefined {
+    const marker = 'ITERATIVE_MIGRATION_FAILURE_V1 '
+    const at = text.indexOf(marker)
+    if (at < 0) return undefined
+    const chunk = text.slice(at + marker.length).split(/\r?\n/, 1)[0]
+    const open = chunk.indexOf('{')
+    const close = chunk.lastIndexOf('}')
+    if (open < 0 || close <= open) return undefined
+    try {
+      const parsed = JSON.parse(chunk.slice(open, close + 1)) as { code?: unknown }
+      if (parsed && typeof parsed.code === 'string') return marker + chunk.slice(open, close + 1)
+    } catch {
+      // not a valid envelope — fall through
+    }
+    return undefined
+  }
+
+  // P1#4 / user report: build the machine failure envelope from the DURABLE
+  // verdict so the scenario offers the RIGHT next step — a failed control is
+  // the red current state (repair agent), an inconclusive result is a retry.
+  function envelopeFromCheckVerdict(verdict: NonNullable<ReturnType<typeof readProjectCheckArtifact>>): string | undefined {
+    const status = verdict.control?.status
+    if (status !== 'failed' && status !== 'inconclusive') return undefined
+    if (status === 'failed') {
+      const failing = (verdict.control?.failingCommands ?? []).slice(0, 3).map((f) => `${f.command} (exit ${f.exitCode})`).join('; ')
+      return `ITERATIVE_MIGRATION_FAILURE_V1 ${JSON.stringify({ code: 'PROJECT_CONTROL_FAILED', summary: `Контроль текущих зависимостей не пройден${failing ? `: ${failing}` : ''}.`, command: '', fixable: true })}`
+    }
+    return `ITERATIVE_MIGRATION_FAILURE_V1 ${JSON.stringify({ code: 'PROJECT_CHECK_INCONCLUSIVE', summary: `Проверка не дала определённого результата (${verdict.control?.kind ?? 'unknown'}): ${verdict.control?.summary || 'результат неизвестен'}. Повторите проверку.`, command: '', fixable: true })}`
+  }
+
+  // P2 (#1): a repair-only run is auxiliary — it fixes the CURRENT state, it is
+  // NOT a migration (no targets). Once it reaches its terminal
+  // (control verified + audit PASS → REPAIR_VERIFIED) it must not block a real
+  // migration: this helper archives every durable artifact of the finished
+  // repair into <runDir>/repair-archive/<runId>-<ts>/ (evidence preserved) and
+  // frees the migration run slot. On top of the freed slot it writes a durable,
+  // honest "project ready" verdict so the panel can offer "Начать обновление".
+  // Returns true only when a TERMINAL REPAIR_VERIFIED run was archived; any
+  // other state (active run, error) is left untouched.
+  function archiveFinishedRepairRun(runDir: string): boolean {
+    const runPath = join(runDir, 'run.json')
+    if (!existsSync(runPath)) return false
+    try {
+      const run = JSON.parse(readFileSync(runPath, 'utf8')) as Record<string, any>
+      const terminalOutcome = (run.terminalOutcome ?? null) as Record<string, any> | null
+      const repairDone = run.phase === 'TERMINAL' && (terminalOutcome?.outcome === 'REPAIR_VERIFIED' || run.terminal === 'REPAIR_VERIFIED')
+      if (!repairDone) return false
+      const archiveRoot = join(runDir, 'repair-archive', `${String(run.runId ?? 'run')}-${Date.now()}`)
+      mkdirSync(archiveRoot, { recursive: true })
+      let projectName = ''
+      let projectDir = ''
+      try {
+        const config = JSON.parse(readFileSync(join(runDir, 'run-config.json'), 'utf8')) as Record<string, any>
+        projectName = String(config.projectName ?? '')
+        projectDir = String(config.projectDir ?? '')
+      } catch { /* verdict above already freed the slot; fields are best-effort */ }
+      const archiveMarker = join(runDir, 'repair-archive')
+      for (const entry of readdirSync(runDir, { withFileTypes: true })) {
+        const from = join(runDir, entry.name)
+        if (from === archiveMarker || entry.name === 'attempt.json' || entry.name === 'attempt.log') continue
+        renameSync(from, join(archiveRoot, entry.name))
+      }
+      writeFileSync(join(runDir, 'project-check.json'), JSON.stringify({
+        schemaVersion: 1,
+        projectDir,
+        projectName,
+        checkedAt: new Date().toISOString(),
+        ok: true,
+        managedDependencies: 0,
+        control: { status: 'passed', kind: 'repair', summary: 'Исходное состояние проекта исправлено и подтверждено (ремонт).' },
+      } as Record<string, unknown>, null, 2), 'utf8')
+      return true
+    } catch {
+      // Never destroy a run we cannot prove is a finished repair.
+      return false
+    }
   }
 
   // Iterative migration ТЗ (task) surface. The Desktop is a pure CONSUMER of
@@ -7538,6 +7640,11 @@ function setupIpc(): void {
   )
 
   const iterativeStepInFlight = new Set<string>()
+  // P2 (#2): the per-project in-flight lock is scoped to (workspace, project) —
+  // the SAME project name living in two workspaces must NOT share a lock: a
+  // second workspace would otherwise screen a foreign launch as "in progress",
+  // and its Stop would drive the wrong workspace's child.
+  const stepLockKey = (workspaceId: string, projectName: string): string => `${workspaceId}::${projectName}`
 
   // L1: after every durable attempt mutation a fresh event reaches the renderer,
   // so the very first click is observable and a restart restores the reason the
@@ -7630,7 +7737,7 @@ function setupIpc(): void {
       // Review P1: Electron-authoritative liveness, available from every status
       // refresh — a remounted panel learns about the running child from HERE,
       // not from a local `stepBusy`.
-      inFlight: iterativeStepInFlight.has(project.name),
+      inFlight: iterativeStepInFlight.has(stepLockKey(workspace.id, project.name)),
       // P1#4: durable "Проверить проект" verdict (only meaningful while no run
       // exists). Lets the panel show a distinct "ready → Начать обновление"
       // state after a real check instead of conflating check with start.
@@ -7643,19 +7750,19 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('flow:iterative:begin', async (_event, input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; checkOnly?: boolean }) => {
+  ipcMain.handle('flow:iterative:begin', async (_event, input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; checkOnly?: boolean; repair?: boolean }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
-    const runPresent = existsSync(join(runDir, 'run.json'))
+    let runPresent = existsSync(join(runDir, 'run.json'))
     // P1#4: "Проверить проект" is a REAL separate action. It runs the same CLI,
     // but with `--check-only`: the Python preflight + the control verification of
     // the CURRENT dependencies happen, and a durable non-run verdict is recorded.
     // No run.json / snapshot / checkpoint and NO discovery ever start here, so
     // "Начать обновление" stays a separate, fresh begin.
     if (input.checkOnly === true) {
-      if (iterativeStepInFlight.has(project.name)) {
+      if (iterativeStepInFlight.has(stepLockKey(workspace.id, project.name))) {
         return { ok: false, step: 'check', error: 'STEP_IN_PROGRESS' }
       }
       if (runPresent) {
@@ -7663,9 +7770,9 @@ function setupIpc(): void {
       }
       const checkIntent = loadBaselineIntent(workspace, project.name)
       const checkLevel = checkIntent.acceptancePolicy?.targetLevel ?? 'yellow'
-      iterativeStepInFlight.add(project.name)
+      iterativeStepInFlight.add(stepLockKey(workspace.id, project.name))
       try {
-        startAttempt(runDir, project.name, 'none', undefined, 0)
+        startAttempt(runDir, project.name, 'none', undefined, 0, workspace.id)
         updateAttempt(runDir, { status: 'running', stage: 'begin' })
         publishIterativeAttempt(runDir)
         const python = resolveExecutable('python')
@@ -7689,20 +7796,41 @@ function setupIpc(): void {
           }
         })
         if (result.code !== 0) {
-          const raw = result.timedOut
-            ? (readAttempt(runDir)?.cancelRequested === true ? 'CANCELED: check terminated by user cancel' : 'CHECK_TIMEOUT: check exceeded its 20-minute budget')
-            : (result.stderr.trim() || result.stdout.trim() || `CHECK_EXIT_${result.code}`)
           const canceledByUser = readAttempt(runDir)?.cancelRequested === true
           if (canceledByUser) clearCancelRequest(runDir)
+          // Python PERSISTS the structured verdict before exiting non-zero, so
+          // the durable project-check.json is the source of truth — a failed or
+          // inconclusive check is a CONCLUDED check (repair / retry), never a
+          // bare "check failed". When no verdict was persisted (the check died
+          // during preparation/preflight), recover the machine envelope from
+          // BOTH streams (stderr noise must not hide it), then the raw output.
+          const verdict = readProjectCheckArtifact(runDir)
+          const combined = `${result.stderr || ''}\n${result.stdout || ''}`
+          const failureEnvelope = extractIterativeFailureEnvelope(combined)
+          const fallback = combined.trim() || `CHECK_EXIT_${result.code}`
+          const lastError = verdict
+            ? (envelopeFromCheckVerdict(verdict) ?? failureEnvelope ?? fallback)
+            : (failureEnvelope ?? fallback)
           updateAttempt(runDir, {
             status: 'failed',
             stage: 'begin',
-            lastError: raw.slice(0, 4000),
-            reason: canceledByUser ? 'cancelled by user; the project was not checked' : result.timedOut ? 'check timed out' : 'check failed',
+            lastError: lastError.slice(0, 4000),
+            reason: verdict?.control?.status === 'failed'
+              ? (verdict.control.summary || 'Контроль текущих зависимостей не пройден')
+              : canceledByUser ? 'cancelled by user; the project was not checked' : result.timedOut ? 'check timed out' : (verdict?.control?.summary || 'Проверка проекта не прошла'),
             lastStep: 'check',
           })
           publishIterativeAttempt(runDir)
-          return { ok: false, step: 'check', error: raw.slice(0, 4000), attempt: readAttempt(runDir) }
+          const attempt = readAttempt(runDir)
+          if (!verdict) {
+            // No durable verdict — the check is definitively unreadable.
+            return { ok: false, step: 'check', error: lastError.slice(0, 4000), attempt }
+          }
+          // A structured verdict DOES exist: the check concluded (failed /
+          // inconclusive). Hand it to the panel so IT explains, while the
+          // journal carries the failure envelope for the scenario decision
+          // (PROJECT_CONTROL_FAILED → "Исправить проект агентом").
+          return { ok: true, step: 'check', checked: { ok: verdict.ok, checkedAt: verdict.checkedAt, control: verdict.control }, attempt }
         }
         const checked = readProjectCheckArtifact(runDir)
         if (!checked) {
@@ -7714,8 +7842,99 @@ function setupIpc(): void {
         publishIterativeAttempt(runDir)
         return { ok: true, step: 'check', checked, attempt: readAttempt(runDir) }
       } finally {
-        iterativeStepInFlight.delete(project.name)
+        iterativeStepInFlight.delete(stepLockKey(workspace.id, project.name))
       }
+    }
+    // P2 (#1): "Исправить текущий проект агентом" — a repair launch INDEPENDENT
+    // of roadmap targets. It runs `begin --repair-only` (current-state control,
+    // NO discovery, empty targets): a red C0 opens the durable BOOTSTRAP_REPAIR
+    // run whose isolated checkout the agent repairs; a green C0 opens a READY
+    // run the coordinator finishes as REPAIR_VERIFIED. The L2 begin-plan
+    // no-targets gate is BYPASSED here — a missing roadmap must never block a
+    // red project from reaching the repair agent.
+    if (input.repair === true) {
+      if (iterativeStepInFlight.has(stepLockKey(workspace.id, project.name))) {
+        return { ok: false, step: 'repair', error: 'STEP_IN_PROGRESS' }
+      }
+      // A FINISHED repair leaves the run slot free for a real migration; any
+      // other existing run stays an exclusive resource.
+      if (runPresent && !archiveFinishedRepairRun(runDir)) {
+        return { ok: false, step: 'repair', error: 'RUN_ALREADY_EXISTS: прогон уже существует — продолжите с его состояния (Продолжить)' }
+      }
+      const repairIntent = loadBaselineIntent(workspace, project.name)
+      const repairLevel = repairIntent.acceptancePolicy?.targetLevel ?? 'yellow'
+      iterativeStepInFlight.add(stepLockKey(workspace.id, project.name))
+      try {
+        startAttempt(runDir, project.name, 'none', undefined, 0, workspace.id)
+        updateAttempt(runDir, { status: 'running', stage: 'begin' })
+        publishIterativeAttempt(runDir)
+        const python = resolveExecutable('python')
+        const generator = join(bundledToolDir(), 'iterative_migration.py')
+        // Deliberately NO targetsFile / dashboardState / auditPolicy: the repair
+        // is scoped to the CURRENT versions, independent of the roadmap.
+        const options = {
+          projectDir: project.path,
+          projectName: project.name,
+          targetLevel: repairLevel,
+          workspaceId: workspace.id,
+          projectId: project.name,
+          toolBuildId: app.getVersion(),
+          requestedNode: project.nodeVersion || undefined,
+        }
+        const invocation = iterativeBeginInvocation(runDir, options, generator, python)
+        invocation.args.push('--repair-only')
+        const repairIo = iterativeStreamIo(runDir)
+        const result = await spawnIterativeStreamed(runDir, invocation.command, invocation.args, workspace.path, 20 * 60_000, repairIo, iterativeStreamPlatform, (event) => {
+          if (event.event === 'begin.capture' && typeof event.managedDependencies === 'number') {
+            updateAttempt(runDir, { packageProgress: { processed: 0, total: event.managedDependencies } })
+            publishIterativeAttempt(runDir)
+          }
+        })
+        if (result.code !== 0) {
+          const raw = result.timedOut
+            ? (readAttempt(runDir)?.cancelRequested === true ? 'CANCELED: repair begin terminated by user cancel' : 'REPAIR_BEGIN_TIMEOUT: repair begin exceeded its 20-minute budget')
+            : (result.stderr.trim() || result.stdout.trim() || `REPAIR_BEGIN_EXIT_${result.code}`)
+          const canceledByUser = readAttempt(runDir)?.cancelRequested === true
+          if (canceledByUser) clearCancelRequest(runDir)
+          updateAttempt(runDir, { status: 'failed', stage: 'begin', lastError: raw.slice(0, 4000), reason: canceledByUser ? 'cancelled by user; repair did not start' : result.timedOut ? 'repair begin timed out' : 'repair begin failed', lastStep: 'begin' })
+          publishIterativeAttempt(runDir)
+          return { ok: false, step: 'repair', error: raw.slice(0, 4000), attempt: readAttempt(runDir) }
+        }
+        // An exit code of 0 is NOT proof a repair run was created — confirm the
+        // durable status payload before claiming the repair track is open.
+        const refresh = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
+        const refreshed = refresh.code === 0
+          ? parseIterativeStatusPayload(refresh.stdout) ?? readIterativeStatus(runDir)
+          : undefined
+        if (!refreshed) {
+          const raw = refresh.timedOut ? 'STATUS_TIMEOUT' : (refresh.stderr.trim() || 'STATUS_UNREADABLE')
+          updateAttempt(runDir, { status: 'failed', stage: 'begin', lastError: raw.slice(0, 4000), reason: 'repair begin exited but no run is readable', lastStep: 'begin' })
+          publishIterativeAttempt(runDir)
+          return { ok: false, step: 'repair', error: raw.slice(0, 4000), attempt: readAttempt(runDir) }
+        }
+        const next = decideNextStep(runDir, refreshed)
+        updateAttempt(runDir, { status: 'done', stage: 'begin', runCreated: true, phase: next?.phase, lastStep: next?.step ?? undefined, reason: 'repair run opened' })
+        publishIterativeAttempt(runDir)
+        return { ok: true, step: 'repair', repair: true, phase: next?.phase, next, attempt: readAttempt(runDir) }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        try {
+          updateAttempt(runDir, { status: 'failed', stage: 'begin', lastError: message.slice(0, 4000), reason: 'repair begin preparation failed', lastStep: 'begin' })
+          publishIterativeAttempt(runDir)
+        } catch { /* journal is best-effort during failure handling */ }
+        return { ok: false, step: 'repair', error: `REPAIR_BEGIN_PREP_FAILED: ${message.slice(0, 4000)}`, attempt: readAttempt(runDir) }
+      } finally {
+        iterativeStepInFlight.delete(stepLockKey(workspace.id, project.name))
+      }
+    }
+    // P2 (#1): after a successful repair-only run reached its TERMINAL
+    // REPAIR_VERIFIED, "Начать обновление" archives that auxiliary run (its
+    // durable verdict is preserved under repair-archive/ and the slot is freed
+    // into a durable "project ready" check) and then starts the REAL migration
+    // from a fresh slot — a finished repair is a precondition, not a leftover
+    // to continue.
+    if (runPresent && archiveFinishedRepairRun(runDir)) {
+      runPresent = false
     }
     const intent = loadBaselineIntent(workspace, project.name)
     const targetLevel = intent.acceptancePolicy?.targetLevel ?? 'yellow'
@@ -7727,7 +7946,7 @@ function setupIpc(): void {
     // path (Draft/scope setup, or an EXPLICIT bounded discovery with a budget).
     const plan = beginPlan({
       runPresent,
-      stepInFlight: iterativeStepInFlight.has(project.name),
+      stepInFlight: iterativeStepInFlight.has(stepLockKey(workspace.id, project.name)),
       targetsCount: Object.keys(targets).length,
       discoveryMode,
     })
@@ -7746,7 +7965,7 @@ function setupIpc(): void {
       // explains the two paths (Draft/scope setup, or bounded discovery).
       // P-review: this is NOT a successful empty run — the record is a
       // non-terminal blocker so the panel shows the choice, never "done".
-      startAttempt(runDir, project.name, 'none', undefined, 0)
+      startAttempt(runDir, project.name, 'none', undefined, 0, workspace.id)
       updateAttempt(runDir, { status: 'failed', stage: 'begin', reason: 'no roadmap targets — nothing was run; выберите авто-поиск или настройку обновления', lastStep: 'no-targets' })
       publishIterativeAttempt(runDir)
       return { ok: true, step: 'begin', noTargets: true, targetsCount: 0, targetLevel, attempt: readAttempt(runDir) }
@@ -7767,11 +7986,11 @@ function setupIpc(): void {
     // itself — runs in ONE try/catch/finally. A preparation failure (e.g. an
     // unwritable temp dir) records a failed attempt and RELEASES the lock
     // instead of leaking it with a 'running' journal and no durable trace.
-    iterativeStepInFlight.add(project.name)
+    iterativeStepInFlight.add(stepLockKey(workspace.id, project.name))
     const beginDir = join(app.getPath('temp'), `iter-begin-${randomUUID()}`)
     let beginDirReady = false
     try {
-      startAttempt(runDir, project.name, discovery ? 'discovery' : 'roadmap', discovery, Object.keys(targets).length)
+      startAttempt(runDir, project.name, discovery ? 'discovery' : 'roadmap', discovery, Object.keys(targets).length, workspace.id)
       updateAttempt(runDir, { status: 'running', stage: 'begin' })
       publishIterativeAttempt(runDir)
       mkdirSync(beginDir, { recursive: true })
@@ -7894,7 +8113,7 @@ function setupIpc(): void {
       } catch { /* journal is best-effort during failure handling */ }
       return { ok: false, step: 'begin', error: `BEGIN_PREP_FAILED: ${message.slice(0, 4000)}`, attempt: readAttempt(runDir) }
     } finally {
-      iterativeStepInFlight.delete(project.name)
+      iterativeStepInFlight.delete(stepLockKey(workspace.id, project.name))
       if (beginDirReady) { try { rmSync(beginDir, { recursive: true, force: true }) } catch { /* temp cleanup is best-effort */ } }
     }
   })
@@ -7911,10 +8130,10 @@ function setupIpc(): void {
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
-    if (iterativeStepInFlight.has(project.name)) {
+    if (iterativeStepInFlight.has(stepLockKey(workspace.id, project.name))) {
       return { ok: false, steps: [], stopped: 'error', error: 'STEP_IN_PROGRESS' }
     }
-    iterativeStepInFlight.add(project.name)
+    iterativeStepInFlight.add(stepLockKey(workspace.id, project.name))
     const steps: string[] = []
     const startedAt = Date.now()
     const publish = () => publishIterativeAttempt(runDir)
@@ -7924,7 +8143,7 @@ function setupIpc(): void {
         return { ok: false, steps, stopped: 'error', error: 'NO_RUN', attempt: readAttempt(runDir) }
       }
       // L1: rebuild the journal after a restart — same attemptId, status running.
-      resumeAttempt(runDir, project.name)
+      resumeAttempt(runDir, project.name, workspace.id)
       updateAttempt(runDir, { status: 'running', stage: 'drive', lastError: undefined, cancelRequested: false })
       publish()
       const python = resolveExecutable('python')
@@ -8016,7 +8235,7 @@ function setupIpc(): void {
       publish()
       return { ok: true, steps, stopped: 'iteration-budget', reason: 'супервизор остановлен по лимиту итераций; продолжите нажатием «Продолжить»', attempt: readAttempt(runDir) }
     } finally {
-      iterativeStepInFlight.delete(project.name)
+      iterativeStepInFlight.delete(stepLockKey(workspace.id, project.name))
     }
   })
 
@@ -8082,7 +8301,7 @@ function setupIpc(): void {
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
-    if (iterativeStepInFlight.has(project.name)) {
+    if (iterativeStepInFlight.has(stepLockKey(workspace.id, project.name))) {
       return { ok: false, error: 'STEP_IN_PROGRESS' }
     }
     if (!existsSync(join(runDir, 'run.json'))) {
@@ -8091,10 +8310,10 @@ function setupIpc(): void {
     // R6: the per-project in-flight guard is taken BEFORE any await. Together
     // with the durable lease below it prevents double dispatch within one
     // process lifetime and across an app restart.
-    iterativeStepInFlight.add(project.name)
+    iterativeStepInFlight.add(stepLockKey(workspace.id, project.name))
     // L1: journal the agent dispatch so the panel can show "ремонт у агента"
     // and the last error survives a restart.
-    resumeAttempt(runDir, project.name)
+    resumeAttempt(runDir, project.name, workspace.id)
     updateAttempt(runDir, { status: 'running', stage: 'agent' })
     publishIterativeAttempt(runDir)
     let agentOutputTail = ''
@@ -8365,7 +8584,7 @@ function setupIpc(): void {
     } finally {
       updateAttempt(runDir, { lastHeartbeatAt: Date.now() })
       publishIterativeAttempt(runDir)
-      iterativeStepInFlight.delete(project.name)
+      iterativeStepInFlight.delete(stepLockKey(workspace.id, project.name))
     }
   })
 

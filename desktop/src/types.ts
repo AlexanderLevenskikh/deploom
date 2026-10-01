@@ -386,6 +386,9 @@ export type IterativeRuntimeView = {
 export type IterativeAttemptView = {
   attemptId: string
   projectName: string
+  // P2 (#2): events are scoped to the workspace — the panel must not ingest the
+  // same-named project of a DIFFERENT workspace.
+  workspaceId?: string
   status: 'starting' | 'running' | 'done' | 'failed' | 'canceled'
   stage: 'preflight' | 'begin' | 'drive' | 'agent' | 'none'
   phase?: string
@@ -423,7 +426,9 @@ export type IterativeStatusOutcome = {
   // P1#4: durable standalone "Проверить проект" verdict (present only while no
   // run exists). A check is a REAL preflight + current-dependencies control and
   // never creates/starts the migration — the UI shows "ready → Начать обновление".
-  checked?: { ok: boolean; checkedAt?: string }
+  // `control` carries the structured conclusion (passed/failed/inconclusive) so
+  // a failed control surfaces the repair agent, not a dead-end re-check.
+  checked?: { ok: boolean; checkedAt?: string; control?: { status?: string; kind?: string; summary?: string; failingCommands?: { command: string; exitCode: number }[] } }
   error?: string
 }
 // #1: durable supervisor outcome. drive runs the Python steps in a loop and
@@ -484,8 +489,14 @@ export type IterativeBeginOutcome = {
     noCompatibleAlternative: string[]
   }
   // P1#4: this begin was a "--check-only" project check. A check records a
-  // durable non-run verdict and NEVER starts the migration.
-  checked?: { ok: boolean; checkedAt?: string }
+  // durable non-run verdict and NEVER starts the migration. `control` carries
+  // the structured conclusion (status passed/failed/inconclusive + failing
+  // project commands) when the check concluded — a failed control means the
+  // repair-agent path, an inconclusive result means a retry.
+  checked?: { ok: boolean; checkedAt?: string; control?: { status?: string; kind?: string; summary?: string; failingCommands?: { command: string; exitCode: number }[] } }
+  // P2 (#1): this begin was the "--repair-only" repair of the current state
+  // (independent of roadmap targets); it opened the repair run.
+  repair?: boolean
   attempt?: IterativeAttemptView
   error?: string
 }
@@ -516,7 +527,7 @@ export type DependencyFlowApi = {
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStatusOutcome>
   iterativeDrive: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeDriveOutcome>
-  iterativeBegin: (input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; checkOnly?: boolean }) => Promise<IterativeBeginOutcome>
+  iterativeBegin: (input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; checkOnly?: boolean; repair?: boolean }) => Promise<IterativeBeginOutcome>
   iterativeAgent: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeAgentOutcome>
   runAction: (input: ActionInput) => Promise<{ jobId: string; runId?: string; preview: string[] }>
   cancelJob: (jobId: string) => Promise<boolean>

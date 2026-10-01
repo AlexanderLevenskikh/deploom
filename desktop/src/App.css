@@ -882,6 +882,27 @@ textarea::placeholder {
 .human-flow-remaining { margin: 11px 0 0; color: var(--text-muted); font-size: 11px; }
 .human-flow-actions { margin-top: 17px; display: flex; flex-wrap: wrap; gap: 8px; }
 
+/* User UX: with the iterative panel active the hero is a compact status header;
+   the slim utility row keeps the fallback actions (Draft first-class, history,
+   artifacts, deferred) always visible without a second button pile. */
+.human-flow-utility { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.human-flow-utility .button.secondary { padding: 6px 11px; }
+
+/* User UX: the one-card pipeline stepper under the panel header — the user sees
+   the linear flow Проверка → Подбор версий → Обновление → Результат and always
+   knows where the project is. Done steps get a green check, the current step is
+   emphasised, the rest stay neutral. */
+.iterative-pipeline { margin: 0 0 14px; padding: 10px 14px; display: flex; align-items: center; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
+.iterative-pipeline-step { display: flex; align-items: center; gap: 7px; flex: 0 1 auto; min-width: 0; }
+.iterative-pipeline-connector { flex: 1 1 26px; min-width: 10px; height: 2px; background: var(--border); }
+.iterative-pipeline-connector.on { background: var(--green); }
+.iterative-pipeline-dot { width: 20px; height: 20px; flex: 0 0 20px; display: grid; place-items: center; border-radius: 50%; font-size: 10px; font-weight: 700; color: var(--text-muted); background: var(--surface-hover); border: 1px solid var(--border); }
+.iterative-pipeline-step.done .iterative-pipeline-dot { color: var(--green); background: var(--green-soft); border-color: var(--green); }
+.iterative-pipeline-step.active .iterative-pipeline-dot { color: #fff; background: var(--blue); border-color: var(--blue); }
+.iterative-pipeline-name { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
+.iterative-pipeline-step.done .iterative-pipeline-name { color: var(--green); }
+.iterative-pipeline-step.active .iterative-pipeline-name { color: var(--text); font-weight: 700; }
+
 /* L5: the iterative panel lives in its own card aligned with .human-flow-card
    (same 980px column), so a wide window does not stretch it. */
 .roadmap-card { max-width: 980px; margin: 0 auto 18px; padding: 18px 20px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-raised); box-shadow: 0 4px 18px rgb(0 0 0 / 5%); }

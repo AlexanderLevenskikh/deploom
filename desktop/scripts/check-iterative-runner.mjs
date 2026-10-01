@@ -104,7 +104,7 @@ if (completeTerminal.step !== "finish" || completeTerminal.satisfied !== true) {
   throw new Error(`COMPLETE terminal must be satisfied finish: ${JSON.stringify(completeTerminal)}`);
 }
 if (!completeTerminal.reason.includes("COMPLETE")) throw new Error(`reason must carry the outcome: ${completeTerminal.reason}`);
-for (const partialOutcome of ["PARTIAL_VERIFIED", "BLOCKED_BASELINE", "NO_VERIFIED_UPGRADE"]) {
+for (const partialOutcome of ["PARTIAL_VERIFIED", "BLOCKED_BASELINE", "NO_VERIFIED_UPGRADE", "REPAIR_VERIFIED"]) {
   const partialTerminal = decideNextStep(
     runDir,
     payload({ phase: "TERMINAL", terminal: partialOutcome, terminalOutcome: { outcome: partialOutcome, satisfied: false }, activeCandidateId: null }),

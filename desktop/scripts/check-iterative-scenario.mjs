@@ -2,7 +2,7 @@
 // Invokes the REAL pure module (dist-electron/iterative-scenario.js) with
 // fixtures — one check per accepted user scenario — instead of grepping the
 // sources. Requires the electron TS to be compiled first (precheck: tsc).
-import { deriveMainAction, parseIterativeFailure } from "../dist-electron/iterative-scenario.js";
+import { deriveMainAction, parseIterativeFailure, scenarioPipeline } from "../dist-electron/iterative-scenario.js";
 
 let failures = 0;
 function expect(name, fn) {
@@ -131,10 +131,11 @@ expect("budget-exhausted terminal is budget-stop, not result", () => {
   if (a.state !== "budget-stop") throw new Error(`expected budget-stop, got ${a.state}`);
 });
 
-// 13. P1#3: other unsatisfied terminals (blocked / no-upgrade) are PARTIAL.
-expect("unsatisfied non-budget terminal is partial, not result", () => {
+// 13. P2 (#3): BLOCKED_BASELINE is an HONEST blocker terminal — never "часть
+//     обновлений применена", so it is NOT the generic partial state.
+expect("BLOCKED_BASELINE terminal is blocked, not partial", () => {
   const a = deriveMainAction({ inFlight: false, runner: runner({ phase: "TERMINAL", decision: { step: "finish", satisfied: false, reason: "BLOCKED_BASELINE" } }), taskPresent: true, noTargets: false, checked: false, attempt: undefined });
-  if (a.state !== "partial") throw new Error(`expected partial, got ${a.state}`);
+  if (a.state !== "blocked") throw new Error(`expected blocked, got ${a.state}`);
 });
 
 // 14. P1#3: policy satisfied but the independent audit is still pending → the
@@ -184,6 +185,52 @@ expect("bootstrap-materialize keeps the repair action (P2#2)", () => {
 expect("COMPLETE terminal outcome shows the verified result (P2#4)", () => {
   const a = deriveMainAction({ inFlight: false, runner: runner({ phase: "TERMINAL", decision: { step: "finish", satisfied: true, reason: "COMPLETE" } }), taskPresent: true, noTargets: false, checked: false, attempt: undefined });
   if (a.state !== "result") throw new Error(`expected result, got ${a.state}`);
+});
+
+// 21. P2 (#3): PARTIAL_VERIFIED stays the honest partial (some updates ARE
+//     applied + verified, so the existing partial wording is right here).
+expect("PARTIAL_VERIFIED terminal is the honest partial", () => {
+  const a = deriveMainAction({ inFlight: false, runner: runner({ phase: "TERMINAL", decision: { step: "finish", satisfied: false, reason: "PARTIAL_VERIFIED" } }), taskPresent: true, noTargets: false, checked: false, attempt: undefined });
+  if (a.state !== "partial") throw new Error(`expected partial, got ${a.state}`);
+});
+
+// 22. P2 (#3): NO_VERIFIED_UPGRADE is NOT "часть обновлений применена" — the
+//     run ended without ANY verified upgrade.
+expect("NO_VERIFIED_UPGRADE terminal is no-upgrade, not partial", () => {
+  const a = deriveMainAction({ inFlight: false, runner: runner({ phase: "TERMINAL", decision: { step: "finish", satisfied: false, reason: "NO_VERIFIED_UPGRADE" } }), taskPresent: false, noTargets: false, checked: false, attempt: undefined });
+  if (a.state !== "no-upgrade") throw new Error(`expected no-upgrade, got ${a.state}`);
+});
+
+// 23. P1 finding 1 / P2 (#1): the repair of the CURRENT state reached its
+//     terminal REPAIR_VERIFIED — that is a repair success, NOT a partial
+//     migration; the next action is starting the real update.
+expect("REPAIR_VERIFIED terminal acts as repair-done → Начать обновление", () => {
+  const a = deriveMainAction({ inFlight: false, runner: runner({ phase: "TERMINAL", decision: { step: "finish", satisfied: false, reason: "REPAIR_VERIFIED" } }), taskPresent: false, noTargets: false, checked: false, attempt: undefined });
+  if (a.state !== "repair-done") throw new Error(`expected repair-done, got ${a.state}`);
+});
+
+// 24. User UX: the one-card pipeline reads as a linear flow. The pure mapping
+//     pins which stage is current and which are done for key scenario states —
+//     the user must always SEE progress, never a dead end.
+expect("pipeline: fresh project is at the check stage", () => {
+  const p = scenarioPipeline("check", false);
+  if (p.current !== "check" || p.completed.length !== 0) throw new Error(`fresh pipeline ${JSON.stringify(p)}`);
+});
+expect("pipeline: verified result completes the flow", () => {
+  const p = scenarioPipeline("result", false);
+  if (p.current !== "result" || JSON.stringify(p.completed) !== JSON.stringify(["check", "plan", "upgrade"])) throw new Error(`result pipeline ${JSON.stringify(p)}`);
+});
+expect("pipeline: running update is at the upgrade stage", () => {
+  const p = scenarioPipeline("running", false);
+  if (p.current !== "upgrade" || JSON.stringify(p.completed) !== JSON.stringify(["check", "plan"])) throw new Error(`running pipeline ${JSON.stringify(p)}`);
+});
+expect("pipeline: repair-done moves to planning the real update", () => {
+  const p = scenarioPipeline("repair-done", false);
+  if (p.current !== "plan" || JSON.stringify(p.completed) !== JSON.stringify(["check"])) throw new Error(`repair-done pipeline ${JSON.stringify(p)}`);
+});
+expect("pipeline: blocked lands on the result, honestly", () => {
+  const p = scenarioPipeline("blocked", false);
+  if (p.current !== "result" || JSON.stringify(p.completed) !== JSON.stringify(["check", "plan"])) throw new Error(`blocked pipeline ${JSON.stringify(p)}`);
 });
 
 if (failures > 0) {
