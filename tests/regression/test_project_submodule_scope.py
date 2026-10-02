@@ -122,6 +122,11 @@ class ProjectSubmoduleScopeTests(unittest.TestCase):
         result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8',
                                 errors='replace', timeout=300)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        progress = [json.loads(line.split('ITERATIVE_MIGRATION_STATUS_V1 ', 1)[1])
+                    for line in result.stdout.splitlines() if line.startswith('ITERATIVE_MIGRATION_STATUS_V1 ')]
+        self.assertTrue(any(event.get('event') == 'begin.check-progress' and
+                            event.get('message') for event in progress),
+                        'Real preparation/check progress must reach Desktop before a verdict')
         check = json.loads((self.base / 'run/project-check.json').read_text(encoding='utf-8'))
         self.assertTrue(check['ok'])
         self.assertEqual('passed', check['control']['kind'])

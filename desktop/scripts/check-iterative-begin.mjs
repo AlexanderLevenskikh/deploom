@@ -3,10 +3,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   iterativeBeginInvocation,
+  iterativeCheckTimeoutFailure,
   hasSavedProjectPlan,
   targetsFromDashboardRows,
   targetsFromDashboardState,
 } from "../dist-electron/iterative-begin.js";
+
+const timeoutEnvelope = iterativeCheckTimeoutFailure('source-materialization: hashing files=12000');
+const timeout = JSON.parse(timeoutEnvelope.slice('ITERATIVE_MIGRATION_FAILURE_V1 '.length));
+if (timeout.code !== 'PROJECT_CHECK_TIMEOUT' || !timeout.summary.includes('20 минут') ||
+    !timeout.summary.includes('hashing files=12000') || timeout.summary.includes('STATUS_V1')) {
+  throw Error('watchdog timeout lacks actionable phase diagnosis');
+}
+if (iterativeCheckTimeoutFailure().includes('undefined')) throw Error('missing phase leaked into timeout');
 
 // 1. Target extraction mirrors the product's own dashboard fallback: an
 // explicit lagPolicyTarget, then lag_target, then a concrete min_lag_<N>m

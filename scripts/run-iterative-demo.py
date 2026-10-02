@@ -1,4 +1,4 @@
-"""Run a retained, physical 12-dependency cumulative migration demo.
+"""Run a retained, physical 12/24-dependency cumulative migration demo.
 
 Uses the same real CLI driver as physical acceptance. No fake verifier, no
 external agent session, and no changes to a user's project. Scripted repairs
@@ -9,6 +9,10 @@ import argparse
 import importlib.util
 import json
 import os
+import subprocess
+import signal
+import sys
+import time
 from pathlib import Path
 import tempfile
 
@@ -26,10 +30,29 @@ NEW = {'is-number': '7.0.0', 'is-finite': '1.1.0', 'is-string': '1.1.1',
        'is-bigint': '1.1.0', 'is-regex': '1.2.1', 'is-negative-zero': '2.0.3',
        'is-map': '2.0.3', 'is-set': '2.0.3', 'object-is': '1.1.6'}
 
+EXTRA_OLD = {'is-array-buffer': '3.0.2', 'is-typed-array': '1.1.9',
+             'is-data-view': '1.0.0', 'is-shared-array-buffer': '1.0.2',
+             'is-weakmap': '2.0.1', 'is-weakset': '2.0.2',
+             'is-generator-function': '1.0.10', 'is-async-function': '2.0.0',
+             'is-callable': '1.2.4', 'has-symbols': '1.0.3',
+             'has-tostringtag': '1.0.0', 'isobject': '3.0.1'}
+EXTRA_NEW = {'is-array-buffer': '3.0.5', 'is-typed-array': '1.1.15',
+             'is-data-view': '1.0.2', 'is-shared-array-buffer': '1.0.4',
+             'is-weakmap': '2.0.2', 'is-weakset': '2.0.4',
+             'is-generator-function': '1.1.0', 'is-async-function': '2.1.1',
+             'is-callable': '1.2.7', 'has-symbols': '1.1.0',
+             'has-tostringtag': '1.0.2', 'isobject': '4.0.0'}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-root', default='.dependency-roadmap/iterative-demo')
+    parser.add_argument('--packages', type=int, choices=(12, 24), default=24)
+    parser.add_argument('--seed-cache', help='Reuse an existing demo npm cache inside this repository')
     args = parser.parse_args()
+    old = {**OLD, **(EXTRA_OLD if args.packages == 24 else {})}
+    new = {**NEW, **(EXTRA_NEW if args.packages == 24 else {})}
+    blocked = {'is-string', *({'is-weakset'} if args.packages == 24 else set())}
     output = (ROOT / args.output_root).resolve()
     if not output.is_relative_to(ROOT):
         parser.error('output-root must be inside this repository')
@@ -38,6 +61,12 @@ def main():
     os.environ['PYTHONIOENCODING'] = 'utf-8'
     cls = physical.IterativeMigrationPhysicalAcceptance
     cls.setUpClass()
+    if args.seed_cache:
+        cached = (ROOT / args.seed_cache).resolve()
+        if not cached.is_relative_to(ROOT) or not cached.is_dir():
+            parser.error('seed-cache must be an existing directory inside this repository')
+        cls.cache = cached
+        cls.seed_env['npm_config_cache'] = str(cached)
     driver = cls('test_vertical_loop_first_upgrade_repair_and_recovery')
     stage, project = cls.stage, cls.project
     print('DEMO_WORKSPACE ' + str(stage), flush=True)
@@ -45,26 +74,50 @@ def main():
         path.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')
     # Warm both exact dependency sets so subsequent materialization is offline.
     seed = stage / 'seed'
-    for deps in (OLD, NEW):
+    for deps in (old, new):
         write(seed / 'package.json', {'name': 'demo-seed', 'version': '1.0.0', 'dependencies': deps})
         result = physical._run([cls.npm, 'install', '--no-audit', '--no-fund'], seed, env=cls.seed_env, timeout=1800)
         if result.returncode:
             raise RuntimeError(result.stderr[-2000:])
     manifest = json.loads((project / 'package.json').read_text(encoding='utf-8'))
-    manifest['dependencies'] = OLD
+    manifest['dependencies'] = old
     # Exercise the real npm.cmd path and shell semantics, not node directly.
     manifest['scripts']['test'] = 'node check.js'
     write(project / 'package.json', manifest)
+    # Exercise every dependency, with two additional independently repairable
+    # application contracts. These deliberately model adaptation, not claims
+    # that these public releases themselves changed those APIs.
+    check = project / 'check.js'
+    checks = """
+for (const [name, versions] of Object.entries(DEMO_ALLOWED)) {
+  const version = installedVersion(name);
+  if (!versions.includes(version)) throw Error(`unexpected ${name}@${version}`);
+  if (typeof require(name) !== 'function') throw Error(`unusable export: ${name}`);
+}
+for (const [name, field] of [['is-array-buffer', 'buffer'], ['is-callable', 'callable']]) {
+  if (DEMO_NEW[name] && installedVersion(name) === DEMO_NEW[name] && cfg[field] !== 'adapted') {
+    throw Error(`${name} upgrade requires application adaptation: ${field}`);
+  }
+}
+if (process.env.DEPLOOM_DEMO_PAUSE === '1') {
+  fs.mkdirSync('.dependency-roadmap', {recursive: true});
+  fs.writeFileSync('.dependency-roadmap/demo-stop-ready', 'ready');
+  setTimeout(() => process.exit(0), 60000);
+}
+"""
+    check.write_text(check.read_text(encoding='utf-8') + '\nconst DEMO_ALLOWED = ' +
+                     json.dumps({name: [old[name], new[name]] for name in old}) +
+                     ';\nconst DEMO_NEW = ' + json.dumps(new) + ';\n' + checks, encoding='utf-8')
     (project / '.gitignore').write_text('node_modules/\n.dependency-roadmap/\n', encoding='utf-8')
     result = physical._run([cls.npm, 'install', '--package-lock-only', '--no-audit', '--no-fund'], project, env=cls.seed_env)
     if result.returncode:
         raise RuntimeError(result.stderr[-2000:])
     git_env = {**os.environ, 'GIT_AUTHOR_NAME': 'Migration Demo', 'GIT_AUTHOR_EMAIL': 'demo@example.test',
                'GIT_COMMITTER_NAME': 'Migration Demo', 'GIT_COMMITTER_EMAIL': 'demo@example.test'}
-    for argv in ([cls.git, 'add', '-A'], [cls.git, 'commit', '-qm', '12 dependency demo']):
+    for argv in ([cls.git, 'add', '-A'], [cls.git, 'commit', '-qm', f'{args.packages} dependency demo']):
         result = physical._run(argv, project, env=git_env)
         if result.returncode: raise RuntimeError(result.stderr)
-    targets = {**NEW, 'is-string': '99.99.99'}
+    targets = {**new, **{name: '99.99.99' for name in blocked}}
     verify = driver._verify_config_file()
     verify_config = json.loads(verify.read_text(encoding='utf-8'))
     verify_config['commands'] = ['npm run test']
@@ -84,8 +137,10 @@ def main():
                 '--run-budget-minutes', '120', '--phase-timeout-seconds', '1200')
     driver.assertEqual('begin.done', begin['last']['event'])
     checkpoints, wrong_repair, deferred = [], False, 0
+    stopped = None
+    repair_cohorts = []
     deferred_bases = set()
-    for _ in range(20):
+    for _ in range(args.packages * 3):
         planned = cli('plan-next')
         if planned['last']['event'] == 'plan-next.no-candidate': break
         candidate = json.loads((run / 'trial/candidate.json').read_text(encoding='utf-8'))
@@ -93,17 +148,52 @@ def main():
         result = cli('materialize', '--timeout-seconds', '1200')
         if result['last']['event'] == 'materialize.failed':
             driver.assertEqual('resolver', result['last']['kind'])
-            driver.assertNotIn(candidate['baseCheckpointId'], deferred_bases, 'Same broken assignment repeated on unchanged base')
-            deferred_bases.add(candidate['baseCheckpointId'])
+            broken_key = (candidate['baseCheckpointId'], tuple(sorted(candidate['delta']['changed'])))
+            driver.assertNotIn(broken_key, deferred_bases, 'Same broken assignment repeated on unchanged base')
+            deferred_bases.add(broken_key)
             feedback = driver._write_feedback(run, 'INCONCLUSIVE', reason='Demonstration target version does not exist')
             cli('apply-feedback', '--feedback-file', str(feedback))
             driver.assertEqual(before['activeCheckpointId'], physical.read_runtime_state(run)['activeCheckpointId'])
             deferred += 1
             continue
         driver.assertEqual('materialize.done', result['last']['event'])
+        if stopped is None and checkpoints:
+            # Stop a real running project command, then resume the SAME trial.
+            env = {**cls.seed_env, 'npm_config_offline': 'true', 'DEPLOOM_DEMO_PAUSE': '1'}
+            marker = driver._trial_project(run) / '.dependency-roadmap/demo-stop-ready'
+            with (stage / 'stopped-precheck.log').open('w', encoding='utf-8') as log:
+                process = subprocess.Popen([sys.executable, str(ROOT / 'iterative_migration.py'),
+                    '--run-dir', str(run), 'precheck'], cwd=ROOT, env=env, stdout=log, stderr=log,
+                    start_new_session=os.name != 'nt')
+                try:
+                    deadline = time.monotonic() + 120
+                    while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+                        time.sleep(0.1)
+                    driver.assertTrue(marker.exists(), 'Pause marker was not reached by real project command')
+                    driver.assertIsNone(process.poll(), 'Command exited before stop')
+                    if os.name == 'nt':
+                        subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], check=True, capture_output=True)
+                    else:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=30)
+                finally:
+                    if process.poll() is None:
+                        if os.name == 'nt':
+                            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True)
+                        else:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=30)
+            after_stop = physical.read_runtime_state(run)
+            driver.assertEqual(before['activeCheckpointId'], after_stop['activeCheckpointId'])
+            same_trial = json.loads((run / 'trial/candidate.json').read_text(encoding='utf-8'))
+            driver.assertEqual(candidate['candidateId'], same_trial['candidateId'])
+            stopped = {'runId': before['runId'], 'candidateId': candidate['candidateId'],
+                       'checkpointBefore': before['activeCheckpointId'], 'checkpointAfterStop': after_stop['activeCheckpointId']}
+            write(stage / 'STOP_RESUME.json', stopped)
         precheck = cli('precheck', '--timeout-seconds', '1200')
         attempt = 0
         if precheck['last']['event'] == 'precheck.repair-required':
+            repair_cohorts.append(candidate['delta']['changed'])
             if not wrong_repair:
                 driver._scripted_repair(run, api='wrong-api', feature='wrong-feature')
                 feedback = driver._write_feedback(run, 'READY_FOR_VERIFY', changed_files=['src/config.js'], attempt_id=0)
@@ -113,6 +203,13 @@ def main():
                 driver.assertEqual(before['activeCheckpointId'], physical.read_runtime_state(run)['activeCheckpointId'])
                 wrong_repair, attempt = True, 1
             driver._repair_for_assignment(run, candidate['fullAssignment'])
+            config_path = driver._trial_project(run) / 'src/config.js'
+            adaptations = {field: 'adapted' for name, field in
+                           [('is-array-buffer', 'buffer'), ('is-callable', 'callable')]
+                           if candidate['fullAssignment'].get(name) == new.get(name) and name in new}
+            if adaptations:
+                with config_path.open('a', encoding='utf-8') as stream:
+                    stream.write('\nObject.assign(module.exports, ' + json.dumps(adaptations) + ');\n')
         feedback = driver._write_feedback(run, 'READY_FOR_VERIFY', changed_files=['src/config.js'] if precheck['last']['event'] == 'precheck.repair-required' else [], attempt_id=attempt)
         cli('apply-feedback', '--feedback-file', str(feedback))
         verified = cli('verify-exact')
@@ -123,22 +220,23 @@ def main():
             if name not in candidate['delta']['changed']:
                 driver.assertEqual(version, state['activeCheckpoint']['fullAssignment'][name])
         checkpoints.append(state['activeCheckpointId'])
-    else: raise AssertionError('Planner did not terminate within 20 cohorts')
+    else: raise AssertionError('Planner did not terminate within bounded cohort attempts')
     driver.assertTrue(wrong_repair)
     driver.assertGreaterEqual(deferred, 1)
-    driver.assertLessEqual(deferred, 3)
-    driver.assertEqual(11, len(checkpoints))
+    driver.assertLessEqual(deferred, 3 * len(blocked))
+    driver.assertEqual(len(old) - len(blocked), len(checkpoints))
+    driver.assertIsNotNone(stopped)
     finished = cli('finish')
     driver.assertEqual('finish.done', finished['last']['event'])
     # Each CLI call above is a new process: cumulative state survives restart.
     state = physical.read_runtime_state(run)
     final = state['activeCheckpoint']['fullAssignment']
-    for name, version in NEW.items():
-        driver.assertEqual(OLD[name] if name == 'is-string' else version, final[name])
+    for name, version in new.items():
+        driver.assertEqual(old[name] if name in blocked else version, final[name])
     for name in ('MIGRATION_REPORT.md', 'DEVELOPER_UPGRADE_GUIDE.md'):
         driver.assertTrue((run / 'reports' / name).is_file())
-    write(stage / 'ACCEPTANCE.json', {'directDependencies': 12, 'acceptedUpdates': 11,
-          'deferredUpdates': 1, 'deferredAttempts': deferred, 'wrongRepairRejected': wrong_repair, 'checkpoints': checkpoints,
+    write(stage / 'ACCEPTANCE.json', {'directDependencies': len(old), 'acceptedUpdates': len(checkpoints),
+          'deferredUpdates': len(blocked), 'repairCohorts': repair_cohorts, 'stopResume': stopped, 'deferredAttempts': deferred, 'wrongRepairRejected': wrong_repair, 'checkpoints': checkpoints,
           'finalRun': state, 'sourceGitStatus': physical._run([cls.git, 'status', '--porcelain'], project).stdout})
     print('DEMO_ACCEPTED ' + str(stage / 'ACCEPTANCE.json'), flush=True)
 

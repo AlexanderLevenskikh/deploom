@@ -67,6 +67,7 @@ from baseline_constraint_verifier import (
 )
 from baseline_repair_handoff import build_repair_request
 from verification_proof import is_fixed_manifest_spec
+from iterative_target_deferrals import record_unavailable_targets, unavailable_targets
 from iterative_restart import TRANSACTION as RESTART_TRANSACTION, RestartArchiveError, archive_for_restart, recover_restart_archive
 from block_psi_progressive_baseline import plan_progressive_extension
 from package_manager_profile import (
@@ -914,6 +915,10 @@ def _begin_check_only_locked(
         config=verify_config,
         run_project_checks=True,
         progress_label="iterative migration project check",
+        progress=lambda message: _emit_status({
+            "event": "begin.check-progress", "runId": "", "project": project_name,
+            "message": message,
+        }),
         runtime_env=_runtime_env(config),
     )
     observed = dict(result.observed_resolved_versions or {})
@@ -2180,6 +2185,14 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
                 if name in effective_targets and effective_targets[name] != incumbent.get(name)
             ]
             targets = effective_targets
+
+    # A verified npm ETARGET defers only the named target in this bounded run
+    # and registry context. It is scheduling evidence, never a solver nogood;
+    # source repairs/new checkpoints do not make a missing version appear.
+    availability_deferred = unavailable_targets(load_ledger(run_dir), run, config)
+    actionable = [name for name in actionable if name not in availability_deferred]
+    desired = {name: incumbent[name] if name in availability_deferred else version
+               for name, version in desired.items()}
 
     if not actionable:
         # Policy is satisfied only when EVERY requested target is present in
@@ -3450,6 +3463,10 @@ def _materialize_locked(
     )
     if install_result.returncode != 0:
         kind = _classify_materialization_failure(install_result.stdout or "")
+        ledger = dict(load_ledger(run_dir))
+        if record_unavailable_targets(ledger, run, config, candidate,
+                                      (install_result.stdout or "") + "\n" + (install_result.stderr or "")):
+            save_ledger(run_dir, ledger)
         run = dict(run)
         run["phase"] = "MATERIALIZING"
         run["updatedAt"] = _now_iso()

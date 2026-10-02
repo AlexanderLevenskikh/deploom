@@ -55,7 +55,7 @@ import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStream
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
-import { hasSavedProjectPlan, iterativeBeginInvocation, targetsFromDashboardState } from './iterative-begin.js'
+import { hasSavedProjectPlan, iterativeBeginInvocation, iterativeCheckTimeoutFailure, targetsFromDashboardState } from './iterative-begin.js'
 import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
 import { beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, recordAttemptLog, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
@@ -7816,6 +7816,10 @@ function setupIpc(): void {
             updateAttempt(runDir, { packageProgress: { processed: 0, total: event.managedDependencies } })
             publishIterativeAttempt(runDir)
           }
+          if (event.event === 'begin.check-progress' && typeof event.message === 'string') {
+            updateAttempt(runDir, { phase: event.message.slice(0, 1000) })
+            publishIterativeAttempt(runDir)
+          }
         })
         if (result.code !== 0) {
           const canceledByUser = readAttempt(runDir)?.cancelRequested === true
@@ -7832,21 +7836,25 @@ function setupIpc(): void {
           // bare "check failed". When no verdict was persisted (the check died
           // during preparation/preflight), recover the machine envelope from
           // BOTH streams (stderr noise must not hide it), then the raw output.
-          const verdict = readProjectCheckArtifact(runDir)
+          // No verdict belongs to a killed check, even if an earlier retry left one.
+          const verdict = result.timedOut ? undefined : readProjectCheckArtifact(runDir)
           const combined = `${result.stderr || ''}\n${result.stdout || ''}`
           const failureEnvelope = extractIterativeFailureEnvelope(combined)
           const fallback = combined.trim() || `CHECK_EXIT_${result.code}`
-          const lastError = verdict
-            ? (envelopeFromCheckVerdict(verdict) ?? failureEnvelope ?? fallback)
-            : (failureEnvelope ?? fallback)
+          const lastError = result.timedOut
+            ? iterativeCheckTimeoutFailure(readAttempt(runDir)?.phase)
+            : verdict
+              ? (envelopeFromCheckVerdict(verdict) ?? failureEnvelope ?? fallback)
+              : (failureEnvelope ?? fallback)
           updateAttempt(runDir, {
             status: 'failed',
             stage: 'begin',
             lastError: lastError.slice(0, 4000),
             reason: verdict?.control?.status === 'failed'
               ? (verdict.control.summary || 'Контроль текущих зависимостей не пройден')
-              : canceledByUser ? 'cancelled by user; the project was not checked' : result.timedOut ? 'check timed out' : (verdict?.control?.summary || 'Проверка проекта не прошла'),
+              : canceledByUser ? 'cancelled by user; the project was not checked' : result.timedOut ? 'Начальная проверка превысила лимит 20 минут; результат не получен.' : (verdict?.control?.summary || 'Проверка проекта не прошла'),
             lastStep: 'check',
+            finishedAt: Date.now(),
           })
           publishIterativeAttempt(runDir)
           const attempt = readAttempt(runDir)

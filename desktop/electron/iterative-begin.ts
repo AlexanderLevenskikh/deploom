@@ -88,6 +88,17 @@ export function targetsFromDashboardState(dashboardStatePath: string, projectNam
   }
 }
 
+/** A watchdog kill cannot reuse an earlier successful check or a STATUS line. */
+export function iterativeCheckTimeoutFailure(lastProgress?: string): string {
+  const phase = String(lastProgress || '').trim()
+  const summary = 'Начальная проверка превысила лимит 20 минут. Обновление не запускалось; результат текущей проверки не получен.' +
+    (phase ? ` Последний этап: ${phase}.` : '') +
+    ' Подробности сохранены в журнале запуска. Проверенный результат сохранён.'
+  return 'ITERATIVE_MIGRATION_FAILURE_V1 ' + JSON.stringify({
+    code: 'PROJECT_CHECK_TIMEOUT', summary, command: '', fixable: true,
+  })
+}
+
 /** Invocation shape for the begin step. `--run-dir` is a TOP-LEVEL CLI
  * argument, so it must precede the subcommand; `--targets-file` is present
  * only when a targets file was actually produced (an empty run is legal and
