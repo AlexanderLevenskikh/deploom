@@ -782,7 +782,8 @@ def project_readiness_preflight(project_dir: Path) -> None:
     if submodule_issues:
         state, path = submodule_issues[0]
         verb = "не инициализирован" if state == "-" else "в конфликтном состоянии"
-        command = f'git submodule update --init --recursive -- "{path}"'
+        # Git reports paths relative to its root; the project may be nested.
+        command = f'git -C "{project_dir}" submodule update --init --recursive -- ":(top){path}"'
         raise ProjectUnreadyError(
             "SOURCE_SUBMODULE_INCOMPLETE",
             f"Git submodule {path} {verb}. Подготовьте submodule и повторите проверку.",

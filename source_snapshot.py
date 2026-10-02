@@ -50,7 +50,7 @@ from substrate_identity import tool_build_id
 
 # BLOCK_X_SOURCE_TRUTH_V1
 SOURCE_SNAPSHOT_SCHEMA = "source-snapshot-v2-tool-build-content"
-SOURCE_INPUT_POLICY_SCHEMA = "source-input-policy-v2-explicit-git-admin"
+SOURCE_INPUT_POLICY_SCHEMA = "source-input-policy-v3-project-submodules"
 SOURCE_CAPTURE_RETRIES = 3
 
 # Deliberately small and explicit. In particular: dist/, build/, .next/,
@@ -90,6 +90,7 @@ class SourceInputPolicy:
             "excludedDirNames": list(self.excluded_dir_names),
             "excludedFileNames": list(self.excluded_file_names),
             "gitAdministrativeExclusions": [".git/**/*.lock"],
+            "submoduleReadiness": "project-workspace-local-dependencies; conflicts-global",
         }, length=64)
 
 
@@ -491,7 +492,7 @@ def _submodule_line_path(line: str) -> str:
     return parts[0]
 
 
-def incomplete_submodules(capture_root: Path) -> list[tuple[str, str]]:
+def _repository_incomplete_submodules(capture_root: Path) -> list[tuple[str, str]]:
     """Incomplete (uninitialized `-` or conflicted `U`) submodule entries.
 
     One shared helper for BOTH the cheap local readiness preflight at begin and
@@ -516,8 +517,80 @@ def incomplete_submodules(capture_root: Path) -> list[tuple[str, str]]:
     return issues
 
 
-def _submodule_preflight(capture_root: Path) -> None:
-    for state, path in incomplete_submodules(capture_root):
+def _submodule_input_roots(project_dir: Path, capture_root: Path) -> set[Path]:
+    """Readiness scope, not a source exclusion: the entire tree is still sealed.
+
+    Include owning workspace packages and recursively declared local inputs.
+    If topology cannot be bound, conservatively retain the repository-wide gate;
+    the authoritative verifier will separately explain unsupported topology.
+    """
+    project = project_dir.resolve()
+    try:
+        manifests = semantic_manifest_paths(project)
+    except ProjectTopologyError:
+        return {capture_root}
+    roots = {project, *(manifest.parent.resolve() for manifest in manifests)}
+    pending = list(roots)
+    visited: set[Path] = set()
+    while pending:
+        root = pending.pop()
+        if root in visited:
+            continue
+        visited.add(root)
+        _local_dependency_preflight(root, capture_root)
+        manifest_path = root / "package.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise SourceCaptureError(f"SOURCE_PACKAGE_JSON_UNREADABLE: {manifest_path}: {exc}") from exc
+        for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
+            values = manifest.get(section)
+            if not isinstance(values, dict):
+                continue
+            for spec in values.values():
+                text = str(spec or "").strip()
+                if not text.lower().startswith(("file:", "link:", "portal:")):
+                    continue
+                payload = text.split(":", 1)[1].strip()
+                if not payload:
+                    continue
+                target = Path(payload).expanduser()
+                if not target.is_absolute():
+                    target = root / target
+                target = target.resolve(strict=False)
+                roots.add(target)
+                pending.append(target)
+    return roots
+
+
+def incomplete_submodules(project_dir: Path) -> list[tuple[str, str]]:
+    """Shared readiness gate for the selected project and capture-time check.
+
+    A sibling absent gitlink is faithfully captured as absent, with its Git
+    metadata preserved. It is not a missing input unless it intersects the
+    package/workspace/local-dependency scope. Conflicts always fail closed.
+    Checks still execute against the sealed tree; no contents are fetched or
+    fabricated and no command failure is converted into a successful proof.
+    """
+    capture_root, _, _ = _subject_layout(project_dir)
+    issues = _repository_incomplete_submodules(capture_root)
+    if not issues:
+        return []
+    roots = _submodule_input_roots(project_dir, capture_root)
+    return [
+        (state, path) for state, path in issues
+        if state == "U" or any(
+            _within((capture_root / path).resolve(), root)
+            or _within(root, (capture_root / path).resolve())
+            for root in roots
+        )
+    ]
+
+
+def _submodule_preflight(project_dir: Path) -> None:
+    for state, path in incomplete_submodules(project_dir):
         if state == "-":
             raise SourceCaptureError(
                 f"SOURCE_SUBMODULE_INCOMPLETE: uninitialized submodule: {path}"
@@ -895,7 +968,7 @@ def _capture_once(
     capture_root, project_relative, git_head = _subject_layout(project_dir)
     project_path = (capture_root / project_relative).resolve()
     _validate_git_layout(capture_root)
-    _submodule_preflight(capture_root)
+    _submodule_preflight(project_path)
     try:
         topology_manifests = semantic_manifest_paths(project_path)
     except ProjectTopologyError:
