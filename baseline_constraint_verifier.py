@@ -663,6 +663,13 @@ def _command_prefix(executable: str, args: Sequence[str]) -> Tuple[List[str], bo
     return [executable, *args], False
 
 
+def project_check_command_argv(command: str, environment: Optional[Mapping[str, str]] = None) -> List[str]:
+    """Run configured shell commands identically in control and iterative checks."""
+    if os.name == "nt":
+        return [(environment if environment is not None else os.environ).get("COMSPEC") or "cmd.exe", "/d", "/s", "/c", command]
+    return ["/bin/sh", "-c", command]
+
+
 def detect_package_manager(project_dir: Path) -> str:
     package_json = project_dir / "package.json"
     if package_json.exists():
@@ -4172,10 +4179,7 @@ def verify_assignment(
                         checks=len(config.commands),
                         isolation=clone_isolation,
                     )
-                    if os.name == "nt":
-                        shell_argv: Sequence[str] = [os.environ.get("COMSPEC") or "cmd.exe", "/d", "/s", "/c", command]
-                    else:
-                        shell_argv = ["/bin/sh", "-c", command]
+                    shell_argv = project_check_command_argv(command)
                     try:
                         check_result = _run(
                             shell_argv,
@@ -4899,18 +4903,21 @@ def verify_assignment(
         # different requested runtime, and tool identity in the proof must name
         # the runtime CI actually uses.
         environment = {**environment, **runtime_env}
-    identity = build_verification_proof_identity(
-        project_dir,
-        assignment=assignment,
-        remove_packages=tuple(sorted(str(item) for item in remove_packages)),
-        resolver_overrides=config.resolver_overrides,
-        manager=manager,
-        manager_executable=executable,
-        registry=config.registry,
-        project_checks=config.project_checks if run_project_checks else "off",
-        commands=config.commands if run_project_checks else (),
-        environment=environment,
-    )
+    try:
+        identity = build_verification_proof_identity(
+            project_dir,
+            assignment=assignment,
+            remove_packages=tuple(sorted(str(item) for item in remove_packages)),
+            resolver_overrides=config.resolver_overrides,
+            manager=manager,
+            manager_executable=executable,
+            registry=config.registry,
+            project_checks=config.project_checks if run_project_checks else "off",
+            commands=config.commands if run_project_checks else (),
+            environment=environment,
+        )
+    except SourceIdentityUnavailable as exc:
+        return BaselineVerifyResult(False, "infrastructure", str(exc))
     telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
 
     cache_operations: Dict[Tuple[str, str], str] = {}

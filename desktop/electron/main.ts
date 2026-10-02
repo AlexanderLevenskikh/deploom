@@ -8067,6 +8067,8 @@ function setupIpc(): void {
       let discoveryReport: { discovered: string[]; unavailable: string[]; budgetSkipped: string[]; noCompatibleAlternative: string[] } | undefined
       const strings = (value: unknown): string[] => Array.isArray(value) ? value.map((item) => String(item)) : []
       const result = await spawnIterativeStreamed(runDir, invocation.command, invocation.args, workspace.path, 20 * 60_000, beginIo, iterativeStreamPlatform, (event) => {
+        updateAttempt(runDir, { phase: event.event })
+        publishIterativeAttempt(runDir)
         if (event.event === 'begin.capture' && typeof event.managedDependencies === 'number') {
           updateAttempt(runDir, { packageProgress: { processed: 0, total: event.managedDependencies } })
           publishIterativeAttempt(runDir)

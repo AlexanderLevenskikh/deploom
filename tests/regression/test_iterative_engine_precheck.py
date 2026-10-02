@@ -19,6 +19,7 @@ from iterative_migration import (
     SCHEMA_VERSION,
     _normalize_effective_node_version,
     _plan_next_locked,
+    _apply_feedback_locked,
     load_candidate,
     load_ledger,
     load_run,
@@ -246,6 +247,24 @@ class IterativeEnginePrecheckTests(unittest.TestCase):
 
         candidate = load_candidate(run_dir)
         self.assertIsNotNone(candidate)
+
+    def test_inconclusive_does_not_starve_next_cohort_or_learn_incompatibility(self) -> None:
+        run_dir = self._run_dir()
+        config = _config_dict(targets={"pkg-a": "1.1.0", "pkg-b": "1.1.0"})
+        save_config(run_dir, config)
+        _plan_next_locked(run_dir, load_run(run_dir), config)
+        candidate = load_candidate(run_dir)
+        self.assertEqual({"pkg-a": "1.1.0"}, candidate["delta"]["changed"])
+        feedback = {"schemaVersion": SCHEMA_VERSION, "runId": candidate["runId"],
+                    "candidateId": candidate["candidateId"], "baseCheckpointId": "C0",
+                    "attemptId": 0, "kind": "INCONCLUSIVE", "reason": "registry unavailable"}
+        _apply_feedback_locked(run_dir, load_run(run_dir), config, feedback)
+        self.assertEqual("C0", load_run(run_dir)["activeCheckpointId"])
+        ledger = load_ledger(run_dir)
+        self.assertFalse(any(block.get("kind") == "NEGATIVE_VERIFY" for block in ledger["blocks"]))
+        _plan_next_locked(run_dir, load_run(run_dir), config)
+        self.assertEqual({"pkg-b": "1.1.0"}, load_candidate(run_dir)["delta"]["changed"])
+        self.assertEqual("C0", load_run(run_dir)["activeCheckpointId"])
 
     def test_normalize_effective_node_version(self) -> None:
         self.assertEqual(_normalize_effective_node_version("20.11.0"), "20.11.0")

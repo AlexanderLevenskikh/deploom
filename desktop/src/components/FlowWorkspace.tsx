@@ -624,6 +624,32 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         )}
       </section>
 
+      <IterativeTaskPanel
+        key={`${details.workspace.id}:${project.name}`}
+        workspaceId={details.workspace.id}
+        projectName={project.name}
+        appVersion={appVersion}
+        refreshKey={activeRunId}
+        onGet={onGetIterativeTask}
+        onExport={onExportIterativeTask}
+        onExportLegacy={onExportLegacyIterativeTask}
+        onCopy={onCopyIterativeTask}
+        onSave={onSaveIterativeTask}
+        onStatus={onIterativeStatus}
+        onDrive={onIterativeDrive}
+        onBegin={onIterativeBegin}
+        onAgent={onIterativeAgent}
+        onAttempt={onIterativeAttempt}
+        onCancel={onIterativeCancel}
+        liveAttempt={liveIterativeAttempt}
+        onConfigureScope={() => void openBaselineIntentDialog('prepare', 'auto')}
+        onOpenPath={onOpenPath}
+        // P1#1: the panel mirrors the one main action to the hero and must not
+        // allow a start while a legacy activeAction owns the checkout.
+        onScenario={scenarioOnScenario}
+        disabledExternal={active}
+      />
+
       <details className="flow-technical-details">
         <summary>{text('Технические детали', 'Technical details')}</summary>
         <div className="flow-technical-details-body">
@@ -761,31 +787,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
       {selectedBranchFailure?.runtime?.phase === 'failed' ? <BranchFailureModal branch={selectedBranchFailure} onClose={() => setSelectedBranchFailure(null)} /> : null}
       {baselineIntentDialog ? <BaselineIntentDialog mode={baselineIntentDialog.mode} resume={baselineIntentDialog.resume} plan={baselineIntentDialog.plan} decision={baselineIntentDialog.decision} onCancel={() => { setBaselineIntentDialog(undefined); if (baselineIntentDialog.mode === 'decision') setBaselineDecisionDismissed(true) }} onSubmit={runBaselineIntent} /> : null}
       {draftPromptPreview ? <PromptPreviewDialog preview={draftPromptPreview} onClose={() => setDraftPromptPreview(undefined)} onOpenPath={onOpenPath} /> : null}
-      <IterativeTaskPanel
-        key={`${details.workspace.id}:${project.name}`}
-        workspaceId={details.workspace.id}
-        projectName={project.name}
-        appVersion={appVersion}
-        refreshKey={activeRunId}
-        onGet={onGetIterativeTask}
-        onExport={onExportIterativeTask}
-        onExportLegacy={onExportLegacyIterativeTask}
-        onCopy={onCopyIterativeTask}
-        onSave={onSaveIterativeTask}
-        onStatus={onIterativeStatus}
-        onDrive={onIterativeDrive}
-        onBegin={onIterativeBegin}
-        onAgent={onIterativeAgent}
-        onAttempt={onIterativeAttempt}
-        onCancel={onIterativeCancel}
-        liveAttempt={liveIterativeAttempt}
-        onConfigureScope={() => void openBaselineIntentDialog('prepare', 'auto')}
-        onOpenPath={onOpenPath}
-        // P1#1: the panel mirrors the one main action to the hero and must not
-        // allow a start while a legacy activeAction owns the checkout.
-        onScenario={scenarioOnScenario}
-        disabledExternal={active}
-      />
+
     </section>
   )
 }

@@ -1,5 +1,5 @@
 import { Check, ChevronDown, ChevronUp, Clipboard, ExternalLink, FileText, RefreshCw, Rocket, Save, Wrench, X } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 
 import { useLanguage } from '../i18n'
 import { deriveMainAction, parseIterativeFailure, scenarioPipeline, PIPELINE_STAGES, type ScenarioMainActionState, type ScenarioSignal } from '../../electron/iterative-scenario'
@@ -71,7 +71,7 @@ const MAIN_LABEL: Record<ScenarioMainActionState, [string, string]> = {
 
 /** User-facing explanation under the main button (no internal step names). */
 const MAIN_DESCRIPTION: Record<ScenarioMainActionState, [string, string]> = {
-  check: ['Проверка зафиксирует текущее состояние проекта и найдёт доступные обновления.', 'The check records the current project state and finds available updates.'],
+  check: ['Проверим установку зависимостей и команды проекта. После успешной проверки можно подобрать обновления.', 'Check dependency installation and project commands. Once the check passes, find available updates.'],
   'retry-check': ['Исправьте причину и повторите проверку — состояние не требует ручной чистки.', 'Fix the cause and re-check — no state files need manual cleanup.'],
   'repair-current': ['Контроль текущих зависимостей не проходит. Откроем прогон: агент исправит проект в изолированном окружении, авторитетная проверка повторится на исправленных байтах.', 'The current-state control fails. We will open the run: the agent repairs the project in an isolated checkout and the authoritative check re-runs on the repaired bytes.'],
   'no-targets': ['Выберите, как найти обновления: подобрать автоматически или настроить состав и политику.', 'Choose how to find updates: automatically, or by configuring scope and policy.'],
@@ -97,6 +97,9 @@ const MAIN_DESCRIPTION: Record<ScenarioMainActionState, [string, string]> = {
 const activityText = (attempt?: IterativeAttemptView, text?: (ru: string, en: string) => string): string => {
   const t = text ?? ((ru: string) => ru)
   if (!attempt) return t('Подготовка…', 'Preparing…')
+  if (attempt.status === 'failed') return t('Попытка не завершилась', 'The attempt failed')
+  if (attempt.status === 'canceled') return t('Работа остановлена', 'Work was stopped')
+  if (attempt.status === 'done') return t(attempt.lastStep === 'no-targets' ? 'План обновления ещё не выбран' : 'Этап завершён', attempt.lastStep === 'no-targets' ? 'No update plan selected yet' : 'Stage completed')
   const stage = attempt.stage
   if (stage === 'begin') {
     if (attempt.targetSource === 'discovery') return t('Подбираем версии…', 'Finding versions…')
@@ -283,8 +286,11 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
           setCopied(true)
           window.setTimeout(() => setCopied(false), 1600)
         }
-        setNote(outcome.path ?? (outcome.artifactId ? `${outcome.artifactId}` : undefined))
-        if (kind === 'export') void load()
+        setNote(outcome.path)
+        if (kind === 'export' || kind === 'export-view') {
+          await load()
+          if (kind === 'export-view') setShowDialog(true)
+        }
       } else {
         setNote(outcome.error ?? 'Ошибка')
       }
@@ -512,7 +518,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       )
     : text(...MAIN_DESCRIPTION[mainAction.state])
 
-  const elapsedMs = attempt?.startedAt && nowTick > attempt.startedAt ? nowTick - attempt.startedAt : 0
+  const elapsedUntil = attemptAlive ? nowTick : (attempt?.finishedAt ?? nowTick)
+  const elapsedMs = attempt?.startedAt && elapsedUntil > attempt.startedAt ? elapsedUntil - attempt.startedAt : 0
   const progress = attempt?.packageProgress
   const showLogTail = showLog && attemptLog
   const attemptFailure = attempt && (attempt.status === 'failed' || attempt.status === 'canceled')
@@ -571,9 +578,9 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         void beginNow({ mode: 'auto' })
         break
       case 'ready':
-        // P1#4: the check passed; starting the migration is a separate, explicit
-        // action that creates the durable run.
-        void beginNow({ mode: 'none' })
+        // Use the configured plan, or discover targets when none were saved.
+        // A successful check must never lead to a no-op launch.
+        void beginNow({ mode: 'auto' })
         break
       case 'repair-done':
         // P2 (#1): the repair of the current state is done and confirmed.
@@ -602,12 +609,12 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         // SAME honest surface — the result dialog + diagnostics — without
         // claiming it was fully verified.
         if (task) setShowDialog(true)
-        else void run('export', () => onExport(projectName))
+        else void run('export-view', () => onExport(projectName))
         break
     }
   }
 
-  const busyLocked = stepBusy || busy !== undefined || disabledExternal === true
+  const busyLocked = stepBusy || busy !== undefined || disabledExternal === true || state.phase === 'loading' || (runner === undefined && !runnerError)
 
   // P1#1: the panel is the SINGLE owner of the scenario main action. Mirror it
   // outward so the enclosing workspace hero renders exactly the same control
@@ -649,18 +656,20 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
           scenario mapping as the single main action, so the stepper and the
           button can never disagree about where the project is. */}
       {(() => {
-        const pipeline = scenarioPipeline(mainAction.state, runner?.checked?.ok === true)
+        const pipeline = scenarioPipeline(mainAction.state, runner?.checked?.ok === true, { attempt, runner })
         return (
           <div className="iterative-pipeline" data-testid="iterative-pipeline">
             {PIPELINE_STAGES.map((stage, index) => {
               const done = pipeline.completed.includes(stage.stage)
               const active = stage.stage === pipeline.current
               return (
-                <div key={stage.stage} className={`iterative-pipeline-step ${done ? 'done' : ''} ${active ? 'active' : ''}`}>
-                  {index > 0 ? <span className={`iterative-pipeline-connector ${done || active ? 'on' : ''}`} aria-hidden="true" /> : null}
+                <Fragment key={stage.stage}>
+                  {index > 0 ? <span className={`iterative-pipeline-connector ${pipeline.completed.includes(PIPELINE_STAGES[index - 1].stage) ? 'on' : ''}`} aria-hidden="true" /> : null}
+                <div data-stage={stage.stage} aria-current={active ? 'step' : undefined} className={`iterative-pipeline-step ${done ? 'done' : ''} ${active ? 'active' : ''}`}>
                   <span className="iterative-pipeline-dot" aria-hidden="true">{done ? <Check size={12} /> : index + 1}</span>
                   <span className="iterative-pipeline-name">{language === 'ru' ? stage.ru : stage.en}</span>
                 </div>
+                </Fragment>
               )
             })}
           </div>
@@ -684,14 +693,9 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
                     ? ` · ${text('версии: не заданы', 'versions: none')}`
                     : ''}
             </span>
-            {attempt && childAlive ? (
-              <button type="button" className="button danger" data-testid="iterative-cancel" onClick={() => void cancelNow()}>
-                <X size={15} />{text('Остановить', 'Stop')}
-              </button>
-            ) : null}
           </div>
           <div className="attempt-strip-row">
-            {progress && progress.total > 0 && attempt.targetSource === 'discovery' ? (
+            {progress && progress.total > 0 && attempt.targetSource === 'discovery' && attempt.stage === 'begin' && childAlive ? (
               <span className="attempt-meta">
                 {text('Подбор версий', 'Finding versions')}: {progress.processed}/{progress.total}
                 <span className="attempt-progress"><span style={{ width: `${Math.min(100, Math.round((progress.processed / progress.total) * 100))}%` }} /></span>
@@ -702,7 +706,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
                 {text('Работа была прервана перезапуском; процесс не запущен — продолжите, чтобы возобновить её.', 'Work was interrupted by a restart; the process is not running — continue to resume it.')}
               </span>
             ) : null}
-            {attempt.reason ? (
+            {attempt.reason && attempt.status !== 'done' && attempt.stage !== 'drive' ? (
               <span className="attempt-meta attempt-reason">{attempt.reason}</span>
             ) : null}
             {attempt ? (
@@ -779,8 +783,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
               ) : null}
               {!busyLocked && !runner?.present && !noTargetsStep ? (
                 <>
-                  <button type="button" className="button secondary" onClick={() => void exportLegacyNow()}>
-                    <FileText size={16} />{text('Импортировать сохранённый результат', 'Import a saved result')}
+                  <button type="button" className="button secondary" title={text('Использует последний сохранённый план Baseline. Обновления не применяются; проверки нужно выполнить заново.', 'Uses the last saved Baseline plan. No updates are applied; checks must run again.')} onClick={() => void exportLegacyNow()}>
+                    <FileText size={16} />{text('Создать ТЗ из прежнего плана', 'Create an assignment from an earlier plan')}
                   </button>
                 </>
               ) : null}
@@ -793,8 +797,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
               <strong>{text('Перед запуском', 'Before you start')}</strong>
               <span>
                 {text(
-                  'Draft предлагает план обновления; запуск применяет и проверяет изменения. Состав, политика и версия Node (по умолчанию не задана) настраиваются здесь и в настройках проекта выше.',
-                  'The Draft proposes an update plan; the launch applies and verifies the changes. Scope, policy and the Node version (unset by default) are configured here and in the project settings above.',
+                  'Draft предлагает план обновления; запуск применяет и проверяет изменения. Состав и политика настраиваются кнопкой «Настроить состав / Draft», версия Node — в технических деталях.',
+                  'The Draft proposes an update plan; the launch applies and verifies the changes. Use Configure scope / Draft for scope and policy; set the Node version in Technical details.',
                 )}
               </span>
             </div>
@@ -805,7 +809,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
               <strong>{text('Задание ещё не сформировано', 'The assignment is not ready yet')}</strong>
               {insufficient ? (
                 <span>
-                  {text('Недостаточно данных durable-состояния:', 'Durable state lacks:')} {snapshot?.missing.join(', ')}. {text('Сначала выполните проверку до результатов.', 'Run the check to results first.')}
+                  {text('Здесь появятся подтверждённые обновления и итоговое ТЗ. Начните обновление после проверки проекта.', 'Verified updates and the final assignment will appear here. Start the update after checking the project.')}
                 </span>
               ) : (
                 <span>{text('После проверки и обновлений задание появится здесь — его можно посмотреть и скопировать.', 'After the check and updates, the assignment appears here — you can view and copy it.')}</span>

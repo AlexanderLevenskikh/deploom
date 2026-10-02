@@ -51,6 +51,7 @@ export type ScenarioAttemptShape = {
   lastError?: string
   reason?: string
   lastStep?: string
+  phase?: string
   targetSource?: string
   stepsDone?: string[]
   runCreated?: boolean
@@ -313,7 +314,7 @@ export const PIPELINE_STAGES: ReadonlyArray<{ stage: PipelineStage; ru: string; 
   { stage: "result", ru: "Результат", en: "Result" },
 ]
 
-export function scenarioPipeline(state: ScenarioMainActionState, checked: boolean): { current: PipelineStage; completed: PipelineStage[] } {
+export function scenarioPipeline(state: ScenarioMainActionState, checked: boolean, context?: { attempt?: ScenarioAttemptShape; runner?: ScenarioRunnerShape }): { current: PipelineStage; completed: PipelineStage[] } {
   switch (state) {
     case "result":
       // a finished, independently-audited, policy-satisfied migration.
@@ -338,10 +339,24 @@ export function scenarioPipeline(state: ScenarioMainActionState, checked: boolea
       return { current: "plan", completed: checked ? ["check"] : [] }
     case "start-run":
     case "continue-run":
-    case "running":
-    case "recovered-running":
     case "agent":
+      return { current: context?.runner?.phase === "BOOTSTRAP_REPAIR" ? "check" : "upgrade", completed: context?.runner?.phase === "BOOTSTRAP_REPAIR" ? [] : ["check", "plan"] }
+    case "running":
+    case "recovered-running": {
+      const attempt = context?.attempt
+      if (context?.runner?.phase === "BOOTSTRAP_REPAIR" || attempt?.stage === "preflight") {
+        return { current: "check", completed: [] }
+      }
+      if (attempt?.stage === "begin") {
+        const discovery = attempt.targetSource === "discovery" && attempt.phase?.includes("discovery")
+        return { current: discovery ? "plan" : "check", completed: discovery && checked ? ["check"] : [] }
+      }
+      // A busy flag alone is not evidence that checking/planning passed.
+      if (!context?.runner?.present && attempt?.stage !== "drive") {
+        return { current: "check", completed: [] }
+      }
       return { current: "upgrade", completed: ["check", "plan"] }
+    }
     default:
       // check / retry-check / repair-current / fresh — the project is being
       // checked (repair is part of making that check pass).

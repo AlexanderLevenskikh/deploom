@@ -1404,7 +1404,13 @@ def source_snapshot_fingerprint(project_dir: Path) -> str:
     if snapshot is not None:
         return validate_source_snapshot(snapshot).key
     root, relative, _head = _subject_layout(project_dir)
-    manifest = build_source_tree_manifest(root)
+    for attempt in range(1, SOURCE_CAPTURE_RETRIES + 1):
+        try:
+            manifest = build_source_tree_manifest(root)
+            break
+        except SourceCaptureError as exc:
+            if "SOURCE_CAPTURE_UNSTABLE" not in str(exc) or attempt >= SOURCE_CAPTURE_RETRIES:
+                raise
     return _canonical_hash({
         "schema": SOURCE_SNAPSHOT_SCHEMA,
         "toolBuildId": tool_build_id(),

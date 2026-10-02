@@ -221,7 +221,7 @@ expect("pipeline: verified result completes the flow", () => {
   if (p.current !== "result" || JSON.stringify(p.completed) !== JSON.stringify(["check", "plan", "upgrade"])) throw new Error(`result pipeline ${JSON.stringify(p)}`);
 });
 expect("pipeline: running update is at the upgrade stage", () => {
-  const p = scenarioPipeline("running", false);
+  const p = scenarioPipeline("running", true, { attempt: { stage: "drive" }, runner: { present: true } });
   if (p.current !== "upgrade" || JSON.stringify(p.completed) !== JSON.stringify(["check", "plan"])) throw new Error(`running pipeline ${JSON.stringify(p)}`);
 });
 expect("pipeline: repair-done moves to planning the real update", () => {
@@ -231,6 +231,23 @@ expect("pipeline: repair-done moves to planning the real update", () => {
 expect("pipeline: blocked lands on the result, honestly", () => {
   const p = scenarioPipeline("blocked", false);
   if (p.current !== "result" || JSON.stringify(p.completed) !== JSON.stringify(["check", "plan"])) throw new Error(`blocked pipeline ${JSON.stringify(p)}`);
+});
+
+expect("pipeline: live check has no completed stages even with stale old verdict", () => {
+  const p = scenarioPipeline("running", true, { attempt: { stage: "begin", phase: "begin.check", targetSource: "none" }, runner: { present: false } });
+  if (p.current !== "check" || p.completed.length !== 0) throw new Error(JSON.stringify(p));
+});
+expect("pipeline: discovery is planning, never an update", () => {
+  const p = scenarioPipeline("running", false, { attempt: { stage: "begin", phase: "begin.discovery-progress", targetSource: "discovery" }, runner: { present: false } });
+  if (p.current !== "plan" || p.completed.length !== 0) throw new Error(JSON.stringify(p));
+});
+expect("pipeline: bootstrap agent still repairs the initial check", () => {
+  const p = scenarioPipeline("agent", false, { runner: { present: true, phase: "BOOTSTRAP_REPAIR" } });
+  if (p.current !== "check" || p.completed.length !== 0) throw new Error(JSON.stringify(p));
+});
+expect("pipeline: generic busy flag cannot manufacture completion", () => {
+  const p = scenarioPipeline("running", false);
+  if (p.current !== "check" || p.completed.length !== 0) throw new Error(JSON.stringify(p));
 });
 
 if (failures > 0) {

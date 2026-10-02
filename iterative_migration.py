@@ -61,6 +61,7 @@ from baseline_constraint_verifier import (
     observed_resolved_assignment,
     observed_resolved_hash,
     resolve_executable,
+    project_check_command_argv,
     structural_project_failure_signatures,
     verify_assignment,
 )
@@ -963,6 +964,13 @@ def _begin_check_only_locked(
             raise ProjectUnreadyError(
                 "PROJECT_CONTROL_FAILED",
                 f"Контроль текущих зависимостей не пройден: {failing}. ",
+                command="",
+            )
+        if "SOURCE_CAPTURE_UNSTABLE" in result_summary:
+            raise ProjectUnreadyError(
+                "SOURCE_CAPTURE_UNSTABLE",
+                "Файлы проекта меняются во время проверки. Остановите сборку или watch/dev-сервер "
+                "и повторите проверку. Проверенный результат сохранён; обновление не запускалось.",
                 command="",
             )
         raise ProjectUnreadyError(
@@ -2182,6 +2190,14 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
         for entry in blocks
         if str(entry.get("assignmentFingerprint") or "").strip()
     }
+    # Deferrals suppress repetition only for the exact assignment on the
+    # current verified base. They remain separate from incompatibility blocks.
+    blocked_fingerprints.update(
+        str(entry["assignmentFingerprint"])
+        for entry in ledger.get("deferrals", [])
+        if entry.get("baseCheckpointId") == checkpoint_id
+        and entry.get("assignmentFingerprint")
+    )
     learned_nogoods = [
         dict(entry.get("nogood") or {})
         for entry in ledger.get("blocks", [])
@@ -3538,7 +3554,7 @@ def _precheck_locked(
             "npm_config_ignore_scripts": "true",
         }
         result = _run(
-            _command_argv(command),
+            _command_argv(command, base_env),
             project_path,
             timeout_seconds=_clamp_int(args.timeout_seconds, 1200, 120, 4 * 3600),
             env=env,
@@ -3601,10 +3617,8 @@ def _precheck_locked(
     return 0
 
 
-def _command_argv(command: str) -> List[str]:
-    import shlex
-
-    return shlex.split(command)
+def _command_argv(command: str, environment: Optional[Mapping[str, str]] = None) -> List[str]:
+    return project_check_command_argv(command, environment)
 
 
 def _write_candidate_repair_requests(
@@ -4133,12 +4147,16 @@ def _record_scope_expansion(
 def _append_deferral(
     ledger: Dict[str, Any], candidate: Mapping[str, Any], reason: str
 ) -> None:
-    """Bounded deferral: a later revision may retry with a fresh reason."""
+    """Defer this exact attempt; a different verified base may permit a retry."""
+    # This is scheduling evidence, never a learned incompatibility. Without
+    # the exact fingerprint, INCONCLUSIVE starves later independent cohorts by
+    # proposing the same assignment forever on the same verified checkpoint.
     ledger["deferrals"] = list(ledger.get("deferrals", [])) + [
         {
             "baseCheckpointId": candidate["baseCheckpointId"],
             "candidateId": candidate["candidateId"],
             "cohortId": candidate.get("cohortId"),
+            "assignmentFingerprint": assignment_fingerprint(candidate["fullAssignment"]),
             "reason": reason,
             "createdAt": _now_iso(),
         }
@@ -4310,6 +4328,9 @@ def _finish_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str, A
     else:
         outcome = str(existing_outcome.get("outcome") or run.get("terminal") or "")
 
+    # finish may have just persisted fresh audit evidence. Render those bytes,
+    # not the pre-audit checkpoint list loaded at entry.
+    checkpoints = _all_checkpoints(run_dir)
     report = _build_migration_report(run_dir, run, config, checkpoints, existing_outcome or run.get("terminalOutcome"))
     guide = _build_developer_upgrade_guide(run_dir, config, checkpoints)
     (reports_dir / "MIGRATION_REPORT.md").write_text(report, encoding="utf-8")

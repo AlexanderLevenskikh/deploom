@@ -562,6 +562,29 @@ class IterativeMigrationFinishAuditTests(unittest.TestCase):
             self.assertIn("COMPLETE", report)
             self.assertIn("lagOkPct", report)
 
+    def test_first_finish_report_contains_audit_just_persisted(self) -> None:
+        from unittest.mock import patch
+        from iterative_migration import _finish_locked, load_config, load_run, load_checkpoint, save_checkpoint
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _RunDir(Path(tmp))
+            root.write_run(_run_dict(phase="READY", terminal=None))
+            root.write_config(_config_dict(targets={"pkg-a": "1.1.0"}))
+            root.write_checkpoint(_checkpoint_dict(full_assignment={"pkg-a": "1.1.0"}, audit={"status": "UNKNOWN"}))
+            def audit_now(run_dir, run, config, args):
+                checkpoint = load_checkpoint(run_dir, "C0")
+                checkpoint["audit"] = {"status": "PASS", "lagOkPct": 100, "lagOk": 1,
+                                       "lagTotal": 1, "lagLagging": 0, "lagUnknown": 0,
+                                       "vulnerabilityPackages": 0, "evidenceRef": "fresh-audit-evidence"}
+                save_checkpoint(run_dir, checkpoint)
+                return 0
+            with patch("iterative_migration._audit_locked", side_effect=audit_now):
+                _finish_locked(root.root, load_run(root.root), load_config(root.root))
+            report = (root.root / "reports/MIGRATION_REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("статус `PASS`", report)
+            self.assertIn("lag-ok `100%`", report)
+            self.assertIn("fresh-audit-evidence", report)
+            self.assertNotIn("статус `UNKNOWN`", report)
+
     def test_finish_idempotent_preserves_terminal_outcome(self) -> None:
         from iterative_migration import _finish_locked, load_config, load_run
 
