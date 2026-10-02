@@ -407,6 +407,7 @@ export type IterativeAttemptView = {
   cancelRequested?: boolean
 }
 export type IterativeStatusOutcome = {
+  legacyPlanPresent?: boolean
   ok: boolean
   present: boolean
   stale: boolean
@@ -527,7 +528,7 @@ export type DependencyFlowApi = {
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStatusOutcome>
   iterativeDrive: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeDriveOutcome>
-  iterativeBegin: (input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; checkOnly?: boolean; repair?: boolean }) => Promise<IterativeBeginOutcome>
+  iterativeBegin: (input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
   iterativeAgent: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeAgentOutcome>
   runAction: (input: ActionInput) => Promise<{ jobId: string; runId?: string; preview: string[] }>
   cancelJob: (jobId: string) => Promise<boolean>

@@ -66,6 +66,17 @@ export function targetsFromDashboardRows(rows: unknown[]): Record<string, string
 
 /** Targets for one project from the tracked dashboard-state file
  * (`.dependency-roadmap/state/dashboard-state.json`, keyed by `projects`). */
+/** Availability only; Python remains the authority on legacy export sufficiency. */
+export function hasSavedProjectPlan(dashboardStatePath: string, projectName: string): boolean {
+  try {
+    const parsed = JSON.parse(readFileSync(dashboardStatePath, 'utf8').replace(/^\uFEFF/, '')) as Record<string, any>
+    const rows = parsed?.projects?.[projectName]
+    return Array.isArray(rows) && rows.length > 0
+  } catch {
+    return false
+  }
+}
+
 export function targetsFromDashboardState(dashboardStatePath: string, projectName: string): Record<string, string> {
   if (!dashboardStatePath || !existsSync(dashboardStatePath)) return {}
   try {

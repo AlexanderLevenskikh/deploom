@@ -134,9 +134,9 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
     return { state: "running", blocker, firstRun: false, reasonShort: activityReason(attempt) }
   }
 
-  // 2. The durable journal says "running" but there is NO live child → the app
-  //    (or the tab) restarted; the run can only be resumed by driving it.
-  if (attemptLive) {
+  // A journal is activity evidence, not proof that begin created a run.
+  // Interrupted checks/discovery must be restarted through begin, never drive.
+  if (attemptLive && runner?.present) {
     return {
       state: "recovered-running",
       blocker,
@@ -147,6 +147,12 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
 
   // 3. No durable run yet: the project has never been verified.
   if (!runner?.present) {
+    if (attemptLive) {
+      return {
+        state: "retry-check", blocker, firstRun: false,
+        reasonShort: "Проверка была прервана до создания прогона. Повторите проверку; прежние результаты сохранены.",
+      }
+    }
     // P2 (#2): a RED current-state control (PROJECT_CONTROL_FAILED) must reach
     // the repair agent, not a dead-end re-check: clicking this opens the durable
     // run whose red C0 puts the coordinator on the BOOTSTRAP_REPAIR track

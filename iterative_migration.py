@@ -66,6 +66,8 @@ from baseline_constraint_verifier import (
     verify_assignment,
 )
 from baseline_repair_handoff import build_repair_request
+from verification_proof import is_fixed_manifest_spec
+from iterative_restart import TRANSACTION as RESTART_TRANSACTION, RestartArchiveError, archive_for_restart, recover_restart_archive
 from block_psi_progressive_baseline import plan_progressive_extension
 from package_manager_profile import (
     install_args_for_profile,
@@ -392,8 +394,11 @@ class _RunLock:
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             owner = str(payload.get("owner") or "")
-            if _process_owner_dead(int(payload.get("pid") or 0)):
-                return True
+            pid = int(payload.get("pid") or 0)
+            if pid > 0:
+                # A slow living verifier still owns the lock after two minutes.
+                # Desktop restart must not archive files beneath an orphan child.
+                return _process_owner_dead(pid)
             started = str(payload.get("startedAt") or "")
             started_at = time.strptime(started, "%Y-%m-%dT%H:%M:%SZ")
             age = time.time() - time.mktime(started_at)
@@ -576,7 +581,16 @@ def direct_dependency_assignment(project_dir: Path) -> Dict[str, str]:
         for name, spec in deps.items():
             if isinstance(name, str) and isinstance(spec, str) and name not in assignment:
                 assignment[name] = spec
-    return dict(sorted(assignment.items()))
+    # Fixed Git/file/workspace/alias inputs stay in the captured manifest and
+    # proof identity, but must never be sent to the exact-version writer.
+    # Mixed registry/fixed declarations still reach its conflict guard.
+    fixed_only = {
+        name for name in assignment
+        if all(is_fixed_manifest_spec(str(manifest[section][name]))
+               for section in DEPENDENCY_SECTIONS
+               if isinstance(manifest.get(section), dict) and name in manifest[section])
+    }
+    return {name: spec for name, spec in sorted(assignment.items()) if name not in fixed_only}
 
 
 def manifest_and_lock_hashes(project_dir: Path) -> Tuple[str, str, Optional[str]]:
@@ -1790,6 +1804,24 @@ def _write_project_check_ready(run_dir: Path, config: Mapping[str, Any], handoff
             },
         },
     )
+
+
+def cmd_archive_run(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}")
+    lock.acquire()
+    try:
+        if getattr(args, 'recover_only', False):
+            recover_restart_archive(run_dir, _write_json_atomic)
+            result = {'archived': False}
+        else:
+            result = archive_for_restart(run_dir, LOCK_FILENAME, _write_json_atomic)
+        print(f"ITERATIVE_ARCHIVE_RESULT_V1 {json.dumps(result)}")
+        return 0
+    except RestartArchiveError as exc:
+        raise InvalidInputError(str(exc)) from exc
+    finally:
+        lock.release()
 
 
 def cmd_archive_repair_run(args: argparse.Namespace) -> int:
@@ -4892,6 +4924,9 @@ def build_parser() -> argparse.ArgumentParser:
     verify_bootstrap = sub.add_parser("verify-bootstrap", help="Повторная контрольная проверка C0 после bootstrap repair")
     verify_bootstrap.add_argument("--timeout-seconds", type=int, default=1800)
 
+    archive_run = sub.add_parser("archive-run", help="Сохранить прежний прогон целиком в истории для нового запуска")
+    archive_run.add_argument("--recover-only", action="store_true")
+
     archive_repair = sub.add_parser(
         "archive-repair-run",
         help="Транзакционная архивация TERMINAL REPAIR_VERIFIED прогона: фиксирует repair-handoff.json + project-check.json, исправленный снимок sources/C0 остаётся для следующей миграции",
@@ -4951,6 +4986,7 @@ COMMANDS = {
     "verify-bootstrap": cmd_verify_bootstrap,
     "bootstrap-materialize": cmd_bootstrap_materialize,
     "archive-repair-run": cmd_archive_repair_run,
+    "archive-run": cmd_archive_run,
     "plan-next": cmd_plan_next,
     "materialize": cmd_materialize,
     "precheck": cmd_precheck,
@@ -4969,6 +5005,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         configure_utf8_stdio()
         recovery_dir = Path(args.run_dir).resolve()
+        if (recovery_dir / RESTART_TRANSACTION).exists():
+            recovery_lock = _RunLock(recovery_dir, args.owner or f"pid-{os.getpid()}")
+            recovery_lock.acquire()
+            try:
+                recover_restart_archive(recovery_dir, _write_json_atomic)
+            except RestartArchiveError as exc:
+                raise InvalidInputError(str(exc)) from exc
+            finally:
+                recovery_lock.release()
         if (recovery_dir / REPAIR_ARCHIVE_TRANSACTION).exists():
             recovery_lock = _RunLock(recovery_dir, args.owner or f"pid-{os.getpid()}")
             recovery_lock.acquire()

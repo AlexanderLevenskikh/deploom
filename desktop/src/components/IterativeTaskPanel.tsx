@@ -17,7 +17,7 @@ type Props = {
   onSave: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
   onDrive: (projectName: string) => Promise<IterativeDriveOutcome>
-  onBegin: (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; checkOnly?: boolean; repair?: boolean }) => Promise<IterativeBeginOutcome>
+  onBegin: (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
   onAgent: (projectName: string) => Promise<IterativeAgentOutcome>
   onAttempt: (projectName: string) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
   onCancel: (projectName: string) => Promise<{ ok: boolean }>
@@ -344,7 +344,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     }
   }
 
-  const beginNow = async (discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; checkOnly?: boolean; repair?: boolean }) => {
+  const beginNow = async (discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
     setStepBusy(true)
     setNote(undefined)
     // P2#5: a fresh attempt supersedes the previous "no targets" explanation.
@@ -518,11 +518,11 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       )
     : text(...MAIN_DESCRIPTION[mainAction.state])
 
-  const elapsedUntil = attemptAlive ? nowTick : (attempt?.finishedAt ?? nowTick)
+  const elapsedUntil = attemptAlive && childAlive ? nowTick : (attempt?.finishedAt ?? attempt?.lastHeartbeatAt ?? nowTick)
   const elapsedMs = attempt?.startedAt && elapsedUntil > attempt.startedAt ? elapsedUntil - attempt.startedAt : 0
   const progress = attempt?.packageProgress
   const showLogTail = showLog && attemptLog
-  const attemptFailure = attempt && (attempt.status === 'failed' || attempt.status === 'canceled')
+  const attemptFailure = attempt && attempt.status === 'failed'
     ? (attempt.lastError || attempt.reason || undefined)
     : undefined
   const decisionText = runner?.decision ? `${runner.decision.step ?? '—'} · ${runner.decision.reason}` : undefined
@@ -703,7 +703,9 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
             ) : null}
             {attempt.status === 'running' && !childAlive ? (
               <span className="attempt-meta attempt-reason">
-                {text('Работа была прервана перезапуском; процесс не запущен — продолжите, чтобы возобновить её.', 'Work was interrupted by a restart; the process is not running — continue to resume it.')}
+                {runner?.present
+                  ? text('Работа была прервана перезапуском; продолжите с сохранённого состояния.', 'Work was interrupted by a restart; continue from the saved state.')
+                  : text('Проверка была прервана до создания прогона. Повторите проверку.', 'The check was interrupted before a run was created. Re-check the project.')}
               </span>
             ) : null}
             {attempt.reason && attempt.status !== 'done' && attempt.stage !== 'drive' ? (
@@ -729,7 +731,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
           The no-targets and running states are DECISIONS, not errors — no red
           card, the main action explains itself. */}
       {mainAction.state !== 'no-targets' && (attemptFailure || runnerError || blocker) ? (
-        <div className="resume-notice danger">
+        <div className={`resume-notice ${attempt?.status === 'canceled' ? '' : 'danger'}`}>
           <strong>{attempt?.status === 'canceled' ? text('Работа остановлена', 'Work was stopped') : text('Работа не завершилась', 'Work did not finish')}</strong>
           <span>
             {blocker?.summary || (attemptFailure && !blocker ? attemptFailure : undefined) || runnerError || text('Неизвестная причина.', 'Unknown cause.')}
@@ -776,12 +778,20 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
                 {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' || mainAction.state === 'repair-current' ? <Wrench size={16} /> : mainAction.state === 'result' || mainAction.state === 'partial' || mainAction.state === 'budget-stop' || mainAction.state === 'blocked' || mainAction.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}
                 {mainLabel}
               </button>
+              {(attempt || runner?.present) && mainAction.state !== 'running' ? (
+                <button type="button" className="button secondary" data-testid="iterative-restart"
+                  disabled={busyLocked}
+                  title={text('Прежний прогон, снимки и результаты сохранятся в истории. Проверим текущие файлы проекта заново.', 'The previous run, snapshots and results stay in history. Re-check the current project files.')}
+                  onClick={() => void beginNow({ mode: 'none', checkOnly: true, restart: true })}>
+                  <RefreshCw size={16} />{text('Начать заново', 'Start over')}
+                </button>
+              ) : null}
               {mainAction.state === 'no-targets' ? (
                 <button type="button" className="button secondary" disabled={busyLocked} onClick={() => onConfigureScope?.()}>
                   <Wrench size={16} />{text('Настроить обновление', 'Configure the update')}
                 </button>
               ) : null}
-              {!busyLocked && !runner?.present && !noTargetsStep ? (
+              {!busyLocked && !runner?.present && !noTargetsStep && runner?.legacyPlanPresent ? (
                 <>
                   <button type="button" className="button secondary" title={text('Использует последний сохранённый план Baseline. Обновления не применяются; проверки нужно выполнить заново.', 'Uses the last saved Baseline plan. No updates are applied; checks must run again.')} onClick={() => void exportLegacyNow()}>
                     <FileText size={16} />{text('Создать ТЗ из прежнего плана', 'Create an assignment from an earlier plan')}

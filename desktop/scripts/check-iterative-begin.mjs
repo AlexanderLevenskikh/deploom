@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   iterativeBeginInvocation,
+  hasSavedProjectPlan,
   targetsFromDashboardRows,
   targetsFromDashboardState,
 } from "../dist-electron/iterative-begin.js";
@@ -29,6 +30,8 @@ if (JSON.stringify(targets) !== JSON.stringify(expected)) {
   throw new Error(`Target extraction mismatch: ${JSON.stringify(targets)}`);
 }
 
+if (hasSavedProjectPlan("missing-dashboard.json", "Demo")) throw Error("missing plan offered");
+
 // 2. Dashboard-state file round-trip, keyed by project.
 const root = mkdtempSync(join(tmpdir(), "iter-begin-contract-"));
 const statePath = join(root, "dashboard-state.json");
@@ -47,6 +50,11 @@ writeFileSync(
   }),
   "utf8",
 );
+if (!hasSavedProjectPlan(statePath, "DemoApp")) throw Error("existing project plan hidden");
+if (hasSavedProjectPlan(statePath, "OtherApp")) throw Error("foreign project plan offered");
+const corruptPath = join(root, "corrupt.json");
+writeFileSync(corruptPath, "{not json");
+if (hasSavedProjectPlan(corruptPath, "DemoApp")) throw Error("corrupt project plan offered");
 const projectTargets = targetsFromDashboardState(statePath, "DemoApp");
 if (JSON.stringify(projectTargets) !== JSON.stringify({ "is-number": "7.0.0", "is-finite": "1.1.0" })) {
   throw new Error(`Dashboard-state targets mismatch: ${JSON.stringify(projectTargets)}`);

@@ -55,7 +55,8 @@ import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStream
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
-import { iterativeBeginInvocation, targetsFromDashboardState } from './iterative-begin.js'
+import { hasSavedProjectPlan, iterativeBeginInvocation, targetsFromDashboardState } from './iterative-begin.js'
+import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
 import { beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, recordAttemptLog, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
 import { spawnIterativeStreamed, type CaptureResult, type StreamAttemptIo, type StreamPlatform } from './iterative-stream.js'
@@ -7589,7 +7590,9 @@ function setupIpc(): void {
       120_000,
     )
     if (result.code !== 0) {
-      return { ok: false, error: result.stderr.trim() || `LEGACY_EXPORT_EXIT_${result.code}` }
+      const failure = parseIterativeFailure(result.stdout)
+      const reason = failure?.summary || result.stderr.trim() || result.stdout.trim() || `LEGACY_EXPORT_EXIT_${result.code}`
+      return { ok: false, error: `Прежний план нельзя выгрузить: недостаточно данных. Сформируйте Draft или завершите обновление. Подробности: ${reason}` }
     }
     const task = readIterativeCurrentTask(runDir)
     return { ok: true, artifactId: task?.manifest.artifactId, stale: task ? taskStaleness(runDir).stale : undefined }
@@ -7743,6 +7746,7 @@ function setupIpc(): void {
       // exists). Lets the panel show a distinct "ready → Начать обновление"
       // state after a real check instead of conflating check with start.
       checked: readProjectCheckArtifact(runDir),
+      legacyPlanPresent: hasSavedProjectPlan(artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json'), project.name),
       requestedNode,
       runtime: runtimeView,
       attempt: readAttempt(runDir),
@@ -7751,11 +7755,23 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('flow:iterative:begin', async (_event, input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; checkOnly?: boolean; repair?: boolean }) => {
+  ipcMain.handle('flow:iterative:begin', async (_event, input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
+    if (input.restart === true || existsSync(join(runDir, 'restart-archive-transaction.json'))) {
+      const key = stepLockKey(workspace.id, project.name)
+      if (iterativeStepInFlight.has(key)) return { ok: false, step: 'begin', error: 'STEP_IN_PROGRESS' }
+      iterativeStepInFlight.add(key)
+      try {
+        const result = await spawnCapture(resolveExecutable('python'),
+          [join(bundledToolDir(), 'iterative_migration.py'), '--run-dir', runDir, 'archive-run', ...(input.restart === true ? [] : ['--recover-only'])], workspace.path, 120_000)
+        if (result.code !== 0) return { ok: false, step: 'begin', error: parseIterativeFailure(result.stdout)?.summary || result.stderr.trim() || 'Не удалось сохранить прежний прогон; повторите попытку.' }
+      } finally {
+        iterativeStepInFlight.delete(key)
+      }
+    }
     if (existsSync(join(runDir, 'repair-archive-transaction.json'))) {
       if (iterativeStepInFlight.has(stepLockKey(workspace.id, project.name))) return { ok: false, step: 'begin', error: 'STEP_IN_PROGRESS' }
       const recovery = await archiveFinishedRepairRun(runDir)
@@ -7803,7 +7819,13 @@ function setupIpc(): void {
         })
         if (result.code !== 0) {
           const canceledByUser = readAttempt(runDir)?.cancelRequested === true
-          if (canceledByUser) clearCancelRequest(runDir)
+          if (canceledByUser) {
+            clearCancelRequest(runDir)
+            const reason = 'Проверка остановлена. Результат не получен; повторите проверку, когда будете готовы.'
+            updateAttempt(runDir, { status: 'canceled', stage: 'begin', lastError: undefined, reason, lastStep: 'check', finishedAt: Date.now() })
+            publishIterativeAttempt(runDir)
+            return { ok: false, step: 'check', error: reason, attempt: readAttempt(runDir) }
+          }
           // Python PERSISTS the structured verdict before exiting non-zero, so
           // the durable project-check.json is the source of truth — a failed or
           // inconclusive check is a CONCLUDED check (repair / retry), never a
@@ -8173,7 +8195,10 @@ function setupIpc(): void {
     const updateSteps = () => updateAttempt(runDir, { stepsDone: [...steps] })
     try {
       if (!existsSync(join(runDir, 'run.json'))) {
-        return { ok: false, steps, stopped: 'error', error: 'NO_RUN', attempt: readAttempt(runDir) }
+        const error = 'Проверка была прервана до создания прогона. Нажмите «Повторить проверку»; прежние результаты сохранены.'
+        updateAttempt(runDir, { status: 'failed', lastError: error, lastStep: 'begin', finishedAt: Date.now(), runCreated: false })
+        publish()
+        return { ok: false, steps, stopped: 'error', error, attempt: readAttempt(runDir) }
       }
       // L1: rebuild the journal after a restart — same attemptId, status running.
       resumeAttempt(runDir, project.name, workspace.id)
@@ -8249,12 +8274,12 @@ function setupIpc(): void {
           updateAttempt(runDir, {
             status: canceledByUser ? 'canceled' : 'failed',
             stage: 'drive',
-            lastError: raw.slice(0, 4000),
-            reason: canceledByUser ? 'степень отменена пользователем; verified checkpoint сохранён' : result.timedOut ? `шаг ${decision.step} превысил бюджет времени` : `step ${decision.step} failed`,
+            lastError: canceledByUser ? undefined : raw.slice(0, 4000),
+            reason: canceledByUser ? 'Работа остановлена пользователем. Проверенный результат сохранён — можно продолжить.' : result.timedOut ? `шаг ${decision.step} превысил бюджет времени` : `step ${decision.step} failed`,
             lastStep: decision.step,
           })
           publish()
-          return { ok: false, steps, stopped: canceledByUser ? 'canceled' : 'error', step: decision.step, error: raw.slice(0, 4000), attempt: readAttempt(runDir) }
+          return { ok: canceledByUser, steps, stopped: canceledByUser ? 'canceled' : 'error', step: decision.step, error: canceledByUser ? undefined : raw.slice(0, 4000), attempt: readAttempt(runDir) }
         }
         steps.push(decision.step)
         updateSteps()

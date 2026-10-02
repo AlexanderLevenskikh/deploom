@@ -61,8 +61,17 @@ expect("in-flight process keeps Stop after a remount", () => {
 
 // 4. Durable journal says running but no live child (restart): resume, honest.
 expect("restored running journal (no live child) resumes", () => {
-  const a = deriveMainAction({ inFlight: false, runner: undefined, taskPresent: false, noTargets: false, attempt: attempt({ runCreated: true }) });
+  const a = deriveMainAction({ inFlight: false, runner: runner({}), taskPresent: false, noTargets: false, attempt: attempt({ runCreated: true }) });
   if (a.state !== "recovered-running") throw new Error(`expected recovered-running, got ${a.state}`);
+});
+
+expect("interrupted check without a run retries instead of driving NO_RUN", () => {
+  for (const status of ["starting", "running"]) {
+    for (const runCreated of [false, true]) {
+      const action = deriveMainAction({ inFlight: false, runner: runner({ present: false }), taskPresent: false, noTargets: false, attempt: attempt({ status, runCreated }) });
+      if (action.state !== "retry-check") throw Error(`expected retry-check: ${status}, ${runCreated}: ${action.state}`);
+    }
+  }
 });
 
 // 5. Fixable local prep blocker (uninitialized submodule): blocked with the
