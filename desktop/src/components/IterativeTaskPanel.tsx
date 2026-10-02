@@ -3,6 +3,7 @@ import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 
 import { useLanguage } from '../i18n'
 import { canApplyAttemptRead, iterativeActivity } from '../../electron/iterative-activity'
+import { startAttemptJournalPolling } from '../../electron/iterative-journal-poll'
 import { deriveMainAction, parseIterativeFailure, scenarioPipeline, PIPELINE_STAGES, type ScenarioMainActionState, type ScenarioSignal } from '../../electron/iterative-scenario'
 import type { IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
 
@@ -271,23 +272,18 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   // when the inline output is collapsed; ignore late reads from a prior run.
   useEffect(() => {
     if (!(attemptAlive || childAlive)) return
-    let alive = true
-    const poll = async () => {
+    return startAttemptJournalPolling(async () => {
       const requestedId = currentAttemptRef.current?.attemptId
-      try {
-        const result = await onAttempt(projectName)
-        if (!alive || !result.attempt || !canApplyAttemptRead(currentAttemptRef.current, result.attempt, projectName, workspaceId)) return
-        if (currentAttemptRef.current?.attemptId !== requestedId || (requestedId && result.attempt.attemptId !== requestedId)) return
-        setLogAttemptId(result.attempt.attemptId)
-        setAttemptLog(result.attemptLog ?? '')
-        setAttempt(current => current && current.lastHeartbeatAt > result.attempt!.lastHeartbeatAt ? current : result.attempt)
-      } catch { /* diagnostics best-effort */ }
-    }
-    void poll()
-    const timer = window.setInterval(() => {
-      void poll()
-    }, 2000)
-    return () => { alive = false; window.clearInterval(timer) }
+      const result = await onAttempt(projectName)
+      if (!result.attempt || !canApplyAttemptRead(currentAttemptRef.current, result.attempt, projectName, workspaceId)) return
+      if (currentAttemptRef.current?.attemptId !== requestedId || (requestedId && result.attempt.attemptId !== requestedId)) return
+      return result
+    }, result => {
+      if (!result?.attempt) return
+      setLogAttemptId(result.attempt.attemptId)
+      setAttemptLog(result.attemptLog ?? '')
+      setAttempt(current => current && current.lastHeartbeatAt > result.attempt!.lastHeartbeatAt ? current : result.attempt)
+    })
   }, [attemptAlive, childAlive, attempt?.attemptId, onAttempt, projectName, workspaceId])
 
   // Fetch the terminal tail even when neither output section is expanded.

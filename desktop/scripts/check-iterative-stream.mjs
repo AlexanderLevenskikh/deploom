@@ -10,6 +10,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { startAttemptJournalPolling } from "../dist-electron/iterative-journal-poll.js";
 import { collectStreamedLines, spawnIterativeStreamed } from "../dist-electron/iterative-stream.js";
 
 const SLEEPY = `setTimeout(() => {}, 60000)`;
@@ -140,9 +141,42 @@ const mkIo = (overrides = {}) => {
     throw new Error("the run-state block must offer the coordinator before a task exists");
   }
   if (!panel.includes("onClick={() => void toggleLog()}")) throw new Error("the log toggle must be available as soon as an attempt exists");
-  if (!panel.includes("Review re-check P2#5: while the output log is open")) {
-    throw new Error("the log must auto-refresh while a run is emitting");
+  if (!panel.includes("return startAttemptJournalPolling(")) {
+    throw new Error("the panel must subscribe to the shared live journal poller");
   }
 }
 
+// 8. Exercise the actual renderer poller, without opening the inline output.
+// It must refresh, survive a failed IPC read, serialize reads, and dispose safely.
+{
+  const observed = [];
+  let reads = 0;
+  let ready;
+  const refreshed = new Promise(resolve => { ready = resolve; });
+  const stop = startAttemptJournalPolling(async () => {
+    if (++reads === 1) throw Error("transient read failure");
+    return `current log ${reads}`;
+  }, line => { observed.push(line); if (observed.length === 2) ready(); }, 5);
+  let deadline;
+  try {
+    await Promise.race([refreshed, new Promise((_, reject) => { deadline = setTimeout(() => reject(Error("journal did not refresh")), 2000); })]);
+    if (observed[0] !== "current log 2" || observed[1] !== "current log 3") throw Error("fresh messages were not applied");
+  } finally { stop(); clearTimeout(deadline); }
+  const before = reads;
+  await new Promise(resolve => setTimeout(resolve, 20));
+  if (reads !== before) throw Error("disposed journal still polls");
+}
+{
+  let releaseRead;
+  let reads = 0;
+  let applications = 0;
+  const delayed = new Promise(resolve => { releaseRead = resolve; });
+  const stop = startAttemptJournalPolling(async () => { reads++; return await delayed; }, () => { applications++; }, 5);
+  try {
+    await new Promise(resolve => setTimeout(resolve, 25));
+    if (reads !== 1) throw Error("journal reads overlap");
+  } finally { stop(); releaseRead("late old attempt"); }
+  await new Promise(resolve => setTimeout(resolve, 0));
+  if (applications !== 0) throw Error("late IPC reply updated a disposed view");
+}
 console.log("check-iterative-stream: OK");
