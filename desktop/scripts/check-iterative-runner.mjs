@@ -246,7 +246,7 @@ if (!statusInvocation.args.includes("status") || !statusInvocation.args.includes
 
 // 10. #1 durable supervisor: the DRIVE IPC must exist, the one-shot STEP IPC
 // must be gone (drive replaces it), and the loop must stop ONLY at an agent
-// gate / finish / error / budget — never invent a step and never fabricate a
+// gate / finish / error / user cancel — never invent a step or fabricate a
 // run. Static contract on the owning source so a regression in the loop's
 // stop conditions is caught here, not in a dialog.
 {
@@ -259,8 +259,13 @@ if (!statusInvocation.args.includes("status") || !statusInvocation.args.includes
   if (!drive.includes("stopped: 'agent-gate'")) throw new Error("drive must stop at the agent GATE");
   if (!drive.includes("stopped: 'finished'")) throw new Error("drive must stop at finish");
   if (!drive.includes("stopped: 'error'")) throw new Error("drive must stop on error");
-  if (!drive.includes("45 * 60 * 1000")) throw new Error("drive must have a wall-clock budget");
-  if (!drive.includes("iteration < 50")) throw new Error("drive must have an iteration budget");
+  if (drive.includes("45 * 60 * 1000") || drive.includes("iteration < 50")) {
+    throw new Error("drive must not stop on an implicit time or batch budget");
+  }
+  if (!drive.includes("while (true)") || !drive.includes("stopped: 'canceled'") ||
+      !drive.includes("readAttempt(runDir)?.cancelRequested")) {
+    throw new Error("unbounded drive must preserve its durable user-cancel gate");
+  }
   if (!drive.includes("'NO_RUN'")) throw new Error("drive must refuse a missing run (NO_RUN), never fabricate begin");
   if (!/(?:decideNextStep\(runDir, payload\))/.test(drive)) throw new Error("drive must recompute the decision from durable state each iteration");
   if (!/IterativeDriveOutcome/.test(types)) throw new Error("IterativeDriveOutcome must exist in types.ts");
