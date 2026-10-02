@@ -1180,6 +1180,7 @@ def build_verification_proof_identity(
     environment: Mapping[str, str],
     source_snapshot_key: str = "",
     resolver_overrides: Mapping[str, str] | None = None,
+    assignment_semantics: str = "exact",
 ) -> VerificationProofIdentity:
     logical_project_dir = project_dir.resolve()
     active = active_source_snapshot(logical_project_dir)
@@ -1192,7 +1193,10 @@ def build_verification_proof_identity(
         active = validate_source_snapshot(active)
     project_dir = active.project_path if active is not None else logical_project_dir
     source_key = str(source_snapshot_key or (active.key if active is not None else source_snapshot_fingerprint(logical_project_dir)))
+    if assignment_semantics not in {"exact", "declared-selectors"}:
+        raise ValueError("ASSIGNMENT_SEMANTICS_INVALID")
     assignment_key = _canonical_hash({
+        **({"assignmentSemantics": assignment_semantics} if assignment_semantics != "exact" else {}),
         "assignment": sorted((str(k), str(v)) for k, v in assignment.items()),
         "removals": sorted(str(item) for item in remove_packages),
         "resolverOverrides": sorted(

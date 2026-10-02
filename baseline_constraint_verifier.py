@@ -14,6 +14,8 @@ are fed back into planning before any Executor branch is created.
 """
 from __future__ import annotations
 
+from semantic_version import NpmSpec, Version
+
 import atexit
 import contextlib
 import dataclasses
@@ -152,7 +154,8 @@ class BaselineVerifyConfig:
     progress_interval_seconds: int = 15
     # Performance policy only. The low-level boolean is retained for legacy
     # callers, while Baseline uses verification_purpose as the typed publication
-    # policy. Neither field participates in proof authority.
+    # policy. Non-exact baseline-control assignments also use a separate declared
+    # selector proof contract; exact assignments retain their original authority.
     publish_durable_prepared_artifact: bool = True
     # BLOCK_PSI4_ROLE_BASED_PUBLICATION_V1
     # legacy | intermediate-candidate | exact-failure-confirmation |
@@ -2345,6 +2348,20 @@ def _installed_package_json_path(
         cursor = parent
 
 
+def _is_exact_assignment_version(target: str) -> bool:
+    try:
+        return str(Version(str(target))) == str(target)
+    except ValueError:
+        return False
+
+
+def _assignment_observation_semantics(config: BaselineVerifyConfig, assignment: Mapping[str, str]) -> str:
+    if (_verification_purpose(config) == "baseline-control"
+            and any(not _is_exact_assignment_version(target) for target in assignment.values())):
+        return "declared-selectors"
+    return "exact"
+
+
 def observed_resolved_assignment(
     project_dir: Path,
     assignment: Mapping[str, str],
@@ -2352,8 +2369,9 @@ def observed_resolved_assignment(
     remove_packages: Iterable[str] = (),
     package_manager_root: Optional[Path] = None,
     authorized_roots: Iterable[Path] = (),
+    allow_declared_selectors: bool = False,
 ) -> Dict[str, str]:
-    """Observe the full direct assignment actually installed by the package manager."""
+    """Observe the installed assignment; control selectors resolve to exact versions."""
     try:
         manifest = json.loads((project_dir / "package.json").read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError) as exc:
@@ -2410,7 +2428,26 @@ def observed_resolved_assignment(
             raise ObservedResolutionError(
                 f"OBSERVED_RESOLVED_ASSIGNMENT_INVALID: {name}: {exc}"
             ) from exc
-        if version != target:
+        matches_target = version == target
+        if not matches_target and allow_declared_selectors and not _is_exact_assignment_version(target):
+            # Control checks start from manifest selectors, not solver-selected
+            # exact versions. Resolve once, then pin observed versions in the
+            # proof hash; lifecycle/project checks still reject any later drift.
+            declarations_match = all(str(manifest[section][name]) == target
+                                     for section in declared_sections)
+            if declarations_match:
+                try:
+                    matches_target = NpmSpec(target).match(Version(version))
+                except ValueError:
+                    # A registry tag has no local semver predicate. The package
+                    # manager resolves it; the resulting exact tree/lock is the
+                    # control subject, never a migration objective.
+                    try:
+                        Version(version)
+                        matches_target = not is_fixed_manifest_spec(target)
+                    except ValueError:
+                        matches_target = False
+        if not matches_target:
             raise ObservedResolutionError(
                 f"OBSERVED_RESOLVED_ASSIGNMENT_DRIFT: "
                 f"{name} expected={target} observed={version or '<missing-version>'}"
@@ -2757,6 +2794,7 @@ def verify_assignment(
                 commands=config.commands if run_project_checks else (),
                 environment=base_env,
                 source_snapshot_key=source_snapshot.key,
+                assignment_semantics=_assignment_observation_semantics(config, assignment),
             )
         elif proof_identity.source_snapshot_key != source_snapshot.key:
             return BaselineVerifyResult(
@@ -3156,6 +3194,7 @@ def verify_assignment(
                     assignment,
                     remove_packages=remove_packages,
                     package_manager_root=package_manager_project,
+                    allow_declared_selectors=_verification_purpose(config) == "baseline-control",
                 )
                 observed_hash = observed_resolved_hash(observed_versions)
             except ObservedResolutionError as exc:
@@ -3525,6 +3564,7 @@ def verify_assignment(
                                     assignment,
                                     remove_packages=remove_packages,
                                     package_manager_root=seed_package_manager,
+                                    allow_declared_selectors=_verification_purpose(config) == "baseline-control",
                                 )
                                 seed_observed_hash = observed_resolved_hash(
                                     seed_observed
@@ -3720,6 +3760,7 @@ def verify_assignment(
                     lifecycle_observed = observed_resolved_assignment(
                         workspace_project, assignment, remove_packages=remove_packages,
                         package_manager_root=package_manager_project,
+                        allow_declared_selectors=_verification_purpose(config) == "baseline-control",
                     )
                     lifecycle_observed_hash = observed_resolved_hash(lifecycle_observed)
                 except ObservedResolutionError as exc:
@@ -4103,6 +4144,7 @@ def verify_assignment(
                             remove_packages=remove_packages,
                             package_manager_root=(command_root / package_manager_relative_to_workspace),
                             authorized_roots=guarded_clone_authorized_roots(command_root),
+                            allow_declared_selectors=_verification_purpose(config) == "baseline-control",
                         )
                         if observed_resolved_hash(precheck_observed) != observed_hash:
                             drifted = sorted(
@@ -4324,6 +4366,7 @@ def verify_assignment(
                             command_project, assignment, remove_packages=remove_packages,
                             package_manager_root=(command_root / package_manager_relative_to_workspace),
                             authorized_roots=guarded_clone_authorized_roots(command_root),
+                            allow_declared_selectors=_verification_purpose(config) == "baseline-control",
                         )
                         check_observed_hash = observed_resolved_hash(check_observed)
                     except ObservedResolutionError as exc:
@@ -4921,6 +4964,7 @@ def verify_assignment(
             project_checks=config.project_checks if run_project_checks else "off",
             commands=config.commands if run_project_checks else (),
             environment=environment,
+            assignment_semantics=_assignment_observation_semantics(config, assignment),
         )
     except SourceIdentityUnavailable as exc:
         return BaselineVerifyResult(False, "infrastructure", str(exc))
