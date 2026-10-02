@@ -725,31 +725,55 @@ def _source_hash_workers() -> int:
     return max(2, min(8, logical // 2 or 1))
 
 
-def _directory_stability_stamp(path: Path, *, relative: Path = Path(".")) -> tuple[object, ...]:
+def _directory_stability_stamp(
+    path: Path, *, relative: Path = Path("."), policy: Optional[SourceInputPolicy] = None,
+) -> tuple[object, ...]:
+    """Compare semantic membership/identities, not directory timestamp noise.
+
+    File metadata is rechecked even after its hash completed. Directory swaps,
+    additions/removals and reparse changes remain failures. Only explicit source
+    exclusions (including Git writer locks) are omitted from membership.
+    """
+    policy = policy or SourceInputPolicy()
     try:
         value = path.stat(follow_symlinks=False)
-    except OSError as exc:
-        raise SourceCaptureError(f"SOURCE_DIRECTORY_UNREADABLE: {path}: {exc}") from exc
-    if ".git" not in relative.parts:
-        return (
-            "strict",
-            int(value.st_mtime_ns),
-            int(value.st_size),
-            int(getattr(value, "st_ino", 0)),
-        )
-    # Git writers create/remove *.lock names as their atomic update protocol.
-    # Preserve persistent-entry detection while ignoring only those synchronization names.
-    try:
+        inode = int(getattr(value, "st_ino", 0))
+        identity = (int(value.st_dev), inode, stat.S_IFMT(value.st_mode),
+                    int(getattr(value, "st_reparse_tag", 0)))
+        if not inode:
+            # Without a file identity, retain the old conservative guard.
+            identity += (int(value.st_mtime_ns), int(value.st_size))
+        children = []
         with os.scandir(path) as iterator:
-            names = sorted(
-                item.name
-                for item in iterator
-                if not _is_ephemeral_git_admin_path(relative / item.name)
-            )
+            for item in iterator:
+                if _excluded(relative / item.name, policy):
+                    continue
+                # Windows DirEntry.stat omits file IDs; query the path so
+                # directory identity does not fall back to timestamp noise.
+                child = Path(item.path).stat(follow_symlinks=False)
+                child_inode = int(getattr(child, "st_ino", 0))
+                child_identity = (int(child.st_dev), child_inode, stat.S_IFMT(child.st_mode),
+                                  int(getattr(child, "st_reparse_tag", 0)))
+                if not stat.S_ISDIR(child.st_mode) or not child_inode:
+                    child_identity += (int(child.st_size), int(child.st_mtime_ns),
+                                       int(child.st_ctime_ns), int(child.st_mode),
+                                       int(getattr(child, "st_nlink", 1)))
+                if stat.S_ISLNK(child.st_mode):
+                    child_identity += (os.readlink(item.path),)
+                children.append((item.name, child_identity))
     except OSError as exc:
         raise SourceCaptureError(f"SOURCE_DIRECTORY_UNREADABLE: {path}: {exc}") from exc
-    name_key = hashlib.sha256("\0".join(names).encode("utf-8", errors="surrogatepass")).hexdigest()
-    return ("git-admin", int(getattr(value, "st_ino", 0)), name_key)
+    return ("semantic-membership", identity, tuple(sorted(children)))
+
+
+def _directory_stamp_change(before: tuple[object, ...], after: tuple[object, ...]) -> str:
+    if before[1] != after[1]:
+        return "directory identity changed"
+    old, new = dict(before[2]), dict(after[2])
+    added = sorted(new.keys() - old.keys())
+    removed = sorted(old.keys() - new.keys())
+    changed = sorted(name for name in old.keys() & new.keys() if old[name] != new[name])
+    return f"added={added[:5]!r}, removed={removed[:5]!r}, changed={changed[:5]!r}"
 
 
 def _build_source_tree_manifest_impl(
@@ -836,7 +860,7 @@ def _build_source_tree_manifest_impl(
         def walk(directory: Path, relative_dir: Path) -> None:
             nonlocal directories
             tick()
-            directory_stamps.append((directory, relative_dir, _directory_stability_stamp(directory, relative=relative_dir)))
+            directory_stamps.append((directory, relative_dir, _directory_stability_stamp(directory, relative=relative_dir, policy=policy)))
             try:
                 with os.scandir(directory) as iterator:
                     scanned = sorted(iterator, key=lambda entry: entry.name)
@@ -924,9 +948,11 @@ def _build_source_tree_manifest_impl(
             drain_one()
 
     for directory, relative_dir, stamp in directory_stamps:
-        if _directory_stability_stamp(directory, relative=relative_dir) != stamp:
+        observed_stamp = _directory_stability_stamp(directory, relative=relative_dir, policy=policy)
+        if observed_stamp != stamp:
             raise SourceCaptureError(
-                f"SOURCE_CAPTURE_UNSTABLE: directory changed while hashing: {directory}"
+                f"SOURCE_CAPTURE_UNSTABLE: directory changed while hashing: {directory}; "
+                f"{_directory_stamp_change(stamp, observed_stamp)}"
             )
 
     entries.sort(key=lambda entry: str(entry["path"]))
