@@ -894,7 +894,24 @@ textarea::placeholder {
    emphasised, the rest stay neutral. */
 .iterative-pipeline { margin: 0 0 14px; padding: 10px 14px; display: flex; align-items: center; gap: 12px; overflow-x: auto; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
 .iterative-pipeline-step { display: flex; align-items: center; gap: 7px; flex: 0 0 auto; }
-.iterative-pipeline-connector { flex: 1 0 24px; min-width: 24px; height: 2px; background: var(--border); }
+.iterative-pipeline-connector { flex: 1 0 24px; min-width: 24px; height: 3px; background: var(--border); position: relative; overflow: hidden; border-radius: 3px; }
+.iterative-pipeline-connector > span { display: block; height: 100%; background: var(--blue); width: 0; transition: width .4s ease; }
+.iterative-pipeline-connector.working.indeterminate > span { width: 40%; animation: iterative-connector-progress 1.8s ease-in-out infinite; }
+@keyframes iterative-connector-progress { from { transform: translateX(-100%); } to { transform: translateX(350%); } }
+@media (prefers-reduced-motion: reduce) { .iterative-pipeline-connector.working.indeterminate > span { animation: none; width: 100%; opacity: .6; } .iterative-pipeline-connector > span { transition: none; } }
+.iterative-run-diagnostics { margin: 16px 0; padding: 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); min-width: 0; }
+.iterative-run-diagnostics header { display: flex; gap: 12px; flex-wrap: wrap; justify-content: space-between; }
+.iterative-run-diagnostics header strong { display: flex; align-items: center; gap: 8px; }
+.iterative-run-diagnostics header span, .iterative-run-diagnostics dt { color: var(--text-muted); }
+.iterative-run-diagnostics dl { display: grid; gap: 8px; font-size: 11px; }
+.iterative-run-diagnostics dl > div { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 8px; }
+.iterative-run-diagnostics dd { margin: 0; overflow-wrap: anywhere; }
+.iterative-run-diagnostics p { overflow-wrap: anywhere; }
+.iterative-log-toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.iterative-log-toolbar [aria-pressed=true] { border-color: var(--blue); color: var(--blue); }
+.flow-legacy-history { margin-top: 18px; }
+.flow-legacy-history > summary { color: var(--text-muted); cursor: pointer; }
+@media (max-width: 600px) { .iterative-run-diagnostics dl > div { grid-template-columns: 1fr; gap: 2px; } }
 .iterative-pipeline-connector.on { background: var(--green); }
 .iterative-pipeline-dot { width: 20px; height: 20px; flex: 0 0 20px; display: grid; place-items: center; border-radius: 50%; font-size: 10px; font-weight: 700; color: var(--text-muted); background: var(--surface-hover); border: 1px solid var(--border); }
 .iterative-pipeline-step.done .iterative-pipeline-dot { color: var(--green); background: var(--green-soft); border-color: var(--green); }

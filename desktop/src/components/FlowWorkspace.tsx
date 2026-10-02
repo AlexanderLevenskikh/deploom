@@ -10,6 +10,7 @@ import { BaselineIntentDialog } from './BaselineIntentDialog'
 import { LogPanel } from './LogPanel'
 import { PromptPreviewDialog } from './PromptPreviewDialog'
 import { IterativeTaskPanel } from './IterativeTaskPanel'
+import { IterativeRunDiagnostics } from './IterativeRunDiagnostics'
 import { normalizeBaselineIntentPlan } from '../data/baselineIntent'
 import type { ScenarioSignal } from '../../electron/iterative-scenario'
 import type { DraftProgressPayload } from '../hooks/useDependencyFlow'
@@ -182,7 +183,8 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   // P1#1: the deterministic iterative scenario owns the ONE main action. The
   // panel mirrors it here; while a signal is present, the hero never renders
   // its own competing legacy FLOW primary.
-  const [scenarioSignal, setScenarioSignal] = useState<ScenarioSignal | undefined>(undefined)
+  const [reportedScenario, setScenarioSignal] = useState<ScenarioSignal | undefined>(undefined)
+  const scenarioSignal = reportedScenario?.projectName === project.name && reportedScenario.workspaceId === details.workspace.id ? reportedScenario : undefined
   const scenarioOnScenario = setScenarioSignal
   const displayedAction = FLOW_STAGES[displayedIndex].action
   const releaseBlocked = displayedAction === 'release' && !acceptanceAccepted
@@ -448,7 +450,10 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   const humanDeferredUpdates = baselineDecision?.bestIncumbent?.deferred_targets?.length
   const humanRemainingUpdates = details.migrationProgress?.unmetPackages.length
   const humanFreshness = typeof currentLevel?.lagOkPct === 'number' ? `${currentLevel.lagOkPct.toFixed(1)}%` : '—'
-  const humanStatusTitle = flowComplete
+  const currentScenario = !active ? scenarioSignal : undefined
+  const humanStatusTitle = currentScenario
+    ? (currentScenario.running || currentScenario.attempt?.status === 'failed' || currentScenario.attempt?.status === 'canceled' || currentScenario.state === 'recovered-running' ? currentScenario.activity.title : currentScenario.state === 'ready' ? text('Проект готов к обновлению', 'Project ready to update') : currentScenario.label)
+    : flowComplete
     ? text('Полезный результат готов', 'Useful result is ready')
     : draftLaunchActive
       ? text('Готовим черновой план', 'Preparing a draft plan')
@@ -463,7 +468,9 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
               : acceptanceUnknown && completed.has('audit')
                 ? text('Нужен свежий аудит', 'A fresh audit is required')
                 : text('Готовы к следующему шагу', 'Ready for the next step')
-  const humanStatusBody = flowComplete
+  const humanStatusBody = currentScenario
+    ? [currentScenario.running ? currentScenario.activity.detail : currentScenario.description, currentScenario.attempt ? `${text('прошло', 'elapsed')} ${currentScenario.elapsed}` : ''].filter(Boolean).join(' · ')
+    : flowComplete
     ? text('Все обязательные проверки пройдены. Можно остановиться здесь или позже вернуться к оставшимся обновлениям.', 'All required checks passed. You can stop here or return to the remaining upgrades later.')
     : draftLaunchActive
       ? text('Черновой план строится без установки и physical-проверок: инвентаризация → обогащение → публикация промпта. Проект не изменяется.', 'The draft plan is built without installing or physical checks: inventory → enrichment → prompt publication. The project is left untouched.')
@@ -477,15 +484,15 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
             ? text('Данные безопасности неполные или устарели. Нужен новый независимый аудит перед принятием результата.', 'Security evidence is incomplete or stale. A fresh independent audit is required before accepting the result.')
             : text('DepLoom покажет здесь только полезное состояние работы. Подробные стадии и диагностика спрятаны ниже.', 'DepLoom shows only useful work state here. Detailed stages and diagnostics are kept below.')
   const humanPrimaryStage = FLOW_STAGES[activeIndex]
-  const artifactsPath = `${details.workspace.path}/.dependency-roadmap/artifacts/runs`
+  const artifactsPath = currentScenario?.attempt ? (currentScenario.runDir ?? `${details.workspace.path}/.dependency-roadmap/iterative`) : `${details.workspace.path}/.dependency-roadmap/artifacts/runs`
 
   return (
     <section className="flow-workspace">
 
       <section className="human-flow-card" aria-label={text('Состояние обновления зависимостей', 'Dependency upgrade status')}>
         <div className="human-flow-hero">
-          <span className={`human-flow-icon ${flowComplete || baselineDecision?.bestIncumbent ? 'success' : active ? 'active' : acceptanceNeedsRemediation ? 'warning' : ''}`}>
-            {active ? <LoaderCircle className="spin" size={22} /> : <ShieldCheck size={22} />}
+          <span className={`human-flow-icon ${currentScenario ? (currentScenario.running ? 'active' : currentScenario.attempt?.status === 'failed' ? 'warning' : '') : flowComplete || baselineDecision?.bestIncumbent ? 'success' : active ? 'active' : acceptanceNeedsRemediation ? 'warning' : ''}`}>
+            {active || currentScenario?.running ? <LoaderCircle className="spin" size={22} /> : <ShieldCheck size={22} />}
           </span>
           <div><h2>{humanStatusTitle}</h2><p>{humanStatusBody}</p></div>
         </div>
@@ -496,9 +503,9 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
             improvements) without duplicating the primary action or the metrics. */}
         {scenarioSignal ? (
           <div className="human-flow-utility">
-            <button className="button secondary" disabled={active} onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button>
-            {draftResult ? <button className="button secondary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Последний Draft / История', 'Last Draft / History')}</button> : null}
-            <button className="button secondary" disabled={!run && !activeAction} onClick={() => void onOpenPath(artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
+            <button className="button secondary" disabled={active || scenarioSignal.running} onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button>
+            {draftResult ? <button className="button secondary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Последний Draft', 'Last Draft')}</button> : null}
+            <button className="button secondary" disabled={!run && !activeAction && !scenarioSignal?.attempt} onClick={() => void onOpenPath(artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
             {flowComplete && acceptanceAccepted ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} />{text('Продолжить улучшение', 'Continue improving')}</button> : null}
           </div>
         ) : (
@@ -529,7 +536,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
               Baseline. The planner still guards what a Draft may do. */}
           {!active ? <button className="button secondary" onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button> : null}
           {flowComplete && acceptanceAccepted ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} />{text('Продолжить улучшение', 'Continue improving')}</button> : null}
-          {draftResult ? <button className="button secondary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Последний Draft / История', 'Last Draft / History')}</button> : null}
+          {draftResult ? <button className="button secondary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Последний Draft', 'Last Draft')}</button> : null}
           <button className="button secondary" disabled={!run && !activeAction} onClick={() => void onOpenPath(artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
         </div>
         {draftResult ? <div className={`draft-result-card${draftResultFresh ? ' fresh' : ''}`}>
@@ -653,7 +660,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
       <details className="flow-technical-details">
         <summary>{text('Технические детали', 'Technical details')}</summary>
         <div className="flow-technical-details-body">
-          <p className="flow-artifact-note">{text('Подробные stdout/stderr и служебные события автоматически сохраняются в .dependency-roadmap/artifacts/runs. Эти данные нужны для диагностики и не определяют результат.', 'Detailed stdout/stderr and service events are saved automatically under .dependency-roadmap/artifacts/runs. They are diagnostic only and do not determine the result.')}</p>
+          <p className="flow-artifact-note">{text('Текущая попытка сохраняет stdout/stderr и служебные события в attempt.log в каталоге итеративного запуска. Журналы прежнего FLOW / Draft находятся в .dependency-roadmap/artifacts/runs. Логи нужны для диагностики и не определяют результат.', 'The current attempt saves stdout/stderr and service events to attempt.log in the iterative run directory. Previous FLOW / Draft logs are under .dependency-roadmap/artifacts/runs. Logs are diagnostic only and do not determine the result.')}</p>
       <div className="project-facts">
         <div><span>{t('flow.projectPath')}</span><strong title={project.path}>{project.path}</strong></div>
         <div><span>{text('Acceptance', 'Acceptance')}</span><strong className="level-label" title={acceptance?.reasons.join(' · ')}><i className={`status-dot ${acceptanceTone}`} />{acceptanceLabel}{typeof acceptance?.critical === 'number' && typeof acceptance?.high === 'number' ? ` · C${acceptance.critical}/H${acceptance.high}` : ''}</strong></div>
@@ -667,6 +674,10 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         </div>
       </div>
 
+      {currentScenario ? <IterativeRunDiagnostics signal={currentScenario} /> : null}
+      <details className="flow-legacy-history" open={currentScenario ? undefined : true}>
+        <summary>{active ? text('Текущий FLOW / Draft', 'Current FLOW / Draft') : text('Прежний FLOW / история (отдельный запуск)', 'Previous FLOW / history (separate run)')}</summary>
+        {currentScenario ? <p className="flow-artifact-note">{text('Эти этапы и ошибки относятся к прежнему FLOW. Они не описывают текущую итеративную попытку выше.', 'These stages and errors belong to the previous FLOW. They do not describe the current iterative attempt above.')}</p> : null}
       <div className="run-progress">
         <span>{t('flow.runProgress')}</span><div className="progress-track"><div style={{ width: `${Math.round((completedStageCount / ACTION_ORDER.length) * 100)}%` }} /></div><strong>{t('flow.commandsCompleted', { done: completedStageCount, total: ACTION_ORDER.length })}</strong>
         <label className="run-label">{t('flow.label')}<input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="deps-2026-q3" /></label>
@@ -778,12 +789,17 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
           </>}
         </div>
       </div>
+      </details>
         </div>
       </details>
-      {logs ? <details className="flow-technical-details flow-logs-details">
+      <details className="flow-technical-details flow-logs-details">
         <summary>{text('Логи запуска', 'Run logs')}</summary>
-        <LogPanel logs={logs} environment={{} as EnvironmentInfo} showEnvironment={false} active={active} activeJobId={activeRunId} activeAction={activeAction} runStartedAt={activeRunStartedAt} migrationProgress={details.migrationProgress} onSendAgentNote={onSendAgentNote} onCancel={onCancelJob ?? (async () => {})} onClear={onClearLogs ?? (() => {})} />
-      </details> : null}
+        {currentScenario ? <IterativeRunDiagnostics signal={currentScenario} logs /> : null}
+        {logs?.length || active ? <details className="flow-legacy-history" open={active ? true : undefined}>
+          <summary>{active ? text('Журнал текущего FLOW / Draft', 'Current FLOW / Draft log') : text('Журнал прежнего FLOW / Draft (отдельный запуск)', 'Previous FLOW / Draft log (separate run)')}</summary>
+          <LogPanel logs={logs ?? []} environment={{} as EnvironmentInfo} showEnvironment={false} showRunMonitor={active} active={active} activeJobId={activeRunId} activeAction={activeAction} runStartedAt={activeRunStartedAt} migrationProgress={details.migrationProgress} onSendAgentNote={onSendAgentNote} onCancel={onCancelJob ?? (async () => {})} onClear={onClearLogs ?? (() => {})} />
+        </details> : null}
+      </details>
       {selectedBranchFailure?.runtime?.phase === 'failed' ? <BranchFailureModal branch={selectedBranchFailure} onClose={() => setSelectedBranchFailure(null)} /> : null}
       {baselineIntentDialog ? <BaselineIntentDialog mode={baselineIntentDialog.mode} resume={baselineIntentDialog.resume} plan={baselineIntentDialog.plan} decision={baselineIntentDialog.decision} onCancel={() => { setBaselineIntentDialog(undefined); if (baselineIntentDialog.mode === 'decision') setBaselineDecisionDismissed(true) }} onSubmit={runBaselineIntent} /> : null}
       {draftPromptPreview ? <PromptPreviewDialog preview={draftPromptPreview} onClose={() => setDraftPromptPreview(undefined)} onOpenPath={onOpenPath} /> : null}

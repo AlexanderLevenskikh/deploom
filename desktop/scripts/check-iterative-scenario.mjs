@@ -4,6 +4,8 @@
 // sources. Requires the electron TS to be compiled first (precheck: tsc).
 import { deriveMainAction, parseIterativeFailure, scenarioPipeline } from "../dist-electron/iterative-scenario.js";
 
+import { canApplyAttemptRead, iterativeActivity } from "../dist-electron/iterative-activity.js";
+
 let failures = 0;
 function expect(name, fn) {
   try {
@@ -257,6 +259,46 @@ expect("pipeline: bootstrap agent still repairs the initial check", () => {
 expect("pipeline: generic busy flag cannot manufacture completion", () => {
   const p = scenarioPipeline("running", false);
   if (p.current !== "check" || p.completed.length !== 0) throw new Error(JSON.stringify(p));
+});
+
+expect("activity: capture reports actual files and bytes, never an invented percent", () => {
+  const result = iterativeActivity(attempt({ phase: "source-materialization: source capture sealed-manifest: files=25362, bytes=4589080824", targetSource: "discovery", packageProgress: { processed: 20, total: 30 } }), true, "en");
+  if (result.title !== "Preparing an isolated project copy" || !result.detail.includes("25,362") || !result.detail.includes("4.27") || result.percent !== undefined) throw new Error(JSON.stringify(result));
+});
+expect("activity: discovery has a measured denominator", () => {
+  const result = iterativeActivity(attempt({ phase: "begin.discovery-progress", packageProgress: { processed: 12, total: 30 } }), true, "ru");
+  if (result.percent !== 40 || !result.detail.includes("12/30")) throw new Error(JSON.stringify(result));
+});
+expect("activity: resolver and project checks remain indeterminate", () => {
+  for (const [phase, title] of [["resolver-install: running", "Installing dependencies in the verification copy"], ["lifecycle: npm run test", "Running project checks"]]) {
+    const result = iterativeActivity(attempt({ phase }), true, "en");
+    if (result.title !== title || result.percent !== undefined) throw new Error(JSON.stringify(result));
+  }
+});
+expect("activity: a restored running journal never pretends a child is working", () => {
+  const result = iterativeActivity(attempt({ phase: "begin.discovery-progress", packageProgress: { processed: 12, total: 30 } }), false, "en");
+  if (result.title !== "Work interrupted — ready to resume" || result.percent !== undefined) throw new Error(JSON.stringify(result));
+});
+expect("activity: failed and canceled attempts drop stale progress", () => {
+  for (const status of ["failed", "canceled"]) {
+    const result = iterativeActivity(attempt({ status, phase: "begin.discovery-progress", packageProgress: { processed: 12, total: 30 } }), false, "en");
+    if (result.percent !== undefined || result.detail) throw new Error(JSON.stringify(result));
+  }
+});
+expect("activity: malformed counters cannot manufacture progress", () => {
+  for (const counter of [{ processed: 10, total: 0 }, { processed: -1, total: 10 }, { processed: 11, total: 10 }, { processed: NaN, total: 10 }]) {
+    const result = iterativeActivity(attempt({ phase: "begin.discovery-progress", packageProgress: counter }), true, "en");
+    if (result.percent !== undefined) throw new Error(JSON.stringify(result));
+  }
+});
+
+expect("journal: delayed reads cannot resurrect an old attempt or a completed process", () => {
+  const current = attempt({ attemptId: "new", workspaceId: "w", lastHeartbeatAt: 100, status: "failed" });
+  for (const incoming of [attempt({ attemptId: "old", workspaceId: "w", lastHeartbeatAt: 200 }), attempt({ attemptId: "new", workspaceId: "other", lastHeartbeatAt: 200 }), attempt({ attemptId: "new", workspaceId: "w", lastHeartbeatAt: 90 }), attempt({ attemptId: "new", workspaceId: "w", lastHeartbeatAt: 100 })]) {
+    if (canApplyAttemptRead(current, incoming, "Demo", "w")) throw new Error(JSON.stringify(incoming));
+  }
+  if (!canApplyAttemptRead(current, { ...current, status: "running", lastHeartbeatAt: 200 }, "Demo", "w")) throw new Error("fresh resume was rejected");
+  if (!canApplyAttemptRead(undefined, current, "Demo", "w")) throw new Error("initial read was rejected");
 });
 
 if (failures > 0) {

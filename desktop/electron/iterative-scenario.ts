@@ -107,11 +107,18 @@ export type ScenarioMainAction = {
  * so the legacy FLOW button and the panel stop competing: ONE control, ONE
  * state machine. `act` is the panel's own handler. */
 export type ScenarioSignal = {
+  projectName: string
+  workspaceId?: string
   state: ScenarioMainActionState
   label: string
   description: string
   running: boolean
   enabled: boolean
+  activity: { title: string; detail: string; percent?: number }
+  elapsed: string
+  attempt?: { attemptId: string; status: string; stage: string; phase?: string; lastHeartbeatAt: number; lastError?: string; reason?: string }
+  attemptLog?: string
+  runDir?: string
   act: () => void
 }
 

@@ -2,6 +2,7 @@ import { Check, ChevronDown, ChevronUp, Clipboard, ExternalLink, FileText, Refre
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 
 import { useLanguage } from '../i18n'
+import { canApplyAttemptRead, iterativeActivity } from '../../electron/iterative-activity'
 import { deriveMainAction, parseIterativeFailure, scenarioPipeline, PIPELINE_STAGES, type ScenarioMainActionState, type ScenarioSignal } from '../../electron/iterative-scenario'
 import type { IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
 
@@ -125,6 +126,9 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   // live event stream from main.ts so the first click is observable without a poll.
   const [attempt, setAttempt] = useState<IterativeAttemptView>()
   const [attemptLog, setAttemptLog] = useState<string>()
+  const [logAttemptId, setLogAttemptId] = useState<string>()
+  const currentAttemptRef = useRef<IterativeAttemptView | undefined>(undefined)
+  currentAttemptRef.current = attempt
   const [showLog, setShowLog] = useState(false)
   const [noTargetsStep, setNoTargetsStep] = useState(false)
   const [showDiag, setShowDiag] = useState(false)
@@ -207,9 +211,10 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         if (!alive) return
         // Guard late responses: only apply an attempt that belongs to THIS
         // project (the read may have been issued for the previous project).
-        if (result.attempt && result.attempt.projectName === projectName) {
+        if (result.attempt && canApplyAttemptRead(currentAttemptRef.current, result.attempt, projectName, workspaceId)) {
           setAttempt(result.attempt)
-          if (result.attemptLog) setAttemptLog(result.attemptLog)
+          setLogAttemptId(result.attempt.attemptId)
+          setAttemptLog(result.attemptLog ?? '')
         }
         if (result.attempt?.projectName === projectName && result.attempt?.lastStep === 'no-targets') setNoTargetsStep(true)
       } catch {
@@ -217,7 +222,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       }
     })()
     return () => { alive = false }
-  }, [onAttempt, projectName, refreshKey])
+  }, [onAttempt, projectName, workspaceId, refreshKey])
 
   // L1: live event stream carries the newest journal snapshot for THIS project.
   // Review re-check (#3): when a launch FOREIGN to this component instance
@@ -228,16 +233,19 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   // P2 (#2): the stream is WORKSPACE-scoped — a same-named project of a
   // different workspace must never leak into this panel.
   const liveAttemptStatus = useRef<string | undefined>(undefined)
+  const liveAttemptId = useRef<string | undefined>(undefined)
   useEffect(() => {
     if (!liveAttempt || liveAttempt.projectName !== projectName) return
     if (workspaceId !== undefined && liveAttempt.workspaceId !== undefined && liveAttempt.workspaceId !== workspaceId) return
     const previous = liveAttemptStatus.current
+    const previousId = liveAttemptId.current
     liveAttemptStatus.current = liveAttempt.status
+    liveAttemptId.current = liveAttempt.attemptId
     setAttempt(liveAttempt)
     if (liveAttempt.lastStep === 'no-targets') setNoTargetsStep(true)
     const nowTerminal = liveAttempt.status === 'done' || liveAttempt.status === 'failed' || liveAttempt.status === 'canceled'
     const leftLive = (previous === 'running' || previous === 'starting') && liveAttempt.status !== previous
-    if (nowTerminal || leftLive) void refreshRunner()
+    if (nowTerminal || leftLive || previousId !== liveAttempt.attemptId || ((liveAttempt.status === 'running' || liveAttempt.status === 'starting') && previous !== liveAttempt.status)) void refreshRunner()
   }, [liveAttempt, projectName, workspaceId, refreshRunner])
 
   // Elapsed counter while an attempt is alive.
@@ -259,22 +267,41 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   const attemptTerminal = Boolean(attempt && (attempt.status === 'done' || attempt.status === 'failed' || attempt.status === 'canceled'))
   const childAlive = stepBusy || (runner?.inFlight === true && !attemptTerminal)
 
-  // Review re-check P2#5: while the output log is open and a run is actively
-  // emitting, re-read the journal tail periodically so the user sees live
-  // progress even though the child's stdout only lands in the journal.
+  // Both output surfaces share this attempt-scoped journal tail. Poll even
+  // when the inline output is collapsed; ignore late reads from a prior run.
   useEffect(() => {
-    if (!showLog || !(attemptAlive || childAlive)) return
+    if (!(attemptAlive || childAlive)) return
+    let alive = true
+    const poll = async () => {
+      const requestedId = currentAttemptRef.current?.attemptId
+      try {
+        const result = await onAttempt(projectName)
+        if (!alive || !result.attempt || !canApplyAttemptRead(currentAttemptRef.current, result.attempt, projectName, workspaceId)) return
+        if (currentAttemptRef.current?.attemptId !== requestedId || (requestedId && result.attempt.attemptId !== requestedId)) return
+        setLogAttemptId(result.attempt.attemptId)
+        setAttemptLog(result.attemptLog ?? '')
+        setAttempt(current => current && current.lastHeartbeatAt > result.attempt!.lastHeartbeatAt ? current : result.attempt)
+      } catch { /* diagnostics best-effort */ }
+    }
+    void poll()
     const timer = window.setInterval(() => {
-      void (async () => {
-        try {
-          const result = await onAttempt(projectName)
-          if (result.attempt?.projectName === projectName && result.attemptLog) setAttemptLog(result.attemptLog)
-          if (result.attempt?.projectName === projectName && result.attempt) setAttempt(result.attempt)
-        } catch { /* diagnostics best-effort */ }
-      })()
+      void poll()
     }, 2000)
-    return () => window.clearInterval(timer)
-  }, [showLog, attemptAlive, childAlive, onAttempt, projectName])
+    return () => { alive = false; window.clearInterval(timer) }
+  }, [attemptAlive, childAlive, attempt?.attemptId, onAttempt, projectName, workspaceId])
+
+  // Fetch the terminal tail even when neither output section is expanded.
+  useEffect(() => {
+    if (!attemptTerminal) return
+    let alive = true
+    const id = attempt?.attemptId
+    void onAttempt(projectName).then(result => {
+      if (!alive || !canApplyAttemptRead(currentAttemptRef.current, result.attempt, projectName, workspaceId) || result.attempt?.attemptId !== id || currentAttemptRef.current?.attemptId !== id) return
+      setLogAttemptId(id)
+      setAttemptLog(result.attemptLog ?? '')
+    }).catch(() => {})
+    return () => { alive = false }
+  }, [attemptTerminal, attempt?.attemptId, onAttempt, projectName, workspaceId])
 
   const run = async (kind: string, action: () => Promise<IterativeTaskActionOutcome>) => {
     setBusy(kind)
@@ -482,10 +509,13 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   }
 
   const toggleLog = async () => {
-    if (showLog || attemptLog === undefined) {
+    if (showLog || logAttemptId !== attempt?.attemptId || attemptLog === undefined) {
       try {
         const result = await onAttempt(projectName)
-        if (result.attempt?.projectName === projectName && result.attemptLog) setAttemptLog(result.attemptLog)
+        if (result.attempt && canApplyAttemptRead(currentAttemptRef.current, result.attempt, projectName, workspaceId)) {
+          setLogAttemptId(result.attempt.attemptId)
+          setAttemptLog(result.attemptLog ?? '')
+        }
       } catch {
         // diagnostics are best-effort
       }
@@ -521,7 +551,9 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   const elapsedUntil = attemptAlive && childAlive ? nowTick : (attempt?.finishedAt ?? attempt?.lastHeartbeatAt ?? nowTick)
   const elapsedMs = attempt?.startedAt && elapsedUntil > attempt.startedAt ? elapsedUntil - attempt.startedAt : 0
   const progress = attempt?.packageProgress
-  const showLogTail = showLog && attemptLog
+  const currentAttemptLog = logAttemptId === attempt?.attemptId ? attemptLog : undefined
+  const showLogTail = showLog && currentAttemptLog
+  const activity = iterativeActivity(attempt, childAlive, language)
   const attemptFailure = attempt && attempt.status === 'failed'
     ? (attempt.lastError || attempt.reason || undefined)
     : undefined
@@ -626,14 +658,22 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   useEffect(() => {
     if (!onScenario) return
     onScenario({
+      projectName,
+      workspaceId,
       state: mainAction.state,
       label: mainLabel,
       description: mainDescription,
-      running: mainAction.state === 'running',
+      running: childAlive,
+      activity: { title: activity.title, detail: activity.detail, percent: activity.percent },
+      elapsed: fmtElapsed(elapsedMs),
+      attempt,
+      attemptLog: currentAttemptLog,
+      runDir: snapshot?.runDir,
       enabled: mainAction.state === 'running' ? true : !busyLocked,
       act: () => runMainActionRef.current(),
     })
-  }, [onScenario, mainAction.state, mainLabel, mainDescription, busyLocked])
+  }, [onScenario, projectName, workspaceId, mainAction.state, mainLabel, mainDescription, busyLocked, childAlive, activity.title, activity.detail, activity.percent, elapsedMs, attempt, currentAttemptLog, snapshot?.runDir])
+  useEffect(() => () => onScenario?.(undefined), [onScenario])
 
   return (
     <section className="roadmap-card" data-testid="iterative-task-panel">
@@ -664,7 +704,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
               const active = stage.stage === pipeline.current
               return (
                 <Fragment key={stage.stage}>
-                  {index > 0 ? <span className={`iterative-pipeline-connector ${pipeline.completed.includes(PIPELINE_STAGES[index - 1].stage) ? 'on' : ''}`} aria-hidden="true" /> : null}
+                  {index > 0 ? <span className={`iterative-pipeline-connector ${pipeline.completed.includes(PIPELINE_STAGES[index - 1].stage) ? 'on' : ''} ${childAlive && PIPELINE_STAGES[index - 1].stage === pipeline.current ? (activity.percent === undefined ? 'working indeterminate' : 'working') : ''}`} aria-hidden="true"><span style={!childAlive || PIPELINE_STAGES[index - 1].stage !== pipeline.current || activity.percent === undefined ? undefined : { width: `${activity.percent}%` }} /></span> : null}
                 <div data-stage={stage.stage} aria-current={active ? 'step' : undefined} className={`iterative-pipeline-step ${done ? 'done' : ''} ${active ? 'active' : ''}`}>
                   <span className="iterative-pipeline-dot" aria-hidden="true">{done ? <Check size={12} /> : index + 1}</span>
                   <span className="iterative-pipeline-name">{language === 'ru' ? stage.ru : stage.en}</span>
@@ -682,7 +722,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       {attempt ? (
         <div className={`attempt-strip ${attempt.status}`} data-testid="attempt-strip">
           <div className="attempt-strip-row">
-            <strong className={`attempt-status ${attempt.status}`}>{activityText(attempt, text)}</strong>
+            <strong className={`attempt-status ${attempt.status}`}>{childAlive || attemptAlive ? activity.title : activityText(attempt, text)}</strong>
             <span className="attempt-meta">
               · {text('прошло', 'elapsed')} {fmtElapsed(elapsedMs)}
               {attempt.targetSource === 'roadmap'
@@ -695,7 +735,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
             </span>
           </div>
           <div className="attempt-strip-row">
-            {progress && progress.total > 0 && attempt.targetSource === 'discovery' && attempt.stage === 'begin' && childAlive ? (
+            {progress && activity.percent !== undefined && childAlive ? (
               <span className="attempt-meta">
                 {text('Подбор версий', 'Finding versions')}: {progress.processed}/{progress.total}
                 <span className="attempt-progress"><span style={{ width: `${Math.min(100, Math.round((progress.processed / progress.total) * 100))}%` }} /></span>
@@ -718,7 +758,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
             ) : null}
           </div>
           {showLogTail ? (
-            <pre className="attempt-log">{attemptLog}</pre>
+            <pre className="attempt-log">{currentAttemptLog}</pre>
           ) : null}
         </div>
       ) : null}
