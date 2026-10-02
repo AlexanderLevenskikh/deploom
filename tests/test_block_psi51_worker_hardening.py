@@ -192,7 +192,22 @@ class Psi51RequestQuiescenceTests(unittest.TestCase):
         with self.assertRaises(LocalizationTimeoutError):
             parallel_ddmin(
                 units,
-                lambda _candidate: True,
+                lambda _candidate: self.fail("screening must already be complete in this confirmation test"),
+                # Start from completed screening evidence. Otherwise OS thread
+                # scheduling can spend the entire 20ms before confirmation,
+                # testing the wrong phase. The confirmation worker and timeout
+                # remain real; the wall-clock bound and taint assertions stay.
+                resume_state={
+                    "schemaVersion": 1,
+                    "initialUnitIds": ["a", "b"],
+                    "currentUnitIds": ["a", "b"],
+                    "granularity": 2,
+                    "checksStarted": 0,
+                    "cache": [
+                        {"unitIds": ["a"], "failed": True, "confirmedFailure": False},
+                        {"unitIds": ["b"], "failed": True, "confirmedFailure": False},
+                    ],
+                },
                 confirm_failure=confirm,
                 parallelism=1,
                 max_checks=2,

@@ -70,6 +70,11 @@ both the scheduling filter and the solver's effective desired assignment.
 A separate product fix forwards actual verifier progress from `begin --check-only`
 to the durable Desktop journal. A watchdog timeout produces
 `PROJECT_CHECK_TIMEOUT` with the latest progress message, freezes elapsed time,
-and cannot reuse an older `project-check.json` verdict. The 20-minute watchdog
-remains unchanged. This improves evidence and recovery; it does not establish
-that a previously timed-out large user repository now completes.
+and cannot reuse an older `project-check.json` verdict. Interactive checks,
+begin/repair and migration steps now have no overall Desktop watchdog or
+45-minute supervisor deadline or 50-step batch stop. New iterative runs default to no run deadline, while an explicitly
+specified CLI run budget remains effective. Source capture, copying and hashing
+in this path also have no implicit deadline. Cancellation remains active;
+individual install/project-command timeouts and explicit solver budgets remain.
+Legacy bounded runner calls still return timeout failures. Removing the deadline
+does not establish that a previously timed-out large user repository completes.

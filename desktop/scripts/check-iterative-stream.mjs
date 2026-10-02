@@ -95,11 +95,21 @@ const mkIo = (overrides = {}) => {
 {
   let cancelled = false;
   const { io } = mkIo({ cancelRequested: () => cancelled });
-  const promise = spawnIterativeStreamed(join(root, "c"), process.execPath, ["-e", SLEEPY], root, 60_000, io, mkPlatform());
+  const promise = spawnIterativeStreamed(join(root, "c"), process.execPath, ["-e", SLEEPY], root, 0, io, mkPlatform());
   setTimeout(() => { cancelled = true; }, 100);
   const result = await promise;
   if (result.code === 0) throw new Error("a user cancel must never report a zero exit code");
   if (!result.timedOut) throw new Error("a user cancel must produce timedOut so callers treat it as a non-success");
+}
+
+// 6a. Zero means no overall deadline, rather than an immediate watchdog kill.
+{
+  const { io, lines } = mkIo();
+  const result = await spawnIterativeStreamed(join(root, "unbounded"), process.execPath,
+    ["-e", `console.log('preparation started'); setTimeout(() => console.log('prepared'), 800)`],
+    root, 0, io, mkPlatform());
+  if (result.code !== 0 || result.timedOut) throw Error("unbounded preparation was killed by a watchdog");
+  if (!lines.some(line => line.includes('prepared'))) throw Error("preparation completion not journaled");
 }
 
 // 6. Plain output lines are journaled line-by-line (decode + record, no loss).
@@ -117,6 +127,13 @@ const mkIo = (overrides = {}) => {
 // auto-refreshes while a run is emitting.
 {
   const { readFileSync } = await import("node:fs");
+  const main = readFileSync(new URL("../electron/main.ts", import.meta.url), "utf8");
+  const iterative = main.slice(main.indexOf("ipcMain.handle('flow:iterative:begin'"));
+  if (iterative.includes('workspace.path, 20 * 60_000') || iterative.includes('workspace.path, 1_800_000') ||
+      iterative.includes('45 * 60 * 1000') || iterative.includes('iteration < 50')) throw Error('interactive migration still has an overall deadline');
+  if (!iterative.includes('const verify = await spawnIterativeStreamed(')) {
+    throw Error('bootstrap repair re-verification must use the cancelable unbounded runner');
+  }
   const panel = readFileSync(new URL("../src/components/IterativeTaskPanel.tsx", import.meta.url), "utf8");
   if (!panel.includes("const childAlive = stepBusy")) throw new Error("Cancel must be gated on an in-flight call (childAlive), not the journal status");
   if (!panel.includes("Review re-check P1#4: a durable run whose ТЗ does not exist yet")) {

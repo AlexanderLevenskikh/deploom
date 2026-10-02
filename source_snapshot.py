@@ -770,7 +770,8 @@ def _build_source_tree_manifest_impl(
     are rechecked after hashing so add/remove/rename races fail closed.
     """
     root = root.resolve()
-    deadline = time.monotonic() + max(1, int(timeout_seconds))
+    deadline = (float("inf") if timeout_seconds == 0
+                else time.monotonic() + max(1, int(timeout_seconds)))
     next_progress = time.monotonic() + max(1, int(progress_interval_seconds))
     entries: list[dict[str, object]] = []
     files = 0
@@ -949,6 +950,8 @@ def _build_source_tree_manifest_impl(
 
 
 def _remaining(deadline: float) -> int:
+    if deadline == float("inf"):
+        return 0  # Explicit unbounded preparation, propagated to copy/hash.
     value = int(deadline - time.monotonic())
     if value <= 0:
         raise SourceCaptureError("SOURCE_MATERIALIZATION_TIMEOUT: source capture deadline exhausted")
@@ -964,7 +967,8 @@ def _capture_once(
     progress_interval_seconds: int,
 ) -> SourceSnapshot:
     started = time.monotonic()
-    deadline = started + max(1, int(timeout_seconds))
+    deadline = (float("inf") if timeout_seconds == 0
+                else started + max(1, int(timeout_seconds)))
     capture_root, project_relative, git_head = _subject_layout(project_dir)
     project_path = (capture_root / project_relative).resolve()
     _validate_git_layout(capture_root)
@@ -1479,7 +1483,7 @@ def source_snapshot_fingerprint(project_dir: Path) -> str:
     root, relative, _head = _subject_layout(project_dir)
     for attempt in range(1, SOURCE_CAPTURE_RETRIES + 1):
         try:
-            manifest = build_source_tree_manifest(root)
+            manifest = build_source_tree_manifest(root, timeout_seconds=0)
             break
         except SourceCaptureError as exc:
             if "SOURCE_CAPTURE_UNSTABLE" not in str(exc) or attempt >= SOURCE_CAPTURE_RETRIES:

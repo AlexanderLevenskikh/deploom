@@ -7811,7 +7811,7 @@ function setupIpc(): void {
         const invocation = iterativeBeginInvocation(runDir, options, generator, python)
         invocation.args.push('--check-only')
         const beginIo = iterativeStreamIo(runDir)
-        const result = await spawnIterativeStreamed(runDir, invocation.command, invocation.args, workspace.path, 20 * 60_000, beginIo, iterativeStreamPlatform, (event) => {
+        const result = await spawnIterativeStreamed(runDir, invocation.command, invocation.args, workspace.path, 0, beginIo, iterativeStreamPlatform, (event) => {
           if (event.event === 'begin.check' && typeof event.managedDependencies === 'number') {
             updateAttempt(runDir, { packageProgress: { processed: 0, total: event.managedDependencies } })
             publishIterativeAttempt(runDir)
@@ -7928,7 +7928,7 @@ function setupIpc(): void {
         const invocation = iterativeBeginInvocation(runDir, options, generator, python)
         invocation.args.push('--repair-only')
         const repairIo = iterativeStreamIo(runDir)
-        const result = await spawnIterativeStreamed(runDir, invocation.command, invocation.args, workspace.path, 20 * 60_000, repairIo, iterativeStreamPlatform, (event) => {
+        const result = await spawnIterativeStreamed(runDir, invocation.command, invocation.args, workspace.path, 0, repairIo, iterativeStreamPlatform, (event) => {
           if (event.event === 'begin.capture' && typeof event.managedDependencies === 'number') {
             updateAttempt(runDir, { packageProgress: { processed: 0, total: event.managedDependencies } })
             publishIterativeAttempt(runDir)
@@ -8096,7 +8096,7 @@ function setupIpc(): void {
       // "registry unavailable / budget exhausted" (those are not completion).
       let discoveryReport: { discovered: string[]; unavailable: string[]; budgetSkipped: string[]; noCompatibleAlternative: string[] } | undefined
       const strings = (value: unknown): string[] => Array.isArray(value) ? value.map((item) => String(item)) : []
-      const result = await spawnIterativeStreamed(runDir, invocation.command, invocation.args, workspace.path, 20 * 60_000, beginIo, iterativeStreamPlatform, (event) => {
+      const result = await spawnIterativeStreamed(runDir, invocation.command, invocation.args, workspace.path, 0, beginIo, iterativeStreamPlatform, (event) => {
         updateAttempt(runDir, { phase: event.event })
         publishIterativeAttempt(runDir)
         if (event.event === 'begin.capture' && typeof event.managedDependencies === 'number') {
@@ -8198,7 +8198,6 @@ function setupIpc(): void {
     }
     iterativeStepInFlight.add(stepLockKey(workspace.id, project.name))
     const steps: string[] = []
-    const startedAt = Date.now()
     const publish = () => publishIterativeAttempt(runDir)
     const updateSteps = () => updateAttempt(runDir, { stepsDone: [...steps] })
     try {
@@ -8214,7 +8213,9 @@ function setupIpc(): void {
       publish()
       const python = resolveExecutable('python')
       const generator = join(bundledToolDir(), 'iterative_migration.py')
-      for (let iteration = 0; iteration < 50; iteration += 1) {
+      // Continue until a real terminal/agent/error/cancel gate, without a
+      // hidden wall-clock or batch-size stop that requires another click.
+      while (true) {
         if (readAttempt(runDir)?.cancelRequested) {
           // L1: a user cancel STOPS the drive loop without touching the durable
           // run/checkpoint state, so the last verified checkpoint is preserved.
@@ -8222,11 +8223,6 @@ function setupIpc(): void {
           updateAttempt(runDir, { status: 'canceled', stage: 'drive', reason: 'отменено пользователем; verified checkpoint сохранён', lastStep: 'canceled' })
           publish()
           return { ok: true, steps, stopped: 'canceled', reason: 'отменено пользователем; verified checkpoint сохранён (продолжите нажатием «Продолжить»)', attempt: readAttempt(runDir) }
-        }
-        if (Date.now() - startedAt > 45 * 60 * 1000) {
-          updateAttempt(runDir, { status: 'done', stage: 'drive', reason: '45-минутный бюджет супервизора исчерпан' })
-          publish()
-          return { ok: true, steps, stopped: 'time-budget', reason: '45-минутный бюджет супервизора исчерпан; продолжайте нажатием «Продолжить»', attempt: readAttempt(runDir) }
         }
         const statusResult = await spawnIterativeStreamed(runDir, python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000, iterativeStreamIo(runDir), iterativeStreamPlatform)
         const payload = statusResult.code === 0
@@ -8272,7 +8268,7 @@ function setupIpc(): void {
           publish()
           return { ok: false, steps, stopped: 'error', error: decision.reason, attempt: readAttempt(runDir) }
         }
-        const result = await spawnIterativeStreamed(runDir, python, iterativeStepInvocation(runDir, decision.step, generator, python).args, workspace.path, 1_800_000, iterativeStreamIo(runDir), iterativeStreamPlatform)
+        const result = await spawnIterativeStreamed(runDir, python, iterativeStepInvocation(runDir, decision.step, generator, python).args, workspace.path, 0, iterativeStreamIo(runDir), iterativeStreamPlatform)
         if (result.code !== 0) {
           const raw = result.timedOut
             ? (readAttempt(runDir)?.cancelRequested === true ? 'CANCELED: step terminated by user cancel' : `STEP_TIMEOUT: step ${decision.step} exceeded its 30-minute budget`)
@@ -8297,9 +8293,6 @@ function setupIpc(): void {
           return { ok: true, steps, stopped: 'finished', phase: 'TERMINAL', reason: decision.reason, attempt: readAttempt(runDir) }
         }
       }
-      updateAttempt(runDir, { status: 'done', stage: 'drive', reason: 'супервизор остановлен по лимиту итераций' })
-      publish()
-      return { ok: true, steps, stopped: 'iteration-budget', reason: 'супервизор остановлен по лимиту итераций; продолжите нажатием «Продолжить»', attempt: readAttempt(runDir) }
     } finally {
       iterativeStepInFlight.delete(stepLockKey(workspace.id, project.name))
     }
@@ -8605,11 +8598,14 @@ function setupIpc(): void {
         if (bootstrap) {
           // No candidate/feedback for bootstrap: the agent gate is a repair run;
           // re-run the C0 control on the repaired trial right away.
-          const verify = await spawnCapture(
+          const verify = await spawnIterativeStreamed(
+            runDir,
             python,
             iterativeStepInvocation(runDir, 'verify-bootstrap', generator, python).args,
             workspace.path,
-            1_800_000,
+            0,
+            iterativeStreamIo(runDir),
+            iterativeStreamPlatform,
           )
           if (verify.code !== 0) {
             const raw = (verify.stderr.trim() || verify.stdout.trim() || `VERIFY_BOOTSTRAP_EXIT_${verify.code}`).slice(0, 4000)

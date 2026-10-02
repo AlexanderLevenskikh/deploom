@@ -751,6 +751,7 @@ def verify_config_from(mapping: Mapping[str, Any], run_dir: Path) -> BaselineVer
     )
     return dataclasses.replace(
         config,
+        unbounded_preparation=True,
         registry=str(resolved.get("registry") or ""),
         telemetry_path=telemetry_path,
         proof_cache_dir=proof_cache_dir,
@@ -1131,8 +1132,8 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
     )
     budget = {
         "runBudgetMinutes": _clamp_int(
-            args.run_budget_minutes if args.run_budget_minutes is not None else 120,
-            120, 5, 24 * 60,
+            args.run_budget_minutes if args.run_budget_minutes is not None else 0,
+            0, 0, 24 * 60,
         ),
         "maxRepairAttemptsPerRevision": _clamp_int(
             args.max_repair_attempts if args.max_repair_attempts is not None else 2,
@@ -1282,7 +1283,7 @@ def _begin_locked(
 
     snapshot_container = run_dir / SOURCE_DIR / "C0"
     snapshot = capture_durable_source_snapshot(
-        project_dir, snapshot_container, timeout_seconds=1800
+        project_dir, snapshot_container, timeout_seconds=0
     )
     project_relative = resolve_project_relative(project_dir, snapshot)
 
@@ -1425,7 +1426,7 @@ def _begin_adopted_locked(
     container = Path(str(source_refs.get("container") or ""))
     key = str(source_refs.get("key") or "")
     try:
-        source = open_source_snapshot(container, expected_key=key, timeout_seconds=1800)
+        source = open_source_snapshot(container, expected_key=key, timeout_seconds=0)
     except SourceCaptureError as exc:
         raise InvalidInputError(
             f"REPAIR_SOURCE_INTEGRITY_FAILED: исправленный снимок недоступен/испорчен: {exc}"
@@ -1573,6 +1574,8 @@ def classify_c0_result(result: BaselineVerifyResult) -> str:
 
 
 def _deadline_iso(minutes: int) -> str:
+    if minutes <= 0:
+        return ""
     return time.strftime(
         "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + int(minutes) * 60)
     )
@@ -1904,7 +1907,7 @@ def _bootstrap_materialize_locked(
     snapshot = open_source_snapshot(
         Path(str(checkpoint["sourceSnapshotContainer"])),
         expected_key=str(checkpoint["sourceSnapshotKey"]),
-        timeout_seconds=1800,
+        timeout_seconds=0,
     )
     workspace_root = bootstrap_workspace_root(run_dir)
     if workspace_root.exists():
@@ -1956,7 +1959,7 @@ def _force_remove_tree(path: Path) -> None:
 
 
 def _replace_c0_source_snapshot(
-    run_dir: Path, project_path: Path, timeout_seconds: int = 1800
+    run_dir: Path, project_path: Path, timeout_seconds: int = 0
 ) -> SourceSnapshot:
     """P1 (v0.2.163 #1): atomically replace the C0 source snapshot container
     with a fresh capture of `project_path` (the repaired bootstrap trial).
@@ -2042,7 +2045,7 @@ def cmd_verify_bootstrap(args: argparse.Namespace) -> int:
             # container (the verify-bootstrap success path was previously
             # unreachable: persist_source_snapshot refused the existing target).
             new_snapshot = _replace_c0_source_snapshot(
-                run_dir, project_path, timeout_seconds=1800
+                run_dir, project_path, timeout_seconds=0
             )
             project_relative = resolve_project_relative(project_path, new_snapshot)
             manifest_hash, lock_hash, _lock = manifest_and_lock_hashes(project_path)
@@ -3444,7 +3447,7 @@ def _materialize_locked(
     snapshot = open_source_snapshot(
         Path(str(base_checkpoint["sourceSnapshotContainer"])),
         expected_key=str(base_checkpoint["sourceSnapshotKey"]),
-        timeout_seconds=1800,
+        timeout_seconds=0,
     )
     workspace_root = trial_workspace_root(run_dir)
     if workspace_root.exists():
@@ -3497,7 +3500,7 @@ def _materialize_locked(
         return 0
     observed_hash = observed_resolved_hash(observed)
 
-    trial_snapshot = capture_source_snapshot(project_path, timeout_seconds=1800)
+    trial_snapshot = capture_source_snapshot(project_path, timeout_seconds=0)
     candidate = dict(candidate)
     candidate["stage"] = "MATERIALIZED"
     candidate["materializationRefs"] = {
@@ -3534,7 +3537,7 @@ def _materialize_trial_tree(
     method = materialize_private_tree(
         Path(snapshot.root),
         workspace_root,
-        timeout_seconds=timeout_seconds or 1800,
+        timeout_seconds=0,
         progress_label="iterative migration trial materialization",
     )
     if not workspace_root.exists():
@@ -3945,7 +3948,7 @@ def _accept_checkpoint(
         }
     )
     snapshot = capture_durable_source_snapshot(
-        project_path, run_dir / SOURCE_DIR / checkpoint_id, timeout_seconds=1800
+        project_path, run_dir / SOURCE_DIR / checkpoint_id, timeout_seconds=0
     )
     project_relative = resolve_project_relative(project_path, snapshot)
 
@@ -4704,7 +4707,7 @@ def _audit_locked(
     snapshot = open_source_snapshot(
         Path(str(checkpoint["sourceSnapshotContainer"])),
         expected_key=str(checkpoint["sourceSnapshotKey"]),
-        timeout_seconds=1800,
+        timeout_seconds=0,
     )
     project_path = Path(snapshot.root) / str(checkpoint.get("projectRelative") or ".")
     try:

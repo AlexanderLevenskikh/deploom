@@ -510,7 +510,7 @@ def run_supervised(
     # seam without weakening production: real subprocess.Popen always exposes
     # stdout/wait and therefore always takes the supervised path below.
     if not hasattr(process, "wait") or not hasattr(process, "stdout"):
-        stdout, _stderr = process.communicate(timeout=max(1, int(timeout_seconds)))
+        stdout, _stderr = process.communicate(timeout=None if timeout_seconds == 0 else max(1, int(timeout_seconds)))
         completed = subprocess.CompletedProcess(
             list(argv), int(getattr(process, "returncode", 0) or 0),
             stdout=stdout or "", stderr=None,
@@ -573,7 +573,9 @@ def run_supervised(
     )
     reader_thread.start()
 
-    interval = max(1, min(int(progress_interval_seconds or 15), max(1, int(timeout_seconds))))
+    interval = max(1, int(progress_interval_seconds or 15))
+    if timeout_seconds > 0:
+        interval = min(interval, max(1, int(timeout_seconds)))
     next_progress = started + interval
     timed_out = False
     return_code = 0
@@ -582,7 +584,7 @@ def run_supervised(
         while process.poll() is None:
             now = time.monotonic()
             elapsed = now - started
-            if elapsed >= timeout_seconds:
+            if timeout_seconds > 0 and elapsed >= timeout_seconds:
                 timed_out = True
                 _emit(
                     progress,

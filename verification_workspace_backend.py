@@ -161,7 +161,7 @@ def _materialize_private_tree_impl(
             result = runner(
                 robocopy_args,
                 source,
-                timeout_seconds=max(1, int(timeout_seconds)),
+                timeout_seconds=0 if timeout_seconds == 0 else max(1, int(timeout_seconds)),
                 progress=progress,
                 progress_label=(
                     f"{progress_label}: refs-same-volume"
@@ -193,7 +193,7 @@ def _materialize_private_tree_impl(
             result = runner(
                 [cp, "-a", "--reflink=always", f"{source}/.", str(target)],
                 source,
-                timeout_seconds=max(1, int(timeout_seconds)),
+                timeout_seconds=0 if timeout_seconds == 0 else max(1, int(timeout_seconds)),
                 progress=progress,
                 progress_label=f"{progress_label}: reflink",
                 progress_interval_seconds=progress_interval_seconds,
@@ -209,7 +209,7 @@ def _materialize_private_tree_impl(
             result = runner(
                 [cp, "-cR", f"{source}/.", str(target)],
                 source,
-                timeout_seconds=max(1, int(timeout_seconds)),
+                timeout_seconds=0 if timeout_seconds == 0 else max(1, int(timeout_seconds)),
                 progress=progress,
                 progress_label=f"{progress_label}: clonefile",
                 progress_interval_seconds=progress_interval_seconds,

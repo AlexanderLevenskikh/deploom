@@ -161,6 +161,9 @@ class BaselineVerifyConfig:
     # Neighboring-assignment seeding is experimental and default-off.
     enable_neighbor_resolver_seed: bool = False
     snapshot_copy_timeout_seconds: int = 1800
+    # Interactive preparation may wait until completion/cancel; command and
+    # explicit search budgets remain bounded. This grants no proof authority.
+    unbounded_preparation: bool = False
     project_checks: str = "adaptive"  # off | diagnostic | adaptive | strict
     commands: Tuple[str, ...] = ()
     registry: str = ""
@@ -394,7 +397,7 @@ def _clamped_phase_seconds(
     (an honest budget outcome), while an exhausted per-attempt deadline raises a
     plain `subprocess.TimeoutExpired` (infrastructure).
     """
-    remaining = int(attempt_remaining_seconds)
+    remaining = int(min(attempt_remaining_seconds, timeout_seconds))
     if budget_remaining_seconds is not None:
         if budget_remaining_seconds <= 0:
             raise BaselineCandidateBudgetExceeded(
@@ -2539,7 +2542,8 @@ def verify_assignment(
     """Materialize one exact assignment over the sealed SourceSnapshot subject."""
     project_dir = project_dir.resolve()
     attempt_started = time.monotonic()
-    attempt_deadline = attempt_started + config.attempt_timeout_seconds
+    attempt_deadline = (float("inf") if config.unbounded_preparation
+                        else attempt_started + config.attempt_timeout_seconds)
     base_env = semantic_verification_environment(os.environ)
     if runtime_env:
         # An EXPLICIT project/CI Node runtime beats ambient PATH exactly where
@@ -2603,6 +2607,8 @@ def verify_assignment(
         )
 
     def snapshot_copy_timeout() -> int:
+        if config.unbounded_preparation and not config.budget_phase_deadline:
+            return 0
         now = time.monotonic()
         return _clamped_phase_seconds(
             attempt_remaining_seconds=attempt_deadline - now,
@@ -2619,7 +2625,7 @@ def verify_assignment(
     def phase_progress(phase: str) -> ProgressCallback:
         return lambda message: _emit_progress(progress, f"{progress_label}: {phase}: {message}")
 
-    _emit_progress(progress, f"{progress_label}: started; attemptHardTimeout={config.attempt_timeout_seconds}s")
+    _emit_progress(progress, f"{progress_label}: started; attemptHardTimeout={0 if config.unbounded_preparation else config.attempt_timeout_seconds}s")
     _emit_progress(progress, f"{progress_label}: prepared-artifact cache configure: started")
     configure_prepared_artifact_store(config.proof_cache_dir or None)
     _emit_progress(progress, f"{progress_label}: prepared-artifact cache configure: ready; cleanup=background")

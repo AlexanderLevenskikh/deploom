@@ -8,7 +8,7 @@
 //    forwards each event to `onEvent`, so `begin.discovery-progress` feeds the
 //    attempt progress WITHOUT waiting for the child to finish;
 //  - honours an attempt.cancelRequested flag: once set it terminates the child
-//    tree, so a user cancel never waits out a 20-minute begin;
+//    tree, including when the operation has no overall deadline;
 //  - treats a kill BY the watchdog (timeout or user cancel) as a NON-ZERO
 //    outcome, never as success — a timed-out begin must not be able to claim
 //    "C0 captured" just because the killed child never produced an exit code;
@@ -84,7 +84,10 @@ export function spawnIterativeStreamed(
       windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       env: commandEnv,
     })
-    const timer = setTimeout(() => { timedOut = true; platform.killProcessTree(child) }, timeoutMs)
+    // Zero disables only the overall watchdog; cancellation remains active.
+    const timer = timeoutMs > 0
+      ? setTimeout(() => { timedOut = true; platform.killProcessTree(child) }, timeoutMs)
+      : undefined
     const cancelCheck = setInterval(() => {
       if (io.cancelRequested(runDir)) {
         timedOut = true
