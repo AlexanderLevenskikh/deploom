@@ -1,4 +1,7 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import assert from "node:assert/strict";
+import ts from "typescript";
+import { commandEnvironment, resolveSpawnInvocation, decodeProcessOutputChunk, processTreeDetached } from "../dist-electron/process-launcher.js";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -322,4 +325,24 @@ if (readAgentLease(join(runDir, "trial", "no-such-lease.json")) !== undefined) {
   throw new Error("Missing lease file must read as undefined");
 }
 
-console.log("check-iterative-agent: OK");
+// Exercise the actual main capture helper against a child that starts only
+// after stdin EOF. No model/server is contacted and no tokens are consumed.
+const mainSource = readFileSync(join(DESKTOP, "electron/main.ts"), "utf8");
+const captureStart = mainSource.indexOf("function spawnCapture(");
+const captureEnd = mainSource.indexOf("function spawnCaptureWithInput", captureStart);
+assert.ok(captureStart >= 0 && captureEnd > captureStart);
+const captureJs = ts.transpileModule(mainSource.slice(captureStart, captureEnd), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+const capture = new Function("spawn", "commandEnvironment", "resolveSpawnInvocation", "processTreeDetached", "decodeProcessOutputChunk", "killProcessTree", captureJs + "; return spawnCapture;")(
+  spawn, commandEnvironment, resolveSpawnInvocation, processTreeDetached, decodeProcessOutputChunk, child => child.kill(),
+);
+const eof = await capture(process.execPath, ["-e", "process.stdin.resume();process.stdin.on('end',()=>{console.log(process.argv[1]);console.error('EOF received')})", "test-provider/explicit-model"], root, 2000);
+assert.equal(eof.timedOut, false);
+assert.equal(eof.code, 0);
+assert.equal(eof.stdout.trim(), "test-provider/explicit-model");
+assert.equal(eof.stderr.trim(), "EOF received");
+const timeout = await capture(process.execPath, ["-e", "setInterval(()=>{},1000)"], root, 200);
+assert.equal(timeout.timedOut, true);
+assert.ok(mainSource.includes("if (agentTimedOut)"));
+assert.ok(mainSource.includes("AGENT_PROVIDER_TIMEOUT:"));
+assert.ok(mainSource.includes("Agent dispatch: provider=${provider}; model=${model"));
+console.log("check-iterative-agent: OK (real child stdin EOF, model argument and timeout)");

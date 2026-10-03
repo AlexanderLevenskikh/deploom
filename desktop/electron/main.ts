@@ -1658,6 +1658,10 @@ function spawnCapture(command: string, args: string[], cwd: string, timeoutMs = 
       clearTimeout(timer)
       resolvePromise({ code: code ?? 1, stdout, stderr, timedOut })
     })
+    // Non-interactive capture has no input. OpenCode waits for EOF before
+    // starting a run when stdin is a pipe, even with --file and --attach.
+    child.stdin.on('error', () => { /* EPIPE when the child exits before EOF */ })
+    child.stdin.end()
   })
 }
 
@@ -8523,6 +8527,9 @@ function setupIpc(): void {
       // agent TEXT alone may never claim a completed repair.
       const provider = workspace.agent === 'claude' ? 'claude' : workspace.agent === 'codex' ? 'codex' : 'opencode'
       const model = workspace.agentModel
+      recordAttemptLog(runDir, `Agent dispatch: provider=${provider}; model=${model || '(provider default)'}`)
+      updateAttempt(runDir, { reason: `Agent repair: ${provider}; model=${model || '(provider default)'}` })
+      publishIterativeAttempt(runDir)
       // #5: after a crash the SAME provider session is resumed (same attempt,
       // same sessionId, durable trial); a fresh dispatch gets a new session.
       const sessionId = resuming ? resumeSessionId : randomUUID()
@@ -8538,6 +8545,7 @@ function setupIpc(): void {
 
         let output = ''
         let exitCode = 0
+        let agentTimedOut = false
         if (provider === 'opencode') {
           const transport = await startStandaloneOpenCodeServer(projectPath)
           try {
@@ -8566,6 +8574,7 @@ function setupIpc(): void {
               transport ? { OPENCODE_DB: databasePath || transport.databasePath } : undefined,
             )
             exitCode = agentResult.code
+            agentTimedOut = agentResult.timedOut === true
             output = `${agentResult.stdout}\n${agentResult.stderr}`
           } finally {
             transport?.stop()
@@ -8595,11 +8604,15 @@ function setupIpc(): void {
             900_000,
           )
           exitCode = agentResult.code
+          agentTimedOut = agentResult.timedOut === true
           output = `${agentResult.stdout}\n${agentResult.stderr}`
         }
         agentOutputTail = output.slice(-4000)
+        if (agentTimedOut) {
+          throw new Error(`AGENT_PROVIDER_TIMEOUT: ${provider}; model=${model || '(provider default)'}; agent process exceeded 15 minutes. The verified checkpoint is preserved.`)
+        }
         if (exitCode !== 0 && !output.trim()) {
-          return { ok: false, error: `AGENT_PROVIDER_FAILURE (exit ${exitCode}): агент не запустился и не выдал вывод; попробуйте другой провайдер` }
+          throw new Error(`AGENT_PROVIDER_FAILURE (exit ${exitCode}): ${provider}; model=${model || '(provider default)'}; agent process exited without output`)
         }
 
         const changed = [...new Set([
