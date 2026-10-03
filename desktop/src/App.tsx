@@ -72,7 +72,7 @@ function App() {
           <button className={`icon-button update-download-button${updateReady ? ' ready' : ''}${updateDownloading ? ' downloading' : ''}`} disabled={!updateReady} aria-busy={updateDownloading} aria-label={updateTitle} title={updateTitle} onClick={() => void flow.installUpdate()}><Download size={17} /></button>
           <button className="button secondary" disabled={!details.dashboardExists} onClick={openDashboard}><ExternalLink size={16} /> Dashboard</button>
           {flow.activeJobId ? <button className="button secondary" onClick={() => void flow.cancelJob()}><Pause size={16} /> {t('app.stop')}</button> : <button className="button secondary" disabled={!project} onClick={() => project && void flow.runAction({ action: 'preflight', workspaceId: details.workspace.id, projectName: project.name })}><Play size={16} /> {t('app.check')}</button>}
-          <button className="icon-button" title={language === 'ru' ? 'Очистка хранилища' : 'Storage cleanup'} aria-label={language === 'ru' ? 'Очистка хранилища' : 'Storage cleanup'} onClick={() => setShowStorage(true)}><Trash2 size={18} /></button>
+          <button className="icon-button" title={t('app.storageCleanup')} aria-label={t('app.storageCleanup')} onClick={() => setShowStorage(true)}><Trash2 size={18} /></button>
           <button className="icon-button" title={t('app.settingsTitle')} onClick={() => void flow.openPath(`${details.workspace.path}/${details.workspace.settingsPath}`)}><Settings size={18} /></button>
         </div>
       </header>

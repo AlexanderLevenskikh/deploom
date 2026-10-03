@@ -44,6 +44,7 @@ export const ru: Record<TranslationKey, string> = {
   "app.stop": "Остановить",
   "app.check": "Проверить",
   "app.settingsTitle": "Открыть settings.project.json",
+  "app.storageCleanup": "Очистка хранилища",
   "app.noProject": "Проект не выбран",
   "app.closeError": "Закрыть",
   "app.error.title": "Что-то пошло не так",

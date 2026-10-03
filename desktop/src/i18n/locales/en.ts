@@ -42,6 +42,7 @@ export const en = {
   "app.stop": "Stop",
   "app.check": "Check",
   "app.settingsTitle": "Open settings.project.json",
+  "app.storageCleanup": "Storage cleanup",
   "app.noProject": "No project selected",
   "app.closeError": "Close",
   "app.error.title": "Something went wrong",
