@@ -137,6 +137,25 @@ def _targets_satisfied(config: Mapping[str, Any], active: Mapping[str, Any]) -> 
     return satisfied, denominator, unmet
 
 
+def build_progress_summary(config, checkpoints, active, ledger):
+    """Live display counts use the same denominator and deferrals as task export."""
+    _satisfied, denominator, remaining = _targets_satisfied(config, active)
+    by_id = {str(c.get("checkpointId")): c for c in checkpoints}
+    chain, seen, cursor = [], set(), active
+    while cursor and str(cursor.get("checkpointId")) not in seen:
+        seen.add(str(cursor.get("checkpointId")))
+        chain.append(cursor)
+        cursor = by_id.get(str(cursor.get("parentCheckpointId") or ""))
+    return {
+        "checkpointId": str(active.get("checkpointId") or ""),
+        "remaining": remaining, "denominator": denominator,
+        "accepted": len(_accepted_actions(list(reversed(chain)))),
+        "deferred": len(_deferred_rows(ledger, config, active)),
+        "targetCount": len(config.get("targets") or {}),
+        "unresolvedGoals": denominator - len(config.get("targets") or {}),
+    }
+
+
 def _discovery_intents(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """Unfulfilled upgrade intents captured by bounded target discovery.
 

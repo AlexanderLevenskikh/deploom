@@ -66,6 +66,7 @@ from baseline_constraint_verifier import (
     verify_assignment,
 )
 from baseline_repair_handoff import build_repair_request
+from iterative_progress import MigrationProgress
 from migration_validation import digest as validation_digest, validate_profile, verify_initial_control, validate_baseline_reference
 from verification_proof import is_fixed_manifest_spec
 from iterative_target_deferrals import record_unavailable_targets, unavailable_targets
@@ -733,14 +734,16 @@ def _run_install(project_dir: Path, *, timeout_seconds: int, progress_label: str
     base_env = os.environ
     if runtime_env:
         base_env = {**base_env, **runtime_env}
-    return _run(
-        [executable, *install_args],
-        project_dir,
-        timeout_seconds=timeout_seconds,
-        env=env,
-        base_env=base_env,
-        progress_label=progress_label,
-    )
+    with MigrationProgress(_emit_status, operation="install", message=f"{progress_label}: installing dependencies") as progress:
+        return _run(
+            [executable, *install_args],
+            project_dir,
+            timeout_seconds=timeout_seconds,
+            env=env,
+            base_env=base_env,
+            progress=progress,
+            progress_label=progress_label,
+        )
 
 
 def verify_config_from(mapping: Mapping[str, Any], run_dir: Path) -> BaselineVerifyConfig:
@@ -1330,13 +1333,15 @@ def _begin_locked(
         verify_config, verification_purpose="baseline-control"
     )
     _emit_status({"event": "begin.c0-verify", "runId": run_id})
-    result = verify_initial_control(
-        project_dir, initial_assignment, run_config=config, run_dir=run_dir,
-        verify_config=verify_config, verifier=verify_assignment,
-        run_project_checks=True,
-        progress_label="iterative migration C0 control verification",
-        runtime_env=_runtime_env(config),
-    )
+    with MigrationProgress(_emit_status, operation="control", message="iterative migration C0 control verification: preparing verification") as progress:
+        result = verify_initial_control(
+            project_dir, initial_assignment, run_config=config, run_dir=run_dir,
+            verify_config=verify_config, verifier=verify_assignment,
+            run_project_checks=True,
+            progress=progress,
+            progress_label="iterative migration C0 control verification",
+            runtime_env=_runtime_env(config),
+        )
 
     if config.get("validationScope"):
         save_config(run_dir, config)
@@ -1487,12 +1492,14 @@ def _begin_adopted_locked(
         verify_config = dataclasses.replace(
             verify_config_from(config["verifyConfig"], run_dir), verification_purpose="baseline-control"
         )
-        result = verify_initial_control(
-            control_project, full_assignment, run_config=config, run_dir=run_dir,
-            verify_config=verify_config, verifier=verify_assignment,
-            run_project_checks=True, runtime_env=_runtime_env(config),
-            progress_label="adopt repaired source: fresh current-environment control",
-        )
+        with MigrationProgress(_emit_status, operation="control", message="adopt repaired source: fresh current-environment control: preparing verification") as progress:
+            result = verify_initial_control(
+                control_project, full_assignment, run_config=config, run_dir=run_dir,
+                verify_config=verify_config, verifier=verify_assignment,
+                run_project_checks=True, runtime_env=_runtime_env(config),
+                progress=progress,
+                progress_label="adopt repaired source: fresh current-environment control",
+            )
         if not result.ok:
             raise ProjectUnreadyError(
                 "REPAIR_ADOPTION_CONTROL_FAILED" if result.hard_failure else "REPAIR_ADOPTION_INCONCLUSIVE",
@@ -2074,14 +2081,16 @@ def cmd_verify_bootstrap(args: argparse.Namespace) -> int:
         verify_config = dataclasses.replace(
             verify_config, verification_purpose="baseline-control"
         )
-        result = verify_assignment(
-            project_path,
-            checkpoint["fullAssignment"],
-            config=verify_config,
-            run_project_checks=True,
-            progress_label="iterative migration bootstrap re-verification",
-            runtime_env=_runtime_env(config),
-        )
+        with MigrationProgress(_emit_status, operation="verify-bootstrap", message="iterative migration bootstrap re-verification: preparing verification", run_id=run["runId"], candidate_id="") as progress:
+            result = verify_assignment(
+                project_path,
+                checkpoint["fullAssignment"],
+                config=verify_config,
+                run_project_checks=True,
+                progress=progress,
+                progress_label="iterative migration bootstrap re-verification",
+                runtime_env=_runtime_env(config),
+            )
         if result.ok:
             # The repaired trial becomes the authoritative C0 source identity:
             # capture a NEW durable snapshot at the SAME checkpoint slot (C0) so
@@ -3580,12 +3589,13 @@ def _materialize_trial_tree(
     snapshot: SourceSnapshot, workspace_root: Path, timeout_seconds: int
 ) -> None:
     workspace_root.parent.mkdir(parents=True, exist_ok=True)
-    method = materialize_private_tree(
-        Path(snapshot.root),
-        workspace_root,
-        timeout_seconds=0,
-        progress_label="iterative migration trial materialization",
-    )
+    with MigrationProgress(_emit_status, operation="materialize", message="Preparing isolated source snapshot copy"):
+        method = materialize_private_tree(
+            Path(snapshot.root),
+            workspace_root,
+            timeout_seconds=0,
+            progress_label="iterative migration trial materialization",
+        )
     if not workspace_root.exists():
         raise IterativeMigrationError(
             "TRIAL_MATERIALIZATION_MISSING", f"materialize_private_tree returned {method!r}"
@@ -3652,14 +3662,16 @@ def _precheck_locked(
             "CI": "1",
             "npm_config_ignore_scripts": "true",
         }
-        result = _run(
-            _command_argv(command, base_env),
-            project_path,
-            timeout_seconds=_clamp_int(args.timeout_seconds, 1200, 120, 4 * 3600),
-            env=env,
-            base_env=base_env,
-            progress_label=f"iterative migration precheck {command}",
-        )
+        with MigrationProgress(_emit_status, operation="precheck", message=f"Running project command: {command}", run_id=run["runId"], candidate_id=candidate["candidateId"]) as progress:
+            result = _run(
+                _command_argv(command, base_env),
+                project_path,
+                timeout_seconds=_clamp_int(args.timeout_seconds, 1200, 120, 4 * 3600),
+                env=env,
+                base_env=base_env,
+                progress=progress,
+                progress_label=f"iterative migration precheck {command}",
+            )
         failed = result.returncode != 0
         entry = {
             "command": command,
@@ -3821,14 +3833,16 @@ def _verify_exact_locked(
             "candidateId": candidate["candidateId"],
         }
     )
-    result = verify_assignment(
-        project_path,
-        candidate["fullAssignment"],
-        config=verify_config,
-        run_project_checks=True,
-        progress_label="iterative migration verify-exact",
-        runtime_env=_runtime_env(config),
-    )
+    with MigrationProgress(_emit_status, operation="verify-exact", message="iterative migration verify-exact: preparing verification", run_id=run["runId"], candidate_id=candidate["candidateId"]) as progress:
+        result = verify_assignment(
+            project_path,
+            candidate["fullAssignment"],
+            config=verify_config,
+            run_project_checks=True,
+            progress=progress,
+            progress_label="iterative migration verify-exact",
+            runtime_env=_runtime_env(config),
+        )
     _emit_status(
         {
             "event": "verify-exact.result",
@@ -3993,9 +4007,10 @@ def _accept_checkpoint(
             "parent": base_id,
         }
     )
-    snapshot = capture_durable_source_snapshot(
-        project_path, run_dir / SOURCE_DIR / checkpoint_id, timeout_seconds=0
-    )
+    with MigrationProgress(_emit_status, operation="checkpoint", message="Saving verified source snapshot", run_id=run["runId"], candidate_id=candidate_id):
+        snapshot = capture_durable_source_snapshot(
+            project_path, run_dir / SOURCE_DIR / checkpoint_id, timeout_seconds=0
+        )
     project_relative = resolve_project_relative(project_path, snapshot)
 
     observed = dict(result.observed_resolved_versions or {})
@@ -4302,10 +4317,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     candidate = load_candidate(run_dir)
     ledger = load_ledger(run_dir)
     repair_requests = read_repair_requests(run_dir)
+    from iterative_task import build_progress_summary
+    progress_summary = build_progress_summary(config, _all_checkpoints(run_dir), checkpoint, ledger)
     payload = {
         "schemaVersion": SCHEMA_VERSION,
         "run": run,
         "activeCheckpoint": checkpoint,
+        "progressSummary": progress_summary,
         "candidate": candidate,
         "ledgerSummary": {
             "blocks": len(ledger.get("blocks", [])),

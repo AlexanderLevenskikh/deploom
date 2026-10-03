@@ -61,7 +61,7 @@ import { migrationProfilePath, readMigrationProfile, readMigrationScope, saveMig
 import { hasSavedProjectPlan, iterativeBeginInvocation, iterativeCheckTimeoutFailure, targetsFromDashboardState } from './iterative-begin.js'
 import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
-import { beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, readRunLogTail, recordAttemptLog, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
+import { beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, readRunLogTail, recordAttemptLog, recordAttemptProgress, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
 import { spawnIterativeStreamed, type CaptureResult, type StreamAttemptIo, type StreamPlatform } from './iterative-stream.js'
 import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, agentProviderFailure, openCodeRuntimeManifestPaths, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
@@ -1709,7 +1709,10 @@ const iterativeStreamPlatform: StreamPlatform = {
 
 const iterativeStreamIo = (_runDir: string): StreamAttemptIo => ({
   cancelRequested: (dir: string) => readAttempt(dir)?.cancelRequested === true,
-  recordLine: (dir: string, text: string) => recordAttemptLog(dir, text),
+  recordLine: (dir: string, text: string) => {
+    const attempt = recordAttemptProgress(dir, text)
+    if (attempt) send('flow:iterative:attempt', attempt)
+  },
   trimLog: (dir: string) => trimAttemptLog(dir),
 })
 
@@ -7715,6 +7718,7 @@ function setupIpc(): void {
     let error: string | undefined
     let requestedNode: string | undefined
     let runtimeView: Record<string, any> | undefined
+    let progressSummary: { checkpointId: string; remaining: number; denominator: number; accepted: number; deferred: number; targetCount: number; unresolvedGoals: number } | undefined
     const scalar = (value: unknown): string | undefined =>
       typeof value === 'string' && value ? value : undefined
     // R3: the coordinator runs on the durable Python state regardless of the
@@ -7730,6 +7734,7 @@ function setupIpc(): void {
         const payload = parseIterativeStatusPayload(result.stdout) ?? readIterativeStatus(runDir)
         if (payload) {
           phase = String(payload.run?.phase ?? '')
+          progressSummary = payload.progressSummary
           decision = decideNextStep(runDir, payload)
           const config = (payload.config ?? {}) as Record<string, any>
           const runtime = (config.runtime ?? undefined) as Record<string, any> | undefined
@@ -7769,6 +7774,7 @@ function setupIpc(): void {
       validationScope: readMigrationScope(runDir),
       legacyPlanPresent: hasSavedProjectPlan(artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json'), project.name),
       requestedNode,
+      progressSummary,
       runtime: runtimeView,
       attempt: readAttempt(runDir),
       attemptLog: readAttemptLogTail(runDir),

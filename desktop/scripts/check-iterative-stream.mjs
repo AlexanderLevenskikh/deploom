@@ -7,6 +7,7 @@
 //     close) must be buffered and reassembled, journaled and emitted once —
 //     never dropped and never parsed as two broken fragments;
 //   - plain output lines are still journaled line-by-line.
+import { startAttempt, updateAttempt, recordAttemptProgress, readAttempt, readRunLogTail } from "../dist-electron/iterative-attempt.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -178,5 +179,22 @@ const mkIo = (overrides = {}) => {
   } finally { stop(); releaseRead("late old attempt"); }
   await new Promise(resolve => setTimeout(resolve, 0));
   if (applications !== 0) throw Error("late IPC reply updated a disposed view");
+}
+// Real Python reporter -> streamed journal -> atomic phase/heartbeat projection.
+{
+  const dir = join(root, 'python-progress');
+  startAttempt(dir, 'demo', 'none');
+  updateAttempt(dir, {status:'running',stage:'drive',phase:'PRECHECK'});
+  const events = [];
+  const script = "import time,json; from iterative_progress import MigrationProgress; emit=lambda e: print('ITERATIVE_MIGRATION_STATUS_V1 '+json.dumps(e),flush=True)\nwith MigrationProgress(emit,operation='verify-exact',message='Preparing verification',run_id='r',candidate_id='c',interval=0.02) as progress:\n time.sleep(0.08)\n progress('project check 1/4 started: yarn typecheck')\n time.sleep(0.04)";
+  const { io } = mkIo({recordLine: (_dir, line) => { const state=recordAttemptProgress(dir,line); if(state) events.push(state); }});
+  const result = await spawnIterativeStreamed(dir, process.platform==='win32'?'python':'python3', ['-c',script], join(process.cwd(),'..'), 10000, io, mkPlatform());
+  if(result.code!==0) throw Error(result.stderr);
+  if(events.length<3 || !readAttempt(dir).phase.includes('yarn typecheck')) throw Error('Progress must update the durable phase while Python runs');
+  if(!readRunLogTail(dir).includes('"heartbeat": true')) throw Error('Quiet work must reach the cumulative log');
+  const before = readAttempt(dir);
+  updateAttempt(dir,{status:'done'});
+  if(recordAttemptProgress(dir,'ITERATIVE_MIGRATION_STATUS_V1 {"event":"migration.progress","message":"late"}\n')) throw Error('Late progress resurrected a terminal attempt');
+  if(readAttempt(dir).phase!==before.phase) throw Error('Late progress changed a terminal phase');
 }
 console.log("check-iterative-stream: OK");

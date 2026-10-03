@@ -40,9 +40,29 @@ retains the complete history from this version onward. Existing trimmed log
 history cannot be reconstructed. Full raw messages remain accessible in the
 artifact. An agent gate is shown as a pause for repairs, not migration success.
 
+## Live progress and checkpoint counts
+
+Long exact verification, bootstrap/control verification, installation, prechecks,
+trial copy and verified snapshot capture publish serialized `migration.progress`
+events. Each operation reports its current message and emits a heartbeat after
+15 seconds without another message. A heartbeat proves the reporter is alive;
+it does not imply a completed check, an accepted upgrade or a measured percent.
+Reporter threads stop before the operation returns or raises. Desktop persists
+phase and heartbeat together and publishes that record to the UI. The hero can
+show the actual command and measured check number; the main panel also displays
+the age of the latest signal.
+
+The count cards read `status.progressSummary`, not a previously exported task.
+Counts come from the active checkpoint and its ancestors, with the same policy
+denominator and explicit deferrals as task export. A newly written descendant
+cannot increment acceptance before the run points to it. Unresolved discovery
+goals stay in remaining/total and are shown separately from versioned targets.
+Updating the application does not hot-patch an already running Python process;
+new progress reporting applies to subsequently launched steps.
+
 ## Validation
 
-- `python run_tool_tests.py --suite all`: 1634 tests, 4 platform skips.
+- `python run_tool_tests.py --suite all`: 1638 tests, 4 platform skips.
 - `python run_tool_tests.py --suite production-fast`: 64 tests.
 - `tests/regression/test_iterative_atomic_write.py` includes a real Windows
   reader that temporarily denies replacement of the durable state file.
@@ -51,6 +71,10 @@ artifact. An agent gate is shown as a pause for repairs, not migration success.
   the actual Python feedback handoff.
 - `check:iterative-scenario` covers adoption, cancellation, disabling and an
   identical repeated repair gate. Log checks cover persistence across attempts.
+- check:iterative-stream exercises a real Python progress reporter through
+  the Desktop journal, quiet heartbeats and terminal-event rejection.
+- test_iterative_progress.py checks reporter shutdown and live counts, including
+  unresolved goals and a descendant written before checkpoint activation.
 - Browser QA uses the rendered monitor harness with synthetic IPC and the real
   Autopilot coordinator: manual-to-Autopilot completion, unavailable-model
   refusal and cumulative-log presentation. It does not claim a completed

@@ -34,9 +34,10 @@ export function iterativeActivity(attempt: ActivityAttempt | undefined, live: bo
   let title = attempt.stage === 'agent' ? text('Агент исправляет проект', 'The agent is repairing the project')
     : attempt.stage === 'drive' ? text('Обновляем пакеты и проверяем результат', 'Updating packages and verifying the result')
     : text('Проверяем текущие зависимости', 'Checking current dependencies')
-  if (phase === 'begin.c0-verify' || (attempt.discoveryCompleted && /^begin\.(capture|discovery)$/.test(phase))) title = text('Подготавливаем проверенное исходное состояние для обновления', 'Preparing the verified starting state for the update')
-  else if (/source-materialization|source capture|source snapshot|sealed source snapshot/i.test(phase)) title = text('Готовим изолированную копию проекта', 'Preparing an isolated project copy')
-  else if (/resolver-install|resolver install/i.test(phase)) title = text('Устанавливаем зависимости в проверочной копии', 'Installing dependencies in the verification copy')
+  if (/Saving verified source snapshot/i.test(phase)) title = text('Сохраняем проверенный результат', 'Saving the verified result')
+  else if (phase === 'begin.c0-verify' || (attempt.discoveryCompleted && /^begin\.(capture|discovery)$/.test(phase))) title = text('Подготавливаем проверенное исходное состояние для обновления', 'Preparing the verified starting state for the update')
+  else if (/source-materialization|source capture|source snapshot|sealed source snapshot|isolated source snapshot copy/i.test(phase)) title = text('Готовим изолированную копию проекта', 'Preparing an isolated project copy')
+  else if (/resolver-install|resolver install|installing dependencies/i.test(phase)) title = text('Устанавливаем зависимости в проверочной копии', 'Installing dependencies in the verification copy')
   else if (/discovery/i.test(phase)) title = text('Подбираем доступные версии пакетов', 'Finding available package versions')
   else if (/audit/i.test(phase)) title = text('Проверяем уязвимости зависимостей', 'Auditing dependency vulnerabilities')
   else if (/lifecycle|project.check|command/i.test(phase) && !/begin.check-progress/.test(phase)) title = text('Выполняем проверки проекта', 'Running project checks')
@@ -46,6 +47,12 @@ export function iterativeActivity(attempt: ActivityAttempt | undefined, live: bo
   const bytes = phase.match(/bytes=(\d+)/)?.[1]
   if (files) facts.push(`${text('файлов', 'files')}: ${Number(files).toLocaleString(language)}`)
   if (bytes) facts.push(`${(Number(bytes) / 1024 ** 3).toLocaleString(language, { maximumFractionDigits: 2 })} ${text('ГиБ', 'GiB')}`)
+  const command = phase.match(/(?:project check \d+\/\d+ (?:started|PASS|RED[^:]*):|project-check:)\s*(.+?)(?::|$)/i)?.[1]
+  if (command) facts.push(command)
+  const commandStart = phase.match(/Running project command:\s*(.+)/i)?.[1]
+  if (commandStart) facts.push(commandStart)
+  const check = phase.match(/project check (\d+)\/(\d+)/i)
+  if (check) facts.push(`${text('проверка', 'check')}: ${check[1]}/${check[2]}`)
   const counter = attempt.packageProgress
   const validCounter = /^begin\.discovery(?:-progress)?$/.test(phase) && !attempt.discoveryCompleted && counter && Number.isFinite(counter.processed) && Number.isFinite(counter.total) && counter.total > 0 && counter.processed >= 0 && counter.processed <= counter.total
   if (validCounter) facts.push(`${text('пакетов', 'packages')}: ${counter.processed}/${counter.total}`)

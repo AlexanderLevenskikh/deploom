@@ -330,6 +330,10 @@ expect('activity: finished discovery is preparation, never a zero search', () =>
   const a = iterativeActivity(attempt({ phase: 'begin.discovery', discoveryCompleted: true, packageProgress: { processed: 30, total: 30 } }), true, 'en');
   assert.equal(a.title, 'Preparing the verified starting state for the update'); assert.equal(a.percent, undefined);
 });
+expect('activity: exact verification exposes the command and measured check counter', () => {
+  const a = iterativeActivity(attempt({stage:'drive',phase:'iterative migration verify-exact: project check 2/4 started: yarn lint'}),true,'ru');
+  assert.equal(a.title,'Выполняем проверки проекта'); assert.ok(a.detail.includes('yarn lint')); assert.ok(a.detail.includes('2/4')); assert.equal(a.percent,undefined);
+});
 const scope = { workspaceId: 'w', projectName: 'Demo', autopilot: true };
 const owner = () => createIterativeAutopilot(s => `${s.workspaceId}:${s.projectName}`);
 const calls = [];

@@ -170,6 +170,21 @@ export function trimAttemptLog(runDir: string): void {
   }
 }
 
+/** Persist the actual phase and heartbeat together before publishing to UI.
+ * Progress is display-only: it cannot alter stage, verdict or checkpoint. */
+export function recordAttemptProgress(runDir: string, line: string): IterativeAttemptRecord | undefined {
+  recordAttemptLog(runDir, line)
+  const match = line.match(/^ITERATIVE_MIGRATION_STATUS_V1 (\{.*\})\s*$/)
+  if (!match) return undefined
+  try {
+    const event = JSON.parse(match[1])
+    if (event.event !== 'migration.progress' || typeof event.message !== 'string') return undefined
+    const current = readAttempt(runDir)
+    if (!current || !['running', 'starting'].includes(current.status)) return undefined
+    return updateAttempt(runDir, { phase: event.message.slice(0, 1000), finishedAt: undefined })
+  } catch { return undefined }
+}
+
 export function readRunLogTail(runDir: string): string {
   return readAttemptLogTail(runDir, 256 * 1024, existsSync(join(runDir, 'run.log')) ? 'run.log' : 'attempt.log')
 }

@@ -412,6 +412,31 @@ class IterativeMigrationGuardTests(unittest.TestCase):
             with self.assertRaises(InvalidInputError):
                 cmd_verify_exact(args)
 
+    def test_exact_verifier_progress_reaches_status_stream(self) -> None:
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        import iterative_migration as migration
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = _RunDir(Path(tmp))
+            fixture.write_run(_run_dict(phase="VERIFYING"))
+            fixture.write_config()
+            fixture.write_checkpoint()
+            project = trial_workspace_root(fixture.root)
+            project.mkdir(parents=True)
+            (project / "package.json").write_text("{}")
+            candidate = _candidate_dict(stage="VERIFYING", materializationRefs={"workspaceRoot": str(project), "projectRelative": "."})
+            fixture.write_candidate(candidate)
+            events = []
+            def verifier(*args, progress, **kwargs):
+                progress("project check 1/4 started: yarn typecheck")
+                return SimpleNamespace(ok=True, kind="passed", summary="checked", project_failures=[])
+            with patch.object(migration, "_assert_runtime_unchanged"), patch.object(migration, "verify_assignment", side_effect=verifier), patch.object(migration, "_accept_checkpoint", return_value=0), patch.object(migration, "_emit_status", side_effect=events.append):
+                self.assertEqual(migration._verify_exact_locked(fixture.root, migration.load_run(fixture.root), migration.load_config(fixture.root), argparse.Namespace()), 0)
+            progress_events = [e for e in events if e["event"] == "migration.progress"]
+            self.assertTrue(any(e["message"] == "project check 1/4 started: yarn typecheck" for e in progress_events))
+            self.assertTrue(all(e["candidateId"] == candidate["candidateId"] for e in progress_events))
+            self.assertEqual(events[-1]["event"], "verify-exact.result")
+
     def test_verify_exact_resumes_verifying_stage_candidate(self) -> None:
         # R4: a kill/restart in the middle of verify-exact leaves stage=VERIFYING.
         # The guard must ACCEPT that stage so the SAME durable candidate can be

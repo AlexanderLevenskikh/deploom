@@ -39,7 +39,7 @@ function Harness() {
   const reads = useRef(0)
   const scope = useRef<IterativeStatusOutcome['validationScope']>(undefined)
   const api = useRef({
-    status: coordinator.current.register('status', async (): Promise<IterativeStatusOutcome> => ({ ok: true, present: present.current, phase: current.current.stage === 'drive' && current.current.status === 'done' ? 'TERMINAL' : present.current ? 'READY' : undefined, decision: current.current.stage === 'drive' && current.current.status === 'done' ? { step: 'finish', phase: 'TERMINAL', reason: 'COMPLETE', satisfied: true } : undefined, checked: { ok: checked.current }, stale: false, inFlight: current.current.status === 'running', attempt: current.current, validationScope: scope.current, validationProfile: { commands: ['npm run typecheck', 'npm run build', 'npm run test'], suggestedUnitCommand: 'npm run test -- --run src', deferredChecks: 'Playwright: requires a separate server' } })),
+    status: coordinator.current.register('status', async (): Promise<IterativeStatusOutcome> => ({ ok: true, present: present.current, phase: current.current.stage === 'drive' && current.current.status === 'done' ? 'TERMINAL' : present.current ? 'READY' : undefined, decision: current.current.stage === 'drive' && current.current.status === 'done' ? { step: 'finish', phase: 'TERMINAL', reason: 'COMPLETE', satisfied: true } : undefined, checked: { ok: checked.current }, progressSummary: present.current ? {checkpointId:'C2',remaining:86,denominator:88,accepted:2,deferred:0,targetCount:52,unresolvedGoals:36} : undefined, stale: false, inFlight: current.current.status === 'running', attempt: current.current, validationScope: scope.current, validationProfile: { commands: ['npm run typecheck', 'npm run build', 'npm run test'], suggestedUnitCommand: 'npm run test -- --run src', deferredChecks: 'Playwright: requires a separate server' } })),
     attempt: async () => { reads.current++; return { ok: true, present: true, attempt: current.current, attemptLog: log.current, runLog: `CUMULATIVE_FIRST_MESSAGE\n${log.current}` } },
     cancel: coordinator.current.register('cancel', async () => { canceled.current = true; setAttempt(value => ({ ...value, status: 'canceled', finishedAt: Date.now() })); return { ok: true } }),
     begin: coordinator.current.register('begin', async (_event, input: { projectName: string; workspaceId?: string; autopilot?: boolean; checkOnly?: boolean }) => {
@@ -79,6 +79,7 @@ function Harness() {
       <button onClick={() => mode('source-materialization: source capture sealed-manifest: files=25362, bytes=4589080824')}>Capture</button>
       <button onClick={() => mode('resolver-install: package-manager resolver install: running')}>Install</button>
       <button onClick={() => mode('begin.discovery-progress')}>Discovery 12/30</button>
+      <button onClick={() => { present.current = true; setAttempt(value => ({...value,stage:'drive'})); mode('iterative migration verify-exact: project check 2/4 started: yarn lint') }}>Exact check 2/4</button>
       <button onClick={() => mode('lifecycle: npm run test', 'failed')}>Fail</button>
       <button onClick={restart}>New attempt</button>
       <button onClick={() => { scope.current = undefined; mode('begin.check-done', 'done') }}>Configure checks</button>

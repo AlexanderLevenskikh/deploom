@@ -762,6 +762,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
             <strong className={`attempt-status ${attempt.status === 'done' && attempt.lastStep === 'agent' ? 'paused' : attempt.status}`}>{childAlive || attemptAlive ? activity.title : activityText(attempt, text)}</strong>
             <span className="attempt-meta">
               · {text('прошло', 'elapsed')} {fmtElapsed(elapsedMs)}
+              {childAlive && attempt.lastHeartbeatAt ? ` · ${text('последний сигнал', 'latest signal')}: ${fmtElapsed(Math.max(0, Date.now() - attempt.lastHeartbeatAt))} ${text('назад', 'ago')}` : ''}
               {attempt.targetSource === 'roadmap'
                 ? ` · ${text('версии: по составу', 'versions: from scope')}`
                 : attempt.targetSource === 'discovery'
@@ -894,6 +895,15 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
             </div>
           ) : null}
 
+          {runner?.progressSummary ? <>
+            <div className="roadmap-summary-grid">
+              <div><strong>{runner.progressSummary.remaining}</strong><span>{text('осталось по политике', 'remaining policy goals')}</span></div>
+              <div><strong>{runner.progressSummary.accepted}</strong><span>{text('принято обновлений', 'accepted updates')}</span></div>
+              <div><strong>{runner.progressSummary.deferred}</strong><span>{text('отложено', 'deferred')}</span></div>
+            </div>
+            <p className="attempt-meta">{runner.progressSummary.checkpointId} · {text('всего целей', 'total goals')}: {runner.progressSummary.denominator} · {text('цели с версиями', 'versioned targets')}: {runner.progressSummary.targetCount} · {text('без подобранной версии', 'without a selected version')}: {runner.progressSummary.unresolvedGoals}</p>
+          </> : null}
+
           {!task ? (
             <div className="resume-notice">
               <strong>{text('Задание ещё не сформировано', 'The assignment is not ready yet')}</strong>
@@ -907,21 +917,6 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
             </div>
           ) : (
             <>
-              <div className="roadmap-summary-grid">
-                <div>
-                  <strong>{task.completeness.remaining}</strong>
-                  <span>{text('осталось', 'remaining')}</span>
-                </div>
-                <div>
-                  <strong>{task.actions.length}</strong>
-                  <span>{text('принято обновлений', 'accepted updates')}</span>
-                </div>
-                <div>
-                  <strong>{task.deferred.length}</strong>
-                  <span>{text('отложено', 'deferred')}</span>
-                </div>
-              </div>
-
               {snapshot?.stale ? (
                 <div className="resume-notice warning">
                   <strong>{text('ТЗ устарело', 'The assignment is stale')}</strong>
