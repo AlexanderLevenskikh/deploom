@@ -36,7 +36,7 @@ function App() {
   }
 
   if (!details) {
-    return <SetupScreen busy={setupBusy} onSelectExisting={flow.registerExisting} onPickParent={flow.pickDirectory} onCreate={async (input) => { setSetupBusy(true); try { await flow.cloneWorkspace(input) } catch (error) { flow.setError(error instanceof Error ? error.message : String(error)) } finally { setSetupBusy(false) } }} />
+    return <SetupScreen busy={setupBusy} onSelectExisting={agent => flow.registerExisting(undefined, agent)} onPickParent={flow.pickDirectory} onCreate={async (input) => { setSetupBusy(true); try { await flow.cloneWorkspace(input) } catch (error) { flow.setError(error instanceof Error ? error.message : String(error)) } finally { setSetupBusy(false) } }} />
   }
 
   const project = flow.selectedProject
@@ -95,7 +95,7 @@ function App() {
 
       {showAddProject ? <AddProjectDialog workspaceId={details.workspace.id} onClose={() => setShowAddProject(false)} onPickDirectory={flow.pickDirectory} onSubmit={flow.addProject} /> : null}
 
-      {showWorkspaceDialog ? <WorkspaceDialog onClose={() => setShowWorkspaceDialog(false)} onPickDirectory={flow.pickDirectory} onConnectExisting={(path) => flow.registerExisting(path)} onCreate={flow.cloneWorkspace} /> : null}
+      {showWorkspaceDialog ? <WorkspaceDialog onClose={() => setShowWorkspaceDialog(false)} onPickDirectory={flow.pickDirectory} onConnectExisting={(path, agent) => flow.registerExisting(path, agent)} onCreate={flow.cloneWorkspace} /> : null}
 
       <footer className="status-bar">
         <span>DepLoom {payload.appVersion}</span><span>Template: {details.git.branch}</span><span>Tool: {payload.environment.python.available ? t('app.footer.toolReady') : t('app.footer.noPython')}</span><span className="status-spacer" /><span><i className={`status-dot ${payload.environment[details.workspace.agent]?.available ? 'success' : 'danger'}`} />{details.workspace.agent}: {payload.environment[details.workspace.agent]?.available ? t('app.footer.available') : t('app.footer.notFound')}</span><span>{details.git.dirty ? t('app.footer.workspaceChanged') : t('app.footer.workspaceClean')}</span>

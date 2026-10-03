@@ -501,3 +501,4 @@ Durable ProjectProof reuse for arbitrary shell commands is disabled until the co
 Release publication is gated on exact-release-SHA Windows physical acceptance. npm and Yarn Classic remain the supported package managers; Yarn Berry and pnpm remain typed unsupported. Windows NTFS is the proof-grade physical substrate. ReFS has no independent Lambda acceptance claim. macOS and Linux do not claim proof-grade descendant-tree supervision.
 
 Migration check selection and optional Vitest nonregression control: [validation profiles](docs/MIGRATION_VALIDATION.md).
+See [Iterative FLOW and automatic continuation](docs/MIGRATION_FLOW.md) for run settings, agent selection and autopilot boundaries.

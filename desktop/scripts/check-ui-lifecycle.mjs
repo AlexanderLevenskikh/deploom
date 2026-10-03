@@ -19,7 +19,7 @@ for (const [name, source, sentinels] of [
   ['WorkspaceDialog', workspace, ["t('workspaceDialog.connect.title')", "t('workspaceDialog.create')", 'dialog-actions']],
   ['BaselineIntentDialog', baseline, ['useDeferredValue', 'autoFocus', 'deferredQuery']],
   ['MonitoringPanel', monitoring, ['presentRunError', "setView('errors')"]],
-  ['FlowWorkspace', flow, ['ModelPicker', 'persistAgentModel', 'startAutopilotWithCurrentModel']],
+  ['FlowWorkspace', flow, ['ModelPicker', 'persistAgentModel', 'onBeforeStart', 'migration-launch-settings']],
   ['ModelPicker', model, ['role="listbox"', 'onCommit', 'model-picker-menu']],
   ['main', main, ["flow:remove-project", 'Agent execution binding:', "spec.args.indexOf('--model')"]],
   ['preload', preload, ['removeProject:', "flow:remove-project"]],

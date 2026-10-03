@@ -55,6 +55,7 @@ export type ScenarioAttemptShape = {
   targetSource?: string
   stepsDone?: string[]
   runCreated?: boolean
+  discoveryCompleted?: boolean
 } | undefined
 
 export type ScenarioRunnerShape = {
@@ -128,6 +129,7 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
   const attempt = input.attempt
   const runner = input.runner
   const blocker = parseIterativeFailure(attempt?.lastError) ?? parseIterativeFailure(attempt?.reason)
+  const checked = input.checked || (attempt?.status === 'done' && attempt.lastStep === 'checked')
   const attemptLive = attempt?.status === "running" || attempt?.status === "starting"
   const attemptFailed = attempt?.status === "failed" || attempt?.status === "canceled"
   const decisionStep = runner?.decision?.step ?? null
@@ -205,7 +207,7 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
     }
     // P1#4: a real "Проверить проект" already passed (durable verdict) and the
     // migration has not started — STARTING is a separate, explicit action.
-    if (input.checked) {
+    if (checked) {
       return {
         state: "ready",
         blocker,
@@ -357,11 +359,12 @@ export function scenarioPipeline(state: ScenarioMainActionState, checked: boolea
     case "running":
     case "recovered-running": {
       const attempt = context?.attempt
+      if (attempt?.status === 'done' && attempt.lastStep === 'checked' && checked) return { current: 'plan', completed: ['check'] }
       if (context?.runner?.phase === "BOOTSTRAP_REPAIR" || attempt?.stage === "preflight") {
         return { current: "check", completed: [] }
       }
       if (attempt?.stage === "begin") {
-        const discovery = attempt.targetSource === "discovery" && attempt.phase?.includes("discovery")
+        const discovery = (attempt.targetSource === 'roadmap' && checked) || (attempt.targetSource === "discovery" && (checked || attempt.discoveryCompleted || attempt.phase?.includes("discovery")))
         return { current: discovery ? "plan" : "check", completed: discovery && checked ? ["check"] : [] }
       }
       // A busy flag alone is not evidence that checking/planning passed.

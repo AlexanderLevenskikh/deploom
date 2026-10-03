@@ -4,6 +4,9 @@
 // sources. Requires the electron TS to be compiled first (precheck: tsc).
 import { deriveMainAction, parseIterativeFailure, scenarioPipeline } from "../dist-electron/iterative-scenario.js";
 
+import { createIterativeAutopilot } from '../dist-electron/iterative-autopilot.js';
+import { discoveryProgress } from '../dist-electron/iterative-discovery-progress.js';
+import assert from 'node:assert/strict';
 import { canApplyAttemptRead, iterativeActivity } from "../dist-electron/iterative-activity.js";
 
 let failures = 0;
@@ -300,6 +303,65 @@ expect("journal: delayed reads cannot resurrect an old attempt or a completed pr
   if (!canApplyAttemptRead(current, { ...current, status: "running", lastHeartbeatAt: 200 }, "Demo", "w")) throw new Error("fresh resume was rejected");
   if (!canApplyAttemptRead(undefined, current, "Demo", "w")) throw new Error("initial read was rejected");
 });
+
+
+expect('pipeline: terminal check marks green before async status catches up', () => {
+  assert.equal(deriveMainAction({ inFlight: false, attempt: { status: 'done', lastStep: 'checked' }, runner: { present: false }, checked: false }).state, 'ready');
+});
+expect('pipeline: a concluded check fills its connector even while IPC returns', () => {
+  assert.deepEqual(scenarioPipeline('running', true, { attempt: { status: 'done', stage: 'begin', lastStep: 'checked' } }), { current: 'plan', completed: ['check'] });
+  assert.deepEqual(scenarioPipeline('running', true, { attempt: { stage: 'begin', targetSource: 'roadmap', phase: 'begin.c0-verify' } }), { current: 'plan', completed: ['check'] });
+});
+expect('pipeline: C0 after discovery never rewinds a passed check', () => {
+  const p = scenarioPipeline('running', true, { attempt: { stage: 'begin', targetSource: 'discovery', phase: 'begin.c0-verify', discoveryCompleted: true }, runner: { present: false } });
+  assert.equal(p.current, 'plan'); assert.deepEqual(p.completed, ['check']);
+});
+expect('progress: discovery -> capture -> discovery-result remains at completion', () => {
+  let p = discoveryProgress(undefined, { event: 'begin.discovery-progress', processed: 12, total: 30 });
+  p = discoveryProgress(p, { event: 'begin.discovery-progress', processed: 30, total: 30 });
+  p = discoveryProgress(p, { event: 'begin.capture', managedDependencies: 30 });
+  assert.deepEqual(p, { processed: 30, total: 30 });
+  p = discoveryProgress(p, { event: 'begin.discovery' });
+  assert.deepEqual(p, { processed: 30, total: 30 });
+  assert.equal(discoveryProgress(p, { event: 'begin.discovery-progress', processed: 0, total: 40 }), undefined);
+  assert.deepEqual(discoveryProgress(p, { event: 'begin.discovery-progress', processed: 0, total: 30 }), p);
+});
+expect('activity: finished discovery is preparation, never a zero search', () => {
+  const a = iterativeActivity(attempt({ phase: 'begin.discovery', discoveryCompleted: true, packageProgress: { processed: 30, total: 30 } }), true, 'en');
+  assert.equal(a.title, 'Preparing the verified starting state for the update'); assert.equal(a.percent, undefined);
+});
+const scope = { workspaceId: 'w', projectName: 'Demo', autopilot: true };
+const owner = () => createIterativeAutopilot(s => `${s.workspaceId}:${s.projectName}`);
+const calls = [];
+const auto = owner();
+const status = auto.register('status', async () => ({ ok: true, decision: { step: 'agent' } }));
+auto.register('agent', async () => { calls.push('agent'); return { ok: true }; });
+let driveNumber = 0;
+auto.register('drive', async () => { calls.push('drive'); return ++driveNumber === 1 ? { ok: true, stopped: 'agent-gate', repairRequests: [{ requestId: 'r1' }] } : { ok: true, stopped: 'finished' }; });
+const begin = auto.register('begin', async (_event, i) => { calls.push(i.checkOnly ? 'check' : 'begin'); assert.equal((await status(null, i)).autopilotActive, true); return i.checkOnly ? { ok: true, checked: { ok: true } } : { ok: true }; });
+const full = await begin(null, { ...scope, checkOnly: true });
+assert.equal(full.autopilot.stopped, 'finished'); assert.deepEqual(calls, ['check', 'begin', 'drive', 'agent', 'drive']); assert.equal((await status(null, scope)).autopilotActive, false);
+for (const blocked of [{ ok: false, error: 'INFRA' }, { ok: true, checked: { ok: false } }, { ok: true, noTargets: true }]) {
+ const a = owner(); let continued = 0;
+ a.register('drive', async () => { continued++; return { ok: true }; });
+ const b = a.register('begin', async () => blocked);
+ await b(null, scope); assert.equal(continued, 0);
+}
+const paused = owner(); let releaseCheck;
+const waitCheck = new Promise(resolve => { releaseCheck = resolve; });
+let extraCalls = 0;
+const pauseBegin = paused.register('begin', async () => { await waitCheck; return { ok: true, checked: { ok: true } }; });
+paused.register('drive', async () => { extraCalls++; return { ok: true }; });
+const cancel = paused.register('cancel', async () => ({ ok: true }));
+const pending = pauseBegin(null, scope);
+assert.equal((await pauseBegin(null, { ...scope, autopilot: false })).error, 'AUTOPILOT_IN_PROGRESS');
+await cancel(null, scope); releaseCheck(); assert.equal((await pending).autopilot.stopped, 'canceled'); assert.equal(extraCalls, 0);
+const repeat = owner(); let dispatched = 0;
+repeat.register('status', async () => ({ ok: true, decision: { step: 'agent' } }));
+repeat.register('agent', async () => { dispatched++; return { ok: true }; });
+const repeatDrive = repeat.register('drive', async () => ({ ok: true, stopped: 'agent-gate', repairRequests: [{ requestId: 'same' }] }));
+assert.equal((await repeatDrive(null, scope)).autopilot.error, 'AUTOPILOT_REPEATED_REPAIR_GATE'); assert.equal(dispatched, 1);
+console.log('autopilot: check -> begin -> drive -> agent -> finish; cancel, failure and repeated-gate boundaries OK');
 
 if (failures > 0) {
   console.error(`${failures} scenario contract check(s) FAILED`);

@@ -3,6 +3,8 @@
 // legacy failure. Exercises current/log/history ownership without a migration.
 import { createRoot } from 'react-dom/client'
 import { useEffect, useRef, useState, type ComponentProps } from 'react'
+import { WorkspaceDialog } from '../components/WorkspaceDialog'
+import { createIterativeAutopilot } from '../../electron/iterative-autopilot'
 import { FlowWorkspace } from '../components/FlowWorkspace'
 import { LanguageProvider, useLanguage } from '../i18n'
 import type { IterativeAttemptView, IterativeStatusOutcome, WorkspaceDetails } from '../types'
@@ -23,6 +25,11 @@ const models = async () => ['default']
 const getIntent: ComponentProps<typeof FlowWorkspace>['onGetBaselineIntentPlan'] = async () => ({ candidates: [], intent: { schemaVersion: 2, policies: {}, controlMode: 'AUTONOMOUS', targetLevel: 'yellow' } })
 
 function Harness() {
+  const [showWorkspace, setShowWorkspace] = useState(false)
+  const checked = useRef(false)
+  const present = useRef(false)
+  const canceled = useRef(false)
+  const coordinator = useRef(createIterativeAutopilot(s => `${s.workspaceId}:${s.projectName}`))
   const { setLanguage } = useLanguage()
   const [attempt, setAttempt] = useState<IterativeAttemptView>({ attemptId: 'current-1', projectName: project.name, workspaceId: 'qa', status: 'running', stage: 'begin', phase: 'source-materialization: source capture sealed-manifest: files=25362, bytes=4589080824', startedAt: Date.now() - 400_000, lastHeartbeatAt: Date.now(), targetSource: 'discovery', packageProgress: { processed: 12, total: 30 }, stepsDone: [], runCreated: false })
   const current = useRef(attempt)
@@ -31,9 +38,21 @@ function Harness() {
   const reads = useRef(0)
   const scope = useRef<IterativeStatusOutcome['validationScope']>(undefined)
   const api = useRef({
-    status: async (): Promise<IterativeStatusOutcome> => ({ ok: true, present: false, stale: false, inFlight: current.current.status === 'running', attempt: current.current, validationScope: scope.current, validationProfile: { commands: ['npm run typecheck', 'npm run build', 'npm run test'], suggestedUnitCommand: 'npm run test -- --run src', deferredChecks: 'Playwright: requires a separate server' } }),
+    status: coordinator.current.register('status', async (): Promise<IterativeStatusOutcome> => ({ ok: true, present: present.current, phase: current.current.stage === 'drive' && current.current.status === 'done' ? 'TERMINAL' : present.current ? 'READY' : undefined, decision: current.current.stage === 'drive' && current.current.status === 'done' ? { step: 'finish', phase: 'TERMINAL', reason: 'COMPLETE', satisfied: true } : undefined, checked: { ok: checked.current }, stale: false, inFlight: current.current.status === 'running', attempt: current.current, validationScope: scope.current, validationProfile: { commands: ['npm run typecheck', 'npm run build', 'npm run test'], suggestedUnitCommand: 'npm run test -- --run src', deferredChecks: 'Playwright: requires a separate server' } })),
     attempt: async () => { reads.current++; return { ok: true, present: true, attempt: current.current, attemptLog: log.current } },
-    cancel: async () => { setAttempt(value => ({ ...value, status: 'canceled', finishedAt: Date.now() })); return { ok: true } },
+    cancel: coordinator.current.register('cancel', async () => { canceled.current = true; setAttempt(value => ({ ...value, status: 'canceled', finishedAt: Date.now() })); return { ok: true } }),
+    begin: coordinator.current.register('begin', async (_event, input: { projectName: string; workspaceId?: string; autopilot?: boolean; checkOnly?: boolean }) => {
+      canceled.current = false; setAttempt(value => ({ ...value, status: 'running', stage: 'begin', phase: input.checkOnly ? 'begin.check' : 'begin.discovery-progress', discoveryCompleted: false }));
+      await new Promise(resolve => setTimeout(resolve, 2200));
+      if (canceled.current) return { ok: false, error: 'canceled' };
+      if (input.checkOnly) { checked.current = true; setAttempt(value => ({ ...value, status: 'done', lastStep: 'checked', phase: 'begin.check-done' })); return { ok: true, checked: { ok: true } }; }
+      present.current = true; setAttempt(value => ({ ...value, status: 'done', lastStep: 'plan-next', discoveryCompleted: true, packageProgress: { processed: 30, total: 30 }, runCreated: true })); return { ok: true, phase: 'READY' };
+    }),
+    drive: coordinator.current.register('drive', async () => {
+      setAttempt(value => ({ ...value, status: 'running', stage: 'drive', phase: 'verify-exact' })); await new Promise(resolve => setTimeout(resolve, 2200));
+      if (canceled.current) return { ok: true, stopped: 'canceled' as const, steps: [] };
+      setAttempt(value => ({ ...value, status: 'done', stage: 'drive', lastStep: 'finish' })); return { ok: true, stopped: 'finished' as const, steps: [] };
+    }),
   })
   useEffect(() => {
     setLanguage('ru')
@@ -62,6 +81,10 @@ function Harness() {
       <button onClick={restart}>New attempt</button>
       <button onClick={() => { scope.current = undefined; mode('begin.check-done', 'done') }}>Configure checks</button>
       <button onClick={() => { scope.current = { mode: 'test-nonregression', existingFailures: 1, total: 2 }; mode('begin.check-done', 'done') }}>Known baseline</button>
+      <button onClick={() => { checked.current = true; setAttempt(value => ({ ...value, status: 'done', lastStep: 'checked', discoveryCompleted: false })) }}>Check passed</button>
+      <button onClick={() => { checked.current = true; setAttempt(value => ({ ...value, phase: 'begin.discovery', status: 'running', discoveryCompleted: true, discoverySkipped: 10, packageProgress: { processed: 30, total: 30 } })) }}>Discovery done</button>
+      <button onClick={() => mode('begin.c0-verify')}>C0 verify</button>
+      <button onClick={() => setShowWorkspace(true)}>Workspace dialog</button>
       <button onClick={() => setLanguage('en')}>EN</button><button onClick={() => setLanguage('ru')}>RU</button>
     </div>
     <FlowWorkspace details={details} project={project} appVersion="QA" liveIterativeAttempt={attempt}
@@ -70,9 +93,10 @@ function Harness() {
       onRun={async () => undefined} onSendAgentNote={async () => false} onStartAutopilot={noop} onStopAutopilot={noop} onRecoverWithAgent={noop}
       onOpenDashboard={() => {}} onOpenPath={noop} onChoosePrompt={noop} onUpdateWorkspace={noop} onUpdateProjectBranches={noop} onUpdateProjectNode={noop}
       onListNodeVersions={models} onListAgentModels={models} onGetIterativeTask={getTask} onExportIterativeTask={outcome} onExportLegacyIterativeTask={outcome} onCopyIterativeTask={outcome} onSaveIterativeTask={outcome}
-      onIterativeStatus={api.current.status} onIterativeAttempt={api.current.attempt} onIterativeCancel={api.current.cancel}
-      onIterativeBegin={async () => ({ ok: true, started: false })} onIterativeDrive={async () => ({ ok: true, stopped: 'canceled', steps: [] })} onIterativeAgent={async () => ({ ok: false })}
+      onIterativeStatus={name => api.current.status(null, { projectName: name })} onIterativeAttempt={api.current.attempt} onIterativeCancel={name => api.current.cancel(null, { projectName: name })}
+      onIterativeBegin={(name, input) => api.current.begin(null, { projectName: name, ...input })} onIterativeDrive={(name, autopilot) => api.current.drive(null, { projectName: name, autopilot })} onIterativeAgent={async () => ({ ok: false })}
       logs={[{ jobId: 'old', stream: 'stderr', line: 'SAVED_OLD_FLOW_ONLY: historical error' }]} />
+    {showWorkspace ? <WorkspaceDialog onClose={() => setShowWorkspace(false)} onPickDirectory={async () => 'C:/demo/workspaces'} onConnectExisting={async () => {}} onCreate={async () => {}} /> : null}
   </main>
 }
 const root = createRoot(document.getElementById('root')!)

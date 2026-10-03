@@ -1,4 +1,4 @@
-import { AlertCircle, AlertTriangle, Check, ChevronDown, Circle, CircleHelp, ExternalLink, FileText, LoaderCircle, Pause, Play, RotateCcw, Send, ShieldCheck } from 'lucide-react'
+import { FileText, LoaderCircle, Play, RotateCcw, ShieldCheck } from 'lucide-react'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ACTION_ORDER, FLOW_STAGES } from '../data/flow'
@@ -16,10 +16,6 @@ import type { ScenarioSignal } from '../../electron/iterative-scenario'
 import type { DraftProgressPayload } from '../hooks/useDependencyFlow'
 import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, DraftResultSnapshot, EnvironmentInfo, FlowAction, IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobOutput, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
 
-const AUTOPILOT_HELP = {
-  ru: '«Продолжить» автономно доводит текущий этап. Автопилот дополнительно проходит весь FLOW до принятого результата: после audit он возвращается в migration только при реальном acceptance blocker, а не ради процента freshness.',
-  en: 'Continue autonomously completes the current stage. Autopilot also advances through FLOW to an accepted result: after audit it re-enters migration only for a real acceptance blocker, never to chase a freshness percentage.',
-} as const
 
 type Props = {
   details: WorkspaceDetails
@@ -57,9 +53,9 @@ type Props = {
   onCopyIterativeTask: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onSaveIterativeTask: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onIterativeStatus: (projectName: string) => Promise<IterativeStatusOutcome>
-  onIterativeDrive: (projectName: string) => Promise<IterativeDriveOutcome>
-  onIterativeBegin: (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
-  onIterativeAgent: (projectName: string) => Promise<IterativeAgentOutcome>
+  onIterativeDrive: (projectName: string, autopilot?: boolean) => Promise<IterativeDriveOutcome>
+  onIterativeBegin: (projectName: string, discovery?: { autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
+  onIterativeAgent: (projectName: string, autopilot?: boolean) => Promise<IterativeAgentOutcome>
   onIterativeAttempt: (projectName: string) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
   onIterativeCancel: (projectName: string) => Promise<{ ok: boolean }>
   liveIterativeAttempt?: IterativeAttemptView
@@ -70,19 +66,18 @@ type Props = {
   onClearLogs?: () => void
 }
 
-export function FlowWorkspace({ details, project, appVersion, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, autopilotActive, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onStartAutopilot, onStopAutopilot, onRecoverWithAgent, onOpenDashboard, onOpenPath, onChoosePrompt, onUpdateWorkspace, onUpdateProjectBranches, onUpdateProjectNode, onListNodeVersions, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onExportLegacyIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeDrive, onIterativeBegin, onIterativeAgent, onIterativeAttempt, onIterativeCancel, liveIterativeAttempt, logs, onCancelJob, onClearLogs }: Props) {
+export function FlowWorkspace({ details, project, appVersion, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onOpenDashboard, onOpenPath, onUpdateWorkspace, onUpdateProjectBranches, onUpdateProjectNode, onListNodeVersions, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onExportLegacyIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeDrive, onIterativeBegin, onIterativeAgent, onIterativeAttempt, onIterativeCancel, liveIterativeAttempt, logs, onCancelJob, onClearLogs }: Props) {
   const { language, text, t } = useLanguage()
   // The persisted goal drives stage actions and autopilot: a green target set
   // in the Baseline dialog must survive into generate/release instead of
   // being reset to a hard-coded yellow on the next step (F1).
   const target: TargetLevel = details.baselineIntent?.targetLevel === 'green' ? 'green' : 'yellow'
-  const [label, setLabel] = useState('')
+  const [label] = useState('')
   const [releaseBranch, setReleaseBranch] = useState(project.git?.releaseBranch || 'libs-release')
-  const [gateCommand, setGateCommand] = useState('')
+  const [gateCommand] = useState('')
   const [agentNote, setAgentNote] = useState('')
-  const [noteSendState, setNoteSendState] = useState<'idle' | 'sending' | 'sent'>('idle')
   const [selectedBranchFailure, setSelectedBranchFailure] = useState<MigrationBranchProgress | null>(null)
-  const [selectedStageIndex, setSelectedStageIndex] = useState<number | null>(null)
+  const [, setSelectedStageIndex] = useState<number | null>(null)
   const [baselineIntentDialog, setBaselineIntentDialog] = useState<{ mode: 'prepare' | 'decision'; resume: 'auto' | 'continue' | 'restart'; plan: BaselineIntentPlan; decision?: BaselineDecision }>()
   const [draftPromptPreview, setDraftPromptPreview] = useState<ProjectPromptPreview>()
   // Draft completion is resolved by runId from workspace state, not by watching
@@ -138,7 +133,6 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   const run = details.teamState?.projects[project.name]
   const recovery = run?.recovery
   const baselineRestartRequired = recovery?.action === 'baseline' && (recovery.code === 'BASELINE_RECOVERY_CONTINUE_UNAVAILABLE' || recovery.message.includes('BASELINE_RECOVERY_CONTINUE_UNAVAILABLE'))
-  const agentRecoveryAvailable = recovery?.kind === 'agent'
   // Legacy whole-migration session, or (once the per-branch-group loop has
   // run for this project) whichever branch it was last working on.
   const activeGroupSession = run?.activeAgentBranch ? run.agentSessions?.[run.activeAgentBranch] : undefined
@@ -151,16 +145,12 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   // the running stage onwards made the progress bar walk backwards during a
   // run and flipped finished stages to "Ожидает"; the stored state already
   // drops the genuinely invalidated downstream stages when a stage restarts.
-  const isActionCompleted = (action: FlowAction) => completed.has(action) && action !== activeAction
-  const completedStageCount = ACTION_ORDER.filter(isActionCompleted).length
   const promptReady = Boolean(details.projectPromptPath && details.migrationProgress?.project === project.name)
   // A branch already created/ready/merged means the plan is mid-flight even
   // when there's no interrupted agent CLI session left to resume (e.g. the
   // orchestrator's own merge step stopped on a conflict and the user just
   // fixed it by hand) -- the primary button must read as "continue", not
   // "start", or it looks identical to the destructive "Начать заново" action.
-  const hasMigrationProgress = Boolean(promptReady && details.migrationProgress?.branches.some((branch) => branch.status !== 'waiting'))
-  const dirtyBlocksMigration = Boolean(details.migrationProgress?.dirty && (details.migrationProgress.currentBranch === details.migrationProgress.mergedBranch || details.migrationProgress.branches.some((branch) => branch.branch === details.migrationProgress?.currentBranch)))
   const planReady = details.dashboardExists && promptReady
   const runningIndex = activeAction ? FLOW_STAGES.findIndex((stage) => stage.action === activeAction) : -1
   const currentIndex = runningIndex >= 0 ? runningIndex : FLOW_STAGES.findIndex((stage) => stage.action ? !completed.has(stage.action) : !planReady)
@@ -178,7 +168,6 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   const actionsComplete = !activeAction && requiredCompletionActions.every((action) => completed.has(action))
   const flowComplete = actionsComplete && acceptanceAccepted
   const activeIndex = currentIndex < 0 ? FLOW_STAGES.length - 1 : currentIndex
-  const displayedIndex = selectedStageIndex ?? activeIndex
   const active = Boolean(activeAction)
   // P1#1: the deterministic iterative scenario owns the ONE main action. The
   // panel mirrors it here; while a signal is present, the hero never renders
@@ -186,8 +175,6 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   const [reportedScenario, setScenarioSignal] = useState<ScenarioSignal | undefined>(undefined)
   const scenarioSignal = reportedScenario?.projectName === project.name && reportedScenario.workspaceId === details.workspace.id ? reportedScenario : undefined
   const scenarioOnScenario = setScenarioSignal
-  const displayedAction = FLOW_STAGES[displayedIndex].action
-  const releaseBlocked = displayedAction === 'release' && !acceptanceAccepted
   const acceptanceTone = acceptanceAccepted ? 'success' : acceptanceNeedsRemediation ? 'danger' : 'muted'
   const acceptanceLabel = acceptanceAccepted ? 'ACCEPTED' : acceptanceNeedsRemediation ? 'REMEDIATION_REQUIRED' : 'UNKNOWN'
   const configuredBranch = project.git?.baseBranch || project.git?.branchPrefix || 'libs'
@@ -201,28 +188,6 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   }, [onListNodeVersions])
   const [agentModel, setAgentModel] = useState(details.workspace.agentModel ?? '')
   const [modelSuggestions, setModelSuggestions] = useState<string[]>([])
-  const migrationStatusLabels = {
-    waiting: t('flow.status.waiting'), created: t('flow.status.created'), partial: t('flow.status.partial'),
-    changes: t('flow.status.changes'), ready: t('flow.status.ready'), integrated: t('flow.status.integrated'), merged: t('flow.status.merged'),
-  } as const
-  const migrationRuntimeLabels = {
-    planning: t('flow.runtime.planning'), queued: t('flow.runtime.queued'), starting: t('flow.runtime.starting'),
-    running: t('flow.runtime.running'), bootstrapping: t('flow.runtime.bootstrapping'), verifying: t('flow.runtime.verifying'),
-    repairing: t('flow.runtime.repairing'), failed: t('flow.runtime.failed'), ready: t('flow.runtime.ready'),
-    merging: t('flow.runtime.merging'), 'integration-verifying': t('flow.runtime.integration'),
-  } as const
-  const migrationStatusLabel = (branch: MigrationBranchProgress) => branch.runtime ? migrationRuntimeLabels[branch.runtime.phase] : migrationStatusLabels[branch.status]
-  const migrationFailureTone = (branch: MigrationBranchProgress) => /USER_ACTION_REQUIRED|APPROVAL_REQUIRED|SAFETY_STOP|MANUAL_INTERVENTION_REQUIRED/i.test(branch.runtime?.detail ?? '') ? 'error' : 'warning'
-  const migrationBranchProgressText = (branch: MigrationBranchProgress) => {
-    if (!branch.runtime && !['created', 'partial', 'changes', 'ready'].includes(branch.status)) return t('flow.branch.dependencies', { count: branch.packages.length })
-    const progressText = t('flow.branch.targets', { met: branch.metPackages, total: branch.packages.length })
-    if (branch.runtime?.phase === 'failed') return `${progressText} · ${t('flow.branch.failureHint')}`
-    return `${progressText}${branch.runtime?.detail ? ` · ${branch.runtime.detail}` : ''}`
-  }
-  const migrationBranchActive = (branch: MigrationBranchProgress) => Boolean(branch.runtime && !['planning', 'queued', 'failed', 'ready'].includes(branch.runtime.phase))
-  const planningMigrationBranches = details.migrationProgress?.branches.filter((branch) => branch.runtime?.phase === 'planning').length ?? 0
-  const queuedMigrationBranches = details.migrationProgress?.branches.filter((branch) => branch.runtime?.phase === 'queued').length ?? 0
-  const failedMigrationBranches = details.migrationProgress?.branches.filter((branch) => branch.runtime?.phase === 'failed').length ?? 0
 
   useEffect(() => {
     setBranchBase(configuredBranch)
@@ -368,25 +333,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
     }
   }
 
-  const sendLiveNote = async () => {
-    const trimmed = agentNote.trim()
-    if (!trimmed) return
-    setNoteSendState('sending')
-    await onSendAgentNote(trimmed)
-    setAgentNote('')
-    setNoteSendState('sent')
-    window.setTimeout(() => setNoteSendState((current) => current === 'sent' ? 'idle' : current), 2500)
-  }
 
-  const startRecovery = async () => {
-    const trimmed = agentNote.trim()
-    if (!trimmed || !agentRecoveryAvailable) return
-    setNoteSendState('sending')
-    await onRecoverWithAgent({ workspaceId: details.workspace.id, projectName: project.name, note: trimmed })
-    setAgentNote('')
-    setNoteSendState('sent')
-    window.setTimeout(() => setNoteSendState((current) => current === 'sent' ? 'idle' : current), 2500)
-  }
 
   const persistAgentModel = async (value = agentModel) => {
     const trimmed = value.trim()
@@ -396,15 +343,10 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
       await onUpdateWorkspace({ id: details.workspace.id, agentModel: trimmed })
     } catch (error) {
       setAgentModel(details.workspace.agentModel ?? '')
-      window.alert(error instanceof Error ? error.message : String(error))
+      throw error
     }
   }
 
-  const startAutopilotWithCurrentModel = async () => {
-    if (!window.confirm(`Автопилот самостоятельно пройдёт оставшиеся этапы FLOW для ${project.name}, будет чинить recoverable-ошибки и после audit продолжит migration только пока не выполнена acceptance policy. Freshness не является обязательным порогом. Публикация ${project.git?.push ? 'разрешена настройкой git.push' : 'НЕ выполняется: git.push выключен'}. Запустить?`)) return
-    await persistAgentModel()
-    await onStartAutopilot({ workspaceId: details.workspace.id, projectName: project.name, target, releaseBranch })
-  }
 
   const persistGitSettings = async (nextBranch = branchBase, nextPush = pushEnabled) => {
     const normalizedBranch = nextBranch.trim() || 'libs'
@@ -435,7 +377,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
       })
     } catch (error) {
       setNodeVersionDraft(configuredNodeVersion)
-      window.alert(error instanceof Error ? error.message : String(error))
+      throw error
     }
   }
 
@@ -631,6 +573,19 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         )}
       </section>
 
+      <section className="roadmap-card migration-launch-settings"><header className="roadmap-card-header"><div><strong>{text('Настройки запуска', 'Run settings')}</strong><span>{text('Агент и модель используются для исправлений. Выберите их до запуска; работа агента может расходовать токены.', 'Agent and model are used for repairs. Choose them before starting; agent work may consume tokens.')}</span></div></header>
+      <fieldset className="project-facts" disabled={active || scenarioSignal?.running}>
+        <div><span>{t('flow.projectPath')}</span><strong title={project.path}>{project.path}</strong></div>
+        <div><span>{t('common.branch')}</span><div className="git-plan-control"><input aria-label={t('flow.updateBranch')} value={branchBase} onChange={(event) => setBranchBase(event.target.value)} onBlur={() => void persistGitSettings()} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }} placeholder="libs" /><label className="push-toggle" title={t('flow.pushTitle')}><input type="checkbox" checked={pushEnabled} onChange={(event) => void persistGitSettings(branchBase, event.target.checked)} />Push</label></div></div>
+        <div><span>{t('flow.workspace')}</span><strong className={details.git.dirty ? 'warning-text' : 'success-text'}>{details.git.dirty ? t('flow.workspaceDirty', { count: details.git.summary.length }) : t('flow.workspaceClean')}</strong></div>
+        <div><span>{t('flow.agent')}</span><QuickSelect value={details.workspace.agent} options={[{ value: 'codex', label: 'Codex' }, { value: 'opencode', label: 'OpenCode' }, { value: 'claude', label: 'Claude' }]} onChange={(value) => void onUpdateWorkspace({ id: details.workspace.id, agent: value as AgentProvider })} ariaLabel={t('flow.agent')} /></div>
+        <div><span>{t('flow.model')}</span><ModelPicker value={agentModel} options={modelSuggestions} onChange={setAgentModel} onCommit={value => persistAgentModel(value).catch(error => window.alert(error instanceof Error ? error.message : String(error)))} placeholder={t('flow.modelDefault')} ariaLabel={t('flow.modelAria')} title={t('flow.modelTitle')} /></div>
+        <div><span title={text('Явная версия Node.js проекта/CI. Пусто = среда не зафиксирована (host runtime, без гарантии совместимости с CI). Проверки и верификация будут выполняться установленным Node.', 'Explicit project/CI Node.js version. Empty = no fixed runtime (host ambient Node, no CI-compatibility claim). Verification and checks run on the installed Node.')}>{text('Node.js', 'Node.js')}</span><ModelPicker value={nodeVersionDraft} options={availableNodeVersions} onChange={setNodeVersionDraft} onCommit={value => persistNodeVersion(value).catch(error => window.alert(error instanceof Error ? error.message : String(error)))} placeholder={text('не задано', 'not set')} ariaLabel={text('Node.js для проекта/CI', 'Node.js for project/CI')} title={text('Node.js для проекта/CI', 'Node.js for project/CI')} />
+          {project.nodeHints?.length ? <span className="node-hints" title={text('Закрепления Node в репозитории (engines.node / .nvmrc / .node-version). Подсказка: выбирать отсюда не обязательно — пустое значение означает среду хоста.', 'Node pins in this repository (engines.node / .nvmrc / .node-version). Suggestion only — leaving it empty keeps the host runtime.')}>{text('В репо закреплён Node', 'Repo pins Node')}: {project.nodeHints.join(', ')}</span> : null}
+        </div>
+      </fieldset>
+      </section>
+
       <IterativeTaskPanel
         key={`${details.workspace.id}:${project.name}`}
         workspaceId={details.workspace.id}
@@ -649,6 +604,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         onAttempt={onIterativeAttempt}
         onCancel={onIterativeCancel}
         liveAttempt={liveIterativeAttempt}
+        onBeforeStart={async () => { await persistAgentModel(); await persistNodeVersion(nodeVersionDraft) }}
         onConfigureScope={() => void openBaselineIntentDialog('prepare', 'auto')}
         onOpenPath={onOpenPath}
         // P1#1: the panel mirrors the one main action to the hero and must not
@@ -660,136 +616,15 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
       <details className="flow-technical-details">
         <summary>{text('Технические детали', 'Technical details')}</summary>
         <div className="flow-technical-details-body">
-          <p className="flow-artifact-note">{text('Текущая попытка сохраняет stdout/stderr и служебные события в attempt.log в каталоге итеративного запуска. Журналы прежнего FLOW / Draft находятся в .dependency-roadmap/artifacts/runs. Логи нужны для диагностики и не определяют результат.', 'The current attempt saves stdout/stderr and service events to attempt.log in the iterative run directory. Previous FLOW / Draft logs are under .dependency-roadmap/artifacts/runs. Logs are diagnostic only and do not determine the result.')}</p>
-      <div className="project-facts">
-        <div><span>{t('flow.projectPath')}</span><strong title={project.path}>{project.path}</strong></div>
+          {(acceptance || currentLevel) ? <section className="previous-audit-metrics"><strong>{text('Метрики последнего отдельного аудита', 'Metrics from the last separate audit')}</strong><p>{text('Это сохранённые метрики отдельного аудита; они не являются статусом текущего итеративного запуска.', 'These are saved metrics from a separate audit, not the status of the current iterative run.')}</p><div className="project-facts">
         <div><span>{text('Acceptance', 'Acceptance')}</span><strong className="level-label" title={acceptance?.reasons.join(' · ')}><i className={`status-dot ${acceptanceTone}`} />{acceptanceLabel}{typeof acceptance?.critical === 'number' && typeof acceptance?.high === 'number' ? ` · C${acceptance.critical}/H${acceptance.high}` : ''}</strong></div>
         <div><span title={currentLevel?.measuredAt ? t('flow.lastMeasured', { value: currentLevel.measuredAt }) : undefined}>{text('Freshness', 'Freshness')}{levelRefreshing ? ` · ${t('flow.recalculating')}` : measuredLabel ? ` · ${measuredLabel}` : ''}</span><strong>{typeof currentLevel?.lagOkPct === 'number' ? `${currentLevel.lagOkPct.toFixed(1)}%` : text('не рассчитана', 'not calculated')}</strong></div>
-        <div><span>{t('common.branch')}</span><div className="git-plan-control"><input aria-label={t('flow.updateBranch')} value={branchBase} onChange={(event) => setBranchBase(event.target.value)} onBlur={() => void persistGitSettings()} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }} placeholder="libs" /><label className="push-toggle" title={t('flow.pushTitle')}><input type="checkbox" checked={pushEnabled} onChange={(event) => void persistGitSettings(branchBase, event.target.checked)} />Push</label></div></div>
-        <div><span>{t('flow.workspace')}</span><strong className={details.git.dirty ? 'warning-text' : 'success-text'}>{details.git.dirty ? t('flow.workspaceDirty', { count: details.git.summary.length }) : t('flow.workspaceClean')}</strong></div>
-        <div><span>{t('flow.agent')}</span><QuickSelect value={details.workspace.agent} options={[{ value: 'codex', label: 'Codex' }, { value: 'opencode', label: 'OpenCode' }, { value: 'claude', label: 'Claude' }]} onChange={(value) => void onUpdateWorkspace({ id: details.workspace.id, agent: value as AgentProvider })} ariaLabel={t('flow.agent')} /></div>
-        <div><span>{t('flow.model')}</span><ModelPicker value={agentModel} options={modelSuggestions} onChange={setAgentModel} onCommit={persistAgentModel} placeholder={t('flow.modelDefault')} ariaLabel={t('flow.modelAria')} title={t('flow.modelTitle')} /></div>
-        <div><span title={text('Явная версия Node.js проекта/CI. Пусто = среда не зафиксирована (host runtime, без гарантии совместимости с CI). Проверки и верификация будут выполняться установленным Node.', 'Explicit project/CI Node.js version. Empty = no fixed runtime (host ambient Node, no CI-compatibility claim). Verification and checks run on the installed Node.')}>{text('Node.js', 'Node.js')}</span><ModelPicker value={nodeVersionDraft} options={availableNodeVersions} onChange={setNodeVersionDraft} onCommit={() => persistNodeVersion(nodeVersionDraft)} placeholder={text('не задано', 'not set')} ariaLabel={text('Node.js для проекта/CI', 'Node.js for project/CI')} title={text('Node.js для проекта/CI', 'Node.js for project/CI')} />
-          {project.nodeHints?.length ? <span className="node-hints" title={text('Закрепления Node в репозитории (engines.node / .nvmrc / .node-version). Подсказка: выбирать отсюда не обязательно — пустое значение означает среду хоста.', 'Node pins in this repository (engines.node / .nvmrc / .node-version). Suggestion only — leaving it empty keeps the host runtime.')}>{text('В репо закреплён Node', 'Repo pins Node')}: {project.nodeHints.join(', ')}</span> : null}
-        </div>
-      </div>
+          </div></section> : null}
+          <p className="flow-artifact-note">{text('Текущая попытка сохраняет stdout/stderr и служебные события в attempt.log в каталоге итеративного запуска. Журналы прежнего FLOW / Draft находятся в .dependency-roadmap/artifacts/runs. Логи нужны для диагностики и не определяют результат.', 'The current attempt saves stdout/stderr and service events to attempt.log in the iterative run directory. Previous FLOW / Draft logs are under .dependency-roadmap/artifacts/runs. Logs are diagnostic only and do not determine the result.')}</p>
+
 
       {currentScenario ? <IterativeRunDiagnostics signal={currentScenario} /> : null}
-      <details className="flow-legacy-history" open={currentScenario ? undefined : true}>
-        <summary>{active ? text('Текущий FLOW / Draft', 'Current FLOW / Draft') : text('Прежний FLOW / история (отдельный запуск)', 'Previous FLOW / history (separate run)')}</summary>
-        {currentScenario ? <p className="flow-artifact-note">{text('Эти этапы и ошибки относятся к прежнему FLOW. Они не описывают текущую итеративную попытку выше.', 'These stages and errors belong to the previous FLOW. They do not describe the current iterative attempt above.')}</p> : null}
-      <div className="run-progress">
-        <span>{t('flow.runProgress')}</span><div className="progress-track"><div style={{ width: `${Math.round((completedStageCount / ACTION_ORDER.length) * 100)}%` }} /></div><strong>{t('flow.commandsCompleted', { done: completedStageCount, total: ACTION_ORDER.length })}</strong>
-        <label className="run-label">{t('flow.label')}<input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="deps-2026-q3" /></label>
-      </div>
 
-      <div className="flow-heading"><div><h2>{t('flow.currentRun')}</h2><p>{t('flow.currentRunHint')}</p></div></div>
-
-      <div className="flow-layout">
-        <ol className="stage-list">
-          {FLOW_STAGES.map((stage, index) => {
-            const isCurrent = !flowComplete && index === activeIndex
-            const isSelected = index === displayedIndex && !(flowComplete && selectedStageIndex === null)
-            const done = stage.action ? isActionCompleted(stage.action) : planReady
-            return (
-              <li key={stage.id} className={`${done ? 'done' : ''} ${isCurrent ? 'current' : ''} ${isSelected ? 'selected' : ''}`}>
-                <button onClick={() => setSelectedStageIndex(index)} disabled={active} aria-pressed={isSelected}>
-                  <span className="stage-marker">{done ? <Check size={14} /> : active && isCurrent ? <LoaderCircle className="spin" size={14} /> : stage.id}</span>
-                  <span className="stage-copy"><strong>{t(stage.titleKey)}</strong><small>{done ? t('flow.stage.completed') : isCurrent ? t('flow.stage.current') : t('flow.stage.waiting')}</small></span>
-                  {isSelected ? <ChevronDown size={15} /> : null}
-                </button>
-              </li>
-            )
-          })}
-        </ol>
-
-        <div className="stage-detail">
-          {flowComplete && selectedStageIndex === null ? <div className="flow-complete">
-            <span className="flow-complete-icon"><Check size={24} /></span>
-            <h3>{text('Результат принят', 'Result accepted')}</h3>
-            <p>{text('Независимый dependency audit проходит acceptance policy, а release/state gates завершены. Freshness — отдельная метрика улучшения и не была обязательным порогом.', 'The independent dependency audit satisfies the acceptance policy and release/state gates are complete. Freshness is a separate improvement metric and was not a mandatory threshold.')}</p>
-            <strong>{`Acceptance: C${acceptance?.critical ?? '?'}/H${acceptance?.high ?? '?'} · ${text('Freshness', 'Freshness')}: ${typeof currentLevel?.lagOkPct === 'number' ? `${currentLevel.lagOkPct.toFixed(1)}%` : '—'}`}</strong>
-            <div className="stage-actions">
-              <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} /> {text('Продолжить улучшение', 'Continue improving')}</button>
-              {run?.bestEffortRelease?.handoffPath ? <button className="button secondary" onClick={() => void onOpenPath(run.bestEffortRelease?.handoffPath)}><FileText size={16} /> {text('Открыть legacy handoff', 'Open legacy handoff')}</button> : null}
-              <button className="button primary" onClick={onOpenDashboard}><ExternalLink size={16} /> {text('Открыть финальный dashboard', 'Open final Dashboard')}</button>
-            </div>
-          </div> : <>
-          <div className="stage-detail-title"><div><h3>{t(FLOW_STAGES[displayedIndex].titleKey)}</h3><p>{t(FLOW_STAGES[displayedIndex].descriptionKey)}</p></div><span className="step-number">{t('flow.step', { step: displayedIndex + 1 })}</span></div>
-          <div className="check-table">
-            <div><Check className="success-text" size={17} /><span>{t('flow.check.workspaceSettings')}</span><strong>{details.settingsExists ? 'OK' : t('flow.check.notFound')}</strong><small>{details.workspace.settingsPath}</small></div>
-            <div><Check className={details.git.dirty ? 'warning-text' : 'success-text'} size={17} /><span>{t('flow.check.git')}</span><strong>{details.git.dirty ? t('flow.check.attention') : 'OK'}</strong><small>{details.git.branch}</small></div>
-            <div>{details.dashboardExists ? <Check className="success-text" size={17} /> : <Circle size={17} />}<span>{t('flow.check.dashboard')}</span><strong>{details.dashboardExists ? t('common.ready') : t('common.waiting')}</strong><small>{details.dashboardExists ? (details.dashboardPath || '—') : t('flow.check.dashboardMissing')}</small></div>
-            <div>{promptReady ? <Check className="success-text" size={17} /> : <Circle size={17} />}<span>{t('flow.check.agentPrompt')}</span><strong>{promptReady ? t('common.ready') : t('common.waiting')}</strong><small>{details.projectPromptPath || t('flow.check.exportPrompt')}</small></div>
-          </div>
-          {acceptanceNeedsRemediation ? <div className="confirmation"><AlertTriangle size={18} /><span>{text(
-            `Acceptance пока не выполнен: Critical=${acceptance?.critical ?? '?'}, High=${acceptance?.high ?? '?'}. Autopilot/Supervisor будет искать минимальный verified residual именно для этих findings; freshness ${typeof currentLevel?.lagOkPct === 'number' ? `${currentLevel.lagOkPct.toFixed(1)}%` : '—'} не является blocker.`,
-            `Acceptance is not satisfied yet: Critical=${acceptance?.critical ?? '?'}, High=${acceptance?.high ?? '?'}. Autopilot/Supervisor will seek the smallest verified residual for these findings; freshness ${typeof currentLevel?.lagOkPct === 'number' ? `${currentLevel.lagOkPct.toFixed(1)}%` : '—'} is not a blocker.`,
-          )}</span></div> : null}
-          {acceptanceUnknown && completed.has('audit') ? <div className="confirmation"><AlertTriangle size={18} /><span>{text(
-            `Acceptance UNKNOWN: ${acceptance?.reasons.join(' · ') || 'нет свежего полного audit evidence'}. Release fail-closed до свежего независимого audit.`,
-            `Acceptance is UNKNOWN: ${acceptance?.reasons.join(' · ') || 'fresh complete audit evidence is unavailable'}. Release fails closed until a fresh independent audit is available.`,
-          )}</span></div> : null}
-          {details.migrationProgress ? <section className="migration-progress" aria-label={t('flow.migrationProgressAria')}>
-            <div className="migration-progress-heading"><div><strong>{t('flow.migrationGroups')}</strong><span>{text(
-              `${details.migrationProgress.completedBranches} в merged · ${details.migrationProgress.readyBranches} готовы · ${details.migrationProgress.activeBranches} выполняются${details.migrationProgress.activeDependencies ? ` (${details.migrationProgress.activeDependencies} целей)` : ''}${planningMigrationBranches ? ` · ${t('flow.supervisorReplans')}` : ''}${queuedMigrationBranches ? ` · ${queuedMigrationBranches} ${t('flow.queued')}` : ''}${failedMigrationBranches ? ` · ${failedMigrationBranches} ${t('flow.waitSupervisor')}` : ''} · ${t('flow.total')} ${details.migrationProgress.totalBranches}`,
-              `${details.migrationProgress.completedBranches} merged · ${details.migrationProgress.readyBranches} ready · ${details.migrationProgress.activeBranches} running${details.migrationProgress.activeDependencies ? ` (${details.migrationProgress.activeDependencies} targets)` : ''}${planningMigrationBranches ? ` · ${t('flow.supervisorReplans')}` : ''}${queuedMigrationBranches ? ` · ${queuedMigrationBranches} ${t('flow.queued')}` : ''}${failedMigrationBranches ? ` · ${failedMigrationBranches} ${t('flow.waitSupervisor')}` : ''} · ${t('flow.total')} ${details.migrationProgress.totalBranches}`,
-            )}</span></div><b>{t('flow.targetsConfirmed', { done: details.migrationProgress.completedDependencies, total: details.migrationProgress.totalDependencies, ref: details.migrationProgress.factsRef || text('рабочем дереве', 'working tree') })}{details.migrationProgress.readyDependencies ? ` · ${t('flow.moreReady', { count: details.migrationProgress.readyDependencies })}` : ''}</b></div>
-            {!details.migrationProgress.trustworthy ? <div className="migration-worktree-warning"><AlertTriangle size={14} /><span>{t('flow.gitIncomplete')}</span></div> : null}
-            {details.migrationProgress.dirty ? <div className="migration-worktree-warning"><AlertTriangle size={14} /><span>{dirtyBlocksMigration ? text(
-              `На ветке миграции осталось ${details.migrationProgress.dirtyChanges} незакоммиченных изменений — они блокируют завершение миграции.`,
-              `${details.migrationProgress.dirtyChanges} uncommitted changes remain on the migration branch and block migration completion.`,
-            ) : text(
-              `На ${details.migrationProgress.currentBranch} осталось ${details.migrationProgress.dirtyChanges} незакоммиченных изменений, но эта ветка не входит в Branch plan. Завершённая миграция не откатывается; разберите состояние на соответствующем этапе${agentRecoveryAvailable ? ' через Recovery ниже' : ''}.`,
-              `${details.migrationProgress.dirtyChanges} uncommitted changes remain on ${details.migrationProgress.currentBranch}, but this branch is outside the Branch plan. Completed migration is preserved; resolve this state at the relevant stage${agentRecoveryAvailable ? ' using Recovery below' : ''}.`,
-            )}</span></div> : null}
-            {details.migrationProgress.unmetPackages.length ? <div className="migration-worktree-warning"><AlertTriangle size={14} /><span>{text('В', 'In')} {details.migrationProgress.factsRef || text('рабочем дереве', 'working tree')} {text('не выполнено', 'there are')} {details.migrationProgress.unmetPackages.length} {text('целей scope', 'unmet scope targets')}: {details.migrationProgress.unmetPackages.slice(0, 8).join(', ')}{details.migrationProgress.unmetPackages.length > 8 ? '…' : ''}.</span></div> : null}
-            <div className="migration-branches">
-              {details.migrationProgress.branches.map((branch) => <div className={`migration-branch ${branch.status}${branch.runtime ? ` runtime-${branch.runtime.phase}` : ''}${branch.runtime?.phase === 'failed' ? ` failure-${migrationFailureTone(branch)}` : ''}${branch.checkedOut ? ' checked-out' : ''}`} key={branch.branch}>
-                {branch.runtime?.phase === 'failed' ? <button type="button" className="migration-error-indicator" data-tone={migrationFailureTone(branch)} title={branch.runtime.detail || t('flow.workerBlocker')} aria-label={t('flow.failureReasonAria', { label: branch.label })} onClick={() => setSelectedBranchFailure(branch)}><AlertCircle size={16} /></button> : branch.status === 'merged' && !branch.runtime ? <Check size={15} /> : migrationBranchActive(branch) ? <LoaderCircle className="spin" size={15} /> : <Circle size={15} />}
-                <span><strong>{branch.label}</strong><code title={branch.branch}>{branch.branch}</code></span>
-                <small title={branch.runtime?.updatedAt}>{migrationBranchProgressText(branch)}</small><b title={branch.worktreeDirtyChanges ? `${branch.worktreeDirtyChanges} незакоммиченных изменений в ${branch.worktreePath}` : branch.integratedInto ? `Фактически находится в ${branch.integratedInto}, но не в ${details.migrationProgress?.mergedBranch}` : undefined}>{migrationStatusLabel(branch)}</b>
-              </div>)}
-            </div>
-          </section> : null}
-          {FLOW_STAGES[displayedIndex].action === 'release' ? <div className="release-fields"><label>{t('flow.releaseBranch')}<input value={releaseBranch} onChange={(event) => setReleaseBranch(event.target.value)} /></label><label>{t('flow.finalGate')} <span>{t('flow.finalGateHint')}</span><input value={gateCommand} onChange={(event) => setGateCommand(event.target.value)} placeholder="yarn test && yarn build" /></label></div> : null}
-          {FLOW_STAGES[displayedIndex].action === 'agent' && details.promptStale ? <div className="resume-notice warning"><strong>{t('flow.promptStale.title')}</strong><span>{t('flow.promptStale.body')}</span></div> : null}
-          {FLOW_STAGES[displayedIndex].action === 'agent' && interruptedSession ? <div className={`resume-notice ${canResumeAgent ? '' : 'warning'}`}><strong>{canResumeAgent ? text('Сессия сохранена', 'Session saved') : `${text('Выберите', 'Select')} ${interruptedSession.provider}`}</strong><span>{canResumeAgent ? (run?.activeAgentBranch ? text(
-            `Сохранено прерывание группы ${run.activeAgentBranch}. Сессия продолжится только если fingerprint текущего prompt/scope совпадёт; после нового baseline, target или prompt будет создан свежий контекст.`,
-            `The interruption for group ${run.activeAgentBranch} is saved. The session resumes only if the current prompt/scope fingerprint matches; a new baseline, target or prompt starts a fresh context.`,
-          ) : text(
-            'Сессия продолжится только при точном совпадении fingerprint текущего prompt/scope; устаревший контекст автоматически не используется.',
-            'The session resumes only when the current prompt/scope fingerprint matches exactly; stale context is never reused automatically.',
-          )) : text('Остановленная сессия принадлежит другому агенту.', 'The stopped session belongs to another agent.')}</span></div> : null}
-          {FLOW_STAGES[displayedIndex].action === 'baseline' && baselineDecision ? <div className="resume-notice warning"><strong>{text('Baseline ждёт решения', 'Baseline is waiting for a decision')}</strong><span>{baselineDecision.package ? `${baselineDecision.package} · ${text('измените политику или продолжите поиск', 'change policy or continue searching')}` : text('Измените состав Baseline или продолжите поиск через кнопку «Продолжить».', 'Change Baseline scope or continue searching with the Continue button.')}</span></div> : null}
-          {FLOW_STAGES[displayedIndex].action === 'baseline' && details.baselineRecovery?.available && !baselineRestartRequired ? <div className="resume-notice"><strong>{text('Baseline checkpoint найден', 'Baseline checkpoint found')}</strong><span>{text(`Последняя safe-точка: итерация ${details.baselineRecovery.iteration ?? 0}, статус ${details.baselineRecovery.status ?? 'unknown'}. «Продолжить» использует строгий resume и не начнёт новый baseline молча.`, `Last safe point: iteration ${details.baselineRecovery.iteration ?? 0}, status ${details.baselineRecovery.status ?? 'unknown'}. Continue uses strict resume and will not silently start over.`)}</span></div> : null}
-          {FLOW_STAGES[displayedIndex].action === 'agent' && !interruptedSession && hasMigrationProgress ? <div className="resume-notice"><strong>{t('flow.planPartial.title')}</strong><span>{t('flow.planPartial.body')}</span></div> : null}
-          {baselineRestartRequired && FLOW_STAGES[displayedIndex].action === 'baseline' ? <div className="resume-notice danger"><strong>{text('Этот Baseline нельзя продолжить', 'This Baseline cannot be resumed')}</strong><span>{text('Сохранённая точка поиска недоступна или не соответствует текущим входным данным, настройкам либо версии DepLoom. Эта остановка не означает, что поиск не может найти результат. Нажмите «Начать новый поиск» и подтвердите новый запуск. Дождитесь завершения фоновых изменений проекта перед запуском.', 'The saved search checkpoint is unavailable or does not match the current inputs, settings, or DepLoom version. This stop does not mean the search cannot find a result. Choose Start a new search and confirm the new run. Let background project changes finish before starting.')}</span></div> : null}
-          {recovery && !baselineRestartRequired ? autopilotActive && recovery.kind === 'agent'
-            ? <div className="resume-notice"><strong>{text('Автопилот устраняет', 'Autopilot is resolving')} · {recovery.code}</strong><span>{text('Это внутреннее recoverable-состояние. Supervisor/Executor уже получили ошибку как рабочий контекст; ввод пользователя не требуется. Карточка исчезнет после повторной deterministic verification.', 'This is an internal recoverable state. Supervisor/Executor already received the failure as working context; no user input is required. The card disappears after deterministic verification passes again.')}</span></div>
-            : <div className={`resume-notice ${recovery.kind === 'agent' ? '' : recovery.kind === 'hard' ? 'danger' : 'warning'}`}><strong>{recovery.kind === 'agent' ? `${text('Recovery доступен', 'Recovery available')} · ${recovery.code}` : `Safety stop · ${recovery.code}`}</strong>{recovery.message && recovery.kind !== 'agent' ? <span className="resume-message">{recovery.message.split('\n')[0]}</span> : null}<span>{recovery.kind === 'agent' ? text('Git-состояние сохранено. Если Автопилот выключен, можно дать recovery-агенту дополнительный контекст вручную; scope/Git safety gates останутся обязательными.', 'Git state is preserved. If Autopilot is off, you may provide extra context to the recovery agent manually; scope/Git safety gates remain mandatory.') : recovery.kind === 'infrastructure' ? text('До этого состояния Автопилот уже выполняет bounded infrastructure retry. Если карточка осталась, повторяемый сбой не удалось устранить автоматически.', 'Autopilot already performs bounded infrastructure retries before this state. If this card remains, the repeated failure could not be resolved automatically.') : recovery.action === 'baseline' ? text('Новый проверенный результат не опубликован. Если ранее был доказанный результат, он сохранён; причина и следующий шаг указаны выше, технические подробности — в уведомлении об ошибке.', 'No new verified result was published. Any previous proven result remains saved; the cause and next step are shown above, with technical details in the error notification.') : text('Это редкий safety stop: продолжение могло бы нарушить согласованный scope/Git-инвариант.', 'This is a rare safety stop: continuing could violate the agreed scope/Git invariant.')}</span>{recovery.kind === 'agent' ? <><textarea value={agentNote} onChange={(event) => setAgentNote(event.target.value)} placeholder={text('Например: разберись с оставшимися изменениями, исправь причину падения hook и доведи release до чистого состояния.', 'For example: inspect the remaining changes, fix the failing hook and bring release to a clean state.')} rows={3} />{activeAction === 'recover' ? <button type="button" className="button secondary" disabled={!agentNote.trim() || noteSendState === 'sending'} onClick={() => void sendLiveNote()}><Send size={14} /> {text('Отправить recovery-агенту', 'Send to recovery agent')}</button> : <button type="button" className="button secondary" disabled={active || !agentNote.trim() || noteSendState === 'sending'} onClick={() => void startRecovery()}><Send size={14} /> {text('Разобраться с ошибкой', 'Resolve failure')}</button>}</> : null}</div> : null}
-          {autopilotActive ? <div className="resume-notice"><strong>{t('flow.autopilot.running')}</strong><span>{t('flow.autopilot.runningBody')}</span></div> : null}
-          <div className="documents-contract">
-            <FileText size={18} /><div><strong>{t('flow.documents.title')}</strong><p>{t('flow.documents.description')}</p></div>
-          </div>
-          {FLOW_STAGES[displayedIndex].confirmationKey && FLOW_STAGES[displayedIndex].action !== 'baseline' ? <div className="confirmation"><AlertTriangle size={18} /><span>{t(FLOW_STAGES[displayedIndex].confirmationKey)}</span></div> : null}
-          <div className="stage-actions">
-            {FLOW_STAGES[displayedIndex].action === 'agent' && !canResumeAgent ? <button className="button secondary" disabled={active} title={text('Необязательно: Desktop сам построит актуальный prompt. Используйте только чтобы явно подменить его файлом.', 'Optional: Desktop builds the current prompt automatically. Use this only to explicitly replace it with a file.')} onClick={() => void onChoosePrompt(project.name)}><FileText size={16} /> {t('flow.customPrompt')}</button> : null}
-            {FLOW_STAGES[displayedIndex].action === 'agent' ? <button className="button secondary" disabled={active} onClick={() => { if (window.confirm(text('Текущие изменения сохранятся в safety stash. Ветки Branch plan (work-ветки и merged) для этого проекта будут удалены локально, сохранённая сессия агента забудется. Начать миграцию заново?', 'Current changes will be saved to a safety stash. Branch-plan work and merged branches for this project will be removed locally and the saved agent session will be forgotten. Start migration over?'))) void execute(displayedIndex, false, true) }}><RotateCcw size={16} /> {t('flow.restartMigration')}</button> : null}
-            {FLOW_STAGES[displayedIndex].action === 'baseline' ? <button className="button secondary" disabled={active} onClick={() => restartBaseline(displayedIndex)}><RotateCcw size={16} /> {text('Перезапустить старый Baseline (чистый Git)', 'Restart legacy Baseline (clean Git)')}</button> : null}
-            {displayedAction === 'release' && acceptanceAccepted ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} /> {text('Продолжить улучшение', 'Continue improving')}</button> : null}
-            <button className="button primary" disabled={active || releaseBlocked} title={releaseBlocked ? text(`Release заблокирован acceptance: ${acceptance?.reasons.join(' · ') || acceptanceLabel}`, `Release is blocked by acceptance: ${acceptance?.reasons.join(' · ') || acceptanceLabel}`) : undefined} onClick={() => baselineRestartRequired && FLOW_STAGES[displayedIndex].action === 'baseline' ? restartBaseline(displayedIndex) : void execute(displayedIndex, undefined, undefined, FLOW_STAGES[displayedIndex].action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}>{active ? <LoaderCircle className="spin" size={17} /> : displayedIndex === 2 ? <ExternalLink size={17} /> : displayedIndex === 5 ? <ShieldCheck size={17} /> : <Play size={17} />}{FLOW_STAGES[displayedIndex].action === 'baseline' ? (baselineRestartRequired ? text('Начать новый поиск', 'Start a new search') : details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Запустить', 'Start')) : FLOW_STAGES[displayedIndex].action === 'agent' && canResumeAgent ? t('flow.continueAgent') : FLOW_STAGES[displayedIndex].action === 'agent' && hasMigrationProgress ? t('flow.continueMigration') : FLOW_STAGES[displayedIndex].action === 'release' ? text('Создать accepted release', 'Create accepted release') : t(FLOW_STAGES[displayedIndex].buttonKey)}</button>
-          </div>
-          <div className="autopilot-actions">
-            {autopilotActive
-              ? <button className="button secondary" onClick={() => void onStopAutopilot()}><Pause size={16} /> {t('flow.autopilot.stop')}</button>
-              : <button className="button secondary" disabled={active} onClick={() => void startAutopilotWithCurrentModel()}><Play size={16} /> {t('flow.autopilot.start')}</button>}
-            <span className="autopilot-help" tabIndex={0} title={AUTOPILOT_HELP[language]} aria-label={AUTOPILOT_HELP[language]}><CircleHelp size={15} /></span>
-          </div>
-          </>}
-        </div>
-      </div>
-      </details>
         </div>
       </details>
       <details className="flow-technical-details flow-logs-details">

@@ -16,8 +16,8 @@ if (!mainSource.includes("deterministicWatchdogFailure") || !mainSource.includes
 if (appSource.includes("<MonitoringPanel")) throw new Error("Default App must not mount the technical MonitoringPanel");
 if (!mainSource.includes("BLOCK_HUMAN_FLOW_ARTIFACT_LOG_V1")) throw new Error("Raw job output must be persisted to run artifacts after removing the default monitor");
 const failedGroupI18nContract = [
-  [flowSource, "migration-error-indicator"],
-  [flowSource, "t('flow.runtime.failed')"],
+  [flowSource, '<IterativeRunDiagnostics signal={currentScenario} logs />'],
+  [flowSource, '<IterativeTaskPanel'],
   [failureModalSource, "t('branchFailure.autopilot')"],
   [failureModalSource, "t('branchFailure.userRequired')"],
   [enLocaleSource, '"flow.runtime.failed": "Waiting for Supervisor"'],

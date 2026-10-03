@@ -10,18 +10,20 @@ class VerifiedPartialGraphErgonomicsContracts(unittest.TestCase):
         flow = (root / "desktop/src/components/FlowWorkspace.tsx").read_text(encoding="utf-8")
         dialog = (root / "desktop/src/components/BaselineIntentDialog.tsx").read_text(encoding="utf-8")
 
-        # Acceptance owns completion. Freshness remains observable and a user
-        # may explicitly start another progressive improvement pass.
+        panel = (root / "desktop/src/components/IterativeTaskPanel.tsx").read_text(encoding="utf-8")
+        scenario = (root / "desktop/electron/iterative-scenario.ts").read_text(encoding="utf-8")
+        # The iterative result owns completion and restart; deferred scope is
+        # still configurable without reviving the removed separate FLOW panel.
         for required in (
-            "Результат принят",
-            "Создать accepted release",
-            "Продолжить улучшение",
-            "acceptanceAccepted",
-            "openDeferredImprovementDialog",
-            "onGetBaselineIntentPlan",
-            "resume: 'restart'",
+            "IterativeTaskPanel", "onConfigureScope", "onGetBaselineIntentPlan",
+            "acceptanceAccepted", "openDeferredImprovementDialog",
         ):
             self.assertIn(required, flow)
+        for required in ("Посмотреть результат", "Начать заново", "restart: true"):
+            self.assertIn(required, panel)
+        self.assertIn('case "result":', scenario)
+        self.assertIn("independently-audited, policy-satisfied", scenario)
+        self.assertNotIn("Прежний FLOW / история (отдельный запуск)", flow)
         for forbidden in (
             "VERIFIED_PARTIAL_SCOPE",
             "Завершить с текущим verified результатом",

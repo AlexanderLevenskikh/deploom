@@ -20,13 +20,14 @@ type Props = {
   onCopy: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onSave: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
-  onDrive: (projectName: string) => Promise<IterativeDriveOutcome>
-  onBegin: (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
-  onAgent: (projectName: string) => Promise<IterativeAgentOutcome>
+  onDrive: (projectName: string, autopilot?: boolean) => Promise<IterativeDriveOutcome>
+  onBegin: (projectName: string, discovery?: { autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
+  onAgent: (projectName: string, autopilot?: boolean) => Promise<IterativeAgentOutcome>
   onAttempt: (projectName: string) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
   onCancel: (projectName: string) => Promise<{ ok: boolean }>
   liveAttempt?: IterativeAttemptView
   onConfigureScope?: () => void
+  onBeforeStart?: () => Promise<void>
   onOpenPath: (path?: string) => Promise<void>
   // P1#1: the panel is the single scenario owner; it mirrors the ONE main action
   // to the enclosing workspace hero so the legacy FLOW button and the panel stop
@@ -115,11 +116,13 @@ const activityText = (attempt?: IterativeAttemptView, text?: (ru: string, en: st
   return t('Работа выполняется', 'Work is in progress')
 }
 
-export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVersion, onGet, onExport, onCopy, onSave, onStatus, onDrive, onBegin, onExportLegacy, onAgent, onAttempt, onCancel, liveAttempt, onConfigureScope, onOpenPath, onScenario, disabledExternal }: Props) {
+export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVersion, onGet, onExport, onCopy, onSave, onStatus, onDrive, onBegin, onExportLegacy, onAgent, onAttempt, onCancel, liveAttempt, onConfigureScope, onBeforeStart, onOpenPath, onScenario, disabledExternal }: Props) {
   const { text, language } = useLanguage()
   const [state, setState] = useState<PanelState>({ phase: 'loading' })
   const [validationDraft, setValidationDraft] = useState<MigrationValidationProfile>()
   useEffect(() => setValidationDraft(undefined), [workspaceId, projectName])
+  const [autopilot, setAutopilot] = useState(false)
+  useEffect(() => setAutopilot(false), [workspaceId, projectName])
   const [busy, setBusy] = useState<string>()
   const [copied, setCopied] = useState(false)
   const [note, setNote] = useState<string>()
@@ -270,7 +273,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   // it is terminal (done/failed/canceled) the lock is released here even before
   // the async status re-read lands, so «Остановить» can never stick forever.
   const attemptTerminal = Boolean(attempt && (attempt.status === 'done' || attempt.status === 'failed' || attempt.status === 'canceled'))
-  const childAlive = stepBusy || (runner?.inFlight === true && !attemptTerminal)
+  const childAlive = stepBusy || runner?.autopilotActive === true || (runner?.inFlight === true && !attemptTerminal)
 
   // Both output surfaces share this attempt-scoped journal tail. Poll even
   // when the inline output is collapsed; ignore late reads from a prior run.
@@ -336,12 +339,23 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   // CONTINUABLE — the supervisor drives plan-next/…/gate and the gate rebuilds
   // the task artifact itself, so the coordinator must stay reachable from the
   // single main action, not from a separate technical button.
+  const autopilotNote = (summary: { stopped: string; error?: string }) => summary.error
+    ? text(`Автопилот остановился: ${summary.error}`, `Autopilot stopped: ${summary.error}`)
+    : summary.stopped === 'finished'
+      ? text('Автопилот завершил работу. Откройте результат.', 'Autopilot finished. Open the result.')
+      : summary.stopped === 'canceled'
+        ? text('Автопилот остановлен. Проверенный результат сохранён.', 'Autopilot stopped. The verified result is kept.')
+        : text(`Автопилот приостановлен (${summary.stopped}). Проверьте результат и следующий шаг.`, `Autopilot paused (${summary.stopped}). Review the outcome and next step.`)
+
   const driveNow = async () => {
     setStepBusy(true)
     setNote(undefined)
     try {
-      const outcome = await onDrive(projectName)
-      if (!outcome.ok) {
+      await onBeforeStart?.()
+      const outcome = await onDrive(projectName, autopilot)
+      if (outcome.autopilot) {
+        setNote(autopilotNote(outcome.autopilot))
+      } else if (!outcome.ok) {
         setNote(outcome.error ?? 'Ошибка')
       } else if (outcome.stopped === 'agent-gate') {
         setNote(
@@ -371,7 +385,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     }
   }
 
-  const beginNow = async (discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
+  const beginNow = async (discovery?: { autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
     setStepBusy(true)
     setNote(undefined)
     // P2#5: a fresh attempt supersedes the previous "no targets" explanation.
@@ -379,8 +393,11 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     try {
       const profile = validationDraft ?? runner?.validationProfile
       const validationProfile = runner?.present && !discovery?.restart ? undefined : profile && { ...profile, commands: profile.commands.map(c => c.trim()).filter(Boolean) }
-      const outcome = await onBegin(projectName, { mode: discovery?.mode ?? 'none', ...discovery, validationProfile })
-      if (outcome.ok) {
+      await onBeforeStart?.()
+      const outcome = await onBegin(projectName, { mode: discovery?.mode ?? 'none', autopilot, ...discovery, validationProfile })
+      if (outcome.autopilot) {
+        setNote(autopilotNote(outcome.autopilot))
+      } else if (outcome.ok) {
         if (outcome.checked) {
           // P1#4: standalone "Проверить проект" — nothing was started. Show the
           // durable verdict and let the user explicitly pick the next step: a
@@ -486,8 +503,11 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     setStepBusy(true)
     setNote(undefined)
     try {
-      const outcome = await onAgent(projectName)
-      if (outcome.ok) {
+      await onBeforeStart?.()
+      const outcome = await onAgent(projectName, autopilot)
+      if (outcome.autopilot) {
+        setNote(autopilotNote(outcome.autopilot))
+      } else if (outcome.ok) {
         const changed = (outcome.changedFiles ?? []).length
         setNote(
           text(
@@ -709,7 +729,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
           scenario mapping as the single main action, so the stepper and the
           button can never disagree about where the project is. */}
       {(() => {
-        const pipeline = scenarioPipeline(mainAction.state, runner?.checked?.ok === true, { attempt, runner })
+        const pipeline = scenarioPipeline(mainAction.state, !validationChanged && (runner?.checked?.ok === true || (attempt?.status === 'done' && attempt.lastStep === 'checked')), { attempt, runner })
         return (
           <div className="iterative-pipeline" data-testid="iterative-pipeline">
             {PIPELINE_STAGES.map((stage, index) => {
@@ -728,6 +748,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
           </div>
         )
       })()}
+
+      <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.autopilotActive || autopilot} disabled={childAlive || busyLocked} onChange={event => setAutopilot(event.target.checked)} />{text('Автопилот: продолжать автоматически, включая исправления агентом', 'Autopilot: continue automatically, including agent repairs')}</label>
 
       <MigrationChecksPanel key={`${workspaceId}:${projectName}`} profile={validationDraft ? { ...runner?.validationProfile, ...validationDraft } : runner?.validationProfile} locked={Boolean(runner?.present || childAlive || stepBusy || disabledExternal)} scope={validationChanged ? undefined : runner?.validationScope ?? runner?.checked?.validationScope} onChange={setValidationDraft} />
 
@@ -750,9 +772,9 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
             </span>
           </div>
           <div className="attempt-strip-row">
-            {progress && activity.percent !== undefined && childAlive ? (
+            {progress && progress.total > 0 && (activity.percent !== undefined || attempt.discoveryCompleted) ? (
               <span className="attempt-meta">
-                {text('Подбор версий', 'Finding versions')}: {progress.processed}/{progress.total}
+                {attempt.discoveryCompleted ? text('Подбор версий завершён', 'Version search finished') : text('Подбор версий', 'Finding versions')}: {progress.processed}/{progress.total}{attempt.discoverySkipped ? text(` · не просмотрено по бюджету: ${attempt.discoverySkipped}`, ` · not examined within budget: ${attempt.discoverySkipped}`) : ''}
                 <span className="attempt-progress"><span style={{ width: `${Math.min(100, Math.round((progress.processed / progress.total) * 100))}%` }} /></span>
               </span>
             ) : null}
@@ -863,8 +885,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
               <strong>{text('Перед запуском', 'Before you start')}</strong>
               <span>
                 {text(
-                  'Draft предлагает план обновления; запуск применяет и проверяет изменения. Состав и политика настраиваются кнопкой «Настроить состав / Draft», версия Node — в технических деталях.',
-                  'The Draft proposes an update plan; the launch applies and verifies the changes. Use Configure scope / Draft for scope and policy; set the Node version in Technical details.',
+                  'Draft предлагает план обновления; запуск применяет и проверяет изменения. Состав и политика настраиваются кнопкой «Настроить состав / Draft», агент, модель и Node — в настройках запуска выше.',
+                  'The Draft proposes an update plan; the launch applies and verifies the changes. Use Configure scope / Draft for scope and policy; set the agent, model and Node in Run settings above.',
                 )}
               </span>
             </div>

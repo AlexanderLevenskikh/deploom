@@ -41,6 +41,8 @@ export type IterativeAttemptRecord = {
   discovery?: IterativeDiscoveryBudget
   targetsCount?: number
   packageProgress?: { processed: number; total: number }
+  discoveryCompleted?: boolean
+  discoverySkipped?: number
   stepsDone: string[]
   reason?: string
   lastError?: string

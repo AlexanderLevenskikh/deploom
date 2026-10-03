@@ -436,14 +436,14 @@ export function useDependencyFlow() {
 
   const pickDirectory = useCallback(async () => api?.pickDirectory(), [api])
 
-  const registerExisting = useCallback(async (providedPath?: string) => {
+  const registerExisting = useCallback(async (providedPath?: string, agent?: AgentProvider) => {
     if (!api) return
     const path = providedPath ?? await api.pickDirectory()
     if (!path) return
-    applyWorkspaceResult(await api.registerWorkspace({ path }))
+    applyWorkspaceResult(await api.registerWorkspace({ path, agent }))
   }, [api, applyWorkspaceResult])
 
-  const cloneWorkspace = useCallback(async (input: { parentPath: string; folderName: string; teamRemote?: string; templateRemote?: string }) => {
+  const cloneWorkspace = useCallback(async (input: { parentPath: string; folderName: string; teamRemote?: string; templateRemote?: string; agent?: AgentProvider }) => {
     if (!api) throw new Error('Клонирование доступно в desktop-приложении.')
     applyWorkspaceResult(await api.cloneWorkspace(input))
   }, [api, applyWorkspaceResult])
@@ -643,17 +643,17 @@ export function useDependencyFlow() {
     if (!api) return { ok: false, present: false, stale: false, error: 'NO_DESKTOP_API' }
     return api.iterativeStatus({ workspaceId: selectedWorkspaceId, projectName })
   }, [api, selectedWorkspaceId])
-  const iterativeDrive = useCallback(async (projectName: string): Promise<IterativeDriveOutcome> => {
+  const iterativeDrive = useCallback(async (projectName: string, autopilot?: boolean): Promise<IterativeDriveOutcome> => {
     if (!api) return { ok: false, steps: [], stopped: 'error', error: 'NO_DESKTOP_API' }
-    return api.iterativeDrive({ workspaceId: selectedWorkspaceId, projectName })
+    return api.iterativeDrive({ workspaceId: selectedWorkspaceId, projectName, autopilot })
   }, [api, selectedWorkspaceId])
-  const iterativeBegin = useCallback(async (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }): Promise<IterativeBeginOutcome> => {
+  const iterativeBegin = useCallback(async (projectName: string, discovery?: { autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }): Promise<IterativeBeginOutcome> => {
     if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
-    return api.iterativeBegin({ workspaceId: selectedWorkspaceId, projectName, discovery, validationProfile: discovery?.validationProfile, checkOnly: discovery?.checkOnly, repair: discovery?.repair, restart: discovery?.restart })
+    return api.iterativeBegin({ workspaceId: selectedWorkspaceId, projectName, autopilot: discovery?.autopilot, discovery, validationProfile: discovery?.validationProfile, checkOnly: discovery?.checkOnly, repair: discovery?.repair, restart: discovery?.restart })
   }, [api, selectedWorkspaceId])
-  const iterativeAgent = useCallback(async (projectName: string): Promise<IterativeAgentOutcome> => {
+  const iterativeAgent = useCallback(async (projectName: string, autopilot?: boolean): Promise<IterativeAgentOutcome> => {
     if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
-    return api.iterativeAgent({ workspaceId: selectedWorkspaceId, projectName })
+    return api.iterativeAgent({ workspaceId: selectedWorkspaceId, projectName, autopilot })
   }, [api, selectedWorkspaceId])
   const iterativeAttemptRead = useCallback(async (projectName: string): Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }> => {
     if (!api) return { ok: false, present: false, error: 'NO_DESKTOP_API' }

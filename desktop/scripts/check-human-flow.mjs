@@ -37,7 +37,7 @@ for (const needle of [
   'baselineRestartRequired',
   "recovery.message.includes('BASELINE_RECOVERY_CONTINUE_UNAVAILABLE')",
   'restartBaseline(activeIndex)',
-  'restartBaseline(displayedIndex)',
+  "onConfigureScope={() => void openBaselineIntentDialog('prepare', 'auto')}",
   "text('Начать новый поиск', 'Start a new search')",
 ]) has(flow, needle, 'Baseline restart after incompatible checkpoint')
 has(css, 'grid-template-columns: 236px minmax(620px, 1fr)', 'two-column default shell')

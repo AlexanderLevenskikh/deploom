@@ -1,12 +1,14 @@
 import { FolderGit2, GitFork, X } from 'lucide-react'
 import { useState, type FormEvent } from 'react'
 import { useLanguage } from '../i18n'
+import type { AgentProvider } from '../types'
+import { QuickSelect } from './QuickSelect'
 
 type Props = {
   onClose: () => void
   onPickDirectory: () => Promise<string | undefined>
-  onConnectExisting: (path: string) => Promise<void>
-  onCreate: (input: { parentPath: string; folderName: string; teamRemote?: string }) => Promise<void>
+  onConnectExisting: (path: string, agent: AgentProvider) => Promise<void>
+  onCreate: (input: { parentPath: string; folderName: string; teamRemote?: string; agent: AgentProvider }) => Promise<void>
 }
 
 export function WorkspaceDialog({ onClose, onPickDirectory, onConnectExisting, onCreate }: Props) {
@@ -14,6 +16,7 @@ export function WorkspaceDialog({ onClose, onPickDirectory, onConnectExisting, o
   const [parentPath, setParentPath] = useState('')
   const [folderName, setFolderName] = useState('deploom-workspace')
   const [teamRemote, setTeamRemote] = useState('')
+  const [agent, setAgent] = useState<AgentProvider | ''>('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
 
@@ -28,13 +31,13 @@ export function WorkspaceDialog({ onClose, onPickDirectory, onConnectExisting, o
   }
 
   const connectExisting = async () => {
-    if (busy) return
+    if (busy || !agent) return
     setError(undefined)
     try {
       const path = await onPickDirectory()
       if (!path) return
       setBusy(true)
-      await onConnectExisting(path)
+      await onConnectExisting(path, agent)
       onClose()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason))
@@ -45,7 +48,7 @@ export function WorkspaceDialog({ onClose, onPickDirectory, onConnectExisting, o
 
   const create = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    if (busy || !parentPath.trim() || !folderName.trim()) return
+    if (busy || !parentPath.trim() || !folderName.trim() || !agent) return
     setBusy(true)
     setError(undefined)
     try {
@@ -53,6 +56,7 @@ export function WorkspaceDialog({ onClose, onPickDirectory, onConnectExisting, o
         parentPath: parentPath.trim(),
         folderName: folderName.trim(),
         teamRemote: teamRemote.trim() || undefined,
+        agent,
       })
       onClose()
     } catch (reason) {
@@ -73,9 +77,11 @@ export function WorkspaceDialog({ onClose, onPickDirectory, onConnectExisting, o
           <button type="button" className="icon-button" disabled={busy} aria-label={t('common.close')} onClick={onClose}><X size={17} /></button>
         </div>
 
+          <label>{t('workspaceDialog.agent')}<QuickSelect value={agent} disabled={busy} ariaLabel={t('workspaceDialog.agent')} onChange={value => setAgent(value as AgentProvider | '')} options={[{ value: '', label: t('workspaceDialog.chooseAgent') }, { value: 'codex', label: 'Codex' }, { value: 'opencode', label: 'OpenCode' }, { value: 'claude', label: 'Claude' }]} /><span className="optional">{t('workspaceDialog.agentHint')}</span></label>
+
         <div className="workspace-connect-card">
           <div><FolderGit2 size={19} /><div><strong>{t('workspaceDialog.connect.title')}</strong><span>{t('workspaceDialog.connect.description')}</span></div></div>
-          <button type="button" className="button secondary" disabled={busy} onClick={() => void connectExisting()}>{t('workspaceDialog.connect.choose')}</button>
+          <button type="button" className="button secondary" disabled={busy || !agent} onClick={() => void connectExisting()}>{t('workspaceDialog.connect.choose')}</button>
         </div>
 
         <div className="setup-divider"><span>{t('workspaceDialog.orCreate')}</span></div>
@@ -88,7 +94,7 @@ export function WorkspaceDialog({ onClose, onPickDirectory, onConnectExisting, o
           {error ? <div className="dialog-error" role="alert">{error}</div> : null}
           <div className="dialog-actions">
             <button type="button" className="button secondary" disabled={busy} onClick={onClose}>{t('common.cancel')}</button>
-            <button type="submit" className="button primary" disabled={busy || !parentPath.trim() || !folderName.trim()}><GitFork size={15} /> {busy ? t('workspaceDialog.creating') : t('workspaceDialog.create')}</button>
+            <button type="submit" className="button primary" disabled={busy || !parentPath.trim() || !folderName.trim() || !agent}><GitFork size={15} /> {busy ? t('workspaceDialog.creating') : t('workspaceDialog.create')}</button>
           </div>
         </form>
       </section>

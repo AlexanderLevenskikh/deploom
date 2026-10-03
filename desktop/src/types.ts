@@ -399,6 +399,8 @@ export type IterativeAttemptView = {
   discovery?: { parallelism: number; timeoutSeconds: number; maxPackages: number }
   targetsCount?: number
   packageProgress?: { processed: number; total: number }
+  discoveryCompleted?: boolean
+  discoverySkipped?: number
   stepsDone: string[]
   reason?: string
   lastError?: string
@@ -407,6 +409,7 @@ export type IterativeAttemptView = {
   cancelRequested?: boolean
 }
 export type IterativeStatusOutcome = {
+  autopilotActive?: boolean
   validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string; suggestedUnitCommand?: string }
   validationScope?: { mode?: string; existingFailures?: number; total?: number; skipped?: number }
   legacyPlanPresent?: boolean
@@ -441,6 +444,7 @@ export type IterativeStatusOutcome = {
 // a human click. Restart-safe: each iteration recomputes the decision from the
 // durable Python state.
 export type IterativeDriveOutcome = {
+  autopilot?: { stopped: string; error?: string }
   ok: boolean
   steps: string[]
   stopped: 'agent-gate' | 'finished' | 'error' | 'time-budget' | 'iteration-budget' | 'canceled'
@@ -453,6 +457,7 @@ export type IterativeDriveOutcome = {
   error?: string
 }
 export type IterativeAgentOutcome = {
+  autopilot?: { stopped: string; error?: string }
   ok: boolean
   changedFiles?: string[]
   // #4: planner-owned files the agent mutated (modified/added/removed). Non-empty
@@ -472,6 +477,7 @@ export type IterativeDiscoveryReport = {
 }
 
 export type IterativeBeginOutcome = {
+  autopilot?: { stopped: string; error?: string }
   ok: boolean
   step?: string
   phase?: string
@@ -509,8 +515,8 @@ export type DependencyFlowApi = {
   pickFile: (filters?: Array<{ name: string; extensions: string[] }>) => Promise<string | undefined>
   copyText: (text: string) => Promise<{ ok: boolean }>
   listAgentModels: (agentProvider: AgentProvider, cwd?: string) => Promise<string[]>
-  registerWorkspace: (input: { path: string; name?: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
-  cloneWorkspace: (input: { parentPath: string; folderName: string; teamRemote?: string; templateRemote?: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
+  registerWorkspace: (input: { path: string; name?: string; agent?: AgentProvider }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
+  cloneWorkspace: (input: { parentPath: string; folderName: string; teamRemote?: string; templateRemote?: string; agent?: AgentProvider }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   addProject: (input: { workspaceId?: string; name: string; path: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   removeProject: (input: { workspaceId?: string; projectName: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   selectWorkspace: (workspaceId: string) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
@@ -529,9 +535,9 @@ export type DependencyFlowApi = {
   copyIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStatusOutcome>
-  iterativeDrive: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeDriveOutcome>
-  iterativeBegin: (input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
-  iterativeAgent: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeAgentOutcome>
+  iterativeDrive: (input: { workspaceId?: string; projectName: string; autopilot?: boolean }) => Promise<IterativeDriveOutcome>
+  iterativeBegin: (input: { workspaceId?: string; projectName: string; autopilot?: boolean; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
+  iterativeAgent: (input: { workspaceId?: string; projectName: string; autopilot?: boolean }) => Promise<IterativeAgentOutcome>
   runAction: (input: ActionInput) => Promise<{ jobId: string; runId?: string; preview: string[] }>
   cancelJob: (jobId: string) => Promise<boolean>
   pauseJob: (jobId: string) => Promise<boolean>

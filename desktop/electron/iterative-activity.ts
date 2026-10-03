@@ -5,6 +5,7 @@ export type ActivityAttempt = {
   stage: string
   phase?: string
   packageProgress?: { processed: number; total: number }
+  discoveryCompleted?: boolean
 }
 type AttemptReadIdentity = { attemptId: string; projectName: string; workspaceId?: string; lastHeartbeatAt: number; status: string }
 
@@ -33,7 +34,8 @@ export function iterativeActivity(attempt: ActivityAttempt | undefined, live: bo
   let title = attempt.stage === 'agent' ? text('Агент исправляет проект', 'The agent is repairing the project')
     : attempt.stage === 'drive' ? text('Обновляем пакеты и проверяем результат', 'Updating packages and verifying the result')
     : text('Проверяем текущие зависимости', 'Checking current dependencies')
-  if (/source-materialization|source capture|source snapshot|sealed source snapshot/i.test(phase)) title = text('Готовим изолированную копию проекта', 'Preparing an isolated project copy')
+  if (phase === 'begin.c0-verify' || (attempt.discoveryCompleted && /^begin\.(capture|discovery)$/.test(phase))) title = text('Подготавливаем проверенное исходное состояние для обновления', 'Preparing the verified starting state for the update')
+  else if (/source-materialization|source capture|source snapshot|sealed source snapshot/i.test(phase)) title = text('Готовим изолированную копию проекта', 'Preparing an isolated project copy')
   else if (/resolver-install|resolver install/i.test(phase)) title = text('Устанавливаем зависимости в проверочной копии', 'Installing dependencies in the verification copy')
   else if (/discovery/i.test(phase)) title = text('Подбираем доступные версии пакетов', 'Finding available package versions')
   else if (/audit/i.test(phase)) title = text('Проверяем уязвимости зависимостей', 'Auditing dependency vulnerabilities')
@@ -45,7 +47,7 @@ export function iterativeActivity(attempt: ActivityAttempt | undefined, live: bo
   if (files) facts.push(`${text('файлов', 'files')}: ${Number(files).toLocaleString(language)}`)
   if (bytes) facts.push(`${(Number(bytes) / 1024 ** 3).toLocaleString(language, { maximumFractionDigits: 2 })} ${text('ГиБ', 'GiB')}`)
   const counter = attempt.packageProgress
-  const validCounter = /discovery/i.test(phase) && counter && Number.isFinite(counter.processed) && Number.isFinite(counter.total) && counter.total > 0 && counter.processed >= 0 && counter.processed <= counter.total
+  const validCounter = /^begin\.discovery(?:-progress)?$/.test(phase) && !attempt.discoveryCompleted && counter && Number.isFinite(counter.processed) && Number.isFinite(counter.total) && counter.total > 0 && counter.processed >= 0 && counter.processed <= counter.total
   if (validCounter) facts.push(`${text('пакетов', 'packages')}: ${counter.processed}/${counter.total}`)
   return { title, detail: facts.join(' · '), percent: validCounter ? Math.round(counter.processed / counter.total * 100) : undefined }
 }

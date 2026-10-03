@@ -41,11 +41,11 @@ for (const sentinel of [
   "const target: TargetLevel = details.baselineIntent?.targetLevel === 'green' ? 'green' : 'yellow'",
   "text('Acceptance', 'Acceptance')",
   "text('Freshness', 'Freshness')",
-  "text('Результат принят', 'Result accepted')",
+  'currentScenario.description',
   'BLOCK_PROGRESSIVE_HUMAN_FLOW_V1',
   "text('Проверено', 'Verified')",
   "text('Открыть артефакты', 'Open artifacts')",
-  'releaseBlocked',
+  '<IterativeTaskPanel',
   "ACTION_ORDER.filter((action) => action !== 'push-workspace')",
   // A01: a new Baseline (prepare) preserves the WHOLE loaded intent - target
   // level, lag %, lag window, productMode, control/budget, M/L caps and

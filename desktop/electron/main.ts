@@ -54,6 +54,8 @@ import { flowNotificationContent, type FlowNotificationEvent } from './notificat
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
+import { discoveryProgress } from './iterative-discovery-progress.js'
+import { createIterativeAutopilot } from './iterative-autopilot.js'
 import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
 import { migrationProfilePath, readMigrationProfile, readMigrationScope, saveMigrationProfile } from './migration-validation.js'
 import { hasSavedProjectPlan, iterativeBeginInvocation, iterativeCheckTimeoutFailure, targetsFromDashboardState } from './iterative-begin.js'
@@ -7074,15 +7076,16 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('flow:register-workspace', async (_event, raw: { path: string; name?: string }) => {
+  ipcMain.handle('flow:register-workspace', async (_event, raw: { path: string; name?: string; agent?: AgentProvider }) => {
     const workspacePath = resolve(raw.path)
     if (!existsSync(join(workspacePath, '.git'))) throw new Error('Выбранная папка не является Git-репозиторием workspace.')
     const state = loadState()
     const existing = state.workspaces.find((item) => normalizePathForComparison(normalize(item.path)) === normalizePathForComparison(normalize(workspacePath)))
+    if (!existing && !['codex', 'opencode', 'claude'].includes(raw.agent || '')) throw new Error('WORKSPACE_AGENT_REQUIRED: choose an agent before connecting a new workspace')
     const workspace = existing ?? {
       id: randomUUID(), name: raw.name?.trim() || basename(workspacePath), path: workspacePath,
       templateRemote: DEFAULT_TEMPLATE_REMOTE, toolRemote: DEFAULT_TOOL_REMOTE,
-      settingsPath: '.dependency-roadmap/settings.project.json', agent: 'codex' as const,
+      settingsPath: '.dependency-roadmap/settings.project.json', agent: raw.agent!,
     }
     if (!existing) state.workspaces.push(workspace)
     state.selectedWorkspaceId = workspace.id
@@ -7161,7 +7164,8 @@ function setupIpc(): void {
   // UI does not send templateRemote: in that mode DepLoom bootstraps a
   // complete local workspace itself and no external template repository is
   // required.
-  ipcMain.handle('flow:clone-workspace', async (_event, raw: { parentPath: string; folderName: string; teamRemote?: string; templateRemote?: string }) => {
+  ipcMain.handle('flow:clone-workspace', async (_event, raw: { parentPath: string; folderName: string; teamRemote?: string; templateRemote?: string; agent?: AgentProvider }) => {
+    if (!['codex', 'opencode', 'claude'].includes(raw.agent || '')) throw new Error('WORKSPACE_AGENT_REQUIRED: choose an agent before creating the workspace')
     const parent = resolve(raw.parentPath)
     const folderName = raw.folderName.trim()
     if (!folderName || isAbsolute(folderName)) {
@@ -7201,7 +7205,7 @@ function setupIpc(): void {
       id: randomUUID(), name: basename(target), path: target,
       templateRemote, toolRemote: DEFAULT_TOOL_REMOTE,
       teamRemote: raw.teamRemote?.trim() || undefined,
-      settingsPath: '.dependency-roadmap/settings.project.json', agent: 'codex',
+      settingsPath: '.dependency-roadmap/settings.project.json', agent: raw.agent!,
     }
     state.workspaces.push(workspace)
     state.selectedWorkspaceId = workspace.id
@@ -7512,6 +7516,11 @@ function setupIpc(): void {
 
   // Baseline and never mutates producer bytes; export runs the real CLI when
   // durable JSON is sufficient and diagnoses TASK_INPUT_INSUFFICIENT otherwise.
+  const iterativeAutopilot = createIterativeAutopilot(input => {
+    const workspace = findWorkspace(loadState(), input.workspaceId)
+    return stepLockKey(workspace.id, input.projectName)
+  })
+
   ipcMain.handle('flow:iterative:task', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
@@ -7676,7 +7685,7 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('flow:iterative:cancel', async (_event, input: { workspaceId?: string; projectName: string }) => {
+  ipcMain.handle('flow:iterative:cancel', iterativeAutopilot.register('cancel', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -7684,9 +7693,9 @@ function setupIpc(): void {
     requestCancel(runDir)
     publishIterativeAttempt(runDir)
     return { ok: true }
-  })
+  }))
 
-  ipcMain.handle('flow:iterative:status', async (_event, input: { workspaceId?: string; projectName: string }) => {
+  ipcMain.handle('flow:iterative:status', iterativeAutopilot.register('status', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -7757,9 +7766,9 @@ function setupIpc(): void {
       attemptLog: readAttemptLogTail(runDir),
       error,
     }
-  })
+  }))
 
-  ipcMain.handle('flow:iterative:begin', async (_event, input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
+  ipcMain.handle('flow:iterative:begin', iterativeAutopilot.register('begin', async (_event, input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -8113,14 +8122,19 @@ function setupIpc(): void {
       const result = await spawnIterativeStreamed(runDir, invocation.command, invocation.args, workspace.path, 0, beginIo, iterativeStreamPlatform, (event) => {
         updateAttempt(runDir, { phase: event.event })
         publishIterativeAttempt(runDir)
-        if (event.event === 'begin.capture' && typeof event.managedDependencies === 'number') {
-          updateAttempt(runDir, { packageProgress: { processed: 0, total: event.managedDependencies } })
+        if (event.event === 'begin.capture') {
+          const progress = discoveryProgress(readAttempt(runDir)?.packageProgress, event)
+          if (progress) updateAttempt(runDir, { packageProgress: progress })
           publishIterativeAttempt(runDir)
         } else if (event.event === 'begin.discovery-progress' && typeof event.processed === 'number' && typeof event.total === 'number') {
           const progress = readAttempt(runDir)?.packageProgress
-          updateAttempt(runDir, { packageProgress: { processed: event.processed, total: Math.max(event.total, progress?.total ?? event.total) } })
+          const next = discoveryProgress(progress, event)
+          if (next) updateAttempt(runDir, { packageProgress: next })
           publishIterativeAttempt(runDir)
         } else if (event.event === 'begin.discovery') {
+          const progress = readAttempt(runDir)?.packageProgress
+          updateAttempt(runDir, { discoveryCompleted: true, discoverySkipped: strings(event.budgetSkipped).length, ...(progress?.total ? { packageProgress: discoveryProgress(progress, event) } : {}) })
+          publishIterativeAttempt(runDir)
           discoveryReport = {
             discovered: strings(event.discoveredTargets),
             unavailable: strings(event.registryUnavailable),
@@ -8193,7 +8207,7 @@ function setupIpc(): void {
       iterativeStepInFlight.delete(stepLockKey(workspace.id, project.name))
       if (beginDirReady) { try { rmSync(beginDir, { recursive: true, force: true }) } catch { /* temp cleanup is best-effort */ } }
     }
-  })
+  }))
 
   // #1: the durable supervisor. ONE call drives the run's Python steps in a
   // loop until it MUST stop: an agent gate (repair needed — dispatching the
@@ -8202,7 +8216,7 @@ function setupIpc(): void {
   // between an accepted cohort and the next one. Restart-safe by design:
   // every iteration recomputes the decision from the DURABLE Python state, so
   // a killed app simply resumes from where the files say the run stands.
-  ipcMain.handle('flow:iterative:drive', async (_event, input: { workspaceId?: string; projectName: string }) => {
+  ipcMain.handle('flow:iterative:drive', iterativeAutopilot.register('drive', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -8310,7 +8324,7 @@ function setupIpc(): void {
     } finally {
       iterativeStepInFlight.delete(stepLockKey(workspace.id, project.name))
     }
-  })
+  }))
 
   async function startStandaloneOpenCodeServer(cwd: string): Promise<{ url: string; databasePath: string; stop: () => void } | undefined> {
     const directory = join(app.getPath('temp'), `iter-agent-opencode-${randomUUID()}`)
@@ -8369,7 +8383,7 @@ function setupIpc(): void {
     return { status: 'ok' }
   }
 
-  ipcMain.handle('flow:iterative:agent', async (_event, input: { workspaceId?: string; projectName: string }) => {
+  ipcMain.handle('flow:iterative:agent', iterativeAutopilot.register('agent', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -8662,7 +8676,7 @@ function setupIpc(): void {
       publishIterativeAttempt(runDir)
       iterativeStepInFlight.delete(stepLockKey(workspace.id, project.name))
     }
-  })
+  }))
 
   ipcMain.handle('flow:dependency-graph-snapshot', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()
