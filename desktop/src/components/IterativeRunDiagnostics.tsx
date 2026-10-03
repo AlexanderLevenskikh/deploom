@@ -1,25 +1,31 @@
 import { Copy, TerminalSquare } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { copyTextToClipboard } from '../clipboard'
+import { iterativeLogMessages } from '../data/iterativeLogMessages'
 import { useLanguage } from '../i18n'
 import type { ScenarioSignal } from '../../electron/iterative-scenario'
 
-function readableLog(log: string): string {
-  return log.split('\n').map(line => {
-    const match = line.match(/^ITERATIVE_MIGRATION_(?:STATUS|FAILURE)_V1 (\{.*\})$/)
-    if (!match) return line
-    try {
-      const event = JSON.parse(match[1]) as { message?: string; summary?: string; event?: string; code?: string }
-      return event.message ?? event.summary ?? event.event ?? event.code ?? line
-    } catch { return line }
-  }).join('\n')
-}
-
-export function IterativeRunDiagnostics({ signal, logs = false }: { signal: ScenarioSignal; logs?: boolean }) {
+export function IterativeRunDiagnostics({ signal, logs = false, onReadLog, onOpenLog }: { signal: ScenarioSignal; logs?: boolean; onReadLog?: () => Promise<{ runLog?: string }>; onOpenLog?: () => Promise<void> }) {
   const { text } = useLanguage()
   const [raw, setRaw] = useState(false)
   const [copyStatus, setCopyStatus] = useState<string>()
-  const logRef = useRef<HTMLPreElement>(null)
+  const logRef = useRef<HTMLDivElement>(null)
+  const readLog = useRef(onReadLog)
+  readLog.current = onReadLog
+  const [runLog, setRunLog] = useState<string>()
+  useEffect(() => {
+    if (!logs) return
+    let alive = true; let pending = false
+    const poll = async () => {
+      if (pending) return
+      pending = true
+      try { const result = await readLog.current?.(); if (alive) setRunLog(result?.runLog) } finally { pending = false }
+    }
+    void poll().catch(() => {})
+    const timer = window.setInterval(() => { void poll().catch(() => {}) }, 2000)
+    return () => { alive = false; window.clearInterval(timer) }
+  }, [logs, signal.projectName, signal.workspaceId])
+  const visibleLog = runLog ?? signal.attemptLog ?? ''
   const follow = useRef(true)
   const attempt = signal.attempt
   useEffect(() => {
@@ -28,9 +34,9 @@ export function IterativeRunDiagnostics({ signal, logs = false }: { signal: Scen
   }, [attempt?.attemptId])
   useEffect(() => {
     if (follow.current && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight
-  }, [signal.attemptLog, raw])
+  }, [visibleLog, raw])
   const copy = async () => {
-    const copied = await copyTextToClipboard(signal.attemptLog ?? '')
+    const copied = await copyTextToClipboard(visibleLog)
     setCopyStatus(copied ? text('Скопировано', 'Copied') : text('Не удалось скопировать', 'Copy failed'))
   }
   return <section className="iterative-run-diagnostics" data-testid={logs ? 'current-run-logs' : 'current-run-details'}>
@@ -45,8 +51,9 @@ export function IterativeRunDiagnostics({ signal, logs = false }: { signal: Scen
     </dl>
     {attempt?.status === 'failed' ? <p className="error-text">{attempt.lastError || attempt.reason}</p> : null}
     {logs ? <>
-      <div className="iterative-log-toolbar"><button className="button secondary" aria-pressed={!raw} onClick={() => setRaw(false)}>{text('Ход работы', 'Activity')}</button><button className="button secondary" aria-pressed={raw} onClick={() => setRaw(true)}>Raw</button><button className="button secondary" disabled={!signal.attemptLog} onClick={() => void copy()}><Copy size={14} />{copyStatus ?? text('Скопировать лог', 'Copy log')}</button></div>
-      <pre ref={logRef} className="attempt-log" tabIndex={0} onScroll={() => { const el = logRef.current; if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40 }}>{signal.attemptLog ? (raw ? signal.attemptLog : readableLog(signal.attemptLog)) : signal.running ? text('Ожидаем первые сообщения текущей попытки…', 'Waiting for the current attempt’s first messages…') : text('В этой попытке нет сохранённых сообщений.', 'No saved messages for this attempt.')}</pre>
+      <div className="iterative-log-toolbar"><button className="button secondary" aria-pressed={!raw} onClick={() => setRaw(false)}>{text('Ход работы', 'Activity')}</button><button className="button secondary" aria-pressed={raw} onClick={() => setRaw(true)}>Raw</button><button className="button secondary" disabled={!visibleLog} onClick={() => void copy()}><Copy size={14} />{copyStatus ?? text('Скопировать лог', 'Copy log')}</button></div>
+      <div ref={logRef} className="attempt-log iterative-log-messages" tabIndex={0} onScroll={() => { const el = logRef.current; if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40 }}>{visibleLog ? (raw ? <pre>{visibleLog}</pre> : iterativeLogMessages(visibleLog).map((message, index) => <pre className="iterative-log-message" key={index}>{message}</pre>)) : signal.running ? text('Ожидаем первые сообщения…', 'Waiting for first messages…') : text('Нет сохранённых сообщений.', 'No saved messages.')}</div>
+      <p>{text('Накопительный журнал запуска. На экране последние 256 КБ; полный журнал сохраняется в run.log.', 'Cumulative run journal. The screen shows the latest 256 KB; the full journal is saved in run.log.')} {onOpenLog ? <button className="linklike" onClick={() => void onOpenLog()}>{text('Открыть полный журнал', 'Open full log')}</button> : null}</p>
     </> : null}
   </section>
 }

@@ -534,6 +534,7 @@ export type DependencyFlowApi = {
   exportLegacyIterativeTask: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeTaskActionOutcome>
   copyIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
+  setIterativeAutopilot: (input: { workspaceId?: string; projectName: string; enabled: boolean }) => Promise<{ ok: boolean; active: boolean }>
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStatusOutcome>
   iterativeDrive: (input: { workspaceId?: string; projectName: string; autopilot?: boolean }) => Promise<IterativeDriveOutcome>
   iterativeBegin: (input: { workspaceId?: string; projectName: string; autopilot?: boolean; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
@@ -556,7 +557,7 @@ export type DependencyFlowApi = {
   onMigrationProgressChanged: (handler: (event: { jobId: string; workspaceId?: string; projectName?: string; branch: string; phase?: MigrationBranchRuntimePhase }) => void) => () => void
   onJobFinished: (handler: (event: JobFinished) => void) => () => void
   onDownloadSaved: (handler: (event: DownloadSaved) => void) => () => void
-  iterativeAttempt: (input: { workspaceId?: string; projectName: string }) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
+  iterativeAttempt: (input: { workspaceId?: string; projectName: string; includeRunLog?: boolean }) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; runLog?: string; error?: string }>
   iterativeCancel: (input: { workspaceId?: string; projectName: string }) => Promise<{ ok: boolean }>
   onIterativeAttempt: (handler: (payload: IterativeAttemptView) => void) => () => void
 }

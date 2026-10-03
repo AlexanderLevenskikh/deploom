@@ -25,11 +25,12 @@ const models = async () => ['default']
 const getIntent: ComponentProps<typeof FlowWorkspace>['onGetBaselineIntentPlan'] = async () => ({ candidates: [], intent: { schemaVersion: 2, policies: {}, controlMode: 'AUTONOMOUS', targetLevel: 'yellow' } })
 
 function Harness() {
+  const [qaProvider, setQaProvider] = useState<'codex' | 'opencode' | 'claude'>('codex')
   const [showWorkspace, setShowWorkspace] = useState(false)
   const checked = useRef(false)
   const present = useRef(false)
   const canceled = useRef(false)
-  const coordinator = useRef(createIterativeAutopilot(s => `${s.workspaceId}:${s.projectName}`))
+  const coordinator = useRef(createIterativeAutopilot(s => s.projectName))
   const { setLanguage } = useLanguage()
   const [attempt, setAttempt] = useState<IterativeAttemptView>({ attemptId: 'current-1', projectName: project.name, workspaceId: 'qa', status: 'running', stage: 'begin', phase: 'source-materialization: source capture sealed-manifest: files=25362, bytes=4589080824', startedAt: Date.now() - 400_000, lastHeartbeatAt: Date.now(), targetSource: 'discovery', packageProgress: { processed: 12, total: 30 }, stepsDone: [], runCreated: false })
   const current = useRef(attempt)
@@ -39,7 +40,7 @@ function Harness() {
   const scope = useRef<IterativeStatusOutcome['validationScope']>(undefined)
   const api = useRef({
     status: coordinator.current.register('status', async (): Promise<IterativeStatusOutcome> => ({ ok: true, present: present.current, phase: current.current.stage === 'drive' && current.current.status === 'done' ? 'TERMINAL' : present.current ? 'READY' : undefined, decision: current.current.stage === 'drive' && current.current.status === 'done' ? { step: 'finish', phase: 'TERMINAL', reason: 'COMPLETE', satisfied: true } : undefined, checked: { ok: checked.current }, stale: false, inFlight: current.current.status === 'running', attempt: current.current, validationScope: scope.current, validationProfile: { commands: ['npm run typecheck', 'npm run build', 'npm run test'], suggestedUnitCommand: 'npm run test -- --run src', deferredChecks: 'Playwright: requires a separate server' } })),
-    attempt: async () => { reads.current++; return { ok: true, present: true, attempt: current.current, attemptLog: log.current } },
+    attempt: async () => { reads.current++; return { ok: true, present: true, attempt: current.current, attemptLog: log.current, runLog: `CUMULATIVE_FIRST_MESSAGE\n${log.current}` } },
     cancel: coordinator.current.register('cancel', async () => { canceled.current = true; setAttempt(value => ({ ...value, status: 'canceled', finishedAt: Date.now() })); return { ok: true } }),
     begin: coordinator.current.register('begin', async (_event, input: { projectName: string; workspaceId?: string; autopilot?: boolean; checkOnly?: boolean }) => {
       canceled.current = false; setAttempt(value => ({ ...value, status: 'running', stage: 'begin', phase: input.checkOnly ? 'begin.check' : 'begin.discovery-progress', discoveryCompleted: false }));
@@ -55,6 +56,7 @@ function Harness() {
     }),
   })
   useEffect(() => {
+    window.dependencyFlow = { ...window.dependencyFlow, setIterativeAutopilot: async input => coordinator.current.setEnabled(input, input.enabled) } as typeof window.dependencyFlow
     setLanguage('ru')
     const timer = window.setInterval(() => {
       if (current.current.status !== 'running') return
@@ -87,11 +89,11 @@ function Harness() {
       <button onClick={() => setShowWorkspace(true)}>Workspace dialog</button>
       <button onClick={() => setLanguage('en')}>EN</button><button onClick={() => setLanguage('ru')}>RU</button>
     </div>
-    <FlowWorkspace details={details} project={project} appVersion="QA" liveIterativeAttempt={attempt}
+    <FlowWorkspace details={{ ...details, workspace: { ...details.workspace, agent: qaProvider } }} project={project} appVersion="QA" liveIterativeAttempt={attempt}
       onMarkDraftLaunched={() => {}} onResetDraftLaunch={() => {}} onAcknowledgeDraftRun={() => {}}
       onClearBaselineDecision={() => {}} onGetBaselineIntentPlan={getIntent} onGetCurrentDraftResult={async () => undefined}
       onRun={async () => undefined} onSendAgentNote={async () => false} onStartAutopilot={noop} onStopAutopilot={noop} onRecoverWithAgent={noop}
-      onOpenDashboard={() => {}} onOpenPath={noop} onChoosePrompt={noop} onUpdateWorkspace={noop} onUpdateProjectBranches={noop} onUpdateProjectNode={noop}
+      onOpenDashboard={() => {}} onOpenPath={noop} onChoosePrompt={noop} onUpdateWorkspace={async patch => { if (patch.agent) setQaProvider(patch.agent) }} onUpdateProjectBranches={noop} onUpdateProjectNode={noop}
       onListNodeVersions={models} onListAgentModels={models} onGetIterativeTask={getTask} onExportIterativeTask={outcome} onExportLegacyIterativeTask={outcome} onCopyIterativeTask={outcome} onSaveIterativeTask={outcome}
       onIterativeStatus={name => api.current.status(null, { projectName: name })} onIterativeAttempt={api.current.attempt} onIterativeCancel={name => api.current.cancel(null, { projectName: name })}
       onIterativeBegin={(name, input) => api.current.begin(null, { projectName: name, ...input })} onIterativeDrive={(name, autopilot) => api.current.drive(null, { projectName: name, autopilot })} onIterativeAgent={async () => ({ ok: false })}

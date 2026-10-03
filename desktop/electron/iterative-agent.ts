@@ -17,8 +17,8 @@
 //     agent text; apply-feedback (the authoritative verifier of staleness and
 //     changed-file scope) is then invoked with the real CLI.
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { dirname, join, sep } from 'node:path'
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, lstatSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { dirname, join, resolve, sep } from 'node:path'
 
 export type IterativeRepairRequest = {
   requestId: string
@@ -249,6 +249,47 @@ export function isForbiddenTrialRelative(relativePath: string): boolean {
   return false
 }
 
+export type AgentRuntimeScope = { provider: string; projectRelative: string }
+
+/** Recognize only OpenCode's own plugin installation, never project manifests.
+ * The explicit provider/project scope, physical paths and plugin-only shape
+ * are all required. Runtime files remain in source verification, but cannot
+ * count as source repair evidence or be sent to Python as changed manifests. */
+export function openCodeRuntimeManifestPaths(workspaceRoot: string, scope?: AgentRuntimeScope): Set<string> {
+  const result = new Set<string>()
+  if (scope?.provider !== 'opencode') return result
+  const project = resolve(workspaceRoot, scope.projectRelative)
+  const root = resolve(workspaceRoot)
+  if (project !== root && !project.startsWith(root + sep)) return result
+  const directory = join(project, '.opencode')
+  try {
+    if (realpathSync(directory).toLowerCase() !== directory.toLowerCase()) return result
+    const manifestPath = join(directory, 'package.json')
+    const lockPath = join(directory, 'package-lock.json')
+    if (!lstatSync(manifestPath).isFile() || !lstatSync(lockPath).isFile()) return result
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    const deps = manifest.dependencies
+    if (Object.keys(manifest).some(key => key !== 'dependencies')) return result
+    if (!deps || Object.keys(deps).length !== 1 || typeof deps['@opencode-ai/plugin'] !== 'string') return result
+    const version = deps['@opencode-ai/plugin']
+    if (!/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(version)) return result
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8'))
+    const lockedRoot = lock.packages?.['']
+    if (lock.name !== '.opencode' || lock.lockfileVersion !== 3 || !lockedRoot) return result
+    if (Object.keys(lockedRoot).some(key => key !== 'dependencies')) return result
+    if (JSON.stringify(lockedRoot.dependencies) !== JSON.stringify(deps)) return result
+    const plugin = lock.packages?.['node_modules/@opencode-ai/plugin']
+    if (plugin?.version !== version) return result
+    const prefix = scope.projectRelative.replace(/\\/g, '/').replace(/^\.\/?$/, '').replace(/\/$/, '')
+    for (const file of ['package.json', 'package-lock.json']) {
+      result.add(`${prefix ? prefix + '/' : ''}.opencode/${file}`)
+    }
+  } catch {
+    // Missing, linked or unrecognized runtime files keep the ordinary guard.
+  }
+  return result
+}
+
 export type TrialMutationKind = 'modified' | 'added' | 'removed'
 export type TrialMutation = { path: string; kind: TrialMutationKind; forbidden: boolean }
 
@@ -314,9 +355,10 @@ export function classifyTrialMutations(workspaceRoot: string, baselineFile: stri
 
 /** Planner-owned files the agent changed or deleted. A non-empty result MUST
  * reject the repair before feedback/verification. */
-export function forbiddenTrialViolations(workspaceRoot: string, baselineFile: string): string[] {
+export function forbiddenTrialViolations(workspaceRoot: string, baselineFile: string, scope?: AgentRuntimeScope): string[] {
+  const runtimePaths = openCodeRuntimeManifestPaths(workspaceRoot, scope)
   return classifyTrialMutations(workspaceRoot, baselineFile)
-    .filter((mutation) => mutation.forbidden)
+    .filter((mutation) => mutation.forbidden && !runtimePaths.has(mutation.path))
     .map((mutation) => `${mutation.kind}:${mutation.path}`)
     .sort()
 }
@@ -440,6 +482,22 @@ export function parseAgentOutcome(output: string, exitCode: number, changedFiles
 // SECOND repair session instead of silently spending another attempt.
 // The in-memory per-project guard only protects one process lifetime; the
 // lease spans app restarts while the repair (or its verification) runs.
+/** Provider failures are infrastructure, never repair feedback or proof. */
+export function agentProviderFailure(output: string, exitCode: number): string | undefined {
+  for (const line of output.split(/\r?\n/)) {
+    try {
+      const event = JSON.parse(line)
+      if (event.type === 'error' || event.error) {
+        const error = event.error ?? event
+        return String(error.data?.message ?? error.message ?? error.name ?? 'Provider error').slice(0, 2000)
+      }
+    } catch { /* ordinary agent text */ }
+  }
+  if (/ProviderModelNotFoundError|Model not found:/i.test(output)) return output.trim().slice(-2000)
+  if (exitCode !== 0 && output.trim()) return output.trim().slice(-2000)
+  return undefined
+}
+
 export const AGENT_LEASE_FILENAME = 'agent-lease.json'
 
 export type AgentLease = {

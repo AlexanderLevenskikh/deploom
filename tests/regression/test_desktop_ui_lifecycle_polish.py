@@ -14,7 +14,7 @@ class DesktopUiLifecyclePolishRegressionTests(unittest.TestCase):
     def test_model_is_persisted_before_manual_or_autopilot_launch(self) -> None:
         flow = (ROOT / "desktop/src/components/FlowWorkspace.tsx").read_text(encoding="utf-8")
         self.assertIn("await persistAgentModel()", flow)
-        self.assertIn("onBeforeStart={async () => { await persistAgentModel()", flow)
+        self.assertIn("onBeforeStart={async () => { await validateAgentSelection(); await persistAgentModel()", flow)
         panel = (ROOT / "desktop/src/components/IterativeTaskPanel.tsx").read_text(encoding="utf-8")
         self.assertEqual(panel.count("await onBeforeStart?.()"), 3)
         self.assertNotIn("Прежний FLOW / история (отдельный запуск)", flow)

@@ -8,6 +8,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   AGENT_LEASE_FILENAME,
+  agentProviderFailure,
   agentLeaseAlive,
   agentLeaseFile,
   agentPromptFile,
@@ -18,6 +19,7 @@ import {
   decideAgentLeaseDispatch,
   forbiddenTrialViolations,
   iterativeApplyFeedbackInvocation,
+  openCodeRuntimeManifestPaths,
   parseAgentOutcome,
   parseChangedFilesFromAgentOutput,
   readAgentLease,
@@ -168,6 +170,40 @@ writeFileSync(manifestPath, JSON.stringify({ dependencies: { "is-number": "7.0.0
 if (forbiddenTrialViolations(workspace, baselineFile).length !== 0) {
   throw new Error(`Restored manifest must clear violations: ${JSON.stringify(forbiddenTrialViolations(workspace, baselineFile))}`);
 }
+
+// Runtime metadata must not hide application manifests or count as repair.
+const runtimeDir = join(workspace, '.opencode');
+const runtimeScope = { provider: 'opencode', projectRelative: '.' };
+function pluginRuntime(version) {
+  const manifest = { dependencies: { '@opencode-ai/plugin': version } };
+  writeJson(join(runtimeDir, 'package.json'), manifest);
+  writeJson(join(runtimeDir, 'package-lock.json'), {
+    name: '.opencode', lockfileVersion: 3,
+    packages: { '': manifest, 'node_modules/@opencode-ai/plugin': { version } },
+  });
+}
+pluginRuntime('1.0.0');
+const runtimeBaseline = join(runDir, 'runtime-baseline.json');
+writeTrialBaseline(workspace, runtimeBaseline);
+pluginRuntime('1.17.14');
+assert.equal(forbiddenTrialViolations(workspace, runtimeBaseline).length, 2);
+assert.deepEqual(forbiddenTrialViolations(workspace, runtimeBaseline, runtimeScope), []);
+assert.equal(openCodeRuntimeManifestPaths(workspace, runtimeScope).size, 2);
+assert.equal(openCodeRuntimeManifestPaths(workspace, { ...runtimeScope, provider: 'codex' }).size, 0);
+assert.equal(changedFilesFromBaseline(workspace, runtimeBaseline).length, 0, 'Tool bootstrap alone is not a repair');
+writeJson(manifestPath, { dependencies: { 'is-number': '8.0.0' } });
+assert.deepEqual(forbiddenTrialViolations(workspace, runtimeBaseline, runtimeScope), ['modified:package.json']);
+writeJson(manifestPath, { dependencies: { 'is-number': '7.0.0' } });
+writeJson(join(runtimeDir, 'package.json'), { dependencies: { '@opencode-ai/plugin': '1.17.14' }, scripts: { test: 'echo bypass' } });
+assert.equal(openCodeRuntimeManifestPaths(workspace, runtimeScope).size, 0);
+assert.equal(forbiddenTrialViolations(workspace, runtimeBaseline, runtimeScope).length, 2);
+pluginRuntime('1.17.14');
+const runtimeLockPath = join(runtimeDir, 'package-lock.json');
+const matchingLock = JSON.parse(readFileSync(runtimeLockPath, 'utf8'));
+writeJson(runtimeLockPath, { ...matchingLock, packages: { ...matchingLock.packages, '': { dependencies: { 'other-package': '1.0.0' } } } });
+assert.equal(openCodeRuntimeManifestPaths(workspace, runtimeScope).size, 0, 'Manifest and lock must describe the same tool');
+pluginRuntime('1.17.14');
+assert.equal(openCodeRuntimeManifestPaths(workspace, { ...runtimeScope, projectRelative: 'src' }).size, 0, 'Only the selected project runtime is exempt');
 
 // 4. Feedback payload carries ONLY the durable candidate identity.
 const feedback = buildFeedbackPayload(ctx, changed, "READY_FOR_VERIFY", "source adapted to is-number 7.0.0");
@@ -325,6 +361,9 @@ if (readAgentLease(join(runDir, "trial", "no-such-lease.json")) !== undefined) {
   throw new Error("Missing lease file must read as undefined");
 }
 
+assert.equal(agentProviderFailure(JSON.stringify({type:'error',error:{name:'ProviderModelNotFoundError',data:{message:'Model not found: test-provider/obsolete'}}}),0), 'Model not found: test-provider/obsolete');
+assert.equal(agentProviderFailure('ordinary repair text',0), undefined);
+assert.equal(agentProviderFailure('connection refused',1), 'connection refused');
 // Exercise the actual main capture helper against a child that starts only
 // after stdin EOF. No model/server is contacted and no tokens are consumed.
 const mainSource = readFileSync(join(DESKTOP, "electron/main.ts"), "utf8");

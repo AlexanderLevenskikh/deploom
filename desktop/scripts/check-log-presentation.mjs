@@ -16,7 +16,7 @@ if (!mainSource.includes("deterministicWatchdogFailure") || !mainSource.includes
 if (appSource.includes("<MonitoringPanel")) throw new Error("Default App must not mount the technical MonitoringPanel");
 if (!mainSource.includes("BLOCK_HUMAN_FLOW_ARTIFACT_LOG_V1")) throw new Error("Raw job output must be persisted to run artifacts after removing the default monitor");
 const failedGroupI18nContract = [
-  [flowSource, '<IterativeRunDiagnostics signal={currentScenario} logs />'],
+  [flowSource, '<IterativeRunDiagnostics signal={currentScenario} logs onReadLog='],
   [flowSource, '<IterativeTaskPanel'],
   [failureModalSource, "t('branchFailure.autopilot')"],
   [failureModalSource, "t('branchFailure.userRequired')"],
@@ -161,5 +161,10 @@ const rawStderr = module.presentLogs([
   { jobId: "git", stream: "stderr", line: "fatal: not a git repository\n" },
 ]);
 if (rawStderr.map((entry) => entry.kind).join(",") !== "warning,raw,error") throw new Error(`Unprefixed stderr severity is wrong: ${JSON.stringify(rawStderr)}`);
+const iterativeSource = await readFile(new URL('../src/data/iterativeLogMessages.ts', import.meta.url), 'utf8');
+const iterativeJs = ts.transpileModule(iterativeSource, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText;
+const iterativeView = await import(`data:text/javascript;base64,${Buffer.from(iterativeJs).toString('base64')}`);
+const messages = iterativeView.iterativeLogMessages('ITERATIVE_MIGRATION_STATUS_V1 '+JSON.stringify({event:'begin.check-output',message:'line one\nline two'})+'\n'+JSON.stringify({schemaVersion:1,run:{phase:'REPAIRING',activeCheckpointId:'C0'},candidate:{large:'payload'}}));
+if (messages.length !== 2 || messages[0] !== 'line one\nline two' || messages[1].includes('payload')) throw new Error('Iterative log messages leaked machine state or lost multiline output');
 console.log("OpenCode/Claude JSONL presentation OK");
 

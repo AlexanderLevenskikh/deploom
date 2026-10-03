@@ -9,15 +9,17 @@ export type AutopilotSummary = { stopped: string; error?: string }
 
 export function createIterativeAutopilot(key: (scope: Scope) => string) {
   const handlers = new Map<Step, Handler>()
-  const sessions = new Map<string, { canceled: boolean }>()
+  const sessions = new Map<string, { canceled: boolean; enabled: boolean }>()
+  const statusReads = new Map<string, Promise<Outcome>>()
   const invoke = (step: Step, input: Input) => {
     const handler = handlers.get(step)
     if (!handler) throw new Error(`AUTOPILOT_HANDLER_MISSING: ${step}`)
     return handler(undefined, input)
   }
-  async function continueRun(first: Step, input: Input, session: { canceled: boolean }) {
+  async function continueRun(first: Step, input: Input, session: { canceled: boolean; enabled: boolean }) {
     let outcome = await invoke(first, input)
     const initial = outcome
+    if (!session.enabled) return initial
     const stopped = (reason: string, error?: string): Outcome => ({ ...initial, autopilot: { stopped: reason, ...(error ? { error } : {}) } })
     if (session.canceled) return stopped('canceled')
     if (outcome.ok !== true) return stopped('error', String(outcome.error || 'AUTOPILOT_STEP_FAILED'))
@@ -35,10 +37,11 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
     // Do not retry an identical gate after a nominally successful agent call.
     const gates = new Set<string>()
     let pendingDrive = first === 'drive' ? outcome : undefined
-    while (!session.canceled) {
+    while (!session.canceled && session.enabled) {
       const drive = pendingDrive ?? await invoke('drive', input)
       pendingDrive = undefined
       if (session.canceled) return stopped('canceled')
+      if (!session.enabled) return stopped('paused')
       if (drive.ok !== true) return stopped('error', String(drive.error || 'AUTOPILOT_DRIVE_FAILED'))
       if (drive.stopped !== 'agent-gate') return stopped(String(drive.stopped || 'paused'))
       const status = await invoke('status', input)
@@ -52,25 +55,36 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
       if (session.canceled) return stopped('canceled')
       if (agent.ok !== true) return stopped('error', String(agent.error || 'AUTOPILOT_AGENT_FAILED'))
     }
-    return stopped('canceled')
+    return stopped(session.canceled ? 'canceled' : 'paused')
   }
   return {
+    setEnabled(scope: Scope, enabled: boolean) {
+      const session = sessions.get(key(scope))
+      if (session) session.enabled = enabled
+      return { ok: true, active: Boolean(session?.enabled) }
+    },
     register<E, I extends Scope, R extends object>(step: Step, handler: (event: E, input: I) => Promise<R>) {
       handlers.set(step, handler as unknown as Handler)
       return async (event: E, input: I): Promise<R> => {
         const id = key(input)
         const session = sessions.get(id)
         if (step === 'status') {
-          const result = await handler(event, input)
-          return { ...result, autopilotActive: sessions.has(id) } as R
+          let pending = statusReads.get(id)
+          if (!pending) {
+            pending = handler(event, input) as Promise<Outcome>
+            statusReads.set(id, pending)
+          }
+          try {
+            const result = await pending
+            return { ...result, autopilotActive: sessions.get(id)?.enabled === true } as R
+          } finally { if (statusReads.get(id) === pending) statusReads.delete(id) }
         }
         if (step === 'cancel') {
           if (session) session.canceled = true
           return handler(event, input)
         }
         if (session) return { ok: false, error: 'AUTOPILOT_IN_PROGRESS' } as R
-        if (!input.autopilot) return handler(event, input)
-        const own = { canceled: false }
+        const own = { canceled: false, enabled: input.autopilot === true }
         sessions.set(id, own)
         try {
           return await continueRun(step, { ...input, autopilot: false } as Input, own) as R

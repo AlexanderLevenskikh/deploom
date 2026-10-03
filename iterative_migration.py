@@ -299,9 +299,21 @@ def _checkpoint_path(run_dir: Path, checkpoint_id: str) -> Path:
 
 def _write_json_atomic(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f".tmp-{os.getpid()}")
-    tmp.write_text(_stable_json(value) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(path.name + f".tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    try:
+        tmp.write_text(_stable_json(value) + "\n", encoding="utf-8")
+        for attempt in range(10):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError as exc:
+                # Windows readers/scanners can briefly deny replacement. Never
+                # delete the old durable state or reinterpret a permanent ACL.
+                if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == 9:
+                    raise
+                time.sleep(min(0.02 * (2 ** attempt), 0.2))
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _read_json(path: Path, *, required: bool = True) -> Optional[Dict[str, Any]]:

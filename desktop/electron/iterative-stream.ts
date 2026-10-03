@@ -85,6 +85,8 @@ export function spawnIterativeStreamed(
       env: commandEnv,
     })
     // Zero disables only the overall watchdog; cancellation remains active.
+    child.stdin.on('error', () => { /* EPIPE from an early child exit */ })
+    child.stdin.end()
     const timer = timeoutMs > 0
       ? setTimeout(() => { timedOut = true; platform.killProcessTree(child) }, timeoutMs)
       : undefined

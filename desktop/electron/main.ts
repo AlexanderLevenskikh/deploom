@@ -61,9 +61,9 @@ import { migrationProfilePath, readMigrationProfile, readMigrationScope, saveMig
 import { hasSavedProjectPlan, iterativeBeginInvocation, iterativeCheckTimeoutFailure, targetsFromDashboardState } from './iterative-begin.js'
 import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
-import { beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, recordAttemptLog, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
+import { beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, readRunLogTail, recordAttemptLog, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
 import { spawnIterativeStreamed, type CaptureResult, type StreamAttemptIo, type StreamPlatform } from './iterative-stream.js'
-import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
+import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, agentProviderFailure, openCodeRuntimeManifestPaths, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
@@ -2248,7 +2248,8 @@ async function listAgentModels(agentProvider: AgentProvider, cwd: string): Promi
     mkdirSync(runtime.directory, { recursive: true })
     try {
       const result = await spawnCapture('opencode', ['models'], cwd, 15_000, { OPENCODE_DB: runtime.databasePath })
-      return result.code === 0 ? parseOpencodeModelsOutput(result.stdout) : []
+      if (result.code !== 0) throw new Error(`AGENT_MODELS_UNAVAILABLE: ${result.stderr.trim() || 'opencode models failed'}`)
+      return parseOpencodeModelsOutput(result.stdout)
     } finally {
       try { rmSync(runtime.root, { recursive: true, force: true }) } catch { /* model discovery runtime is disposable */ }
     }
@@ -7525,6 +7526,8 @@ function setupIpc(): void {
     return stepLockKey(workspace.id, input.projectName)
   })
 
+  ipcMain.handle('flow:iterative:autopilot', async (_event, input: { workspaceId?: string; projectName: string; enabled: boolean }) => iterativeAutopilot.setEnabled(input, input.enabled))
+
   ipcMain.handle('flow:iterative:task', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
@@ -7673,7 +7676,7 @@ function setupIpc(): void {
     if (attempt) send('flow:iterative:attempt', attempt)
   }
 
-  ipcMain.handle('flow:iterative:attempt', async (_event, input: { workspaceId?: string; projectName: string }) => {
+  ipcMain.handle('flow:iterative:attempt', async (_event, input: { workspaceId?: string; projectName: string; includeRunLog?: boolean }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -7685,6 +7688,7 @@ function setupIpc(): void {
       present,
       attempt,
       attemptLog: readAttemptLogTail(runDir),
+      runLog: input.includeRunLog ? readRunLogTail(runDir) : undefined,
       error: !attempt && !present ? 'NO_ATTEMPT' : undefined,
     }
   })
@@ -8256,7 +8260,7 @@ function setupIpc(): void {
           publish()
           return { ok: true, steps, stopped: 'canceled', reason: 'отменено пользователем; verified checkpoint сохранён (продолжите нажатием «Продолжить»)', attempt: readAttempt(runDir) }
         }
-        const statusResult = await spawnIterativeStreamed(runDir, python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000, iterativeStreamIo(runDir), iterativeStreamPlatform)
+        const statusResult = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
         const payload = statusResult.code === 0
           ? parseIterativeStatusPayload(statusResult.stdout) ?? readIterativeStatus(runDir)
           : undefined
@@ -8408,6 +8412,7 @@ function setupIpc(): void {
     updateAttempt(runDir, { status: 'running', stage: 'agent' })
     publishIterativeAttempt(runDir)
     let agentOutputTail = ''
+    let agentSucceeded = false
     try {
       const python = resolveExecutable('python')
       const generator = join(bundledToolDir(), 'iterative_migration.py')
@@ -8527,7 +8532,11 @@ function setupIpc(): void {
       // agent TEXT alone may never claim a completed repair.
       const provider = workspace.agent === 'claude' ? 'claude' : workspace.agent === 'codex' ? 'codex' : 'opencode'
       const model = workspace.agentModel
-      recordAttemptLog(runDir, `Agent dispatch: provider=${provider}; model=${model || '(provider default)'}`)
+      if (provider === 'opencode' && model) {
+        const available = await listAgentModels(provider, projectPath)
+        if (!available.includes(model)) throw new Error(`AGENT_MODEL_UNAVAILABLE: ${model}; choose an available model for ${provider}`)
+      }
+      recordAttemptLog(runDir, `Agent dispatch: provider=${provider}; model=${model || '(provider default)'}\n`)
       updateAttempt(runDir, { reason: `Agent repair: ${provider}; model=${model || '(provider default)'}` })
       publishIterativeAttempt(runDir)
       // #5: after a crash the SAME provider session is resumed (same attempt,
@@ -8564,14 +8573,16 @@ function setupIpc(): void {
               pid: process.pid,
               startedAt: new Date().toISOString(),
             })
-            const agentResult = await spawnCapture(
+            const agentResult = await spawnIterativeStreamed(
+              runDir,
               'opencode',
               resuming
                 ? buildOpenCodeResumeArgs(projectPath, resumeSessionId as string, model, promptFile, undefined, undefined, transport?.url)
                 : buildOpenCodeAgentArgs(projectPath, promptFile, model, undefined, transport?.url),
               projectPath,
               900_000,
-              transport ? { OPENCODE_DB: databasePath || transport.databasePath } : undefined,
+              iterativeStreamIo(runDir),
+              { ...iterativeStreamPlatform, commandEnvironment: env => commandEnvironment(openCodeDatabaseEnv(env, databasePath || transport?.databasePath || '')) },
             )
             exitCode = agentResult.code
             agentTimedOut = agentResult.timedOut === true
@@ -8608,6 +8619,8 @@ function setupIpc(): void {
           output = `${agentResult.stdout}\n${agentResult.stderr}`
         }
         agentOutputTail = output.slice(-4000)
+        const providerFailure = agentProviderFailure(output, exitCode)
+        if (providerFailure) throw new Error(`AGENT_PROVIDER_ERROR: ${provider}; model=${model || '(provider default)'}; ${providerFailure}`)
         if (agentTimedOut) {
           throw new Error(`AGENT_PROVIDER_TIMEOUT: ${provider}; model=${model || '(provider default)'}; agent process exceeded 15 minutes. The verified checkpoint is preserved.`)
         }
@@ -8615,16 +8628,22 @@ function setupIpc(): void {
           throw new Error(`AGENT_PROVIDER_FAILURE (exit ${exitCode}): ${provider}; model=${model || '(provider default)'}; agent process exited without output`)
         }
 
+        const runtimeScope = { provider, projectRelative }
+        const runtimePaths = openCodeRuntimeManifestPaths(workspaceRoot, runtimeScope)
+        if (runtimePaths.size > 0) {
+          recordAttemptLog(runDir, 'OpenCode plugin runtime manifests recognized; excluded from repair evidence. Project manifests remain protected.\n')
+        }
         const changed = [...new Set([
           ...changedFilesFromBaseline(workspaceRoot, baselineFile),
           ...parseChangedFilesFromAgentOutput(output),
-        ])].sort()
+        ])].filter(path => !runtimePaths.has(path)).sort()
         // #4: the baseline hash diff is the source of truth for agent edits.
         // A planner-owned file (manifest/lock/.npmrc/...) that was modified,
         // added or removed is a violation and REJECTS the repair BEFORE any
         // feedback reaches Python and before any verification is attempted.
-        const forbidden = forbiddenTrialViolations(workspaceRoot, baselineFile)
+        const forbidden = forbiddenTrialViolations(workspaceRoot, baselineFile, runtimeScope)
         if (forbidden.length > 0) {
+          updateAttempt(runDir, { status: 'failed', stage: 'agent', lastStep: 'agent', finishedAt: Date.now(), lastError: `FORBIDDEN_MUTATION: ${forbidden.join(', ')}` })
           return {
             ok: false,
             error: `FORBIDDEN_MUTATION: агент изменил файлы, принадлежащие планировщику: ${forbidden.join(', ')}. Manifest/lockfile и другие forbidden-файлы не могут быть правкой агента; откатите их в trial вручную и повторите ремонт.`,
@@ -8657,6 +8676,7 @@ function setupIpc(): void {
             ? parseIterativeStatusPayload(refresh.stdout) ?? readIterativeStatus(runDir)
             : undefined
           const next = refreshed ? decideNextStep(runDir, refreshed) : undefined
+          agentSucceeded = true
           return { ok: true, changedFiles: parsed.changedFiles, phase: next?.phase, next, agentOutputTail }
         }
         const proposedScope = parsed.proposals.length > 0
@@ -8675,16 +8695,22 @@ function setupIpc(): void {
           ? parseIterativeStatusPayload(refresh.stdout) ?? readIterativeStatus(runDir)
           : undefined
         const next = refreshed ? decideNextStep(runDir, refreshed) : undefined
+        agentSucceeded = true
         return { ok: true, changedFiles: parsed.changedFiles, phase: next?.phase, next, agentOutputTail }
       } finally {
         clearAgentLease(leasePath)
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      updateAttempt(runDir, { status: 'failed', stage: 'agent', lastError: message.slice(0, 4000), lastStep: 'agent' })
+      recordAttemptLog(runDir, `Agent failed: ${message.slice(0, 4000)}\n`)
+      updateAttempt(runDir, { status: 'failed', stage: 'agent', finishedAt: Date.now(), lastError: message.slice(0, 4000), lastStep: 'agent' })
       publishIterativeAttempt(runDir)
       return { ok: false, error: message, agentOutputTail }
     } finally {
+      const terminalAttempt = readAttempt(runDir)
+      if (terminalAttempt?.status === 'running' && terminalAttempt.stage === 'agent') {
+        updateAttempt(runDir, { status: agentSucceeded ? 'done' : 'failed', finishedAt: Date.now(), ...(agentSucceeded ? {} : { lastError: terminalAttempt.lastError || 'AGENT_STEP_INCOMPLETE: repair was not applied; inspect the provider result' }) })
+      }
       updateAttempt(runDir, { lastHeartbeatAt: Date.now() })
       publishIterativeAttempt(runDir)
       iterativeStepInFlight.delete(stepLockKey(workspace.id, project.name))

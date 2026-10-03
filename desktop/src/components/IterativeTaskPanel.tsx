@@ -1,6 +1,7 @@
 import { Check, ChevronDown, ChevronUp, Clipboard, ExternalLink, FileText, RefreshCw, Rocket, Save, Wrench, X } from 'lucide-react'
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 
+import { iterativeLogMessages } from '../data/iterativeLogMessages'
 import { useLanguage } from '../i18n'
 import { MigrationChecksPanel } from './MigrationChecksPanel'
 import { validateMigrationProfile, validationProfilesEqual, type MigrationValidationProfile } from '../../electron/migration-validation-profile'
@@ -104,6 +105,7 @@ const activityText = (attempt?: IterativeAttemptView, text?: (ru: string, en: st
   if (!attempt) return t('Подготовка…', 'Preparing…')
   if (attempt.status === 'failed') return t('Попытка не завершилась', 'The attempt failed')
   if (attempt.status === 'canceled') return t('Работа остановлена', 'Work was stopped')
+  if (attempt.status === 'done' && attempt.lastStep === 'agent') return t('Нужны исправления — обновление приостановлено', 'Repairs needed — update paused')
   if (attempt.status === 'done') return t(attempt.lastStep === 'no-targets' ? 'План обновления ещё не выбран' : 'Этап завершён', attempt.lastStep === 'no-targets' ? 'No update plan selected yet' : 'Stage completed')
   const stage = attempt.stage
   if (stage === 'begin') {
@@ -164,7 +166,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   const refreshRunner = useCallback(async () => {
     try {
       const status = await onStatus(projectName)
-      setRunner(status)
+      setRunner(current => status.ok ? status : current ?? status)
       setRunnerError(status.ok || !status.error ? undefined : status.error)
       return status
     } catch (error) {
@@ -749,17 +751,15 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         )
       })()}
 
-      <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.autopilotActive || autopilot} disabled={childAlive || busyLocked} onChange={event => setAutopilot(event.target.checked)} />{text('Автопилот: продолжать автоматически, включая исправления агентом', 'Autopilot: continue automatically, including agent repairs')}</label>
-
       <MigrationChecksPanel key={`${workspaceId}:${projectName}`} profile={validationDraft ? { ...runner?.validationProfile, ...validationDraft } : runner?.validationProfile} locked={Boolean(runner?.present || childAlive || stepBusy || disabledExternal)} scope={validationChanged ? undefined : runner?.validationScope ?? runner?.checked?.validationScope} onChange={setValidationDraft} />
 
       {/* L1: durable attempt strip — visible from the very first click, after a
           restart, and during a long check/discovery/cohort. User-facing wording;
           raw status/stage/steps live in the diagnostics below. */}
       {attempt ? (
-        <div className={`attempt-strip ${attempt.status}`} data-testid="attempt-strip">
+        <div className={`attempt-strip ${attempt.status === 'done' && attempt.lastStep === 'agent' ? 'paused' : attempt.status}`} data-testid="attempt-strip">
           <div className="attempt-strip-row">
-            <strong className={`attempt-status ${attempt.status}`}>{childAlive || attemptAlive ? activity.title : activityText(attempt, text)}</strong>
+            <strong className={`attempt-status ${attempt.status === 'done' && attempt.lastStep === 'agent' ? 'paused' : attempt.status}`}>{childAlive || attemptAlive ? activity.title : activityText(attempt, text)}</strong>
             <span className="attempt-meta">
               · {text('прошло', 'elapsed')} {fmtElapsed(elapsedMs)}
               {attempt.targetSource === 'roadmap'
@@ -795,7 +795,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
             ) : null}
           </div>
           {showLogTail ? (
-            <pre className="attempt-log">{currentAttemptLog}</pre>
+            <div className="iterative-log-messages">{iterativeLogMessages(currentAttemptLog ?? '').slice(-8).map((message, index) => <pre className="iterative-log-message" key={index}>{message}</pre>)}</div>
           ) : null}
         </div>
       ) : null}
@@ -843,6 +843,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
           {/* THE single main action for the current scenario state. */}
           <div className="resume-notice">
             <span>{mainDescription}</span>
+            <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.autopilotActive || autopilot} disabled={disabledExternal === true} onChange={event => { const enabled = event.target.checked; setAutopilot(enabled); void window.dependencyFlow?.setIterativeAutopilot({ workspaceId, projectName, enabled }).then(() => refreshRunner()).catch(error => { setAutopilot(!enabled); setNote(String(error)) }) }} />{text('Автопилот: продолжать автоматически, включая исправления агентом', 'Autopilot: continue automatically, including agent repairs')}</label>
+            <small>{text('Можно включить во время работы. Автопилот продолжит после текущего шага; выключение остановит автоматические переходы.', 'Enable while running to continue after the current step; disabling stops automatic transitions.')}</small>
             <footer className="baseline-intent-actions">
               <button
                 type="button"

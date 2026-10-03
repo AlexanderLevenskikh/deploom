@@ -10,7 +10,7 @@
 // chunks and terminates the child WITHOUT deleting any durable run state
 // (begin/drive never touch checkpoints, so the last verified checkpoint is
 // always preserved on retry/resume).
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
 
@@ -145,7 +145,10 @@ export function clearCancelRequest(runDir: string): void {
 export function recordAttemptLog(runDir: string, line: string): void {
   const target = attemptLogPath(runDir)
   mkdirSync(dirname(target), { recursive: true })
+  const cumulative = join(runDir, 'run.log')
+  if (!existsSync(cumulative) && existsSync(target)) writeFileSync(cumulative, readFileSync(target))
   appendFileSync(target, line, 'utf8')
+  appendFileSync(cumulative, line, 'utf8')
 }
 
 /** Trim the log to the cap after writing (cheap; only called when size grows). */
@@ -167,14 +170,23 @@ export function trimAttemptLog(runDir: string): void {
   }
 }
 
+export function readRunLogTail(runDir: string): string {
+  return readAttemptLogTail(runDir, 256 * 1024, existsSync(join(runDir, 'run.log')) ? 'run.log' : 'attempt.log')
+}
+
 /** Cap-safe log tail for the UI (never ships the whole artifact). */
-export function readAttemptLogTail(runDir: string, maxBytes = 16 * 1024): string {
-  const target = attemptLogPath(runDir)
+export function readAttemptLogTail(runDir: string, maxBytes = 16 * 1024, filename = 'attempt.log'): string {
+  const target = join(runDir, filename)
   if (!existsSync(target)) return ''
   try {
-    const text = readFileSync(target, 'utf8')
-    if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text
-    return `…${text.slice(-maxBytes)}\n`
+    const file = openSync(target, 'r')
+    try {
+      const size = fstatSync(file).size
+      const buffer = Buffer.alloc(Math.min(size, maxBytes))
+      const bytes = readSync(file, buffer, 0, buffer.length, Math.max(0, size - maxBytes))
+      const text = buffer.subarray(0, bytes).toString('utf8')
+      return size <= maxBytes ? text : `…${text}\n`
+    } finally { closeSync(file) }
   } catch {
     return ''
   }

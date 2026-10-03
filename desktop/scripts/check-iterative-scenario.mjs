@@ -361,6 +361,25 @@ repeat.register('status', async () => ({ ok: true, decision: { step: 'agent' } }
 repeat.register('agent', async () => { dispatched++; return { ok: true }; });
 const repeatDrive = repeat.register('drive', async () => ({ ok: true, stopped: 'agent-gate', repairRequests: [{ requestId: 'same' }] }));
 assert.equal((await repeatDrive(null, scope)).autopilot.error, 'AUTOPILOT_REPEATED_REPAIR_GATE'); assert.equal(dispatched, 1);
+const adopt = owner(); let finishManual; let adoptedCalls = 0;
+const manualWait = new Promise(resolve => { finishManual = resolve; });
+adopt.register('status', async () => ({ok:true}));
+const manual = adopt.register('begin', async () => { await manualWait; return {ok:true}; });
+adopt.register('drive', async () => { adoptedCalls++; return {ok:true,stopped:'finished'}; });
+const manualPending = manual(null, {...scope,autopilot:false});
+assert.equal(adopt.setEnabled(scope,true).active,true);
+finishManual(); assert.equal((await manualPending).autopilot.stopped,'finished'); assert.equal(adoptedCalls,1);
+const disableOwner = owner(); let finishDrive; let disabledAgents = 0;
+const driveWait = new Promise(resolve => { finishDrive = resolve; });
+disableOwner.register('agent', async () => { disabledAgents++; return {ok:true}; });
+const disableDrive = disableOwner.register('drive', async () => { await driveWait; return {ok:true,stopped:'agent-gate',repairRequests:[{requestId:'disabled-gate'}]}; });
+const disablePending = disableDrive(null,scope);
+disableOwner.setEnabled(scope,false); finishDrive();
+assert.equal((await disablePending).stopped,'agent-gate'); assert.equal(disabledAgents,0);
+const reading = owner(); let resolveRead; let readCount = 0;
+const sharedRead = new Promise(resolve => { resolveRead = resolve; });
+const readStatus = reading.register('status', async () => { readCount++; await sharedRead; return {ok:true}; });
+const reads = [readStatus(null,scope),readStatus(null,scope)]; resolveRead(); await Promise.all(reads); assert.equal(readCount,1);
 console.log('autopilot: check -> begin -> drive -> agent -> finish; cancel, failure and repeated-gate boundaries OK');
 
 if (failures > 0) {

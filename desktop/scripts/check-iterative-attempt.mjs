@@ -8,6 +8,7 @@ import {
   clearCancelRequest,
   readAttempt,
   readAttemptLogTail,
+  readRunLogTail,
   recordAttemptLog,
   requestCancel,
   resumeAttempt,
@@ -100,6 +101,9 @@ if (bigTail.length > 16 * 1024 + 2) throw new Error("UI tail must be capped to t
 // A NEW attempt clears the log (no cross-run leakage of a previous child).
 startAttempt(runB, "DemoApp", "roadmap", undefined, 1);
 if (readAttemptLogTail(runB) !== "") throw new Error("startAttempt must clear the previous log");
+
+if (!readRunLogTail(runB).includes('discovery line')) throw new Error('Cumulative log lost a previous attempt');
+if (!readFileSync(join(big, 'run.log'), 'utf8').includes(`payload ${"x".repeat(300)} 0\n`)) throw new Error('Trimming the UI tail discarded cumulative history');
 
 // 6. beginPlan: the pure plan keeps "no silent discovery" honest. Already-exists
 // and in-progress win over target-count logic; roadmap targets start; empty

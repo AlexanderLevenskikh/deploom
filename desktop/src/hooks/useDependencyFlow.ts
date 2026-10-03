@@ -655,9 +655,9 @@ export function useDependencyFlow() {
     if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
     return api.iterativeAgent({ workspaceId: selectedWorkspaceId, projectName, autopilot })
   }, [api, selectedWorkspaceId])
-  const iterativeAttemptRead = useCallback(async (projectName: string): Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }> => {
+  const iterativeAttemptRead = useCallback(async (projectName: string, includeRunLog?: boolean): Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; runLog?: string; error?: string }> => {
     if (!api) return { ok: false, present: false, error: 'NO_DESKTOP_API' }
-    return api.iterativeAttempt({ workspaceId: selectedWorkspaceId, projectName })
+    return api.iterativeAttempt({ workspaceId: selectedWorkspaceId, projectName, includeRunLog })
   }, [api, selectedWorkspaceId])
   const iterativeCancel = useCallback(async (projectName: string): Promise<{ ok: boolean }> => {
     if (!api) return { ok: false }

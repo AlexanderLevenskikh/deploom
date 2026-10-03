@@ -24,7 +24,10 @@ or that all proposed versions passed project verification.
 
 ## Autopilot
 
-Enable the checkbox before starting or continuing. Electron owns the sequence:
+Enable the checkbox before starting, while a manual step is running, or at a
+repair gate. The active operation is adopted without launching a duplicate.
+Disabling it lets the current step finish and stops automatic transitions.
+Electron owns the sequence:
 project check -> begin with the configured scope or discovery -> durable drive
 -> agent repair when requested -> durable drive again. The same underlying
 handlers, exact-request verifier, audit, checkpoint guards and budgets apply.

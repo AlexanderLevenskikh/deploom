@@ -56,7 +56,7 @@ type Props = {
   onIterativeDrive: (projectName: string, autopilot?: boolean) => Promise<IterativeDriveOutcome>
   onIterativeBegin: (projectName: string, discovery?: { autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
   onIterativeAgent: (projectName: string, autopilot?: boolean) => Promise<IterativeAgentOutcome>
-  onIterativeAttempt: (projectName: string) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
+  onIterativeAttempt: (projectName: string, includeRunLog?: boolean) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; runLog?: string; error?: string }>
   onIterativeCancel: (projectName: string) => Promise<{ ok: boolean }>
   liveIterativeAttempt?: IterativeAttemptView
   // Live log window (activity bubbles) for the current run, rendered below all
@@ -188,6 +188,8 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   }, [onListNodeVersions])
   const [agentModel, setAgentModel] = useState(details.workspace.agentModel ?? '')
   const [modelSuggestions, setModelSuggestions] = useState<string[]>([])
+  const [modelListError, setModelListError] = useState<string>()
+  const [modelListLoaded, setModelListLoaded] = useState(false)
 
   useEffect(() => {
     setBranchBase(configuredBranch)
@@ -205,7 +207,9 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   useEffect(() => {
     let cancelled = false
     setModelSuggestions([])
-    void onListAgentModels(details.workspace.agent, project.path).then((models) => { if (!cancelled) setModelSuggestions(models) })
+    setModelListError(undefined)
+    setModelListLoaded(false)
+    void onListAgentModels(details.workspace.agent, project.path).then((models) => { if (!cancelled) { setModelSuggestions(models); setModelListLoaded(true) } }).catch(error => { if (!cancelled) setModelListError(String(error)) })
     return () => { cancelled = true }
   }, [details.workspace.agent, project.path, onListAgentModels])
 
@@ -334,6 +338,14 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   }
 
 
+
+  const modelValidationError = modelListError || (details.workspace.agent === 'opencode' && agentModel.trim() && modelListLoaded && !modelSuggestions.includes(agentModel.trim()) ? text('Модель недоступна у выбранного провайдера. Выберите её из списка.', 'Model unavailable for the selected provider. Choose one from the list.') : undefined)
+  const validateAgentSelection = async () => {
+    if (details.workspace.agent !== 'opencode' || !agentModel.trim()) return
+    const available = await onListAgentModels(details.workspace.agent, project.path)
+    setModelSuggestions(available); setModelListLoaded(true)
+    if (!available.includes(agentModel.trim())) throw new Error(text(`Модель ${agentModel.trim()} недоступна. Выберите доступную модель выше.`, `Model ${agentModel.trim()} unavailable. Choose an available model above.`))
+  }
 
   const persistAgentModel = async (value = agentModel) => {
     const trimmed = value.trim()
@@ -579,7 +591,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         <div><span>{t('common.branch')}</span><div className="git-plan-control"><input aria-label={t('flow.updateBranch')} value={branchBase} onChange={(event) => setBranchBase(event.target.value)} onBlur={() => void persistGitSettings()} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }} placeholder="libs" /><label className="push-toggle" title={t('flow.pushTitle')}><input type="checkbox" checked={pushEnabled} onChange={(event) => void persistGitSettings(branchBase, event.target.checked)} />Push</label></div></div>
         <div><span>{t('flow.workspace')}</span><strong className={details.git.dirty ? 'warning-text' : 'success-text'}>{details.git.dirty ? t('flow.workspaceDirty', { count: details.git.summary.length }) : t('flow.workspaceClean')}</strong></div>
         <div><span>{t('flow.agent')}</span><QuickSelect value={details.workspace.agent} options={[{ value: 'codex', label: 'Codex' }, { value: 'opencode', label: 'OpenCode' }, { value: 'claude', label: 'Claude' }]} onChange={(value) => void onUpdateWorkspace({ id: details.workspace.id, agent: value as AgentProvider })} ariaLabel={t('flow.agent')} /></div>
-        <div><span>{t('flow.model')}</span><ModelPicker value={agentModel} options={modelSuggestions} onChange={setAgentModel} onCommit={value => persistAgentModel(value).catch(error => window.alert(error instanceof Error ? error.message : String(error)))} placeholder={t('flow.modelDefault')} ariaLabel={t('flow.modelAria')} title={t('flow.modelTitle')} /></div>
+        <div><span>{t('flow.model')}</span><ModelPicker value={agentModel} options={modelSuggestions} onChange={setAgentModel} onCommit={value => persistAgentModel(value).catch(error => window.alert(error instanceof Error ? error.message : String(error)))} placeholder={t('flow.modelDefault')} ariaLabel={t('flow.modelAria')} title={t('flow.modelTitle')} />{modelValidationError ? <span className="error-text" role="alert">{modelValidationError}</span> : null}</div>
         <div><span title={text('Явная версия Node.js проекта/CI. Пусто = среда не зафиксирована (host runtime, без гарантии совместимости с CI). Проверки и верификация будут выполняться установленным Node.', 'Explicit project/CI Node.js version. Empty = no fixed runtime (host ambient Node, no CI-compatibility claim). Verification and checks run on the installed Node.')}>{text('Node.js', 'Node.js')}</span><ModelPicker value={nodeVersionDraft} options={availableNodeVersions} onChange={setNodeVersionDraft} onCommit={value => persistNodeVersion(value).catch(error => window.alert(error instanceof Error ? error.message : String(error)))} placeholder={text('не задано', 'not set')} ariaLabel={text('Node.js для проекта/CI', 'Node.js for project/CI')} title={text('Node.js для проекта/CI', 'Node.js for project/CI')} />
           {project.nodeHints?.length ? <span className="node-hints" title={text('Закрепления Node в репозитории (engines.node / .nvmrc / .node-version). Подсказка: выбирать отсюда не обязательно — пустое значение означает среду хоста.', 'Node pins in this repository (engines.node / .nvmrc / .node-version). Suggestion only — leaving it empty keeps the host runtime.')}>{text('В репо закреплён Node', 'Repo pins Node')}: {project.nodeHints.join(', ')}</span> : null}
         </div>
@@ -604,7 +616,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         onAttempt={onIterativeAttempt}
         onCancel={onIterativeCancel}
         liveAttempt={liveIterativeAttempt}
-        onBeforeStart={async () => { await persistAgentModel(); await persistNodeVersion(nodeVersionDraft) }}
+        onBeforeStart={async () => { await validateAgentSelection(); await persistAgentModel(); await persistNodeVersion(nodeVersionDraft) }}
         onConfigureScope={() => void openBaselineIntentDialog('prepare', 'auto')}
         onOpenPath={onOpenPath}
         // P1#1: the panel mirrors the one main action to the hero and must not
@@ -629,7 +641,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
       </details>
       <details className="flow-technical-details flow-logs-details">
         <summary>{text('Логи запуска', 'Run logs')}</summary>
-        {currentScenario ? <IterativeRunDiagnostics signal={currentScenario} logs /> : null}
+        {currentScenario ? <IterativeRunDiagnostics signal={currentScenario} logs onReadLog={() => onIterativeAttempt(project.name, true)} onOpenLog={() => onOpenPath(`${currentScenario.runDir}/run.log`)} /> : null}
         {logs?.length || active ? <details className="flow-legacy-history" open={active ? true : undefined}>
           <summary>{active ? text('Журнал текущего FLOW / Draft', 'Current FLOW / Draft log') : text('Журнал прежнего FLOW / Draft (отдельный запуск)', 'Previous FLOW / Draft log (separate run)')}</summary>
           <LogPanel logs={logs ?? []} environment={{} as EnvironmentInfo} showEnvironment={false} showRunMonitor={active} active={active} activeJobId={activeRunId} activeAction={activeAction} runStartedAt={activeRunStartedAt} migrationProgress={details.migrationProgress} onSendAgentNote={onSendAgentNote} onCancel={onCancelJob ?? (async () => {})} onClear={onClearLogs ?? (() => {})} />
