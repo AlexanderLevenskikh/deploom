@@ -250,7 +250,7 @@ class IterativeEnginePrecheckTests(unittest.TestCase):
 
     def test_inconclusive_does_not_starve_next_cohort_or_learn_incompatibility(self) -> None:
         run_dir = self._run_dir()
-        config = _config_dict(targets={"pkg-a": "1.1.0", "pkg-b": "1.1.0"})
+        config = _config_dict(targets={"pkg-a": "1.1.0", "pkg-b": "1.1.0"}, cohortMaxPackages=1)
         save_config(run_dir, config)
         _plan_next_locked(run_dir, load_run(run_dir), config)
         candidate = load_candidate(run_dir)
