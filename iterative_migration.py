@@ -66,6 +66,7 @@ from baseline_constraint_verifier import (
     verify_assignment,
 )
 from baseline_repair_handoff import build_repair_request
+from migration_validation import digest as validation_digest, validate_profile, verify_initial_control, validate_baseline_reference
 from verification_proof import is_fixed_manifest_spec
 from iterative_target_deferrals import record_unavailable_targets, unavailable_targets
 from iterative_restart import TRANSACTION as RESTART_TRANSACTION, RestartArchiveError, archive_for_restart, recover_restart_archive
@@ -738,6 +739,10 @@ def verify_config_from(mapping: Mapping[str, Any], run_dir: Path) -> BaselineVer
     identity; the trial's resolved state is shared with the coordinator).
     """
     resolved = dict(mapping or {})
+    try:
+        validate_baseline_reference(resolved)
+    except ValueError as exc:
+        raise ProjectUnreadyError("TEST_BASELINE_UNAVAILABLE", str(exc)) from exc
     config = BaselineVerifyConfig.from_mapping(resolved)
     proof_cache_dir = str(
         (
@@ -913,10 +918,9 @@ def _begin_check_only_locked(
             "managedDependencies": len(initial_assignment),
         }
     )
-    result = verify_assignment(
-        project_dir,
-        initial_assignment,
-        config=verify_config,
+    result = verify_initial_control(
+        project_dir, initial_assignment, run_config=config, run_dir=run_dir,
+        verify_config=verify_config, verifier=verify_assignment,
         run_project_checks=True,
         progress_label="iterative migration project check",
         progress=lambda message: _emit_status({
@@ -961,6 +965,8 @@ def _begin_check_only_locked(
         "projectName": project_name,
         "checkedAt": _now_iso(),
         "ok": check_ok,
+        "validationProfileHash": validation_digest(config.get("validationProfile")) if config.get("validationProfile") else "",
+        "validationScope": config.get("validationScope"),
         "managedDependencies": len(initial_assignment),
         "manifestHash": manifest_hash,
         "control": {
@@ -1030,6 +1036,15 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
         verify_raw = json.loads(Path(args.verify_config).read_text(encoding="utf-8"))
         if not isinstance(verify_raw, dict):
             raise InvalidInputError("VERIFY_CONFIG_INVALID")
+
+    validation_profile = None
+    profile_path = getattr(args, "validation_profile", "")
+    if profile_path:
+        try:
+            validation_profile = validate_profile(json.loads(Path(profile_path).read_text(encoding="utf-8-sig")))
+        except (OSError, ValueError) as exc:
+            raise InvalidInputError(f"VALIDATION_PROFILE_INVALID: {exc}") from exc
+        verify_raw["commands"] = validation_profile["commands"]
 
     targets: Dict[str, str] = {}
     if args.targets_file:
@@ -1186,6 +1201,7 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
         "targetLevel": target_level,
         "targets": targets,
         "verifyConfig": verify_config,
+        "validationProfile": validation_profile,
         "policyHash": policy_hash,
         "budget": budget,
         "auditPolicy": audit_policy,
@@ -1302,15 +1318,17 @@ def _begin_locked(
         verify_config, verification_purpose="baseline-control"
     )
     _emit_status({"event": "begin.c0-verify", "runId": run_id})
-    result = verify_assignment(
-        project_dir,
-        initial_assignment,
-        config=verify_config,
+    result = verify_initial_control(
+        project_dir, initial_assignment, run_config=config, run_dir=run_dir,
+        verify_config=verify_config, verifier=verify_assignment,
         run_project_checks=True,
         progress_label="iterative migration C0 control verification",
         runtime_env=_runtime_env(config),
     )
 
+    if config.get("validationScope"):
+        save_config(run_dir, config)
+    verify_config = verify_config_from(config["verifyConfig"], run_dir)
     observed = dict(result.observed_resolved_versions or {})
     full_assignment = {
         name: observed.get(name, spec)
@@ -1339,6 +1357,7 @@ def _begin_locked(
             "status": "passed" if result.ok else ("failed" if result.hard_failure else "unknown"),
             "kind": result.kind,
             "commands": list(verify_config.commands),
+            "scope": config.get("validationScope") or {"mode": "selected-checks", "deferredChecks": (config.get("validationProfile") or {}).get("deferredChecks", "")},
             "failingCommands": [
                 {"command": failure.command, "exitCode": failure.exit_code}
                 for failure in result.project_failures
@@ -1456,8 +1475,9 @@ def _begin_adopted_locked(
         verify_config = dataclasses.replace(
             verify_config_from(config["verifyConfig"], run_dir), verification_purpose="baseline-control"
         )
-        result = verify_assignment(
-            control_project, full_assignment, config=verify_config,
+        result = verify_initial_control(
+            control_project, full_assignment, run_config=config, run_dir=run_dir,
+            verify_config=verify_config, verifier=verify_assignment,
             run_project_checks=True, runtime_env=_runtime_env(config),
             progress_label="adopt repaired source: fresh current-environment control",
         )
@@ -1469,6 +1489,9 @@ def _begin_adopted_locked(
             )
     finally:
         _force_remove_tree(control_root)
+    if config.get("validationScope"):
+        save_config(run_dir, config)
+    verify_config = verify_config_from(config["verifyConfig"], run_dir)
     status = "VERIFIED"
     checkpoint_id = "C0"
 
@@ -1494,6 +1517,7 @@ def _begin_adopted_locked(
             "status": "passed",
             "kind": result.kind,
             "commands": list(verify_config.commands),
+            "scope": config.get("validationScope") or {"mode": "selected-checks", "deferredChecks": (config.get("validationProfile") or {}).get("deferredChecks", "")},
             "failingCommands": [],
         },
         "proofRefs": {
@@ -3988,6 +4012,7 @@ def _accept_checkpoint(
             "status": "passed",
             "kind": result.kind,
             "commands": list((config.get("verifyConfig") or {}).get("commands") or ()),
+            "scope": config.get("validationScope") or {"mode": "selected-checks", "deferredChecks": (config.get("validationProfile") or {}).get("deferredChecks", "")},
             "failingCommands": [],
         },
         "proofRefs": {
@@ -4531,6 +4556,15 @@ def _build_migration_report(
         f"`{active_audit.get('vulnerabilityPackages')}`; evidence: `{active_audit.get('evidenceRef') or '-'}`."
     )
     lines.append("")
+    lines.append("## Проверки и ограничения покрытия")
+    lines.append("")
+    profile = config.get("validationProfile") or {}
+    scope = config.get("validationScope") or {}
+    lines.append(f"- Команды: `{profile.get('commands') or (config.get('verifyConfig') or {}).get('commands', [])}`.")
+    lines.append(f"- Отложенные проверки (не подтверждены): {profile.get('deferredChecks') or 'не указаны'}. ")
+    if scope.get("mode") == "test-nonregression":
+        lines.append(f"- Подтверждено отсутствие новых сбоев Vitest относительно исходного контроля, а не полностью зелёный проект. Исходно падающих тестов: `{scope.get('existingFailures')}`; baseline: `{scope.get('baselinePath')}`; hash: `{scope.get('baselineHash')}`. Актуальные результаты: `validation-evidence/comparison-*.json`.")
+    lines.append("")
     lines.append("## Checkpoints (по цепочке parent)")
     lines.append("")
     lines.append("| Checkpoint | Parent | Status | Changed packages | Audit |")
@@ -4913,6 +4947,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="начать миграцию С исправленных исходников завершённого ремонта (REPAIR_VERIFIED): C0 наследует проверенный снимок repair-handoff.json вместо повторного снятия с красного project-dir",
     )
     begin.add_argument("--targets-file", default="", help="JSON {package: exact version} policy targets")
+    begin.add_argument("--validation-profile", default="", help="Explicit migration validation profile JSON: commands, unitCommand, compareExistingFailures, deferredChecks")
     begin.add_argument("--verify-config", default="", help="BaselineVerifyConfig JSON file (commands, projectChecks, ...)")
     begin.add_argument("--tool-build-id", default="")
     begin.add_argument("--run-budget-minutes", type=int, default=None)

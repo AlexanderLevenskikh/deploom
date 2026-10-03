@@ -407,6 +407,8 @@ export type IterativeAttemptView = {
   cancelRequested?: boolean
 }
 export type IterativeStatusOutcome = {
+  validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string; suggestedUnitCommand?: string }
+  validationScope?: { mode?: string; existingFailures?: number; total?: number; skipped?: number }
   legacyPlanPresent?: boolean
   ok: boolean
   present: boolean
@@ -429,7 +431,7 @@ export type IterativeStatusOutcome = {
   // never creates/starts the migration — the UI shows "ready → Начать обновление".
   // `control` carries the structured conclusion (passed/failed/inconclusive) so
   // a failed control surfaces the repair agent, not a dead-end re-check.
-  checked?: { ok: boolean; checkedAt?: string; control?: { status?: string; kind?: string; summary?: string; failingCommands?: { command: string; exitCode: number }[] } }
+  checked?: { validationScope?: { mode?: string; existingFailures?: number; total?: number; skipped?: number }; ok: boolean; checkedAt?: string; control?: { status?: string; kind?: string; summary?: string; failingCommands?: { command: string; exitCode: number }[] } }
   error?: string
 }
 // #1: durable supervisor outcome. drive runs the Python steps in a loop and
@@ -494,7 +496,7 @@ export type IterativeBeginOutcome = {
   // the structured conclusion (status passed/failed/inconclusive + failing
   // project commands) when the check concluded — a failed control means the
   // repair-agent path, an inconclusive result means a retry.
-  checked?: { ok: boolean; checkedAt?: string; control?: { status?: string; kind?: string; summary?: string; failingCommands?: { command: string; exitCode: number }[] } }
+  checked?: { validationScope?: { mode?: string; existingFailures?: number; total?: number; skipped?: number }; ok: boolean; checkedAt?: string; control?: { status?: string; kind?: string; summary?: string; failingCommands?: { command: string; exitCode: number }[] } }
   // P2 (#1): this begin was the "--repair-only" repair of the current state
   // (independent of roadmap targets); it opened the repair run.
   repair?: boolean
@@ -528,7 +530,7 @@ export type DependencyFlowApi = {
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStatusOutcome>
   iterativeDrive: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeDriveOutcome>
-  iterativeBegin: (input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
+  iterativeBegin: (input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
   iterativeAgent: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeAgentOutcome>
   runAction: (input: ActionInput) => Promise<{ jobId: string; runId?: string; preview: string[] }>
   cancelJob: (jobId: string) => Promise<boolean>

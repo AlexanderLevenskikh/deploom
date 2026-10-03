@@ -546,10 +546,16 @@ def _build_ru(
     lines.append("")
     lines.append(table([
         ("Project checks", str(verification.get("status") or "unknown")),
-        ("Команды", "; ".join(commands) or "-"),
+        ("Команды", "; ".join((config.get("validationProfile") or {}).get("commands") or commands) or "-"),
         ("Аудит", str(audit.get("status") or "UNKNOWN")),
         ("Evidence аудита", str(audit.get("evidenceRef") or "-")),
     ]))
+    lines.append("")
+    profile = config.get("validationProfile") or {}
+    scope = config.get("validationScope") or {}
+    lines.append(f"Отложенные проверки (не подтверждены): {profile.get('deferredChecks') or 'не указаны'}.")
+    if scope.get("mode") == "test-nonregression":
+        lines.append(f"Подтверждён выбранный набор и отсутствие новых сбоев Vitest, а не полностью зелёный проект. Исходных сбоев: {scope.get('existingFailures')}/{scope.get('total')}. Baseline: `{scope.get('baselinePath')}`, hash: `{scope.get('baselineHash')}`. Команды выше служат для диагностики; обычный exit 1 не доказывает регрессию или её отсутствие. Итоговое сравнение выполняет авторитетный verifier через встроенный адаптер. Не исполняй внутренние deploom-vitest-v1 токены как shell-команды. Не изменяй baseline, не скрывай/пропускай тесты; актуальные comparison-*.json приложи к отчёту.")
     lines.append("")
     lines.append("## Правила работы для агента")
     lines.append("")
@@ -711,10 +717,16 @@ def _build_en(
     lines.append("")
     lines.append(table([
         ("Project checks", str(verification.get("status") or "unknown")),
-        ("Commands", "; ".join(commands) or "-"),
+        ("Commands", "; ".join((config.get("validationProfile") or {}).get("commands") or commands) or "-"),
         ("Audit", str(audit.get("status") or "UNKNOWN")),
         ("Audit evidence", str(audit.get("evidenceRef") or "-")),
     ]))
+    lines.append("")
+    profile = config.get("validationProfile") or {}
+    scope = config.get("validationScope") or {}
+    lines.append(f"Deferred checks (not verified): {profile.get('deferredChecks') or 'not specified'}.")
+    if scope.get("mode") == "test-nonregression":
+        lines.append(f"The selected checks and absence of new Vitest failures are confirmed, not an entirely green project. Initially failing: {scope.get('existingFailures')}/{scope.get('total')}. Baseline: `{scope.get('baselinePath')}`, hash: `{scope.get('baselineHash')}`. The commands above are diagnostic; a plain exit 1 proves neither regression nor its absence. The authoritative verifier performs the final comparison through the built-in adapter. Do not execute internal deploom-vitest-v1 tokens as shell commands. Never change the baseline or hide/skip tests; attach current comparison-*.json to the report.")
     lines.append("")
     lines.append("## Working rules for the agent")
     lines.append("")
@@ -816,6 +828,7 @@ def build_task_manifest(
         "verification": {
             "status": str((active.get("verification") or {}).get("status") or "unknown"),
             "commands": commands,
+            "scope": config.get("validationScope") or {"mode": "selected-checks", "deferredChecks": (config.get("validationProfile") or {}).get("deferredChecks", "")},
         },
         "audit": {
             "status": str((active.get("audit") or {}).get("status") or "UNKNOWN"),

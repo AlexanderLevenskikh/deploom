@@ -29,8 +29,9 @@ function Harness() {
   current.current = attempt
   const log = useRef('CURRENT_RUN_ONLY: source preparation started\n')
   const reads = useRef(0)
+  const scope = useRef<IterativeStatusOutcome['validationScope']>(undefined)
   const api = useRef({
-    status: async (): Promise<IterativeStatusOutcome> => ({ ok: true, present: false, stale: false, inFlight: current.current.status === 'running', attempt: current.current }),
+    status: async (): Promise<IterativeStatusOutcome> => ({ ok: true, present: false, stale: false, inFlight: current.current.status === 'running', attempt: current.current, validationScope: scope.current, validationProfile: { commands: ['npm run typecheck', 'npm run build', 'npm run test'], suggestedUnitCommand: 'npm run test -- --run src', deferredChecks: 'Playwright: requires a separate server' } }),
     attempt: async () => { reads.current++; return { ok: true, present: true, attempt: current.current, attemptLog: log.current } },
     cancel: async () => { setAttempt(value => ({ ...value, status: 'canceled', finishedAt: Date.now() })); return { ok: true } },
   })
@@ -59,6 +60,8 @@ function Harness() {
       <button onClick={() => mode('begin.discovery-progress')}>Discovery 12/30</button>
       <button onClick={() => mode('lifecycle: npm run test', 'failed')}>Fail</button>
       <button onClick={restart}>New attempt</button>
+      <button onClick={() => { scope.current = undefined; mode('begin.check-done', 'done') }}>Configure checks</button>
+      <button onClick={() => { scope.current = { mode: 'test-nonregression', existingFailures: 1, total: 2 }; mode('begin.check-done', 'done') }}>Known baseline</button>
       <button onClick={() => setLanguage('en')}>EN</button><button onClick={() => setLanguage('ru')}>RU</button>
     </div>
     <FlowWorkspace details={details} project={project} appVersion="QA" liveIterativeAttempt={attempt}

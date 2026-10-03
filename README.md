@@ -499,3 +499,5 @@ Project command output is project evidence, not DepLoom infrastructure authority
 Durable ProjectProof reuse for arbitrary shell commands is disabled until the command's external tool closure is explicitly declared and identity-bound. Production toolBuildId is computed from proof-semantic code and cannot be replaced by DEPLOOM_TOOL_BUILD_ID.
 
 Release publication is gated on exact-release-SHA Windows physical acceptance. npm and Yarn Classic remain the supported package managers; Yarn Berry and pnpm remain typed unsupported. Windows NTFS is the proof-grade physical substrate. ReFS has no independent Lambda acceptance claim. macOS and Linux do not claim proof-grade descendant-tree supervision.
+
+Migration check selection and optional Vitest nonregression control: [validation profiles](docs/MIGRATION_VALIDATION.md).

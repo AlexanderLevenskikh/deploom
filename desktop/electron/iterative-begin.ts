@@ -20,6 +20,7 @@ export type IterativeBeginOptions = {
   workspaceId?: string
   projectId?: string
   toolBuildId?: string
+  validationProfileFile?: string
   targetsFile?: string
   // R8: the independent audit runs with the user's ACTUAL package lag policy.
   // dashboardStatePath points at the workspace dashboard-state.json (the same
@@ -112,6 +113,7 @@ export function iterativeBeginInvocation(
   const args = [scriptPath, '--run-dir', runDir, 'begin', '--project-dir', options.projectDir]
   if (options.projectName) args.push('--project-name', options.projectName)
   args.push('--target-level', options.targetLevel)
+  if (options.validationProfileFile) args.push('--validation-profile', options.validationProfileFile)
   if (options.targetsFile) args.push('--targets-file', options.targetsFile)
   if (options.dashboardStatePath) args.push('--dashboard-state', options.dashboardStatePath)
   const auditPolicy = options.auditPolicy

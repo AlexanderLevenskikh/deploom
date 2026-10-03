@@ -55,6 +55,7 @@ import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStream
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
+import { migrationProfilePath, readMigrationProfile, readMigrationScope, saveMigrationProfile } from './migration-validation.js'
 import { hasSavedProjectPlan, iterativeBeginInvocation, iterativeCheckTimeoutFailure, targetsFromDashboardState } from './iterative-begin.js'
 import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
@@ -7385,7 +7386,7 @@ function setupIpc(): void {
   // failing project commands) BEFORE exiting — even a non-zero exit leaves a
   // real verdict here, so a failed/inconclusive check is NEVER a bare
   // "check failed" without a cause.
-  function readProjectCheckArtifact(runDir: string): { ok: boolean; checkedAt?: string; control?: { status?: string; kind?: string; summary?: string; failingCommands?: { command: string; exitCode: number }[] } } | undefined {
+  function readProjectCheckArtifact(runDir: string): { validationScope?: { mode?: string; existingFailures?: number; total?: number; skipped?: number }; ok: boolean; checkedAt?: string; control?: { status?: string; kind?: string; summary?: string; failingCommands?: { command: string; exitCode: number }[] } } | undefined {
     const checkPath = join(runDir, 'project-check.json')
     if (!existsSync(checkPath)) return undefined
     try {
@@ -7394,6 +7395,7 @@ function setupIpc(): void {
         const control = parsed.control as Record<string, any> | undefined
         return {
           ok: parsed.ok === true,
+          validationScope: parsed.validationScope,
           checkedAt: typeof parsed.checkedAt === 'string' ? parsed.checkedAt : undefined,
           control: control && typeof control === 'object'
             ? {
@@ -7746,6 +7748,8 @@ function setupIpc(): void {
       // exists). Lets the panel show a distinct "ready → Начать обновление"
       // state after a real check instead of conflating check with start.
       checked: readProjectCheckArtifact(runDir),
+      validationProfile: readMigrationProfile(runDir, project.path),
+      validationScope: readMigrationScope(runDir),
       legacyPlanPresent: hasSavedProjectPlan(artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json'), project.name),
       requestedNode,
       runtime: runtimeView,
@@ -7755,7 +7759,7 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('flow:iterative:begin', async (_event, input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
+  ipcMain.handle('flow:iterative:begin', async (_event, input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -7783,6 +7787,13 @@ function setupIpc(): void {
     // the CURRENT dependencies happen, and a durable non-run verdict is recorded.
     // No run.json / snapshot / checkpoint and NO discovery ever start here, so
     // "Начать обновление" stays a separate, fresh begin.
+    if (input.validationProfile) {
+      const key = stepLockKey(workspace.id, project.name)
+      if (iterativeStepInFlight.has(key)) return { ok: false, step: 'begin', error: 'STEP_IN_PROGRESS' }
+      if (existsSync(join(runDir, 'run.json'))) return { ok: false, step: 'begin', error: 'VALIDATION_PROFILE_LOCKED_FOR_RUN' }
+      try { saveMigrationProfile(runDir, input.validationProfile) }
+      catch (error) { return { ok: false, step: 'begin', error: error instanceof Error ? error.message : String(error) } }
+    }
     if (input.checkOnly === true) {
       if (iterativeStepInFlight.has(stepLockKey(workspace.id, project.name))) {
         return { ok: false, step: 'check', error: 'STEP_IN_PROGRESS' }
@@ -7808,6 +7819,7 @@ function setupIpc(): void {
           toolBuildId: app.getVersion(),
           requestedNode: project.nodeVersion || undefined,
         }
+        Object.assign(options, { validationProfileFile: existsSync(migrationProfilePath(runDir)) ? migrationProfilePath(runDir) : undefined })
         const invocation = iterativeBeginInvocation(runDir, options, generator, python)
         invocation.args.push('--check-only')
         const beginIo = iterativeStreamIo(runDir)
@@ -7925,6 +7937,7 @@ function setupIpc(): void {
           toolBuildId: app.getVersion(),
           requestedNode: project.nodeVersion || undefined,
         }
+        Object.assign(options, { validationProfileFile: existsSync(migrationProfilePath(runDir)) ? migrationProfilePath(runDir) : undefined })
         const invocation = iterativeBeginInvocation(runDir, options, generator, python)
         invocation.args.push('--repair-only')
         const repairIo = iterativeStreamIo(runDir)
@@ -8084,6 +8097,7 @@ function setupIpc(): void {
       if (auditPolicy.lagPolicyMonths === undefined && auditPolicy.minLagOkPct === undefined && auditPolicy.maxKnownHigh === undefined) {
         delete (options as { auditPolicy?: object }).auditPolicy
       }
+      Object.assign(options, { validationProfileFile: existsSync(migrationProfilePath(runDir)) ? migrationProfilePath(runDir) : undefined })
       const invocation = iterativeBeginInvocation(runDir, options, generator, python)
       if (discovery) {
         invocation.args.push('--discover-parallelism', String(discovery.parallelism))

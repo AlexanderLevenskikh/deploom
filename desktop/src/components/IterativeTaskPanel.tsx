@@ -2,6 +2,8 @@ import { Check, ChevronDown, ChevronUp, Clipboard, ExternalLink, FileText, Refre
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 
 import { useLanguage } from '../i18n'
+import { MigrationChecksPanel } from './MigrationChecksPanel'
+import { validateMigrationProfile, validationProfilesEqual, type MigrationValidationProfile } from '../../electron/migration-validation-profile'
 import { canApplyAttemptRead, iterativeActivity } from '../../electron/iterative-activity'
 import { startAttemptJournalPolling } from '../../electron/iterative-journal-poll'
 import { deriveMainAction, parseIterativeFailure, scenarioPipeline, PIPELINE_STAGES, type ScenarioMainActionState, type ScenarioSignal } from '../../electron/iterative-scenario'
@@ -19,7 +21,7 @@ type Props = {
   onSave: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
   onDrive: (projectName: string) => Promise<IterativeDriveOutcome>
-  onBegin: (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
+  onBegin: (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
   onAgent: (projectName: string) => Promise<IterativeAgentOutcome>
   onAttempt: (projectName: string) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
   onCancel: (projectName: string) => Promise<{ ok: boolean }>
@@ -116,6 +118,8 @@ const activityText = (attempt?: IterativeAttemptView, text?: (ru: string, en: st
 export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVersion, onGet, onExport, onCopy, onSave, onStatus, onDrive, onBegin, onExportLegacy, onAgent, onAttempt, onCancel, liveAttempt, onConfigureScope, onOpenPath, onScenario, disabledExternal }: Props) {
   const { text, language } = useLanguage()
   const [state, setState] = useState<PanelState>({ phase: 'loading' })
+  const [validationDraft, setValidationDraft] = useState<MigrationValidationProfile>()
+  useEffect(() => setValidationDraft(undefined), [workspaceId, projectName])
   const [busy, setBusy] = useState<string>()
   const [copied, setCopied] = useState(false)
   const [note, setNote] = useState<string>()
@@ -367,13 +371,15 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     }
   }
 
-  const beginNow = async (discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
+  const beginNow = async (discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
     setStepBusy(true)
     setNote(undefined)
     // P2#5: a fresh attempt supersedes the previous "no targets" explanation.
     setNoTargetsStep(false)
     try {
-      const outcome = await onBegin(projectName, discovery)
+      const profile = validationDraft ?? runner?.validationProfile
+      const validationProfile = runner?.present && !discovery?.restart ? undefined : profile && { ...profile, commands: profile.commands.map(c => c.trim()).filter(Boolean) }
+      const outcome = await onBegin(projectName, { mode: discovery?.mode ?? 'none', ...discovery, validationProfile })
       if (outcome.ok) {
         if (outcome.checked) {
           // P1#4: standalone "Проверить проект" — nothing was started. Show the
@@ -525,13 +531,14 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
 
   // Machine-readable blocker (e.g. uninitialized submodule) surfaced ONCE.
   const blocker = parseIterativeFailure(attempt?.lastError) ?? parseIterativeFailure(attempt?.reason)
+  const validationChanged = !runner?.present && validationDraft !== undefined && !validationProfilesEqual(validationDraft, runner?.validationProfile)
   const mainAction = deriveMainAction({
     inFlight: childAlive,
-    attempt,
+    attempt: validationChanged ? undefined : attempt,
     runner,
     taskPresent: Boolean(task),
-    noTargets: noTargetsStep,
-    checked: runner?.checked?.ok === true,
+    noTargets: validationChanged ? false : noTargetsStep,
+    checked: !validationChanged && runner?.checked?.ok === true,
   })
   const retryIsDiscoverySearch = blocker?.code === 'DISCOVERY_UNSETTLED'
   const mainLabel = mainAction.state === 'retry-check' && retryIsDiscoverySearch
@@ -642,7 +649,17 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     }
   }
 
-  const busyLocked = stepBusy || busy !== undefined || disabledExternal === true || state.phase === 'loading' || (runner === undefined && !runnerError)
+  let validationError: string | undefined
+  const selectedProfile = validationDraft ?? runner?.validationProfile
+  if (!runner?.present && selectedProfile) {
+    try { validateMigrationProfile({ ...selectedProfile, commands: selectedProfile.commands.map(c => c.trim()).filter(Boolean) }) }
+    catch (error) {
+      validationError = error instanceof Error && error.message === 'VITEST_COMMAND_MUST_BE_A_SINGLE_SELECTED_COMMAND'
+        ? text('Укажите одну команду Vitest из обязательного списка, без цепочек команд и собственных аргументов JSON-отчёта.', 'Choose a single Vitest command from the required list, without command chains or custom JSON-report arguments.')
+        : text('Укажите от 1 до 20 обязательных команд и корректное описание отложенных проверок.', 'Select 1–20 required commands and a valid description of deferred checks.')
+    }
+  }
+  const busyLocked = Boolean(validationError) || stepBusy || busy !== undefined || disabledExternal === true || state.phase === 'loading' || (runner === undefined && !runnerError)
 
   // P1#1: the panel is the SINGLE owner of the scenario main action. Mirror it
   // outward so the enclosing workspace hero renders exactly the same control
@@ -712,6 +729,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         )
       })()}
 
+      <MigrationChecksPanel key={`${workspaceId}:${projectName}`} profile={validationDraft ? { ...runner?.validationProfile, ...validationDraft } : runner?.validationProfile} locked={Boolean(runner?.present || childAlive || stepBusy || disabledExternal)} scope={validationChanged ? undefined : runner?.validationScope ?? runner?.checked?.validationScope} onChange={setValidationDraft} />
+
       {/* L1: durable attempt strip — visible from the very first click, after a
           restart, and during a long check/discovery/cohort. User-facing wording;
           raw status/stage/steps live in the diagnostics below. */}
@@ -759,6 +778,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         </div>
       ) : null}
 
+      {validationError ? <div className="resume-notice warning" role="alert">{validationError}</div> : null}
       {note ? <div className="resume-notice"><span>{note}</span></div> : null}
 
       {/* Single error surface: a short reason + next step up front, the full
@@ -808,7 +828,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
                 data-testid="iterative-main-action"
                 // P1#2: Stop must stay AVAILABLE while work is running — the
                 // busy lock disables everything EXCEPT the in-flight Stop.
-                disabled={mainAction.state === 'running' ? false : busyLocked}
+                disabled={mainAction.state === 'running' ? false : busyLocked || Boolean(validationError)}
                 onClick={() => void runMainAction()}
               >
                 {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' || mainAction.state === 'repair-current' ? <Wrench size={16} /> : mainAction.state === 'result' || mainAction.state === 'partial' || mainAction.state === 'budget-stop' || mainAction.state === 'blocked' || mainAction.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}

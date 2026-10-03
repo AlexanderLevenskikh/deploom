@@ -699,6 +699,10 @@ def _command_prefix(executable: str, args: Sequence[str]) -> Tuple[List[str], bo
 
 def project_check_command_argv(command: str, environment: Optional[Mapping[str, str]] = None) -> List[str]:
     """Run configured shell commands identically in control and iterative checks."""
+    from migration_validation import internal_command_argv
+    internal = internal_command_argv(command)
+    if internal is not None:
+        return internal
     if os.name == "nt":
         return [(environment if environment is not None else os.environ).get("COMSPEC") or "cmd.exe", "/d", "/s", "/c", command]
     return ["/bin/sh", "-c", command]
@@ -4246,7 +4250,9 @@ def verify_assignment(
                             workspace=str(command_project),
                         )
 
-                    _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} started: {command}")
+                    from migration_validation import display_validation_command
+                    command_label = display_validation_command(command)
+                    _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} started: {command_label}")
                     check_started = time.monotonic()
                     event(
                         "verify.project-check.start",
@@ -4267,8 +4273,8 @@ def verify_assignment(
                                 progress_label=progress_label,
                             ),
                             base_env=base_env,
-                            progress=phase_progress(f"project-check:{command}"),
-                            progress_label=command,
+                            progress=phase_progress(f"project-check:{command_label}"),
+                            progress_label=command_label,
                             progress_interval_seconds=config.progress_interval_seconds,
                         )
                         project_publication_allowed = bool(
@@ -4439,9 +4445,15 @@ def verify_assignment(
                         quiescenceMs=int(getattr(getattr(check_result, "supervision", None), "quiescence_ms", 0) or 0),
                     )
                     if check_result.returncode == 0:
-                        _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} PASS: {command}")
+                        _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} PASS: {command_label}")
                         continue
                     tail = "\n".join((check_result.stdout or "").splitlines()[-80:])
+                    # Only our direct, trusted adapter reserves exit 2 for
+                    # unavailable evidence. Arbitrary project output cannot
+                    # grant infrastructure authority or teach incompatibility.
+                    from migration_validation import internal_command_argv
+                    if internal_command_argv(command) is not None and check_result.returncode == 2:
+                        return BaselineVerifyResult(False, "infrastructure", "TEST_EVIDENCE_UNAVAILABLE: " + (tail.splitlines()[-1] if tail else "adapter returned exit 2"), command=command, output=tail)
                     # Arbitrary project output is not infrastructure authority.
                     # Launch, timeout, watcher and supervision failures are already
                     # represented by typed exceptions above.
@@ -4452,7 +4464,7 @@ def verify_assignment(
                         kind="project",
                     )
                     project_failures.append(BaselineProjectFailure(command, check_result.returncode, tail))
-                    _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} RED exit={check_result.returncode}: {command}")
+                    _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} RED exit={check_result.returncode}: {command_label}")
                 finally:
                     workspace_changes = workspace_guard.stop() if workspace_guard is not None else None
 

@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,6 +8,30 @@ import {
   targetsFromDashboardRows,
   targetsFromDashboardState,
 } from "../dist-electron/iterative-begin.js";
+
+import { readMigrationProfile, saveMigrationProfile, validateMigrationProfile, migrationProfilePath } from '../dist-electron/migration-validation.js';
+import assert from 'node:assert/strict';
+
+const profileRoot = mkdtempSync(join(tmpdir(), 'deploom-validation-profile-'));
+const profileRun = join(profileRoot, 'run');
+writeFileSync(join(profileRoot, 'package.json'), JSON.stringify({ scripts: { typecheck: 'tsc', build: 'vite build', test: 'vitest', 'test:playwright:ci': 'playwright test' } }));
+const defaultProfile = readMigrationProfile(profileRun, profileRoot);
+assert.deepEqual(defaultProfile.commands, ['npm run typecheck', 'npm run build', 'npm run test']);
+assert.equal(defaultProfile.suggestedUnitCommand, 'npm run test -- --run src');
+assert.match(defaultProfile.deferredChecks, /playwright/);
+assert.equal(defaultProfile.compareExistingFailures, false);
+const selectedProfile = { commands: ['npm run build', 'npm run test -- --run src'], unitCommand: 'npm run test -- --run src', compareExistingFailures: true, deferredChecks: 'E2E need a server' };
+saveMigrationProfile(profileRun, selectedProfile);
+assert.deepEqual(JSON.parse(readFileSync(migrationProfilePath(profileRun), 'utf8')), selectedProfile);
+assert.deepEqual(readMigrationProfile(profileRun, profileRoot).commands, selectedProfile.commands);
+assert.throws(() => validateMigrationProfile({ commands: [] }), /COMMANDS_REQUIRED/);
+assert.throws(() => validateMigrationProfile({ ...selectedProfile, unitCommand: 'npm run build && npm test' }), /SINGLE_SELECTED/);
+writeFileSync(join(profileRun, 'run.json'), '{}');
+writeFileSync(join(profileRun, 'run-config.json'), JSON.stringify({ validationProfile: selectedProfile }));
+saveMigrationProfile(profileRun, { commands: ['npm run typecheck'] });
+assert.deepEqual(readMigrationProfile(profileRun, profileRoot).commands, selectedProfile.commands, 'an active run uses the pinned profile');
+const profileInvocation = iterativeBeginInvocation(profileRun, { projectDir: profileRoot, projectName: 'demo', targetLevel: 'yellow', validationProfileFile: migrationProfilePath(profileRun) }, 'iterative_migration.py');
+assert.equal(profileInvocation.args[profileInvocation.args.indexOf('--validation-profile') + 1], migrationProfilePath(profileRun));
 
 const timeoutEnvelope = iterativeCheckTimeoutFailure('source-materialization: hashing files=12000');
 const timeout = JSON.parse(timeoutEnvelope.slice('ITERATIVE_MIGRATION_FAILURE_V1 '.length));

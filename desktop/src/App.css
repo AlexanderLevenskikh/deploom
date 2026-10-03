@@ -1001,6 +1001,12 @@ textarea::placeholder {
 .flow-logs-details .log-panel .run-monitor { max-height: none; }
 .flow-logs-details .log-panel .activity-log, .flow-logs-details .log-panel .terminal { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 .flow-artifact-note { margin: 0 0 8px; padding: 8px 10px; border-radius: 6px; background: var(--surface); color: var(--text-muted); font-size: 10px; line-height: 1.45; }
+.migration-checks { font-size: 12px; }
+.migration-checks summary { cursor: pointer; line-height: 1.6; }
+.migration-checks label { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.migration-checks label:has(input[type="checkbox"]) { flex-direction: row; align-items: center; }
+.migration-checks textarea, .migration-checks input:not([type="checkbox"]) { width: 100%; box-sizing: border-box; }
+.migration-checks p { line-height: 1.5; }
 .baseline-critical-fixed { display: inline-grid; grid-template-columns: auto auto auto; align-items: center; gap: 6px; min-height: 30px; padding: 0 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); }
 .baseline-critical-fixed span, .baseline-critical-fixed small { color: var(--text-muted); font-size: 10px; }
 .baseline-critical-fixed strong { color: var(--green); font-size: 13px; }

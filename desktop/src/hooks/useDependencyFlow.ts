@@ -647,9 +647,9 @@ export function useDependencyFlow() {
     if (!api) return { ok: false, steps: [], stopped: 'error', error: 'NO_DESKTOP_API' }
     return api.iterativeDrive({ workspaceId: selectedWorkspaceId, projectName })
   }, [api, selectedWorkspaceId])
-  const iterativeBegin = useCallback(async (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; checkOnly?: boolean; repair?: boolean; restart?: boolean }): Promise<IterativeBeginOutcome> => {
+  const iterativeBegin = useCallback(async (projectName: string, discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }): Promise<IterativeBeginOutcome> => {
     if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
-    return api.iterativeBegin({ workspaceId: selectedWorkspaceId, projectName, discovery, checkOnly: discovery?.checkOnly, repair: discovery?.repair, restart: discovery?.restart })
+    return api.iterativeBegin({ workspaceId: selectedWorkspaceId, projectName, discovery, validationProfile: discovery?.validationProfile, checkOnly: discovery?.checkOnly, repair: discovery?.repair, restart: discovery?.restart })
   }, [api, selectedWorkspaceId])
   const iterativeAgent = useCallback(async (projectName: string): Promise<IterativeAgentOutcome> => {
     if (!api) return { ok: false, error: 'NO_DESKTOP_API' }

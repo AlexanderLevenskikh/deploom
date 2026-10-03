@@ -27,6 +27,7 @@ These instructions apply to this repository. Follow the user's task scope and pr
 
 ## Correctness contracts
 
+- Explicit migration validation profiles define the selected checks. `validationScope.mode=test-nonregression` proves no new Vitest failures against a hash-bound initial control; it is not a fully green project. Preserve per-case coverage, fail closed on missing/collection/runtime evidence, and expose old failures and deferred checks. Never reset the baseline after a cohort or use comparison to claim a repair fixed existing failures. See `docs/MIGRATION_VALIDATION.md`.
 - Draft is a proposal. Resolver success, a sealed source snapshot, a search incumbent and project-green verification are different states. An exit code of zero or a mode named `green` does not prove the project checks passed.
 - Preserve the last verified cumulative checkpoint. An accepted cohort builds on verified cumulative state; deferred work remains visible in the health denominator and remaining work.
 - Infrastructure failures, unavailable evidence, timeout and solver UNKNOWN must not become false incompatibility constraints or zero vulnerabilities. Never weaken existing checks, hooks or acceptance thresholds to manufacture green.
