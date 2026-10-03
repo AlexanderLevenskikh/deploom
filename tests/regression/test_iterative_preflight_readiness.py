@@ -302,6 +302,7 @@ class IterativePreflightReadinessTests(unittest.TestCase):
                         observed_resolved_versions={}, resolved_state_key="",
                         observed_resolved_hash=None, preparation_proof_key="",
                         kind=kind, summary=f"{kind} outcome: no definitive verdict",
+                        command="npm test", output="captured diagnostics",
                     )
                 with mock.patch.object(iterative_migration, "verify_assignment", side_effect=inconclusive_result):
                     with self.assertRaises(ProjectUnreadyError) as ctx:
@@ -310,6 +311,9 @@ class IterativePreflightReadinessTests(unittest.TestCase):
                 check = json.loads((run_dir / "project-check.json").read_text(encoding="utf-8"))
                 self.assertFalse(check["ok"])
                 self.assertEqual(check["control"]["kind"], kind)
+                self.assertEqual("npm test", check["control"]["command"])
+                self.assertEqual("captured diagnostics", check["control"]["output"])
+                self.assertEqual("npm test", ctx.exception.command)
 
     def test_preflight_blocks_uninitialized_submodule_before_discovery(self) -> None:
         if shutil.which("git") is None:

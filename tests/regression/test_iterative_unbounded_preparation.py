@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from baseline_constraint_verifier import _clamped_phase_seconds
+from baseline_constraint_verifier import BaselineVerifyConfig, BaselineCandidateBudgetExceeded, _clamped_phase_seconds, project_check_timeout, project_verification_environment
 from iterative_migration import _deadline_iso, run_budget_ok, verify_config_from
 from source_snapshot import build_source_tree_manifest, capture_source_snapshot, materialize_source_for_verification
 from verification_process_supervisor import run_supervised
@@ -22,10 +22,45 @@ class UnboundedPreparationTests(unittest.TestCase):
         config = verify_config_from({'timeoutSeconds': 90}, Path('run'))
         self.assertTrue(config.unbounded_preparation)
         self.assertEqual(90, config.timeout_seconds)
+        self.assertEqual(0, config.project_check_timeout_seconds)
         self.assertEqual(90, _clamped_phase_seconds(attempt_remaining_seconds=float('inf'),
             budget_remaining_seconds=None, timeout_seconds=90, attempt_timeout_seconds=3600, progress_label='test'))
         self.assertEqual(5, _clamped_phase_seconds(attempt_remaining_seconds=float('inf'),
             budget_remaining_seconds=5, timeout_seconds=90, attempt_timeout_seconds=3600, progress_label='test'))
+
+    def test_project_checks_wait_but_explicit_limits_and_search_budgets_bind(self):
+        config = verify_config_from({}, Path('run'))
+        def limit(config, attempt=float('inf'), budget=None):
+            return project_check_timeout(config, attempt_remaining_seconds=attempt,
+                budget_remaining_seconds=budget, progress_label='test')
+        self.assertEqual(0, limit(config))
+        self.assertEqual(600, limit(BaselineVerifyConfig()))
+        self.assertEqual(5, limit(config, budget=5))
+        self.assertEqual(7, limit(config, attempt=7))
+        with self.assertRaises(BaselineCandidateBudgetExceeded):
+            limit(config, budget=-1)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            limit(config, attempt=-1)
+        explicit = verify_config_from({'projectCheckTimeoutSeconds': 17}, Path('run'))
+        self.assertEqual(17, limit(explicit))
+        self.assertEqual(3, limit(explicit, budget=3))
+
+    def test_check_environment_is_noninteractive_and_proof_identity_covers_it(self):
+        from verification_proof import environment_snapshot_fingerprint
+        with mock.patch.dict('os.environ', {'CI': 'false'}):
+            environment = project_verification_environment({'CI': 'false', 'NODE_ENV': 'test'})
+            self.assertEqual('1', environment['CI'])
+            self.assertEqual('test', environment['NODE_ENV'])
+            self.assertNotEqual(environment_snapshot_fingerprint(environment),
+                environment_snapshot_fingerprint({**environment, 'CI': 'false'}))
+            with tempfile.TemporaryDirectory() as raw:
+                result = run_supervised([sys.executable, '-c',
+                    'import os, time; assert os.environ["CI"] == "1"; time.sleep(1.2); print("completed")'],
+                    Path(raw), timeout_seconds=project_check_timeout(
+                        verify_config_from({}, Path('run')), attempt_remaining_seconds=float('inf'),
+                        budget_remaining_seconds=None, progress_label='test'), base_env=environment)
+                self.assertEqual(0, result.returncode)
+                self.assertIn('completed', result.stdout)
 
     def test_unbounded_hash_survives_elapsed_time_that_exhausts_bounded_hash(self):
         from source_snapshot import SourceCaptureError

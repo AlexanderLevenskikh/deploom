@@ -451,6 +451,20 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 )
             self.assertEqual("infrastructure", result.kind)
             self.assertIn("project check launch failed", result.summary)
+            timeout = subprocess.TimeoutExpired('npm run check', 1, output=b'test output before timeout')
+            with patch("baseline_constraint_verifier.resolve_executable", return_value="npm"), \
+                    patch("baseline_constraint_verifier._run", side_effect=[
+                        CompletedProcess(["npm", "install"], 0, stdout="resolver ok"),
+                        CompletedProcess(["npm", "install"], 0, stdout="lifecycle ok"), timeout,
+                    ]):
+                result = verify_assignment(root, {"demo": "2.0.0"},
+                    config=BaselineVerifyConfig(project_checks="diagnostic", commands=("npm run check",)),
+                    run_project_checks=True)
+            self.assertFalse(result.ok)
+            self.assertEqual("infrastructure", result.kind)
+            self.assertIn("PROJECT_CHECK_COMMAND_TIMEOUT", result.summary)
+            self.assertEqual("npm run check", result.command)
+            self.assertEqual("test output before timeout", result.output)
     def test_module_resolution_structural_signature_is_independent_from_unrelated_baseline_type_error(self) -> None:
         candidate = BaselineVerifyResult(
             False, "project", "project preflight failed: yarn lint:types", command="yarn lint:types",
@@ -616,7 +630,7 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 registry="",
                 project_checks="off",
                 commands=(),
-                environment=dict(os.environ),
+                environment={**os.environ, "CI": "1"},
             )
             observed_hash = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
             state = capture_resolved_dependency_state(
@@ -688,7 +702,7 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 registry="",
                 project_checks="adaptive",
                 commands=("npm run typecheck",),
-                environment=dict(os.environ),
+                environment={**os.environ, "CI": "1"},
             )
             observed_hash = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
             state = capture_resolved_dependency_state(
@@ -760,7 +774,7 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                 registry="",
                 project_checks="off",
                 commands=(),
-                environment=dict(os.environ),
+                environment={**os.environ, "CI": "1"},
             )
             observed_hash = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
             state = capture_resolved_dependency_state(

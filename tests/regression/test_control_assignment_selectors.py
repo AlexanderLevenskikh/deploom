@@ -115,7 +115,7 @@ class RealNpmControlSelectorTests(unittest.TestCase):
                         'packages': {'': {'name': 'control-fixture', 'devDependencies': {'control-demo': '^1.55.0'}},
                                      'node_modules/control-demo': {'version': '1.59.1', 'resolved': f'{url}/control-demo/-/1.59.1.tgz', 'dev': True}}}
                 (root / 'package-lock.json').write_text(json.dumps(lock))
-                (root / 'check.cjs').write_text("require('node:assert/strict').equal(require('control-demo/package.json').version, '1.59.1');\n")
+                (root / 'check.cjs').write_text("require('node:assert/strict').equal(process.env.CI, '1'); require('node:assert/strict').equal(require('control-demo/package.json').version, '1.59.1');\n")
                 (root / 'mutate.cjs').write_text("const fs=require('node:fs'); const p='node_modules/control-demo/package.json'; const v=JSON.parse(fs.readFileSync(p)); v.version='1.59.2'; fs.writeFileSync(p,JSON.stringify(v));\n")
                 def git(*args):
                     subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True)

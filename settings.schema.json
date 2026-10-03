@@ -1024,6 +1024,11 @@
           "maximum": 3600,
           "default": 600
         },
+        "projectCheckTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Per project-check command limit in seconds. Zero waits until completion or cancellation, while explicit search/attempt budgets remain effective. Iterative migration defaults to zero; other callers inherit timeoutSeconds when omitted."
+        },
         "attemptTimeoutSeconds": {
           "type": "integer",
           "minimum": 60,

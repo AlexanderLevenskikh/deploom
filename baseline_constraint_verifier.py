@@ -35,6 +35,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, 
 
 from verification_proof import (
     VerificationProofIdentity,
+    project_verification_environment,
     VerificationProofStore,
     bind_resolved_state_identity,
     build_verification_proof_identity,
@@ -149,6 +150,8 @@ class BaselineVerifyConfig:
     max_iterations: int = 8
     max_delta_checks: int = 24
     timeout_seconds: int = 600
+    # None inherits the legacy phase cap; 0 waits until completion/cancel.
+    project_check_timeout_seconds: Optional[int] = None
     attempt_timeout_seconds: int = 3600
     localization_timeout_seconds: int = 7200
     progress_interval_seconds: int = 15
@@ -164,8 +167,9 @@ class BaselineVerifyConfig:
     # Neighboring-assignment seeding is experimental and default-off.
     enable_neighbor_resolver_seed: bool = False
     snapshot_copy_timeout_seconds: int = 1800
-    # Interactive preparation may wait until completion/cancel; command and
-    # explicit search budgets remain bounded. This grants no proof authority.
+    # Interactive preparation may wait until completion/cancel. Resolver and
+    # lifecycle commands retain phase caps; project checks have their own policy.
+    # Explicit search budgets still bind. This grants no proof authority.
     unbounded_preparation: bool = False
     project_checks: str = "adaptive"  # off | diagnostic | adaptive | strict
     commands: Tuple[str, ...] = ()
@@ -223,6 +227,11 @@ class BaselineVerifyConfig:
             max_iterations=max(1, min(_as_int(raw.get("maxIterations", raw.get("max_iterations")), 8), 32)),
             max_delta_checks=max(1, min(_as_int(raw.get("maxDeltaChecks", raw.get("max_delta_checks")), 24), 128)),
             timeout_seconds=max(30, min(_as_int(raw.get("timeoutSeconds", raw.get("timeout_seconds")), 600), 3600)),
+            project_check_timeout_seconds=(
+                max(0, _as_int(raw.get("projectCheckTimeoutSeconds", raw.get("project_check_timeout_seconds")), 0))
+                if "projectCheckTimeoutSeconds" in raw or "project_check_timeout_seconds" in raw
+                else None
+            ),
             attempt_timeout_seconds=max(60, min(_as_int(raw.get("attemptTimeoutSeconds", raw.get("attempt_timeout_seconds")), 3600), 14400)),
             localization_timeout_seconds=max(300, min(_as_int(raw.get("localizationTimeoutSeconds", raw.get("localization_timeout_seconds")), 7200), 21600)),
             progress_interval_seconds=max(5, min(_as_int(raw.get("progressIntervalSeconds", raw.get("progress_interval_seconds")), 15), 60)),
@@ -410,6 +419,25 @@ def _clamped_phase_seconds(
     if remaining <= 0:
         raise subprocess.TimeoutExpired(progress_label, attempt_timeout_seconds)
     return max(1, min(timeout_seconds, remaining))
+
+
+def project_check_timeout(config: BaselineVerifyConfig, *, attempt_remaining_seconds: float,
+                          budget_remaining_seconds: Optional[float], progress_label: str) -> int:
+    limit = config.project_check_timeout_seconds
+    if limit is None:
+        limit = config.timeout_seconds
+    if limit == 0:
+        if budget_remaining_seconds is None and attempt_remaining_seconds == float("inf"):
+            return 0
+        # Explicit search/attempt budgets still bind an otherwise unbounded check.
+        limit = max(1, int(min(attempt_remaining_seconds,
+                              budget_remaining_seconds if budget_remaining_seconds is not None else float("inf"))))
+    return _clamped_phase_seconds(
+        attempt_remaining_seconds=attempt_remaining_seconds,
+        budget_remaining_seconds=budget_remaining_seconds,
+        timeout_seconds=limit, attempt_timeout_seconds=config.attempt_timeout_seconds,
+        progress_label=progress_label,
+    )
 
 
 class ObservedResolutionError(RuntimeError):
@@ -2581,13 +2609,13 @@ def verify_assignment(
     attempt_started = time.monotonic()
     attempt_deadline = (float("inf") if config.unbounded_preparation
                         else attempt_started + config.attempt_timeout_seconds)
-    base_env = semantic_verification_environment(os.environ)
+    base_env = project_verification_environment()
     if runtime_env:
         # An EXPLICIT project/CI Node runtime beats ambient PATH exactly where
         # the runtime is the subject: proof/tool identity and subprocess PATH
         # must reflect the requested Node, matching what CI would run. The host
         # ambient runtime remains untouched.
-        base_env = {**base_env, **runtime_env}
+        base_env = project_verification_environment(runtime_env)
     remove_packages = tuple(sorted({str(item) for item in remove_packages}))
     telemetry_path = Path(config.telemetry_path).resolve() if config.telemetry_path else None
     assignment_hash = assignment_fingerprint(assignment)
@@ -4232,7 +4260,12 @@ def verify_assignment(
                         check_result = _run(
                             shell_argv,
                             command_project,
-                            timeout_seconds=phase_timeout(),
+                            timeout_seconds=project_check_timeout(
+                                config, attempt_remaining_seconds=attempt_deadline - time.monotonic(),
+                                budget_remaining_seconds=(config.budget_phase_deadline - time.monotonic()
+                                                          if config.budget_phase_deadline else None),
+                                progress_label=progress_label,
+                            ),
                             base_env=base_env,
                             progress=phase_progress(f"project-check:{command}"),
                             progress_label=command,
@@ -4268,6 +4301,15 @@ def verify_assignment(
                                 False, "budget",
                                 f"BASELINE_BUDGET_EXHAUSTED: project-check: the wall-clock budget was reached while the command was still running: {exc}",
                                 command=command,
+                            )
+                        if isinstance(exc, subprocess.TimeoutExpired):
+                            output = exc.output or ""
+                            if isinstance(output, bytes):
+                                output = output.decode("utf-8", errors="replace")
+                            return BaselineVerifyResult(
+                                False, "infrastructure",
+                                f"PROJECT_CHECK_COMMAND_TIMEOUT: {command}: exceeded {exc.timeout} seconds; no verdict obtained",
+                                command=command, output=str(output)[-8192:],
                             )
                         return BaselineVerifyResult(False, "infrastructure", f"project check launch failed: {exc}", command=command)
 
@@ -4945,13 +4987,13 @@ def verify_assignment(
             progress_label=progress_label,
         )
 
-    environment = semantic_verification_environment(os.environ)
+    environment = project_verification_environment()
     if runtime_env:
         # The EXPLICIT project/CI Node runtime participates in proof identity:
         # a proof cached under the ambient host Node must never be reused for a
         # different requested runtime, and tool identity in the proof must name
         # the runtime CI actually uses.
-        environment = {**environment, **runtime_env}
+        environment = project_verification_environment(runtime_env)
     try:
         identity = build_verification_proof_identity(
             project_dir,

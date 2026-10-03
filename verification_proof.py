@@ -94,6 +94,12 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def project_verification_environment(runtime_env: Mapping[str, str] | None = None) -> dict[str, str]:
+    # CI mode is an execution policy, shared by the planner, verifier and proof
+    # readers. Ambient development mode must not create a different proof key.
+    return {**semantic_verification_environment(os.environ), **(runtime_env or {}), "CI": "1"}
+
+
 def environment_snapshot_fingerprint(environment: Mapping[str, str]) -> str:
     """Hash semantic child environment without persisting secrets."""
     semantic = semantic_verification_environment(environment)
@@ -945,6 +951,7 @@ def _resolver_context_payload(
     # is read from the same sealed source bytes that package-manager verification
     # consumes, not from a live checkout that may change mid-run.
     project_dir = proof_subject_project_dir(project_dir)
+    environment = project_verification_environment(environment)
     environment_key = environment_snapshot_fingerprint(environment)
     try:
         topology_payload = topology_identity_payload(project_dir)

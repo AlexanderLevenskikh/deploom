@@ -752,6 +752,9 @@ def verify_config_from(mapping: Mapping[str, Any], run_dir: Path) -> BaselineVer
     return dataclasses.replace(
         config,
         unbounded_preparation=True,
+        project_check_timeout_seconds=(
+            config.project_check_timeout_seconds if config.project_check_timeout_seconds is not None else 0
+        ),
         registry=str(resolved.get("registry") or ""),
         telemetry_path=telemetry_path,
         proof_cache_dir=proof_cache_dir,
@@ -925,6 +928,8 @@ def _begin_check_only_locked(
     observed = dict(result.observed_resolved_versions or {})
     result_kind = str(getattr(result, "kind", "") or "")
     result_summary = str(getattr(result, "summary", "") or "")
+    result_command = str(getattr(result, "command", "") or "")
+    result_output = str(getattr(result, "output", "") or "")[-8192:]
     failing_commands = [
         {"command": failure.command, "exitCode": failure.exit_code}
         for failure in result.project_failures
@@ -962,6 +967,8 @@ def _begin_check_only_locked(
             "status": control_status,
             "kind": result_kind,
             "summary": result_summary,
+            "command": result_command,
+            "output": result_output,
             "failingCommands": failing_commands,
             "resolvedStateKey": result.resolved_state_key or "",
             "observedResolvedHash": result.observed_resolved_hash or observed_resolved_hash(observed),
@@ -977,6 +984,9 @@ def _begin_check_only_locked(
         }
     )
     if not check_ok:
+        if result_output:
+            _emit_status({"event": "begin.check-output", "runId": "", "project": project_name,
+                          "message": result_output})
         failing = "; ".join(
             f"{failure.command} (exit {failure.exit_code})"
             for failure in result.project_failures[:3]
@@ -997,7 +1007,7 @@ def _begin_check_only_locked(
         raise ProjectUnreadyError(
             "PROJECT_CHECK_INCONCLUSIVE",
             f"Проверка не дала определённого результата ({result.kind}): {result.summary or 'результат неизвестен'} — обновление не запущено. Повторите проверку.",
-            command="",
+            command=result_command,
         )
     return 0
 
