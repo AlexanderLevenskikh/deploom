@@ -21,7 +21,7 @@ Identity/authority contract (shared with desktop/electron/iterative-migration.ts
     rejected.  It controls scheduling, never proof.
 
 This module does NOT launch agents, does NOT wait for human dialogs and does NOT
-own the agent provider.  It reuses existing primitives (plan_progressive_extension,
+own the agent provider.  It reuses existing primitives (ProgressiveExtensionPlan,
 verify_assignment, durable SourceSnapshot containers, _apply_assignment,
 build_repair_request, manual_dependency_audit) instead of a second solver or a
 competing store of truth.
@@ -71,7 +71,6 @@ from migration_validation import digest as validation_digest, validate_profile, 
 from verification_proof import is_fixed_manifest_spec
 from iterative_target_deferrals import record_unavailable_targets, unavailable_targets
 from iterative_restart import TRANSACTION as RESTART_TRANSACTION, RestartArchiveError, archive_for_restart, recover_restart_archive
-from block_psi_progressive_baseline import plan_progressive_extension
 from package_manager_profile import (
     install_args_for_profile,
     resolve_package_manager_profile,
@@ -1214,6 +1213,7 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
         "workspaceId": (args.workspace_id or "").strip(),
         "projectId": (args.project_id or project_name).strip(),
         "targetLevel": target_level,
+        "cohortMaxPackages": int(getattr(args, "cohort_max_packages", 24) or 24),
         "targets": targets,
         "verifyConfig": verify_config,
         "validationProfile": validation_profile,
@@ -2310,19 +2310,14 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
         and entry.get("nogood")
         and entry.get("scope") == "deterministic"
     ]
-    priority = tuple(str(item) for item in (config.get("priorityPackages") or ()))
-
-    atomic_groups = _build_atomic_groups(actionable, config)
-    atomic_groups = _apply_scope_expansions(atomic_groups, ledger, checkpoint_id, actionable)
-    plan = plan_progressive_extension(
-        incumbent=incumbent,
-        desired=desired,
-        atomic_groups=atomic_groups,
-        blocked_fingerprints=blocked_fingerprints,
-        learned_nogoods=learned_nogoods,
+    from iterative_cohort_planner import plan_adaptive_cohort
+    plan, cohort_selection = plan_adaptive_cohort(
+        incumbent=incumbent, desired=desired, config=config, ledger=ledger,
+        checkpoints=_all_checkpoints(run_dir), base_checkpoint_id=checkpoint_id,
+        blocked_fingerprints=blocked_fingerprints, learned_nogoods=learned_nogoods,
         fingerprint_fn=assignment_fingerprint,
-        priority_packages=priority,
     )
+    atomic_groups = [list(plan.packages)] if plan else []
     if plan is None:
         all_blocked = len(actionable) > 0
         reason = "SCOPE_EXHAUSTED" if all_blocked else "NO_ACTIONABLE"
@@ -2363,6 +2358,7 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
         "fullAssignment": assignment,
         "delta": {"changed": dict(sorted(changed.items()))},
         "atomicGroups": [list(group) for group in plan_visible_groups(atomic_groups)],
+        "cohortSelection": cohort_selection,
         "allowedSourceScope": {
             "mode": "source-config",
             "forbiddenRelatives": sorted(FORBIDDEN_TRIAL_RELATIVES),
@@ -2391,6 +2387,7 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
             "candidateId": candidate["candidateId"],
             "baseCheckpointId": checkpoint_id,
             "cohortPackages": sorted(changed.keys()),
+            "cohortSelection": cohort_selection,
             "assignmentFingerprint": assignment_fingerprint(assignment),
             "changedCount": len(changed),
             "dependencyDiagnostics": dependency_diagnostics,
@@ -3399,65 +3396,6 @@ def _record_engine_deferrals(
     ledger["deferrals"] = entries
 
 
-def _build_atomic_groups(
-    actionable: Sequence[str], config: Mapping[str, Any]
-) -> List[List[str]]:
-    """One atomic group per package by default.
-
-    `cohortMaxPackages` (config) allows grouping the first N packages into one
-    atomic cohort; the remainder stays as single packages.  Peer/API-coherent
-    groups are not split (each package is its own group unless configured).
-    """
-    limit = _clamp_int(config.get("cohortMaxPackages"), 1, 1, 8)
-    groups: List[List[str]] = []
-    remaining = list(actionable)
-    if limit > 1 and len(remaining) >= 2:
-        head, remaining = remaining[:limit], remaining[limit:]
-        groups.append(head)
-    groups.extend([name] for name in remaining)
-    return groups
-
-
-def _apply_scope_expansions(
-    groups: Sequence[Sequence[str]],
-    ledger: Mapping[str, Any],
-    base_checkpoint_id: str,
-    actionable: Sequence[str],
-) -> List[List[str]]:
-    """Merge validated companion proposals into one atomic group.
-
-    A companion is honored only when it is actionable in the SAME base
-    checkpoint and currently planned alone.  Unknown packages are ignored
-    (the planner re-validates scope; proposals are never proof).
-    """
-    expansion = [
-        (str(item.get("candidateId") or ""), [str(c) for c in (item.get("companions") or [])])
-        for item in ledger.get("scopeExpansions", [])
-        if item.get("baseCheckpointId") == base_checkpoint_id
-    ]
-    if not expansion:
-        return [list(group) for group in groups]
-    merged: List[List[str]] = [list(group) for group in groups]
-    for _candidate, companions in expansion:
-        singles = {group[0]: i for i, group in enumerate(merged) if len(group) == 1}
-        merged_companions = [c for c in companions if c in actionable]
-        # Attach each validated companion to the *first* unrelated single group
-        # (the original proposal package itself is not mandatory: cohesion is
-        # what matters, and it is bounded by `actionable`).
-        for companion in merged_companions:
-            index = singles.get(companion)
-            if index is None:
-                continue
-            # Find another single group to merge with (deterministic: first).
-            for other_index, other in enumerate(merged):
-                if other_index == index or len(other) != 1:
-                    continue
-                merged[index] = [companion, other[0]]
-                break
-            break
-    return merged
-
-
 # ---------------------------------------------------------------------------
 # materialize
 # ---------------------------------------------------------------------------
@@ -4215,7 +4153,7 @@ def _apply_feedback_locked(
                 _record_scope_expansion(
                     ledger, candidate, list(companions), str(feedback.get("reason") or "")
                 )
-        if kind == "INCONCLUSIVE":
+        if kind in {"INCONCLUSIVE", "NEEDS_ALTERNATIVE"}:
             _append_deferral(ledger, candidate, str(feedback.get("reason") or "inconclusive"))
     elif kind == "REPAIRING":
         run["phase"] = "REPAIRING"
@@ -4252,6 +4190,7 @@ def _record_scope_expansion(
             "baseCheckpointId": candidate["baseCheckpointId"],
             "candidateId": candidate["candidateId"],
             "package": "",
+            "packages": sorted((candidate.get("delta") or {}).get("changed") or {}),
             "companions": [str(item) for item in companions],
             "reason": reason,
             "createdAt": _now_iso(),
@@ -4984,6 +4923,7 @@ def build_parser() -> argparse.ArgumentParser:
     begin.add_argument("--max-repair-attempts", type=int, default=None)
     begin.add_argument("--max-infra-retries", type=int, default=None)
     begin.add_argument("--phase-timeout-seconds", type=int, default=None)
+    begin.add_argument("--cohort-max-packages", type=int, choices=range(1, 33), default=24, help="Adaptive cohort cap (default 24; starts at 8, grows after verified acceptance)")
     begin.add_argument(
         "--dashboard-state",
         default="",

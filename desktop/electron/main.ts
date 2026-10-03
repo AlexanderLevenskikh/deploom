@@ -8824,6 +8824,13 @@ function setupIpc(): void {
     }
   })
 
+  ipcMain.handle('flow:storage-maintenance', async (_event, action: unknown) => {
+    if (action !== 'inspect' && action !== 'clean') throw new Error('Invalid storage action')
+    const toolDir = bundledToolDir()
+    const result = await spawnIterativeStreamed(toolDir, 'python', [join(toolDir, 'verification_storage_maintenance.py'), action], toolDir, 0, { cancelRequested: () => false, recordLine: () => {}, trimLog: () => {} }, iterativeStreamPlatform)
+    if (result.code !== 0) throw new Error(result.stderr || 'Storage maintenance failed')
+    return JSON.parse(result.stdout.trim())
+  })
   ipcMain.handle('flow:get-hardware-snapshot', () => hardwareSnapshot())
   ipcMain.handle('flow:get-theme-preference', () => currentThemePreference())
   ipcMain.handle('flow:set-theme-preference', (_event, value: unknown) => { const state = loadState(); const preference = applyThemePreference(value); saveState({ ...state, themePreference: preference }); return { preference } })

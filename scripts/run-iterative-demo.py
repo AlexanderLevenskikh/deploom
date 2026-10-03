@@ -99,13 +99,9 @@ for (const [name, field] of [['is-array-buffer', 'buffer'], ['is-callable', 'cal
     throw Error(`${name} upgrade requires application adaptation: ${field}`);
   }
 }
-if (process.env.DEPLOOM_DEMO_PAUSE === '1') {
-  fs.mkdirSync('.dependency-roadmap', {recursive: true});
-  fs.writeFileSync('.dependency-roadmap/demo-stop-ready', 'ready');
-  setTimeout(() => process.exit(0), 60000);
-}
 """
-    check.write_text(check.read_text(encoding='utf-8') + '\nconst DEMO_ALLOWED = ' +
+    pause = "if (process.env.DEPLOOM_DEMO_PAUSE === '1') { require('fs').mkdirSync('.dependency-roadmap', {recursive:true}); require('fs').writeFileSync('.dependency-roadmap/demo-stop-ready','ready'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,60000); }\n"
+    check.write_text(pause + check.read_text(encoding='utf-8') + '\nconst DEMO_ALLOWED = ' +
                      json.dumps({name: [old[name], new[name]] for name in old}) +
                      ';\nconst DEMO_NEW = ' + json.dumps(new) + ';\n' + checks, encoding='utf-8')
     (project / '.gitignore').write_text('node_modules/\n.dependency-roadmap/\n', encoding='utf-8')
@@ -224,7 +220,9 @@ if (process.env.DEPLOOM_DEMO_PAUSE === '1') {
     driver.assertTrue(wrong_repair)
     driver.assertGreaterEqual(deferred, 1)
     driver.assertLessEqual(deferred, 3 * len(blocked))
-    driver.assertEqual(len(old) - len(blocked), len(checkpoints))
+    accepted_updates = sum(1 for name, version in physical.read_runtime_state(run)["activeCheckpoint"]["fullAssignment"].items() if version != old[name])
+    driver.assertEqual(len(old) - len(blocked), accepted_updates)
+    driver.assertLess(len(checkpoints), accepted_updates, "Greedy cohorts must reduce physical verification cycles")
     driver.assertIsNotNone(stopped)
     finished = cli('finish')
     driver.assertEqual('finish.done', finished['last']['event'])
@@ -235,7 +233,7 @@ if (process.env.DEPLOOM_DEMO_PAUSE === '1') {
         driver.assertEqual(old[name] if name in blocked else version, final[name])
     for name in ('MIGRATION_REPORT.md', 'DEVELOPER_UPGRADE_GUIDE.md'):
         driver.assertTrue((run / 'reports' / name).is_file())
-    write(stage / 'ACCEPTANCE.json', {'directDependencies': len(old), 'acceptedUpdates': len(checkpoints),
+    write(stage / 'ACCEPTANCE.json', {'directDependencies': len(old), 'acceptedUpdates': accepted_updates, 'acceptedCohorts': len(checkpoints),
           'deferredUpdates': len(blocked), 'repairCohorts': repair_cohorts, 'stopResume': stopped, 'deferredAttempts': deferred, 'wrongRepairRejected': wrong_repair, 'checkpoints': checkpoints,
           'finalRun': state, 'sourceGitStatus': physical._run([cls.git, 'status', '--porcelain'], project).stdout})
     print('DEMO_ACCEPTED ' + str(stage / 'ACCEPTANCE.json'), flush=True)

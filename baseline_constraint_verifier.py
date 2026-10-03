@@ -2517,6 +2517,9 @@ def reap_orphan_verification_trials(
     """Bounded cleanup for old tool-owned trial namespaces only."""
     if parent is None or not parent.is_dir():
         return 0, 0
+    # Retry already-detached garbage too; failed deletion must not leak forever.
+    from verification_storage_maintenance import clean_retired_trials
+    clean_retired_trials(parent.parent, limit=max_candidates)
     cutoff = time.time() - max(3600, int(max_age_seconds))
     candidates = 0
     reclaimed = 0
@@ -2529,8 +2532,11 @@ def reap_orphan_verification_trials(
             break
         if not item.is_dir() or not item.name.startswith("dependency-flow-baseline-verify-"):
             continue
+        from verification_storage_maintenance import dead_trial_owner, _plain_directory, _has_links
+        if not _plain_directory(item) or not dead_trial_owner(item):
+            continue
         try:
-            if item.stat().st_mtime > cutoff:
+            if item.stat().st_mtime > cutoff or _has_links(item):
                 continue
         except OSError:
             continue
@@ -2706,6 +2712,8 @@ def verify_assignment(
         prefix="dependency-flow-baseline-verify-",
         dir=str(trial_parent) if trial_parent is not None else None,
     ))
+    from verification_storage_maintenance import register_trial_owner, retire_trial
+    register_trial_owner(temp_root)
     try:
         workspace_root = temp_root / "repo"
         workspace_started = time.monotonic()
@@ -4568,6 +4576,8 @@ def verify_assignment(
         )
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
+        if temp_root.exists():
+            retire_trial(temp_root)
 
 
 

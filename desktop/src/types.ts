@@ -550,6 +550,7 @@ export type DependencyFlowApi = {
   setNotificationsEnabled: (enabled: boolean) => Promise<{ enabled: boolean }>
   notifyAutopilotComplete: (input: { projectName: string; published: boolean }) => Promise<void>
   installUpdate: () => Promise<void>
+  storageMaintenance: (action: 'inspect' | 'clean') => Promise<{ root: string; filesystem: string; freeBytes: number; eligible: number; removed: number; failed: number; protected: number }>
   getHardwareSnapshot: () => Promise<HardwareSnapshot>
   getThemePreference: () => Promise<ThemePreference>
   setThemePreference: (preference: ThemePreference) => Promise<{ preference: ThemePreference }>

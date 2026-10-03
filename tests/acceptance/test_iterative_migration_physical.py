@@ -310,6 +310,8 @@ class IterativeMigrationPhysicalAcceptance(unittest.TestCase):
             str(self._targets_file({"is-number": "7.0.0", "is-finite": "1.1.0", "is-string": "99.99.99"})),
             "--verify-config",
             str(self._verify_config_file()),
+            "--cohort-max-packages",
+            "1",  # This scenario explicitly tests two separate cumulative repairs.
             "--run-budget-minutes",
             "30",
             "--phase-timeout-seconds",

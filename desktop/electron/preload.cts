@@ -43,6 +43,7 @@ exportLegacyIterativeTask: (input: { workspaceId?: string; projectName: string }
   notifyAutopilotComplete: (input: { projectName: string; published: boolean }) => ipcRenderer.invoke('flow:notify-autopilot-complete', input),
   installUpdate: () => ipcRenderer.invoke('flow:install-update'),
   getHardwareSnapshot: () => ipcRenderer.invoke('flow:get-hardware-snapshot'),
+  storageMaintenance: (action: 'inspect' | 'clean') => ipcRenderer.invoke('flow:storage-maintenance', action),
   getThemePreference: () => ipcRenderer.invoke('flow:get-theme-preference'),
   setThemePreference: (preference: string) => ipcRenderer.invoke('flow:set-theme-preference', preference),
   onUpdateStatus: (handler: (event: unknown) => void) => {

@@ -4,6 +4,7 @@
 import { createRoot } from 'react-dom/client'
 import { useEffect, useRef, useState, type ComponentProps } from 'react'
 import { WorkspaceDialog } from '../components/WorkspaceDialog'
+import { StorageMaintenanceDialog } from '../components/StorageMaintenanceDialog'
 import { createIterativeAutopilot } from '../../electron/iterative-autopilot'
 import { FlowWorkspace } from '../components/FlowWorkspace'
 import { LanguageProvider, useLanguage } from '../i18n'
@@ -27,6 +28,8 @@ const getIntent: ComponentProps<typeof FlowWorkspace>['onGetBaselineIntentPlan']
 function Harness() {
   const [qaProvider, setQaProvider] = useState<'codex' | 'opencode' | 'claude'>('codex')
   const [showWorkspace, setShowWorkspace] = useState(false)
+  const [showStorage, setShowStorage] = useState(false)
+  const storageCleaned = useRef(false)
   const checked = useRef(false)
   const present = useRef(false)
   const canceled = useRef(false)
@@ -88,6 +91,7 @@ function Harness() {
       <button onClick={() => { checked.current = true; setAttempt(value => ({ ...value, phase: 'begin.discovery', status: 'running', discoveryCompleted: true, discoverySkipped: 10, packageProgress: { processed: 30, total: 30 } })) }}>Discovery done</button>
       <button onClick={() => mode('begin.c0-verify')}>C0 verify</button>
       <button onClick={() => setShowWorkspace(true)}>Workspace dialog</button>
+      <button onClick={() => setShowStorage(true)}>Storage dialog</button>
       <button onClick={() => setLanguage('en')}>EN</button><button onClick={() => setLanguage('ru')}>RU</button>
     </div>
     <FlowWorkspace details={{ ...details, workspace: { ...details.workspace, agent: qaProvider } }} project={project} appVersion="QA" liveIterativeAttempt={attempt}
@@ -99,6 +103,11 @@ function Harness() {
       onIterativeStatus={name => api.current.status(null, { projectName: name })} onIterativeAttempt={api.current.attempt} onIterativeCancel={name => api.current.cancel(null, { projectName: name })}
       onIterativeBegin={(name, input) => api.current.begin(null, { projectName: name, ...input })} onIterativeDrive={(name, autopilot) => api.current.drive(null, { projectName: name, autopilot })} onIterativeAgent={async () => ({ ok: false })}
       logs={[{ jobId: 'old', stream: 'stderr', line: 'SAVED_OLD_FLOW_ONLY: historical error' }]} />
+    {showStorage ? <StorageMaintenanceDialog onClose={() => setShowStorage(false)} onMaintenance={async action => {
+      const eligible = storageCleaned.current ? 0 : 3
+      if (action === 'clean') storageCleaned.current = true
+      return { root: 'D:/QA/verification', filesystem: 'refs', freeBytes: 20 * 1024 ** 3, eligible, removed: action === 'clean' ? eligible : 0, failed: 0, protected: 0 }
+    }} /> : null}
     {showWorkspace ? <WorkspaceDialog onClose={() => setShowWorkspace(false)} onPickDirectory={async () => 'C:/demo/workspaces'} onConnectExisting={async () => {}} onCreate={async () => {}} /> : null}
   </main>
 }

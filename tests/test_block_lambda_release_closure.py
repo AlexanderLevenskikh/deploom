@@ -442,10 +442,14 @@ error demo@1.2.3: The engine "node" is incompatible with this module. Expected v
             old_trial = parent / "dependency-flow-baseline-verify-old"
             unrelated = parent / "user-data"
             old_trial.mkdir()
+            from verification_storage_maintenance import register_trial_owner
+            from unittest.mock import patch
+            register_trial_owner(old_trial)
             unrelated.mkdir()
             old_time = time.time() - 48 * 60 * 60
             os.utime(old_trial, (old_time, old_time))
-            candidates, reclaimed = reap_orphan_verification_trials(parent, max_age_seconds=3600)
+            with patch("verification_storage_maintenance.owner_alive", return_value=False):
+                candidates, reclaimed = reap_orphan_verification_trials(parent, max_age_seconds=3600)
             self.assertEqual((1, 1), (candidates, reclaimed))
             self.assertTrue(unrelated.is_dir())
 
