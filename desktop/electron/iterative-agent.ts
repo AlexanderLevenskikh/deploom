@@ -28,6 +28,7 @@ export type IterativeRepairRequest = {
 }
 
 export type IterativeAgentContext = {
+  verificationCommands?: string[]
   runId: string
   candidateId: string
   baseCheckpointId: string
@@ -42,6 +43,7 @@ export type IterativeAgentContext = {
 }
 
 export type IterativeBootstrapContext = {
+  verificationCommands?: string[]
   runId: string
   checkpointId: string
   projectName: string
@@ -79,6 +81,18 @@ const CHANGED_FILES_MARKER = 'CHANGED_FILES:'
 export const TRIAL_BASELINE_FILENAME = 'agent-baseline.json'
 export const AGENT_PROMPT_FILENAME = 'agent-prompt.md'
 
+function verificationProfileText(commands: string[] = []): string {
+  return [
+    '## Настроенные проверки / Configured verification commands',
+    commands.length ? commands.map(command => `  $ ${command}`).join('\n') : 'Список проверок недоступен; не угадывай команды. / Verification commands are unavailable; do not guess.',
+    'Используй точные команды выше, включая аргументы и область тестов. Не заменяй scoped unit-проверку общим yarn test и не добавляй Playwright/e2e без явного требования профиля.',
+    'Use the exact commands above, including arguments and test scope. Do not replace a scoped unit check with plain yarn test or add Playwright/e2e unless the profile requires it.',
+    'Дополнительные проверки отмечай отдельно: они не меняют критерии принятия. Называй сбой pre-existing только при наличии сопоставимого результата той же команды на исходном checkpoint; иначе причина не подтверждена.',
+    'Label additional checks separately; they do not change acceptance criteria. Call a failure pre-existing only with comparable evidence from the same command on the base checkpoint; otherwise its origin is unconfirmed.',
+    'Окончательное принятие выполняет контроллер после свежей верификации. / The controller accepts changes only after fresh verification.',
+  ].join('\n')
+}
+
 /** RU repair prompt. The task text is the ТЗ body; repair requests carry the
  * exact failing commands the PRE-check reported. */
 export function buildIterativeRepairPrompt(ctx: IterativeAgentContext): string {
@@ -101,6 +115,8 @@ export function buildIterativeRepairPrompt(ctx: IterativeAgentContext): string {
     ``,
     `Проект: ${ctx.projectName} (целевой уровень: ${ctx.targetLevel}).`,
     `Кандидат: ${ctx.candidateId} на базе checkpoint ${ctx.baseCheckpointId} (попытка ${ctx.attemptId}).`,
+    verificationProfileText(ctx.verificationCommands),
+    ``,
     `Точное назначение версий:`,
     assignment,
     ``,
@@ -150,6 +166,8 @@ export function buildIterativeBootstrapPrompt(ctx: IterativeBootstrapContext): s
     ``,
     `Проект: ${ctx.projectName} (целевой уровень: ${ctx.targetLevel}).`,
     `Контрольная проверка C0 (${ctx.checkpointId}) упала на ИСХОДНОМ состоянии зависимостей.`,
+    verificationProfileText(ctx.verificationCommands),
+    ``,
     `Назначение версий НЕ меняется:`,
     ``,
     `## Текущее назначение (зафиксировано, менять нельзя)`,

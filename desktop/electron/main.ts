@@ -8512,6 +8512,10 @@ function setupIpc(): void {
           taskText: '',
         }
       }
+      const verificationCommands = (payload.config as Record<string, unknown> | undefined)?.verifyConfigCommands
+      ctx.verificationCommands = Array.isArray(verificationCommands)
+        ? verificationCommands.filter((command): command is string => typeof command === 'string' && command.trim().length > 0)
+        : []
       const projectPath = trialProjectPath(workspaceRoot, projectRelative)
       const repairRequests = (Array.isArray(payload.openRepairRequests) ? payload.openRepairRequests : []) as Array<{
         requestId?: string; reason?: string; failingCommands?: Array<{ command: string; exitCode: number }>; diagnosticsTail?: string;
