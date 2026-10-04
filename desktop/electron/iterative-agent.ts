@@ -541,6 +541,17 @@ export type AgentLease = {
   attemptId: number
   pid: number
   startedAt: string
+  // Launch-wait resilience: a retryable provider outage (rate limit / temp /
+  // unknown with budget left) parks the lease as WAITING with its retry
+  // parameters instead of failing the repair. A restarted Desktop reads the
+  // same lease and either continues waiting or retries exactly once the wait
+  // is over — never a second concurrent agent and never a re-spent attempt.
+  waiting?: boolean
+  waitKind?: 'rate-limited' | 'temporary' | 'unknown'
+  waitDetail?: string
+  retryAt?: number
+  retryAfterSeconds?: number
+  launchAttempts?: number
 }
 
 export function agentLeaseFile(runDir: string): string {
@@ -558,6 +569,7 @@ export function readAgentLease(file: string): AgentLease | undefined {
     if (!parsed || typeof parsed !== 'object') return undefined
     if (Number(parsed.schemaVersion) !== 1) return undefined
     if (typeof parsed.sessionId !== 'string' || typeof parsed.startedAt !== 'string') return undefined
+    const waitKind = parsed.waitKind === 'rate-limited' || parsed.waitKind === 'temporary' || parsed.waitKind === 'unknown' ? parsed.waitKind : undefined
     return {
       schemaVersion: 1,
       sessionId: parsed.sessionId,
@@ -568,6 +580,12 @@ export function readAgentLease(file: string): AgentLease | undefined {
       attemptId: Number(parsed.attemptId ?? 0),
       pid: Number(parsed.pid ?? 0),
       startedAt: parsed.startedAt,
+      ...(parsed.waiting === true ? { waiting: true } : {}),
+      ...(waitKind ? { waitKind } : {}),
+      ...(typeof parsed.waitDetail === 'string' && parsed.waitDetail ? { waitDetail: parsed.waitDetail } : {}),
+      ...(typeof parsed.retryAt === 'number' ? { retryAt: parsed.retryAt } : {}),
+      ...(typeof parsed.retryAfterSeconds === 'number' ? { retryAfterSeconds: parsed.retryAfterSeconds } : {}),
+      ...(typeof parsed.launchAttempts === 'number' && Number.isInteger(parsed.launchAttempts) && parsed.launchAttempts > 0 ? { launchAttempts: parsed.launchAttempts } : {}),
     }
   } catch {
     return undefined
@@ -589,6 +607,23 @@ export function clearAgentLease(file: string): void {
   }
 }
 
+/** True when the durable lease currently describes a parked launch-wait
+ *  (retryable provider outage waiting for its retry time). */
+export function isWaitingAgentLease(lease: AgentLease | undefined): boolean {
+  return Boolean(lease?.waiting)
+}
+
+/** Cancel a parked launch-wait: clears the lease and returns whether a wait
+ *  was actually active. A running agent lease is left untouched — cancelling a
+ *  wait is NOT cancelling a live agent process. Pure enough for the contract
+ *  check (no timers are managed here). */
+export function cancelWaitingAgentLease(file: string): boolean {
+  const lease = readAgentLease(file)
+  if (!isWaitingAgentLease(lease)) return false
+  clearAgentLease(file)
+  return true
+}
+
 // #5: what a fresh `flow:iterative:agent` dispatch must do about a durable
 // lease left on disk:
 //   - none: the lease is absent or older than the expiry window -> fresh run.
@@ -597,19 +632,55 @@ export function clearAgentLease(file: string): void {
 //   - resume: the lease is fresh but the issuing Desktop was killed or crashed
 //     mid-run -> resume the SAME provider session (same attempt, durable trial
 //     edits), never a second attempt for the same repair.
+//   - wait: the lease is a parked launch-wait whose retry time has NOT arrived
+//     -> keep waiting; no attempt is consumed and nothing is spawned.
+//   - retry: the lease is a parked launch-wait whose retry time has arrived ->
+//     retry the launch FRESH (no provider session exists yet) carrying the
+//     durable launchAttempts so the retry budget is honored across restarts.
+//   - give-up: the lease is a parked launch-wait whose finite retry budget is
+//     exhausted -> end with a clear diagnostic, no further retries.
+// A waiting lease holder keeps its own process pid, so a LIVE owner is NOT
+// refused as in-progress while a wait is parked: the wait itself is the
+// single-owner guard until its retry time or the cancel.
 // The owner-liveness probe is injected so the decision is testable without OS
 // process-table races.
 export type AgentLeaseDecision =
   | { action: 'none' }
   | { action: 'in-progress' }
   | { action: 'resume'; sessionId: string }
+  | { action: 'wait'; retryAt: number; detail: string }
+  | { action: 'retry'; launchAttempts: number; detail: string }
+  | { action: 'give-up'; detail: string }
+
+/** A parked launch-wait is retained far longer than a live-agent lease: a
+ *  long provider reset (up to AGENT_LAUNCH_MAX_RETRY_AFTER_MS) must not be
+ *  silently downgraded to a fresh dispatch because 2 h elapsed. */
+const AGENT_WAIT_LEASE_MAX_AGE_MS = 24 * 60 * 60 * 1000
 
 export function decideAgentLeaseDispatch(
   lease: AgentLease | undefined,
   isOwnerAlive: (pid: number) => boolean,
   now = Date.now(),
 ): AgentLeaseDecision {
-  if (!lease || !agentLeaseAlive(lease, now)) return { action: 'none' }
+  if (!lease) return { action: 'none' }
+  const maxAge = lease.waiting ? AGENT_WAIT_LEASE_MAX_AGE_MS : 2 * 60 * 60 * 1000
+  if (!agentLeaseAlive(lease, now, maxAge)) return { action: 'none' }
+  if (lease.waiting) {
+    const attempts = lease.launchAttempts ?? 0
+    if (lease.waitKind !== 'rate-limited') {
+      const budget = lease.waitKind === 'unknown' ? 3 : lease.waitKind === 'temporary' ? 5 : 0
+      if (budget > 0 && attempts >= budget) {
+        return { action: 'give-up', detail: `AGENT_LAUNCH_BUDGET_EXHAUSTED: провайдер недоступен (${lease.waitKind}) после ${attempts} попыток запуска: ${lease.waitDetail ?? 'причина неизвестна'}. Верификация и последний verified checkpoint сохранились; ремонт не засчитан.` }
+      }
+      if (budget === 0) {
+        return { action: 'give-up', detail: `AGENT_LAUNCH_FAILED: ${lease.waitDetail ?? 'неизвестная причина'}. Проверьте настройки провайдера и повторите ремонт.` }
+      }
+    }
+    if ((lease.retryAt ?? 0) > now) {
+      return { action: 'wait', retryAt: lease.retryAt ?? now, detail: lease.waitDetail ?? '' }
+    }
+    return { action: 'retry', launchAttempts: attempts, detail: lease.waitDetail ?? '' }
+  }
   if (lease.pid > 0 && isOwnerAlive(lease.pid)) return { action: 'in-progress' }
   return { action: 'resume', sessionId: lease.sessionId }
 }

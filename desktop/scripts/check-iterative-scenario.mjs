@@ -108,6 +108,27 @@ expect("agent gate acts as repair-with-agent", () => {
   if (a.state !== "agent") throw new Error(`expected agent, got ${a.state}`);
 });
 
+// 7b. Launch-wait: a provider rate limit / temporary outage parks the repair.
+// The 'waiting' journal is NOT an active run (a live child still wins) and NOT
+// a failure — the action is the cancelable agent-wait; when no live child runs
+// it must never be misread as recovered-running or a failed attempt.
+expect("launch-wait parks the repair into agent-waiting", () => {
+  const a = deriveMainAction({
+    inFlight: false,
+    runner: runner({ decision: { step: "agent", satisfied: false, reason: "repair" } }),
+    taskPresent: true,
+    noTargets: false,
+    checked: false,
+    attempt: attempt({ status: "waiting", stage: "agent", reason: "Ожидание повторного запуска агента: лимит запросов провайдера; следующая попытка в 12:00", waitUntil: Date.now() + 30_000, waitFailureKind: "rate-limited" }),
+  });
+  if (a.state !== "agent-waiting") throw new Error(`expected agent-waiting, got ${a.state}`);
+  if (!a.reasonShort.includes("12:00")) throw new Error("waiting reason must carry the next-attempt time");
+});
+expect("a live child still wins over a durable waiting journal", () => {
+  const a = deriveMainAction({ inFlight: true, runner: undefined, taskPresent: false, noTargets: false, attempt: attempt({ status: "waiting", stage: "agent" }) });
+  if (a.state !== "running") throw new Error(`expected running, got ${a.state}`);
+});
+
 // 8. Verified result → «Посмотреть результат».
 expect("satisfied run acts as view-result", () => {
   const a = deriveMainAction({ inFlight: false, runner: runner({ phase: "TERMINAL", decision: { step: "finish", satisfied: true, reason: "done" } }), taskPresent: true, noTargets: false, attempt: undefined });
@@ -259,6 +280,12 @@ expect("pipeline: bootstrap agent still repairs the initial check", () => {
   const p = scenarioPipeline("agent", false, { runner: { present: true, phase: "BOOTSTRAP_REPAIR" } });
   if (p.current !== "check" || p.completed.length !== 0) throw new Error(JSON.stringify(p));
 });
+expect("pipeline: an agent launch-wait stays on the repair path (agent-waiting)", () => {
+  const p = scenarioPipeline("agent-waiting", false, { runner: { present: true, phase: "BOOTSTRAP_REPAIR" } });
+  if (p.current !== "check" || p.completed.length !== 0) throw new Error(JSON.stringify(p));
+  const upgrade = scenarioPipeline("agent-waiting", false, { runner: { present: true, phase: "REPAIRING" } });
+  if (upgrade.current !== "upgrade" || JSON.stringify(upgrade.completed) !== JSON.stringify(["check", "plan"])) throw new Error(JSON.stringify(upgrade));
+});
 expect("pipeline: generic busy flag cannot manufacture completion", () => {
   const p = scenarioPipeline("running", false);
   if (p.current !== "check" || p.completed.length !== 0) throw new Error(JSON.stringify(p));
@@ -287,6 +314,10 @@ expect("activity: failed and canceled attempts drop stale progress", () => {
     const result = iterativeActivity(attempt({ status, phase: "begin.discovery-progress", packageProgress: { processed: 12, total: 30 } }), false, "en");
     if (result.percent !== undefined || result.detail) throw new Error(JSON.stringify(result));
   }
+});
+expect("activity: a waiting agent-launch shows the wait, not an interruption", () => {
+  const result = iterativeActivity(attempt({ status: "waiting", stage: "agent" }), false, "en");
+  if (result.title !== "Waiting for agent access to recover" || result.detail) throw new Error(JSON.stringify(result));
 });
 expect("activity: malformed counters cannot manufacture progress", () => {
   for (const counter of [{ processed: 10, total: 0 }, { processed: -1, total: 10 }, { processed: 11, total: 10 }, { processed: NaN, total: 10 }]) {

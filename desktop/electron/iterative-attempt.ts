@@ -14,7 +14,7 @@ import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, 
 import { randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
 
-export type IterativeAttemptStatus = 'starting' | 'running' | 'done' | 'failed' | 'canceled'
+export type IterativeAttemptStatus = 'starting' | 'running' | 'waiting' | 'done' | 'failed' | 'canceled'
 export type IterativeTargetSource = 'none' | 'roadmap' | 'discovery'
 
 export type IterativeDiscoveryBudget = {
@@ -51,6 +51,10 @@ export type IterativeAttemptRecord = {
   lastStep?: string
   runCreated: boolean
   cancelRequested?: boolean
+  // Launch-wait display: the epoch-ms time of the next agent launch attempt
+  // while the attempt is in the provider-outage wait (status 'waiting'). It is
+  // DISPLAY ONLY — the authoritative retry time lives in the durable lease.
+  waitUntil?: number
 }
 
 export function attemptFilePath(runDir: string): string {

@@ -8,6 +8,7 @@ import { buildDependencyGraphSnapshot } from './dependency-graph.js'
 import { BaselineWorkerPool, WORKER_CANCEL } from './baseline-worker.js'
 const { autoUpdater } = updaterPackage
 import { buildClaudeAgentArgs, buildClaudeResumeArgs, buildCodexAgentArgs, buildCodexResumeArgs, buildOpenCodeAgentArgs, buildOpenCodeResumeArgs, parseOpencodeModelsOutput } from './agent-command.js'
+import { AGENT_LAUNCH_RETRY_BUDGET, agentLaunchRetryDelayMs, canRetryAgentLaunch, classifyAgentLaunchFailure, type AgentLaunchDiagnostics } from './agent-launch-errors.js'
 import { agentBatchCompletionFingerprint, agentScopeFingerprint, extractAgentSessionId, resumableAgentSessionId } from './agent-session.js'
 import { restoreVerifiedAgentCompletion, updateFlowProgress, type FlowAction } from './flow-state.js'
 import { adoptEmptyContinuationBranches, adoptHistoricalContinuationBranches, adoptPreferredScopeBranches, buildMigrationProgress, continuationMigrationPlan, integratedBranchTargets, leftoverConflictMarkerLines, liveGitWorktreeRecords, mergeInProgressNote, mergePackageJsonThreeWay, migrationBranchStateText, migrationCompletionIssues, migrationBatchScopeDriftIssues, migrationGroupScopeDriftIssues, migrationPlanFromPrompt, migrationScopeManifestFromPrompt, migrationStateSummary, nextIncompleteMigrationBranch, recoverContinuationScopeBranches, rebindMigrationPromptBranchIdentity, replaceMigrationPlanInPrompt, relevantGitStatus, relevantGitStatusLines, workspaceNoiseGitExcludePathspecs, rollbackIncompleteMigrationActions, satisfiedScopePackagesFromPrompt, scopeActionsFromPrompt, scopeTargetsFromPrompt, validateScopeProofEnvelope, type MigrationBranchProgress, type MigrationBranchRuntime, type MigrationBranchRuntimePhase, type MigrationPlan, type MigrationProgress } from './migration-progress.js'
@@ -56,14 +57,14 @@ import { commandEnvironment, decodeProcessOutputChunk, normalizePathForCompariso
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { discoveryProgress } from './iterative-discovery-progress.js'
 import { createIterativeAutopilot } from './iterative-autopilot.js'
-import { decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
+import { IterativeDecision, decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
 import { migrationProfilePath, readMigrationProfile, readMigrationScope, saveMigrationProfile } from './migration-validation.js'
 import { hasSavedProjectPlan, iterativeBeginInvocation, iterativeCheckTimeoutFailure, targetsFromDashboardState } from './iterative-begin.js'
 import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
 import { beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, readRunLogTail, recordAttemptLog, recordAttemptProgress, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
 import { spawnIterativeStreamed, type CaptureResult, type StreamAttemptIo, type StreamPlatform } from './iterative-stream.js'
-import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, agentProviderFailure, openCodeRuntimeManifestPaths, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
+import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, agentProviderFailure, openCodeRuntimeManifestPaths, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
@@ -7701,9 +7702,19 @@ function setupIpc(): void {
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
+    // Launch-wait: cancelling a parked wait clears the *waiting* lease (an
+    // in-flight agent's lease is never touched) and marks the attempt canceled
+    // without spending a repair attempt. The retry timer for this scope is
+    // dropped so no late relaunch resurrects the canceled repair.
+    const waitingCleared = cancelWaitingAgentLease(agentLeaseFile(runDir))
+    cancelPendingAgentWait({ workspaceId: workspace.id, projectName: project.name })
     requestCancel(runDir)
+    const cancelAttempt = readAttempt(runDir)
+    if (waitingCleared && cancelAttempt?.status === 'waiting') {
+      updateAttempt(runDir, { status: 'canceled', stage: 'agent', cancelRequested: undefined, lastError: undefined, reason: 'Waiting for agent relaunch canceled by the user', waitUntil: undefined, finishedAt: Date.now() })
+    }
     publishIterativeAttempt(runDir)
-    return { ok: true }
+    return { ok: true, waitingCleared }
   }))
 
   ipcMain.handle('flow:iterative:status', iterativeAutopilot.register('status', async (_event, input: { workspaceId?: string; projectName: string }) => {
@@ -7754,6 +7765,16 @@ function setupIpc(): void {
           }
         }
       }
+    }
+    // Launch-wait: a panel mount reads status. If a parked wait's retry time
+    // has already come (e.g. this Desktop restarted while the repair was
+    // waiting), re-arm the timer so the repair relaunches by itself instead of
+    // sitting idle until a user click. scheduleAgentWaitRetry is idempotent —
+    // it cancels any existing timer for this scope first.
+    const statusAttempt = readAttempt(runDir)
+    const waitLease = readAgentLease(agentLeaseFile(runDir))
+    if (statusAttempt?.status === 'waiting' && waitLease?.waiting) {
+      scheduleAgentWaitRetry({ workspaceId: workspace.id, projectName: project.name }, waitLease.retryAt ?? Date.now())
     }
     return {
       ok: error === undefined,
@@ -8454,7 +8475,78 @@ function setupIpc(): void {
     return { status: 'ok' }
   }
 
-  ipcMain.handle('flow:iterative:agent', iterativeAutopilot.register('agent', async (_event, input: { workspaceId?: string; projectName: string }) => {
+  // ── Launch-wait resilience helpers ────────────────────────────────────────
+  // A retryable agent-launch outage (rate limit / temporary / unknown with
+  // budget left) parks the repair: the attempt reads 'waiting', the durable
+  // lease carries the retry time, and a process-lifetime timer + a lazy
+  // reschedule on status read re-launch exactly one agent after the wait.
+
+  const pendingAgentWaitRetries = new Map<string, NodeJS.Timeout>()
+
+  function ensureAttemptRecord(runDir: string, projectName: string, workspaceId: string | undefined): void {
+    if (!readAttempt(runDir)) startAttempt(runDir, projectName, 'none', undefined, 0, workspaceId)
+  }
+
+  function agentLaunchWaitDetail(diag: AgentLaunchDiagnostics, attempts: number, retryAt: number): string {
+    const when = new Date(retryAt).toLocaleTimeString()
+    const budget = AGENT_LAUNCH_RETRY_BUDGET[diag.kind]
+    const kindLabel = diag.kind === 'rate-limited' ? 'лимит запросов провайдера' : diag.kind === 'temporary' ? 'временный сбой провайдера' : 'неустановленный сбой запуска'
+    const budgetText = Number.isFinite(budget) ? ` (попытка ${attempts}/${budget})` : ` (попытка ${attempts})`
+    return `Ожидание повторного запуска агента: ${kindLabel}${diag.detail ? ` — ${diag.detail}` : ''}; следующая попытка в ${when}${budgetText}. Ремонт не отменён и не расходует попытку.`
+  }
+
+  async function retryIterativeAgent(scope: { workspaceId?: string; projectName: string }): Promise<void> {
+    const state = loadState()
+    const workspace = findWorkspace(state, scope.workspaceId)
+    const project = findProject(workspace, scope.projectName)
+    const runDir = iterativeTaskRunDir(workspace, project)
+    const fullScope = { workspaceId: workspace.id, projectName: project.name }
+    const lease = readAgentLease(agentLeaseFile(runDir))
+    if (!lease?.waiting) return
+    if ((lease.retryAt ?? 0) > Date.now()) {
+      scheduleAgentWaitRetry(fullScope, lease.retryAt as number)
+      return
+    }
+    await runIterativeAgent(fullScope)
+  }
+
+  function scheduleAgentWaitRetry(scope: { workspaceId: string; projectName: string }, retryAt: number): void {
+    cancelPendingAgentWait(scope)
+    const delay = Math.max(0, retryAt - Date.now())
+    const timer = setTimeout(() => {
+      pendingAgentWaitRetries.delete(stepLockKey(scope.workspaceId, scope.projectName))
+      retryIterativeAgent(scope).catch(() => undefined)
+    }, Math.min(delay, 2_147_000_000))
+    pendingAgentWaitRetries.set(stepLockKey(scope.workspaceId, scope.projectName), timer)
+  }
+
+  function cancelPendingAgentWait(scope: { workspaceId: string; projectName: string }): void {
+    const key = stepLockKey(scope.workspaceId, scope.projectName)
+    const timer = pendingAgentWaitRetries.get(key)
+    if (timer) {
+      clearTimeout(timer)
+      pendingAgentWaitRetries.delete(key)
+    }
+  }
+
+  const runIterativeAgent = async (input: { workspaceId?: string; projectName: string }): Promise<{
+    autopilot?: { stopped: string; error?: string }
+    ok: boolean
+    changedFiles?: string[]
+    forbiddenMutations?: string[]
+    phase?: string
+    step?: string
+    next?: IterativeDecision
+    agentOutputTail?: string
+    // Launch-wait resilience: a retryable provider outage parks the repair.
+    waiting?: boolean
+    retryAt?: number
+    retryAfterSeconds?: number
+    failureKind?: string
+    cancelable?: boolean
+    reason?: string
+    error?: string
+  }> => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -8469,6 +8561,32 @@ function setupIpc(): void {
     // with the durable lease below it prevents double dispatch within one
     // process lifetime and across an app restart.
     iterativeStepInFlight.add(stepLockKey(workspace.id, project.name))
+    // Launch-wait resilience: classify the durable lease BEFORE marking the
+    // attempt running. A parked WAIT (retry time not reached) must not be
+    // flipped to running, must not consume a repair attempt, and must not
+    // spawn a second agent. When the wait is over the SAME lease returns
+    // 'retry' (fresh launch, durable attempt counter carried) — a restarted
+    // Desktop therefore continues exactly the parked wait, never a duplicate.
+    const leasePath = agentLeaseFile(runDir)
+    const existingLease = readAgentLease(leasePath)
+    const leaseDecision = decideAgentLeaseDispatch(existingLease, isPidAlive)
+    if (leaseDecision.action === 'wait') {
+      ensureAttemptRecord(runDir, project.name, workspace.id)
+      updateAttempt(runDir, { status: 'waiting', stage: 'agent', lastError: undefined, cancelRequested: false, reason: leaseDecision.detail, waitUntil: leaseDecision.retryAt })
+      publishIterativeAttempt(runDir)
+      return { ok: false, waiting: true, retryAt: leaseDecision.retryAt, cancelable: true, failureKind: 'wait', reason: leaseDecision.detail, error: `AGENT_LAUNCH_WAIT: ${leaseDecision.detail}` }
+    }
+    if (leaseDecision.action === 'give-up') {
+      clearAgentLease(leasePath)
+      ensureAttemptRecord(runDir, project.name, workspace.id)
+      updateAttempt(runDir, { status: 'failed', stage: 'agent', lastStep: 'agent', finishedAt: Date.now(), lastError: leaseDecision.detail })
+      publishIterativeAttempt(runDir)
+      recordAttemptLog(runDir, `Agent launch gave up: ${leaseDecision.detail}\n`)
+      return { ok: false, error: leaseDecision.detail }
+    }
+    const carriedLaunchAttempts = leaseDecision.action === 'retry' ? leaseDecision.launchAttempts : 0
+    const resumeSessionId = leaseDecision.action === 'resume' ? leaseDecision.sessionId : undefined
+    const resuming = resumeSessionId !== undefined
     // L1: journal the agent dispatch so the panel can show "ремонт у агента"
     // and the last error survives a restart.
     resumeAttempt(runDir, project.name, workspace.id)
@@ -8503,6 +8621,9 @@ function setupIpc(): void {
       }
       const decision = decideNextStep(runDir, payload)
       if (decision.step !== 'agent') {
+        // A parked launch-wait belongs to a repair that is no longer pending;
+        // drop it so the user's next action starts clean.
+        if (existingLease?.waiting) clearAgentLease(leasePath)
         return { ok: false, error: `NO_REPAIR_PENDING: phase=${String(payload.run?.phase ?? '')}` }
       }
       // R6/#5: classify the durable lease before dispatching. A fresh lease
@@ -8510,18 +8631,14 @@ function setupIpc(): void {
       // refuse without spending an attempt. A fresh lease whose owner is DEAD
       // means a kill/crash mid-run: resume the exact same provider session
       // (same attempt, durable trial edits, budget untouched). An absent or
-      // expired lease starts fresh.
-      const leasePath = agentLeaseFile(runDir)
-      const existingLease = readAgentLease(leasePath)
-      const leaseDecision = decideAgentLeaseDispatch(existingLease, isPidAlive)
+      // expired lease starts fresh. A parked WAIT is handled before the run
+      // journal starts (above); here only in-progress/resume/fresh remain.
       if (leaseDecision.action === 'in-progress') {
         return {
           ok: false,
           error: `AGENT_IN_PROGRESS: ремонт от ${existingLease?.startedAt} (${existingLease?.provider}, сессия ${String(existingLease?.sessionId ?? '').slice(0, 8)}…) ещё не завершён; дождитесь завершения`,
         }
       }
-      const resumeSessionId = leaseDecision.action === 'resume' ? leaseDecision.sessionId : undefined
-      const resuming = resumeSessionId !== undefined
       // R7: the bootstrap repair works in the version-neutral C0 trial (run-level
       // bootstrapRefs, no candidate); candidate repair works in the candidate
       // trial. Both branches build the prompt over the durable repair requests.
@@ -8599,10 +8716,14 @@ function setupIpc(): void {
       // agent TEXT alone may never claim a completed repair.
       const provider = workspace.agent === 'claude' ? 'claude' : workspace.agent === 'codex' ? 'codex' : 'opencode'
       const model = workspace.agentModel
-      if (provider === 'opencode' && model) {
-        const available = await listAgentModels(provider, projectPath)
-        if (!available.includes(model)) throw new Error(`AGENT_MODEL_UNAVAILABLE: ${model}; choose an available model for ${provider}`)
-      }
+      // Model DISCOVERY (`opencode models`) never gates a launch when a model is
+      // already explicitly selected: the OpenCode `--model` contract owns the
+      // validation, and a discovery probe that itself fails (rate limit,
+      // concurrent process, crash) must not abort a repair. A wrong selected
+      // model fails at LAUNCH with the provider's own error, which is classified
+      // (auth-config / permanent) and surfaced with clear diagnostics — never
+      // hidden and never blamed on discovery. The UI dropdown still lists models
+      // via flow:list-agent-models (best-effort, errors swallow to `[]`).
       recordAttemptLog(runDir, `Agent dispatch: provider=${provider}; model=${model || '(provider default)'}\n`)
       updateAttempt(runDir, { reason: `Agent repair: ${provider}; model=${model || '(provider default)'}` })
       publishIterativeAttempt(runDir)
@@ -8629,6 +8750,8 @@ function setupIpc(): void {
         let output = ''
         let exitCode = 0
         let agentTimedOut = false
+        let agentStdout = ''
+        let agentStderr = ''
         if (provider === 'opencode') {
           const transport = await startStandaloneOpenCodeServer(projectPath)
           try {
@@ -8636,6 +8759,8 @@ function setupIpc(): void {
             // awaited, with the session/provider/database/attempt identities.
             // On resume it keeps the ORIGINAL sessionId and databasePath so
             // the exact provider conversation is found and continued.
+            // launchAttempts is carried across a parked wait so a restarted
+            // Desktop honors the same retry budget (never a re-spent attempt).
             writeAgentLease(leasePath, {
               schemaVersion: 1,
               sessionId,
@@ -8646,6 +8771,7 @@ function setupIpc(): void {
               attemptId: ctx.attemptId,
               pid: process.pid,
               startedAt: new Date().toISOString(),
+              launchAttempts: carriedLaunchAttempts,
             })
             const agentResult = await spawnIterativeStreamed(
               runDir,
@@ -8660,7 +8786,9 @@ function setupIpc(): void {
             )
             exitCode = agentResult.code
             agentTimedOut = agentResult.timedOut === true
-            output = `${agentResult.stdout}\n${agentResult.stderr}`
+            agentStdout = agentResult.stdout
+            agentStderr = agentResult.stderr
+            output = `${agentStdout}\n${agentStderr}`
           } finally {
             transport?.stop()
           }
@@ -8676,6 +8804,7 @@ function setupIpc(): void {
             attemptId: ctx.attemptId,
             pid: process.pid,
             startedAt: new Date().toISOString(),
+            launchAttempts: carriedLaunchAttempts,
           })
           const agentResult = await spawnCaptureWithInput(
             provider === 'claude' ? 'claude' : 'codex',
@@ -8690,9 +8819,46 @@ function setupIpc(): void {
           )
           exitCode = agentResult.code
           agentTimedOut = agentResult.timedOut === true
-          output = `${agentResult.stdout}\n${agentResult.stderr}`
+          agentStdout = agentResult.stdout
+          agentStderr = agentResult.stderr
+          output = `${agentStdout}\n${agentStderr}`
         }
         agentOutputTail = output.slice(-4000)
+        // Launch-failure resilience: classify BEFORE the ordinary provider
+        // error handling. A retryable outage (rate limit / temporary / unknown
+        // with budget left) parks the repair in a durable wait: the attempt is
+        // NOT failed, no repair attempt is consumed, and the launch is retried
+        // after the provider's reset time / a bounded backoff. A permanent or
+        // budget-exhausted failure falls through to a clear terminal error.
+        if (exitCode !== 0 || agentTimedOut) {
+          const launchDiag = classifyAgentLaunchFailure({ code: exitCode, stdout: agentStdout, stderr: agentStderr, timedOut: agentTimedOut })
+          const parkedLaunchAttempts = (readAgentLease(leasePath)?.launchAttempts ?? 0) + 1
+          if (canRetryAgentLaunch(launchDiag.kind, parkedLaunchAttempts) && launchDiag.kind !== 'permanent') {
+            const retryAt = Date.now() + agentLaunchRetryDelayMs(launchDiag, parkedLaunchAttempts)
+            const waitDetail = agentLaunchWaitDetail(launchDiag, parkedLaunchAttempts, retryAt)
+            const waitKind: 'rate-limited' | 'temporary' | 'unknown' =
+              launchDiag.kind === 'rate-limited' || launchDiag.kind === 'temporary' || launchDiag.kind === 'unknown' ? launchDiag.kind : 'unknown'
+            const parked = { ...(readAgentLease(leasePath) ?? existingLease!), waiting: true, waitKind, waitDetail: launchDiag.detail, retryAt, retryAfterSeconds: launchDiag.retryAfterSeconds, launchAttempts: parkedLaunchAttempts, sessionId, provider, databasePath: readAgentLease(leasePath)?.databasePath ?? existingLease?.databasePath ?? '', runId: ctx.runId, candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId, attemptId: ctx.attemptId, pid: process.pid, startedAt: new Date().toISOString() }
+            writeAgentLease(leasePath, parked)
+            recordAttemptLog(runDir, `Agent launch wait (${launchDiag.kind}): exit=${launchDiag.code}, timedOut=${launchDiag.timedOut}${launchDiag.retryAfterSeconds !== undefined ? `, retryAfter=${launchDiag.retryAfterSeconds}s` : ''}; ${launchDiag.detail}\n`)
+            updateAttempt(runDir, { status: 'waiting', stage: 'agent', lastError: undefined, cancelRequested: false, reason: waitDetail, waitUntil: retryAt })
+            publishIterativeAttempt(runDir)
+            scheduleAgentWaitRetry({ workspaceId: workspace.id, projectName: project.name }, retryAt)
+            return { ok: false, waiting: true, retryAt, retryAfterSeconds: launchDiag.retryAfterSeconds, failureKind: launchDiag.kind, cancelable: true, reason: waitDetail, error: `AGENT_LAUNCH_WAIT: ${launchDiag.kind}: ${launchDiag.detail}`, agentOutputTail }
+          }
+          if (launchDiag.kind === 'unknown' || launchDiag.kind === 'temporary') {
+            // Budget exhausted for a never-resolving unconfirmed outage: end
+            // with the RAW diagnostics so the true cause is not hidden.
+            clearAgentLease(leasePath)
+            throw new Error(`AGENT_LAUNCH_BUDGET_EXHAUSTED: ${provider}; model=${model || '(provider default)'}; ${launchDiag.kind} after ${parkedLaunchAttempts} attempts; exit=${launchDiag.code}, timedOut=${launchDiag.timedOut}: ${launchDiag.detail}${agentStderr.trim() ? `\n${agentStderr.trim().slice(-1200)}` : ''}`)
+          }
+          // auth-config / permanent: retrying cannot fix them — fail with a
+          // clear, actionable diagnostic instead of hiding the cause.
+          if (launchDiag.kind === 'auth-config' || launchDiag.kind === 'permanent') {
+            clearAgentLease(leasePath)
+            throw new Error(`AGENT_LAUNCH_FAILED: ${provider}; model=${model || '(provider default)'}; ${launchDiag.kind}: ${launchDiag.detail}${agentStderr.trim() ? `\n${agentStderr.trim().slice(-1200)}` : ''}`)
+          }
+        }
         const providerFailure = agentProviderFailure(output, exitCode)
         if (providerFailure) throw new Error(`AGENT_PROVIDER_ERROR: ${provider}; model=${model || '(provider default)'}; ${providerFailure}`)
         if (agentTimedOut) {
@@ -8772,7 +8938,10 @@ function setupIpc(): void {
         agentSucceeded = true
         return { ok: true, changedFiles: parsed.changedFiles, phase: next?.phase, next, agentOutputTail }
       } finally {
-        clearAgentLease(leasePath)
+        // A parked launch-wait lease is the durable record of the wait; only a
+        // non-waiting lease is cleared here. The waiting return above already
+        // published the 'waiting' attempt; the retry timer consumes the lease.
+        if (!readAgentLease(leasePath)?.waiting) clearAgentLease(leasePath)
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -8789,7 +8958,9 @@ function setupIpc(): void {
       publishIterativeAttempt(runDir)
       iterativeStepInFlight.delete(stepLockKey(workspace.id, project.name))
     }
-  }))
+  }
+
+  ipcMain.handle('flow:iterative:agent', iterativeAutopilot.register('agent', async (_event, input: { workspaceId?: string; projectName: string }) => runIterativeAgent(input)))
 
   ipcMain.handle('flow:dependency-graph-snapshot', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()

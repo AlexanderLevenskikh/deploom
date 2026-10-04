@@ -14,6 +14,7 @@ import {
   agentPromptFile,
   buildFeedbackPayload,
   buildIterativeRepairPrompt,
+  cancelWaitingAgentLease,
   changedFilesFromBaseline,
   clearAgentLease,
   decideAgentLeaseDispatch,
@@ -393,6 +394,35 @@ const expiredLease = {
 };
 const expired = decideAgentLeaseDispatch(expiredLease, () => true);
 if (expired.action !== "none") throw new Error(`Expired lease must dispatch fresh even with a live pid: ${JSON.stringify(expired)}`);
+
+// 11b. Launch-wait (rate limit / temporary outage): a PARKED WAIT lease is the
+// durable "repair is parked" record. While its retry time is in the future the
+// dispatch MUST say 'wait' (never spawn an agent, never consume an attempt);
+// once the time passes it says 'retry' carrying the durable attempt counter so
+// a restarted Desktop honors the same retry budget. A finite budget exhausted
+// ends in 'give-up' with a clear diagnostic; a CONFIRMED rate limit has NO
+// budget. A waiting-lease holder stays alive and is NEVER refused as
+// in-progress — the parked wait IS the single-owner guard until retry or cancel.
+const waitingFuture = { schemaVersion: 1, sessionId: "s1", provider: "opencode", databasePath: "/db", runId: "iter-agent-1", candidateId: "C2", attemptId: 1, pid: process.pid, startedAt: new Date().toISOString(), waiting: true, waitKind: "rate-limited", waitDetail: "429: rate limit; retry after 30s", retryAt: Date.now() + 30_000, retryAfterSeconds: 30, launchAttempts: 2 };
+const waitDecision = decideAgentLeaseDispatch(waitingFuture, () => true);
+assert.equal(waitDecision.action, "wait", "Future retry time must keep the repair parked");
+if (waitDecision.action === "wait" && waitDecision.retryAt !== waitingFuture.retryAt) throw new Error("wait must carry the exact retryAt");
+const waitEligible = { ...waitingFuture, retryAt: Date.now() - 1000 };
+const retryDecision = decideAgentLeaseDispatch(waitEligible, () => true);
+assert.equal(retryDecision.action, "retry", "Passed retry time must relaunch");
+if (retryDecision.action === "retry" && retryDecision.launchAttempts !== 2) throw new Error("retry must carry the durable launchAttempts");
+assert.equal(decideAgentLeaseDispatch({ ...waitEligible, waitKind: "unknown", launchAttempts: 3 }, () => true).action, "give-up", "Unknown-outage budget exhausted must end with a diagnostic");
+assert.equal(decideAgentLeaseDispatch({ ...waitEligible, waitKind: "temporary", launchAttempts: 5 }, () => true).action, "give-up", "Temporary-outage budget exhausted must end with a diagnostic");
+assert.equal(decideAgentLeaseDispatch({ ...waitEligible, waitKind: "rate-limited", launchAttempts: 99 }, () => true).action, "retry", "A confirmed rate limit has NO retry budget");
+// cancelWaitingAgentLease clears ONLY a parked waiting lease — the in-flight
+// protection must never be removable through the wait-cancel path.
+const waitFile = join(runDir, "trial", "wait-lease.json");
+writeAgentLease(waitFile, waitingFuture);
+assert.equal(cancelWaitingAgentLease(waitFile), true, "cancel must clear a waiting lease");
+assert.equal(readAgentLease(waitFile), undefined, "canceled wait lease must be gone");
+writeAgentLease(leasePath, { schemaVersion: 1, sessionId: "abc123", provider: "opencode", databasePath: "/db", runId: "iter-agent-1", candidateId: "C2", attemptId: 1, pid: process.pid, startedAt: new Date(leaseNow).toISOString() });
+assert.equal(cancelWaitingAgentLease(leasePath), false, "an in-flight lease must never be cleared by the wait-cancel path");
+assert.ok(readAgentLease(leasePath), "in-flight lease must survive the wait-cancel");
 
 clearAgentLease(leasePath);
 if (existsSync(leasePath)) throw new Error("clearAgentLease must remove the file");

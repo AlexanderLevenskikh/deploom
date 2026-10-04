@@ -197,6 +197,7 @@ jobs:
           npm run check:iterative-stream
           npm run check:iterative-scenario
           npm run check:iterative-agent
+          npm run check:agent-launch-errors
           npm run check:storage-maintenance
           npm run check:task-clipboard
           npm run check:electron-clipboard

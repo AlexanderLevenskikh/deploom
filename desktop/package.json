@@ -92,6 +92,8 @@
     "check:iterative-scenario": "node scripts/check-iterative-scenario.mjs",
     "precheck:iterative-agent": "tsc -p tsconfig.electron.json",
     "check:iterative-agent": "node scripts/check-iterative-agent.mjs",
+    "precheck:agent-launch-errors": "tsc -p tsconfig.electron.json",
+    "check:agent-launch-errors": "node scripts/check-agent-launch-errors.mjs",
     "check:storage-maintenance": "node scripts/check-storage-maintenance.mjs"
   },
   "dependencies": {

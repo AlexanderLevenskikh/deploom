@@ -391,7 +391,11 @@ export type IterativeAttemptView = {
   // P2 (#2): events are scoped to the workspace — the panel must not ingest the
   // same-named project of a DIFFERENT workspace.
   workspaceId?: string
-  status: 'starting' | 'running' | 'done' | 'failed' | 'canceled'
+  // 'waiting' — a retryable agent-launch outage (rate limit / temporary /
+  // unknown with budget left) parked the repair until the provider's reset
+  // time or a bounded backoff. It is NOT an active run (no attempt spent, no
+  // agent spawned) and NOT a failure — the repair resumes on its own.
+  status: 'starting' | 'running' | 'done' | 'failed' | 'canceled' | 'waiting'
   stage: 'preflight' | 'begin' | 'drive' | 'agent' | 'none'
   phase?: string
   startedAt: number
@@ -411,6 +415,13 @@ export type IterativeAttemptView = {
   lastStep?: string
   runCreated: boolean
   cancelRequested?: boolean
+  // Launch-wait display: epoch-ms time of the next agent launch attempt while
+  // the attempt is 'waiting'. The AUTHORITATIVE retry time lives in the durable
+  // lease — this only drives the countdown in the panel.
+  waitUntil?: number
+  // Launch-wait display: the failure kind that caused the wait (rate-limited /
+  // temporary / unknown) for a precise reason label.
+  waitFailureKind?: string
 }
 export type IterativeStatusOutcome = {
   progressSummary?: { checkpointId: string; remaining: number; denominator: number; accepted: number; deferred: number; targetCount: number; unresolvedGoals: number }
@@ -471,6 +482,15 @@ export type IterativeAgentOutcome = {
   phase?: string
   next?: IterativeRunnerDecision
   agentOutputTail?: string
+  // Launch-wait resilience: ok=false + waiting=true parks the repair until
+  // retryAt (provider rate limit / temporary outage); cancelable lets the panel
+  // offer "отменить ожидание" via flow:iterative:cancel.
+  waiting?: boolean
+  retryAt?: number
+  retryAfterSeconds?: number
+  failureKind?: string
+  cancelable?: boolean
+  reason?: string
   error?: string
 }
 

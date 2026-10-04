@@ -64,6 +64,9 @@ const MAIN_LABEL: Record<ScenarioMainActionState, [string, string]> = {
   running: ['Остановить', 'Stop'],
   'recovered-running': ['Продолжить обновление', 'Continue the update'],
   agent: ['Исправить агентом', 'Repair with an agent'],
+  // Launch-wait: a provider rate limit / temporary outage parked the repair.
+  // The only useful user control while waiting is canceling the wait.
+  'agent-waiting': ['Отменить ожидание', 'Cancel wait'],
   result: ['Посмотреть результат', 'View the result'],
   partial: ['Посмотреть результат', 'View the result'],
   'budget-stop': ['Посмотреть результат', 'View the result'],
@@ -87,6 +90,9 @@ const MAIN_DESCRIPTION: Record<ScenarioMainActionState, [string, string]> = {
   running: ['Идёт работа. Остановить можно в любой момент; проверенный результат сохраняется.', 'Work is running. You can stop at any time; the verified result is kept.'],
   'recovered-running': ['Работа была прервана перезапуском; процесс не запущен. Продолжите, чтобы возобновить её.', 'Work was interrupted by a restart; no process is running. Continue to resume it.'],
   agent: ['Нужны исправления в изолированном окружении. Запустите агента.', 'Repairs are needed in an isolated environment. Run the agent.'],
+  // Launch-wait: the durable attempt.reason carries the exact cause + the next
+  // attempt time; the static line is the fallback when the journal is absent.
+  'agent-waiting': ['Провайдер агента временно недоступен (лимит запросов или сбой). Ремонт продолжит сам — попытка не расходуется. Можно отменить ожидание.', 'The agent provider is temporarily unavailable (rate limit or outage). The repair continues on its own — no attempt is spent. You can cancel the wait.'],
   result: ['Обновления проверены. Откройте результат и задание.', 'The updates are verified. Open the result and the assignment.'],
   partial: ['Часть обновлений применена и проверена, но не все цели выполнены. Откройте результат.', 'Some updates were applied and verified, but not all goals were reached. Open the result.'],
   'budget-stop': ['Работа остановилась по бюджету; проверенное сохранено, часть целей не выполнена. Откройте результат.', 'Stopped by the budget; the verified work is kept, some goals were not reached. Open the result.'],
@@ -105,6 +111,7 @@ const activityText = (attempt?: IterativeAttemptView, text?: (ru: string, en: st
   if (!attempt) return t('Подготовка…', 'Preparing…')
   if (attempt.status === 'failed') return t('Попытка не завершилась', 'The attempt failed')
   if (attempt.status === 'canceled') return t('Работа остановлена', 'Work was stopped')
+  if (attempt.status === 'waiting') return t('Ожидание повторного запуска агента', 'Waiting for the agent to relaunch')
   if (attempt.status === 'done' && attempt.lastStep === 'agent') return t('Нужны исправления — обновление приостановлено', 'Repairs needed — update paused')
   if (attempt.status === 'done') return t(attempt.lastStep === 'no-targets' ? 'План обновления ещё не выбран' : 'Этап завершён', attempt.lastStep === 'no-targets' ? 'No update plan selected yet' : 'Stage completed')
   const stage = attempt.stage
@@ -574,6 +581,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         'Registry-данные не получены или бюджет поиска исчерпан — результат не засчитан. Повторите поиск или настройте состав обновления.',
         'Registry data was not obtained or the search budget was exhausted — not counted. Retry the search or configure the update scope.',
       )
+    : mainAction.state === 'agent-waiting'
+    ? (attempt?.reason || text(...MAIN_DESCRIPTION[mainAction.state]))
     : text(...MAIN_DESCRIPTION[mainAction.state])
 
   const elapsedMs = attemptActiveElapsed(attempt, attemptAlive && childAlive, nowTick)
@@ -654,6 +663,12 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         void driveNow()
         break
       case 'running':
+        void cancelNow()
+        break
+      case 'agent-waiting':
+        // The repair is parked by a provider outage; the user control is
+        // canceling the wait (flow:iterative:cancel clears only the *waiting*
+        // lease — no agent was running; no repair attempt is spent).
         void cancelNow()
         break
       case 'agent':

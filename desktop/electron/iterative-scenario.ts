@@ -56,6 +56,9 @@ export type ScenarioAttemptShape = {
   stepsDone?: string[]
   runCreated?: boolean
   discoveryCompleted?: boolean
+  /** Launch-wait display: epoch-ms of the next agent launch while 'waiting'. */
+  waitUntil?: number
+  waitFailureKind?: string
 } | undefined
 
 export type ScenarioRunnerShape = {
@@ -87,6 +90,7 @@ export type ScenarioMainActionState =
   | "running" // реальный процесс выполняется → Остановить
   | "recovered-running" // журнал running, но живого процесса нет → Продолжить
   | "agent" // требуется ремонт агентом → Исправить агентом
+  | "agent-waiting" // прерывание запуска агента (rate limit / временный сбой) → ждать / отменить ожидание
   | "result" // результат ПОЛНОСТЬЮ проверен и принят → Посмотреть результат
   | "partial" // P1#3: завершено, но не все цели выполнены → Посмотреть результат (честно)
   | "budget-stop" // P1#3: остановлено бюджетом → Посмотреть результат (честно)
@@ -141,6 +145,24 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
   //    Electron, not from a local busy flag.
   if (input.inFlight) {
     return { state: "running", blocker, firstRun: false, reasonShort: activityReason(attempt) }
+  }
+
+  // Launch-wait: a retryable agent-launch outage (rate limit / temporary /
+  // unknown with budget left) parked the repair until the provider's reset
+  // time or a bounded backoff. The attempt is NOT active (no agent spawned,
+  // no repair attempt spent) and NOT failed — the repair relaunches on its
+  // own; the panel offers "отменить ожидание". Must be checked after the
+  // in-flight guard (a concurrent live agent still wins) and before any
+  // "recovered-running" logic that would misread the durable 'waiting' as an
+  // interrupted active run.
+  if (attempt?.status === "waiting") {
+    return {
+      state: "agent-waiting",
+      blocker,
+      firstRun: false,
+      reasonShort:
+        attempt?.reason ?? "Провайдер агента временно недоступен — ремонт ждёт повтора запуска и не расходует попытку.",
+    }
   }
 
   // A journal is activity evidence, not proof that begin created a run.
@@ -355,6 +377,7 @@ export function scenarioPipeline(state: ScenarioMainActionState, checked: boolea
     case "start-run":
     case "continue-run":
     case "agent":
+    case "agent-waiting":
       return { current: context?.runner?.phase === "BOOTSTRAP_REPAIR" ? "check" : "upgrade", completed: context?.runner?.phase === "BOOTSTRAP_REPAIR" ? [] : ["check", "plan"] }
     case "running":
     case "recovered-running": {
