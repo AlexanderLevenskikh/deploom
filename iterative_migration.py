@@ -3495,6 +3495,38 @@ def cmd_materialize(args: argparse.Namespace) -> int:
         lock.release()
 
 
+def _open_checkpoint_source(run_dir, checkpoint, config):
+    try:
+        return open_source_snapshot(
+            Path(str(checkpoint["sourceSnapshotContainer"])),
+            expected_key=str(checkpoint["sourceSnapshotKey"]), timeout_seconds=0,
+        )
+    except SourceCaptureError as exc:
+        if not str(exc).startswith("SOURCE_SNAPSHOT_TOOL_BUILD_MISMATCH:"):
+            raise
+    from checkpoint_build_upgrade import CheckpointBuildUpgradeError, reopen_checkpoint_source
+    verify_config = dataclasses.replace(
+        verify_config_from(config["verifyConfig"], run_dir), verification_purpose="intermediate-candidate"
+    )
+    with MigrationProgress(_emit_status, operation="checkpoint-upgrade", message="Opening preserved checkpoint") as progress:
+        def verify(project, assignment):
+            return verify_assignment(
+                project, assignment, config=verify_config, run_project_checks=True,
+                runtime_env=_runtime_env(config), progress=progress,
+                progress_label="checkpoint after DepLoom update",
+            )
+        def report(message):
+            _emit_status({"event": "migration.progress", "message": message})
+        try:
+            return reopen_checkpoint_source(run_dir, checkpoint, config, verify=verify, progress=report, runtime_env=_runtime_env(config))
+        except CheckpointBuildUpgradeError as exc:
+            raise ProjectUnreadyError(
+                "CHECKPOINT_BUILD_UPGRADE_UNCONFIRMED",
+                "Сохранённый результат не подтверждён новой версией DepLoom. Прежний checkpoint сохранён. " + str(exc),
+                command="",
+            ) from exc
+
+
 def _materialize_locked(
     run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], args: argparse.Namespace
 ) -> int:
@@ -3520,11 +3552,7 @@ def _materialize_locked(
         }
     )
 
-    snapshot = open_source_snapshot(
-        Path(str(base_checkpoint["sourceSnapshotContainer"])),
-        expected_key=str(base_checkpoint["sourceSnapshotKey"]),
-        timeout_seconds=0,
-    )
+    snapshot = _open_checkpoint_source(run_dir, base_checkpoint, config)
     workspace_root = trial_workspace_root(run_dir)
     if workspace_root.exists():
         shutil.rmtree(workspace_root, ignore_errors=True)
@@ -5187,11 +5215,7 @@ def _audit_locked(
 ) -> int:
     _assert_runtime_unchanged(config)
     checkpoint = load_checkpoint(run_dir, str(run["activeCheckpointId"]))
-    snapshot = open_source_snapshot(
-        Path(str(checkpoint["sourceSnapshotContainer"])),
-        expected_key=str(checkpoint["sourceSnapshotKey"]),
-        timeout_seconds=0,
-    )
+    snapshot = _open_checkpoint_source(run_dir, checkpoint, config)
     project_path = Path(snapshot.root) / str(checkpoint.get("projectRelative") or ".")
     try:
         from manual_dependency_audit import build_report, markdown

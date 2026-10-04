@@ -16,6 +16,7 @@ _COMPONENT_FILES: Mapping[str, tuple[str, ...]] = {
         "block_vex_storage.py",
     ),
     "source": (
+        "checkpoint_build_upgrade.py",
         "source_snapshot.py",
         "project_topology.py",
         "verification_workspace_backend.py",

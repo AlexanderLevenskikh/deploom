@@ -1881,8 +1881,9 @@ def open_source_snapshot(
     *,
     expected_key: str = "",
     timeout_seconds: int = 1800,
+    allow_build_upgrade: bool = False,
 ) -> SourceSnapshot:
-    """Open and strongly validate a durable SourceSnapshot container."""
+    """Validate durable bytes; foreign-build input is opt-in, never proof."""
     container = container.expanduser().resolve()
     manifest_path = container / "manifest.json"
     root = container / "tree"
@@ -1905,7 +1906,10 @@ def open_source_snapshot(
     manifest_key = str(raw.get("manifestKey") or "")
     policy_key = str(raw.get("policyKey") or "")
     current_build_id = tool_build_id()
-    if raw.get("toolBuildId") != current_build_id:
+    producer_build_id = raw.get("toolBuildId")
+    if not isinstance(producer_build_id, str) or not producer_build_id:
+        raise SourceCaptureError("SOURCE_SNAPSHOT_TOOL_BUILD_INVALID")
+    if producer_build_id != current_build_id and not allow_build_upgrade:
         raise SourceCaptureError(
             "SOURCE_SNAPSHOT_TOOL_BUILD_MISMATCH: "
             f"expected={current_build_id}; observed={raw.get('toolBuildId')}"
@@ -1940,16 +1944,22 @@ def open_source_snapshot(
         timeout_seconds=timeout_seconds,
         progress_label="durable source snapshot validation",
     )
-    if observed.key != manifest_key:
+    # Content manifests also include the producer build. Recompute that
+    # identity from freshly hashed bytes, never by replacing the stored build.
+    producer_manifest_key = _canonical_hash({
+        "schema": SOURCE_SNAPSHOT_SCHEMA, "toolBuildId": producer_build_id,
+        "policyKey": policy_key, "entries": list(observed.entries),
+    }, length=64)
+    if producer_manifest_key != manifest_key:
         raise SourceCaptureError(
             "SOURCE_SNAPSHOT_CONTENT_MISMATCH: "
-            f"expected={manifest_key}; observed={observed.key}"
+            f"expected={manifest_key}; observed={producer_manifest_key}"
         )
     recomputed_key = _canonical_hash({
         "schema": SOURCE_SNAPSHOT_SCHEMA,
-        "toolBuildId": current_build_id,
+        "toolBuildId": producer_build_id,
         "policyKey": policy_key,
-        "manifestKey": observed.key,
+        "manifestKey": producer_manifest_key,
         "projectRelative": relative.as_posix() or ".",
     }, length=32)
     if recomputed_key != key:
