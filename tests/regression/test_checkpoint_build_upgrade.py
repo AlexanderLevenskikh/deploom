@@ -54,14 +54,17 @@ class CheckpointBuildUpgradeTests(unittest.TestCase):
             root = Path(tmp)
             checkpoint, config = self.fixture(root)
             calls = []
+            messages = []
             def verify(project, assignment):
                 calls.append((project, assignment))
                 return BaselineVerifyResult(True, "passed", "checked")
-            first = upgrade.reopen_checkpoint_source(root / "run", checkpoint, config, verify=verify, progress=lambda *args: None)
+            first = upgrade.reopen_checkpoint_source(root / "run", checkpoint, config, verify=verify, progress=messages.append)
             second = upgrade.reopen_checkpoint_source(root / "run", checkpoint, config, verify=verify, progress=lambda *args: None)
             self.assertNotEqual(first.key, checkpoint["sourceSnapshotKey"])
             self.assertEqual(first.key, second.key)
             self.assertEqual(len(calls), 1)
+            self.assertTrue(any("durable source snapshot copy: ready; files=" in message for message in messages))
+            self.assertTrue(any("durable source snapshot validation" in message for message in messages))
             changed = {**config, "verifyConfig": {**config["verifyConfig"], "commands": ["node another-check.cjs"]}}
             upgrade.reopen_checkpoint_source(root / "run", checkpoint, changed, verify=verify, progress=lambda *args: None)
             self.assertEqual(len(calls), 2)
@@ -83,12 +86,15 @@ class CheckpointBuildUpgradeTests(unittest.TestCase):
             checkpoint, config = self.fixture(root)
             messages = []
             with mock.patch.object(migration, "_emit_status", side_effect=messages.append):
-                snapshot = migration._open_checkpoint_source(root / "run", checkpoint, config)
+                snapshot = migration._open_checkpoint_source(root / "run", checkpoint, config, run_id="demo-run", candidate_id="demo-candidate")
             self.assertNotEqual(snapshot.key, checkpoint["sourceSnapshotKey"])
             record = json.loads(next((root / "run" / "checkpoint-build-upgrades").glob("*.json")).read_text(encoding="utf-8"))
             self.assertEqual(record["verification"]["status"], "passed")
             self.assertTrue(any("Re-running" in str(event) for event in messages))
             self.assertEqual(checkpoint["checkpointId"], "C4")
+            self.assertTrue(messages)
+            self.assertTrue(all(event["runId"] == "demo-run" and event["candidateId"] == "demo-candidate" for event in messages))
+            self.assertEqual([event["sequence"] for event in messages], list(range(1, len(messages) + 1)))
 
 
 if __name__ == "__main__":

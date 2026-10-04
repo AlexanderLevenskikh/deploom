@@ -3495,7 +3495,7 @@ def cmd_materialize(args: argparse.Namespace) -> int:
         lock.release()
 
 
-def _open_checkpoint_source(run_dir, checkpoint, config):
+def _open_checkpoint_source(run_dir, checkpoint, config, *, run_id="", candidate_id=""):
     try:
         return open_source_snapshot(
             Path(str(checkpoint["sourceSnapshotContainer"])),
@@ -3508,17 +3508,16 @@ def _open_checkpoint_source(run_dir, checkpoint, config):
     verify_config = dataclasses.replace(
         verify_config_from(config["verifyConfig"], run_dir), verification_purpose="intermediate-candidate"
     )
-    with MigrationProgress(_emit_status, operation="checkpoint-upgrade", message="Opening preserved checkpoint") as progress:
+    with MigrationProgress(_emit_status, operation="checkpoint-upgrade", message="Opening preserved checkpoint",
+                           run_id=run_id, candidate_id=candidate_id) as progress:
         def verify(project, assignment):
             return verify_assignment(
                 project, assignment, config=verify_config, run_project_checks=True,
                 runtime_env=_runtime_env(config), progress=progress,
                 progress_label="checkpoint after DepLoom update",
             )
-        def report(message):
-            _emit_status({"event": "migration.progress", "message": message})
         try:
-            return reopen_checkpoint_source(run_dir, checkpoint, config, verify=verify, progress=report, runtime_env=_runtime_env(config))
+            return reopen_checkpoint_source(run_dir, checkpoint, config, verify=verify, progress=progress, runtime_env=_runtime_env(config))
         except CheckpointBuildUpgradeError as exc:
             raise ProjectUnreadyError(
                 "CHECKPOINT_BUILD_UPGRADE_UNCONFIRMED",
@@ -3552,7 +3551,7 @@ def _materialize_locked(
         }
     )
 
-    snapshot = _open_checkpoint_source(run_dir, base_checkpoint, config)
+    snapshot = _open_checkpoint_source(run_dir, base_checkpoint, config, run_id=str(run["runId"]), candidate_id=str(candidate["candidateId"]))
     workspace_root = trial_workspace_root(run_dir)
     if workspace_root.exists():
         shutil.rmtree(workspace_root, ignore_errors=True)
@@ -5215,7 +5214,7 @@ def _audit_locked(
 ) -> int:
     _assert_runtime_unchanged(config)
     checkpoint = load_checkpoint(run_dir, str(run["activeCheckpointId"]))
-    snapshot = _open_checkpoint_source(run_dir, checkpoint, config)
+    snapshot = _open_checkpoint_source(run_dir, checkpoint, config, run_id=str(run["runId"]))
     project_path = Path(snapshot.root) / str(checkpoint.get("projectRelative") or ".")
     try:
         from manual_dependency_audit import build_report, markdown

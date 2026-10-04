@@ -25,12 +25,12 @@ def reopen_checkpoint_source(run_dir, checkpoint, config, *, verify, progress, r
     container = Path(str(checkpoint["sourceSnapshotContainer"]))
     old_key = str(checkpoint["sourceSnapshotKey"])
     try:
-        return open_source_snapshot(container, expected_key=old_key, timeout_seconds=0)
+        return open_source_snapshot(container, expected_key=old_key, timeout_seconds=0, progress=progress)
     except SourceCaptureError as exc:
         if not str(exc).startswith("SOURCE_SNAPSHOT_TOOL_BUILD_MISMATCH:"):
             raise
     progress("Validating preserved checkpoint after the DepLoom update")
-    old = open_source_snapshot(container, expected_key=old_key, timeout_seconds=0, allow_build_upgrade=True)
+    old = open_source_snapshot(container, expected_key=old_key, timeout_seconds=0, allow_build_upgrade=True, progress=progress)
     manager = detect_package_manager(old.project_path)
     context = build_resolver_context_key(
         old.project_path, manager=manager, manager_executable=resolve_executable(manager) or manager,
@@ -55,14 +55,14 @@ def reopen_checkpoint_source(run_dir, checkpoint, config, *, verify, progress, r
         record = json.loads(record_path.read_text(encoding="utf-8"))
         if record.get("identity") != identity or record.get("verification", {}).get("status") != "passed":
             raise CheckpointBuildUpgradeError("CHECKPOINT_BUILD_UPGRADE_RECORD_INVALID")
-        snapshot = open_source_snapshot(Path(record["container"]), expected_key=record["key"], timeout_seconds=0)
+        snapshot = open_source_snapshot(Path(record["container"]), expected_key=record["key"], timeout_seconds=0, progress=progress)
         if snapshot.manifest_key != old.manifest_key:
             raise CheckpointBuildUpgradeError("CHECKPOINT_BUILD_UPGRADE_CONTENT_MISMATCH")
         return snapshot
     progress("Preparing checkpoint copy for fresh verification with the updated DepLoom")
     destination = directory / (key + "-source")
-    snapshot = (open_source_snapshot(destination, timeout_seconds=0) if destination.exists()
-                else capture_durable_source_snapshot(old.project_path, destination, timeout_seconds=0))
+    snapshot = (open_source_snapshot(destination, timeout_seconds=0, progress=progress) if destination.exists()
+                else capture_durable_source_snapshot(old.project_path, destination, timeout_seconds=0, progress=progress))
     if snapshot.manifest_key != old.manifest_key:
         raise CheckpointBuildUpgradeError("CHECKPOINT_BUILD_UPGRADE_CONTENT_MISMATCH")
     progress("Re-running the selected checks on the preserved checkpoint; old proof is not reused")

@@ -1882,6 +1882,7 @@ def open_source_snapshot(
     expected_key: str = "",
     timeout_seconds: int = 1800,
     allow_build_upgrade: bool = False,
+    progress: Optional[ProgressCallback] = None,
 ) -> SourceSnapshot:
     """Validate durable bytes; foreign-build input is opt-in, never proof."""
     container = container.expanduser().resolve()
@@ -1942,6 +1943,7 @@ def open_source_snapshot(
         root,
         policy=policy,
         timeout_seconds=timeout_seconds,
+        progress=progress,
         progress_label="durable source snapshot validation",
     )
     # Content manifests also include the producer build. Recompute that
@@ -1993,9 +1995,10 @@ def persist_source_snapshot(
     destination: Path,
     *,
     timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
 ) -> SourceSnapshot:
     """Atomically publish an active snapshot as durable evidence."""
-    validate_source_snapshot(snapshot, timeout_seconds=timeout_seconds)
+    validate_source_snapshot(snapshot, timeout_seconds=timeout_seconds, progress=progress)
     destination = destination.expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
@@ -2007,22 +2010,41 @@ def persist_source_snapshot(
         dir=str(destination.parent),
     ))
     try:
+        copied_files = copied_bytes = 0
+        last_report = time.monotonic()
+        def copy_with_progress(source, target):
+            nonlocal copied_files, copied_bytes, last_report
+            result = shutil.copy2(source, target)
+            copied_files += 1
+            copied_bytes += os.stat(source).st_size
+            now = time.monotonic()
+            if now - last_report >= 15:
+                progress(f"durable source snapshot copy: files={copied_files}, bytes={copied_bytes}")
+                last_report = now
+            return result
+        if progress:
+            progress("durable source snapshot copy: started")
         shutil.copytree(
             snapshot.container,
             stage,
             dirs_exist_ok=True,
             symlinks=True,
+            copy_function=copy_with_progress if progress else shutil.copy2,
         )
+        if progress:
+            progress(f"durable source snapshot copy: ready; files={copied_files}, bytes={copied_bytes}")
         open_source_snapshot(
             stage,
             expected_key=snapshot.key,
             timeout_seconds=timeout_seconds,
+            progress=progress,
         )
         os.replace(stage, destination)
         return open_source_snapshot(
             destination,
             expected_key=snapshot.key,
             timeout_seconds=timeout_seconds,
+            progress=progress,
         )
     except Exception:
         shutil.rmtree(stage, ignore_errors=True)
@@ -2034,15 +2056,18 @@ def capture_durable_source_snapshot(
     destination: Path,
     *,
     timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
 ) -> SourceSnapshot:
     snapshot = capture_source_snapshot(
         project_dir,
         timeout_seconds=timeout_seconds,
+        progress=progress,
     )
     return persist_source_snapshot(
         snapshot,
         destination,
         timeout_seconds=timeout_seconds,
+        progress=progress,
     )
 
 
