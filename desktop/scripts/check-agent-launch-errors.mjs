@@ -6,11 +6,13 @@ import {
   AGENT_LAUNCH_MAX_RETRY_AFTER_MS,
   AGENT_LAUNCH_MIN_RETRY_DELAY_MS,
   AGENT_LAUNCH_RETRY_BUDGET,
+  agentLaunchProviderError,
   agentLaunchRetryDelayMs,
   canRetryAgentLaunch,
   classifyAgentLaunchFailure,
   extractRetryAfterSeconds,
   isRetryableAgentLaunchFailure,
+  redactAgentDiagnostics,
 } from "../dist-electron/agent-launch-errors.js";
 
 const DESKTOP = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -74,9 +76,11 @@ assert.equal(AGENT_LAUNCH_RETRY_BUDGET.permanent, 0);
 assert.equal(isRetryableAgentLaunchFailure("rate-limited"), true);
 assert.equal(isRetryableAgentLaunchFailure("auth-config"), false);
 assert.equal(isRetryableAgentLaunchFailure("permanent"), false);
-assert.equal(canRetryAgentLaunch("temporary", 5), true);
+assert.equal(canRetryAgentLaunch("temporary", 4), true);
+assert.equal(canRetryAgentLaunch("temporary", 5), false);
 assert.equal(canRetryAgentLaunch("temporary", 6), false, "Attempt beyond the temporary budget must stop");
-assert.equal(canRetryAgentLaunch("unknown", 3), true);
+assert.equal(canRetryAgentLaunch("unknown", 2), true);
+assert.equal(canRetryAgentLaunch("unknown", 3), false);
 assert.equal(canRetryAgentLaunch("unknown", 4), false);
 assert.equal(canRetryAgentLaunch("rate-limited", 10_000), true);
 
@@ -85,7 +89,8 @@ assert.equal(canRetryAgentLaunch("rate-limited", 10_000), true);
 // 120 s so concurrent agents retry with spread, not in lockstep.
 const retryAfter = agentLaunchRetryDelayMs({ kind: "rate-limited", retryAfterSeconds: 30 }, 1);
 assert.ok(retryAfter >= 30_000 && retryAfter <= 30_000 * 1.0, `Retry-After must be honored (got ${retryAfter})`);
-assert.equal(agentLaunchRetryDelayMs({ kind: "rate-limited", retryAfterSeconds: 7200 }, 1), AGENT_LAUNCH_MAX_RETRY_AFTER_MS, "Retry-After must be capped at 1 h");
+assert.equal(agentLaunchRetryDelayMs({ kind: "rate-limited", retryAfterSeconds: 7200 }, 1), 7200_000, "A two-hour provider window must not retry early");
+assert.equal(agentLaunchRetryDelayMs({ kind: "rate-limited", retryAfterSeconds: 1e12 }, 1), AGENT_LAUNCH_MAX_RETRY_AFTER_MS);
 {
   const absentReset = agentLaunchRetryDelayMs({ kind: "rate-limited", retryAfterSeconds: 0 }, 1);
   assert.ok(absentReset >= 4000 && absentReset <= 6000, `Zero/absent reset must fall back to the 5 s backoff (got ${absentReset})`);
@@ -110,4 +115,22 @@ assert.equal(extractRetryAfterSeconds("x-ratelimit-reset: 120"), 120);
 assert.equal(extractRetryAfterSeconds('{"error":{"retry_after":75}}'), 75);
 assert.equal(extractRetryAfterSeconds("no timing info"), undefined);
 
+const now = Date.parse("2026-10-05T00:00:00Z");
+assert.equal(extractRetryAfterSeconds(`x-ratelimit-reset: ${now / 1000 + 30}`, now), 30);
+assert.equal(extractRetryAfterSeconds(`x-ratelimit-reset: ${now + 30_000}`, now), 30);
+assert.equal(extractRetryAfterSeconds(`Retry-After: ${new Date(now + 60_000).toUTCString()}`, now), 60);
+assert.equal(extractRetryAfterSeconds("x-ratelimit-reset-requests: 2m", now), 120);
+for (const message of ["insufficient_quota: no credits", "HTTP 429 insufficient_quota", "billing limit exceeded", "payment required"]) {
+  assert.equal(launch(message).kind, "permanent", message);
+}
+const jsonLimit = JSON.stringify({type: "error", error: {data: {message: "429 Too Many Requests", headers: {"retry-after": "30"}}}});
+assert.ok(agentLaunchProviderError(jsonLimit));
+assert.equal(launch("", 0, jsonLimit).kind, "rate-limited");
+assert.equal(launch("", 0, jsonLimit).retryAfterSeconds, 30);
+assert.equal(agentLaunchProviderError(JSON.stringify({type: "text", part: {text: "check error 429"}})), undefined);
+assert.equal(launch("", 0, "ordinary agent text mentions 429").kind, "permanent");
+assert.equal(extractRetryAfterSeconds('x-ratelimit-reset-tokens: 1m12s', now), 72);
+assert.equal(extractRetryAfterSeconds('{"retry_after_ms":30000}', now), 30);
+assert.equal(redactAgentDiagnostics('Authorization: Bearer sample-value'), 'Authorization: [redacted]');
+assert.equal(redactAgentDiagnostics('{"apiKey":"sample-value"}'), '{"apiKey":"[redacted]"}');
 console.log(`check-agent-launch-errors: OK (${DESKTOP})`);

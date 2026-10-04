@@ -25,7 +25,7 @@ function captureTail(previous: string, text: string): string {
   return bytes.subarray(start).toString('utf8')
 }
 
-export type CaptureResult = { code: number; stdout: string; stderr: string; timedOut: boolean }
+export type CaptureResult = { code: number; stdout: string; stderr: string; timedOut: boolean; canceled?: boolean }
 
 export type StreamPlatform = {
   processTreeDetached: () => boolean
@@ -75,6 +75,7 @@ export function spawnIterativeStreamed(
   io: StreamAttemptIo,
   platform: StreamPlatform,
   onEvent?: (payload: Record<string, any>) => void,
+  options?: { stdin?: string; onLine?: (line: string) => void; onSpawn?: (pid: number) => void },
 ): Promise<CaptureResult> {
   return new Promise((resolvePromise) => {
     let stdout = ''
@@ -82,6 +83,15 @@ export function spawnIterativeStreamed(
     let stdoutCarry = ''
     let settled = false
     let timedOut = false
+    let canceled = false
+    let observerFailed = false
+    const observe = (callback: (() => void) | undefined): void => {
+      try { callback?.() } catch (error) {
+        observerFailed = true
+        stderr += `\nAGENT_SESSION_PERSIST_FAILED: ${String(error)}`
+        platform.killProcessTree(child)
+      }
+    }
     // B6: the attempt.log byte cap must hold DURING a long/chatty child, not
     // only at close — trim throttled, so a runaway stdout/stderr stream cannot
     // balloon the diagnostic artifact past MAX_LOG_BYTES before the step ends.
@@ -106,13 +116,14 @@ export function spawnIterativeStreamed(
     })
     // Zero disables only the overall watchdog; cancellation remains active.
     child.stdin.on('error', () => { /* EPIPE from an early child exit */ })
-    child.stdin.end()
+    child.stdin.end(options?.stdin)
+    if (child.pid) observe(() => options?.onSpawn?.(child.pid as number))
     const timer = timeoutMs > 0
       ? setTimeout(() => { timedOut = true; platform.killProcessTree(child) }, timeoutMs)
       : undefined
     const cancelCheck = setInterval(() => {
-      if (io.cancelRequested(runDir)) {
-        timedOut = true
+      if (!canceled && io.cancelRequested(runDir)) {
+        canceled = true
         platform.killProcessTree(child)
       }
     }, 500)
@@ -125,6 +136,7 @@ export function spawnIterativeStreamed(
       try { io.recordLine(runDir, `${line}\n`) } catch { /* log is best-effort */ }
       maybeTrim()
       parseEventLine(line, onEvent)
+      observe(() => options?.onLine?.(line))
     }
 
     child.stdout.on('data', (chunk: Buffer) => {
@@ -144,6 +156,7 @@ export function spawnIterativeStreamed(
         maybeTrim()
       }
       for (const line of lines) {
+        observe(() => options?.onLine?.(line))
         if (line.includes('ITERATIVE_MIGRATION_STATUS_V1 ')) {
           flushPlain()
           try { io.recordLine(runDir, `${line}\n`) } catch { /* log is best-effort */ }
@@ -174,7 +187,7 @@ export function spawnIterativeStreamed(
       settled = true
       clearTimeout(timer)
       clearInterval(cancelCheck)
-      resolvePromise({ code: 1, stdout, stderr: `${stderr}${error.message}`, timedOut })
+      resolvePromise({ code: 1, stdout, stderr: `${stderr}${error.message}`, timedOut, canceled })
     })
     child.on('close', (code, signal) => {
       if (settled) return
@@ -188,8 +201,8 @@ export function spawnIterativeStreamed(
       // A kill by the watchdog leaves no exit code from the child's point of
       // view; reporting 0 here would let a timed-out begin claim success. Any
       // reason WE terminated the tree is therefore a non-zero outcome.
-      const effectiveCode = timedOut || signal ? 1 : (code ?? 1)
-      resolvePromise({ code: effectiveCode, stdout, stderr, timedOut })
+      const effectiveCode = timedOut || canceled || observerFailed || signal ? 1 : (code ?? 1)
+      resolvePromise({ code: effectiveCode, stdout, stderr, timedOut, canceled })
     })
   })
 }

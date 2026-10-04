@@ -92,8 +92,7 @@ const mkIo = (overrides = {}) => {
 }
 
 // 5. User cancel: flipping cancelRequested mid-run terminates the child and the
-// result is a non-zero, timedOut outcome — the caller distinguishes cancel from
-// a plain exit, and never treats it as success.
+// result carries an explicit canceled flag, separate from watchdog timeout.
 {
   let cancelled = false;
   const { io } = mkIo({ cancelRequested: () => cancelled });
@@ -101,7 +100,7 @@ const mkIo = (overrides = {}) => {
   setTimeout(() => { cancelled = true; }, 100);
   const result = await promise;
   if (result.code === 0) throw new Error("a user cancel must never report a zero exit code");
-  if (!result.timedOut) throw new Error("a user cancel must produce timedOut so callers treat it as a non-success");
+  if (!result.canceled || result.timedOut) throw new Error("User cancellation must be distinct from timeout and never retryable");
 }
 
 // 6a. Zero means no overall deadline, rather than an immediate watchdog kill.

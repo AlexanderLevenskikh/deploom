@@ -1,12 +1,8 @@
-"""Shared, process-local memoization of read-only Git identity probes.
+"""Shared read-only Git identity probes.
 
-Every DepLoom Git probe here is read-only (`rev-parse --show-toplevel` with
-GIT_OPTIONAL_LOCKS semantics preserved by the callers' original environment).
-Within one process the probe outcome for a resolved directory cannot change:
-no DepLoom code creates, moves or commits a repository at the probed paths
-after they have been probed. Probing each resolved path is therefore done at
-most once per process and the raw outcome is cached, cutting repeated
-subprocess spawns that dominated CLI wall time.
+Live repositories and Git environment can change between calls, including
+between requests in a persistent worker. Never reuse a path-only identity or
+an infrastructure failure. Immutable SourceSnapshot identities own reuse.
 
 Callers keep their own error semantics on top of the raw probe outcome
 (return None, fall back to the project dir, raise an identity error, ...).
@@ -14,16 +10,12 @@ Callers keep their own error semantics on top of the raw probe outcome
 
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
 
 # (stdout, returncode, stderr, marker_exists_at_probe_time)
 Probe = Tuple[str, int, str, bool]
-
-_cache: dict[str, Probe] = {}
-
 
 def _git_marker_exists(project_dir: Path) -> bool:
     current = Path(project_dir).resolve()
@@ -37,10 +29,6 @@ def _git_marker_exists(project_dir: Path) -> bool:
 
 def _probe(project_dir: Path) -> Probe:
     project_dir = Path(project_dir).expanduser().resolve()
-    key = os.path.normcase(str(project_dir))
-    cached = _cache.get(key)
-    if cached is not None:
-        return cached
     marker_exists = _git_marker_exists(project_dir)
     try:
         result = subprocess.run(
@@ -57,7 +45,6 @@ def _probe(project_dir: Path) -> Probe:
     except (OSError, subprocess.SubprocessError) as exc:
         out, rc, err = "", 127, str(exc)
     probe: Probe = (out, rc, err, marker_exists)
-    _cache[key] = probe
     return probe
 
 
@@ -74,5 +61,5 @@ def git_toplevel(project_dir: Path) -> Optional[Path]:
 
 
 def git_toplevel_raw(project_dir: Path) -> Probe:
-    """Raw cached probe for callers that need the returncode/stderr/marker."""
+    """Fresh probe for callers that need the returncode/stderr/marker."""
     return _probe(project_dir)

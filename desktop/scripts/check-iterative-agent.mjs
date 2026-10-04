@@ -25,6 +25,7 @@ import {
   parseChangedFilesFromAgentOutput,
   readAgentLease,
   trialBaselineFile,
+  withAgentDispatchLock,
   writeAgentLease,
   writeTrialBaseline,
 } from "../dist-electron/iterative-agent.js";
@@ -437,7 +438,7 @@ assert.equal(agentProviderFailure('connection refused',1), 'connection refused')
 // after stdin EOF. No model/server is contacted and no tokens are consumed.
 const mainSource = readFileSync(join(DESKTOP, "electron/main.ts"), "utf8");
 const captureStart = mainSource.indexOf("function spawnCapture(");
-const captureEnd = mainSource.indexOf("function spawnCaptureWithInput", captureStart);
+const captureEnd = mainSource.indexOf("// Adoption helpers for the TESTABLE streaming runner", captureStart);
 assert.ok(captureStart >= 0 && captureEnd > captureStart);
 const captureJs = ts.transpileModule(mainSource.slice(captureStart, captureEnd), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
 const capture = new Function("spawn", "commandEnvironment", "resolveSpawnInvocation", "processTreeDetached", "decodeProcessOutputChunk", "killProcessTree", captureJs + "; return spawnCapture;")(
@@ -453,4 +454,18 @@ assert.equal(timeout.timedOut, true);
 assert.ok(mainSource.includes("if (agentTimedOut)"));
 assert.ok(mainSource.includes("AGENT_PROVIDER_TIMEOUT:"));
 assert.ok(mainSource.includes("Agent dispatch: provider=${provider}; model=${model"));
-console.log("check-iterative-agent: OK (real child stdin EOF, model argument and timeout)");
+const locks = new Set();
+for (const action of ["wait", "give-up"]) {
+  assert.equal(await withAgentDispatchLock(locks, "scope", async () => action), action);
+  assert.equal(locks.size, 0, `${action} must release the project lock`);
+}
+await assert.rejects(withAgentDispatchLock(locks, "scope", async () => { throw Error("failure"); }));
+assert.equal(locks.size, 0);
+assert.deepEqual(await withAgentDispatchLock(locks, "scope", async () => withAgentDispatchLock(locks, "scope", async () => "duplicate")), {ok: false, error: "STEP_IN_PROGRESS"});
+assert.equal(locks.size, 0);
+assert.equal(decideAgentLeaseDispatch({...waitingFuture, startedAt: new Date(Date.now() - 3 * 86400_000).toISOString()}, () => false).action, "wait", "A durable waiting episode must survive a long restart");
+assert.equal(decideAgentLeaseDispatch({...waitEligible, sessionId: "ses-real"}, () => false).sessionId, "ses-real");
+assert.equal(decideAgentLeaseDispatch({...waitEligible, sessionId: ""}, () => false).sessionId, undefined);
+assert.equal(decideAgentLeaseDispatch({...waitEligible, waiting: false, pid: 999, childPid: 321}, pid => pid === 321).action, "in-progress");
+await import("./agent-launch-lifecycle-fixture.mjs");
+console.log("check-iterative-agent: OK (real child, launch wait, session recovery and cancel)");

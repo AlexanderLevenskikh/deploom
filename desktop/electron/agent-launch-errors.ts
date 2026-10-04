@@ -30,7 +30,7 @@
 export type AgentLaunchFailureKind = 'rate-limited' | 'temporary' | 'auth-config' | 'permanent' | 'unknown'
 
 export type AgentLaunchDiagnostics = {
-  /** Process exit code (0 only when the process itself timed out). */
+  /** Process exit code; provider error envelopes can also accompany zero. */
   code: number
   timedOut: boolean
   /** Bounded tail of stdout (no secrets; env/args are never captured). */
@@ -57,10 +57,9 @@ export const AGENT_LAUNCH_RETRY_BUDGET: Record<AgentLaunchFailureKind, number> =
   unknown: 3,
 }
 
-// Upper sanity cap for a provider-reported retry-after (1 h), so a corrupted
-// or hostile value cannot park the repair for days. The app remains usable:
-// the wait is cancelable and the durable lease keeps its retry parameters.
-export const AGENT_LAUNCH_MAX_RETRY_AFTER_MS = 60 * 60 * 1000
+// Maximum timer duration. Provider windows longer than one hour are honored;
+// a parked lease does not expire during a provider-reported waiting window.
+export const AGENT_LAUNCH_MAX_RETRY_AFTER_MS = 2_147_000_000
 export const AGENT_LAUNCH_MIN_RETRY_DELAY_MS = 1000
 // Bounded exponential backoff cap (120 s) prevents tight polling during a wait.
 export const AGENT_LAUNCH_BACKOFF_CAP_MS = 120_000
@@ -68,25 +67,55 @@ export const AGENT_LAUNCH_BACKOFF_CAP_MS = 120_000
 const MAX_DETAIL_LENGTH = 1000
 const MAX_TAIL_LENGTH = 1200
 
+export function redactAgentDiagnostics(text: string): string {
+  return text
+    .replace(/(authorization\s*["']?\s*[:=]\s*["']?)(?:Bearer\s+)?[^\s,"'}]+/gi, '$1[redacted]')
+    .replace(/((?:api[-_ ]?key|access[-_ ]?token|auth[-_ ]?token)\s*["']?\s*[:=]\s*["']?)[^"'\s,}]+/gi, '$1[redacted]')
+}
+
 function tail(text: string | undefined, max = MAX_TAIL_LENGTH): string {
   if (!text) return ''
-  const value = text.trim()
+  const value = redactAgentDiagnostics(text).trim()
   return value.length <= max ? value : `…${value.slice(-max)}`
 }
 
 /** Extract a provider-reported reset/retry-after in SECONDS from output text.
  *  Accepts the HTTP `Retry-After: <seconds>`, common `x-ratelimit-reset`, and
  *  `retry_after` JSON-like forms. Returns undefined when absent/unparseable. */
-export function extractRetryAfterSeconds(text: string): number | undefined {
+export function extractRetryAfterSeconds(text: string, now = Date.now()): number | undefined {
   if (!text) return undefined
-  const patterns: Array<RegExp> = [
-    /retry[-_ ]?after\s*["']?\s*[:=]?\s*["']?\s*(\d{1,6})/i,
-    /x-ratelimit-reset\s*["']?\s*[:=]?\s*["']?\s*(\d{1,10})/i,
-    /rate[ _-]?limit[^]{0,40}?reset[^]{0,10}?["']?\s*[:=]?\s*["']?\s*(\d{1,10})/i,
-  ]
-  for (const pattern of patterns) {
-    const match = text.match(pattern)
-    if (match && Number.isFinite(Number(match[1]))) return Number(match[1])
+  const milliseconds = text.match(/retry_after_ms\s*["']?\s*[:=]\s*["']?\s*(\d+)/i)
+  if (milliseconds) return Number(milliseconds[1]) / 1000
+  const duration = text.match(/x-ratelimit-reset(?:-requests|-tokens)?\s*["']?\s*[:=]\s*["']?\s*((?:\d+(?:\.\d+)?(?:ms|s|m|h))+)/i)
+  if (duration) return [...duration[1].matchAll(/(\d+(?:\.\d+)?)(ms|s|m|h)/gi)].reduce((sum, part) => sum + Number(part[1]) * ({ ms: 0.001, s: 1, m: 60, h: 3600 }[part[2].toLowerCase()] ?? 1), 0)
+  const after = text.match(/retry[-_ ]?after\s*["']?\s*[:=]?\s*["']?\s*(\d+(?:\.\d+)?)(?=["'\s,}]|$)/i)
+  if (after) return Number(after[1])
+  const date = text.match(/retry[-_ ]?after\s*["']?\s*[:=]\s*["']?\s*((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),[^\n"']+GMT)/i)
+  if (date) {
+    const at = Date.parse(date[1])
+    if (Number.isFinite(at)) return Math.max(0, (at - now) / 1000)
+  }
+  const reset = text.match(/(?:x-ratelimit-reset(?:-requests|-tokens)?|rate[ _-]?limit[^]{0,40}?reset)\s*["']?\s*[:=]?\s*["']?\s*(\d+(?:\.\d+)?)(ms|s|m|h)?/i)
+  if (!reset) return undefined
+  const value = Number(reset[1])
+  const unit = reset[2]?.toLowerCase()
+  if (unit) return value * ({ ms: 0.001, s: 1, m: 60, h: 3600 }[unit] ?? 1)
+  // Unix timestamps are absolute; small numeric reset values are durations.
+  if (value >= 1e12) return Math.max(0, (value - now) / 1000)
+  if (value >= 1e9) return Math.max(0, value - now / 1000)
+  return value
+}
+
+/** Only provider error envelopes confer failure authority at exit code zero.
+ * Ordinary assistant/tool text mentioning limits is not an outage. */
+export function agentLaunchProviderError(output: string): string | undefined {
+  for (const line of output.split(/\r?\n/)) {
+    try {
+      const event = JSON.parse(line)
+      if (event.type === 'error' || event.error || (event.type === 'result' && event.is_error === true)) {
+        return JSON.stringify(event.error ?? event)
+      }
+    } catch { /* plain output */ }
   }
   return undefined
 }
@@ -95,7 +124,7 @@ const HAS_RATE_LIMIT = [
   /\b429\b/,
   /\brate[ _-]?limit/i,
   /too many requests/i,
-  /quota/i,
+  /quota exceeded for (?:model )?requests/i,
   /limit.{0,24}?exceeded/i,
   /exceeded.{0,24}?limit/i,
   /request.{0,24}?limit/i,
@@ -116,6 +145,10 @@ const HAS_AUTH_OR_CONFIG = [
 ]
 
 const HAS_PERMANENT = [
+  /insufficient[_ -]quota/i,
+  /(?:no|insufficient|out of) (?:billing )?credits/i,
+  /(?:billing|payment).{0,40}(?:required|exceeded|limit|disabled)/i,
+  /(?:monthly|daily) (?:spend|budget).{0,30}(?:exceeded|limit)/i,
   /model not found/i,
   /ProviderModelNotFoundError/i,
   /unknown command/i,
@@ -124,6 +157,7 @@ const HAS_PERMANENT = [
   /invalid.{0,24}?(?:argument|option|flag)/i,
   /not.{0,24}?(?:supported|implemented)/i,
   /unknown flag/i,
+  /AGENT_SESSION_PERSIST_FAILED/i,
 ]
 
 const HAS_TEMPORARY = [
@@ -158,21 +192,23 @@ export function classifyAgentLaunchFailure(input: {
   stdout: string
   stderr: string
   timedOut?: boolean
+  providerError?: string
 }): AgentLaunchDiagnostics {
   const timedOut = input.timedOut === true
   const code = timedOut && input.code === 0 ? 124 : input.code
   const stdout = tail(input.stdout)
   const stderr = tail(input.stderr)
-  const source = `${stdout}\n${stderr}`
+  const providerError = input.providerError ?? agentLaunchProviderError(input.stdout)
+  const source = providerError ? redactAgentDiagnostics(providerError) : `${stdout}\n${stderr}`
   // A successful process is never a launch failure; it is left to the
   // provider-error/outcome parsers. We only classify failed launches.
-  if (!timedOut && code === 0) {
+  if (!timedOut && code === 0 && !providerError) {
     return { code, timedOut, stdout, stderr, kind: 'permanent', detail: 'agent process exited 0 — not a launch failure' }
   }
   const retryAfterSeconds = extractRetryAfterSeconds(source)
   // Order matters: rate-limit evidence is checked first so a 429 is never
   // downgraded to a generic temporary/unknown because other text is present.
-  if (HAS_RATE_LIMIT.some((re) => re.test(source))) {
+  if (!HAS_PERMANENT.some((re) => re.test(source)) && HAS_RATE_LIMIT.some((re) => re.test(source))) {
     const hint = findMatch(HAS_RATE_LIMIT, source)
     const reset = retryAfterSeconds !== undefined ? `; retry after ${retryAfterSeconds}s` : ''
     return { code, timedOut, stdout, stderr, kind: 'rate-limited', retryAfterSeconds, detail: `${hint ?? 'rate limit'} (exit ${code})${reset}`.slice(0, MAX_DETAIL_LENGTH) }
@@ -219,7 +255,7 @@ export function canRetryAgentLaunch(kind: AgentLaunchFailureKind, attempt: numbe
   if (!isRetryableAgentLaunchFailure(kind)) return false
   const budget = AGENT_LAUNCH_RETRY_BUDGET[kind]
   if (!Number.isFinite(budget)) return true
-  return attempt <= budget
+  return attempt < budget
 }
 
 /** Delay before the NEXT launch attempt, in ms. Honors the provider's

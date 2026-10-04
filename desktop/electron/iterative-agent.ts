@@ -17,8 +17,9 @@
 //     agent text; apply-feedback (the authoritative verifier of staleness and
 //     changed-file scope) is then invoked with the real CLI.
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, lstatSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, lstatSync, statSync, unlinkSync, writeFileSync, renameSync } from 'node:fs'
 import { dirname, join, resolve, sep } from 'node:path'
+import type { AgentLaunchDiagnostics } from './agent-launch-errors.js'
 
 export type IterativeRepairRequest = {
   requestId: string
@@ -540,6 +541,7 @@ export type AgentLease = {
   candidateId: string
   attemptId: number
   pid: number
+  childPid?: number
   startedAt: string
   // Launch-wait resilience: a retryable provider outage (rate limit / temp /
   // unknown with budget left) parks the lease as WAITING with its retry
@@ -552,6 +554,15 @@ export type AgentLease = {
   retryAt?: number
   retryAfterSeconds?: number
   launchAttempts?: number
+  launchDiagnostics?: AgentLaunchDiagnostics
+}
+
+/** Every exit, including a parked wait and exhausted budget, releases the
+ * project lock. The callback runs synchronously until its first await. */
+export async function withAgentDispatchLock<T>(inFlight: Set<string>, key: string, execute: () => Promise<T>): Promise<T | { ok: false; error: string }> {
+  if (inFlight.has(key)) return { ok: false, error: 'STEP_IN_PROGRESS' }
+  inFlight.add(key)
+  try { return await execute() } finally { inFlight.delete(key) }
 }
 
 export function agentLeaseFile(runDir: string): string {
@@ -560,7 +571,9 @@ export function agentLeaseFile(runDir: string): string {
 
 export function writeAgentLease(file: string, lease: AgentLease): void {
   mkdirSync(dirname(file), { recursive: true })
-  writeFileSync(file, JSON.stringify(lease), 'utf8')
+  const temporary = `${file}.${process.pid}.tmp`
+  writeFileSync(temporary, JSON.stringify(lease), 'utf8')
+  renameSync(temporary, file)
 }
 
 export function readAgentLease(file: string): AgentLease | undefined {
@@ -579,6 +592,7 @@ export function readAgentLease(file: string): AgentLease | undefined {
       candidateId: String(parsed.candidateId ?? ''),
       attemptId: Number(parsed.attemptId ?? 0),
       pid: Number(parsed.pid ?? 0),
+      ...(typeof parsed.childPid === 'number' ? { childPid: parsed.childPid } : {}),
       startedAt: parsed.startedAt,
       ...(parsed.waiting === true ? { waiting: true } : {}),
       ...(waitKind ? { waitKind } : {}),
@@ -586,6 +600,7 @@ export function readAgentLease(file: string): AgentLease | undefined {
       ...(typeof parsed.retryAt === 'number' ? { retryAt: parsed.retryAt } : {}),
       ...(typeof parsed.retryAfterSeconds === 'number' ? { retryAfterSeconds: parsed.retryAfterSeconds } : {}),
       ...(typeof parsed.launchAttempts === 'number' && Number.isInteger(parsed.launchAttempts) && parsed.launchAttempts > 0 ? { launchAttempts: parsed.launchAttempts } : {}),
+      ...(parsed.launchDiagnostics && typeof parsed.launchDiagnostics === 'object' ? { launchDiagnostics: parsed.launchDiagnostics as AgentLaunchDiagnostics } : {}),
     }
   } catch {
     return undefined
@@ -649,22 +664,19 @@ export type AgentLeaseDecision =
   | { action: 'in-progress' }
   | { action: 'resume'; sessionId: string }
   | { action: 'wait'; retryAt: number; detail: string }
-  | { action: 'retry'; launchAttempts: number; detail: string }
+  | { action: 'retry'; launchAttempts: number; detail: string; sessionId?: string }
   | { action: 'give-up'; detail: string }
 
 /** A parked launch-wait is retained far longer than a live-agent lease: a
  *  long provider reset (up to AGENT_LAUNCH_MAX_RETRY_AFTER_MS) must not be
  *  silently downgraded to a fresh dispatch because 2 h elapsed. */
-const AGENT_WAIT_LEASE_MAX_AGE_MS = 24 * 60 * 60 * 1000
-
 export function decideAgentLeaseDispatch(
   lease: AgentLease | undefined,
   isOwnerAlive: (pid: number) => boolean,
   now = Date.now(),
 ): AgentLeaseDecision {
   if (!lease) return { action: 'none' }
-  const maxAge = lease.waiting ? AGENT_WAIT_LEASE_MAX_AGE_MS : 2 * 60 * 60 * 1000
-  if (!agentLeaseAlive(lease, now, maxAge)) return { action: 'none' }
+  if (!lease.waiting && !agentLeaseAlive(lease, now)) return { action: 'none' }
   if (lease.waiting) {
     const attempts = lease.launchAttempts ?? 0
     if (lease.waitKind !== 'rate-limited') {
@@ -679,8 +691,8 @@ export function decideAgentLeaseDispatch(
     if ((lease.retryAt ?? 0) > now) {
       return { action: 'wait', retryAt: lease.retryAt ?? now, detail: lease.waitDetail ?? '' }
     }
-    return { action: 'retry', launchAttempts: attempts, detail: lease.waitDetail ?? '' }
+    return { action: 'retry', launchAttempts: attempts, detail: lease.waitDetail ?? '', ...(lease.sessionId ? { sessionId: lease.sessionId } : {}) }
   }
-  if (lease.pid > 0 && isOwnerAlive(lease.pid)) return { action: 'in-progress' }
-  return { action: 'resume', sessionId: lease.sessionId }
+  if ((lease.pid > 0 && isOwnerAlive(lease.pid)) || (lease.childPid && isOwnerAlive(lease.childPid))) return { action: 'in-progress' }
+  return lease.sessionId ? { action: 'resume', sessionId: lease.sessionId } : { action: 'retry', launchAttempts: lease.launchAttempts ?? 0, detail: 'Agent stopped before publishing a session ID' }
 }

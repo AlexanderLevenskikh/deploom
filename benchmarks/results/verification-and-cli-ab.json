@@ -1,0 +1,489 @@
+{
+  "date": "2026-10-05",
+  "referenceRevision": "96a09731dd2a51ce451b783f22ab8912c91c2903",
+  "candidateParent": "44e77bc0690b5c58cf900527cc5a50ea3f75129e",
+  "candidatePythonSourceDigest": "9683c7cc0bf50022ee29d8412d91b5bbb5cdf5d6ee4269f26825d776b4a0f31e",
+  "python": "3.14.3 (tags/v3.14.3:323c59a, Feb  3 2026, 16:04:56) [MSC v.1944 64 bit (AMD64)]",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "order": [
+    "reference",
+    "candidate",
+    "candidate",
+    "reference",
+    "reference",
+    "candidate"
+  ],
+  "conditions": "Sequential on one Windows host; real Git/npm/Node; seeded npm cache; offline installs; fresh run/proofs for CLI, retained project/proofs within each verification sequence; excludes online audit, AI and Electron. Three samples per scenario/revision; not a representative product benchmark.",
+  "summaries": {
+    "verification:cold-verification": {
+      "reference": {
+        "medianSeconds": 4.460827799979597,
+        "minSeconds": 4.257534199976362,
+        "maxSeconds": 4.662554700043984
+      },
+      "candidate": {
+        "medianSeconds": 4.240159700042568,
+        "minSeconds": 4.1144004999659956,
+        "maxSeconds": 4.510863100062124
+      }
+    },
+    "verification:warm-identical": {
+      "reference": {
+        "medianSeconds": 2.1540008999872953,
+        "minSeconds": 2.081837599980645,
+        "maxSeconds": 2.624608000041917
+      },
+      "candidate": {
+        "medianSeconds": 2.3259329999564216,
+        "minSeconds": 2.300223600002937,
+        "maxSeconds": 2.4241777999559417
+      }
+    },
+    "verification:leaf-source-change": {
+      "reference": {
+        "medianSeconds": 3.245804400066845,
+        "minSeconds": 3.2387646000133827,
+        "maxSeconds": 3.6695286999456584
+      },
+      "candidate": {
+        "medianSeconds": 3.4177651000209153,
+        "minSeconds": 3.3438251999905333,
+        "maxSeconds": 3.8632610999047756
+      }
+    },
+    "verification:root-config-change": {
+      "reference": {
+        "medianSeconds": 4.82333759998437,
+        "minSeconds": 4.274366500088945,
+        "maxSeconds": 4.968595799989998
+      },
+      "candidate": {
+        "medianSeconds": 4.611572399968281,
+        "minSeconds": 4.514249200001359,
+        "maxSeconds": 4.897966400021687
+      }
+    },
+    "verification:dependency-change": {
+      "reference": {
+        "medianSeconds": 4.582027799915522,
+        "minSeconds": 4.280753800063394,
+        "maxSeconds": 5.649325000005774
+      },
+      "candidate": {
+        "medianSeconds": 4.6820342999417335,
+        "minSeconds": 4.6750884999055415,
+        "maxSeconds": 5.09205259999726
+      }
+    },
+    "cli:cold": {
+      "reference": {
+        "medianSeconds": 27.6916,
+        "minSeconds": 27.6668,
+        "maxSeconds": 27.761
+      },
+      "candidate": {
+        "medianSeconds": 26.1168,
+        "minSeconds": 25.4647,
+        "maxSeconds": 26.3609
+      }
+    }
+  },
+  "samples": {
+    "verification:cold-verification": {
+      "reference": [
+        {
+          "seconds": 4.257534199976362,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 4.460827799979597,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 4.662554700043984,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        }
+      ],
+      "candidate": [
+        {
+          "seconds": 4.1144004999659956,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 4.240159700042568,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 4.510863100062124,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        }
+      ]
+    },
+    "verification:warm-identical": {
+      "reference": [
+        {
+          "seconds": 2.081837599980645,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 3,
+            "proof.cache.miss": 0,
+            "verify.resolver.start": 0,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 2.1540008999872953,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 3,
+            "proof.cache.miss": 0,
+            "verify.resolver.start": 0,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 2.624608000041917,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 3,
+            "proof.cache.miss": 0,
+            "verify.resolver.start": 0,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        }
+      ],
+      "candidate": [
+        {
+          "seconds": 2.300223600002937,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 3,
+            "proof.cache.miss": 0,
+            "verify.resolver.start": 0,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 2.4241777999559417,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 3,
+            "proof.cache.miss": 0,
+            "verify.resolver.start": 0,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 2.3259329999564216,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 3,
+            "proof.cache.miss": 0,
+            "verify.resolver.start": 0,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        }
+      ]
+    },
+    "verification:leaf-source-change": {
+      "reference": [
+        {
+          "seconds": 3.2387646000133827,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 2,
+            "proof.cache.miss": 1,
+            "verify.resolver.start": 0,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 3.245804400066845,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 2,
+            "proof.cache.miss": 1,
+            "verify.resolver.start": 0,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 3.6695286999456584,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 2,
+            "proof.cache.miss": 1,
+            "verify.resolver.start": 0,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        }
+      ],
+      "candidate": [
+        {
+          "seconds": 3.4177651000209153,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 2,
+            "proof.cache.miss": 1,
+            "verify.resolver.start": 0,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 3.3438251999905333,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 2,
+            "proof.cache.miss": 1,
+            "verify.resolver.start": 0,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 3.8632610999047756,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 2,
+            "proof.cache.miss": 1,
+            "verify.resolver.start": 0,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        }
+      ]
+    },
+    "verification:root-config-change": {
+      "reference": [
+        {
+          "seconds": 4.274366500088945,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 4.82333759998437,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 4.968595799989998,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        }
+      ],
+      "candidate": [
+        {
+          "seconds": 4.611572399968281,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 4.514249200001359,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 4.897966400021687,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        }
+      ]
+    },
+    "verification:dependency-change": {
+      "reference": [
+        {
+          "seconds": 4.280753800063394,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 4.582027799915522,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 5.649325000005774,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        }
+      ],
+      "candidate": [
+        {
+          "seconds": 4.6750884999055415,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 5.09205259999726,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        },
+        {
+          "seconds": 4.6820342999417335,
+          "status": "passed",
+          "eventCounts": {
+            "proof.cache.hit": 0,
+            "proof.cache.miss": 2,
+            "verify.resolver.start": 1,
+            "verify.project-check.start": 1,
+            "verify.project-check.finish": 1
+          }
+        }
+      ]
+    },
+    "cli:cold": {
+      "reference": [
+        {
+          "seconds": 27.6668,
+          "status": "completed",
+          "eventCounts": {}
+        },
+        {
+          "seconds": 27.761,
+          "status": "completed",
+          "eventCounts": {}
+        },
+        {
+          "seconds": 27.6916,
+          "status": "completed",
+          "eventCounts": {}
+        }
+      ],
+      "candidate": [
+        {
+          "seconds": 26.1168,
+          "status": "completed",
+          "eventCounts": {}
+        },
+        {
+          "seconds": 25.4647,
+          "status": "completed",
+          "eventCounts": {}
+        },
+        {
+          "seconds": 26.3609,
+          "status": "completed",
+          "eventCounts": {}
+        }
+      ]
+    }
+  }
+}

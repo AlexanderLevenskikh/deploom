@@ -1,5 +1,31 @@
 # DepLoom performance benchmarks
 
+## Retained-state verification
+
+`python benchmarks/bench_verification_reuse.py --reps 3` uses the real
+`verify_assignment` entry point on an isolated npm/Git fixture. It retains
+one project's proof/preparation caches across cold verification, an identical
+warm repeat, a committed leaf-source change, a root manifest/check-profile
+change and a dependency assignment change. Every sample requires authoritative
+PASS and evidence that the mandatory shell check actually executed. Raw rows
+include resolver/cache/check counts and CPU/RSS snapshots when available.
+
+These are verification measurements, excluding online security audit, AI
+latency and Electron startup/rendering. The iterative CLI harness below also
+excludes those stages. Neither harness establishes full product latency on a
+representative real project; those measurements remain follow-up work.
+
+## Fresh iterative runs (historical scenario names)
+
+The names `cold`, `repeat-identical` and `leaf-change` are retained for old
+commands. They mean fresh proof caches, a fresh run on a warm host, and a
+fresh replan with one fewer target, respectively. They do not demonstrate
+warm proof reuse or incremental invalidation of an existing run. The npm
+cache is seeded in all three, so `cold` is not an empty-machine-cache run.
+Samples now include platform/Python/source-digest metadata. With few repeats,
+report the full range; the reported nearest-rank p95 is not a reliable tail
+latency estimate for such a small sample.
+
 Reproducible benchmark harness for the DepLoom user-critical path. Everything
 in `benchmarks/` is tracked; scratch work, fixtures and raw results live under
 `benchmarks/work/` which is git-ignored.
@@ -58,4 +84,3 @@ from; `DEPLOOM_BENCH_PYTHON` overrides the interpreter. This lets you compare
 a candidate change against `HEAD` back-to-back on the same machine. A baseline
 checkout has no metrics instrumentation, so its git/npm/node counters read 0 —
 compare wall time, not counters.
-

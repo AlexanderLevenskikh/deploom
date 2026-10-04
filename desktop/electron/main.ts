@@ -8,7 +8,7 @@ import { buildDependencyGraphSnapshot } from './dependency-graph.js'
 import { BaselineWorkerPool, WORKER_CANCEL } from './baseline-worker.js'
 const { autoUpdater } = updaterPackage
 import { buildClaudeAgentArgs, buildClaudeResumeArgs, buildCodexAgentArgs, buildCodexResumeArgs, buildOpenCodeAgentArgs, buildOpenCodeResumeArgs, parseOpencodeModelsOutput } from './agent-command.js'
-import { AGENT_LAUNCH_RETRY_BUDGET, agentLaunchRetryDelayMs, canRetryAgentLaunch, classifyAgentLaunchFailure, type AgentLaunchDiagnostics } from './agent-launch-errors.js'
+import { AGENT_LAUNCH_RETRY_BUDGET, agentLaunchProviderError, agentLaunchRetryDelayMs, canRetryAgentLaunch, classifyAgentLaunchFailure, redactAgentDiagnostics, type AgentLaunchDiagnostics } from './agent-launch-errors.js'
 import { agentBatchCompletionFingerprint, agentScopeFingerprint, extractAgentSessionId, resumableAgentSessionId } from './agent-session.js'
 import { restoreVerifiedAgentCompletion, updateFlowProgress, type FlowAction } from './flow-state.js'
 import { adoptEmptyContinuationBranches, adoptHistoricalContinuationBranches, adoptPreferredScopeBranches, buildMigrationProgress, continuationMigrationPlan, integratedBranchTargets, leftoverConflictMarkerLines, liveGitWorktreeRecords, mergeInProgressNote, mergePackageJsonThreeWay, migrationBranchStateText, migrationCompletionIssues, migrationBatchScopeDriftIssues, migrationGroupScopeDriftIssues, migrationPlanFromPrompt, migrationScopeManifestFromPrompt, migrationStateSummary, nextIncompleteMigrationBranch, recoverContinuationScopeBranches, rebindMigrationPromptBranchIdentity, replaceMigrationPlanInPrompt, relevantGitStatus, relevantGitStatusLines, workspaceNoiseGitExcludePathspecs, rollbackIncompleteMigrationActions, satisfiedScopePackagesFromPrompt, scopeActionsFromPrompt, scopeTargetsFromPrompt, validateScopeProofEnvelope, type MigrationBranchProgress, type MigrationBranchRuntime, type MigrationBranchRuntimePhase, type MigrationPlan, type MigrationProgress } from './migration-progress.js'
@@ -64,7 +64,7 @@ import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
 import { beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, readRunLogTail, recordAttemptLog, recordAttemptProgress, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
 import { spawnIterativeStreamed, type CaptureResult, type StreamAttemptIo, type StreamPlatform } from './iterative-stream.js'
-import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, agentProviderFailure, openCodeRuntimeManifestPaths, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
+import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, agentProviderFailure, openCodeRuntimeManifestPaths, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, withAgentDispatchLock, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
@@ -1663,35 +1663,6 @@ function spawnCapture(command: string, args: string[], cwd: string, timeoutMs = 
     // starting a run when stdin is a pipe, even with --file and --attach.
     child.stdin.on('error', () => { /* EPIPE when the child exits before EOF */ })
     child.stdin.end()
-  })
-}
-
-function spawnCaptureWithInput(command: string, args: string[], cwd: string, input: string, timeoutMs = 8_000): Promise<CaptureResult> {
-  return new Promise((resolvePromise) => {
-    let stdout = ''
-    let stderr = ''
-    let settled = false
-    let timedOut = false
-    const commandEnv = commandEnvironment(process.env)
-    const invocation = resolveSpawnInvocation(command, args, { env: commandEnv })
-    const child = spawn(invocation.command, invocation.args, { cwd, shell: false, detached: processTreeDetached(), windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments, env: commandEnv })
-    const timer = setTimeout(() => { timedOut = true; killProcessTree(child) }, timeoutMs)
-    child.stdout.on('data', (chunk: Buffer) => { stdout += decodeProcessOutputChunk(chunk) })
-    child.stderr.on('data', (chunk: Buffer) => { stderr += decodeProcessOutputChunk(chunk) })
-    child.on('error', (error) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolvePromise({ code: 1, stdout, stderr: `${stderr}${error.message}`, timedOut })
-    })
-    child.on('close', (code) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolvePromise({ code: code ?? 1, stdout, stderr, timedOut })
-    })
-    child.stdin.on('error', () => { /* EPIPE from a provider that does not read stdin is not a failure */ })
-    child.stdin.end(input)
   })
 }
 
@@ -8418,10 +8389,10 @@ function setupIpc(): void {
     }
   }))
 
-  async function startStandaloneOpenCodeServer(cwd: string): Promise<{ url: string; databasePath: string; stop: () => void } | undefined> {
-    const directory = join(app.getPath('temp'), `iter-agent-opencode-${randomUUID()}`)
+  async function startStandaloneOpenCodeServer(cwd: string, savedDatabasePath?: string): Promise<{ url: string; databasePath: string; stop: () => Promise<void> } | undefined> {
+    const directory = savedDatabasePath ? dirname(savedDatabasePath) : join(app.getPath('temp'), `iter-agent-opencode-${randomUUID()}`)
     mkdirSync(directory, { recursive: true })
-    const databasePath = join(directory, 'opencode.db')
+    const databasePath = savedDatabasePath || join(directory, 'opencode.db')
     const port = await reserveLocalPort()
     const url = `http://127.0.0.1:${port}`
     const commandEnv = commandEnvironment(openCodeDatabaseEnv(process.env, databasePath))
@@ -8442,7 +8413,11 @@ function setupIpc(): void {
       if (server.exitCode !== null) break
       try {
         const health = await fetchWithTimeout(`${url}/global/health`)
-        if (health.ok) return { url, databasePath, stop: () => { if (server.exitCode === null) killProcessTree(server) } }
+        if (health.ok) return { url, databasePath, stop: () => new Promise<void>((done) => {
+          if (server.exitCode !== null || server.signalCode !== null) { done(); return }
+          server.once('close', () => done())
+          killProcessTree(server)
+        }) }
       } catch {
         // server is still starting
       }
@@ -8551,16 +8526,10 @@ function setupIpc(): void {
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
-    if (iterativeStepInFlight.has(stepLockKey(workspace.id, project.name))) {
-      return { ok: false, error: 'STEP_IN_PROGRESS' }
-    }
     if (!existsSync(join(runDir, 'run.json'))) {
       return { ok: false, error: 'NO_RUN' }
     }
-    // R6: the per-project in-flight guard is taken BEFORE any await. Together
-    // with the durable lease below it prevents double dispatch within one
-    // process lifetime and across an app restart.
-    iterativeStepInFlight.add(stepLockKey(workspace.id, project.name))
+    return withAgentDispatchLock(iterativeStepInFlight, stepLockKey(workspace.id, project.name), async () => {
     // Launch-wait resilience: classify the durable lease BEFORE marking the
     // attempt running. A parked WAIT (retry time not reached) must not be
     // flipped to running, must not consume a repair attempt, and must not
@@ -8574,6 +8543,7 @@ function setupIpc(): void {
       ensureAttemptRecord(runDir, project.name, workspace.id)
       updateAttempt(runDir, { status: 'waiting', stage: 'agent', lastError: undefined, cancelRequested: false, reason: leaseDecision.detail, waitUntil: leaseDecision.retryAt })
       publishIterativeAttempt(runDir)
+      scheduleAgentWaitRetry({ workspaceId: workspace.id, projectName: project.name }, leaseDecision.retryAt)
       return { ok: false, waiting: true, retryAt: leaseDecision.retryAt, cancelable: true, failureKind: 'wait', reason: leaseDecision.detail, error: `AGENT_LAUNCH_WAIT: ${leaseDecision.detail}` }
     }
     if (leaseDecision.action === 'give-up') {
@@ -8585,7 +8555,7 @@ function setupIpc(): void {
       return { ok: false, error: leaseDecision.detail }
     }
     const carriedLaunchAttempts = leaseDecision.action === 'retry' ? leaseDecision.launchAttempts : 0
-    const resumeSessionId = leaseDecision.action === 'resume' ? leaseDecision.sessionId : undefined
+    const resumeSessionId = leaseDecision.action === 'resume' || leaseDecision.action === 'retry' ? leaseDecision.sessionId : undefined
     const resuming = resumeSessionId !== undefined
     // L1: journal the agent dispatch so the panel can show "ремонт у агента"
     // and the last error survives a restart.
@@ -8727,9 +8697,12 @@ function setupIpc(): void {
       recordAttemptLog(runDir, `Agent dispatch: provider=${provider}; model=${model || '(provider default)'}\n`)
       updateAttempt(runDir, { reason: `Agent repair: ${provider}; model=${model || '(provider default)'}` })
       publishIterativeAttempt(runDir)
-      // #5: after a crash the SAME provider session is resumed (same attempt,
-      // same sessionId, durable trial); a fresh dispatch gets a new session.
-      const sessionId = resuming ? resumeSessionId : randomUUID()
+      if (existingLease && (existingLease.runId !== ctx.runId || existingLease.candidateId !== (bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId) || existingLease.attemptId !== ctx.attemptId || existingLease.provider !== provider)) {
+        throw new Error('AGENT_LEASE_SCOPE_MISMATCH: saved session belongs to a different repair or provider')
+      }
+      // Persist the provider's actual session as soon as its first event arrives.
+      // A failed launch before that event has no resumable conversation.
+      let sessionId = resumeSessionId ?? ''
       try {
         let baselineFile = trialBaselineFile(runDir, ctx)
         // Preserve the pre-dispatch bytes when resuming a legacy in-flight session.
@@ -8745,16 +8718,46 @@ function setupIpc(): void {
           ? buildIterativeBootstrapPrompt({ ...ctx, checkpointId: ctx.baseCheckpointId })
           : buildIterativeRepairPrompt(ctx)
         writeFileSync(promptFile, promptText, 'utf8')
-        const databasePath = existingLease?.databasePath || ''
+        if (readAttempt(runDir)?.cancelRequested) {
+          updateAttempt(runDir, { status: 'canceled', stage: 'agent', finishedAt: Date.now(), lastError: undefined })
+          return { ok: false, error: 'AGENT_CANCELED' }
+        }
+        const databasePath = provider === 'opencode'
+          ? existingLease?.databasePath || join(app.getPath('temp'), `iter-agent-opencode-${randomUUID()}`, 'opencode.db')
+          : ''
 
         let output = ''
         let exitCode = 0
         let agentTimedOut = false
+        let agentCanceled = false
+        let streamedProviderError: string | undefined
+        const sessionOptions = {
+          onLine: (line: string) => {
+            streamedProviderError = agentLaunchProviderError(line) ?? streamedProviderError
+            const actualId = extractAgentSessionId(line, provider)
+            if (!actualId || actualId === sessionId) return
+            const lease = readAgentLease(leasePath)
+            if (!lease) throw new Error('AGENT_SESSION_PERSIST_FAILED: missing dispatch lease')
+            sessionId = actualId
+            writeAgentLease(leasePath, { ...lease, sessionId: actualId })
+          },
+          onSpawn: (childPid: number) => {
+            const lease = readAgentLease(leasePath)
+            if (!lease) throw new Error('AGENT_SESSION_PERSIST_FAILED: missing dispatch lease')
+            writeAgentLease(leasePath, { ...lease, childPid })
+          },
+        }
         let agentStdout = ''
         let agentStderr = ''
         if (provider === 'opencode') {
-          const transport = await startStandaloneOpenCodeServer(projectPath)
-          try {
+          writeAgentLease(leasePath, { schemaVersion: 1, sessionId, provider, databasePath, runId: ctx.runId, candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId, attemptId: ctx.attemptId, pid: process.pid, startedAt: new Date().toISOString(), launchAttempts: carriedLaunchAttempts })
+          let transport: Awaited<ReturnType<typeof startStandaloneOpenCodeServer>>
+          try { transport = await startStandaloneOpenCodeServer(projectPath, databasePath) } catch (error) {
+            exitCode = 1
+            agentStderr = error instanceof Error ? error.message : String(error)
+            output = agentStderr
+          }
+          if (transport) try {
             // R6: the durable dispatch lease is persisted BEFORE the agent is
             // awaited, with the session/provider/database/attempt identities.
             // On resume it keeps the ORIGINAL sessionId and databasePath so
@@ -8783,14 +8786,17 @@ function setupIpc(): void {
               900_000,
               iterativeStreamIo(runDir),
               { ...iterativeStreamPlatform, commandEnvironment: env => commandEnvironment(openCodeDatabaseEnv(env, databasePath || transport?.databasePath || '')) },
+              undefined,
+              sessionOptions,
             )
             exitCode = agentResult.code
             agentTimedOut = agentResult.timedOut === true
+            agentCanceled = agentResult.canceled === true
             agentStdout = agentResult.stdout
             agentStderr = agentResult.stderr
             output = `${agentStdout}\n${agentStderr}`
           } finally {
-            transport?.stop()
+            await transport?.stop()
           }
         } else {
           // claude/codex are one-shot: the prompt file is piped to stdin.
@@ -8806,7 +8812,8 @@ function setupIpc(): void {
             startedAt: new Date().toISOString(),
             launchAttempts: carriedLaunchAttempts,
           })
-          const agentResult = await spawnCaptureWithInput(
+          const agentResult = await spawnIterativeStreamed(
+            runDir,
             provider === 'claude' ? 'claude' : 'codex',
             resuming
               ? (provider === 'claude'
@@ -8814,31 +8821,44 @@ function setupIpc(): void {
                 : buildCodexResumeArgs(resumeSessionId as string, model, promptFile))
               : (provider === 'claude' ? buildClaudeAgentArgs(model) : buildCodexAgentArgs(projectPath, model)),
             projectPath,
-            readFileSync(promptFile, 'utf8'),
             900_000,
+            iterativeStreamIo(runDir),
+            iterativeStreamPlatform,
+            undefined,
+            { ...sessionOptions, stdin: readFileSync(promptFile, 'utf8') },
           )
           exitCode = agentResult.code
           agentTimedOut = agentResult.timedOut === true
+          agentCanceled = agentResult.canceled === true
           agentStdout = agentResult.stdout
           agentStderr = agentResult.stderr
           output = `${agentStdout}\n${agentStderr}`
         }
-        agentOutputTail = output.slice(-4000)
+        agentStdout = redactAgentDiagnostics(agentStdout)
+        agentStderr = redactAgentDiagnostics(agentStderr)
+        agentOutputTail = redactAgentDiagnostics(output.slice(-4000))
+        if (agentCanceled || readAttempt(runDir)?.cancelRequested) {
+          cancelPendingAgentWait({ workspaceId: workspace.id, projectName: project.name })
+          clearAgentLease(leasePath)
+          updateAttempt(runDir, { status: 'canceled', stage: 'agent', finishedAt: Date.now(), waitUntil: undefined, reason: 'Agent canceled by the user', lastError: undefined })
+          return { ok: false, error: 'AGENT_CANCELED', agentOutputTail }
+        }
+        const providerFailure = agentProviderFailure(output, exitCode)
         // Launch-failure resilience: classify BEFORE the ordinary provider
         // error handling. A retryable outage (rate limit / temporary / unknown
         // with budget left) parks the repair in a durable wait: the attempt is
         // NOT failed, no repair attempt is consumed, and the launch is retried
         // after the provider's reset time / a bounded backoff. A permanent or
         // budget-exhausted failure falls through to a clear terminal error.
-        if (exitCode !== 0 || agentTimedOut) {
-          const launchDiag = classifyAgentLaunchFailure({ code: exitCode, stdout: agentStdout, stderr: agentStderr, timedOut: agentTimedOut })
+        if (exitCode !== 0 || agentTimedOut || streamedProviderError || providerFailure) {
+          const launchDiag = classifyAgentLaunchFailure({ code: exitCode, stdout: agentStdout, stderr: agentStderr, timedOut: agentTimedOut, providerError: streamedProviderError })
           const parkedLaunchAttempts = (readAgentLease(leasePath)?.launchAttempts ?? 0) + 1
           if (canRetryAgentLaunch(launchDiag.kind, parkedLaunchAttempts) && launchDiag.kind !== 'permanent') {
             const retryAt = Date.now() + agentLaunchRetryDelayMs(launchDiag, parkedLaunchAttempts)
             const waitDetail = agentLaunchWaitDetail(launchDiag, parkedLaunchAttempts, retryAt)
             const waitKind: 'rate-limited' | 'temporary' | 'unknown' =
               launchDiag.kind === 'rate-limited' || launchDiag.kind === 'temporary' || launchDiag.kind === 'unknown' ? launchDiag.kind : 'unknown'
-            const parked = { ...(readAgentLease(leasePath) ?? existingLease!), waiting: true, waitKind, waitDetail: launchDiag.detail, retryAt, retryAfterSeconds: launchDiag.retryAfterSeconds, launchAttempts: parkedLaunchAttempts, sessionId, provider, databasePath: readAgentLease(leasePath)?.databasePath ?? existingLease?.databasePath ?? '', runId: ctx.runId, candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId, attemptId: ctx.attemptId, pid: process.pid, startedAt: new Date().toISOString() }
+            const parked = { ...(readAgentLease(leasePath) ?? existingLease!), childPid: undefined, launchDiagnostics: launchDiag, waiting: true, waitKind, waitDetail: launchDiag.detail, retryAt, retryAfterSeconds: launchDiag.retryAfterSeconds, launchAttempts: parkedLaunchAttempts, sessionId, provider, databasePath: readAgentLease(leasePath)?.databasePath ?? existingLease?.databasePath ?? '', runId: ctx.runId, candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId, attemptId: ctx.attemptId, pid: process.pid, startedAt: new Date().toISOString() }
             writeAgentLease(leasePath, parked)
             recordAttemptLog(runDir, `Agent launch wait (${launchDiag.kind}): exit=${launchDiag.code}, timedOut=${launchDiag.timedOut}${launchDiag.retryAfterSeconds !== undefined ? `, retryAfter=${launchDiag.retryAfterSeconds}s` : ''}; ${launchDiag.detail}\n`)
             updateAttempt(runDir, { status: 'waiting', stage: 'agent', lastError: undefined, cancelRequested: false, reason: waitDetail, waitUntil: retryAt })
@@ -8859,7 +8879,6 @@ function setupIpc(): void {
             throw new Error(`AGENT_LAUNCH_FAILED: ${provider}; model=${model || '(provider default)'}; ${launchDiag.kind}: ${launchDiag.detail}${agentStderr.trim() ? `\n${agentStderr.trim().slice(-1200)}` : ''}`)
           }
         }
-        const providerFailure = agentProviderFailure(output, exitCode)
         if (providerFailure) throw new Error(`AGENT_PROVIDER_ERROR: ${provider}; model=${model || '(provider default)'}; ${providerFailure}`)
         if (agentTimedOut) {
           throw new Error(`AGENT_PROVIDER_TIMEOUT: ${provider}; model=${model || '(provider default)'}; agent process exceeded 15 minutes. The verified checkpoint is preserved.`)
@@ -8956,8 +8975,8 @@ function setupIpc(): void {
       }
       updateAttempt(runDir, { lastHeartbeatAt: Date.now() })
       publishIterativeAttempt(runDir)
-      iterativeStepInFlight.delete(stepLockKey(workspace.id, project.name))
     }
+    })
   }
 
   ipcMain.handle('flow:iterative:agent', iterativeAutopilot.register('agent', async (_event, input: { workspaceId?: string; projectName: string }) => runIterativeAgent(input)))

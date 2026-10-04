@@ -29,16 +29,9 @@ def _write_files(root: Path, count: int, prefix: str = "f") -> None:
 
 class SubjectLayoutCombinedProbeTests(unittest.TestCase):
     """The combined `rev-parse --show-toplevel HEAD` call must keep the exact
-    semantics of the former two separate probes, and must be memoized per
-    resolved directory within the process."""
+    semantics of the former two separate probes, and observe live changes."""
 
-    def setUp(self) -> None:
-        source_snapshot._subject_layout_cache.clear()
-
-    def tearDown(self) -> None:
-        source_snapshot._subject_layout_cache.clear()
-
-    def test_normal_repo_matches_head_and_is_memoized(self) -> None:
+    def test_normal_repo_matches_head_and_refreshes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             git(root, "init", "-b", "master")
@@ -55,8 +48,21 @@ class SubjectLayoutCombinedProbeTests(unittest.TestCase):
             self.assertEqual(layout[1], Path("."))
             with mock.patch.object(source_snapshot, "_run_git", wraps=source_snapshot._run_git) as run:
                 again = source_snapshot._subject_layout(root)
-                run.assert_not_called()
+                run.assert_called_once()
             self.assertEqual(again, layout)
+
+    def test_new_commit_refreshes_live_provenance_in_same_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            git(root, "init", "-b", "master")
+            git(root, "config", "user.email", "layout@example.invalid")
+            git(root, "config", "user.name", "Layout")
+            git(root, "commit", "--allow-empty", "-m", "first")
+            before = source_snapshot.source_snapshot_provenance_head(root, require_git=True)
+            git(root, "commit", "--allow-empty", "-m", "second")
+            after = source_snapshot.source_snapshot_provenance_head(root, require_git=True)
+            self.assertNotEqual(before, after)
+            self.assertEqual(after, git(root, "rev-parse", "HEAD").stdout.strip())
 
     def test_empty_repo_raises_head_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -97,15 +103,9 @@ class SubjectLayoutCombinedProbeTests(unittest.TestCase):
 
 
 class GitIdentityMemoizationTests(unittest.TestCase):
-    """The shared toplevel probe is computed at most once per resolved path."""
+    """Live toplevel probes must observe repository and environment changes."""
 
-    def setUp(self) -> None:
-        git_identity._cache.clear()
-
-    def tearDown(self) -> None:
-        git_identity._cache.clear()
-
-    def test_toplevel_memoized_across_callers(self) -> None:
+    def test_toplevel_refreshed_across_callers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             git(root, "init", "-b", "master")
@@ -115,13 +115,28 @@ class GitIdentityMemoizationTests(unittest.TestCase):
             git(root, "add", ".")
             git(root, "commit", "-m", "initial")
             self.assertEqual(git_identity.git_toplevel(root), root.resolve())
-            with mock.patch.object(git_identity.subprocess, "run", side_effect=AssertionError("cached probe re-ran")) as run:
+            with mock.patch.object(git_identity.subprocess, "run", wraps=git_identity.subprocess.run) as run:
                 self.assertEqual(git_identity.git_toplevel(root), root.resolve())
-                run.assert_not_called()
+                run.assert_called_once()
 
     def test_non_repo_returns_none(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(git_identity.git_toplevel(Path(tmp)))
+
+    def test_repository_created_after_negative_probe_is_observed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertIsNone(git_identity.git_toplevel(root))
+            git(root, "init", "-b", "master")
+            self.assertEqual(git_identity.git_toplevel(root), root.resolve())
+
+    def test_infrastructure_failure_is_not_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            git(root, "init", "-b", "master")
+            with mock.patch.object(git_identity.subprocess, "run", side_effect=OSError("unavailable")):
+                self.assertIsNone(git_identity.git_toplevel(root))
+            self.assertEqual(git_identity.git_toplevel(root), root.resolve())
 
     def test_marker_semantics_match_probe(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

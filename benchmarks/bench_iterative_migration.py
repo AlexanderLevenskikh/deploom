@@ -25,6 +25,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import hashlib
+import platform
 import os
 import re
 import shutil
@@ -440,7 +443,7 @@ def summarize(values: list[float]) -> dict:
         median = 0.5 * (values[n // 2 - 1] + values[n // 2])
     else:
         median = values[n // 2]
-    p95 = values[min(n - 1, int(0.95 * (n - 1)))]
+    p95 = values[min(n - 1, math.ceil(0.95 * n) - 1)]
     return {
         "n": n,
         "median": round(median, 4),
@@ -501,6 +504,8 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--keep", action="store_true", help="keep existing npm cache seed / fixture stage")
     args = ap.parse_args()
+    if args.reps < 1:
+        ap.error("--reps must be positive")
 
     RESULTS.mkdir(parents=True, exist_ok=True)
     stage = WORK / "iterative"
@@ -535,7 +540,12 @@ def main() -> int:
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     raw = RESULTS / f"iterative-{stamp}.json"
-    raw.write_text(json.dumps({"created": stamp, "results": results}, indent=2), encoding="utf-8")
+    source_digest = hashlib.sha256()
+    for path in sorted(ROOT.glob("*.py")):
+        source_digest.update(path.name.encode("utf-8"))
+        source_digest.update(path.read_bytes())
+    metadata = {"sourceDigest": source_digest.hexdigest(), "revisionLabel": os.environ.get("DEPLOOM_BENCH_LABEL", "working-tree"), "python": sys.version, "platform": platform.platform(), "scope": "iterative CLI only; no online audit, AI latency or Desktop startup", "cacheContract": "fresh run and proof caches in every sample; warm seeded npm and host caches"}
+    raw.write_text(json.dumps({"created": stamp, "metadata": metadata, "results": results}, indent=2), encoding="utf-8")
 
     print("\n=== summary (seconds, e2e total) ===")
     for scenario_name, rows in results.items():

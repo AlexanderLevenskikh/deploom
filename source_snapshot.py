@@ -320,21 +320,13 @@ def _run_git(project_dir: Path, args: list[str]) -> subprocess.CompletedProcess[
         return subprocess.CompletedProcess(["git", *args], 127, stdout="", stderr=str(exc))
 
 
-_subject_layout_cache: "dict[tuple[Path, bool], tuple[Path, Path, str]]" = {}
-
-
 def _subject_layout(project_dir: Path, *, require_git: bool = False) -> tuple[Path, Path, str]:
     project_dir = project_dir.expanduser().resolve()
-    cache_key = (project_dir, require_git)
-    cached = _subject_layout_cache.get(cache_key)
-    if cached is not None:
-        return cached
     # One combined read-only probe instead of two subprocesses: the first stdout
     # line is the toplevel, the second is HEAD.  Semantics are preserved:
     # toplevel-empty == "not a Git repository"; toplevel-present-with-failed-HEAD
-    # == SOURCE_GIT_HEAD_UNAVAILABLE.  source_snapshot never writes to the
-    # probed repositories (no in-process commit/init), so the result is
-    # immutable for a resolved directory within one process and is memoized.
+    # == SOURCE_GIT_HEAD_UNAVAILABLE. Always probe live HEAD: another process
+    # can commit or replace this repository while a reusable worker is alive.
     result = _run_git(project_dir, ["rev-parse", "--show-toplevel", "HEAD"])
     output_lines = result.stdout.strip().splitlines() if result.stdout.strip() else []
     root = Path(output_lines[0]).resolve() if output_lines else None
@@ -347,7 +339,6 @@ def _subject_layout(project_dir: Path, *, require_git: bool = False) -> tuple[Pa
             ) from exc
         head = output_lines[1].strip()
         value = (root, relative, head)
-        _subject_layout_cache[cache_key] = value
         return value
     if root is not None:
         detail = (result.stderr or result.stdout or "empty HEAD").strip()
@@ -356,7 +347,6 @@ def _subject_layout(project_dir: Path, *, require_git: bool = False) -> tuple[Pa
         detail = (result.stderr or result.stdout or "not a Git repository").strip()
         raise SourceCaptureError(f"SOURCE_GIT_REQUIRED: {detail}")
     value = (project_dir, Path("."), "")
-    _subject_layout_cache[cache_key] = value
     return value
 
 
@@ -997,19 +987,20 @@ def _build_source_tree_manifest_impl(
                 f"SOURCE_SPECIAL_FILE_UNSUPPORTED: {relative.as_posix()} mode={oct(st.st_mode)}"
             )
 
-    walk(root, Path("."))
-    if executor is None:
-        for path, relative_text in sorted(file_work, key=lambda item: item[1]):
-            digest, stable = _hash_regular_file(
-                path,
-                suppress_worker_observability=suppress_worker_observability,
-            )
-            accept_hash(path, relative_text, digest, stable)
-    else:
-        try:
+    try:
+        walk(root, Path("."))
+        if executor is None:
+            for path, relative_text in sorted(file_work, key=lambda item: item[1]):
+                digest, stable = _hash_regular_file(
+                    path,
+                    suppress_worker_observability=suppress_worker_observability,
+                )
+                accept_hash(path, relative_text, digest, stable)
+        else:
             while pending:
                 drain_one()
-        finally:
+    finally:
+        if executor is not None:
             executor.shutdown(wait=True)
 
     for directory, relative_dir, stamp in directory_stamps:

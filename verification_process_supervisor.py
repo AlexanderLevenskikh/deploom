@@ -505,7 +505,13 @@ def run_supervised(
             | int(getattr(subprocess, "CREATE_SUSPENDED", 0x00000004))
         )
 
-    process: subprocess.Popen[str] = subprocess.Popen(list(argv), **popen_kwargs)
+    # cmd.exe parses its own shell syntax, not the CRT argv quoting used by
+    # list2cmdline. Escaping inner quotes changes `node -e "process.exit(1)"`
+    # into a JavaScript string literal and can turn a failing check into PASS.
+    launch_args: str | list[str] = list(argv)
+    if os.name == "nt" and len(argv) >= 3 and Path(argv[0]).name.lower() in {"cmd", "cmd.exe"} and str(argv[-2]).lower() == "/c":
+        launch_args = subprocess.list2cmdline(list(argv[:-1])) + ' "' + str(argv[-1]) + '"'
+    process: subprocess.Popen[str] = subprocess.Popen(launch_args, **popen_kwargs)
     # A handful of historical unit tests use minimal Popen doubles. Keep that
     # seam without weakening production: real subprocess.Popen always exposes
     # stdout/wait and therefore always takes the supervised path below.

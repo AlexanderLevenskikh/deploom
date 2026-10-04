@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -65,6 +66,26 @@ class SigmaProcessSupervisionTests(unittest.TestCase):
         )
         self.assertEqual(0, result.returncode)
         self.assertEqual("best-effort", result.supervision.quality)
+
+    @unittest.skipUnless(shutil.which("node"), "Node required for physical shell checks")
+    def test_shell_quoted_expression_keeps_real_failure_exit(self) -> None:
+        for expression, expected in [("process.exit(1)", 1), ("process.exit(7)", 7), ("process.exit(0)", 0)]:
+            with self.subTest(expression=expression):
+                result = run_supervised(
+                    verifier.project_check_command_argv(f'node -e "{expression}"'),
+                    Path.cwd(), timeout_seconds=10,
+                )
+                self.assertEqual(expected, result.returncode, result.stdout)
+
+    @unittest.skipUnless(shutil.which("node"), "Node required for physical shell checks")
+    def test_shell_compound_failure_preserves_quotes_and_environment(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="shell quotes ") as tmp:
+            command = 'node -e "if(process.env.DEPLOOM_QUOTE_TEST!==\'two words\')process.exit(2)" && node -e "process.exit(9)"'
+            result = run_supervised(
+                verifier.project_check_command_argv(command), Path(tmp),
+                timeout_seconds=10, env={"DEPLOOM_QUOTE_TEST": "two words"},
+            )
+            self.assertEqual(9, result.returncode, result.stdout)
 
     def test_output_is_bounded_but_full_stream_infra_match_survives(self) -> None:
         script = (
