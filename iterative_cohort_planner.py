@@ -35,6 +35,16 @@ def _risk(old, new):
     return 3 if av[0] != bv[0] or (av[0] == 0 and av[1] != bv[1]) else (1 if av[1] != bv[1] else 0)
 
 
+def _budget_strategy(config):
+    # B4: the split-then-recombine closure is strictly bounded so a fully
+    # conflicting group collapses to a few leaves instead of a combinatorial
+    # explosion; the explicit cohort cap remains authoritative. The bound is
+    # generous enough to complete a realistic cap-8 cohort (a dense conflict
+    # graph visits at most a few hundred closure nodes) but never unbounded.
+    cap = max(1, min(32, int(config.get("cohortMaxPackages") or 24)))
+    return max(128, min(4096, cap * 512))
+
+
 def plan_adaptive_cohort(*, incumbent, desired, config, ledger, checkpoints, blocked_fingerprints, learned_nogoods, fingerprint_fn, base_checkpoint_id):
     actionable = sorted(name for name in incumbent if name in desired and incumbent[name] != desired[name])
     if not actionable: return None, {}
@@ -88,24 +98,123 @@ def plan_adaptive_cohort(*, incumbent, desired, config, ledger, checkpoints, blo
             batch.extend(part)
             if len(batch) >= size: roots.append(batch); batch = []
     if batch: roots.append(batch)
-    # A fallback half is eligible only when every ancestor was rejected by
-    # exact evidence/deferral. Merely listing smaller groups must not recreate
-    # the old singleton-first behavior.
+
+    # B4: split-then-recombine with a strictly bounded closure.
+    #
+    # If a whole group is rejected by exact evidence, it is divided (existing
+    # behavior). If however a STRICTLY SMALLER learned clause (typically a
+    # mutually exclusive pair like a+h) is satisfied by the group, resolution
+    # must not depend on the order the packages appear in; instead every member
+    # of the minimal conflicting clause is dropped in turn and the conflict-free
+    # subgroups are RE-COMBINED into a maximal compatible cover. This closes the
+    # cross-group gap without skipping, repeating or duplicating packages. The
+    # closure is bounded by the cohort cap and an explicit node budget.
     blocked = set(blocked_fingerprints)
+    node_budget = [_budget_strategy(config)]
     options = []
-    def consider(names):
-        assignment = dict(incumbent)
-        assignment.update({n: desired[n] for n in names})
+
+    def clause_matches(clause, assignment):
+        return all(str(assignment.get(n)) == str(v) for n, v in clause.items())
+
+    def whole_blocked(names, assignment, fingerprint):
+        if not fingerprint or fingerprint in blocked:
+            return True
+        return any(
+            clause and set(clause) == set(names) and clause_matches(clause, assignment)
+            for clause in learned_nogoods
+        )
+
+    def min_subset_conflict(names, assignment):
+        nameset = set(names)
+        clauses = [
+            clause
+            for clause in learned_nogoods
+            if clause and set(clause).issubset(nameset) and set(clause) != nameset
+            and clause_matches(clause, assignment)
+        ]
+        return min(clauses, key=lambda c: len(c)) if clauses else None
+
+    def compatible_cover(names, leaves):
+        # Greedy, deterministic re-combine of mutually disjoint conflict-free
+        # leaves. The cohort cap bounds the cover; the compatibility check keeps
+        # the union free of whole blocks and of smaller conflicting clauses, so
+        # closing a gap never re-creates a rejected combination.
+        picked = set()
+        for leaf in sorted(leaves, key=lambda leaf: (-len(leaf), leaf)):
+            union = tuple(sorted(set(leaf) | picked))
+            if len(union) > size:
+                continue
+            assignment = dict(incumbent); assignment.update({n: desired[n] for n in union})
+            fingerprint = fingerprint_fn(assignment)
+            if whole_blocked(union, assignment, fingerprint) or min_subset_conflict(union, assignment) is not None:
+                continue
+            picked = set(union)
+        return tuple(sorted(picked))
+
+    def closure_leaf(names):
+        # Maximal compatible subset of `names` with all inner conflicts closed.
+        # A member of the blocker (the minimal conflicting clause, or ANY member
+        # for a whole-blocked sub-group) is dropped in turn and the conflict-free
+        # results are re-combined, so even a dense conflict graph collapses to
+        # compatible leaves instead of returning None. Strictly decreasing in
+        # size per step; node_budget keeps the resolution bounded.
+        node_budget[0] -= 1
+        if node_budget[0] <= 0 or not names:
+            return None
+        names = tuple(sorted(set(names)))
+        assignment = dict(incumbent); assignment.update({n: desired[n] for n in names})
         fingerprint = fingerprint_fn(assignment)
-        forbidden = not fingerprint or fingerprint in blocked or any(all(str(assignment.get(n)) == str(v) for n,v in clause.items()) for clause in learned_nogoods if clause)
-        if forbidden:
+        is_whole = whole_blocked(names, assignment, fingerprint)
+        conflict = None if is_whole else min_subset_conflict(names, assignment)
+        if not is_whole and conflict is None:
+            return names
+        dropset = sorted(conflict) if conflict is not None else sorted(names)
+        seen, leaves = set(), []
+        for name in dropset:
+            leaf = closure_leaf(tuple(n for n in names if n != name))
+            if leaf and leaf not in seen:
+                seen.add(leaf)
+                leaves.append(leaf)
+        if not leaves:
+            return None
+        return compatible_cover(names, leaves) or None
+
+    def consider(names):
+        # A fallback half is eligible only when every ancestor was rejected by
+        # exact evidence/deferral. Merely listing smaller groups must not recreate
+        # the old singleton-first behavior.
+        names = tuple(sorted(set(names)))
+        if not names:
+            return
+        assignment = dict(incumbent); assignment.update({n: desired[n] for n in names})
+        fingerprint = fingerprint_fn(assignment)
+        if whole_blocked(names, assignment, fingerprint):
             if len(names) > 1:
                 midpoint = len(names) // 2
                 consider(names[:midpoint]); consider(names[midpoint:])
             return
+        conflict = min_subset_conflict(names, assignment)
+        if conflict is not None:
+            # Split-then-recombine: resolve the conflicting pair order-
+            # independently, then close the gap over the conflict-free leaves.
+            leaves = []
+            for name in sorted(conflict):
+                leaf = closure_leaf(tuple(n for n in names if n != name))
+                if leaf:
+                    leaves.append(leaf)
+            cover = compatible_cover(names, leaves) if leaves else None
+            if cover:
+                push_option(cover)
+            return
+        push_option(names)
+
+    def push_option(names):
+        assignment = dict(incumbent); assignment.update({n: desired[n] for n in names})
+        fingerprint = fingerprint_fn(assignment)
         changed = tuple(sorted(names))
         rank = (not bool(priority.intersection(changed)), -len(changed), sum(_risk(incumbent[n],desired[n]) for n in changed), changed)
         options.append((rank, ProgressiveExtensionPlan(tuple(sorted(assignment.items())), changed, fingerprint, len(actionable)-len(changed))))
+
     for names in roots: consider(names)
     if not options: return None, {"strategy": "adaptive-greedy", "batchLimit": size}
     _, plan = min(options, key=lambda option: option[0])
