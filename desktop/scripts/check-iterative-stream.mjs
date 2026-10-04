@@ -232,9 +232,22 @@ const mkIo = (overrides = {}) => {
   const result = await spawnIterativeStreamed(dir, process.execPath,
     ["-e", `for(let i=0;i<1024;i++)process.stdout.write('x'.repeat(8192)+'\\n');process.stdout.write('z'.repeat(2*1024*1024));process.stderr.write('e'.repeat(2*1024*1024));`],
     root, 10000, journalIo, mkPlatform());
-  if(result.code!==0) throw Error("long-line child failed");
+  if(result.code!==0) throw Error(`long-line child failed: code=${result.code}, timedOut=${result.timedOut}, stderr=${result.stderr.slice(-300)}`);
   if(Buffer.byteLength(result.stdout)>1024*1024 || Buffer.byteLength(result.stderr)>1024*1024) throw Error("capture is not byte-bounded");
   if(statSync(attemptLogPath(dir)).size>128*1024) throw Error("long lines defeated the attempt.log byte cap");
   if(statSync(join(dir,"run.log")).size<12*1024*1024) throw Error("full cumulative evidence was lost");
+}
+// Batching plain output must not swallow or reorder durable status events.
+{
+  const status = n => 'ITERATIVE_MIGRATION_STATUS_V1 ' + JSON.stringify({event:'migration.progress',message:`stage ${n}`}) + '\n';
+  const payload = 'first\nsecond\n' + status(1) + 'middle\n' + status(2) + 'last\n';
+  const { io, lines } = mkIo();
+  const events = [];
+  const result = await spawnIterativeStreamed(root, process.execPath,
+    ['-e', `process.stdout.write(${JSON.stringify(payload)})`], root, 10000, io, mkPlatform(), event => events.push(event));
+  if(result.code!==0 || lines.join('')!==payload) throw Error('batching lost or reordered journal bytes');
+  if(events.map(event=>event.message).join(',')!=='stage 1,stage 2') throw Error('batching lost status events');
+  const statusRecords = lines.filter(line=>line.startsWith('ITERATIVE_MIGRATION_STATUS_V1 '));
+  if(statusRecords.length!==2 || statusRecords.some(line=>line.trim().includes('\n'))) throw Error('status records must remain individually parseable');
 }
 console.log("check-iterative-stream: OK");

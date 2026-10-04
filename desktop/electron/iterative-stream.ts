@@ -130,12 +130,31 @@ export function spawnIterativeStreamed(
     child.stdout.on('data', (chunk: Buffer) => {
       const { carry, lines } = collectStreamedLines(stdoutCarry, platform.decodeChunk(chunk))
       stdoutCarry = carry
-      for (const line of lines) {
-        stdout = captureTail(stdout, `${line}\n`)
-        try { io.recordLine(runDir, `${line}\n`) } catch { /* log is best-effort */ }
+      // Bound the captured tail once per input chunk, not once per line.
+      // Per-line copies repeatedly encoded a 1 MiB tail during chatty output.
+      if (lines.length) stdout = captureTail(stdout, `${lines.join('\n')}\n`)
+      // Batch ordinary output within this chunk to avoid opening and trimming
+      // both journal files for every small line. Status events stay separate
+      // so durable phase updates and their ordering remain unchanged.
+      let plain = ''
+      const flushPlain = (): void => {
+        if (!plain) return
+        try { io.recordLine(runDir, plain) } catch { /* log is best-effort */ }
+        plain = ''
         maybeTrim()
-        parseEventLine(line, onEvent)
       }
+      for (const line of lines) {
+        if (line.includes('ITERATIVE_MIGRATION_STATUS_V1 ')) {
+          flushPlain()
+          try { io.recordLine(runDir, `${line}\n`) } catch { /* log is best-effort */ }
+          maybeTrim()
+          parseEventLine(line, onEvent)
+        } else {
+          plain += `${line}\n`
+          if (plain.length >= 64 * 1024) flushPlain()
+        }
+      }
+      flushPlain()
       // Journal oversized plain lines verbatim without retaining an unlimited carry.
       if (Buffer.byteLength(stdoutCarry, 'utf8') > MAX_CAPTURE_BYTES) {
         stdout = captureTail(stdout, stdoutCarry)
