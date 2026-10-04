@@ -52,6 +52,9 @@ export type IterativeDecision = {
   repairRequests?: Array<{ requestId: string; summary: string }>
   satisfied?: boolean
   bootstrap?: boolean
+  /** A recoverable infrastructure stop: the cause (registry/auth/offline/…)
+   * may change and the user may retry afterwards; this is never COMPLETE. */
+  infraBlocked?: boolean
 }
 
 export const ITERATIVE_STATUS_FILENAME = 'status.json'
@@ -214,9 +217,25 @@ export function decideNextStep(
       // R2: a candidate that is already MATERIALIZED must go to precheck, not
       // re-materialize (Python refuses a MATERIALIZED candidate with
       // CANDIDATE_STAGE_NOT_PLANNED).
-      return candidateStage === 'MATERIALIZED'
-        ? { step: 'precheck', phase, reason: 'candidate is materialized; run the diagnostic check pass in the trial' }
-        : { step: 'materialize', phase, reason: 'materialization was interrupted; resume from durable candidate state' }
+      if (candidateStage === 'MATERIALIZED') {
+        return { step: 'precheck', phase, reason: 'candidate is materialized; run the diagnostic check pass in the trial' }
+      }
+      // B1: a failed materialize records a durable structured attemptResult on
+      // the candidate. While it is retryable the same candidate is re-invoked
+      // (bounded by Python's per-sequence infra budget); a concluded / non
+      // retryable result must NEVER re-materialize — that was the endless
+      // hidden-install loop. Python moves a concluded candidate out of PLANNED,
+      // this guard is a belt-and-braces stop.
+      const attempt = (candidate?.attemptResult ?? null) as Record<string, any> | null
+      if (attempt && attempt.retryable !== true) {
+        return {
+          step: null,
+          phase,
+          reason: `MATERIALIZE_CONCLUDED: ${String(attempt.code ?? attempt.classification ?? '')} — не совместимость; восстановите причину и повторите`,
+          infraBlocked: attempt.recoverable === true,
+        }
+      }
+      return { step: 'materialize', phase, reason: 'candidate is planned; materialize exact versions into the isolated trial' }
     }
     case 'PRECHECK': {
       // A passed precheck leaves phase=PRECHECK + stage=PRECHECKED; the next
@@ -266,6 +285,18 @@ export function decideNextStep(
           phase,
           reason: terminalReason(run),
           satisfied: terminalSatisfied(run),
+        }
+      }
+      // B1: a completed infrastructure stop is durable on the run. The
+      // coordinator STOPS with evidence instead of looping plan-next; the
+      // user retries (plan-next --retry-infra) after the cause changed.
+      const infraBlocked = (run.infraBlocked ?? null) as Record<string, any> | null
+      if (infraBlocked) {
+        return {
+          step: null,
+          phase,
+          reason: `INFRA_BLOCKED: ${String(infraBlocked.reason ?? '')}; verified checkpoint preserved — повторите после восстановления причины`,
+          infraBlocked: true,
         }
       }
       if (candidate && candidateStage) {

@@ -8306,6 +8306,15 @@ function setupIpc(): void {
           return { ok: false, steps, stopped: 'error', error: 'NO_RUN: создайте прогон (Начать миграцию) перед «Продолжить»', attempt: readAttempt(runDir) }
         }
         if (decision.step === null) {
+          // B1: a recoverable infrastructure stop is NOT a migration error and
+          // NOT an incompatibility — the cause (registry/auth/offline/…) may
+          // change and the user retries afterwards. Surface it distinctly so the
+          // panel never claims the run failed.
+          if (decision.infraBlocked) {
+            updateAttempt(runDir, { status: 'failed', stage: 'drive', lastError: decision.reason, lastStep: 'infra-blocked' })
+            publish()
+            return { ok: false, steps, stopped: 'infra-blocked', phase, reason: decision.reason, error: decision.reason, attempt: readAttempt(runDir) }
+          }
           updateAttempt(runDir, { status: 'failed', stage: 'drive', lastError: decision.reason, lastStep: 'unknown' })
           publish()
           return { ok: false, steps, stopped: 'error', error: decision.reason, attempt: readAttempt(runDir) }

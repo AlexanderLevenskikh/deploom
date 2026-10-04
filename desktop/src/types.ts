@@ -369,6 +369,8 @@ export type IterativeRunnerDecision = {
   reason: string
   repairRequests?: IterativeRunnerRepairRequest[]
   satisfied?: boolean
+  bootstrap?: boolean
+  infraBlocked?: boolean
 }
 export type IterativeRuntimeView = {
   requested?: string
@@ -448,7 +450,7 @@ export type IterativeDriveOutcome = {
   autopilot?: { stopped: string; error?: string }
   ok: boolean
   steps: string[]
-  stopped: 'agent-gate' | 'finished' | 'error' | 'time-budget' | 'iteration-budget' | 'canceled'
+  stopped: 'agent-gate' | 'finished' | 'error' | 'time-budget' | 'iteration-budget' | 'canceled' | 'infra-blocked'
   phase?: string
   step?: string
   reason?: string

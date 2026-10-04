@@ -2171,15 +2171,36 @@ def cmd_plan_next(args: argparse.Namespace) -> int:
     lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=60)
     lock.acquire()
     try:
-        return _plan_next_locked(run_dir, run, config)
+        return _plan_next_locked(run_dir, run, config, args)
     finally:
         lock.release()
 
 
-def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any]) -> int:
+def _plan_next_locked(
+    run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any],
+    args: Optional[argparse.Namespace] = None,
+) -> int:
     if not run_budget_ok(config, run):
         raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
     _assert_runtime_unchanged(config)
+    retry_infra = bool(getattr(args, "retry_infra", False) if args is not None else False)
+    if retry_infra:
+        # Explicit user continuation after the infra cause changed: clear the
+        # recoverable infra blocks for the CURRENT registry scope and the
+        # run.infraBlocked marker. A fresh attempt sequence gets a FRESH infra
+        # retry budget; the verified checkpoint is never touched.
+        ledger = dict(load_ledger(run_dir))
+        scope = availability_scope_flat(run, config)
+        ledger["infraBlocks"] = [
+            entry for entry in ledger.get("infraBlocks") or []
+            if entry.get("scopeHash") != scope
+        ]
+        save_ledger(run_dir, ledger)
+        if run.get("infraBlocked") or run.get("terminal") == "INFRA_BLOCKED":
+            run = dict(run)
+            run["infraBlocked"] = None
+            run["updatedAt"] = _now_iso()
+            save_run(run_dir, run)
     active_candidate = load_candidate(run_dir)
     if active_candidate is not None and active_candidate.get("stage") in {
         "PLANNED",
@@ -2310,6 +2331,18 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
         and entry.get("nogood")
         and entry.get("scope") == "deterministic"
     ]
+    # Recoverable, registry-scoped infra blocks: an identical install must not
+    # be silently re-proposed for the same configuration. They are scheduling
+    # blockers only — never compatibility evidence.
+    current_scope = availability_scope_flat(run, config)
+    infra_blocked_fps = {
+        str(entry.get("assignmentFingerprint"))
+        for entry in ledger.get("infraBlocks", [])
+        if entry.get("scopeHash") == current_scope
+        and entry.get("baseCheckpointId") == checkpoint_id
+        and str(entry.get("assignmentFingerprint") or "").strip()
+    }
+    blocked_fingerprints.update(infra_blocked_fps)
     from iterative_cohort_planner import plan_adaptive_cohort
     plan, cohort_selection = plan_adaptive_cohort(
         incumbent=incumbent, desired=desired, config=config, ledger=ledger,
@@ -2320,6 +2353,39 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
     atomic_groups = [list(plan.packages)] if plan else []
     if plan is None:
         all_blocked = len(actionable) > 0
+        if all_blocked and infra_blocked_fps:
+            # Recoverable infra stop with evidence: NOT scope exhaustion and NOT
+            # a terminal. The verified checkpoint is preserved; the user retries
+            # with plan-next --retry-infra after the cause changed.
+            run = dict(run)
+            run["phase"] = "READY"
+            run["activeCandidateId"] = None
+            run["infraBlocked"] = {
+                "baseCheckpointId": checkpoint_id,
+                "scopeHash": current_scope,
+                "blockedFingerprints": sorted(infra_blocked_fps),
+                "classification": "infrastructure",
+                "reason": "materialize failed with an infrastructure cause; recoverable after the cause changes",
+                "blockedAt": _now_iso(),
+            }
+            run["updatedAt"] = _now_iso()
+            save_run(run_dir, run)
+            # The terminal-concluded candidate is left over from the exhausted
+            # materialize; clear it so the coordinator does not re-schedule or
+            # re-materialize a REJECTED candidate. Its evidence is durable in
+            # ledger.infraBlocks and run.infraBlocked.
+            if active_candidate is not None and active_candidate.get("stage") == "REJECTED":
+                clear_candidate(run_dir)
+            _emit_status(
+                {
+                    "event": "plan-next.infra-blocked",
+                    "runId": run["runId"],
+                    "checkpointId": checkpoint_id,
+                    "reason": "INFRA_BLOCKED",
+                    "blockedFingerprints": len(infra_blocked_fps),
+                }
+            )
+            return 0
         reason = "SCOPE_EXHAUSTED" if all_blocked else "NO_ACTIONABLE"
         run = dict(run)
         run["terminal"] = reason
@@ -2378,6 +2444,9 @@ def _plan_next_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str
     run = dict(run)
     run["activeCandidateId"] = candidate["candidateId"]
     run["phase"] = "PLANNING"
+    if run.get("infraBlocked"):
+        run["infraBlocked"] = None
+        run["terminal"] = None
     run["updatedAt"] = _now_iso()
     save_run(run_dir, run)
     _emit_status(
@@ -3458,39 +3527,19 @@ def _materialize_locked(
         runtime_env=_runtime_env(config),
     )
     if install_result.returncode != 0:
-        kind = _classify_materialization_failure(install_result.stdout or "")
-        ledger = dict(load_ledger(run_dir))
-        if record_unavailable_targets(ledger, run, config, candidate,
-                                      (install_result.stdout or "") + "\n" + (install_result.stderr or "")):
-            save_ledger(run_dir, ledger)
-        run = dict(run)
-        run["phase"] = "MATERIALIZING"
-        run["updatedAt"] = _now_iso()
-        save_run(run_dir, run)
-        _emit_status(
-            {
-                "event": "materialize.failed",
-                "runId": run["runId"],
-                "candidateId": candidate["candidateId"],
-                "kind": kind,
-                "exitCode": install_result.returncode,
-                "outputTail": (install_result.stdout or install_result.stderr or "")[-2000:],
-            }
+        return _handle_materialize_failure(
+            run_dir, run, config, candidate, base_checkpoint, install_result=install_result
         )
-        return 0
 
     try:
         observed = observed_resolved_assignment(project_path, candidate["fullAssignment"])
     except Exception as exc:  # drift / undeclared -> materialization not exact
-        _emit_status(
-            {
-                "event": "materialize.observed-drift",
-                "runId": run["runId"],
-                "candidateId": candidate["candidateId"],
-                "summary": str(exc),
-            }
+        # Drift is a recoverable infrastructure-class observation (the install
+        # did not produce the requested exact assignment). It is bounded by the
+        # same infra retry budget and never becomes an incompatibility.
+        return _handle_materialize_failure(
+            run_dir, run, config, candidate, base_checkpoint, drift=exc
         )
-        return 0
     observed_hash = observed_resolved_hash(observed)
 
     trial_snapshot = capture_source_snapshot(project_path, timeout_seconds=0)
@@ -3523,6 +3572,216 @@ def _materialize_locked(
     return 0
 
 
+def _handle_materialize_failure(
+    run_dir: Path,
+    run: Mapping[str, Any],
+    config: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    base_checkpoint: Mapping[str, Any],
+    *,
+    install_result: Optional[Any] = None,
+    drift: Optional[Exception] = None,
+) -> int:
+    """Conclude or bound a failed exact materialization with a durable result.
+
+    Three outcomes, all written under the run lock (the single counter owner):
+
+    * resolver (ETARGET/NOTARGET/...): defer the EXACT target through
+      ``record_unavailable_targets``, conclude the current candidate and defer
+      its exact fingerprint so plan-next can reach the remaining packages
+      without any manual apply-feedback. No learned incompatibility.
+    * infrastructure (recoverable): bounded by ``budget.maxInfraRetries`` for
+      this attempt sequence. While retries remain the candidate stays PLANNED
+      and the coordinator re-invokes materialize (retryable); when exhausted
+      the candidate is concluded and the identity is blocked for the CURRENT
+      registry scope with a recoverable stop + evidence.
+    * unknown: concluded immediately with evidence; the identity is blocked for
+      the current scope so an identical gate stops instead of replaying.
+    """
+    output = ""
+    exit_code: int = 1
+    if install_result is not None:
+        output = (install_result.stdout or "") + "\n" + (install_result.stderr or "")
+        exit_code = int(install_result.returncode)
+    if drift is not None:
+        output = output + f"\nobserved drift: {drift}"
+        classification: str = "infrastructure"
+        code: str = "DRIFT"
+    else:
+        classification, code = _materialization_failure(output)
+
+    candidate_id = str(candidate["candidateId"])
+    base_id = str(base_checkpoint["checkpointId"])
+    fingerprint = assignment_fingerprint(candidate["fullAssignment"])
+    revision_key = _attempt_revision_key(base_id, fingerprint)
+    max_retries = int(config["budget"]["maxInfraRetries"])
+
+    ledger = dict(load_ledger(run_dir))
+    counters = dict(ledger.get("counters", {}))
+
+    if classification == "resolver":
+        # ETARGET defers only the exact package target in this scope; the
+        # remaining packages stay actionable through plan-next.
+        record_unavailable_targets(ledger, run, config, candidate, output)
+        _append_deferral(ledger, candidate, f"resolver {code}: target version unavailable")
+        candidate = dict(candidate)
+        candidate["stage"] = "REJECTED"
+        candidate["conclusion"] = {
+            "kind": "resolver-target-unavailable",
+            "code": code,
+            "reason": f"resolver {code} during exact materialization",
+            "exactTargetDeferred": True,
+        }
+        candidate["attemptResult"] = _build_attempt_result(
+            candidate, base_id, classification=classification, code=code,
+            exit_code=exit_code, retry_count=0, max_retries=max_retries,
+            retryable=False, terminal_failure=True, output_tail=output,
+        )
+        candidate["updatedAt"] = _now_iso()
+        save_candidate(run_dir, candidate)
+        run = dict(run)
+        run["activeCandidateId"] = None
+        run["phase"] = "READY"
+        run["updatedAt"] = _now_iso()
+        save_run(run_dir, run)
+        save_ledger(run_dir, ledger)
+        _emit_status(
+            {
+                "event": "materialize.failed",
+                "runId": run["runId"],
+                "candidateId": candidate_id,
+                "kind": classification,
+                "code": code,
+                "exitCode": exit_code,
+                "outputTail": output[-2000:],
+                "concluded": True,
+                "exactTargetDeferred": True,
+            }
+        )
+        return 0
+
+    # infrastructure / unknown from here on.
+    previous = candidate.get("attemptResult") or {}
+    retry_count = int(previous.get("retryCount") or 0)
+    infra_counter = int(counters.get("infraRetries", 0)) + 1
+    counters["infraRetries"] = infra_counter
+    run = dict(run)
+    run["updatedAt"] = _now_iso()
+
+    recoverable = classification == "infrastructure"
+    can_retry = recoverable and retry_count < max_retries
+    if can_retry:
+        # Keep the candidate PLANNED so the coordinator re-invokes materialize;
+        # the durable attemptResult is the bounded retry counter for the
+        # sequence (it survives a Desktop restart between retries).
+        retry_count += 1
+        candidate = dict(candidate)
+        candidate["attemptResult"] = _build_attempt_result(
+            candidate, base_id, classification=classification, code=code,
+            exit_code=exit_code, retry_count=retry_count, max_retries=max_retries,
+            retryable=True, terminal_failure=False, output_tail=output,
+        )
+        candidate["updatedAt"] = _now_iso()
+        save_candidate(run_dir, candidate)
+        ledger["counters"] = counters
+        save_ledger(run_dir, ledger)
+        run["phase"] = "MATERIALIZING"
+        save_run(run_dir, run)
+        _emit_status(
+            {
+                "event": "materialize.failed",
+                "runId": run["runId"],
+                "candidateId": candidate_id,
+                "kind": classification,
+                "code": code,
+                "exitCode": exit_code,
+                "outputTail": output[-2000:],
+                "retryable": True,
+                "retryCount": retry_count,
+                "maxRetries": max_retries,
+            }
+        )
+        return 0
+
+    # Terminal for this sequence: conclude the candidate and block the identity
+    # for the current registry scope. run.infraBlocked makes the coordinator
+    # STOP with evidence; plan-next --retry-infra (user continuation after the
+    # cause changed) opens a fresh attempt sequence with a fresh budget.
+    scoped_key = _infra_scope_key(run, config, base_id, fingerprint)
+    current_scope = availability_scope_flat(run, config)
+    infra_blocks = list(ledger.get("infraBlocks") or [])
+    infra_blocks = [
+        entry for entry in infra_blocks
+        if not (entry.get("scopeKey") == scoped_key and entry.get("revisionKey") == revision_key)
+    ]
+    infra_blocks.append(
+        {
+            "scopeKey": scoped_key,
+            "scopeHash": current_scope,
+            "revisionKey": revision_key,
+            "baseCheckpointId": base_id,
+            "candidateId": candidate_id,
+            "assignmentFingerprint": fingerprint,
+            "classification": classification,
+            "code": code,
+            "retryCount": retry_count,
+            "maxRetries": max_retries,
+            "reason": f"{classification.upper()} {code}: materialize failed {retry_count} time(s); recoverable, cause may change",
+            "evidenceTail": output[-2000:],
+            "journalRef": "attempt.log",
+            "createdAt": _now_iso(),
+        }
+    )
+    ledger["infraBlocks"] = infra_blocks
+    ledger["counters"] = counters
+    candidate = dict(candidate)
+    candidate["stage"] = "REJECTED"
+    candidate["conclusion"] = {
+        "kind": "infra-blocked" if recoverable else "unknown-failed",
+        "code": code,
+        "reason": f"{classification.upper()} {code}: materialize retries exhausted or not classifiable",
+        "scopeKey": scoped_key,
+    }
+    candidate["attemptResult"] = _build_attempt_result(
+        candidate, base_id, classification=classification, code=code,
+        exit_code=exit_code, retry_count=retry_count, max_retries=max_retries,
+        retryable=False, terminal_failure=True, output_tail=output,
+    )
+    candidate["updatedAt"] = _now_iso()
+    save_candidate(run_dir, candidate)
+    run["activeCandidateId"] = None
+    run["phase"] = "READY"
+    run["infraBlocked"] = {
+        "baseCheckpointId": base_id,
+        "assignmentFingerprint": fingerprint,
+        "classification": classification,
+        "code": code,
+        "reason": f"{classification.upper()} {code}: materialize failed; cause may change",
+        "evidenceTail": output[-2000:],
+        "retryCount": retry_count,
+        "maxRetries": max_retries,
+        "blockedAt": _now_iso(),
+    }
+    save_run(run_dir, run)
+    save_ledger(run_dir, ledger)
+    _emit_status(
+        {
+            "event": "materialize.failed",
+            "runId": run["runId"],
+            "candidateId": candidate_id,
+            "kind": classification,
+            "code": code,
+            "exitCode": exit_code,
+            "outputTail": output[-2000:],
+            "retryable": False,
+            "terminalFailure": True,
+            "retryCount": retry_count,
+            "maxRetries": max_retries,
+        }
+    )
+    return 0
+
+
 def _materialize_trial_tree(
     snapshot: SourceSnapshot, workspace_root: Path, timeout_seconds: int
 ) -> None:
@@ -3543,17 +3802,120 @@ def _materialize_trial_tree(
     apply_tree_write_protection(workspace_root, readonly=False)
 
 
-def _classify_materialization_failure(output: str) -> str:
-    lowered = output.lower()
-    for marker in ("enoent", "econnrefused", "esockettimeout", "eai_again", "network", "getaddrinfo"):
+# Materialize failure classification. Recoverable infrastructure causes
+# (registry auth/rate-limit/server/offline/cache/network/filesystem) bound the
+# infra retry budget and NEVER become compatibility evidence; a resolver
+# ETARGET defers only the exact target; anything else is an honest unknown that
+# stops with evidence instead of looping.
+_MATERIALIZE_INFRA_MARKERS = (
+    ("RATE_LIMIT", ("429", "e429", "rate limit exceeded", "too many requests")),
+    ("UNAUTHORIZED", ("401", "e401", "unauthorized", "authentication failed")),
+    ("FORBIDDEN", ("403", "e403", "forbidden")),
+    ("OFFLINE", ("eoffline", "offline", "network is unreachable")),
+    ("CACHE_MISS", ("enotcached", "not in cache", "missing from cache", "enoent")),
+    ("CONNECTION", ("econnreset", "econnrefused", "esockettimeout", "eai_again", "etimedout", "getaddrinfo", "socket hang up", "network error", "network request")),
+    ("FILESYSTEM", ("eacces", "eperm", "eio")),
+)
+
+
+def _materialization_failure(output: str) -> Tuple[str, str]:
+    """Return (classification, code) for a failed exact install.
+
+    classification: ``infrastructure`` | ``resolver`` | ``unknown``.
+    code: a stable short code (ETARGET, ENOTCACHED, RATE_LIMIT, ...). The
+    classification is scheduling input only; nothing here grants verification
+    proof or asserts incompatibility.
+    """
+    lowered = (output or "").lower()
+    if re.search(r"\b5\d\d\b", output or ""):
+        return "infrastructure", "SERVER_ERROR"
+    for code, markers in _MATERIALIZE_INFRA_MARKERS:
+        for marker in markers:
+            if marker in lowered:
+                return "infrastructure", code
+    for marker, code in (
+        ("etarget", "ETARGET"),
+        ("enotarget", "NOTARGET"),
+        ("no matching version", "ETARGET"),
+        ("e404", "ETARGET"),
+        ("unable to resolve", "RESOLVER"),
+        ("unresolved", "RESOLVER"),
+    ):
         if marker in lowered:
-            return "infrastructure"
-    for marker in ("enotcached", "e404", "notarget", "no matching version", "unable to resolve", "unresolved"):
-        if marker in lowered:
-            return "resolver"
+            return "resolver", code
     if "fixed" in lowered or "conflict" in lowered:
-        return "resolver"
-    return "unknown"
+        return "resolver", "CONFLICT"
+    return "unknown", "UNKNOWN"
+
+
+def _classify_materialization_failure(output: str) -> str:
+    # Kept as a thin, backward-compatible facade (kind only) for callers that
+    # render the event; the coordinator consumes the structured classification.
+    return _materialization_failure(output)[0]
+
+
+def _attempt_revision_key(base_checkpoint_id: Any, fingerprint: str) -> str:
+    """Per-revision durable identity for repair/infra budgets."""
+    return _sha256_text(f"{base_checkpoint_id}|{fingerprint}")
+
+
+def _infra_scope_key(
+    run: Mapping[str, Any], config: Mapping[str, Any], base_checkpoint_id: Any, fingerprint: str
+) -> str:
+    """Infra attempt identity: (registry/auth coordinates, base, fingerprint).
+
+    The registry coordinates come from availability_scope, so a change of the
+    server/proxy/offline flag naturally expires an old infra block without the
+    user having to know the key.
+    """
+    from iterative_target_deferrals import availability_scope
+
+    return _sha256_text(
+        f"{availability_scope(run, config)}|{base_checkpoint_id}|{fingerprint}"
+    )
+
+
+def availability_scope_flat(run: Mapping[str, Any], config: Mapping[str, Any]) -> str:
+    from iterative_target_deferrals import availability_scope
+
+    return availability_scope(run, config)
+
+
+def _build_attempt_result(
+    candidate: Mapping[str, Any],
+    base_checkpoint_id: str,
+    *,
+    classification: str,
+    code: str,
+    exit_code: int,
+    retry_count: int,
+    max_retries: int,
+    retryable: bool,
+    terminal_failure: bool,
+    output_tail: str,
+) -> Dict[str, Any]:
+    sequence = list(
+        (candidate.get("attemptResult") or {}).get("attemptSequence") or []
+    )
+    return {
+        "kind": "materialize",
+        "classification": classification,
+        "code": code,
+        "exitCode": int(exit_code),
+        "retryCount": int(retry_count),
+        "maxRetries": int(max_retries),
+        "retryable": bool(retryable),
+        "recoverable": classification == "infrastructure",
+        "terminalFailure": bool(terminal_failure),
+        "attemptSequence": sequence + [classification],
+        "lastFailureEvidence": {
+            "outputTail": (output_tail or "")[-2000:],
+            "journalRef": "attempt.log",
+        },
+        "candidateId": candidate.get("candidateId"),
+        "baseCheckpointId": base_checkpoint_id,
+        "createdAt": _now_iso(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3810,20 +4172,31 @@ def _verify_exact_locked(
         candidate = dict(candidate)
         ledger = load_ledger(run_dir)
         counters = dict(ledger.get("counters", {}))
-        completed_repairs = int(counters.get("repairAttemptsForRevision", 0)) + 1
         max_attempts = int(config["budget"]["maxRepairAttemptsPerRevision"])
-        counters["repairAttemptsForRevision"] = completed_repairs
+        # B2: the repair budget belongs to THIS candidate incarnation
+        # (candidate.attemptId), so a NEW candidate never inherits a spent
+        # per-revision count and restarting the SAME attempt never resets it.
+        # The ledger keeps the per-revision total only as observable telemetry
+        # with a single owner (the locked controller).
+        used = int(candidate.get("attemptId", 0)) + 1
+        revision_key = _attempt_revision_key(
+            str(candidate["baseCheckpointId"]),
+            assignment_fingerprint(candidate["fullAssignment"]),
+        )
+        by_revision = dict(counters.get("repairAttemptsByRevision") or {})
+        by_revision[revision_key] = used
+        counters["repairAttemptsByRevision"] = by_revision
+        counters["repairAttemptsForRevision"] = used  # latest-revision telemetry
         ledger = dict(ledger)
         ledger["counters"] = counters
-        save_ledger(run_dir, ledger)
-        if completed_repairs >= max_attempts:
+        if used >= max_attempts:
             _record_block(
                 ledger,
                 run_dir,
                 candidateId=str(candidate["candidateId"]),
                 baseCheckpointId=str(candidate["baseCheckpointId"]),
                 kind="NOT_ACTIONABLE",
-                reason=f"REPAIR_ATTEMPTS_EXHAUSTED completed={completed_repairs} max={max_attempts}",
+                reason=f"REPAIR_ATTEMPTS_EXHAUSTED completed={used} max={max_attempts}",
                 assignmentFingerprint=assignment_fingerprint(candidate["fullAssignment"]),
             )
             candidate["stage"] = "REJECTED"
@@ -3843,7 +4216,7 @@ def _verify_exact_locked(
                 }
             )
             return 0
-        candidate["attemptId"] = int(candidate.get("attemptId", 0)) + 1
+        candidate["attemptId"] = used
         candidate["stage"] = "REPAIRING"
         candidate["updatedAt"] = _now_iso()
         save_candidate(run_dir, candidate)
@@ -3855,6 +4228,7 @@ def _verify_exact_locked(
             failing_commands=failing,
             reason="project-source-config-repair",
         )
+        save_ledger(run_dir, ledger)
         run = dict(run)
         run["phase"] = "REPAIRING"
         run["updatedAt"] = _now_iso()
@@ -4268,8 +4642,10 @@ def cmd_status(args: argparse.Namespace) -> int:
             "blocks": len(ledger.get("blocks", [])),
             "deferrals": len(ledger.get("deferrals", [])),
             "feedback": len(ledger.get("feedback", [])),
+            "infraBlocks": len(ledger.get("infraBlocks", [])),
             "counters": ledger.get("counters", {}),
         },
+        "infraBlocked": run.get("infraBlocked") or None,
         "openRepairRequests": repair_requests,
         "config": {
             "projectName": config.get("projectName"),
@@ -4975,6 +5351,11 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap_materialize.add_argument("--timeout-seconds", type=int, default=1800)
 
     plan_next = sub.add_parser("plan-next", help="Выбрать следующий небольшой шаг от активного checkpoint")
+    plan_next.add_argument(
+        "--retry-infra",
+        action="store_true",
+        help="Пользовательское продолжение после изменённой инфраструктурной причины: снять recoverable infra-блоки текущего registry-scope и открыть новую attempt-последовательность со свежим infra-бюджетом",
+    )
 
     materialize = sub.add_parser("materialize", help="Физическая материализация точных версий в isolated trial")
     materialize.add_argument("--timeout-seconds", type=int, default=1200)
