@@ -4478,6 +4478,34 @@ def _apply_feedback_locked(
             raise InvalidInputError("FEEDBACK_CHANGED_FILES_INVALID")
         _validate_changed_files(run_dir, candidate, changed_files)
 
+    # B5: the whole payload is validated BEFORE any durable write. An invalid
+    # feedback must fail here and leave the on-disk state untouched — never
+    # conclude the candidate first and only then raise (the old ordering left a
+    # half-written durable state: REJECTED candidate with no ledger feedback).
+    reason = feedback.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        raise InvalidInputError("FEEDBACK_REASON_INVALID")
+    diagnostics_refs = feedback.get("diagnosticsRefs") or []
+    if not isinstance(diagnostics_refs, list) or not all(
+        isinstance(item, str) for item in diagnostics_refs
+    ):
+        raise InvalidInputError("FEEDBACK_DIAGNOSTICS_INVALID")
+    proposed_scope = feedback.get("proposedScope") or {}
+    if not isinstance(proposed_scope, dict):
+        raise InvalidInputError("FEEDBACK_SCOPE_INVALID")
+    proposed_constraints = feedback.get("proposedConstraints") or {}
+    if not isinstance(proposed_constraints, dict):
+        raise InvalidInputError("FEEDBACK_CONSTRAINTS_INVALID")
+    companions: Optional[Sequence[str]] = None
+    if kind == "NEEDS_COHORT_EXPANSION":
+        companions = proposed_scope.get("companions")
+        if companions is not None:
+            if not isinstance(companions, list) or not all(
+                isinstance(item, str) for item in companions
+            ):
+                raise InvalidInputError("FEEDBACK_COMPANIONS_INVALID")
+            companions = [str(item) for item in companions]
+
     ledger = load_ledger(run_dir)
     feedback_record = {
         "schemaVersion": SCHEMA_VERSION,
@@ -4513,17 +4541,7 @@ def _apply_feedback_locked(
         run["activeCandidateId"] = None
         run["phase"] = "READY"
         if kind == "NEEDS_COHORT_EXPANSION":
-            proposed = feedback.get("proposedScope") or {}
-            companions = (
-                proposed.get("companions")
-                if isinstance(proposed, dict)
-                else None
-            )
             if companions is not None:
-                if not isinstance(companions, list) or not all(
-                    isinstance(c, str) for c in companions
-                ):
-                    raise InvalidInputError("FEEDBACK_COMPANIONS_INVALID")
                 _record_scope_expansion(
                     ledger, candidate, list(companions), str(feedback.get("reason") or "")
                 )
@@ -4689,6 +4707,24 @@ def _terminal_outcome(satisfied: bool, audit_status: str, accepted_count: int) -
     return "NO_VERIFIED_UPGRADE"
 
 
+def _is_baseline_checkpoint(checkpoint: Mapping[str, Any]) -> bool:
+    # The baseline C0 has no parent and seq 0; every accepted checkpoint records
+    # its parent and a higher seq (see _accept_checkpoint).
+    return not checkpoint.get("parentCheckpointId") and int(checkpoint.get("seq") or 0) == 0
+
+
+def _accepted_upgrade_count(checkpoints: Sequence[Mapping[str, Any]]) -> int:
+    # B3: C0 is the VERIFIED starting point, not an accepted UPGRADE. Finish must
+    # not count it, otherwise a run with zero real updates reports
+    # acceptedCheckpoints=1 / PARTIAL_VERIFIED instead of
+    # NO_VERIFIED_UPGRADE (actual updates = 0).
+    return sum(
+        1
+        for c in checkpoints
+        if c.get("status") == "VERIFIED" and not _is_baseline_checkpoint(c)
+    )
+
+
 def cmd_finish(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
     run = load_run(run_dir)
@@ -4736,7 +4772,7 @@ def _finish_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str, A
             audit = checkpoint.get("audit") or {}
             audit_status = str(audit.get("status") or "")
         satisfied = _policy_satisfied(config, checkpoint)
-        accepted_count = sum(1 for c in checkpoints if c.get("status") == "VERIFIED")
+        accepted_count = _accepted_upgrade_count(checkpoints)
         outcome = _terminal_outcome(satisfied, audit_status, accepted_count)
         # P2 (#1): a repair-only run whose CURRENT-state control passes the audit
         # is a repair SUCCESS — never a partial migration ("0 verified UPGRADES"
