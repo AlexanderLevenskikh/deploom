@@ -446,7 +446,28 @@ failureOwner.register('drive',async () => { failureDrives++; return {ok:true}; }
 const providerFailed = failureOwner.register('agent',async () => ({ok:false,error:'AGENT_PROVIDER_ERROR: unavailable'}));
 assert.equal((await providerFailed(null,scope)).autopilot.stopped,'error');
 assert.equal(failureDrives,0,'Unknown provider failures must not discard a candidate');
-console.log('autopilot: check -> begin -> drive -> agent -> finish; cancel, failure, guard recovery and repeated-gate boundaries OK');
+// Waiting is a suspended agent call, not a failed migration or repeated gate.
+for (const first of ['agent','drive']) {
+ const waiting = owner(); let calls = 0; let drives = 0;
+ waiting.register('status',async()=>({ok:true,decision:{step:'agent'}}));
+ const agent = waiting.register('agent',async()=> ++calls === 1 ? {ok:false,waiting:true,retryAt:Date.now()+20} : {ok:true});
+ const drive = waiting.register('drive',async()=> ++drives === 1 && first === 'drive' ? {ok:true,stopped:'agent-gate',repairRequests:[{requestId:'waiting'}]} : {ok:true,stopped:'finished'});
+ const result = await (first === 'agent' ? agent : drive)(null,scope);
+ assert.equal(result.autopilot.stopped,'finished'); assert.equal(calls,2);
+}
+for (const stop of ['cancel','pause']) {
+ const waiting = owner(); let calls = 0;
+ const agent = waiting.register('agent',async()=>{calls++;return {ok:false,waiting:true,retryAt:Date.now()+60_000};});
+ const cancel = waiting.register('cancel',async()=>({ok:true}));
+ const pending = agent(null,scope);
+ await new Promise(resolve=>setTimeout(resolve,20));
+ assert.equal(waiting.hasSession(scope),true);
+ if (stop === 'cancel') await cancel(null,scope); else waiting.setEnabled(scope,false);
+ const result = await pending;
+ assert.equal(result.autopilot.stopped,stop==='cancel'?'canceled':'paused');
+ assert.equal(calls,1); assert.equal(waiting.hasSession(scope),false);
+}
+console.log('autopilot: continuation, waiting, pause, cancel and repeated-gate boundaries OK');
 
 if (failures > 0) {
   console.error(`${failures} scenario contract check(s) FAILED`);

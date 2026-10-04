@@ -542,6 +542,7 @@ export type AgentLease = {
   attemptId: number
   pid: number
   childPid?: number
+  autopilot?: boolean
   startedAt: string
   // Launch-wait resilience: a retryable provider outage (rate limit / temp /
   // unknown with budget left) parks the lease as WAITING with its retry
@@ -593,6 +594,7 @@ export function readAgentLease(file: string): AgentLease | undefined {
       attemptId: Number(parsed.attemptId ?? 0),
       pid: Number(parsed.pid ?? 0),
       ...(typeof parsed.childPid === 'number' ? { childPid: parsed.childPid } : {}),
+      ...(parsed.autopilot === true ? { autopilot: true } : {}),
       startedAt: parsed.startedAt,
       ...(parsed.waiting === true ? { waiting: true } : {}),
       ...(waitKind ? { waitKind } : {}),
@@ -679,7 +681,7 @@ export function decideAgentLeaseDispatch(
   if (!lease.waiting && !agentLeaseAlive(lease, now)) return { action: 'none' }
   if (lease.waiting) {
     const attempts = lease.launchAttempts ?? 0
-    if (lease.waitKind !== 'rate-limited') {
+    if (lease.waitKind !== 'rate-limited' && !(lease.autopilot && lease.waitKind === 'temporary')) {
       const budget = lease.waitKind === 'unknown' ? 3 : lease.waitKind === 'temporary' ? 5 : 0
       if (budget > 0 && attempts >= budget) {
         return { action: 'give-up', detail: `AGENT_LAUNCH_BUDGET_EXHAUSTED: провайдер недоступен (${lease.waitKind}) после ${attempts} попыток запуска: ${lease.waitDetail ?? 'причина неизвестна'}. Верификация и последний verified checkpoint сохранились; ремонт не засчитан.` }

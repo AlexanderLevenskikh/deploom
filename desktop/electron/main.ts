@@ -8,7 +8,7 @@ import { buildDependencyGraphSnapshot } from './dependency-graph.js'
 import { BaselineWorkerPool, WORKER_CANCEL } from './baseline-worker.js'
 const { autoUpdater } = updaterPackage
 import { buildClaudeAgentArgs, buildClaudeResumeArgs, buildCodexAgentArgs, buildCodexResumeArgs, buildOpenCodeAgentArgs, buildOpenCodeResumeArgs, parseOpencodeModelsOutput } from './agent-command.js'
-import { AGENT_LAUNCH_RETRY_BUDGET, agentLaunchProviderError, agentLaunchRetryDelayMs, canRetryAgentLaunch, classifyAgentLaunchFailure, redactAgentDiagnostics, type AgentLaunchDiagnostics } from './agent-launch-errors.js'
+import { AGENT_LAUNCH_RETRY_BUDGET, agentLaunchProviderError, agentLaunchRetryDelayMs, agentLaunchTimeoutMs, canRetryAgentLaunch, classifyAgentLaunchFailure, redactAgentDiagnostics, type AgentLaunchDiagnostics } from './agent-launch-errors.js'
 import { agentBatchCompletionFingerprint, agentScopeFingerprint, extractAgentSessionId, resumableAgentSessionId } from './agent-session.js'
 import { restoreVerifiedAgentCompletion, updateFlowProgress, type FlowAction } from './flow-state.js'
 import { adoptEmptyContinuationBranches, adoptHistoricalContinuationBranches, adoptPreferredScopeBranches, buildMigrationProgress, continuationMigrationPlan, integratedBranchTargets, leftoverConflictMarkerLines, liveGitWorktreeRecords, mergeInProgressNote, mergePackageJsonThreeWay, migrationBranchStateText, migrationCompletionIssues, migrationBatchScopeDriftIssues, migrationGroupScopeDriftIssues, migrationPlanFromPrompt, migrationScopeManifestFromPrompt, migrationStateSummary, nextIncompleteMigrationBranch, recoverContinuationScopeBranches, rebindMigrationPromptBranchIdentity, replaceMigrationPlanInPrompt, relevantGitStatus, relevantGitStatusLines, workspaceNoiseGitExcludePathspecs, rollbackIncompleteMigrationActions, satisfiedScopePackagesFromPrompt, scopeActionsFromPrompt, scopeTargetsFromPrompt, validateScopeProofEnvelope, type MigrationBranchProgress, type MigrationBranchRuntime, type MigrationBranchRuntimePhase, type MigrationPlan, type MigrationProgress } from './migration-progress.js'
@@ -7501,7 +7501,16 @@ function setupIpc(): void {
     return stepLockKey(workspace.id, input.projectName)
   })
 
-  ipcMain.handle('flow:iterative:autopilot', async (_event, input: { workspaceId?: string; projectName: string; enabled: boolean }) => iterativeAutopilot.setEnabled(input, input.enabled))
+  ipcMain.handle('flow:iterative:autopilot', async (_event, input: { workspaceId?: string; projectName: string; enabled: boolean }) => {
+    const workspace = findWorkspace(loadState(), input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    const file = agentLeaseFile(iterativeTaskRunDir(workspace, project))
+    const lease = readAgentLease(file)
+    if (lease) writeAgentLease(file, { ...lease, autopilot: input.enabled })
+    const result = iterativeAutopilot.setEnabled(input, input.enabled)
+    if (lease?.waiting) scheduleAgentWaitRetry({ workspaceId: workspace.id, projectName: project.name }, lease.retryAt ?? Date.now())
+    return { ...result, active: result.active || (input.enabled && lease?.waiting === true) }
+  })
 
   ipcMain.handle('flow:iterative:task', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()
@@ -7758,6 +7767,7 @@ function setupIpc(): void {
       // refresh — a remounted panel learns about the running child from HERE,
       // not from a local `stepBusy`.
       inFlight: iterativeStepInFlight.has(stepLockKey(workspace.id, project.name)),
+      autopilotActive: waitLease?.waiting === true && waitLease.autopilot === true,
       // P1#4: durable "Проверить проект" verdict (only meaningful while no run
       // exists). Lets the panel show a distinct "ready → Начать обновление"
       // state after a real check instead of conflating check with start.
@@ -8462,9 +8472,9 @@ function setupIpc(): void {
     if (!readAttempt(runDir)) startAttempt(runDir, projectName, 'none', undefined, 0, workspaceId)
   }
 
-  function agentLaunchWaitDetail(diag: AgentLaunchDiagnostics, attempts: number, retryAt: number): string {
+  function agentLaunchWaitDetail(diag: AgentLaunchDiagnostics, attempts: number, retryAt: number, autopilot = false): string {
     const when = new Date(retryAt).toLocaleTimeString()
-    const budget = AGENT_LAUNCH_RETRY_BUDGET[diag.kind]
+    const budget = autopilot && diag.kind === 'temporary' ? Infinity : AGENT_LAUNCH_RETRY_BUDGET[diag.kind]
     const kindLabel = diag.kind === 'rate-limited' ? 'лимит запросов провайдера' : diag.kind === 'temporary' ? 'временный сбой провайдера' : 'неустановленный сбой запуска'
     const budgetText = Number.isFinite(budget) ? ` (попытка ${attempts}/${budget})` : ` (попытка ${attempts})`
     return `Ожидание повторного запуска агента: ${kindLabel}${diag.detail ? ` — ${diag.detail}` : ''}; следующая попытка в ${when}${budgetText}. Ремонт не отменён и не расходует попытку.`
@@ -8482,7 +8492,10 @@ function setupIpc(): void {
       scheduleAgentWaitRetry(fullScope, lease.retryAt as number)
       return
     }
-    await runIterativeAgent(fullScope)
+    // An active coordinator owns its wait and continuation; the timer is for
+    // manual repair or recovery after Desktop restart.
+    if (iterativeAutopilot.hasSession(fullScope)) return
+    await runIterativeAgentWithAutopilot(undefined, { ...fullScope, autopilot: lease.autopilot === true })
   }
 
   function scheduleAgentWaitRetry(scope: { workspaceId: string; projectName: string }, retryAt: number): void {
@@ -8538,6 +8551,8 @@ function setupIpc(): void {
     // Desktop therefore continues exactly the parked wait, never a duplicate.
     const leasePath = agentLeaseFile(runDir)
     const existingLease = readAgentLease(leasePath)
+    const autopilot = iterativeAutopilot.isEnabled(input) ?? (existingLease?.autopilot === true)
+    if (existingLease) existingLease.autopilot = autopilot
     const leaseDecision = decideAgentLeaseDispatch(existingLease, isPidAlive)
     if (leaseDecision.action === 'wait') {
       ensureAttemptRecord(runDir, project.name, workspace.id)
@@ -8750,7 +8765,7 @@ function setupIpc(): void {
         let agentStdout = ''
         let agentStderr = ''
         if (provider === 'opencode') {
-          writeAgentLease(leasePath, { schemaVersion: 1, sessionId, provider, databasePath, runId: ctx.runId, candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId, attemptId: ctx.attemptId, pid: process.pid, startedAt: new Date().toISOString(), launchAttempts: carriedLaunchAttempts })
+          writeAgentLease(leasePath, { schemaVersion: 1, sessionId, provider, databasePath, runId: ctx.runId, candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId, attemptId: ctx.attemptId, pid: process.pid, startedAt: new Date().toISOString(), launchAttempts: carriedLaunchAttempts, autopilot })
           let transport: Awaited<ReturnType<typeof startStandaloneOpenCodeServer>>
           try { transport = await startStandaloneOpenCodeServer(projectPath, databasePath) } catch (error) {
             exitCode = 1
@@ -8775,6 +8790,7 @@ function setupIpc(): void {
               pid: process.pid,
               startedAt: new Date().toISOString(),
               launchAttempts: carriedLaunchAttempts,
+              autopilot,
             })
             const agentResult = await spawnIterativeStreamed(
               runDir,
@@ -8783,7 +8799,7 @@ function setupIpc(): void {
                 ? buildOpenCodeResumeArgs(projectPath, resumeSessionId as string, model, promptFile, undefined, undefined, transport?.url)
                 : buildOpenCodeAgentArgs(projectPath, promptFile, model, undefined, transport?.url),
               projectPath,
-              900_000,
+              agentLaunchTimeoutMs(carriedLaunchAttempts, autopilot),
               iterativeStreamIo(runDir),
               { ...iterativeStreamPlatform, commandEnvironment: env => commandEnvironment(openCodeDatabaseEnv(env, databasePath || transport?.databasePath || '')) },
               undefined,
@@ -8811,6 +8827,7 @@ function setupIpc(): void {
             pid: process.pid,
             startedAt: new Date().toISOString(),
             launchAttempts: carriedLaunchAttempts,
+            autopilot,
           })
           const agentResult = await spawnIterativeStreamed(
             runDir,
@@ -8821,7 +8838,7 @@ function setupIpc(): void {
                 : buildCodexResumeArgs(resumeSessionId as string, model, promptFile))
               : (provider === 'claude' ? buildClaudeAgentArgs(model) : buildCodexAgentArgs(projectPath, model)),
             projectPath,
-            900_000,
+            agentLaunchTimeoutMs(carriedLaunchAttempts, autopilot),
             iterativeStreamIo(runDir),
             iterativeStreamPlatform,
             undefined,
@@ -8853,12 +8870,13 @@ function setupIpc(): void {
         if (exitCode !== 0 || agentTimedOut || streamedProviderError || providerFailure) {
           const launchDiag = classifyAgentLaunchFailure({ code: exitCode, stdout: agentStdout, stderr: agentStderr, timedOut: agentTimedOut, providerError: streamedProviderError })
           const parkedLaunchAttempts = (readAgentLease(leasePath)?.launchAttempts ?? 0) + 1
-          if (canRetryAgentLaunch(launchDiag.kind, parkedLaunchAttempts) && launchDiag.kind !== 'permanent') {
-            const retryAt = Date.now() + agentLaunchRetryDelayMs(launchDiag, parkedLaunchAttempts)
-            const waitDetail = agentLaunchWaitDetail(launchDiag, parkedLaunchAttempts, retryAt)
+          const retryAutopilot = iterativeAutopilot.isEnabled(input) ?? (readAgentLease(leasePath)?.autopilot === true)
+          if (canRetryAgentLaunch(launchDiag.kind, parkedLaunchAttempts, retryAutopilot) && launchDiag.kind !== 'permanent') {
+            const retryAt = Date.now() + agentLaunchRetryDelayMs(launchDiag, parkedLaunchAttempts, retryAutopilot)
+            const waitDetail = agentLaunchWaitDetail(launchDiag, parkedLaunchAttempts, retryAt, retryAutopilot)
             const waitKind: 'rate-limited' | 'temporary' | 'unknown' =
               launchDiag.kind === 'rate-limited' || launchDiag.kind === 'temporary' || launchDiag.kind === 'unknown' ? launchDiag.kind : 'unknown'
-            const parked = { ...(readAgentLease(leasePath) ?? existingLease!), childPid: undefined, launchDiagnostics: launchDiag, waiting: true, waitKind, waitDetail: launchDiag.detail, retryAt, retryAfterSeconds: launchDiag.retryAfterSeconds, launchAttempts: parkedLaunchAttempts, sessionId, provider, databasePath: readAgentLease(leasePath)?.databasePath ?? existingLease?.databasePath ?? '', runId: ctx.runId, candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId, attemptId: ctx.attemptId, pid: process.pid, startedAt: new Date().toISOString() }
+            const parked = { ...(readAgentLease(leasePath) ?? existingLease!), childPid: undefined, autopilot: retryAutopilot, launchDiagnostics: launchDiag, waiting: true, waitKind, waitDetail: launchDiag.detail, retryAt, retryAfterSeconds: launchDiag.retryAfterSeconds, launchAttempts: parkedLaunchAttempts, sessionId, provider, databasePath: readAgentLease(leasePath)?.databasePath ?? existingLease?.databasePath ?? '', runId: ctx.runId, candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId, attemptId: ctx.attemptId, pid: process.pid, startedAt: new Date().toISOString() }
             writeAgentLease(leasePath, parked)
             recordAttemptLog(runDir, `Agent launch wait (${launchDiag.kind}): exit=${launchDiag.code}, timedOut=${launchDiag.timedOut}${launchDiag.retryAfterSeconds !== undefined ? `, retryAfter=${launchDiag.retryAfterSeconds}s` : ''}; ${launchDiag.detail}\n`)
             updateAttempt(runDir, { status: 'waiting', stage: 'agent', lastError: undefined, cancelRequested: false, reason: waitDetail, waitUntil: retryAt })
@@ -8979,7 +8997,8 @@ function setupIpc(): void {
     })
   }
 
-  ipcMain.handle('flow:iterative:agent', iterativeAutopilot.register('agent', async (_event, input: { workspaceId?: string; projectName: string }) => runIterativeAgent(input)))
+  const runIterativeAgentWithAutopilot = iterativeAutopilot.register('agent', async (_event, input: { workspaceId?: string; projectName: string; autopilot?: boolean }) => runIterativeAgent(input))
+  ipcMain.handle('flow:iterative:agent', runIterativeAgentWithAutopilot)
 
   ipcMain.handle('flow:dependency-graph-snapshot', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()

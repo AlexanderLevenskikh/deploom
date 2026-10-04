@@ -11,6 +11,7 @@ import * as agents from '../dist-electron/iterative-agent.js';
 import * as attempts from '../dist-electron/iterative-attempt.js';
 import * as commands from '../dist-electron/agent-command.js';
 import * as errors from '../dist-electron/agent-launch-errors.js';
+import { createIterativeAutopilot } from '../dist-electron/iterative-autopilot.js';
 import { extractAgentSessionId } from '../dist-electron/agent-session.js';
 import { spawnIterativeStreamed } from '../dist-electron/iterative-stream.js';
 
@@ -20,7 +21,12 @@ const start = source.indexOf('  const runIterativeAgent = async');
 const end = source.indexOf("  ipcMain.handle('flow:iterative:agent'", start);
 assert.ok(start >= 0 && end > start);
 const js = ts.transpileModule(source.slice(start, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-const handler = new Function('bindings', `with(bindings) { ${js}; return runIterativeAgent; }`);
+const handler = new Function('bindings', `with(bindings) { ${js}; return {run: runIterativeAgent, autonomous: runIterativeAgentWithAutopilot}; }`);
+const retryStart = source.indexOf('  async function retryIterativeAgent(');
+const retryEnd = source.indexOf('  function scheduleAgentWaitRetry(', retryStart);
+assert.ok(retryStart >= 0 && retryEnd > retryStart);
+const retryJs = ts.transpileModule(source.slice(retryStart,retryEnd), {compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+const retryHandler = new Function('bindings', `with(bindings) { ${retryJs}; return retryIterativeAgent; }`);
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'agent-launch-lifecycle-'));
@@ -36,11 +42,14 @@ function fixture() {
   const candidate = { runId: 'run', candidateId: 'candidate', baseCheckpointId: 'C0', attemptId: 2, fullAssignment: {}, materializationRefs: { workspaceRoot: projectPath, projectRelative: '.' } };
   const payload = { run: { runId: 'run', phase: 'REPAIRING' }, candidate, config: {}, openRepairRequests: [{ requestId: 'request', reason: 'fixture repair' }] };
   const launches = [], waits = [], databases = [];
+  const iterativeAutopilot = createIterativeAutopilot(() => 'fixture');
+  let drives = 0;
+  iterativeAutopilot.register('drive', async () => { drives++; return {ok:true, stopped:'finished'}; });
   let childSource = '';
   let beforeChild;
   let serverError;
   const bindings = {
-    ...agents, ...attempts, ...commands, ...errors,
+    ...agents, ...attempts, ...commands, ...errors, iterativeAutopilot,
     existsSync, join, readFileSync, writeFileSync, extractAgentSessionId,
     loadState: () => ({}), findWorkspace: () => workspace, findProject: () => project,
     iterativeTaskRunDir: () => runDir, iterativeStepInFlight: new Set(), stepLockKey: () => 'fixture',
@@ -63,8 +72,8 @@ function fixture() {
     iterativeStreamIo: () => ({cancelRequested: () => attempts.readAttempt(runDir)?.cancelRequested === true, recordLine: (dir, line) => attempts.recordAttemptLog(dir, line), trimLog: () => {}}),
     iterativeStreamPlatform: {}, commandEnvironment: env => env, openCodeDatabaseEnv: env => env,
     spawnIterativeStreamed: async (dir, command, args, cwd, timeout, io, _platform, onEvent, options) => {
-      launches.push({command, args});
-      const script = childSource;
+      launches.push({command, args, timeout});
+      const script = typeof childSource === 'function' ? childSource(launches.length) : childSource;
       beforeChild?.();
       return spawnIterativeStreamed(dir, process.execPath, ['-e', script], cwd, timeout, io, {
         processTreeDetached: () => false, commandEnvironment: env => env,
@@ -73,8 +82,10 @@ function fixture() {
       }, onEvent, options);
     },
   };
-  const run = handler(bindings);
-  return { root, runDir, projectPath, bindings, run, launches, waits, databases,
+  const {run, autonomous} = handler(bindings);
+  const retry = retryHandler({...bindings, runIterativeAgentWithAutopilot: autonomous});
+  return { retry, root, runDir, projectPath, bindings, run, autonomous, launches, waits, databases,
+    drives: () => drives,
     setChild: script => { childSource = script; }, beforeChild: fn => { beforeChild = fn; },
     setServerError: value => { serverError = value; },
     lease: () => agents.readAgentLease(agents.agentLeaseFile(runDir)),
@@ -153,4 +164,58 @@ function fixture() {
   assert.equal(f.launches.length, 0);
   assert.equal(f.bindings.iterativeStepInFlight.size, 0);
 }
-console.log('agent-launch-lifecycle: production handler + real child wait/resume/cancel OK');
+// Autopilot waits beyond the manual budget and then continues the migration.
+{
+  const f = fixture();
+  f.bindings.agentLaunchRetryDelayMs = () => 10;
+  f.setChild(n => n <= 6
+    ? `console.log(JSON.stringify({type:'error',sessionID:'ses-timeout',error:{message:'APITimeoutError: model request timed out'}}));`
+    : `require('fs').writeFileSync('input.js','repaired');console.log('FEEDBACK_KIND: READY_FOR_VERIFY');`);
+  const result = await f.autonomous(undefined, {projectName:'fixture',autopilot:true});
+  assert.equal(result.autopilot.stopped, 'finished', JSON.stringify(result));
+  assert.equal(f.launches.length, 7);
+  assert.equal(f.drives(), 1);
+  assert.deepEqual(f.launches.slice(0,3).map(x => x.timeout), [900_000,1800_000,3600_000]);
+  assert.ok(f.launches.slice(1).every(x => x.args.includes('ses-timeout')));
+  assert.equal(f.lease(), undefined);
+}
+// A parked autonomous wait survives a Desktop restart beyond five launches.
+{
+  const f = fixture();
+  agents.writeTrialBaseline(f.projectPath, agents.trialBaselineFile(f.runDir));
+  agents.writeAgentLease(agents.agentLeaseFile(f.runDir), {schemaVersion:1,sessionId:'ses-restart',provider:'opencode',databasePath:'saved.db',runId:'run',candidateId:'candidate',attemptId:2,pid:0,startedAt:new Date().toISOString(),waiting:true,waitKind:'temporary',retryAt:0,launchAttempts:8,autopilot:true});
+  f.setChild(`require('fs').writeFileSync('input.js','repaired');console.log('FEEDBACK_KIND: READY_FOR_VERIFY');`);
+  await f.retry({projectName:'fixture'});
+  assert.equal(f.lease(),undefined);
+  assert.equal(f.databases[0],'saved.db');
+  assert.ok(f.launches[0].args.includes('ses-restart'));
+  assert.equal(f.drives(),1);
+}
+// The durable timer cannot race a live coordinator into a duplicate child.
+{
+  const f = fixture();
+  f.bindings.agentLaunchRetryDelayMs = () => 150;
+  f.setChild(n => n === 1 ? `console.log(JSON.stringify({type:'error',error:{message:'503 model unavailable'}}));` : `require('fs').writeFileSync('input.js','repaired');console.log('FEEDBACK_KIND: READY_FOR_VERIFY');`);
+  const pending = f.autonomous(undefined,{projectName:'fixture',autopilot:true});
+  const deadline = Date.now()+5000;
+  while (!f.lease()?.waiting && Date.now()<deadline) await new Promise(resolve=>setTimeout(resolve,5));
+  assert.equal(f.lease()?.waiting,true);
+  f.expireWait();
+  await f.retry({projectName:'fixture'});
+  assert.equal(f.launches.length,1);
+  assert.equal((await pending).autopilot.stopped,'finished');
+  assert.equal(f.launches.length,2);
+}
+// Disabling autopilot during the child must persist manual retry policy.
+{
+  const f = fixture();
+  f.beforeChild(()=>setTimeout(()=>f.bindings.iterativeAutopilot.setEnabled({projectName:'fixture'},false),10));
+  f.setChild(`setTimeout(()=>console.log(JSON.stringify({type:'error',error:{message:'503 unavailable'}})),100);`);
+  const result = await f.autonomous(undefined,{projectName:'fixture',autopilot:true});
+  assert.equal(result.autopilot.stopped,'paused');
+  assert.equal(f.lease()?.waiting,true);
+  assert.notEqual(f.lease()?.autopilot,true);
+  assert.equal(f.launches.length,1);
+  assert.equal(f.drives(),0);
+}
+console.log('agent-launch-lifecycle: production handler + real child wait/resume/cancel/autopilot OK');

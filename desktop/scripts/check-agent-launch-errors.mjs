@@ -8,6 +8,7 @@ import {
   AGENT_LAUNCH_RETRY_BUDGET,
   agentLaunchProviderError,
   agentLaunchRetryDelayMs,
+  agentLaunchTimeoutMs,
   canRetryAgentLaunch,
   classifyAgentLaunchFailure,
   extractRetryAfterSeconds,
@@ -84,7 +85,7 @@ assert.equal(canRetryAgentLaunch("unknown", 3), false);
 assert.equal(canRetryAgentLaunch("unknown", 4), false);
 assert.equal(canRetryAgentLaunch("rate-limited", 10_000), true);
 
-// 7. Delay honors Retry-After (capped to the 1 h sanity bound), never below
+// 7. Delay honors Retry-After (bounded by the timer range), never below
 // the 1 s floor, and bounded exponential backoff with ±20 % jitter caps at
 // 120 s so concurrent agents retry with spread, not in lockstep.
 const retryAfter = agentLaunchRetryDelayMs({ kind: "rate-limited", retryAfterSeconds: 30 }, 1);
@@ -133,4 +134,15 @@ assert.equal(extractRetryAfterSeconds('x-ratelimit-reset-tokens: 1m12s', now), 7
 assert.equal(extractRetryAfterSeconds('{"retry_after_ms":30000}', now), 30);
 assert.equal(redactAgentDiagnostics('Authorization: Bearer sample-value'), 'Authorization: [redacted]');
 assert.equal(redactAgentDiagnostics('{"apiKey":"sample-value"}'), '{"apiKey":"[redacted]"}');
+assert.equal(launch('APITimeoutError: request timed out').kind, 'temporary');
+assert.equal(canRetryAgentLaunch('temporary', 1000, true), true);
+for (const kind of ['permanent','auth-config','unknown']) assert.equal(canRetryAgentLaunch(kind, 1000, true), false);
+for (let n = 1; n < 20; n++) {
+  const delay = agentLaunchRetryDelayMs({kind:'temporary'},n,true);
+  assert.ok(delay >= Math.min(30_000 * 2 ** (n-1),1800_000)*0.8);
+  assert.ok(delay <= 1800_000);
+}
+assert.equal(agentLaunchRetryDelayMs({kind:'temporary',retryAfterSeconds:7200},7,true),7200_000);
+assert.deepEqual([0,1,2,100].map(n=>agentLaunchTimeoutMs(n,true)),[900_000,1800_000,3600_000,3600_000]);
+assert.equal(agentLaunchTimeoutMs(100,false),900_000);
 console.log(`check-agent-launch-errors: OK (${DESKTOP})`);

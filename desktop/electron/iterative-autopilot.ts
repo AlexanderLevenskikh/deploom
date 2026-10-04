@@ -1,4 +1,5 @@
-/** Electron-owned continuation: survives renderer remounts, never restarts an
+/** Electron-owned continuation: survives renderer remounts, waits through
+ * provider outages, never restarts an
  * inconclusive stage, and stops at the authoritative supervisor's boundaries. */
 type Scope = { workspaceId?: string; projectName: string; autopilot?: boolean }
 type Input = Scope & Record<string, unknown>
@@ -16,14 +17,29 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
     if (!handler) throw new Error(`AUTOPILOT_HANDLER_MISSING: ${step}`)
     return handler(undefined, input)
   }
+  async function resumeWaitingAgent(outcome: Outcome, input: Input, session: { canceled: boolean; enabled: boolean }): Promise<Outcome> {
+    while (outcome.waiting === true && session.enabled && !session.canceled) {
+      const retryAt = Number(outcome.retryAt)
+      if (!Number.isFinite(retryAt)) return { ok: false, error: 'AGENT_WAIT_DEADLINE_MISSING' }
+      while (Date.now() < retryAt && session.enabled && !session.canceled) {
+        await new Promise(resolve => setTimeout(resolve, Math.min(250, retryAt - Date.now())))
+      }
+      if (!session.enabled || session.canceled) return outcome
+      outcome = await invoke('agent', input)
+    }
+    return outcome
+  }
   async function continueRun(first: Step, input: Input, session: { canceled: boolean; enabled: boolean }) {
+    const initiallyEnabled = session.enabled
     let outcome = await invoke(first, input)
+    if (first === 'agent') outcome = await resumeWaitingAgent(outcome, input, session)
     let initial = outcome
     // Explicit infrastructure retry is one user action, never an autopilot loop.
     input = { ...input, retryInfra: false, discardCandidate: false }
-    if (!session.enabled) return initial
+    if (!session.enabled && !initiallyEnabled) return initial
     const stopped = (reason: string, error?: string): Outcome => ({ ...initial, autopilot: { stopped: reason, ...(error ? { error } : {}) } })
     if (session.canceled) return stopped('canceled')
+    if (!session.enabled || outcome.waiting === true) return stopped('paused')
     let recoveredRepair = false
     if (first === 'agent' && outcome.ok !== true && /^FORBIDDEN_MUTATION:/.test(String(outcome.error ?? ''))) {
       outcome = await invoke('drive', { ...input, discardCandidate: true })
@@ -60,8 +76,9 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
       const gate = JSON.stringify({ phase: drive.phase, requests: requests?.map(r => r.requestId).sort(), decision: status.decision })
       if (gates.has(gate)) return stopped('agent-gate', 'AUTOPILOT_REPEATED_REPAIR_GATE')
       gates.add(gate)
-      const agent = await invoke('agent', input)
+      const agent = await resumeWaitingAgent(await invoke('agent', input), input, session)
       if (session.canceled) return stopped('canceled')
+      if (!session.enabled) return stopped('paused')
       if (agent.ok !== true) {
         if (/^FORBIDDEN_MUTATION:/.test(String(agent.error ?? ''))) {
           // Reject the trial instead of repeating paid repair on disputed bytes.
@@ -76,6 +93,8 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
     return stopped(session.canceled ? 'canceled' : 'paused')
   }
   return {
+    hasSession(scope: Scope) { return sessions.has(key(scope)) },
+    isEnabled(scope: Scope): boolean | undefined { return sessions.get(key(scope))?.enabled },
     setEnabled(scope: Scope, enabled: boolean) {
       const session = sessions.get(key(scope))
       if (session) session.enabled = enabled
@@ -94,7 +113,7 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
           }
           try {
             const result = await pending
-            return { ...result, autopilotActive: sessions.get(id)?.enabled === true } as R
+            return { ...result, autopilotActive: sessions.get(id)?.enabled ?? (result.autopilotActive === true) } as R
           } finally { if (statusReads.get(id) === pending) statusReads.delete(id) }
         }
         if (step === 'cancel') {

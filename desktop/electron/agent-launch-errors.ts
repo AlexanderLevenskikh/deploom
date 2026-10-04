@@ -11,7 +11,7 @@
 // desired handling:
 //   - rate-limited  -> wait and re-try, honoring Retry-After/reset when given,
 //                      else bounded expoential backoff with jitter; no budget.
-//   - temporary     -> wait and re-try with a finite budget (bounded backoff).
+//   - temporary     -> finite manual budget; autonomous repair keeps waiting.
 //   - auth-config   -> permanent: fail with a clear, actionable message.
 //   - permanent     -> permanent: fail with a clear, actionable message.
 //   - unknown       -> no evidence of anything specific: re-try with a SMALL
@@ -46,9 +46,10 @@ export type AgentLaunchDiagnostics = {
 // A confirmed rate limit has NO budget: it keeps re-waiting as long as the
 // provider keeps reporting it (each wait honors Retry-After/reset; a reset
 // without a time uses bounded backoff). Temporary and unknown outages get a
-// FINITE budget so an unconfirmed / never-resolving outage eventually stops
+// FINITE manual budget so an unconfirmed / never-resolving outage eventually stops
 // with a readable diagnostic instead of retrying forever. auth-config and
-// permanent are 0: retrying cannot fix them.
+// permanent are 0: retrying cannot fix them. Autopilot can keep retrying
+// confirmed temporary failures; unknown failures retain their finite budget.
 export const AGENT_LAUNCH_RETRY_BUDGET: Record<AgentLaunchFailureKind, number> = {
   'rate-limited': Number.POSITIVE_INFINITY,
   temporary: 5,
@@ -167,6 +168,7 @@ const HAS_TEMPORARY = [
   /try again later/i,
   /overloaded/i,
   /ETIMEDOUT/i,
+  /timeout|timed[ -]?out/i,
   /ECONNRESET/i,
   /ECONNREFUSED/i,
   /EAI_AGAIN/i,
@@ -245,13 +247,19 @@ export function classifyAgentLaunchFailure(input: {
   }
 }
 
+/** Grow the agent watchdog after provider outages, while retaining a deadline. */
+export function agentLaunchTimeoutMs(launchAttempts: number, autopilot = false): number {
+  return 15 * 60_000 * (autopilot ? 2 ** Math.max(0, Math.min(launchAttempts, 2)) : 1)
+}
+
 export function isRetryableAgentLaunchFailure(kind: AgentLaunchFailureKind): boolean {
   return AGENT_LAUNCH_RETRY_BUDGET[kind] !== 0
 }
 
 /** True when this launch attempt may be auto-retried (budget still available
  *  and the kind is retryable). `attempt` is 1-based within the wait episode. */
-export function canRetryAgentLaunch(kind: AgentLaunchFailureKind, attempt: number): boolean {
+export function canRetryAgentLaunch(kind: AgentLaunchFailureKind, attempt: number, autopilot = false): boolean {
+  if (autopilot && kind === 'temporary') return true
   if (!isRetryableAgentLaunchFailure(kind)) return false
   const budget = AGENT_LAUNCH_RETRY_BUDGET[kind]
   if (!Number.isFinite(budget)) return true
@@ -262,14 +270,16 @@ export function canRetryAgentLaunch(kind: AgentLaunchFailureKind, attempt: numbe
  *  Retry-After/reset (capped), otherwise a bounded exponential backoff with
  *  ±20% jitter so concurrent agents do not retry in lockstep. The caps apply
  *  to the FINAL value: jitter may never push the delay below the 1 s floor or
- *  above the 120 s backoff cap. */
-export function agentLaunchRetryDelayMs(diag: Pick<AgentLaunchDiagnostics, 'kind' | 'retryAfterSeconds'>, attempt: number): number {
+ *  above the manual 120 s or autonomous 30 min backoff cap. */
+export function agentLaunchRetryDelayMs(diag: Pick<AgentLaunchDiagnostics, 'kind' | 'retryAfterSeconds'>, attempt: number, autopilot = false): number {
   if (diag.retryAfterSeconds !== undefined && Number.isFinite(diag.retryAfterSeconds) && diag.retryAfterSeconds > 0) {
     return Math.min(Math.max(diag.retryAfterSeconds * 1000, AGENT_LAUNCH_MIN_RETRY_DELAY_MS), AGENT_LAUNCH_MAX_RETRY_AFTER_MS)
   }
-  const base = diag.kind === 'unknown' ? 10_000 : 5_000
+  const extended = autopilot && (diag.kind === 'temporary' || diag.kind === 'rate-limited')
+  const cap = extended ? 30 * 60_000 : AGENT_LAUNCH_BACKOFF_CAP_MS
+  const base = extended ? 30_000 : diag.kind === 'unknown' ? 10_000 : 5_000
   const exponent = Math.max(0, Math.min(attempt - 1, 8))
-  const planned = Math.min(base * 2 ** exponent, AGENT_LAUNCH_BACKOFF_CAP_MS)
+  const planned = Math.min(base * 2 ** exponent, cap)
   const jitter = 0.8 + (Math.random() * 0.4)
-  return Math.max(AGENT_LAUNCH_MIN_RETRY_DELAY_MS, Math.min(Math.round(planned * jitter), AGENT_LAUNCH_BACKOFF_CAP_MS))
+  return Math.max(AGENT_LAUNCH_MIN_RETRY_DELAY_MS, Math.min(Math.round(planned * jitter), cap))
 }
