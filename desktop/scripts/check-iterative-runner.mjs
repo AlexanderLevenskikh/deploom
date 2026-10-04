@@ -61,7 +61,9 @@ if (bootstrap.bootstrap !== true || bootstrap.repairRequests.length !== 1) {
   throw new Error(`Bootstrap repair must be an agent GATE with the request bytes: ${JSON.stringify(bootstrap)}`);
 }
 expectDecision({ phase: "PLANNING", activeCandidateId: "C2" }, {}, "materialize", "materialize");
-expectDecision({ phase: "MATERIALIZING" }, {}, "materialize", "resume");
+// MATERIALIZING without a MATERIALIZED stage resumes the same materialize step
+// (B1: a concluded attemptResult must instead stop, covered below).
+expectDecision({ phase: "MATERIALIZING", activeCandidateId: "C2" }, {}, "materialize", "exact versions");
 // R2: a MATERIALIZED candidate moves to precheck, never re-materialize.
 const materialized = expectDecision(
   { phase: "MATERIALIZING", activeCandidateId: "C2" },

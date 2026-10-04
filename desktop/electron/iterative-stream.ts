@@ -74,6 +74,18 @@ export function spawnIterativeStreamed(
     let stdoutCarry = ''
     let settled = false
     let timedOut = false
+    // B6: the attempt.log byte cap must hold DURING a long/chatty child, not
+    // only at close — trim throttled, so a runaway stdout/stderr stream cannot
+    // balloon the diagnostic artifact past MAX_LOG_BYTES before the step ends.
+    let recordsSinceTrim = 0
+    const trimEveryRecords = 200
+    const maybeTrim = (): void => {
+      recordsSinceTrim += 1
+      if (recordsSinceTrim >= trimEveryRecords) {
+        recordsSinceTrim = 0
+        try { io.trimLog(runDir) } catch { /* best-effort */ }
+      }
+    }
     const commandEnv = platform.commandEnvironment(process.env)
     const invocation = platform.resolveSpawnInvocation(command, args, { env: commandEnv })
     const child = spawn(invocation.command, invocation.args, {
@@ -103,6 +115,7 @@ export function spawnIterativeStreamed(
       stdoutCarry = ''
       stdout += `${line}\n`
       try { io.recordLine(runDir, `${line}\n`) } catch { /* log is best-effort */ }
+      maybeTrim()
       parseEventLine(line, onEvent)
     }
 
@@ -112,12 +125,14 @@ export function spawnIterativeStreamed(
       for (const line of lines) {
         stdout += `${line}\n`
         try { io.recordLine(runDir, `${line}\n`) } catch { /* log is best-effort */ }
+        maybeTrim()
         parseEventLine(line, onEvent)
       }
     })
     child.stderr.on('data', (chunk: Buffer) => {
       const text = platform.decodeChunk(chunk)
       try { io.recordLine(runDir, text) } catch { /* best-effort */ }
+      maybeTrim()
       stderr += text
     })
     child.on('error', (error) => {

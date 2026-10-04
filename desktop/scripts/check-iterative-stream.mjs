@@ -7,8 +7,8 @@
 //     close) must be buffered and reassembled, journaled and emitted once —
 //     never dropped and never parsed as two broken fragments;
 //   - plain output lines are still journaled line-by-line.
-import { startAttempt, updateAttempt, recordAttemptProgress, readAttempt, readRunLogTail } from "../dist-electron/iterative-attempt.js";
-import { mkdtempSync } from "node:fs";
+import { startAttempt, updateAttempt, recordAttemptProgress, readAttempt, readRunLogTail, recordAttemptLog, trimAttemptLog, attemptLogPath } from "../dist-electron/iterative-attempt.js";
+import { mkdtempSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startAttemptJournalPolling } from "../dist-electron/iterative-journal-poll.js";
@@ -120,6 +120,31 @@ const mkIo = (overrides = {}) => {
   const result = await spawnIterativeStreamed(join(root, "p"), process.execPath, ["-e", PLAIN], root, 10_000, io, mkPlatform());
   if (result.code !== 0 || result.timedOut) throw new Error("clean exit expected");
   if (!lines.some((line) => line.includes("plain line"))) throw new Error("stdout lines must be journaled");
+}
+
+// 6b. B6: the attempt.log byte cap holds DURING a chatty child, not only at
+// close. A child that streams hundreds of KB while still running must not
+// balloon the diagnostic artifact to its full unbounded size: the throttled
+// trim keeps it bounded, and the close trim leaves the newest MAX_LOG_LINES.
+{
+  const dir = join(root, "chatty");
+  startAttempt(dir, "demo", "none");
+  const journalIo = {
+    cancelRequested: () => false,
+    recordLine: (d, line) => recordAttemptLog(d, line),
+    trimLog: (d) => trimAttemptLog(d),
+  };
+  const logSize = () => { try { return statSync(attemptLogPath(dir)).size } catch { return 0 } };
+  const chatty = `let i=0;const t=setInterval(()=>{console.log('payload ${"x".repeat(300)} '+i);if(++i===4000)clearInterval(t);},1);`;
+  const promise = spawnIterativeStreamed(dir, process.execPath, ["-e", chatty], root, 0, journalIo, mkPlatform());
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 900));
+  const midSize = logSize();
+  if (midSize > 512 * 1024) throw new Error(`attempt.log grew unbounded mid-stream (${midSize} bytes)`);
+  const result = await promise;
+  if (result.code !== 0 || result.timedOut) throw new Error("chatty child must exit cleanly");
+  const kept = statSync(attemptLogPath(dir)).size > 0 ? (await import("node:fs")).readFileSync(attemptLogPath(dir), "utf8").split(/\n/) : [];
+  if (kept.length > 802) throw new Error(`attempt.log must be cap-trimmed after the chatty child, got ${kept.length} lines`);
+  if (!kept.some((line) => line.endsWith(" 3999"))) throw new Error("trim must keep the newest chatty lines");
 }
 
 // 7. Panel wiring (review re-check P1#4 + P2#5): Cancel is gated on an
