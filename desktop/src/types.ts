@@ -395,6 +395,8 @@ export type IterativeAttemptView = {
   stage: 'preflight' | 'begin' | 'drive' | 'agent' | 'none'
   phase?: string
   startedAt: number
+  activeElapsedMs?: number
+  activeSince?: number
   finishedAt?: number
   lastHeartbeatAt: number
   targetSource: 'none' | 'roadmap' | 'discovery'
@@ -539,7 +541,7 @@ export type DependencyFlowApi = {
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   setIterativeAutopilot: (input: { workspaceId?: string; projectName: string; enabled: boolean }) => Promise<{ ok: boolean; active: boolean }>
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStatusOutcome>
-  iterativeDrive: (input: { workspaceId?: string; projectName: string; autopilot?: boolean; retryInfra?: boolean }) => Promise<IterativeDriveOutcome>
+  iterativeDrive: (input: { workspaceId?: string; projectName: string; autopilot?: boolean; retryInfra?: boolean; discardCandidate?: boolean }) => Promise<IterativeDriveOutcome>
   iterativeBegin: (input: { workspaceId?: string; projectName: string; autopilot?: boolean; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
   iterativeAgent: (input: { workspaceId?: string; projectName: string; autopilot?: boolean }) => Promise<IterativeAgentOutcome>
   runAction: (input: ActionInput) => Promise<{ jobId: string; runId?: string; preview: string[] }>

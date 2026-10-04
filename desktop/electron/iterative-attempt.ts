@@ -35,6 +35,8 @@ export type IterativeAttemptRecord = {
   stage: 'preflight' | 'begin' | 'drive' | 'agent' | 'none'
   phase?: string
   startedAt: number
+  activeElapsedMs?: number
+  activeSince?: number
   finishedAt?: number
   lastHeartbeatAt: number
   targetSource: IterativeTargetSource
@@ -90,7 +92,14 @@ export function readAttempt(runDir: string): IterativeAttemptRecord | undefined 
 export function updateAttempt(runDir: string, patch: Partial<IterativeAttemptRecord>): IterativeAttemptRecord | undefined {
   const current = readAttempt(runDir)
   if (!current) return undefined
-  return writeAttempt(runDir, { ...current, ...patch, lastHeartbeatAt: Date.now() })
+  const now = Date.now()
+  const next = { ...current, ...patch, lastHeartbeatAt: now }
+  const wasActive = ['starting', 'running'].includes(current.status) && !current.cancelRequested
+  const isActive = ['starting', 'running'].includes(next.status) && !next.cancelRequested
+  next.activeElapsedMs = (current.activeElapsedMs ?? 0) + (wasActive && current.activeSince !== undefined ? Math.max(0, now - current.activeSince) : 0)
+  next.activeSince = isActive ? now : undefined
+  next.finishedAt = isActive ? undefined : (wasActive ? now : (current.finishedAt ?? patch.finishedAt ?? now))
+  return writeAttempt(runDir, next)
 }
 
 /** Start a NEW attempt (fresh attemptId) and a fresh log. Only safe when no
@@ -114,6 +123,8 @@ export function startAttempt(
     status: 'starting',
     stage: 'preflight',
     startedAt: now,
+    activeElapsedMs: 0,
+    activeSince: now,
     lastHeartbeatAt: now,
     targetSource,
     discovery,
@@ -129,6 +140,10 @@ export function startAttempt(
 export function resumeAttempt(runDir: string, projectName: string, workspaceId?: string): IterativeAttemptRecord | undefined {
   const current = readAttempt(runDir)
   if (!current) return startAttempt(runDir, projectName, 'none', undefined, 0, workspaceId)
+  // A stale running record can survive a crash. Close its interval at the last
+  // durable heartbeat, never at restart time (which would count offline hours).
+  const elapsed = (current.activeElapsedMs ?? 0) + (current.activeSince !== undefined && !current.cancelRequested ? Math.max(0, current.lastHeartbeatAt - current.activeSince) : 0)
+  writeAttempt(runDir, { ...current, activeElapsedMs: elapsed, activeSince: undefined })
   return updateAttempt(runDir, { status: 'running', stage: 'drive', lastError: undefined, cancelRequested: false })
 }
 

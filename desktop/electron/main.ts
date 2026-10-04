@@ -8230,7 +8230,7 @@ function setupIpc(): void {
   // between an accepted cohort and the next one. Restart-safe by design:
   // every iteration recomputes the decision from the DURABLE Python state, so
   // a killed app simply resumes from where the files say the run stands.
-  ipcMain.handle('flow:iterative:drive', iterativeAutopilot.register('drive', async (_event, input: { workspaceId?: string; projectName: string; retryInfra?: boolean }) => {
+  ipcMain.handle('flow:iterative:drive', iterativeAutopilot.register('drive', async (_event, input: { workspaceId?: string; projectName: string; retryInfra?: boolean; discardCandidate?: boolean }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -8249,6 +8249,10 @@ function setupIpc(): void {
         publish()
         return { ok: false, steps, stopped: 'error', error, attempt: readAttempt(runDir) }
       }
+      const blockedRepair = readAttempt(runDir)
+      if (input.discardCandidate && !/^FORBIDDEN_MUTATION:/.test(blockedRepair?.lastError ?? '')) {
+        return { ok: false, steps, stopped: 'error', error: 'DISCARD_REPAIR_NOT_BLOCKED' }
+      }
       // L1: rebuild the journal after a restart — same attemptId, status running.
       resumeAttempt(runDir, project.name, workspace.id)
       updateAttempt(runDir, { status: 'running', stage: 'drive', lastError: undefined, cancelRequested: false })
@@ -8256,6 +8260,7 @@ function setupIpc(): void {
       const python = resolveExecutable('python')
       const generator = join(bundledToolDir(), 'iterative_migration.py')
       let retryInfra = input.retryInfra === true
+      let discardCandidate = input.discardCandidate === true
       // Continue until a real terminal/agent/error/cancel gate, without a
       // hidden wall-clock or batch-size stop that requires another click.
       while (true) {
@@ -8276,6 +8281,35 @@ function setupIpc(): void {
           updateAttempt(runDir, { status: 'failed', stage: 'drive', lastError: raw.slice(0, 4000), lastStep: 'status' })
           publish()
           return { ok: false, steps, stopped: 'error', error: raw.slice(0, 4000), attempt: readAttempt(runDir) }
+        }
+        if (discardCandidate) {
+          discardCandidate = false
+          const candidate = payload.candidate
+          if (!candidate || payload.run?.phase !== 'REPAIRING' || candidate.candidateId !== payload.run.activeCandidateId) {
+            const error = 'DISCARD_REPAIR_CANDIDATE_CHANGED'
+            updateAttempt(runDir, { status: 'failed', lastError: error })
+            publish()
+            return { ok: false, steps, stopped: 'error', error }
+          }
+          // Scheduling only: reject disputed trial bytes, never weaken verification
+          // or turn an agent/guard failure into a dependency incompatibility.
+          const feedback = buildFeedbackPayload({
+            runId: String(candidate.runId), candidateId: String(candidate.candidateId),
+            baseCheckpointId: String(candidate.baseCheckpointId), attemptId: Number(candidate.attemptId ?? 0),
+          }, [], 'INCONCLUSIVE', 'Protected-file guard rejected this trial; continue from the verified checkpoint without adopting trial changes')
+          const feedbackFile = join(runDir, 'trial', 'discard-feedback.json')
+          writeFileSync(feedbackFile, JSON.stringify(feedback), 'utf8')
+          const applied = await spawnCapture(python, iterativeApplyFeedbackInvocation(runDir, feedbackFile, generator, python).args, workspace.path, 120_000)
+          if (applied.code !== 0) {
+            const error = applied.stderr.trim() || applied.stdout.trim() || 'DISCARD_REPAIR_FAILED'
+            updateAttempt(runDir, { status: 'failed', lastError: error.slice(0, 4000) })
+            publish()
+            return { ok: false, steps, stopped: 'error', error }
+          }
+          recordAttemptLog(runDir, 'Disputed repair trial discarded; continuing from the last verified checkpoint. No trial changes accepted.\n')
+          steps.push('discard-repair')
+          updateSteps()
+          continue
         }
         if (retryInfra && payload.run?.infraBlocked) {
           retryInfra = false
@@ -8576,7 +8610,14 @@ function setupIpc(): void {
       // same sessionId, durable trial); a fresh dispatch gets a new session.
       const sessionId = resuming ? resumeSessionId : randomUUID()
       try {
-        const baselineFile = trialBaselineFile(runDir)
+        let baselineFile = trialBaselineFile(runDir, ctx)
+        // Preserve the pre-dispatch bytes when resuming a legacy in-flight session.
+        // A new candidate gets its own baseline AFTER planner materialization.
+        if (resuming && !existsSync(baselineFile)) {
+          const legacyBaseline = trialBaselineFile(runDir)
+          if (!existsSync(legacyBaseline)) throw new Error('AGENT_BASELINE_MISSING: cannot resume repair without its original mutation evidence')
+          baselineFile = legacyBaseline
+        }
         if (!existsSync(baselineFile)) writeTrialBaseline(workspaceRoot, baselineFile)
         const promptFile = agentPromptFile(runDir)
         const promptText = bootstrap

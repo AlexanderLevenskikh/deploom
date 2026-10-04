@@ -18,6 +18,8 @@ import {
   writeAttempt,
 } from "../dist-electron/iterative-attempt.js";
 
+import { attemptActiveElapsed } from "../dist-electron/iterative-activity.js";
+
 const root = mkdtempSync(join(tmpdir(), "iter-attempt-contract-"));
 
 // 1. startAttempt writes a NEW durable record (fresh attemptId) whose journal
@@ -135,5 +137,39 @@ if (!readAttempt(runC)?.runCreated) throw new Error("writeAttempt round-trip");
 const leftover = runC && attemptFilePath(runC).endsWith("attempt.json") ? "attempt.json" : "";
 if (!leftover) throw new Error("attempt path malformed");
 mkdirSync(runC, { recursive: true });
+
+// Active execution excludes pauses, stopped UI time and offline restarts.
+const clockDir = join(root, "clock");
+const originalNow = Date.now;
+let clock = 1000;
+Date.now = () => clock;
+try {
+  startAttempt(clockDir, "Clock", "roadmap");
+  clock = 6000;
+  updateAttempt(clockDir, { status: "running" });
+  clock = 11000;
+  requestCancel(clockDir);
+  const stopped = readAttempt(clockDir);
+  if (stopped.activeElapsedMs !== 10000 || stopped.activeSince !== undefined) throw new Error("stop must freeze active time immediately");
+  if (attemptActiveElapsed(stopped, true, 99999999) !== 10000) throw new Error("stopped UI must not tick");
+  clock = 3600000;
+  resumeAttempt(clockDir, "Clock");
+  clock += 5000;
+  updateAttempt(clockDir, { status: "done" });
+  const done = readAttempt(clockDir);
+  if (done.activeElapsedMs !== 15000 || done.finishedAt !== clock) throw new Error("resume counted the paused hour or completion did not freeze");
+  clock += 3600000;
+  updateAttempt(clockDir, { reason: "late metadata" });
+  if (attemptActiveElapsed(readAttempt(clockDir), false, clock) !== 15000) throw new Error("terminal metadata extended elapsed time");
+  resumeAttempt(clockDir, "Clock");
+  clock += 3000;
+  updateAttempt(clockDir, { phase: "heartbeat" });
+  const interrupted = readAttempt(clockDir);
+  if (attemptActiveElapsed(interrupted, false, clock + 3600000) !== 18000) throw new Error("interrupted UI counted offline time");
+  clock += 3600000;
+  resumeAttempt(clockDir, "Clock");
+  if (attemptActiveElapsed(readAttempt(clockDir), true, clock) !== 18000) throw new Error("restart counted offline time");
+  if (attemptActiveElapsed({ status: "done", lastHeartbeatAt: 9999999 }, false, clock) !== 0) throw new Error("legacy elapsed was invented");
+} finally { Date.now = originalNow; }
 
 console.log("check-iterative-attempt: OK");

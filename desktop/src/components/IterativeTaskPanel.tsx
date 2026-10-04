@@ -5,7 +5,7 @@ import { iterativeLogMessages } from '../data/iterativeLogMessages'
 import { useLanguage } from '../i18n'
 import { MigrationChecksPanel } from './MigrationChecksPanel'
 import { validateMigrationProfile, validationProfilesEqual, type MigrationValidationProfile } from '../../electron/migration-validation-profile'
-import { canApplyAttemptRead, iterativeActivity } from '../../electron/iterative-activity'
+import { attemptActiveElapsed, canApplyAttemptRead, iterativeActivity } from '../../electron/iterative-activity'
 import { startAttemptJournalPolling } from '../../electron/iterative-journal-poll'
 import { deriveMainAction, parseIterativeFailure, scenarioPipeline, PIPELINE_STAGES, type ScenarioMainActionState, type ScenarioSignal } from '../../electron/iterative-scenario'
 import type { IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
@@ -21,7 +21,7 @@ type Props = {
   onCopy: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onSave: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
-  onDrive: (projectName: string, autopilot?: boolean, retryInfra?: boolean) => Promise<IterativeDriveOutcome>
+  onDrive: (projectName: string, autopilot?: boolean, retryInfra?: boolean, discardCandidate?: boolean) => Promise<IterativeDriveOutcome>
   onBegin: (projectName: string, discovery?: { autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
   onAgent: (projectName: string, autopilot?: boolean) => Promise<IterativeAgentOutcome>
   onAttempt: (projectName: string) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
@@ -349,12 +349,12 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         ? text('Автопилот остановлен. Проверенный результат сохранён.', 'Autopilot stopped. The verified result is kept.')
         : text(`Автопилот приостановлен (${summary.stopped}). Проверьте результат и следующий шаг.`, `Autopilot paused (${summary.stopped}). Review the outcome and next step.`)
 
-  const driveNow = async () => {
+  const driveNow = async (discardCandidate = false) => {
     setStepBusy(true)
     setNote(undefined)
     try {
       await onBeforeStart?.()
-      const outcome = await onDrive(projectName, autopilot, runner?.decision?.infraBlocked === true)
+      const outcome = await onDrive(projectName, autopilot, runner?.decision?.infraBlocked === true, discardCandidate)
       if (outcome.autopilot) {
         setNote(autopilotNote(outcome.autopilot))
       } else if (!outcome.ok) {
@@ -562,19 +562,21 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     noTargets: validationChanged ? false : noTargetsStep,
     checked: !validationChanged && runner?.checked?.ok === true,
   })
+  const repairMutationBlocked = mainAction.state === 'agent' && attempt?.status === 'failed' && /^FORBIDDEN_MUTATION:/.test(attempt.lastError ?? '')
   const retryIsDiscoverySearch = blocker?.code === 'DISCOVERY_UNSETTLED'
-  const mainLabel = mainAction.state === 'retry-check' && retryIsDiscoverySearch
+  const mainLabel = repairMutationBlocked ? text('Подобрать другой набор', 'Try another package set') : mainAction.state === 'retry-check' && retryIsDiscoverySearch
     ? text('Повторить поиск обновлений', 'Retry the update search')
     : text(...MAIN_LABEL[mainAction.state])
-  const mainDescription = retryIsDiscoverySearch
+  const mainDescription = repairMutationBlocked
+    ? text('Защищённые файлы отличаются от снимка перед ремонтом. Отбросим эту попытку и продолжим подбор от последнего проверенного результата; спорные изменения не будут приняты.', 'Protected files differ from the pre-repair snapshot. Discard this trial and continue planning from the last verified result; disputed changes will not be accepted.')
+    : retryIsDiscoverySearch
     ? text(
         'Registry-данные не получены или бюджет поиска исчерпан — результат не засчитан. Повторите поиск или настройте состав обновления.',
         'Registry data was not obtained or the search budget was exhausted — not counted. Retry the search or configure the update scope.',
       )
     : text(...MAIN_DESCRIPTION[mainAction.state])
 
-  const elapsedUntil = attemptAlive && childAlive ? nowTick : (attempt?.finishedAt ?? attempt?.lastHeartbeatAt ?? nowTick)
-  const elapsedMs = attempt?.startedAt && elapsedUntil > attempt.startedAt ? elapsedUntil - attempt.startedAt : 0
+  const elapsedMs = attemptActiveElapsed(attempt, attemptAlive && childAlive, nowTick)
   const progress = attempt?.packageProgress
   const currentAttemptLog = logAttemptId === attempt?.attemptId ? attemptLog : undefined
   const showLogTail = showLog && currentAttemptLog
@@ -655,7 +657,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         void cancelNow()
         break
       case 'agent':
-        void agentNow()
+        if (repairMutationBlocked) void driveNow(true)
+        else void agentNow()
         break
       case 'result':
       case 'partial':
@@ -707,7 +710,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       enabled: mainAction.state === 'running' ? true : !busyLocked,
       act: () => runMainActionRef.current(),
     })
-  }, [onScenario, projectName, workspaceId, mainAction.state, mainLabel, mainDescription, busyLocked, childAlive, activity.title, activity.detail, activity.percent, elapsedMs, attempt, currentAttemptLog, snapshot?.runDir])
+  }, [onScenario, projectName, workspaceId, mainAction.state, mainLabel, mainDescription, busyLocked, repairMutationBlocked, childAlive, activity.title, activity.detail, activity.percent, elapsedMs, attempt, currentAttemptLog, snapshot?.runDir])
   useEffect(() => () => onScenario?.(undefined), [onScenario])
 
   return (

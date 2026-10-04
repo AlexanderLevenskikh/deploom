@@ -18,6 +18,15 @@ export function canApplyAttemptRead(current: AttemptReadIdentity | undefined, in
   return !(terminal && ['running', 'starting'].includes(incoming.status) && current.lastHeartbeatAt === incoming.lastHeartbeatAt)
 }
 
+/** Active execution time only. Legacy journals contain no reliable pause history. */
+export function attemptActiveElapsed(attempt: { activeElapsedMs?: number; activeSince?: number; lastHeartbeatAt: number; status: string; cancelRequested?: boolean } | undefined, live: boolean, now: number): number {
+  if (!attempt) return 0
+  const accumulated = Math.max(0, attempt.activeElapsedMs ?? 0)
+  if (attempt.activeSince === undefined || attempt.cancelRequested || !['starting', 'running'].includes(attempt.status)) return accumulated
+  const until = live ? now : attempt.lastHeartbeatAt
+  return accumulated + Math.max(0, until - attempt.activeSince)
+}
+
 export type IterativeActivity = { title: string; detail: string; percent?: number }
 
 export function iterativeActivity(attempt: ActivityAttempt | undefined, live: boolean, language: 'ru' | 'en'): IterativeActivity {

@@ -418,8 +418,10 @@ export function writeTrialBaseline(workspaceRoot: string, baselineFile: string):
   return Object.keys(entries).length
 }
 
-export function trialBaselineFile(runDir: string): string {
-  return join(runDir, 'trial', TRIAL_BASELINE_FILENAME)
+export function trialBaselineFile(runDir: string, identity?: Pick<IterativeAgentContext, 'runId' | 'candidateId' | 'baseCheckpointId'>): string {
+  if (!identity) return join(runDir, 'trial', TRIAL_BASELINE_FILENAME)
+  const key = createHash('sha256').update(JSON.stringify([identity.runId, identity.candidateId, identity.baseCheckpointId])).digest('hex')
+  return join(runDir, 'trial', `agent-baseline-${key}.json`)
 }
 
 export function agentPromptFile(runDir: string): string {
@@ -466,7 +468,18 @@ const REASON_RE = /^\s*(?:REASON|ПРИЧИНА)\s*:\s*(.+)$/im
 const PROPOSALS_RE = /^(?:PROPOSALS|ПРЕДЛОЖЕНИЯ|ALTERNATIVES|КОМПАНЬОНЫ)\s*:/im
 
 export function parseAgentOutcome(output: string, exitCode: number, changedFiles: string[]): AgentParsedOutcome {
-  const kindMatch = output.match(KIND_RE)
+  // OpenCode streams JSON events: parse the final assistant text, never tool
+  // input/output containing a quoted prompt or a competing feedback marker.
+  output = output.split(/\r?\n/).flatMap(line => {
+    try {
+      const event = JSON.parse(line)
+      if (event.type === 'text' && typeof event.part?.text === 'string') return [event.part.text]
+      if (event.type === 'result' && typeof event.result === 'string') return [event.result]
+      if (event.type === 'item.completed' && event.item?.type === 'agent_message' && typeof event.item.text === 'string') return [event.item.text]
+      return []
+    } catch { return [line] }
+  }).join('\n')
+  const kindMatch = [...output.matchAll(new RegExp(KIND_RE.source, 'gi'))].at(-1)
   const kindRaw = kindMatch ? kindMatch[1].toUpperCase() : ''
   let kind: IterativeFeedbackKind = kindRaw && ITERATIVE_FEEDBACK_KINDS.has(kindRaw)
     ? (kindRaw as IterativeFeedbackKind)
@@ -479,7 +492,7 @@ export function parseAgentOutcome(output: string, exitCode: number, changedFiles
     const start = (headerMatch.index ?? 0) + headerMatch[0].length
     for (const line of output.slice(start).split(/\r?\n/)) {
       const value = line.trim().replace(/^[-*\d.)\s]+/, '')
-      if (value === '') continue
+      if (value === '' || value.startsWith('```')) continue
       if (/^(CHANGED_FILES|FEEDBACK_KIND|REASON)\s*:/i.test(value)) break
       proposals.push(value.slice(0, 200))
       if (proposals.length >= 10) break

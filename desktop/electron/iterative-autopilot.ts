@@ -18,12 +18,19 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
   }
   async function continueRun(first: Step, input: Input, session: { canceled: boolean; enabled: boolean }) {
     let outcome = await invoke(first, input)
-    const initial = outcome
+    let initial = outcome
     // Explicit infrastructure retry is one user action, never an autopilot loop.
-    input = { ...input, retryInfra: false }
+    input = { ...input, retryInfra: false, discardCandidate: false }
     if (!session.enabled) return initial
     const stopped = (reason: string, error?: string): Outcome => ({ ...initial, autopilot: { stopped: reason, ...(error ? { error } : {}) } })
     if (session.canceled) return stopped('canceled')
+    let recoveredRepair = false
+    if (first === 'agent' && outcome.ok !== true && /^FORBIDDEN_MUTATION:/.test(String(outcome.error ?? ''))) {
+      outcome = await invoke('drive', { ...input, discardCandidate: true })
+      initial = outcome
+      recoveredRepair = true
+      if (session.canceled) return stopped('canceled')
+    }
     if (outcome.ok !== true) return stopped('error', String(outcome.error || 'AUTOPILOT_STEP_FAILED'))
     if (first === 'begin') {
       if (outcome.checked) {
@@ -38,7 +45,7 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
     // Agent budgets and exact-request closure remain authoritative in Python.
     // Do not retry an identical gate after a nominally successful agent call.
     const gates = new Set<string>()
-    let pendingDrive = first === 'drive' ? outcome : undefined
+    let pendingDrive = first === 'drive' || recoveredRepair ? outcome : undefined
     while (!session.canceled && session.enabled) {
       const drive = pendingDrive ?? await invoke('drive', input)
       pendingDrive = undefined
@@ -55,7 +62,16 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
       gates.add(gate)
       const agent = await invoke('agent', input)
       if (session.canceled) return stopped('canceled')
-      if (agent.ok !== true) return stopped('error', String(agent.error || 'AUTOPILOT_AGENT_FAILED'))
+      if (agent.ok !== true) {
+        if (/^FORBIDDEN_MUTATION:/.test(String(agent.error ?? ''))) {
+          // Reject the trial instead of repeating paid repair on disputed bytes.
+          // Python keeps the checkpoint and schedules other cohorts; the gate
+          // set above still prevents an identical repair loop.
+          pendingDrive = await invoke('drive', { ...input, discardCandidate: true })
+          continue
+        }
+        return stopped('error', String(agent.error || 'AUTOPILOT_AGENT_FAILED'))
+      }
     }
     return stopped(session.canceled ? 'canceled' : 'paused')
   }

@@ -394,7 +394,28 @@ const retryDrive = retryOwner.register('drive', async (_event, input) => {
 });
 assert.equal((await retryDrive(null,{...scope,retryInfra:true})).autopilot.stopped,'finished');
 assert.deepEqual(retries,[true,false]);
-console.log('autopilot: check -> begin -> drive -> agent -> finish; cancel, failure and repeated-gate boundaries OK');
+// Disputed repair bytes are rejected; other cohorts continue without another
+// paid repair of the same candidate. Exercise both initial and later agent gates.
+for (const initialAgent of [false, true]) {
+ const recovery = owner(); const recoveryFlags = []; let agentCalls = 0;
+ recovery.register('status', async () => ({ok:true,decision:{step:'agent'}}));
+ const repair = recovery.register('agent', async () => { agentCalls++; return {ok:false,error:'FORBIDDEN_MUTATION: modified:package.json'}; });
+ const driving = recovery.register('drive', async (_event, input) => {
+  recoveryFlags.push(input.discardCandidate === true);
+  return input.discardCandidate ? {ok:true,stopped:'finished'} : {ok:true,stopped:'agent-gate',repairRequests:[{requestId:'bad-trial'}]};
+ });
+ const completed = await (initialAgent ? repair(null,scope) : driving(null,scope));
+ assert.equal(completed.autopilot.stopped,'finished');
+ assert.equal(completed.ok,true);
+ assert.equal(agentCalls,1);
+ assert.deepEqual(recoveryFlags,initialAgent ? [true] : [false,true]);
+}
+const failureOwner = owner(); let failureDrives = 0;
+failureOwner.register('drive',async () => { failureDrives++; return {ok:true}; });
+const providerFailed = failureOwner.register('agent',async () => ({ok:false,error:'AGENT_PROVIDER_ERROR: unavailable'}));
+assert.equal((await providerFailed(null,scope)).autopilot.stopped,'error');
+assert.equal(failureDrives,0,'Unknown provider failures must not discard a candidate');
+console.log('autopilot: check -> begin -> drive -> agent -> finish; cancel, failure, guard recovery and repeated-gate boundaries OK');
 
 if (failures > 0) {
   console.error(`${failures} scenario contract check(s) FAILED`);

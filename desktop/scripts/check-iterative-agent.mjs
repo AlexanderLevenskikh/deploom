@@ -124,6 +124,17 @@ for (const needle of ["repair-1", "CHANGED_FILES:", "is-number = 7.0.0", "packag
 // deleted. Edits, adds AND removes are reported; planner-forbidden mutations
 // are classified separately and NEVER ride the changed list.
 const baselineFile = trialBaselineFile(runDir);
+const scopedA = trialBaselineFile(runDir, { runId: 'run', candidateId: 'A', baseCheckpointId: 'C0' });
+const scopedB = trialBaselineFile(runDir, { runId: 'run', candidateId: 'B', baseCheckpointId: 'C1' });
+assert.notEqual(scopedA, scopedB, 'Candidate repair baselines must not cross cohorts');
+writeTrialBaseline(workspace, scopedA);
+const plannerManifest = readFileSync(join(workspace, 'package.json'), 'utf8');
+writeFileSync(join(workspace, 'package.json'), JSON.stringify({ dependencies: { 'is-number': '8.0.0' } }));
+writeTrialBaseline(workspace, scopedB);
+assert.equal(forbiddenTrialViolations(workspace, scopedB).length, 0, 'New planner assignment must not be attributed to the agent');
+assert.ok(forbiddenTrialViolations(workspace, scopedA).includes('modified:package.json'), 'Same candidate must preserve manifest protection');
+assert.equal(trialBaselineFile(runDir, { runId: 'run', candidateId: 'B', baseCheckpointId: 'C1' }), scopedB, 'Resume must retain exact candidate evidence');
+writeFileSync(join(workspace, 'package.json'), plannerManifest);
 const baselineCount = writeTrialBaseline(workspace, baselineFile);
 if (baselineCount !== 3) throw new Error(`Baseline must cover 3 files (manifest + 2 sources), got ${baselineCount}`);
 if (forbiddenTrialViolations(workspace, baselineFile).length !== 0) {
@@ -232,6 +243,26 @@ if (!statusPayload || statusPayload.run.phase !== "VERIFYING") {
   throw new Error(`apply-feedback must move REPAIRING -> VERIFYING, phase=${statusPayload?.run.phase}`);
 }
 
+// Guard recovery uses the REAL Python CLI: disputed bytes never become a
+// checkpoint or incompatibility clause; scheduling resumes from C1.
+const rejectedDir = join(root, 'run-rejected');
+const savedCheckpoint = readFileSync(join(runDir, 'checkpoints', 'C1.json'));
+writeJson(join(rejectedDir, 'run.json'), { ...JSON.parse(readFileSync(join(runDir,'run.json'),'utf8')), phase:'REPAIRING' });
+writeFileSync(join(rejectedDir,'run-config.json'),readFileSync(join(runDir,'run-config.json')));
+mkdirSync(join(rejectedDir,'checkpoints'),{recursive:true});
+writeFileSync(join(rejectedDir,'checkpoints','C1.json'),savedCheckpoint);
+writeJson(join(rejectedDir,'trial','candidate.json'),{...JSON.parse(readFileSync(join(runDir,'trial','candidate.json'),'utf8')),stage:'REPAIRING'});
+const discardFile = join(rejectedDir,'discard-feedback.json');
+writeJson(discardFile,buildFeedbackPayload(ctx,[],'INCONCLUSIVE','Protected-file guard rejected this trial'));
+execFileSync(PYTHON,[GENERATOR,'--run-dir',rejectedDir,'apply-feedback','--feedback-file',discardFile],{encoding:'utf8'});
+const rejectedState = parseIterativeStatusPayload(execFileSync(PYTHON,[GENERATOR,'--run-dir',rejectedDir,'status'],{encoding:'utf8'})) ?? readIterativeStatus(rejectedDir);
+assert.equal(rejectedState.run.phase,'READY');
+assert.equal(rejectedState.run.activeCheckpointId,'C1');
+assert.equal(rejectedState.run.activeCandidateId,null);
+assert.equal(JSON.parse(readFileSync(join(rejectedDir,'trial','candidate.json'),'utf8')).stage,'REJECTED');
+assert.deepEqual(readFileSync(join(rejectedDir,'checkpoints','C1.json')),savedCheckpoint);
+assert.deepEqual(JSON.parse(readFileSync(join(rejectedDir,'ledger.json'),'utf8')).blocks,[]);
+
 // 6. Staleness is rejected by the real CLI: a feedback bound to a foreign
 // candidate must fail with STALE_FEEDBACK and change NOTHING.
 const staleDir = join(root, "run-stale");
@@ -305,6 +336,14 @@ if (parseAgentOutcome("FEEDBACK_KIND: NEEDS_ALTERNATIVE\nPROPOSALS:\nlib = 2.0.0
 if (parseAgentOutcome("no marker at all", 0, files).kind !== "READY_FOR_VERIFY") {
   throw new Error("Missing marker must default to READY_FOR_VERIFY (then degrade by files/exit)");
 }
+const streamedAlternative = parseAgentOutcome([
+ JSON.stringify({type:'tool_use',part:{state:{output:'FEEDBACK_KIND: READY_FOR_VERIFY'}}}),
+ JSON.stringify({type:'text',part:{text:'FEEDBACK_KIND: NEEDS_ALTERNATIVE\nPROPOSALS:\n```\neslint = 9.13.0\n@typescript-eslint/parser = 8.11.0\n```\nREASON: unsupported peers'}}),
+ JSON.stringify({type:'step_finish'}),
+].join('\n'),0,[]);
+assert.equal(streamedAlternative.kind,'NEEDS_ALTERNATIVE');
+assert.deepEqual(streamedAlternative.proposals,['eslint = 9.13.0','@typescript-eslint/parser = 8.11.0']);
+assert.equal(streamedAlternative.reason,'unsupported peers');
 // Proposals ride into the feedback for NEEDS_COHORT_EXPANSION (companions).
 const expansionFeedback = buildFeedbackPayload(
   ctx,
