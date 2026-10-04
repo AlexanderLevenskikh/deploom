@@ -95,7 +95,11 @@ const bigLog = readFileSync(attemptLogPath(big), "utf8").split(/\n/);
 if (bigLog.length > 802) throw new Error(`log must be capped to MAX_LOG_LINES after the byte cap, got ${bigLog.length}`);
 if (!bigLog.some((line) => line.endsWith(" 1599"))) throw new Error("trim must keep the newest lines");
 if (bigLog.some((line) => line.endsWith(" 0"))) throw new Error("trim must drop the oldest lines after the byte cap");
-if (!bigLog.some((line) => line.endsWith(" 801"))) throw new Error("trim must keep a contiguous newest block");
+if (readFileSync(attemptLogPath(big)).length > 128 * 1024) throw new Error("attempt log must stay within its byte cap");
+const retainedIndices = bigLog.filter((line) => line.startsWith("payload ")).map((line) => Number(line.match(/ (\d+)$/)?.[1]));
+if (retainedIndices.length < 100 || retainedIndices.at(-1) !== 1599 || retainedIndices.some((value, index) => index > 0 && value !== retainedIndices[index - 1] + 1)) {
+  throw new Error("trim must keep a contiguous newest block within the byte budget");
+}
 const bigTail = readAttemptLogTail(big);
 if (bigTail.length > 16 * 1024 + 2) throw new Error("UI tail must be capped to the 16KB budget");
 // A NEW attempt clears the log (no cross-run leakage of a previous child).
