@@ -1,50 +1,67 @@
 # Physical iterative migration demo
 
+The demo drives the real iterative migration control loop over real Git/npm
+fixtures. Since the coordinator loop lives in the Desktop control plane, the
+demo runs it through the REAL compiled production modules by driving
+`scripts/iterative-node-drive.mjs` (the same `decide → status → step` loop that
+`desktop/electron/main.ts` wires to `flow:iterative:drive`), with the REAL Python
+CLI, npm, Git, materializer, project checks, proof validation, feedback
+identities and audit.
+
+No fake verifier, no external LLM agent session, and no user checkout is
+touched. Scripted repairs are proposals: only `verify-exact` may accept a
+checkpoint. The demo driver never sends feedback on the application's behalf
+and never sends `INCONCLUSIVE`.
+
 Run from the repository root:
 
 ```powershell
-python scripts/run-iterative-demo.py
+# build/refresh the compiled production coordinator modules first
+cd desktop; npx tsc -p tsconfig.electron.json; cd ..
+
+python scripts/run-iterative-demo.py                       # default: happy-path-24
+python scripts/run-iterative-demo.py --profile failure-matrix
+python scripts/run-iterative-demo.py --profile cross-group-closure
+python scripts/run-iterative-demo.py --keep-output         # retain the stage dir for inspection
 ```
 
-The script requires Git, Node, npm and registry access. It creates a NEW isolated
-Git repository below `.dependency-roadmap/iterative-demo/`, installs real public
-packages and retains all evidence. It does not migrate a developer's checkout or
-publish anything. Initial and target versions are warmed in a private npm cache;
-subsequent dependency materialization uses that cache offline. Final independent
-audit still uses the production audit implementation and records its evidence.
+The Desktop `dist-electron` build is required by `scripts/iterative-node-drive.mjs`
+(the helper fails fast with a build hint otherwise). The script requires Git,
+Node, npm and one-time registry access to warm cache fixtures; every subsequent
+dependency materialization runs with `npm_config_offline=true`.
 
-The demo has 12 direct dependencies and one package per initial cohort:
+## Profiles
 
-| Cohort type | Expected behavior |
+| Profile | What it proves |
 | --- | --- |
-| Ordinary upgrades | Install exact versions, run `npm run test`, accept a checkpoint. |
-| Version-sensitive configuration | The old config fails after upgrading `is-finite` / `is-number`; propose source/config repair, then run `verify-exact`. |
-| Deliberately wrong repair | Real project checks remain RED; the verified base is unchanged. |
-| Correct repair | Real checks pass, repaired source bytes are captured in the next checkpoint. |
-| Impossible `is-string@99.99.99` | Real npm returns ETARGET. INCONCLUSIVE defers the exact attempt on the current base; later independent cohorts still run. |
-| Process restart | Every CLI step is a fresh Python process; subsequent cohorts read the same durable cumulative chain. |
+| `happy-path-24` (default) | 24 real packages migrate in greedy cohorts with a deliberately wrong repair (rejected), version-sensitive config adaptation, stop/resume of a real project command with the checkpoint preserved, ETARGET on impossible targets (`is-string@99.99.99`, `is-weakset@99.99.99`) that defers exactly and never repeats on an unchanged base. Terminal `PARTIAL_VERIFIED`. |
+| `failure-matrix` | With a degraded cache (none of the new versions present), exact `maxInfraRetries` install attempts occur, the run stops at `INFRA_BLOCKED` with durable evidence (CACHE_MISS, fingerprint, verified checkpoint preserved), a healthy cache alone does NOT silently continue, and the operator heals via `plan-next --retry-infra`. A drive kill right after the healed materialize resumes the SAME candidate and the SAME checkpoint (restart-safe, no attempt re-spent); a wrong repair is rejected before the correct one lands. Terminal `COMPLETE`. |
+| `cross-group-closure` | A mutually exclusive pair (`is-string` + `is-symbol`, "a+h") inside a noisy 8-package batch. The combined assignment is inherently RED, gets REJECTED, and the planner's split-then-recombine finds a workable separation. The pair is never accepted together, no package is skipped/repeated/duplicated across accepted checkpoints, and the search is never declared exhausted early. Because the pair is an exclusive OR, exactly one member is upgraded and the other is honestly blocked — terminal `PARTIAL_VERIFIED`, never a fabricated `COMPLETE`. |
 
-The artificial configuration contracts are fixture behavior, not claims about
-breaking changes in those npm packages. Repair proposals are scripted to make the
-scenario reproducible: this does not test the quality or availability of an
-external LLM agent. The production CLI, npm, Git, materializer, project checks,
-proof validation, feedback identities and audit are real.
+Every profile asserts the driver only ever writes `READY_FOR_VERIFY` at agent
+gates, never `INCONCLUSIVE`, and never edits durable state for the application.
 
-Expected outcome: 11 accepted upgrades, one unmet target, C0 → C11,
-`PARTIAL_VERIFIED` when the final independent audit passes. The impossible target
-is never counted as satisfied. It may be tried again after a NEW verified base
-changes dependency context; it must not repeat on an unchanged base.
+## Fixtures
 
-The script prints `DEMO_WORKSPACE` and finally `DEMO_ACCEPTED`. Inspect:
+The script creates a NEW isolated directory (a temp stage by default, or
+`.dependency-roadmap/iterative-demo/` with `--output-root`) with a fresh Git
+project pinned to the OLD versions. Version-sensitive `src/config.js` contracts
+are fixture behavior — intentional rules that the scripted agent adapts to —
+not claims about real breaking changes in those public packages. Repair
+proposals are scripted to keep the scenario reproducible; this does not test an
+external agent's quality.
 
-- `ACCEPTANCE.json`: assertions, exact final state and original source Git status.
-- `TIMELINE.json` and `cli.log`: all process invocations and results.
+The script prints `DEMO_WORKSPACE` (the stage) and finally
+`DEMO_ACCEPTED <path-to-summary>`. Inspect the retained stage:
+
+- `DEMO_SUMMARY.json` / `ACCEPTANCE.json`: assertions and exact final state.
+- `TIMELINE.json`, `cli.log`, `run/attempt.log`: every invocation and result.
 - `run/checkpoints/`: accepted cumulative states and proof identities.
-- `run/ledger.json`: feedback and scheduling deferrals, distinct from learned incompatibilities.
-- `run/audit/C11/audit-report.json` and `audit-report.md`: independent audit evidence.
+- `run/ledger.json`: feedback, infra and scheduling deferrals.
+- `run/audit/…/audit-report.json|.md`: independent audit evidence.
 - `run/reports/MIGRATION_REPORT.md` and `DEVELOPER_UPGRADE_GUIDE.md`.
 
 These reports are generated summaries. Agent-authored upgrade explanations are
-not fabricated by this scripted demo; the guide explicitly reports their absence.
-Runtime artifacts are ignored local data. Do not add caches, sealed snapshots or
-machine-specific paths to a public commit.
+not fabricated by this scripted demo; the guide explicitly reports their
+absence. Runtime artifacts are ignored local data. Do not add caches, sealed
+snapshots or machine-specific paths to a public commit.
