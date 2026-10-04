@@ -50,3 +50,7 @@ desktop/.cache/
 
 # Local per-date probe/audit artifacts (never published)
 docs/2026-*/
+
+# Internal audit/task evidence from the 2026-10-04 audit session (never published)
+docs/AUDIT_2026-10-04.md
+docs/AGENT_TASK_AUDIT_2026-10-04.md
