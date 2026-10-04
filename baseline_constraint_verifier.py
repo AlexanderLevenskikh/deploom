@@ -2514,13 +2514,30 @@ def reap_orphan_verification_trials(
     parent: Optional[Path], *, max_age_seconds: int = 24 * 60 * 60,
     max_candidates: int = 4,
 ) -> Tuple[int, int]:
-    """Bounded cleanup for old tool-owned trial namespaces only."""
+    """Bounded cleanup for old tool-owned trial namespaces only.
+
+    Must never stall trial reuse: retries of already-detached garbage and the
+    dead-owner detach step use only O(1) renames plus a tiny traversal budget.
+    Trees that do not fit the budget are detached, not walked/deleted here.
+    """
     if parent is None or not parent.is_dir():
         return 0, 0
+    from verification_storage_maintenance import (
+        bounded_sweep_candidate, clean_retired_trials, dead_trial_owner,
+        _plain_directory, HOT_SWEEP_BYTES, HOT_SWEEP_FILES, HOT_SWEEP_SECONDS,
+    )
     # Retry already-detached garbage too; failed deletion must not leak forever.
-    from verification_storage_maintenance import clean_retired_trials
-    clean_retired_trials(parent.parent, limit=max_candidates)
+    # A tiny budget means a multi-thousand-file remnant is deferred, never walked.
+    clean_retired_trials(
+        parent.parent, limit=max_candidates,
+        budget_bytes=HOT_SWEEP_BYTES, budget_files=HOT_SWEEP_FILES,
+        budget_seconds=HOT_SWEEP_SECONDS,
+    )
     cutoff = time.time() - max(3600, int(max_age_seconds))
+    budget = {
+        "bytes_left": HOT_SWEEP_BYTES, "files_left": HOT_SWEEP_FILES,
+        "deadline": time.monotonic() + HOT_SWEEP_SECONDS,
+    }
     candidates = 0
     reclaimed = 0
     try:
@@ -2532,22 +2549,28 @@ def reap_orphan_verification_trials(
             break
         if not item.is_dir() or not item.name.startswith("dependency-flow-baseline-verify-"):
             continue
-        from verification_storage_maintenance import dead_trial_owner, _plain_directory, _has_links
         if not _plain_directory(item) or not dead_trial_owner(item):
             continue
         try:
-            if item.stat().st_mtime > cutoff or _has_links(item):
+            if item.stat().st_mtime > cutoff:
                 continue
         except OSError:
             continue
         candidates += 1
-        trash = parent / f".deploom-trial-trash-{item.name}-{os.getpid()}-{time.time_ns()}"
         try:
-            os.replace(item, trash)
-            shutil.rmtree(trash, ignore_errors=False)
-            reclaimed += 1
+            # O(1) detach first: rename the dead-owner tree into the trash
+            # namespace, keeping the original mtime as the retirement timestamp
+            # so a deferred deletion stays retryable without a full walk.
+            trash = parent / f".deploom-trial-trash-{item.name}-{os.getpid()}-{int(item.stat().st_mtime * 1e9)}"
+            if trash.exists():
+                outcome = bounded_sweep_candidate(trash, budget)
+            else:
+                os.replace(item, trash)
+                outcome = bounded_sweep_candidate(trash, budget)
         except OSError:
-            continue
+            outcome = "failed"
+        if outcome == "removed":
+            reclaimed += 1
     emit_observability_event(
         "trial.reaper", candidates=candidates, reclaimed=reclaimed,
         failures=max(0, candidates - reclaimed),

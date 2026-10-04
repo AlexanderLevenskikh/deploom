@@ -6,7 +6,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
-from verification_storage_maintenance import clean_retired_trials, retired_trials, MIN_AGE_SECONDS
+from verification_storage_maintenance import clean_retired_trials, retired_trials, MIN_AGE_SECONDS, storage_available
 from iterative_cohort_planner import plan_adaptive_cohort
 
 class StorageMaintenanceTests(unittest.TestCase):
@@ -39,6 +39,13 @@ class StorageMaintenanceTests(unittest.TestCase):
             with patch('verification_storage_maintenance._has_links',return_value=True):
                 result=clean_retired_trials(root)
             self.assertEqual(result['protected'],1);self.assertTrue(p.exists())
+    def test_unavailable_root_is_distinguishable_from_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            self.assertFalse(storage_available(root))   # cannot scan, not "no garbage"
+            self.assertEqual(clean_retired_trials(root)['eligible'],0)
+            (root/'trials').mkdir()
+            self.assertTrue(storage_available(root))
 
 class GreedyCohortTests(unittest.TestCase):
     def plan(self,names,*,config=None,blocks=(),checkpoints=(),ledger=None,old=None):
@@ -102,3 +109,51 @@ class OwnerProtectionTests(unittest.TestCase):
             self.assertTrue(dead_trial_owner(trial))
             self.assertEqual(reap_orphan_verification_trials(root),(1,1))
             self.assertFalse(trial.exists())
+
+class BudgetedSweepTests(unittest.TestCase):
+    def big_old(self, root, *, name='big', files=4000):
+        p=root/'trials'/f'.deploom-trial-trash-dependency-flow-baseline-verify-{name}-123-{time.time_ns()-3*MIN_AGE_SECONDS*10**9}'
+        p.mkdir(parents=True)
+        for i in range(files): (p/f'f{i:05}.dat').write_bytes(b'x'*200)
+        os.utime(p,(time.time()-3*MIN_AGE_SECONDS,)*2);return p
+    def dead_owner_trial(self, trials, *, name='big', files=0):
+        import subprocess,sys
+        from verification_storage_maintenance import register_trial_owner
+        trial=trials/f'dependency-flow-baseline-verify-{name}';trial.mkdir()
+        child=subprocess.Popen([sys.executable,'-c','pass']);child.wait(timeout=10)
+        (trial/'.deploom-trial-owner.json').write_text(json.dumps({'pid':child.pid}))
+        for i in range(files): (trial/f'f{i:05}.dat').write_bytes(b'x'*200)
+        os.utime(trial,(time.time()-3*MIN_AGE_SECONDS,)*2)
+        return trial
+    def test_hot_budget_defers_oversized_tree_without_full_walk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);p=self.big_old(root)
+            with patch('verification_storage_maintenance._has_links',wraps=__import__('verification_storage_maintenance',fromlist=['_has_links'])._has_links) as links:
+                hot=clean_retired_trials(root,budget_bytes=4096,budget_files=64,budget_seconds=0.5)
+                self.assertEqual(hot['protected'],1);self.assertEqual(hot['removed'],0)
+                self.assertEqual(links.call_count,0)  # no full _has_links walk on the hot path
+                self.assertTrue(p.exists())
+                big=clean_retired_trials(root,budget_bytes=10*1024*1024,budget_files=100_000,budget_seconds=30)
+                self.assertEqual(big['removed'],1)
+            self.assertFalse(p.exists());self.assertGreater(links.call_count,0)
+    def test_reap_detaches_oversized_dead_owner_tree_without_walking_it(self):
+        from baseline_constraint_verifier import reap_orphan_verification_trials
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);trials=root/'trials';trials.mkdir()
+            trial=self.dead_owner_trial(trials,files=4000)
+            with patch('verification_storage_maintenance._has_links',wraps=__import__('verification_storage_maintenance',fromlist=['_has_links'])._has_links) as links:
+                candidates,reclaimed=reap_orphan_verification_trials(trials,max_age_seconds=3600)
+                self.assertEqual((candidates,reclaimed),(1,0))  # detached O(1), deletion deferred
+                self.assertEqual(links.call_count,0)
+            self.assertFalse(trial.exists())
+            self.assertTrue(any(n.startswith('.deploom-trial-trash-dependency-flow-baseline-verify-big-') for n in os.listdir(trials)))
+            finished=clean_retired_trials(root,budget_bytes=10*1024*1024,budget_files=100_000,budget_seconds=30)
+            self.assertEqual(finished['removed'],1)
+    def test_maintenance_clean_claims_dead_owner_normal_trial(self):
+        from verification_storage_maintenance import claim_dead_owner_trials
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);trials=root/'trials';trials.mkdir()
+            trial=self.dead_owner_trial(trials,name='crashed')
+            self.assertEqual(claim_dead_owner_trials(root),1)
+            self.assertFalse(trial.exists())
+            self.assertEqual(clean_retired_trials(root)['removed'],1)

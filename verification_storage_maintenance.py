@@ -51,7 +51,21 @@ def dead_trial_owner(path):
 
 
 TRASH_NAME = re.compile(r"^\.deploom-trial-trash-dependency-flow-baseline-verify-[a-z0-9_]+-\d+-\d+$")
+# GC locators are the claim target of a concurrent-backoff sweep; they are still
+# trash-named so `retired_trials` keeps returning them until deletion succeeds.
+GC_NAME = re.compile(r"^\.deploom-trial-trash-dependency-flow-baseline-verify-gc_[a-z0-9_]+-\d+-\d+$")
 MIN_AGE_SECONDS = 24 * 3600
+
+# Traversal budgets. The hot path (reap before an expensive check) may only burn
+# a tiny amount of wall/time/IO; oversized trees are detached O(1) and deleted by
+# a later maintenance pass with a much larger budget. A full _has_links/rmtree
+# walk of a multi-thousand-file tree must never stall trial reuse.
+HOT_SWEEP_BYTES = 64 * 1024          # ~64 KiB of file content counted
+HOT_SWEEP_FILES = 1024               # ~1024 entries lstat'ed
+HOT_SWEEP_SECONDS = 0.5              # ~0.5 s of traversal wall
+MAINT_SWEEP_BYTES = 512 * 1024 * 1024
+MAINT_SWEEP_FILES = 200_000
+MAINT_SWEEP_SECONDS = 120.0
 
 
 def _plain_directory(path: Path) -> bool:
@@ -87,6 +101,14 @@ def retired_trials(root: Path, *, now: float | None = None) -> list[Path]:
     return sorted(result, key=lambda path: path.name)
 
 
+def storage_available(root: Path) -> bool:
+    # Distinguishes "no garbage" (True) from "could not scan" (False): a root
+    # that is missing, has a junction in its ancestry, or lacks the trials
+    # namespace cannot be certified, and emptiness must not be misread as a
+    # successful clean.
+    return _trusted_parent(root) is not None
+
+
 def _has_links(path: Path) -> bool:
     # Do not remove trees containing junctions/symlinks, even though modern
     # rmtree handles them. They can represent a still-guarded shared snapshot.
@@ -100,22 +122,151 @@ def _has_links(path: Path) -> bool:
     return False
 
 
-def clean_retired_trials(root: Path, *, limit: int = 256, now: float | None = None) -> dict:
+def _make_budget(*, bytes: int, files: int, seconds: float) -> dict:
+    return {
+        "bytes_left": max(0, int(bytes)),
+        "files_left": max(0, int(files)),
+        "deadline": time.monotonic() + max(0.0, float(seconds)),
+    }
+
+
+def _budget_exhausted(budget: dict) -> bool:
+    return budget["bytes_left"] <= 0 or budget["files_left"] <= 0 or time.monotonic() >= budget["deadline"]
+
+
+def _budgeted_scan(path: Path, budget: dict) -> dict:
+    # Only traverse while the shared budget lasts; never follows links. Returns
+    # {'status': 'ok'|'links'|'oversized', 'files': int, 'bytes': int}. A tree
+    # that cannot be certified inside the budget is 'oversized' (protected).
+    files = 0
+    total = 0
+
+    def fail(error):
+        raise error
+
+    try:
+        for current, dirs, names in os.walk(path, followlinks=False, onerror=fail):
+            for name in dirs + names:
+                try:
+                    info = (Path(current) / name).lstat()
+                except OSError:
+                    return {"status": "oversized", "files": files, "bytes": total}
+                if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400 or (stat.S_ISREG(info.st_mode) and info.st_nlink > 1):
+                    return {"status": "links", "files": files, "bytes": total}
+                if not stat.S_ISDIR(info.st_mode):
+                    files += 1
+                    total += getattr(info, "st_size", 0)
+                    budget["bytes_left"] -= getattr(info, "st_size", 0)
+                    budget["files_left"] -= 1
+                    if _budget_exhausted(budget):
+                        return {"status": "oversized", "files": files, "bytes": total}
+    except OSError:
+        return {"status": "oversized", "files": files, "bytes": total}
+    return {"status": "ok", "files": files, "bytes": total}
+
+
+def _claim_gc(path: Path) -> Path | None:
+    # Claim by atomic rename so concurrent cleaners never delete the same tree.
+    # The encoded retirement timestamp derives from the original mtime, so a
+    # locator left behind by an interrupted/budget-deferred deletion stays
+    # eligible for the next pass instead of waiting another retirement window.
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    target = path.with_name(f".deploom-trial-trash-dependency-flow-baseline-verify-gc_{os.getpid()}-{os.getpid()}-{int(mtime * 1e9)}")
+    try:
+        os.rename(path, target)
+        return target
+    except OSError:
+        return None
+
+
+def bounded_sweep_candidate(path: Path, budget: dict) -> str:
+    # Delete one detached garbage <path> only if it fits the caller's shared
+    # traversal budget. Returns 'removed' | 'links' | 'oversized' | 'failed'.
+    # 'links'/'oversized' leave the tree in place at its current locator for a
+    # bigger maintenance pass; only a budget-fitting, link-free tree is moved
+    # (claim) and actually removed in this call.
+    if _budget_exhausted(budget):
+        return "oversized"
+    scan = _budgeted_scan(path, budget)
+    if scan["status"] != "ok":
+        return scan["status"]
+    if _has_links(path):
+        return "links"
+    if not GC_NAME.fullmatch(path.name):
+        claimed = _claim_gc(path)
+        if claimed is None:
+            return "failed"
+        path = claimed
+    try:
+        shutil.rmtree(path)
+        return "removed"
+    except OSError:
+        return "failed"
+
+
+def claim_dead_owner_trials(root: Path, *, max_age: float = MIN_AGE_SECONDS, limit: int = 256) -> int:
+    # O(1) detach of old normal-name trials whose owner process is gone. No
+    # tree walking, no link checks, no deletion; the locators become trash that
+    # a later budgeted sweep (maintenance/reap) can safely remove. This is the
+    # atomic-detach half of "detach fast, delete later".
+    parent = _trusted_parent(root)
+    if parent is None:
+        return 0
+    cutoff = time.time() - max_age
+    claimed = 0
+    try:
+        entries = sorted(parent.iterdir(), key=lambda item: item.stat().st_mtime)
+    except OSError:
+        return 0
+    for item in entries:
+        if claimed >= max(0, limit):
+            break
+        if not item.name.startswith("dependency-flow-baseline-verify-"):
+            continue
+        if not _plain_directory(item) or not dead_trial_owner(item):
+            continue
+        try:
+            if item.stat().st_mtime > cutoff:
+                continue
+        except OSError:
+            continue
+        trash = item.with_name(f".deploom-trial-trash-{item.name}-{os.getpid()}-{int(item.stat().st_mtime * 1e9)}")
+        if trash.exists():
+            continue
+        try:
+            os.rename(item, trash)
+            claimed += 1
+        except OSError:
+            continue
+    return claimed
+
+
+def clean_retired_trials(
+    root: Path,
+    *,
+    limit: int = 256,
+    now: float | None = None,
+    budget_bytes: int = MAINT_SWEEP_BYTES,
+    budget_files: int = MAINT_SWEEP_FILES,
+    budget_seconds: float = MAINT_SWEEP_SECONDS,
+) -> dict:
     candidates = retired_trials(root, now=now)
     removed = failed = protected = 0
+    budget = _make_budget(bytes=budget_bytes, files=budget_files, seconds=budget_seconds)
     for path in candidates[:max(0, limit)]:
-        try:
-            if _trusted_parent(root) != path.parent or not _plain_directory(path) or _has_links(path):
-                protected += 1
-                continue
-            # Claim by atomic rename. Concurrent cleaners never delete the same
-            # locator. Failed/partial removal remains recognizable next time.
-            claimed = path.with_name(f".deploom-trial-trash-dependency-flow-baseline-verify-gc_{os.getpid()}-{os.getpid()}-{time.time_ns()}")
-            os.rename(path, claimed)
-            shutil.rmtree(claimed)
+        if _trusted_parent(root) != path.parent or not _plain_directory(path):
+            protected += 1
+            continue
+        outcome = bounded_sweep_candidate(path, budget)
+        if outcome == "removed":
             removed += 1
-        except OSError:
+        elif outcome == "failed":
             failed += 1
+        else:
+            protected += 1
     return {"eligible": len(candidates), "removed": removed, "failed": failed, "protected": protected}
 
 
@@ -125,8 +276,14 @@ def maintenance(action: str) -> dict:
     if profile.root is None:
         raise RuntimeError("Verification storage is unavailable")
     root = profile.root.absolute()
-    counts = clean_retired_trials(root) if action == "clean" else {"eligible": len(retired_trials(root)), "removed": 0, "failed": 0, "protected": 0}
-    return {"root": str(root), "filesystem": profile.filesystem, "freeBytes": shutil.disk_usage(root).free, **counts}
+    if action == "clean":
+        # Maintenance is the "delete later" side of the detach-fast contract and
+        # also recovers normal-name trials left by a crashed verifier.
+        claim_dead_owner_trials(root)
+        counts = clean_retired_trials(root)
+    else:
+        counts = {"eligible": len(retired_trials(root)), "removed": 0, "failed": 0, "protected": 0}
+    return {"root": str(root), "filesystem": profile.filesystem, "freeBytes": shutil.disk_usage(root).free, "available": storage_available(root), **counts}
 
 
 if __name__ == "__main__":
