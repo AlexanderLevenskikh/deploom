@@ -48,6 +48,9 @@ desktop/.cache/
 # Local agent-managed worktrees
 .claude/worktrees/
 
+# Local benchmark scratch/fixtures/raw results (never published)
+benchmarks/work/
+
 # Local per-date probe/audit artifacts (never published)
 docs/2026-*/
 

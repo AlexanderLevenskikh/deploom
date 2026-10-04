@@ -286,22 +286,9 @@ def _key(path: Path) -> str:
 
 
 def _git_root(project_dir: Path) -> Optional[Path]:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(project_dir), "rev-parse", "--show-toplevel"],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    return Path(result.stdout.strip()).resolve()
+    from git_identity import git_toplevel
+
+    return git_toplevel(project_dir)
 
 
 def _dependency_roots(prepared_root: Path) -> list[Path]:

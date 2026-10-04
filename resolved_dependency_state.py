@@ -41,23 +41,12 @@ def _canonical_hash(value: object) -> str:
 
 
 def _git_root_or_project(project_dir: Path) -> Path:
-    project_dir = project_dir.resolve()
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(project_dir), "rev-parse", "--show-toplevel"],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return project_dir
-    if result.returncode == 0 and result.stdout.strip():
-        return Path(result.stdout.strip()).resolve()
-    return project_dir
+    from git_identity import git_toplevel
+
+    root = git_toplevel(project_dir)
+    if root is not None:
+        return root
+    return Path(project_dir).resolve()
 
 
 def _lockfile_names(manager: str) -> tuple[str, ...]:

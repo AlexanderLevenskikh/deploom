@@ -5533,7 +5533,26 @@ COMMANDS = {
 }
 
 
+def _install_metrics() -> None:
+    """Opt-in DEPLOOM_METRICS instrumentation (no-op in normal execution)."""
+    if not os.environ.get("DEPLOOM_METRICS"):
+        return
+    try:
+        import atexit
+
+        import runtime_metrics
+
+        runtime_metrics.mark_start()
+        runtime_metrics.wrap_popen()
+        runtime_metrics.wrap_walk()
+        runtime_metrics.wrap_stat()
+        atexit.register(runtime_metrics.emit_final)
+    except Exception:
+        pass
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    _install_metrics()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

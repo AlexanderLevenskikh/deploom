@@ -2164,19 +2164,13 @@ def _package_manager_cache_environment(
     )
 
 def _git_root_and_relative(project_dir: Path) -> Tuple[Optional[Path], Path]:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(project_dir), "rev-parse", "--show-toplevel"],
-            text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=30, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+    from git_identity import git_toplevel
+
+    root = git_toplevel(project_dir)
+    if root is None:
         return None, Path(".")
-    if result.returncode != 0 or not result.stdout.strip():
-        return None, Path(".")
-    root = Path(result.stdout.strip()).resolve()
     try:
-        return root, project_dir.resolve().relative_to(root)
+        return root, Path(project_dir).resolve().relative_to(root)
     except ValueError:
         return root, Path(".")
 

@@ -11736,17 +11736,10 @@ def _proof_source_head_clean_and_entries(
     require_git: bool = True,
 ) -> tuple[str, bool, Tuple[str, ...]]:
     project_path = project_path.resolve()
-    root_result = subprocess.run(
-        ["git", "-C", str(project_path), "rev-parse", "--show-toplevel"],
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=30,
-        check=False,
-    )
-    if root_result.returncode != 0 or not root_result.stdout.strip():
+    from git_identity import git_toplevel
+
+    git_root = git_toplevel(project_path)
+    if git_root is None:
         if require_git:
             raise BaselineConstraintVerificationError(
                 "PROVEN_DEPENDENCY_SOURCE_SNAPSHOT_INVALID: actionable dependency proof "
@@ -11754,8 +11747,6 @@ def _proof_source_head_clean_and_entries(
             )
         source_key = source_snapshot_fingerprint(project_path)
         return "non-git", bool(source_key), ()
-
-    git_root = Path(root_result.stdout.strip()).resolve()
     head_result = subprocess.run(
         ["git", "-C", str(git_root), "rev-parse", "HEAD"],
         text=True,

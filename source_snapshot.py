@@ -320,26 +320,44 @@ def _run_git(project_dir: Path, args: list[str]) -> subprocess.CompletedProcess[
         return subprocess.CompletedProcess(["git", *args], 127, stdout="", stderr=str(exc))
 
 
+_subject_layout_cache: "dict[tuple[Path, bool], tuple[Path, Path, str]]" = {}
+
+
 def _subject_layout(project_dir: Path, *, require_git: bool = False) -> tuple[Path, Path, str]:
     project_dir = project_dir.expanduser().resolve()
-    result = _run_git(project_dir, ["rev-parse", "--show-toplevel"])
-    if result.returncode == 0 and result.stdout.strip():
-        root = Path(result.stdout.strip()).resolve()
+    cache_key = (project_dir, require_git)
+    cached = _subject_layout_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    # One combined read-only probe instead of two subprocesses: the first stdout
+    # line is the toplevel, the second is HEAD.  Semantics are preserved:
+    # toplevel-empty == "not a Git repository"; toplevel-present-with-failed-HEAD
+    # == SOURCE_GIT_HEAD_UNAVAILABLE.  source_snapshot never writes to the
+    # probed repositories (no in-process commit/init), so the result is
+    # immutable for a resolved directory within one process and is memoized.
+    result = _run_git(project_dir, ["rev-parse", "--show-toplevel", "HEAD"])
+    output_lines = result.stdout.strip().splitlines() if result.stdout.strip() else []
+    root = Path(output_lines[0]).resolve() if output_lines else None
+    if result.returncode == 0 and root is not None and len(output_lines) >= 2:
         try:
             relative = project_dir.relative_to(root)
         except ValueError as exc:
             raise SourceCaptureError(
                 f"SOURCE_PROJECT_OUTSIDE_GIT_ROOT: project={project_dir}, root={root}"
             ) from exc
-        head_result = _run_git(project_dir, ["rev-parse", "HEAD"])
-        if head_result.returncode != 0 or not head_result.stdout.strip():
-            detail = (head_result.stderr or head_result.stdout or "empty HEAD").strip()
-            raise SourceCaptureError(f"SOURCE_GIT_HEAD_UNAVAILABLE: {detail}")
-        return root, relative, head_result.stdout.strip()
+        head = output_lines[1].strip()
+        value = (root, relative, head)
+        _subject_layout_cache[cache_key] = value
+        return value
+    if root is not None:
+        detail = (result.stderr or result.stdout or "empty HEAD").strip()
+        raise SourceCaptureError(f"SOURCE_GIT_HEAD_UNAVAILABLE: {detail}")
     if require_git:
         detail = (result.stderr or result.stdout or "not a Git repository").strip()
         raise SourceCaptureError(f"SOURCE_GIT_REQUIRED: {detail}")
-    return project_dir, Path("."), ""
+    value = (project_dir, Path("."), "")
+    _subject_layout_cache[cache_key] = value
+    return value
 
 
 def _iter_source_files_without_links(
@@ -714,6 +732,13 @@ def _hash_regular_file(
     return digest.hexdigest(), after
 
 
+# Trees with no more regular files than this are hashed synchronously on the
+# caller thread: spawning an 8-thread pool and waiting on its wakeups for a
+# handful of small files is pure overhead on the CLI critical path. Larger
+# trees keep the bounded streaming pool (see _build_source_tree_manifest_impl).
+_SYNC_HASH_THRESHOLD = 256
+
+
 def _source_hash_workers() -> int:
     raw = str(os.environ.get("DEPLOOM_SOURCE_HASH_WORKERS") or "").strip()
     if raw:
@@ -819,10 +844,13 @@ def _build_source_tree_manifest_impl(
             )
             next_progress = now + max(1, int(progress_interval_seconds))
 
-    def accept_future(future: concurrent.futures.Future[tuple[str, os.stat_result]]) -> None:
+    def accept_hash(
+        path: Path,
+        relative_text: str,
+        digest: str,
+        stable: os.stat_result,
+    ) -> None:
         nonlocal files, byte_count
-        path, relative_text = pending.pop(future)
-        digest, stable = future.result()
         if require_exclusive_links and int(getattr(stable, "st_nlink", 1) or 1) > 1:
             # A sealed tree is a fresh private copy, so every file must have
             # exactly one directory entry. A second link is an alias through
@@ -844,6 +872,11 @@ def _build_source_tree_manifest_impl(
         })
         tick()
 
+    def accept_future(future: concurrent.futures.Future[tuple[str, os.stat_result]]) -> None:
+        path, relative_text = pending.pop(future)
+        digest, stable = future.result()
+        accept_hash(path, relative_text, digest, stable)
+
     def drain_one() -> None:
         if not pending:
             return
@@ -853,99 +886,131 @@ def _build_source_tree_manifest_impl(
         for future in done:
             accept_future(future)
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=workers,
-        thread_name_prefix="deploom-source-hash",
-    ) as executor:
-        def walk(directory: Path, relative_dir: Path) -> None:
-            nonlocal directories
-            tick()
-            directory_stamps.append((directory, relative_dir, _directory_stability_stamp(directory, relative=relative_dir, policy=policy)))
-            try:
-                with os.scandir(directory) as iterator:
-                    scanned = sorted(iterator, key=lambda entry: entry.name)
-            except OSError as exc:
-                raise SourceCaptureError(f"SOURCE_DIRECTORY_UNREADABLE: {directory}: {exc}") from exc
-            for item in scanned:
-                relative = relative_dir / item.name
-                if _excluded(relative, policy):
-                    continue
-                path = Path(item.path)
-                tick()
-                try:
-                    st = item.stat(follow_symlinks=False)
-                except OSError as exc:
-                    raise SourceCaptureError(f"SOURCE_ENTRY_UNREADABLE: {path}: {exc}") from exc
+    file_work: list[tuple[Path, str]] = []
+    executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
-                is_junction = getattr(path, "is_junction", None)
-                if callable(is_junction):
-                    try:
-                        if is_junction():
-                            raise SourceCaptureError(
-                                f"SOURCE_UNSUPPORTED_REPARSE_POINT: junction: {path}"
-                            )
-                    except OSError as exc:
-                        raise SourceCaptureError(
-                            f"SOURCE_ENTRY_UNREADABLE: junction probe {path}: {exc}"
-                        ) from exc
-
-                if stat.S_ISLNK(st.st_mode):
-                    try:
-                        target_text = os.readlink(path)
-                    except OSError as exc:
-                        raise SourceCaptureError(f"SOURCE_SYMLINK_UNREADABLE: {path}: {exc}") from exc
-                    target = Path(target_text)
-                    if not target.is_absolute():
-                        target = path.parent / target
-                    if not _within(target, root):
-                        raise SourceCaptureError(
-                            f"SOURCE_SYMLINK_ESCAPE: {relative.as_posix()} -> {target_text}"
-                        )
-                    try:
-                        target_relative = target.resolve(strict=False).relative_to(root)
-                    except ValueError:
-                        target_relative = Path(".")
-                    if _excluded(target_relative, policy):
-                        raise SourceCaptureError(
-                            f"SOURCE_SYMLINK_TARGET_EXCLUDED: {relative.as_posix()} -> {target_text}"
-                        )
-                    entries.append({
-                        "path": relative.as_posix(),
-                        "kind": "symlink",
-                        "target": target_text.replace("\\", "/"),
-                    })
-                    continue
-
-                if stat.S_ISDIR(st.st_mode):
-                    directories += 1
-                    entries.append({"path": relative.as_posix(), "kind": "directory"})
-                    walk(path, relative)
-                    continue
-
-                if stat.S_ISREG(st.st_mode):
-                    if int(getattr(st, "st_nlink", 1) or 1) > 1 and not (
-                        relative.parts and relative.parts[0] == ".git"
-                    ):
-                        raise SourceCaptureError(
-                            f"SOURCE_HARDLINK_UNSUPPORTED: {relative.as_posix()} nlink={st.st_nlink}"
-                        )
-                    future = executor.submit(
+    def submit(path: Path, relative_text: str) -> None:
+        nonlocal executor
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="deploom-source-hash",
+            )
+            collected, file_work[:] = file_work[:], []
+            for pending_path, pending_rel in collected:
+                future = executor.submit(
                     _hash_regular_file,
-                    path,
+                    pending_path,
                     suppress_worker_observability=suppress_worker_observability,
                 )
-                    pending[future] = (path, relative.as_posix())
-                    if len(pending) >= max_pending:
-                        drain_one()
-                    continue
-
-                raise SourceCaptureError(
-                    f"SOURCE_SPECIAL_FILE_UNSUPPORTED: {relative.as_posix()} mode={oct(st.st_mode)}"
-                )
-
-        walk(root, Path("."))
-        while pending:
+                pending[future] = (pending_path, pending_rel)
+                if len(pending) >= max_pending:
+                    drain_one()
+        future = executor.submit(
+            _hash_regular_file,
+            path,
+            suppress_worker_observability=suppress_worker_observability,
+        )
+        pending[future] = (path, relative_text)
+        if len(pending) >= max_pending:
             drain_one()
+
+    def walk(directory: Path, relative_dir: Path) -> None:
+        nonlocal directories
+        tick()
+        directory_stamps.append((directory, relative_dir, _directory_stability_stamp(directory, relative=relative_dir, policy=policy)))
+        try:
+            with os.scandir(directory) as iterator:
+                scanned = sorted(iterator, key=lambda entry: entry.name)
+        except OSError as exc:
+            raise SourceCaptureError(f"SOURCE_DIRECTORY_UNREADABLE: {directory}: {exc}") from exc
+        for item in scanned:
+            relative = relative_dir / item.name
+            if _excluded(relative, policy):
+                continue
+            path = Path(item.path)
+            tick()
+            try:
+                st = item.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise SourceCaptureError(f"SOURCE_ENTRY_UNREADABLE: {path}: {exc}") from exc
+
+            is_junction = getattr(path, "is_junction", None)
+            if callable(is_junction):
+                try:
+                    if is_junction():
+                        raise SourceCaptureError(
+                            f"SOURCE_UNSUPPORTED_REPARSE_POINT: junction: {path}"
+                        )
+                except OSError as exc:
+                    raise SourceCaptureError(
+                        f"SOURCE_ENTRY_UNREADABLE: junction probe {path}: {exc}"
+                    ) from exc
+
+            if stat.S_ISLNK(st.st_mode):
+                try:
+                    target_text = os.readlink(path)
+                except OSError as exc:
+                    raise SourceCaptureError(f"SOURCE_SYMLINK_UNREADABLE: {path}: {exc}") from exc
+                target = Path(target_text)
+                if not target.is_absolute():
+                    target = path.parent / target
+                if not _within(target, root):
+                    raise SourceCaptureError(
+                        f"SOURCE_SYMLINK_ESCAPE: {relative.as_posix()} -> {target_text}"
+                    )
+                try:
+                    target_relative = target.resolve(strict=False).relative_to(root)
+                except ValueError:
+                    target_relative = Path(".")
+                if _excluded(target_relative, policy):
+                    raise SourceCaptureError(
+                        f"SOURCE_SYMLINK_TARGET_EXCLUDED: {relative.as_posix()} -> {target_text}"
+                    )
+                entries.append({
+                    "path": relative.as_posix(),
+                    "kind": "symlink",
+                    "target": target_text.replace("\\", "/"),
+                })
+                continue
+
+            if stat.S_ISDIR(st.st_mode):
+                directories += 1
+                entries.append({"path": relative.as_posix(), "kind": "directory"})
+                walk(path, relative)
+                continue
+
+            if stat.S_ISREG(st.st_mode):
+                if int(getattr(st, "st_nlink", 1) or 1) > 1 and not (
+                    relative.parts and relative.parts[0] == ".git"
+                ):
+                    raise SourceCaptureError(
+                        f"SOURCE_HARDLINK_UNSUPPORTED: {relative.as_posix()} nlink={st.st_nlink}"
+                    )
+                if executor is None and len(file_work) < _SYNC_HASH_THRESHOLD:
+                    file_work.append((path, relative.as_posix()))
+                else:
+                    submit(path, relative.as_posix())
+                continue
+
+            raise SourceCaptureError(
+                f"SOURCE_SPECIAL_FILE_UNSUPPORTED: {relative.as_posix()} mode={oct(st.st_mode)}"
+            )
+
+    walk(root, Path("."))
+    if executor is None:
+        for path, relative_text in sorted(file_work, key=lambda item: item[1]):
+            digest, stable = _hash_regular_file(
+                path,
+                suppress_worker_observability=suppress_worker_observability,
+            )
+            accept_hash(path, relative_text, digest, stable)
+    else:
+        try:
+            while pending:
+                drain_one()
+        finally:
+            executor.shutdown(wait=True)
 
     for directory, relative_dir, stamp in directory_stamps:
         observed_stamp = _directory_stability_stamp(directory, relative=relative_dir, policy=policy)

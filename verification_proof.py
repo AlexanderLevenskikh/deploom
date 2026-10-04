@@ -131,11 +131,13 @@ def _run_git(project_dir: Path, args: Sequence[str]) -> subprocess.CompletedProc
 
 
 def _git_root_or_none(project_dir: Path) -> Path | None:
-    result = _run_git(project_dir, ["rev-parse", "--show-toplevel"])
-    if result.returncode == 0 and result.stdout.strip():
-        return Path(result.stdout.strip()).resolve()
-    if result.returncode == 127 or _git_marker_exists(project_dir):
-        detail = (result.stderr or result.stdout or "git rev-parse failed").strip()
+    from git_identity import git_toplevel_raw
+
+    out, rc, err, marker_exists = git_toplevel_raw(project_dir)
+    if rc == 0 and out.strip():
+        return Path(out.strip()).resolve()
+    if rc == 127 or marker_exists:
+        detail = (err or out or "git rev-parse failed").strip()
         raise SourceIdentityUnavailable(
             f"SOURCE_IDENTITY_GIT_UNAVAILABLE: rev-parse --show-toplevel: {detail}"
         )

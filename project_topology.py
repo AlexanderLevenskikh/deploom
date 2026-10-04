@@ -220,22 +220,11 @@ def resolve_package_root(
 
 
 def _git_layout(package_root: Path) -> tuple[Path | None, str]:
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(package_root), "rev-parse", "--show-toplevel"],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+    from git_identity import git_toplevel
+
+    root = git_toplevel(package_root)
+    if root is None:
         return None, "none"
-    if result.returncode != 0 or not result.stdout.strip():
-        return None, "none"
-    root = Path(result.stdout.strip()).resolve()
     marker = root / ".git"
     if marker.is_file():
         return root, "linked-worktree"
