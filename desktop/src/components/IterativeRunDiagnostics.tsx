@@ -12,20 +12,21 @@ export function IterativeRunDiagnostics({ signal, logs = false, onReadLog, onOpe
   const logRef = useRef<HTMLDivElement>(null)
   const readLog = useRef(onReadLog)
   readLog.current = onReadLog
-  const [runLog, setRunLog] = useState<string>()
+  const logScope = JSON.stringify([signal.workspaceId, signal.projectName, signal.attempt?.attemptId])
+  const [runLog, setRunLog] = useState<{ scope: string; text?: string }>()
   useEffect(() => {
     if (!logs) return
     let alive = true; let pending = false
     const poll = async () => {
       if (pending) return
       pending = true
-      try { const result = await readLog.current?.(); if (alive) setRunLog(result?.runLog) } finally { pending = false }
+      try { const result = await readLog.current?.(); if (alive) setRunLog({ scope: logScope, text: result?.runLog }) } finally { pending = false }
     }
     void poll().catch(() => {})
     const timer = window.setInterval(() => { void poll().catch(() => {}) }, 2000)
     return () => { alive = false; window.clearInterval(timer) }
-  }, [logs, signal.projectName, signal.workspaceId])
-  const visibleLog = runLog ?? signal.attemptLog ?? ''
+  }, [logs, logScope])
+  const visibleLog = (runLog?.scope === logScope ? runLog.text : undefined) ?? signal.attemptLog ?? ''
   const follow = useRef(true)
   const attempt = signal.attempt
   useEffect(() => {

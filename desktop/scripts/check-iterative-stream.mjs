@@ -222,4 +222,19 @@ const mkIo = (overrides = {}) => {
   if(recordAttemptProgress(dir,'ITERATIVE_MIGRATION_STATUS_V1 {"event":"migration.progress","message":"late"}\n')) throw Error('Late progress resurrected a terminal attempt');
   if(readAttempt(dir).phase!==before.phase) throw Error('Late progress changed a terminal phase');
 }
+// Long lines (including a newline-free stream) used to defeat both the RAM
+// bound and the artifact cap. Full evidence must remain in cumulative run.log.
+{
+  const dir = join(root, "long-lines");
+  startAttempt(dir, "demo", "none");
+  const journalIo = { cancelRequested: () => false,
+    recordLine: (d, line) => recordAttemptLog(d, line), trimLog: (d) => trimAttemptLog(d) };
+  const result = await spawnIterativeStreamed(dir, process.execPath,
+    ["-e", `for(let i=0;i<1024;i++)process.stdout.write('x'.repeat(8192)+'\\n');process.stdout.write('z'.repeat(2*1024*1024));process.stderr.write('e'.repeat(2*1024*1024));`],
+    root, 10000, journalIo, mkPlatform());
+  if(result.code!==0) throw Error("long-line child failed");
+  if(Buffer.byteLength(result.stdout)>1024*1024 || Buffer.byteLength(result.stderr)>1024*1024) throw Error("capture is not byte-bounded");
+  if(statSync(attemptLogPath(dir)).size>128*1024) throw Error("long lines defeated the attempt.log byte cap");
+  if(statSync(join(dir,"run.log")).size<12*1024*1024) throw Error("full cumulative evidence was lost");
+}
 console.log("check-iterative-stream: OK");

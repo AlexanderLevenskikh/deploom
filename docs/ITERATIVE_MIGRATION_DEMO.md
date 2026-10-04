@@ -22,6 +22,7 @@ cd desktop; npx tsc -p tsconfig.electron.json; cd ..
 python scripts/run-iterative-demo.py                       # default: happy-path-24
 python scripts/run-iterative-demo.py --profile failure-matrix
 python scripts/run-iterative-demo.py --profile cross-group-closure
+python scripts/run-iterative-demo.py --profile cross-group-companions
 python scripts/run-iterative-demo.py --keep-output         # retain the stage dir for inspection
 ```
 
@@ -40,6 +41,15 @@ dependency materialization runs with `npm_config_offline=true`.
 
 Every profile asserts the driver only ever writes `READY_FOR_VERIFY` at agent
 gates, never `INCONCLUSIVE`, and never edits durable state for the application.
+
+The additional `cross-group-companions` profile uses four real packages. The
+`is-finite` / `is-symbol` pair lies across the positional split and must upgrade
+TOGETHER; both singletons fail, and two noisy targets are deliberately blocked.
+The production planner must reach and accept the pair after rejecting the large
+batch and split candidates. This tests positive companion closure separately
+from the mutually exclusive pair in `cross-group-closure`. The expected result
+is `PARTIAL_VERIFIED` with both companions upgraded and the two noisy targets
+remaining at their verified old versions.
 
 ## Fixtures
 

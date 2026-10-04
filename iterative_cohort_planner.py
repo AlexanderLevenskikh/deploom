@@ -216,6 +216,23 @@ def plan_adaptive_cohort(*, incumbent, desired, config, ledger, checkpoints, blo
         options.append((rank, ProgressiveExtensionPlan(tuple(sorted(assignment.items())), changed, fingerprint, len(actionable)-len(changed))))
 
     for names in roots: consider(names)
+    # Exact blocks are not subset nogoods: rejected singletons may work together.
+    # Explore bounded cross-root combinations after splits fail, preserving the
+    # normal greedy path and leaving compatibility proof to the verifier.
+    if not options and cap > 1:
+        import itertools
+        for width in range(2, min(size, len(actionable)) + 1):
+            for names in itertools.combinations(actionable, width):
+                node_budget[0] -= 1
+                if node_budget[0] <= 0:
+                    break
+                assignment = dict(incumbent)
+                assignment.update({n: desired[n] for n in names})
+                if not whole_blocked(names, assignment, fingerprint_fn(assignment)) and min_subset_conflict(names, assignment) is None:
+                    push_option(names)
+                    break
+            if options or node_budget[0] <= 0:
+                break
     if not options: return None, {"strategy": "adaptive-greedy", "batchLimit": size}
     _, plan = min(options, key=lambda option: option[0])
     return plan, {"strategy": "adaptive-greedy", "batchLimit": size, "maxPackages": cap, "selectedPackages": len(plan.packages), "remainingActionable": len(actionable), "familyGroups": [names for names in ordered if len(names)>1], "peerHintEdges": len(peer_edges)}

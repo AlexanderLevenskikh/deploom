@@ -2184,6 +2184,20 @@ def _plan_next_locked(
         raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
     _assert_runtime_unchanged(config)
     retry_infra = bool(getattr(args, "retry_infra", False) if args is not None else False)
+    blocked = run.get("infraBlocked") or {}
+    if retry_infra and blocked.get("operation") == "verify-exact":
+        candidate = load_candidate(run_dir)
+        if not candidate or candidate.get("candidateId") != blocked.get("candidateId") or candidate.get("stage") != "VERIFYING":
+            raise InvalidInputError("INFRA_RETRY_CANDIDATE_MISMATCH")
+        candidate = dict(candidate)
+        candidate["verifyInfraFailures"] = 0
+        save_candidate(run_dir, candidate)
+        run = dict(run)
+        run["infraBlocked"] = None
+        run["phase"] = "VERIFYING"
+        run["updatedAt"] = _now_iso()
+        save_run(run_dir, run)
+        return 0
     if retry_infra:
         # Explicit user continuation after the infra cause changed: clear the
         # recoverable infra blocks for the CURRENT registry scope and the
@@ -4103,6 +4117,23 @@ def _verify_exact_locked(
         raise InvalidInputError(
             f"CANDIDATE_STAGE_NOT_READY_FOR_VERIFY: {candidate.get('stage')}"
         )
+    # A crash between persisting the failure counter and publishing the run
+    # stop must not buy another physical verification on restart.
+    failures = int(candidate.get("verifyInfraFailures") or 0)
+    limit = int(config["budget"]["maxInfraRetries"])
+    if failures > limit:
+        evidence = candidate.get("verificationFailure") or {}
+        run = dict(run)
+        run["phase"] = "READY"
+        run["infraBlocked"] = {
+            "operation": "verify-exact", "candidateId": candidate["candidateId"],
+            "baseCheckpointId": candidate["baseCheckpointId"],
+            "classification": evidence.get("kind", "unknown"),
+            "reason": evidence.get("summary", "Verification infrastructure retries exhausted"),
+            "failures": failures, "maxRetries": limit, "blockedAt": _now_iso(),
+        }
+        save_run(run_dir, run)
+        return 0
     base_checkpoint = load_checkpoint(run_dir, str(candidate["baseCheckpointId"]))
 
     refs = candidate.get("materializationRefs") or {}
@@ -4268,10 +4299,28 @@ def _verify_exact_locked(
         )
         return 0
 
+    # UNKNOWN/infrastructure evidence never rejects the assignment. Bound the
+    # same candidate's re-verification; retain repaired bytes for explicit retry.
+    failures = int(candidate.get("verifyInfraFailures") or 0) + 1
+    limit = int(config["budget"]["maxInfraRetries"])
+    candidate["verifyInfraFailures"] = failures
+    candidate["verificationFailure"] = {"kind": result.kind, "summary": result.summary}
+    save_candidate(run_dir, candidate)
     run = dict(run)
-    run["phase"] = "VERIFYING"
+    exhausted = failures > limit
+    run["phase"] = "READY" if exhausted else "VERIFYING"
+    if exhausted:
+        run["infraBlocked"] = {
+            "operation": "verify-exact", "candidateId": candidate["candidateId"],
+            "baseCheckpointId": candidate["baseCheckpointId"],
+            "classification": result.kind, "reason": result.summary,
+            "failures": failures, "maxRetries": limit, "blockedAt": _now_iso(),
+        }
     run["updatedAt"] = _now_iso()
     save_run(run_dir, run)
+    _emit_status({"event": "verify-exact.inconclusive", "runId": run["runId"],
+                  "candidateId": candidate["candidateId"], "retryable": not exhausted,
+                  "failures": failures, "summary": result.summary})
     return 0
 
 
@@ -4772,7 +4821,16 @@ def _finish_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str, A
             audit = checkpoint.get("audit") or {}
             audit_status = str(audit.get("status") or "")
         satisfied = _policy_satisfied(config, checkpoint)
-        accepted_count = _accepted_upgrade_count(checkpoints)
+        # Count actual version deltas only on the active ancestor chain.
+        by_id = {c.get("checkpointId"): c for c in checkpoints}
+        chain, seen, cursor = [], set(), checkpoint
+        while cursor and cursor.get("checkpointId") not in seen:
+            seen.add(cursor.get("checkpointId"))
+            parent = by_id.get(cursor.get("parentCheckpointId"))
+            if parent and cursor.get("status") == "VERIFIED" and cursor.get("fullAssignment") != parent.get("fullAssignment"):
+                chain.append(cursor)
+            cursor = parent
+        accepted_count = len(chain)
         outcome = _terminal_outcome(satisfied, audit_status, accepted_count)
         # P2 (#1): a repair-only run whose CURRENT-state control passes the audit
         # is a repair SUCCESS — never a partial migration ("0 verified UPGRADES"

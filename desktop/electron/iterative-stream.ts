@@ -17,6 +17,14 @@
 //    into two TCP writes is still parsed and journaled.
 import { spawn, type ChildProcess } from 'node:child_process'
 
+const MAX_CAPTURE_BYTES = 1024 * 1024
+function captureTail(previous: string, text: string): string {
+  const bytes = Buffer.from(previous + text, 'utf8')
+  let start = Math.max(0, bytes.length - MAX_CAPTURE_BYTES)
+  while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start++
+  return bytes.subarray(start).toString('utf8')
+}
+
 export type CaptureResult = { code: number; stdout: string; stderr: string; timedOut: boolean }
 
 export type StreamPlatform = {
@@ -113,7 +121,7 @@ export function spawnIterativeStreamed(
       if (!stdoutCarry) return
       const line = stdoutCarry
       stdoutCarry = ''
-      stdout += `${line}\n`
+      stdout = captureTail(stdout, `${line}\n`)
       try { io.recordLine(runDir, `${line}\n`) } catch { /* log is best-effort */ }
       maybeTrim()
       parseEventLine(line, onEvent)
@@ -123,17 +131,24 @@ export function spawnIterativeStreamed(
       const { carry, lines } = collectStreamedLines(stdoutCarry, platform.decodeChunk(chunk))
       stdoutCarry = carry
       for (const line of lines) {
-        stdout += `${line}\n`
+        stdout = captureTail(stdout, `${line}\n`)
         try { io.recordLine(runDir, `${line}\n`) } catch { /* log is best-effort */ }
         maybeTrim()
         parseEventLine(line, onEvent)
+      }
+      // Journal oversized plain lines verbatim without retaining an unlimited carry.
+      if (Buffer.byteLength(stdoutCarry, 'utf8') > MAX_CAPTURE_BYTES) {
+        stdout = captureTail(stdout, stdoutCarry)
+        try { io.recordLine(runDir, stdoutCarry) } catch { /* best-effort */ }
+        stdoutCarry = ''
+        maybeTrim()
       }
     })
     child.stderr.on('data', (chunk: Buffer) => {
       const text = platform.decodeChunk(chunk)
       try { io.recordLine(runDir, text) } catch { /* best-effort */ }
       maybeTrim()
-      stderr += text
+      stderr = captureTail(stderr, text)
     })
     child.on('error', (error) => {
       if (settled) return
@@ -142,7 +157,7 @@ export function spawnIterativeStreamed(
       clearInterval(cancelCheck)
       resolvePromise({ code: 1, stdout, stderr: `${stderr}${error.message}`, timedOut })
     })
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
@@ -154,7 +169,7 @@ export function spawnIterativeStreamed(
       // A kill by the watchdog leaves no exit code from the child's point of
       // view; reporting 0 here would let a timed-out begin claim success. Any
       // reason WE terminated the tree is therefore a non-zero outcome.
-      const effectiveCode = timedOut ? 1 : (code ?? 0)
+      const effectiveCode = timedOut || signal ? 1 : (code ?? 1)
       resolvePromise({ code: effectiveCode, stdout, stderr, timedOut })
     })
   })

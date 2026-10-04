@@ -19,6 +19,8 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
   async function continueRun(first: Step, input: Input, session: { canceled: boolean; enabled: boolean }) {
     let outcome = await invoke(first, input)
     const initial = outcome
+    // Explicit infrastructure retry is one user action, never an autopilot loop.
+    input = { ...input, retryInfra: false }
     if (!session.enabled) return initial
     const stopped = (reason: string, error?: string): Outcome => ({ ...initial, autopilot: { stopped: reason, ...(error ? { error } : {}) } })
     if (session.canceled) return stopped('canceled')

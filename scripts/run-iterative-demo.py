@@ -685,7 +685,7 @@ def run_failure_matrix(driver) -> None:
             shutil.rmtree(stage, ignore_errors=True)
 
 
-def run_cross_group_closure(driver) -> None:
+def run_cross_group_closure(driver, *, companions_only: bool = False) -> None:
     d = driver
     stage = Path(tempfile.mkdtemp(prefix="demo-closure-"))
     print("DEMO_WORKSPACE " + str(stage), flush=True)
@@ -696,6 +696,13 @@ def run_cross_group_closure(driver) -> None:
         new = {"is-string": "1.1.1", "is-symbol": "1.1.1", "is-number": "7.0.0",
                "is-finite": "1.1.0", "is-date-object": "1.1.0", "is-regex": "1.2.1",
                "is-bigint": "1.1.0", "is-map": "2.0.3"}
+        if companions_only:
+            # Sorted positions 1 and 3 are in DIFFERENT halves; their pair
+            # cannot be reached by recursive halving alone. Two noisy targets
+            # keep the physical failure matrix small and reproducible.
+            fixture_names = {"is-date-object", "is-finite", "is-regex", "is-symbol"}
+            old = {n: v for n, v in old.items() if n in fixture_names}
+            new = {n: v for n, v in new.items() if n in fixture_names}
         cache = stage / "npm-cache"
         seed_cache(cache, [old, new])
         # a == is-string, h == is-symbol: mutually exclusive (cannot both be at
@@ -712,6 +719,16 @@ def run_cross_group_closure(driver) -> None:
             + contract_if("is-finite", "1.0.0", "feature", "stable")
             + "".join(version_presence(n, [old[n], new[n]]) for n in old if n not in ("is-string", "is-symbol", "is-number", "is-finite"))
         )
+        if companions_only:
+            # A genuine joint-update trap: neither companion works alone; all
+            # noisy targets are impossible. Only the cross-half PAIR is green.
+            contracts = (
+                "if ((v('is-finite')==='1.1.0') !== (v('is-symbol')==='1.1.1')) errors.push('companions must upgrade together');\n"
+                + "".join(f"if (v({json.dumps(n)})==={json.dumps(new[n])}) errors.push('noisy target blocked: {n}');\n"
+                          for n in old if n not in ('is-finite', 'is-symbol'))
+                + contract_if("is-finite", "1.1.0", "feature", "beta")
+                + contract_if("is-symbol", "1.1.1", "is_sym", "y2")
+            )
         project = build_project(
             stage, old,
             {"api": "v1", "feature": "stable", "is_str": "s1", "is_sym": "y1"},
@@ -748,7 +765,7 @@ def run_cross_group_closure(driver) -> None:
         # (which is intrinsically RED: no config can pass the pair rule), the
         # naive agent repairs anyway, attempts exhaust, and the assignment is
         # REJECTED once; the planner then splits to a workable separation.
-        for _ in range(30):
+        for _ in range(100 if companions_only else 30):
             result = run_drive(run, env, timeout=3600)
             if result["stopped"] == "finished":
                 break
@@ -774,7 +791,19 @@ def run_cross_group_closure(driver) -> None:
         # the live status may still carry a transient coordination name.
         terminal = str((read_run(run).get("terminalOutcome") or {}).get("outcome") or read_run(run).get("terminal") or "")
         full = final_state["activeCheckpoint"]["fullAssignment"]
-        pair = ["is-string", "is-symbol"]
+        pair = ["is-finite", "is-symbol"] if companions_only else ["is-string", "is-symbol"]
+        if companions_only:
+            accepted = _accepted_delta_chain(run, final_state)
+            d.assertTrue(any(set(delta) == set(pair) for delta in accepted), "joint companion pair was never accepted")
+            for name in old:
+                d.assertEqual(new[name] if name in pair else old[name], full[name])
+            d.assertEqual("PARTIAL_VERIFIED", terminal)
+            d.assertTrue(all(k == "READY_FOR_VERIFY" for k in feedback_log))
+            summary = {"profile": "cross-group-companions", "terminal": terminal,
+                       "acceptedPair": pair, "acceptedCohorts": len(accepted), "feedbackKinds": feedback_log}
+            write_json(stage / "DEMO_SUMMARY.json", summary)
+            print("DEMO_ACCEPTED " + str(stage / "DEMO_SUMMARY.json"), flush=True)
+            return
         for name, version in new.items():
             if name in pair:
                 continue
@@ -836,7 +865,7 @@ def run_cross_group_closure(driver) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", choices=("happy-path-24", "failure-matrix", "cross-group-closure"), default="happy-path-24")
+    parser.add_argument("--profile", choices=("happy-path-24", "failure-matrix", "cross-group-closure", "cross-group-companions"), default="happy-path-24")
     parser.add_argument("--output-root", default=".dependency-roadmap/iterative-demo")
     parser.add_argument("--packages", type=int, choices=(12, 24), default=24)
     parser.add_argument("--seed-cache", help="Reuse an existing demo npm cache inside this repository")
@@ -861,9 +890,10 @@ def main() -> None:
     elif args.profile == "failure-matrix":
         cls.setUpClass()
         run_failure_matrix(cls("test_vertical_loop_first_upgrade_repair_and_recovery"))
-    elif args.profile == "cross-group-closure":
+    elif args.profile in {"cross-group-closure", "cross-group-companions"}:
         cls.setUpClass()
-        run_cross_group_closure(cls("test_vertical_loop_first_upgrade_repair_and_recovery"))
+        run_cross_group_closure(cls("test_vertical_loop_first_upgrade_repair_and_recovery"),
+                               companions_only=args.profile == "cross-group-companions")
 
 
 if __name__ == "__main__":

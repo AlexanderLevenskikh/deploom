@@ -21,7 +21,7 @@ type Props = {
   onCopy: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onSave: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
-  onDrive: (projectName: string, autopilot?: boolean) => Promise<IterativeDriveOutcome>
+  onDrive: (projectName: string, autopilot?: boolean, retryInfra?: boolean) => Promise<IterativeDriveOutcome>
   onBegin: (projectName: string, discovery?: { autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
   onAgent: (projectName: string, autopilot?: boolean) => Promise<IterativeAgentOutcome>
   onAttempt: (projectName: string) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
@@ -354,7 +354,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     setNote(undefined)
     try {
       await onBeforeStart?.()
-      const outcome = await onDrive(projectName, autopilot)
+      const outcome = await onDrive(projectName, autopilot, runner?.decision?.infraBlocked === true)
       if (outcome.autopilot) {
         setNote(autopilotNote(outcome.autopilot))
       } else if (!outcome.ok) {

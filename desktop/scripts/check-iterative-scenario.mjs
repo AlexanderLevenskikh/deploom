@@ -384,6 +384,16 @@ const reading = owner(); let resolveRead; let readCount = 0;
 const sharedRead = new Promise(resolve => { resolveRead = resolve; });
 const readStatus = reading.register('status', async () => { readCount++; await sharedRead; return {ok:true}; });
 const reads = [readStatus(null,scope),readStatus(null,scope)]; resolveRead(); await Promise.all(reads); assert.equal(readCount,1);
+// A manual infra retry must not propagate to subsequent automatic drives.
+const retryOwner = owner(); const retries = [];
+retryOwner.register('status', async () => ({ok:true, decision:{step:'agent'}}));
+retryOwner.register('agent', async () => ({ok:true}));
+const retryDrive = retryOwner.register('drive', async (_event, input) => {
+ retries.push(input.retryInfra === true);
+ return retries.length === 1 ? {ok:true, stopped:'agent-gate', repairRequests:[{requestId:'retry'}]} : {ok:true, stopped:'finished'};
+});
+assert.equal((await retryDrive(null,{...scope,retryInfra:true})).autopilot.stopped,'finished');
+assert.deepEqual(retries,[true,false]);
 console.log('autopilot: check -> begin -> drive -> agent -> finish; cancel, failure and repeated-gate boundaries OK');
 
 if (failures > 0) {

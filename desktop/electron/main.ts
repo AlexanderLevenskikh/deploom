@@ -8230,7 +8230,7 @@ function setupIpc(): void {
   // between an accepted cohort and the next one. Restart-safe by design:
   // every iteration recomputes the decision from the DURABLE Python state, so
   // a killed app simply resumes from where the files say the run stands.
-  ipcMain.handle('flow:iterative:drive', iterativeAutopilot.register('drive', async (_event, input: { workspaceId?: string; projectName: string }) => {
+  ipcMain.handle('flow:iterative:drive', iterativeAutopilot.register('drive', async (_event, input: { workspaceId?: string; projectName: string; retryInfra?: boolean }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -8255,6 +8255,7 @@ function setupIpc(): void {
       publish()
       const python = resolveExecutable('python')
       const generator = join(bundledToolDir(), 'iterative_migration.py')
+      let retryInfra = input.retryInfra === true
       // Continue until a real terminal/agent/error/cancel gate, without a
       // hidden wall-clock or batch-size stop that requires another click.
       while (true) {
@@ -8276,6 +8277,19 @@ function setupIpc(): void {
           publish()
           return { ok: false, steps, stopped: 'error', error: raw.slice(0, 4000), attempt: readAttempt(runDir) }
         }
+        if (retryInfra && payload.run?.infraBlocked) {
+          retryInfra = false
+          const retry = iterativeStepInvocation(runDir, 'plan-next', generator, python)
+          const reopened = await spawnIterativeStreamed(runDir, retry.command, [...retry.args, '--retry-infra'], workspace.path, 0, iterativeStreamIo(runDir), iterativeStreamPlatform)
+          if (reopened.code !== 0) {
+            const error = reopened.stderr.trim() || reopened.stdout.trim() || 'INFRA_RETRY_FAILED'
+            updateAttempt(runDir, { status: 'failed', stage: 'drive', lastError: error.slice(0, 4000) })
+            publish()
+            return { ok: false, steps, stopped: 'error', error, attempt: readAttempt(runDir) }
+          }
+          continue
+        }
+        retryInfra = false
         const phase = String((payload.run ?? {}).phase ?? '')
         const decision = decideNextStep(runDir, payload)
         updateAttempt(runDir, { status: 'running', stage: 'drive', phase, lastStep: decision.step ?? undefined })

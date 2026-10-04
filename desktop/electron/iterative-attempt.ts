@@ -149,6 +149,7 @@ export function recordAttemptLog(runDir: string, line: string): void {
   if (!existsSync(cumulative) && existsSync(target)) writeFileSync(cumulative, readFileSync(target))
   appendFileSync(target, line, 'utf8')
   appendFileSync(cumulative, line, 'utf8')
+  trimAttemptLog(runDir)
 }
 
 /** Trim the log to the cap after writing (cheap; only called when size grows). */
@@ -161,9 +162,20 @@ export function trimAttemptLog(runDir: string): void {
     return
   }
   try {
-    const text = readFileSync(target, 'utf8')
-    const lines = text.split(/\r?\n/)
-    const kept = lines.slice(-MAX_LOG_LINES).join('\n')
+    // Read only the byte-bounded tail, even when a single line exceeds the cap.
+    const file = openSync(target, 'r')
+    let tail: Buffer
+    try {
+      const size = fstatSync(file).size
+      // Retain half the cap to amortize synchronous trims across many small lines.
+      tail = Buffer.alloc(Math.min(size, Math.floor(MAX_LOG_BYTES / 2)))
+      const count = readSync(file, tail, 0, tail.length, size - tail.length)
+      tail = tail.subarray(0, count)
+    } finally { closeSync(file) }
+    // A byte cut may land inside a UTF-8 character; skip continuation bytes.
+    let start = 0
+    while (start < tail.length && (tail[start] & 0xc0) === 0x80) start++
+    const kept = tail.subarray(start).toString('utf8').split(/\r?\n/).slice(-MAX_LOG_LINES).join('\n')
     writeFileSync(target, kept, 'utf8')
   } catch {
     /* best-effort trim */
