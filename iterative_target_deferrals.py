@@ -31,7 +31,8 @@ def record_unavailable_targets(ledger: dict, run: Mapping, config: Mapping,
     added = False
     for match in re.finditer(r'No matching version found for ((?:@[^\s/@]+/)?[^\s/@]+)@([^\s.]+(?:\.[^\s.]+)*?)\.(?:\s|$)', output):
         name, version = match.groups()
-        if changed.get(name) != version or targets.get(name) != version:
+        if changed.get(name) != version or (targets.get(name) != version and
+                (candidate.get('scopeExpansionVersions') or {}).get(name) != version):
             continue
         entry = {'package': name, 'target': version, 'scope': scope,
                  'code': 'TARGET_VERSION_UNAVAILABLE', 'candidateId': candidate.get('candidateId'),

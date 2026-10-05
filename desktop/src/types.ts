@@ -436,6 +436,8 @@ export type IterativeStatusOutcome = {
   staleReason?: string
   phase?: string
   decision?: IterativeRunnerDecision
+  scopeExpansionIssues?: Array<{ packages: string[]; proposals: string[]; reason: string; nextAction: string }>
+  workingCheckout?: { path: string; kind: 'trial' | 'checkpoint' | 'project'; checkpointId?: string }
   // Review P1: Electron-authoritative liveness — a REAL begin/drive child is
   // in-flight for this project, independent of any React component's local busy
   // flag. The panel relies on it across tab switches and remounts.

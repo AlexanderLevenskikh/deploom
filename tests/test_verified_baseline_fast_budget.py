@@ -520,9 +520,10 @@ class VerifiedBaselineFastBudgetTests(unittest.TestCase):
             "print(json.dumps(f.to_envelope(), ensure_ascii=False))\n"
         ) % str(ROOT)
         completed = subprocess.run(
-            [sys.executable, "-c", script],
+            [sys.executable, "-X", "utf8", "-c", script],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=120,
         )
         self.assertEqual(0, completed.returncode, completed.stderr)

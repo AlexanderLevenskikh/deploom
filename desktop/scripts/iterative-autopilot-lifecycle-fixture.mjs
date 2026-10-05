@@ -2,7 +2,7 @@
 // real journal/continuation files and fixture-only Python endpoints.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import ts from 'typescript';
@@ -23,6 +23,20 @@ const recoveryStart = source.indexOf('  queueMicrotask(() => {', source.indexOf(
 const recoveryEnd = source.indexOf('\n  })', recoveryStart) + '\n  })'.length;
 assert.ok(recoveryStart >= 0 && recoveryEnd > recoveryStart);
 const productionRecovery = new Function('bindings', `with(bindings) { ${compile(source.slice(recoveryStart,recoveryEnd))} }`);
+const toggleStart = source.indexOf("  ipcMain.handle('flow:iterative:autopilot'");
+const toggleEnd = source.indexOf("  ipcMain.handle('flow:iterative:task'", toggleStart);
+assert.ok(toggleStart >= 0 && toggleEnd > toggleStart);
+const productionToggle = new Function('bindings', `with(bindings) { ${compile(source.slice(toggleStart,toggleEnd))} }`);
+function toggleHandler(f, extra = {}) {
+  let handler;
+  productionToggle({...f.bindings, autopilotWorkspace: () => ({id:'w'}),
+    agentLeaseFile: () => join(f.runDir,'agent-lease.json'), readAgentLease: () => undefined,
+    writeAgentLease: () => {throw Error('Unexpected lease mutation');},
+    scheduleAgentWaitRetry: () => {throw Error('Unexpected lease retry');},
+    runIterativeDriveWithAutopilot: f.drive,
+    ipcMain: {handle: (_channel, callback) => {handler=callback;}}, ...extra});
+  return enabled => handler(undefined,{workspaceId:'w',projectName:'demo',enabled});
+}
 
 async function child(script, timeout = 10_000) {
   return new Promise((resolve, reject) => {
@@ -69,7 +83,7 @@ function fixture(failures = 0, critical = false, infra = false) {
     iterativeStreamIo: () => ({}),iterativeStreamPlatform: {},
   };
   const newOwner = () => { auto = createIterativeAutopilot(()=>'w:demo',options); bindings.iterativeAutopilot = auto; return productionDrive(bindings); };
-  return {runDir,scope,bindings,drive:newOwner(),newOwner,auto:()=>auto,reads:()=>reads,mutations:()=>mutations,options};
+  return {payload,runDir,scope,bindings,drive:newOwner(),newOwner,auto:()=>auto,reads:()=>reads,mutations:()=>mutations,options};
 }
 
 for (const failures of [1,3]) {
@@ -192,4 +206,66 @@ for (const stop of ['pause','cancel']) {
   assert.equal((await drive(undefined,{projectName:'demo',autopilot:true,retryInfra:true})).autopilot.stopped,'finished');
   assert.deepEqual(flags,[true,false]);
 }
-console.log('autopilot lifecycle: production drive, durable restart, identity, bounded reads, cancel, critical and exhausted verification boundaries OK');
+// Exercise the actual IPC toggle against the actual drive and durable journal.
+// Both enabling before the manual gate and enabling after its session closes
+// must reach exactly one repair, then resume verification without another click.
+for (const during of [false,true]) {
+  const f=fixture();
+  Object.assign(f.payload.run,{phase:'REPAIRING',terminal:undefined});
+  f.payload.candidate={candidateId:'candidate-1',attemptId:'repair-1',stage:'REPAIRING'};
+  f.payload.openRepairRequests=[{requestId:'request-1',summary:'fixture repair'}];
+  let releaseRead, releaseRepair, repaired;
+  const repairStarted=new Promise(resolve=>{repaired=resolve;});
+  const repairWait=new Promise(resolve=>{releaseRepair=resolve;});
+  const read=f.bindings.spawnCapture;
+  const readWait=new Promise(resolve=>{releaseRead=resolve;});
+  f.bindings.spawnCapture=async(...args)=>{await readWait;return read(...args);};
+  let repairs=0;
+  f.auto().register('status',async()=>({ok:true,decision:{step:'agent'}}));
+  f.auto().register('agent',async()=>{
+    repairs++;repaired();await repairWait;
+    Object.assign(f.payload.run,{phase:'TERMINAL',terminal:'COMPLETE'});
+    return{ok:true};
+  });
+  const resumed=[];
+  const toggle=toggleHandler(f,{runIterativeDriveWithAutopilot:(...args)=>{
+    const pending=f.drive(...args);resumed.push(pending);return pending;
+  }});
+  const attemptId=attempts.readAttempt(f.runDir).attemptId;
+  const manual=f.drive(undefined,{...f.scope,autopilot:false});
+  if(during) assert.equal((await toggle(true)).active,true);
+  releaseRead();
+  if(!during) {
+    assert.equal((await manual).stopped,'agent-gate');
+    assert.equal(f.auto().hasSession(f.scope),false);
+    assert.equal((await toggle(false)).active,false);
+    assert.equal(resumed.length,0);
+    assert.equal((await toggle(true)).active,true);
+    assert.equal(resumed.length,1);
+  }
+  await repairStarted;
+  assert.equal((await toggle(true)).active,true);
+  assert.equal(resumed.length,during?0:1,'a second toggle must adopt the same session');
+  assert.equal(repairs,1);
+  releaseRepair();
+  assert.equal((await (during?manual:resumed[0])).autopilot.stopped,'finished');
+  assert.equal(f.mutations(),1);
+  assert.equal(attempts.readAttempt(f.runDir).attemptId,attemptId);
+  assert.equal(f.auto().hasSession(f.scope),false);
+  assert.equal(readAutopilotState(f.runDir).enabled,false);
+}
+for (const kind of ['failed','canceled','finished','no-run','last-error','cancel-requested']) {
+  const f=fixture();
+  attempts.updateAttempt(f.runDir,{status:'done',stage:'drive',lastStep:'agent',
+    ...(kind==='failed'?{status:'failed'}:{}),
+    ...(kind==='canceled'?{status:'canceled'}:{}),
+    ...(kind==='finished'?{lastStep:'finish'}:{}),
+    ...(kind==='last-error'?{lastError:'AUTH_ERROR'}:{}),
+    ...(kind==='cancel-requested'?{cancelRequested:true}:{})});
+  // Missing durable state must not create a new migration from a preference.
+  if(kind==='no-run') unlinkSync(join(f.runDir,'run.json'));
+  const toggle=toggleHandler(f,{runIterativeDriveWithAutopilot:()=>{throw Error(`Unexpected resume: ${kind}`);}});
+  assert.equal((await toggle(true)).active,false,kind);
+  assert.equal(f.reads(),0);assert.equal(f.mutations(),0);
+}
+console.log('autopilot lifecycle: production toggle/drive, durable restart, identity, bounded reads, cancel, critical and exhausted verification boundaries OK');

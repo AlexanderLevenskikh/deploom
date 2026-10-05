@@ -53,6 +53,7 @@ from baseline_constraint_verifier import (
     BaselineVerifyConfig,
     BaselineVerifyResult,
     _apply_assignment,
+    _validate_assignment_materialization,
     _run,
     assignment_fingerprint,
     detect_package_manager,
@@ -1214,6 +1215,10 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
         "projectId": (args.project_id or project_name).strip(),
         "targetLevel": target_level,
         "cohortMaxPackages": int(getattr(args, "cohort_max_packages", 24) or 24),
+        "cohortInitialPackages": getattr(args, "cohort_initial_packages", None),
+        "cohortExplorationRatio": int(getattr(args, "cohort_exploration_ratio", 2) or 2),
+        "cohortSearchSteps": int(getattr(args, "cohort_search_steps", 128) or 128),
+        "cohortSchedulingStrategy": getattr(args, "cohort_scheduling_strategy", "whole-first"),
         "targets": targets,
         "verifyConfig": verify_config,
         "validationProfile": validation_profile,
@@ -2241,7 +2246,17 @@ def _plan_next_locked(
     incumbent = {str(k): str(v) for k, v in (checkpoint.get("fullAssignment") or {}).items()}
     targets = {str(k): str(v) for k, v in (config.get("targets") or {}).items()}
     desired = {name: targets.get(name, version) for name, version in incumbent.items()}
-    actionable = [name for name, version in sorted(desired.items()) if name in targets and targets[name] != incumbent.get(name)]
+    from iterative_scope_expansion import prepare_expansions
+    planning_ledger = load_ledger(run_dir)
+    desired, planning_ledger, expansion_issues = prepare_expansions(
+        incumbent, desired, planning_ledger, checkpoint_id, _all_checkpoints(run_dir),
+        unavailable={(e.get("package"), e.get("target")) for e in planning_ledger.get("targetAvailabilityDeferrals", [])
+                     if e.get("scope") == availability_scope_flat(run, config)})
+    planning_targets = dict(desired)
+    actionable = [name for name, version in sorted(desired.items()) if version != incumbent.get(name)]
+    if expansion_issues:
+        _emit_status({"event": "plan-next.scope-expansion-deferred", "runId": run["runId"],
+                      "issues": expansion_issues, "message": "Other cohorts continue; exact companion versions are required."})
 
     # #6: runtime-aware candidate selection BEFORE the expensive materialize.
     # The run's chosen Node (runtime contract effectiveVersion) is the engine
@@ -2256,7 +2271,7 @@ def _plan_next_locked(
             (config.get("runtime") or {}).get("effectiveVersion") or ""
         )
         if node_version:
-            engine_requested = {name: targets[name] for name in actionable}
+            engine_requested = {name: planning_targets[name] for name in actionable}
             effective_targets, engine_deferrals = _engine_deferred_targets(
                 Path(config.get("projectDir") or ""),
                 incumbent,
@@ -2269,23 +2284,24 @@ def _plan_next_locked(
                 _record_engine_deferrals(ledger, checkpoint_id, engine_deferrals)
                 save_ledger(run_dir, ledger)
             desired = {
-                name: effective_targets.get(name, version)
-                for name, version in incumbent.items()
+                name: effective_targets.get(name, incumbent.get(name))
+                for name in desired
+                if name in incumbent or name in effective_targets
             }
             actionable = [
                 name
                 for name, version in sorted(desired.items())
                 if name in effective_targets and effective_targets[name] != incumbent.get(name)
             ]
-            targets = effective_targets
+            # Original target policy remains authoritative after engine filtering.
 
     # A verified npm ETARGET defers only the named target in this bounded run
     # and registry context. It is scheduling evidence, never a solver nogood;
     # source repairs/new checkpoints do not make a missing version appear.
     availability_deferred = unavailable_targets(load_ledger(run_dir), run, config)
     actionable = [name for name in actionable if name not in availability_deferred]
-    desired = {name: incumbent[name] if name in availability_deferred else version
-               for name, version in desired.items()}
+    desired = {name: incumbent.get(name) if name in availability_deferred else version
+               for name, version in desired.items() if name in incumbent or name not in availability_deferred}
 
     if not actionable:
         # Policy is satisfied only when EVERY requested target is present in
@@ -2357,15 +2373,34 @@ def _plan_next_locked(
         and str(entry.get("assignmentFingerprint") or "").strip()
     }
     blocked_fingerprints.update(infra_blocked_fps)
+    blocked_fingerprints.update(
+        str(e["assignmentFingerprint"]) for e in ledger.get("scopeExpansions", [])
+        if e.get("baseCheckpointId") == checkpoint_id and e.get("assignmentFingerprint"))
+    from cohort_action_cost import observation_scope
+    planning_ledger["schedulerObservations"] = [
+        row for row in ledger.get("schedulerObservations", [])
+        if row.get("scope") == observation_scope(run, config)]
+    from cohort_conflict_regions import region_source_key
+    region_source = region_source_key(checkpoint)
+    planning_ledger["conflictRegions"] = [r for r in ledger.get("conflictRegions", []) if region_source is not None and r.get("scope") == observation_scope(run, config) and r.get("sourceHintKey") == region_source]
+    size_state = ledger.get("cohortSizeState") or {}
+    planning_ledger["cohortSizeState"] = size_state if size_state.get("scope") == observation_scope(run, config) else {}
+    if config.get("cohortSchedulingStrategy") == "cost-aware":
+        raise InvalidInputError("COST_AWARE_EXPERIMENTAL_ONLY: use adaptive-size or whole-first for physical migrations")
     from iterative_cohort_planner import plan_adaptive_cohort
     plan, cohort_selection = plan_adaptive_cohort(
-        incumbent=incumbent, desired=desired, config=config, ledger=ledger,
+        incumbent=incumbent, desired=desired, config=config, ledger=planning_ledger,
         checkpoints=_all_checkpoints(run_dir), base_checkpoint_id=checkpoint_id,
         blocked_fingerprints=blocked_fingerprints, learned_nogoods=learned_nogoods,
         fingerprint_fn=assignment_fingerprint,
     )
     atomic_groups = [list(plan.packages)] if plan else []
     if plan is None:
+        if cohort_selection.get("searchBudgetExhausted"):
+            raise BudgetExceededError(
+                "COHORT_SEARCH_BUDGET_EXHAUSTED: проверенный checkpoint сохранён. "
+                "Автоматическое расширение поиска достигло лимита 4096; "
+                "предложите точные альтернативные версии или уменьшите состав обновления.")
         all_blocked = len(actionable) > 0
         if all_blocked and infra_blocked_fps:
             # Recoverable infra stop with evidence: NOT scope exhaustion and NOT
@@ -2436,6 +2471,8 @@ def _plan_next_locked(
         "cohortId": cohort_id,
         "policyHash": str(config["policyHash"]),
         "fullAssignment": assignment,
+        "scopeExpansionAdditions": {name: version for name, version in assignment.items() if name not in incumbent},
+        "scopeExpansionVersions": {n: v for n, v in assignment.items() if v != targets.get(n) and v != incumbent.get(n)},
         "delta": {"changed": dict(sorted(changed.items()))},
         "atomicGroups": [list(group) for group in plan_visible_groups(atomic_groups)],
         "cohortSelection": cohort_selection,
@@ -3529,6 +3566,7 @@ def _open_checkpoint_source(run_dir, checkpoint, config, *, run_id="", candidate
 def _materialize_locked(
     run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], args: argparse.Namespace
 ) -> int:
+    scheduler_started = time.monotonic()
     if not run_budget_ok(config, run):
         raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
     _assert_runtime_unchanged(config)
@@ -3559,14 +3597,31 @@ def _materialize_locked(
 
     project_relative = Path(str(base_checkpoint.get("projectRelative") or "."))
     project_path = workspace_root / project_relative
-    changed = _apply_assignment(project_path, candidate["fullAssignment"])
+    from iterative_scope_expansion import apply_expansion_assignment
+    changed = apply_expansion_assignment(
+        project_path, candidate["fullAssignment"], candidate.get("scopeExpansionAdditions") or {},
+        _apply_assignment, _validate_assignment_materialization)
 
+    from cohort_attempt_telemetry import record_attempt, stage_measurement
+    candidate = dict(candidate)
+    candidate["telemetrySequence"] = int(candidate.get("telemetrySequence") or 0) + 1
+    save_candidate(run_dir, candidate)
+    install_started = time.monotonic()
     install_result = _run_install(
         project_path,
         timeout_seconds=args.timeout_seconds,
         progress_label="iterative migration exact materialization",
         runtime_env=_runtime_env(config),
     )
+    install_seconds = time.monotonic() - install_started
+    install_kind, install_code = _materialization_failure((install_result.stdout or "") + "\n" + (install_result.stderr or "")) if install_result.returncode else ("passed", "")
+    install_outcome = "PASS" if install_result.returncode == 0 else "FAIL" if install_kind == "resolver" else "UNKNOWN"
+    measurements = [stage_measurement("install", install_seconds, install_outcome)]
+    candidate["stageMeasurements"] = list(candidate.get("stageMeasurements") or []) + measurements
+    save_candidate(run_dir, candidate)
+    record_attempt(run_dir, run, config, candidate, stage="install", outcome=install_outcome,
+                   seconds=install_seconds, stages=measurements,
+                   size_feedback="FAIL" if install_kind=="resolver" and install_code=="CONFLICT" else "NONE")
     if install_result.returncode != 0:
         return _handle_materialize_failure(
             run_dir, run, config, candidate, base_checkpoint, install_result=install_result
@@ -3585,6 +3640,7 @@ def _materialize_locked(
 
     trial_snapshot = capture_source_snapshot(project_path, timeout_seconds=0)
     candidate = dict(candidate)
+    candidate["schedulerSeconds"] = float(candidate.get("schedulerSeconds") or 0) + time.monotonic() - scheduler_started
     candidate["stage"] = "MATERIALIZED"
     candidate["materializationRefs"] = {
         "workspaceRoot": str(workspace_root),
@@ -3978,6 +4034,7 @@ def cmd_precheck(args: argparse.Namespace) -> int:
 def _precheck_locked(
     run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], args: argparse.Namespace
 ) -> int:
+    scheduler_started = time.monotonic()
     if not run_budget_ok(config, run):
         raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
     _assert_runtime_unchanged(config)
@@ -3994,6 +4051,11 @@ def _precheck_locked(
 
     failing: List[Dict[str, Any]] = []
     first_failure: Optional[Dict[str, Any]] = None
+    from cohort_attempt_telemetry import record_attempt, stage_measurement, command_stage
+    measurements = []
+    candidate = dict(candidate)
+    candidate["telemetrySequence"] = int(candidate.get("telemetrySequence") or 0) + 1
+    save_candidate(run_dir, candidate)
     runtime_env = _runtime_env(config)
     base_env: Dict[str, str] = os.environ
     if runtime_env:
@@ -4003,6 +4065,7 @@ def _precheck_locked(
             "CI": "1",
             "npm_config_ignore_scripts": "true",
         }
+        command_started = time.monotonic()
         with MigrationProgress(_emit_status, operation="precheck", message=f"Running project command: {command}", run_id=run["runId"], candidate_id=candidate["candidateId"]) as progress:
             result = _run(
                 _command_argv(command, base_env),
@@ -4014,6 +4077,8 @@ def _precheck_locked(
                 progress_label=f"iterative migration precheck {command}",
             )
         failed = result.returncode != 0
+        measurement_outcome = "UNKNOWN" if result.returncode < 0 or result.returncode in {124, 137} else "FAIL" if failed else "PASS"
+        measurements.append(stage_measurement(command_stage(command), time.monotonic()-command_started, measurement_outcome, command))
         entry = {
             "command": command,
             "exitCode": result.returncode,
@@ -4026,6 +4091,13 @@ def _precheck_locked(
                 break  # PRECHECK may stop at the first meaningful error
 
     candidate = dict(candidate)
+    candidate["schedulerSeconds"] = float(candidate.get("schedulerSeconds") or 0) + time.monotonic() - scheduler_started
+    candidate["stageMeasurements"] = list(candidate.get("stageMeasurements") or []) + measurements
+    save_candidate(run_dir, candidate)
+    precheck_outcome = next((m["outcome"] for m in measurements if m["outcome"] != "PASS"), "PASS")
+    record_attempt(run_dir, run, config, candidate, stage="precheck", outcome=precheck_outcome,
+                   seconds=time.monotonic()-scheduler_started, stages=measurements,
+                   size_feedback="FAIL" if precheck_outcome=="FAIL" else "NONE")
     if failing:
         candidate["stage"] = "REPAIRING"
         candidate["diagnostics"] = failing
@@ -4191,6 +4263,11 @@ def _verify_exact_locked(
             "candidateId": candidate["candidateId"],
         }
     )
+    from cohort_attempt_telemetry import record_attempt, event_offset, verification_stages
+    candidate["telemetrySequence"] = int(candidate.get("telemetrySequence") or 0) + 1
+    save_candidate(run_dir, candidate)
+    offset = event_offset(verify_config.telemetry_path)
+    scheduler_started = time.monotonic()
     with MigrationProgress(_emit_status, operation="verify-exact", message="iterative migration verify-exact: preparing verification", run_id=run["runId"], candidate_id=candidate["candidateId"]) as progress:
         result = verify_assignment(
             project_path,
@@ -4216,10 +4293,30 @@ def _verify_exact_locked(
         }
     )
 
+    verify_seconds = time.monotonic()-scheduler_started
+    measurements = verification_stages(verify_config.telemetry_path, offset, assignment_fingerprint(candidate["fullAssignment"]))
+    candidate = {**candidate, "schedulerSeconds": float(candidate.get("schedulerSeconds") or 0) + verify_seconds,
+                 "stageMeasurements": list(candidate.get("stageMeasurements") or []) + measurements,
+                 "lastVerificationSeconds": verify_seconds, "lastVerificationMeasurements": measurements}
+    save_candidate(run_dir, candidate)
+    if not result.ok:
+        verify_outcome = "FAIL" if result.kind in {"dependency", "preparation", "project"} else "UNKNOWN"
+        if any(m.get("outcome")=="UNKNOWN" for m in measurements) or any(f.exit_code < 0 or f.exit_code in {124,137} for f in result.project_failures):
+            verify_outcome = "UNKNOWN"
+        record_attempt(run_dir, run, config, candidate, stage="verify-exact", outcome=verify_outcome,
+                       seconds=verify_seconds, stages=measurements, size_feedback="FAIL" if verify_outcome=="FAIL" and result.kind in {"dependency","project"} else "NONE",
+                       evidence_kind="structural" if result.kind=="dependency" else "opaque" if result.kind=="project" else "unavailable")
     if result.ok:
         return _accept_checkpoint(
             run_dir, run, config, candidate, base_checkpoint, result
         )
+    from cohort_action_cost import append_observation, observation_scope
+    scheduler_ledger = load_ledger(run_dir)
+    append_observation(scheduler_ledger, scope=observation_scope(run, config), candidate=candidate,
+                       seconds=candidate["schedulerSeconds"],
+                       outcome="rejected" if result.kind in {"dependency", "preparation"} else "inconclusive",
+                       source_key=str(base_checkpoint.get("sourceSnapshotKey") or ""))
+    save_ledger(run_dir, scheduler_ledger)
 
     if result.kind == "project":
         failing = [
@@ -4452,6 +4549,20 @@ def _accept_checkpoint(
     clear_candidate(run_dir)
     write_repair_requests(run_dir, [])
 
+    # Physical acceptance telemetry follows the durable pointer switch too.
+    from cohort_attempt_telemetry import record_attempt
+    targets = config.get("targets") or {}
+    cumulative = sum(str(new_assignment.get(n)) == str(v) for n,v in targets.items())
+    record_attempt(run_dir, run, config, candidate, stage="verify-exact", outcome="PASS",
+                   seconds=candidate.get("lastVerificationSeconds"), stages=candidate.get("lastVerificationMeasurements") or [],
+                   accepted_delta=accepted_delta, cumulative_verified=cumulative, size_feedback="PASS")
+    # Success learning follows the durable pointer switch, never precedes it.
+    from cohort_action_cost import append_observation, observation_scope
+    scheduler_ledger = load_ledger(run_dir)
+    append_observation(scheduler_ledger, scope=observation_scope(run, config), candidate=candidate,
+                       seconds=float(candidate.get("schedulerSeconds") or 0), outcome="accepted",
+                       source_key=str(base_checkpoint.get("sourceSnapshotKey") or ""))
+    save_ledger(run_dir, scheduler_ledger)
     _emit_status(
         {
             "event": "checkpoint.accepted",
@@ -4573,8 +4684,8 @@ def _apply_feedback_locked(
     if not isinstance(proposed_constraints, dict):
         raise InvalidInputError("FEEDBACK_CONSTRAINTS_INVALID")
     companions: Optional[Sequence[str]] = None
-    if kind == "NEEDS_COHORT_EXPANSION":
-        companions = proposed_scope.get("companions")
+    if kind in {"NEEDS_COHORT_EXPANSION", "NEEDS_ALTERNATIVE"}:
+        companions = proposed_scope.get("companions" if kind == "NEEDS_COHORT_EXPANSION" else "alternatives")
         if companions is not None:
             if not isinstance(companions, list) or not all(
                 isinstance(item, str) for item in companions
@@ -4598,6 +4709,16 @@ def _apply_feedback_locked(
         "createdAt": _now_iso(),
     }
     ledger = dict(ledger)
+    from cohort_attempt_telemetry import append_attempt, agent_measurement, stage_measurement
+    from cohort_action_cost import observation_scope
+    agent_seconds = agent_measurement(run_dir, candidate)
+    candidate = dict(candidate)
+    candidate["telemetrySequence"] = int(candidate.get("telemetrySequence") or 0) + 1
+    append_attempt(ledger, scope=observation_scope(run,config), config=config, candidate=candidate,
+                   stage="agent", outcome="UNKNOWN", seconds=agent_seconds,
+                   stages=[stage_measurement("agent",agent_seconds,"UNKNOWN")])
+    # Feedback is a proposal: neither prose nor agent exit records verified PASS.
+    save_candidate(run_dir, candidate)
     feedback_list = list(ledger.get("feedback", []))
     feedback_list.append(feedback_record)
     ledger["feedback"] = feedback_list
@@ -4616,12 +4737,12 @@ def _apply_feedback_locked(
         save_candidate(run_dir, candidate)
         run["activeCandidateId"] = None
         run["phase"] = "READY"
-        if kind == "NEEDS_COHORT_EXPANSION":
+        if kind in {"NEEDS_COHORT_EXPANSION", "NEEDS_ALTERNATIVE"}:
             if companions is not None:
                 _record_scope_expansion(
                     ledger, candidate, list(companions), str(feedback.get("reason") or "")
                 )
-        if kind in {"INCONCLUSIVE", "NEEDS_ALTERNATIVE"}:
+        if kind in {"INCONCLUSIVE", "NEEDS_ALTERNATIVE", "NEEDS_COHORT_EXPANSION"}:
             _append_deferral(ledger, candidate, str(feedback.get("reason") or "inconclusive"))
     elif kind == "REPAIRING":
         run["phase"] = "REPAIRING"
@@ -4650,8 +4771,8 @@ def _record_scope_expansion(
 ) -> None:
     """Record a proposed companion (cohort expansion) as deterministic scope input.
 
-    The planner re-validates the proposal (package must be in the managed set)
-    before it can affect group construction; the proposal is never proof.
+    The planner requires an exact assignment and preserves original declaration
+    guards. Missing peers may be added to the isolated trial; this is not proof.
     """
     ledger["scopeExpansions"] = list(ledger.get("scopeExpansions", [])) + [
         {
@@ -4660,6 +4781,7 @@ def _record_scope_expansion(
             "package": "",
             "packages": sorted((candidate.get("delta") or {}).get("changed") or {}),
             "companions": [str(item) for item in companions],
+            "assignmentFingerprint": assignment_fingerprint(candidate["fullAssignment"]),
             "reason": reason,
             "createdAt": _now_iso(),
         }
@@ -4678,6 +4800,7 @@ def _append_deferral(
             "baseCheckpointId": candidate["baseCheckpointId"],
             "candidateId": candidate["candidateId"],
             "cohortId": candidate.get("cohortId"),
+            "packages": sorted((candidate.get("delta") or {}).get("changed") or {}),
             "assignmentFingerprint": assignment_fingerprint(candidate["fullAssignment"]),
             "reason": reason,
             "createdAt": _now_iso(),
@@ -4726,6 +4849,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     repair_requests = read_repair_requests(run_dir)
     from iterative_task import build_progress_summary
     progress_summary = build_progress_summary(config, _all_checkpoints(run_dir), checkpoint, ledger)
+    from iterative_scope_expansion import prepare_expansions
     payload = {
         "schemaVersion": SCHEMA_VERSION,
         "run": run,
@@ -4737,9 +4861,19 @@ def cmd_status(args: argparse.Namespace) -> int:
             "deferrals": len(ledger.get("deferrals", [])),
             "feedback": len(ledger.get("feedback", [])),
             "infraBlocks": len(ledger.get("infraBlocks", [])),
+            "attemptTelemetry": len(ledger.get("attemptTelemetry", [])),
+            "cohortSizeState": ledger.get("cohortSizeState") or {},
+            "conflictRegions": ledger.get("conflictRegions") or [],
+            "schedulerProgress": ledger.get("schedulerProgress") or {},
             "counters": ledger.get("counters", {}),
         },
         "infraBlocked": run.get("infraBlocked") or None,
+        "scopeExpansionIssues": prepare_expansions(
+            dict(checkpoint.get("fullAssignment") or {}),
+            {n: (config.get("targets") or {}).get(n, v) for n, v in (checkpoint.get("fullAssignment") or {}).items()},
+            ledger, checkpoint_id, _all_checkpoints(run_dir),
+            unavailable={(e.get("package"), e.get("target")) for e in ledger.get("targetAvailabilityDeferrals", [])
+                         if e.get("scope") == availability_scope_flat(run, config)})[2],
         "openRepairRequests": repair_requests,
         "config": {
             "projectName": config.get("projectName"),
@@ -5233,6 +5367,7 @@ def _audit_locked(
     # with the ACTUAL policy captured at begin (lag window, lag-ok threshold,
     # known-High limit) plus the user's package lag policy from dashboard state
     # — never dashboard_state=None.
+    audit_started=time.monotonic()
     report = build_report(
         project_path,
         str(config.get("projectName") or ""),
@@ -5269,6 +5404,11 @@ def _audit_locked(
         )
     evidence_ref = str(audit_workspace)
     audit_status = _audit_status_from_report(report)
+    from cohort_attempt_telemetry import record_attempt, stage_measurement
+    audit_seconds=time.monotonic()-audit_started
+    record_attempt(run_dir,run,config,{"candidateId":None,"telemetrySequence":time.time_ns()},
+                   stage="audit",outcome=audit_status,seconds=audit_seconds,
+                   stages=[stage_measurement("audit",audit_seconds,audit_status)])
     audit_metrics = report.get("audit") or {}
     checkpoint = dict(checkpoint)
     checkpoint["audit"] = {
@@ -5416,7 +5556,11 @@ def build_parser() -> argparse.ArgumentParser:
     begin.add_argument("--max-repair-attempts", type=int, default=None)
     begin.add_argument("--max-infra-retries", type=int, default=None)
     begin.add_argument("--phase-timeout-seconds", type=int, default=None)
-    begin.add_argument("--cohort-max-packages", type=int, choices=range(1, 33), default=24, help="Adaptive cohort cap (default 24; starts at 8, grows after verified acceptance)")
+    begin.add_argument("--cohort-max-packages", type=int, choices=range(1, 33), default=24, help="Adaptive cohort cap (default 24; starts at the cap)")
+    begin.add_argument("--cohort-initial-packages", type=int, choices=range(1, 33), default=None)
+    begin.add_argument("--cohort-exploration-ratio", type=int, choices=range(2, 17), default=2)
+    begin.add_argument("--cohort-search-steps", type=int, choices=range(8, 4097), metavar="8..4096", default=128)
+    begin.add_argument("--cohort-scheduling-strategy", choices=("local-adaptive-region", "adaptive-size", "whole-first"), default="whole-first")
     begin.add_argument(
         "--dashboard-state",
         default="",

@@ -59,7 +59,7 @@ class GreedyCohortTests(unittest.TestCase):
             plan,details,_=self.plan(names,old=base,checkpoints=checkpoints)
             sizes.append(len(plan.packages));base=plan.assignment_dict
             checkpoints.append({'checkpointId':f'C{len(checkpoints)+1}','parentCheckpointId':f'C{len(checkpoints)}','status':'VERIFIED','acceptedDelta':{'changed':dict.fromkeys(plan.packages,'1.1.0')}})
-        self.assertEqual(sum(sizes),30);self.assertEqual(sizes,[8,12,10])
+        self.assertEqual(sum(sizes),30);self.assertEqual(sizes,[24,6])
     def test_failed_batch_is_divided_without_learning_failed_members(self):
         names=[f'pkg-{i:02}' for i in range(8)];first,_,fp=self.plan(names)
         second,details,_=self.plan(names,blocks=[fp(first.assignment_dict)])
@@ -76,7 +76,7 @@ class GreedyCohortTests(unittest.TestCase):
         plan,_,_=self.plan(['a','b'],config={'cohortMaxPackages':1,'priorityPackages':['b']})
         self.assertEqual(plan.packages,('b',))
     def test_unverified_success_never_grows_batch(self):
-        plan,details,_=self.plan([f'p{i}' for i in range(20)],checkpoints=[{'status':'FAILED','acceptedDelta':{'changed':dict.fromkeys(range(8))}}])
+        plan,details,_=self.plan([f'p{i}' for i in range(20)],config={'cohortInitialPackages':8},checkpoints=[{'status':'FAILED','acceptedDelta':{'changed':dict.fromkeys(range(8))}}])
         self.assertEqual(details['batchLimit'],8)
 
     def test_local_peer_hints_keep_companions_near_without_becoming_proof(self):

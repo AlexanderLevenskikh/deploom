@@ -819,6 +819,28 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         </div>
       ) : null}
 
+      {runner?.workingCheckout ? (
+        <div className="resume-notice" data-testid="iterative-working-checkout">
+          <strong>{runner.workingCheckout.kind === 'trial'
+            ? text('Изолированная рабочая копия', 'Isolated working checkout')
+            : runner.workingCheckout.kind === 'checkpoint'
+              ? text('Сохранённый проверенный результат', 'Saved verified result')
+              : text('Исходная рабочая копия', 'Original checkout')}{runner.workingCheckout.checkpointId ? ` · ${runner.workingCheckout.checkpointId}` : ''}</strong>
+          <span style={{ overflowWrap: 'anywhere' }}>{runner.workingCheckout.path}</span>
+          <span>{text('Результат сохраняется отдельно. Этот прогон не пушит основную ветку и не переносит изменения в исходную копию автоматически.', 'The result is saved separately. This run does not push the main branch or automatically transfer changes into the original checkout.')}</span>
+          <button type="button" className="button secondary" onClick={() => void onOpenPath(runner.workingCheckout!.path)}>
+            <ExternalLink size={16} />{text('Открыть папку', 'Open folder')}
+          </button>
+        </div>
+      ) : null}
+
+      {runner?.scopeExpansionIssues?.length ? (
+        <div className="resume-notice warning" role="status" data-testid="scope-expansion-issues">
+          <strong>{text('Для части обновлений нужен уточнённый вариант', 'Some updates need a more specific proposal')}</strong>
+          <span>{text('Проверенный результат сохранён. Для этой группы агенту нужна точная версия обязательного пакета: имя = X.Y.Z. Следующим шагом можно обновить другие группы.', 'The verified result is preserved. This cohort needs an exact required package version from the agent: name = X.Y.Z. Other cohorts can be updated next.')}</span>
+          {runner.scopeExpansionIssues.map((issue, index) => <span key={index}>{issue.packages.join(', ')} · {issue.proposals.join('; ')}</span>)}
+        </div>
+      ) : null}
       {validationError ? <div className="resume-notice warning" role="alert">{validationError}</div> : null}
       {note ? <div className="resume-notice"><span>{note}</span></div> : null}
 

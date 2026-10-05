@@ -330,9 +330,10 @@ def _deferred_rows(
     for entry in ((ledger or {}).get("deferrals") or []):
         if not isinstance(entry, dict):
             continue
-        name = str(entry.get("package") or "")
-        if name and name not in reasons:
-            reasons[name] = str(entry.get("reason") or entry.get("kind") or "deferred")
+        names = [str(entry.get("package") or ""), *(str(n) for n in entry.get("packages", []))]
+        for name in names:
+            if name and name not in reasons:
+                reasons[name] = str(entry.get("reason") or entry.get("kind") or "deferred")
 
     for name, reason in sorted(reasons.items()):
         if name not in targets:

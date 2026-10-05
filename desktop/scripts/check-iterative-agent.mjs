@@ -24,6 +24,7 @@ import {
   parseAgentOutcome,
   parseChangedFilesFromAgentOutput,
   readAgentLease,
+  recordAgentDispatchTiming,
   trialBaselineFile,
   withAgentDispatchLock,
   writeAgentLease,
@@ -47,6 +48,11 @@ const root = mkdtempSync(join(tmpdir(), "iter-agent-handoff-"));
 const runDir = join(root, "run");
 const workspace = join(runDir, "trial", "workspace");
 mkdirSync(join(workspace, "src"), { recursive: true });
+recordAgentDispatchTiming(runDir, {runId:"timing-run", candidateId:"timing-candidate", attemptId:2}, 1000, "feedback-applied", 3500);
+const timing = JSON.parse(readFileSync(join(runDir,"cohort-agent-telemetry.jsonl"),"utf8").trim());
+assert.equal(timing.durationSeconds,2.5);
+assert.equal(timing.outcome,"UNKNOWN","Agent completion is not project PASS");
+assert.equal(timing.attemptId,2);
 mkdirSync(join(runDir, "checkpoints"), { recursive: true });
 writeJson(join(runDir, "run.json"), {
   schemaVersion: 1, runId: "iter-agent-1", workspaceId: "ws", projectId: "demo-app",

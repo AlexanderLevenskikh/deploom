@@ -292,8 +292,12 @@ class IterativeMigrationPhysicalAcceptance(unittest.TestCase):
 
     # -- tests --------------------------------------------------------------
 
+    def test_vertical_local_region_repair_and_recovery(self) -> None:
+        self.local_region = True
+        self.test_vertical_loop_first_upgrade_repair_and_recovery()
+
     def test_vertical_loop_first_upgrade_repair_and_recovery(self) -> None:
-        run_dir = self.stage / "run1"
+        run_dir = self.stage / ("run-local" if getattr(self,"local_region",False) else "run1")
         run_dir.mkdir(parents=True)
 
         # begin: C0 «Исходный замер» control verification must PASS.
@@ -312,6 +316,8 @@ class IterativeMigrationPhysicalAcceptance(unittest.TestCase):
             str(self._verify_config_file()),
             "--cohort-max-packages",
             "1",  # This scenario explicitly tests two separate cumulative repairs.
+            "--cohort-scheduling-strategy",
+            "local-adaptive-region" if getattr(self,"local_region",False) else "whole-first",
             "--run-budget-minutes",
             "30",
             "--phase-timeout-seconds",
@@ -436,6 +442,22 @@ class IterativeMigrationPhysicalAcceptance(unittest.TestCase):
         full = status_after_c2["activeCheckpoint"]["fullAssignment"]
         self.assertEqual("7.0.0", full["is-number"])
         self.assertEqual("1.1.0", full["is-finite"])
+
+        # Physical telemetry survives each fresh CLI process; success follows C2.
+        telemetry = json.loads((run_dir / "ledger.json").read_text(encoding="utf-8"))["attemptTelemetry"]
+        accepts = [row for row in telemetry if row.get("acceptedDelta") is not None]
+        self.assertEqual([row["cumulativeVerifiedPackages"] for row in accepts], [1, 2])
+        self.assertTrue(all(row["attemptsWithoutVerifiedProgress"] == 0 for row in accepts))
+        self.assertTrue(any(row["stage"] == "precheck" and row["outcome"] == "FAIL" for row in telemetry))
+        self.assertTrue(any(row["stage"] == "verify-exact" and row["outcome"] == "FAIL" for row in telemetry))
+        self.assertTrue(all(row["wallSeconds"] is not None and row["wallSeconds"] > 0 for row in accepts))
+        self.assertTrue(all(row["stages"] for row in accepts), "Physical verifier command timing must be captured")
+        self.assertTrue(all(row["agentSeconds"] is None for row in telemetry if row["stage"] == "agent"), "Scripted repair does not measure a provider agent")
+
+        if getattr(self,"local_region",False):
+            self.assertTrue(all(row["regionId"] for row in accepts), "Repair acceptance must retain the original failed region lineage")
+            regions=json.loads((run_dir / "ledger.json").read_text(encoding="utf-8"))["conflictRegions"]
+            self.assertTrue(all(r["lastProgress"] is not None for r in regions if r["evidence"]=="opaque"))
 
         # Drain any remaining candidates (the impossible is-string target):
         # materialization fails deterministically, INCONCLUSIVE frees it, and

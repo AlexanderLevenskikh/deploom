@@ -17,7 +17,7 @@
 //     agent text; apply-feedback (the authoritative verifier of staleness and
 //     changed-file scope) is then invoked with the real CLI.
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, lstatSync, statSync, unlinkSync, writeFileSync, renameSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, lstatSync, statSync, unlinkSync, writeFileSync, renameSync, appendFileSync } from 'node:fs'
 import { dirname, join, resolve, sep } from 'node:path'
 import type { AgentLaunchDiagnostics } from './agent-launch-errors.js'
 
@@ -137,7 +137,9 @@ export function buildIterativeRepairPrompt(ctx: IterativeAgentContext): string {
     `## Формат ответа`,
     `- Ремонт выполнен (изменены исходники): напиши строку "${CHANGED_FILES_MARKER}" и перечисли по одному изменённому файлу на строку, затем подтверди: FEEDBACK_KIND: READY_FOR_VERIFY.`,
     `- Текущий набор версий непригоден, нужен другой вариант: FEEDBACK_KIND: NEEDS_ALTERNATIVE, затем PROPOSALS: (по одной строке «пакет = версия») и REASON:.`,
-    `- Нужен соседний пакет в скоупе: FEEDBACK_KIND: NEEDS_COHORT_EXPANSION, затем PROPOSALS: со списком пакетов-компаньонов и REASON:.`,
+    `- Нужен соседний пакет или обязательный peer: FEEDBACK_KIND: NEEDS_COHORT_EXPANSION, затем PROPOSALS: по одной строке «пакет = точная версия X.Y.Z» и REASON: с evidence по peer/runtime. Контроллер может добавить отсутствующий registry-пакет в зависимости trial и проверит весь кандидат.`,
+    `- Предлагай конкретный следующий вариант: согласованное семейство версий, недостающий peer, адаптацию исходников или конфигурации. Для альтернативы тоже нужны точные версии. Не повторяй прежний неработающий набор.`,
+    `- resolutions не устанавливает отсутствующий peer. Не маскируй runtime-ошибки заглушками типов, отключением проверок или подавлением ошибок; опиши компромисс в REASON:.`,
     `- Инфраструктура заблокировала работу: FEEDBACK_KIND: INFRA_BLOCKED и REASON:.`,
     `- Результат неясен: FEEDBACK_KIND: INCONCLUSIVE и REASON:.`,
     `Текст ответа не считается доказательством; контроллер проверит файлы и перезапустит проверки.`,
@@ -528,6 +530,21 @@ export function agentProviderFailure(output: string, exitCode: number): string |
   if (/ProviderModelNotFoundError|Model not found:/i.test(output)) return output.trim().slice(-2000)
   if (exitCode !== 0 && output.trim()) return output.trim().slice(-2000)
   return undefined
+}
+
+/** Observability only: a completed agent dispatch never grants project PASS. */
+export function recordAgentDispatchTiming(runDir: string, context: { runId: string; candidateId: string; attemptId: number }, startedAt: number, status: string, finishedAt = Date.now()): void {
+  if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt) || finishedAt < startedAt) return
+  try {
+    const file = join(runDir, 'cohort-agent-telemetry.jsonl')
+    mkdirSync(runDir, { recursive: true })
+    if (existsSync(file) && statSync(file).size > 8 * 1024 * 1024) {
+      const archive = `${file}.1`
+      if (existsSync(archive)) unlinkSync(archive)
+      renameSync(file, archive)
+    }
+    appendFileSync(file, `${JSON.stringify({ ...context, stage: 'agent', outcome: 'UNKNOWN', status, durationSeconds: (finishedAt - startedAt) / 1000, timingScope: 'dispatch including provider wait and feedback; no project verification authority', finishedAt })}\n`, 'utf8')
+  } catch { /* Telemetry never turns a completed repair into failure. */ }
 }
 
 export const AGENT_LEASE_FILENAME = 'agent-lease.json'

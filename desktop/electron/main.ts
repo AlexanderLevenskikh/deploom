@@ -59,13 +59,14 @@ import { discoveryProgress } from './iterative-discovery-progress.js'
 import { createIterativeAutopilot } from './iterative-autopilot.js'
 import { liveRunWriterPid, readAutopilotState, writeAutopilotState } from './iterative-autopilot-state.js'
 import { IterativeDecision, decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
+import { iterativeCheckoutView, type IterativeCheckoutView } from './iterative-checkout-view.js'
 import { migrationProfilePath, readMigrationProfile, readMigrationScope, saveMigrationProfile } from './migration-validation.js'
 import { hasSavedProjectPlan, iterativeBeginInvocation, iterativeCheckTimeoutFailure, targetsFromDashboardState } from './iterative-begin.js'
 import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
 import { beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, readRunLogTail, recordAttemptLog, recordAttemptProgress, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
 import { spawnIterativeStreamed, type CaptureResult, type StreamAttemptIo, type StreamPlatform } from './iterative-stream.js'
-import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, agentProviderFailure, openCodeRuntimeManifestPaths, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, trialBaselineFile, trialProjectPath, withAgentDispatchLock, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
+import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, agentProviderFailure, openCodeRuntimeManifestPaths, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, recordAgentDispatchTiming, trialBaselineFile, trialProjectPath, withAgentDispatchLock, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
@@ -7541,12 +7542,24 @@ function setupIpc(): void {
   ipcMain.handle('flow:iterative:autopilot', async (_event, input: { workspaceId?: string; projectName: string; enabled: boolean }) => {
     const workspace = autopilotWorkspace(input)
     const project = findProject(workspace, input.projectName)
-    const file = agentLeaseFile(iterativeTaskRunDir(workspace, project))
+    const runDir = iterativeTaskRunDir(workspace, project)
+    const scope = { workspaceId: workspace.id, projectName: project.name }
+    const file = agentLeaseFile(runDir)
     const lease = readAgentLease(file)
     if (lease) writeAgentLease(file, { ...lease, autopilot: input.enabled })
-    const result = iterativeAutopilot.setEnabled(input, input.enabled)
-    if (lease?.waiting) scheduleAgentWaitRetry({ workspaceId: workspace.id, projectName: project.name }, lease.retryAt ?? Date.now())
-    return { ...result, active: result.active || (input.enabled && lease?.waiting === true) }
+    const result = iterativeAutopilot.setEnabled(scope, input.enabled)
+    if (lease?.waiting) scheduleAgentWaitRetry(scope, lease.retryAt ?? Date.now())
+    const attempt = readAttempt(runDir)
+    // A completed manual drive releases its session at the repair gate. Adopt
+    // that stopped run through drive so Python rechecks the current authority.
+    // Registering drive claims the session before its first await; repeated
+    // toggles therefore cannot dispatch another repair or block this IPC call.
+    if (input.enabled && !iterativeAutopilot.hasSession(scope) && !lease &&
+        existsSync(join(runDir, 'run.json')) && attempt?.status === 'done' &&
+        attempt.stage === 'drive' && attempt.lastStep === 'agent' && !attempt.cancelRequested && !attempt.lastError) {
+      void runIterativeDriveWithAutopilot(undefined, { ...scope, autopilot: true })
+    }
+    return { ...result, active: iterativeAutopilot.isEnabled(scope) === true || (input.enabled && lease?.waiting === true) }
   })
 
   ipcMain.handle('flow:iterative:task', async (_event, input: { workspaceId?: string; projectName: string }) => {
@@ -7747,6 +7760,8 @@ function setupIpc(): void {
     let retryable = false
     let requestedNode: string | undefined
     let runtimeView: Record<string, any> | undefined
+    let workingCheckout: IterativeCheckoutView | undefined
+    let scopeExpansionIssues: Array<{ packages: string[]; proposals: string[]; reason: string; nextAction: string }> | undefined
     let progressSummary: { checkpointId: string; remaining: number; denominator: number; accepted: number; deferred: number; targetCount: number; unresolvedGoals: number } | undefined
     const scalar = (value: unknown): string | undefined =>
       typeof value === 'string' && value ? value : undefined
@@ -7766,6 +7781,8 @@ function setupIpc(): void {
         if (payload) {
           phase = String(payload.run?.phase ?? '')
           progressSummary = payload.progressSummary
+          workingCheckout = iterativeCheckoutView(payload, runDir, project.path)
+          scopeExpansionIssues = Array.isArray(payload.scopeExpansionIssues) ? payload.scopeExpansionIssues : undefined
           decision = decideNextStep(runDir, payload)
           const config = (payload.config ?? {}) as Record<string, any>
           const runtime = (config.runtime ?? undefined) as Record<string, any> | undefined
@@ -7819,6 +7836,8 @@ function setupIpc(): void {
       legacyPlanPresent: hasSavedProjectPlan(artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json'), project.name),
       requestedNode,
       progressSummary,
+      scopeExpansionIssues,
+      workingCheckout,
       runtime: runtimeView,
       attempt: readAttempt(runDir),
       attemptLog: readAttemptLogTail(runDir),
@@ -8274,7 +8293,7 @@ function setupIpc(): void {
   // between an accepted cohort and the next one. Restart-safe by design:
   // every iteration recomputes the decision from the DURABLE Python state, so
   // a killed app simply resumes from where the files say the run stands.
-  const runIterativeDriveWithAutopilot = iterativeAutopilot.register('drive', async (_event, input: { workspaceId?: string; projectName: string; retryInfra?: boolean; discardCandidate?: boolean }) => {
+  const runIterativeDriveWithAutopilot = iterativeAutopilot.register('drive', async (_event, input: { workspaceId?: string; projectName: string; autopilot?: boolean; retryInfra?: boolean; discardCandidate?: boolean }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -8637,6 +8656,7 @@ function setupIpc(): void {
     publishIterativeAttempt(runDir)
     let agentOutputTail = ''
     let agentSucceeded = false
+    let agentTimingStartedAt: number | undefined
     let preserveLease = false
     try {
       const python = resolveExecutable('python')
@@ -8797,6 +8817,7 @@ function setupIpc(): void {
           ? existingLease?.databasePath || join(app.getPath('temp'), `iter-agent-opencode-${randomUUID()}`, 'opencode.db')
           : ''
 
+        agentTimingStartedAt = Date.now()
         let output = ''
         let exitCode = 0
         let agentTimedOut = false
@@ -9031,6 +9052,7 @@ function setupIpc(): void {
         agentSucceeded = true
         return { ok: true, changedFiles: parsed.changedFiles, phase: next?.phase, next, agentOutputTail }
       } finally {
+        if (agentTimingStartedAt !== undefined) recordAgentDispatchTiming(runDir, ctx, agentTimingStartedAt, agentSucceeded ? 'feedback-applied' : readAgentLease(leasePath)?.waiting ? 'waiting' : 'failed-or-canceled')
         // A parked launch-wait lease is the durable record of the wait; only a
         // non-waiting lease is cleared here. The waiting return above already
         // published the 'waiting' attempt; the retry timer consumes the lease.
