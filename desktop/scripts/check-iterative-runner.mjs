@@ -257,7 +257,10 @@ if (!statusInvocation.args.includes("status") || !statusInvocation.args.includes
   const types = readFileSync(new URL("../src/types.ts", import.meta.url), "utf8");
   if (!/ipcMain\.handle\('flow:iterative:drive'/.test(main)) throw new Error("flow:iterative:drive handler must exist in main.ts");
   if (/ipcMain\.handle\('flow:iterative:step'/.test(main)) throw new Error("one-shot flow:iterative:step must be REMOVED (drive replaces it)");
-  const drive = main.slice(main.indexOf("flow:iterative:drive"));
+  const driveStart = main.indexOf('  const runIterativeDriveWithAutopilot =');
+  const driveEnd = main.indexOf("  ipcMain.handle('flow:iterative:drive', runIterativeDriveWithAutopilot)", driveStart);
+  if (driveStart < 0 || driveEnd <= driveStart) throw new Error('drive owner must be registered as the production IPC handler');
+  const drive = main.slice(driveStart, driveEnd);
   if (!drive.includes("stopped: 'agent-gate'")) throw new Error("drive must stop at the agent GATE");
   if (!drive.includes("stopped: 'finished'")) throw new Error("drive must stop at finish");
   if (!drive.includes("stopped: 'error'")) throw new Error("drive must stop on error");
@@ -309,7 +312,7 @@ if (!statusInvocation.args.includes("status") || !statusInvocation.args.includes
   // DURABLE C0 payload before success (never trusts a bare exit 0), and the
   // begin in-flight lock is held inside ONE try/catch/finally so a preparation
   // failure releases it and records a failed attempt.
-  const begin = main.slice(main.indexOf("flow:iterative:begin"), main.indexOf("flow:iterative:drive"));
+  const begin = main.slice(main.indexOf("flow:iterative:begin"), driveStart);
   if (!main.includes("./iterative-stream.js")) throw new Error("main must adopt the testable stream runner (iterative-stream.js)");
   if (!begin.includes("result.timedOut")) throw new Error("begin must branch on a watchdog timeout, never claim success");
   if (!begin.includes("!refreshed")) throw new Error("begin must confirm a durable C0 payload before success, never trust a bare exit 0");
