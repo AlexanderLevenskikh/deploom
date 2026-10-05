@@ -468,6 +468,7 @@ for (const stop of ['cancel','pause']) {
  assert.equal(calls,1); assert.equal(waiting.hasSession(scope),false);
 }
 console.log('autopilot: continuation, waiting, pause, cancel and repeated-gate boundaries OK');
+await import('./iterative-autopilot-lifecycle-fixture.mjs');
 
 if (failures > 0) {
   console.error(`${failures} scenario contract check(s) FAILED`);

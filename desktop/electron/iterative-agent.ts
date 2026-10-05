@@ -678,6 +678,8 @@ export function decideAgentLeaseDispatch(
   now = Date.now(),
 ): AgentLeaseDecision {
   if (!lease) return { action: 'none' }
+  // A child surviving Desktop must not expire into a duplicate paid repair.
+  if (!lease.waiting && lease.childPid && isOwnerAlive(lease.childPid)) return { action: 'in-progress' }
   if (!lease.waiting && !agentLeaseAlive(lease, now)) return { action: 'none' }
   if (lease.waiting) {
     const attempts = lease.launchAttempts ?? 0

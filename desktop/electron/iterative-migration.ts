@@ -214,7 +214,7 @@ export function repairPromptTaskText(
 export type IterativeTaskRefreshResult =
   | { status: 'ok' }
   | { status: 'input-missing'; missing: string[] }
-  | { status: 'export-failed'; exitCode: number; stderr: string }
+  | { status: 'export-failed'; exitCode: number; stderr: string; timedOut?: boolean }
 
 /** The bytes meant for the OS clipboard: markdown body plus the manifest
  * fingerprint the UI can echo back ("task <runId> <artifactId>, hash …"). */

@@ -51,7 +51,7 @@ function fixture() {
   const bindings = {
     ...agents, ...attempts, ...commands, ...errors, iterativeAutopilot,
     existsSync, join, readFileSync, writeFileSync, extractAgentSessionId,
-    loadState: () => ({}), findWorkspace: () => workspace, findProject: () => project,
+    loadState: () => ({}), findWorkspace: () => workspace, autopilotWorkspace: () => workspace, findProject: () => project,
     iterativeTaskRunDir: () => runDir, iterativeStepInFlight: new Set(), stepLockKey: () => 'fixture',
     publishIterativeAttempt: () => {}, ensureAttemptRecord: () => { if (!attempts.readAttempt(runDir)) attempts.startAttempt(runDir, project.name, 'none'); },
     isPidAlive: () => false, resolveExecutable: () => 'python', bundledToolDir: () => '.',
@@ -217,5 +217,27 @@ function fixture() {
   assert.notEqual(f.lease()?.autopilot,true);
   assert.equal(f.launches.length,1);
   assert.equal(f.drives(),0);
+}
+// A pre-dispatch status timeout retries without buying a new paid attempt.
+{
+  const f = fixture();
+  const status = f.bindings.spawnCapture;
+  let reads = 0;
+  f.bindings.spawnCapture = async (...args) => ++reads === 1 ? {code:-1,timedOut:true,stdout:'',stderr:''} : status(...args);
+  f.setChild(`require('fs').writeFileSync('input.js','repaired');console.log('FEEDBACK_KIND: READY_FOR_VERIFY');`);
+  const result = await f.autonomous(undefined,{projectName:'fixture',autopilot:true});
+  assert.equal(result.autopilot.stopped,'finished',JSON.stringify(result));
+  assert.equal(f.launches.length,1); assert.equal(f.drives(),1);
+}
+// Another handler must preserve the live child's lease and refuse duplicates.
+for (const autopilot of [false,true]) {
+  const f = fixture();
+  agents.writeAgentLease(agents.agentLeaseFile(f.runDir), {schemaVersion:1,sessionId:'ses-alive',provider:'opencode',databasePath:'saved.db',runId:'run',candidateId:'candidate',attemptId:2,pid:123,childPid:456,startedAt:new Date(Date.now()-3*60*60*1000).toISOString()});
+  f.bindings.isPidAlive = () => true;
+  f.bindings.iterativeAutopilot.isEnabled = () => autopilot;
+  const result = await f.run({projectName:'fixture'});
+  assert.equal(result.ok,false); assert.equal(result.waiting===true,autopilot);
+  assert.match(result.error,/AGENT_IN_PROGRESS/);
+  assert.equal(f.lease()?.sessionId,'ses-alive'); assert.equal(f.launches.length,0);
 }
 console.log('agent-launch-lifecycle: production handler + real child wait/resume/cancel/autopilot OK');

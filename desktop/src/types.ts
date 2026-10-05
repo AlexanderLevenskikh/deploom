@@ -426,6 +426,7 @@ export type IterativeAttemptView = {
 export type IterativeStatusOutcome = {
   progressSummary?: { checkpointId: string; remaining: number; denominator: number; accepted: number; deferred: number; targetCount: number; unresolvedGoals: number }
   autopilotActive?: boolean
+  autopilotEnabled?: boolean
   validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string; suggestedUnitCommand?: string }
   validationScope?: { mode?: string; existingFailures?: number; total?: number; skipped?: number }
   legacyPlanPresent?: boolean

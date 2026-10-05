@@ -8,22 +8,67 @@ type Step = 'begin' | 'drive' | 'agent' | 'status' | 'cancel'
 type Handler = (event: unknown, input: Input) => Promise<Outcome>
 export type AutopilotSummary = { stopped: string; error?: string }
 
-export function createIterativeAutopilot(key: (scope: Scope) => string) {
+type Retry = { count: number; retryAt: number; error: string }
+type Persistence = {
+  normalizeScope?: (scope: Scope) => Scope
+  setEnabled?: (scope: Scope, enabled: boolean) => void
+  readRetry?: (scope: Scope) => Retry | undefined
+  writeRetry?: (scope: Scope, retry?: Retry) => void
+  retryDelayMs?: (count: number) => number
+  onStopped?: (scope: Scope, summary: AutopilotSummary) => void
+  waitForWriter?: (scope: Scope) => number | undefined
+}
+
+export function createIterativeAutopilot(key: (scope: Scope) => string, persistence: Persistence = {}) {
   const handlers = new Map<Step, Handler>()
   const sessions = new Map<string, { canceled: boolean; enabled: boolean }>()
   const statusReads = new Map<string, Promise<Outcome>>()
-  const invoke = (step: Step, input: Input) => {
+  async function waitUntil(retryAt: number, session: { canceled: boolean; enabled: boolean }) {
+    while (Date.now() < retryAt && session.enabled && !session.canceled) {
+      await new Promise(resolve => setTimeout(resolve, Math.min(250, retryAt - Date.now())))
+    }
+  }
+  const invoke = async (step: Step, input: Input): Promise<Outcome> => {
     const handler = handlers.get(step)
     if (!handler) throw new Error(`AUTOPILOT_HANDLER_MISSING: ${step}`)
-    return handler(undefined, input)
+    const session = sessions.get(key(input))
+    if (session && step !== 'status') persistence.setEnabled?.(input, step !== 'begin' && session.enabled && !session.canceled)
+    let retry = persistence.readRetry?.(input)
+    if (retry && session?.enabled) {
+      await waitUntil(retry.retryAt, session)
+      if (!session.enabled || session.canceled) return { ok: false, stopped: session.canceled ? 'canceled' : 'paused' }
+    }
+    let count = retry?.count ?? 0
+    while (true) {
+      if (step === 'drive' && session?.enabled) {
+        let deadline = persistence.waitForWriter?.(input)
+        while (deadline !== undefined && session.enabled && !session.canceled) {
+          await waitUntil(deadline, session)
+          deadline = persistence.waitForWriter?.(input)
+        }
+        if (!session.enabled || session.canceled) return { ok: false, stopped: session.canceled ? 'canceled' : 'paused' }
+      }
+      const result = await handler(undefined, input)
+      // Only the owning handler can mark a failed read as safe to retry.
+      // Agent retries are limited to explicitly marked reads before dispatch.
+      // Never replay begin, paid repairs or arbitrary mutating step failures.
+      if (!['drive', 'status', 'agent'].includes(step) || result.retryable !== true || !session?.enabled || session.canceled) {
+        if (result.ok === true && ['drive', 'status', 'agent'].includes(step)) persistence.writeRetry?.(input)
+        return result
+      }
+      if (count >= 3) return { ...result, retryable: false, error: `AUTOPILOT_RETRY_EXHAUSTED: ${String(result.error || 'status unavailable')}` }
+      retry = { count: ++count, retryAt: Date.now() + (persistence.retryDelayMs?.(count) ?? 5_000 * 2 ** (count - 1)), error: String(result.error || 'status unavailable') }
+      persistence.writeRetry?.(input, retry)
+      if (step === 'drive') input = { ...input, retryInfra: result.retryInfraPending === true, discardCandidate: result.discardCandidatePending === true }
+      await waitUntil(retry.retryAt, session)
+      if (!session.enabled || session.canceled) return result
+    }
   }
   async function resumeWaitingAgent(outcome: Outcome, input: Input, session: { canceled: boolean; enabled: boolean }): Promise<Outcome> {
     while (outcome.waiting === true && session.enabled && !session.canceled) {
       const retryAt = Number(outcome.retryAt)
       if (!Number.isFinite(retryAt)) return { ok: false, error: 'AGENT_WAIT_DEADLINE_MISSING' }
-      while (Date.now() < retryAt && session.enabled && !session.canceled) {
-        await new Promise(resolve => setTimeout(resolve, Math.min(250, retryAt - Date.now())))
-      }
+      await waitUntil(retryAt, session)
       if (!session.enabled || session.canceled) return outcome
       outcome = await invoke('agent', input)
     }
@@ -33,11 +78,16 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
     const initiallyEnabled = session.enabled
     let outcome = await invoke(first, input)
     if (first === 'agent') outcome = await resumeWaitingAgent(outcome, input, session)
+    persistence.setEnabled?.(input, session.enabled && !session.canceled)
     let initial = outcome
     // Explicit infrastructure retry is one user action, never an autopilot loop.
     input = { ...input, retryInfra: false, discardCandidate: false }
     if (!session.enabled && !initiallyEnabled) return initial
-    const stopped = (reason: string, error?: string): Outcome => ({ ...initial, autopilot: { stopped: reason, ...(error ? { error } : {}) } })
+    const stopped = (reason: string, error?: string): Outcome => {
+      const summary = { stopped: reason, ...(error ? { error } : {}) }
+      persistence.onStopped?.(input, summary)
+      return { ...initial, ...(error ? { ok: false, error } : {}), autopilot: summary }
+    }
     if (session.canceled) return stopped('canceled')
     if (!session.enabled || outcome.waiting === true) return stopped('paused')
     let recoveredRepair = false
@@ -71,9 +121,10 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
       if (drive.stopped !== 'agent-gate') return stopped(String(drive.stopped || 'paused'))
       const status = await invoke('status', input)
       if (session.canceled) return stopped('canceled')
+      if (!session.enabled) return stopped('paused')
       if (status.ok !== true) return stopped('error', String(status.error || 'AUTOPILOT_STATUS_FAILED'))
       const requests = drive.repairRequests as Array<{ requestId?: string }> | undefined
-      const gate = JSON.stringify({ phase: drive.phase, requests: requests?.map(r => r.requestId).sort(), decision: status.decision })
+      const gate = JSON.stringify({ runId: drive.runId, candidateId: drive.candidateId, attemptId: drive.repairAttemptId, phase: drive.phase, requests: requests?.map(r => r.requestId).sort(), decision: status.decision })
       if (gates.has(gate)) return stopped('agent-gate', 'AUTOPILOT_REPEATED_REPAIR_GATE')
       gates.add(gate)
       const agent = await resumeWaitingAgent(await invoke('agent', input), input, session)
@@ -98,11 +149,13 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
     setEnabled(scope: Scope, enabled: boolean) {
       const session = sessions.get(key(scope))
       if (session) session.enabled = enabled
+      persistence.setEnabled?.(scope, enabled)
       return { ok: true, active: Boolean(session?.enabled) }
     },
     register<E, I extends Scope, R extends object>(step: Step, handler: (event: E, input: I) => Promise<R>) {
       handlers.set(step, handler as unknown as Handler)
       return async (event: E, input: I): Promise<R> => {
+        input = { ...input, ...persistence.normalizeScope?.(input) }
         const id = key(input)
         const session = sessions.get(id)
         if (step === 'status') {
@@ -118,6 +171,7 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
         }
         if (step === 'cancel') {
           if (session) session.canceled = true
+          persistence.setEnabled?.(input, false)
           return handler(event, input)
         }
         if (session) return { ok: false, error: 'AUTOPILOT_IN_PROGRESS' } as R
@@ -126,9 +180,11 @@ export function createIterativeAutopilot(key: (scope: Scope) => string) {
         try {
           return await continueRun(step, { ...input, autopilot: false } as Input, own) as R
         } catch (error) {
-          return { ok: false, error: error instanceof Error ? error.message : String(error), autopilot: { stopped: 'error' } } as R
+          const message = error instanceof Error ? error.message : String(error)
+          persistence.onStopped?.(input, { stopped: 'error', error: message })
+          return { ok: false, error: message, autopilot: { stopped: 'error', error: message } } as R
         } finally {
-          sessions.delete(id)
+          try { persistence.setEnabled?.(input, false) } finally { sessions.delete(id) }
         }
       }
     },

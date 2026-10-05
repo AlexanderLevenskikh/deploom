@@ -57,6 +57,7 @@ import { commandEnvironment, decodeProcessOutputChunk, normalizePathForCompariso
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { discoveryProgress } from './iterative-discovery-progress.js'
 import { createIterativeAutopilot } from './iterative-autopilot.js'
+import { liveRunWriterPid, readAutopilotState, writeAutopilotState } from './iterative-autopilot-state.js'
 import { IterativeDecision, decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
 import { migrationProfilePath, readMigrationProfile, readMigrationScope, saveMigrationProfile } from './migration-validation.js'
 import { hasSavedProjectPlan, iterativeBeginInvocation, iterativeCheckTimeoutFailure, targetsFromDashboardState } from './iterative-begin.js'
@@ -7496,13 +7497,49 @@ function setupIpc(): void {
 
   // Baseline and never mutates producer bytes; export runs the real CLI when
   // durable JSON is sufficient and diagnoses TASK_INPUT_INSUFFICIENT otherwise.
-  const iterativeAutopilot = createIterativeAutopilot(input => {
+  const autopilotWorkspace = (input: { workspaceId?: string }) => {
     const workspace = findWorkspace(loadState(), input.workspaceId)
+    if (input.workspaceId && workspace.id !== input.workspaceId) throw new Error('AUTOPILOT_WORKSPACE_MISSING: the original workspace is unavailable')
+    return workspace
+  }
+  const autopilotRunDir = (input: { workspaceId?: string; projectName: string }) => {
+    const workspace = autopilotWorkspace(input)
+    return iterativeTaskRunDir(workspace, findProject(workspace, input.projectName))
+  }
+  const iterativeAutopilot = createIterativeAutopilot(input => {
+    const workspace = autopilotWorkspace(input)
     return stepLockKey(workspace.id, input.projectName)
+  }, {
+    normalizeScope: input => ({ ...input, workspaceId: autopilotWorkspace(input).id }),
+    setEnabled: (input, enabled) => {
+      const runDir = autopilotRunDir(input)
+      const previous = readAutopilotState(runDir)
+      const resume = enabled && (iterativeAutopilot.hasSession(input) || readAgentLease(agentLeaseFile(runDir))?.waiting === true)
+      writeAutopilotState(runDir, enabled, enabled && previous?.enabled === false ? undefined : previous?.retry, resume)
+    },
+    readRetry: input => readAutopilotState(autopilotRunDir(input))?.retry,
+    waitForWriter: input => liveRunWriterPid(autopilotRunDir(input), isPidAlive) ? Date.now() + 1_000 : undefined,
+    onStopped: (input, summary) => {
+      if (!summary.error) return
+      const runDir = autopilotRunDir(input)
+      updateAttempt(runDir, { status: 'failed', lastError: summary.error.slice(0, 4000), waitUntil: undefined })
+      recordAttemptLog(runDir, `Autopilot stopped (${summary.stopped}): ${summary.error.slice(0, 4000)}\n`)
+      publishIterativeAttempt(runDir)
+    },
+    writeRetry: (input, retry) => {
+      const runDir = autopilotRunDir(input)
+      writeAutopilotState(runDir, iterativeAutopilot.isEnabled(input) === true, retry)
+      if (retry) {
+        const reason = `Autopilot status retry ${retry.count}/3: ${retry.error}; retry at ${new Date(retry.retryAt).toISOString()}`
+        updateAttempt(runDir, { status: 'running', stage: 'drive', reason, waitUntil: retry.retryAt })
+        recordAttemptLog(runDir, `${reason}\n`)
+      } else updateAttempt(runDir, { waitUntil: undefined })
+      publishIterativeAttempt(runDir)
+    },
   })
 
   ipcMain.handle('flow:iterative:autopilot', async (_event, input: { workspaceId?: string; projectName: string; enabled: boolean }) => {
-    const workspace = findWorkspace(loadState(), input.workspaceId)
+    const workspace = autopilotWorkspace(input)
     const project = findProject(workspace, input.projectName)
     const file = agentLeaseFile(iterativeTaskRunDir(workspace, project))
     const lease = readAgentLease(file)
@@ -7707,6 +7744,7 @@ function setupIpc(): void {
     let phase: string | undefined
     let decision: ReturnType<typeof decideNextStep> | undefined
     let error: string | undefined
+    let retryable = false
     let requestedNode: string | undefined
     let runtimeView: Record<string, any> | undefined
     let progressSummary: { checkpointId: string; remaining: number; denominator: number; accepted: number; deferred: number; targetCount: number; unresolvedGoals: number } | undefined
@@ -7720,9 +7758,11 @@ function setupIpc(): void {
       const generator = join(bundledToolDir(), 'iterative_migration.py')
       const result = await spawnCapture(python, iterativeStatusInvocation(runDir, generator, python).args, workspace.path, 120_000)
       if (result.code !== 0) {
-        error = result.stderr.trim() || `STATUS_EXIT_${result.code}`
+        error = result.timedOut ? 'STATUS_TIMEOUT' : (result.stderr.trim() || result.stdout.trim() || `STATUS_EXIT_${result.code}`)
+        retryable = result.timedOut === true
       } else {
         const payload = parseIterativeStatusPayload(result.stdout) ?? readIterativeStatus(runDir)
+        if (!payload) { error = 'STATUS_UNREADABLE'; retryable = true }
         if (payload) {
           phase = String(payload.run?.phase ?? '')
           progressSummary = payload.progressSummary
@@ -7758,6 +7798,7 @@ function setupIpc(): void {
     }
     return {
       ok: error === undefined,
+      retryable,
       present,
       stale,
       staleReason: taskStaleness(runDir).reason,
@@ -7768,6 +7809,7 @@ function setupIpc(): void {
       // not from a local `stepBusy`.
       inFlight: iterativeStepInFlight.has(stepLockKey(workspace.id, project.name)),
       autopilotActive: waitLease?.waiting === true && waitLease.autopilot === true,
+      autopilotEnabled: iterativeAutopilot.isEnabled(input) ?? readAutopilotState(runDir)?.enabled ?? (waitLease?.autopilot === true),
       // P1#4: durable "Проверить проект" verdict (only meaningful while no run
       // exists). Lets the panel show a distinct "ready → Начать обновление"
       // state after a real check instead of conflating check with start.
@@ -8232,7 +8274,7 @@ function setupIpc(): void {
   // between an accepted cohort and the next one. Restart-safe by design:
   // every iteration recomputes the decision from the DURABLE Python state, so
   // a killed app simply resumes from where the files say the run stands.
-  ipcMain.handle('flow:iterative:drive', iterativeAutopilot.register('drive', async (_event, input: { workspaceId?: string; projectName: string; retryInfra?: boolean; discardCandidate?: boolean }) => {
+  const runIterativeDriveWithAutopilot = iterativeAutopilot.register('drive', async (_event, input: { workspaceId?: string; projectName: string; retryInfra?: boolean; discardCandidate?: boolean }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -8257,7 +8299,7 @@ function setupIpc(): void {
       }
       // L1: rebuild the journal after a restart — same attemptId, status running.
       resumeAttempt(runDir, project.name, workspace.id)
-      updateAttempt(runDir, { status: 'running', stage: 'drive', lastError: undefined, cancelRequested: false })
+      updateAttempt(runDir, { status: 'running', stage: 'drive', lastError: undefined, cancelRequested: false, waitUntil: undefined })
       publish()
       const python = resolveExecutable('python')
       const generator = join(bundledToolDir(), 'iterative_migration.py')
@@ -8280,9 +8322,9 @@ function setupIpc(): void {
           : undefined
         if (!payload) {
           const raw = statusResult.timedOut ? 'STATUS_TIMEOUT' : (statusResult.stderr.trim() || 'STATUS_UNREADABLE')
-          updateAttempt(runDir, { status: 'failed', stage: 'drive', lastError: raw.slice(0, 4000), lastStep: 'status' })
+          updateAttempt(runDir, { status: 'failed', stage: 'drive', lastError: discardCandidate ? blockedRepair?.lastError : raw.slice(0, 4000), lastStep: 'status' })
           publish()
-          return { ok: false, steps, stopped: 'error', error: raw.slice(0, 4000), attempt: readAttempt(runDir) }
+          return { ok: false, retryable: statusResult.timedOut === true || statusResult.code === 0, retryInfraPending: retryInfra, discardCandidatePending: discardCandidate, steps, stopped: 'error', error: raw.slice(0, 4000), attempt: readAttempt(runDir) }
         }
         if (discardCandidate) {
           discardCandidate = false
@@ -8330,7 +8372,8 @@ function setupIpc(): void {
         const decision = decideNextStep(runDir, payload)
         updateAttempt(runDir, { status: 'running', stage: 'drive', phase, lastStep: decision.step ?? undefined })
         publish()
-        // GATE: the repair agent is a human/provider action, never auto-run.
+        // Return the exact repair gate; the Electron coordinator dispatches
+        // the agent only while the user has enabled autopilot.
         if (decision.step === 'agent') {
           // P1.1: keep the human-facing ТЗ fresh at the gate — rebuilt from the
           // current durable state, never a stale C0-bound artifact.
@@ -8341,6 +8384,9 @@ function setupIpc(): void {
             ok: true,
             steps,
             stopped: 'agent-gate',
+            runId: payload.run?.runId,
+            candidateId: payload.candidate?.candidateId ?? `bootstrap:${payload.run?.activeCheckpointId}`,
+            repairAttemptId: payload.candidate?.attemptId,
             phase,
             reason: decision.reason,
             bootstrap: decision.bootstrap,
@@ -8384,7 +8430,8 @@ function setupIpc(): void {
             lastStep: decision.step,
           })
           publish()
-          return { ok: canceledByUser, steps, stopped: canceledByUser ? 'canceled' : 'error', step: decision.step, error: canceledByUser ? undefined : raw.slice(0, 4000), attempt: readAttempt(runDir) }
+          const failure = parseIterativeFailure(result.stdout)
+          return { ok: canceledByUser, retryable: !canceledByUser && failure?.code === 'TRIAL_LOCKED' && failure.summary.startsWith('RUN_LOCK_BUSY:'), retryInfraPending: retryInfra, discardCandidatePending: discardCandidate, steps, stopped: canceledByUser ? 'canceled' : 'error', step: decision.step, error: canceledByUser ? undefined : raw.slice(0, 4000), attempt: readAttempt(runDir) }
         }
         steps.push(decision.step)
         updateSteps()
@@ -8397,7 +8444,8 @@ function setupIpc(): void {
     } finally {
       iterativeStepInFlight.delete(stepLockKey(workspace.id, project.name))
     }
-  }))
+  })
+  ipcMain.handle('flow:iterative:drive', runIterativeDriveWithAutopilot)
 
   async function startStandaloneOpenCodeServer(cwd: string, savedDatabasePath?: string): Promise<{ url: string; databasePath: string; stop: () => Promise<void> } | undefined> {
     const directory = savedDatabasePath ? dirname(savedDatabasePath) : join(app.getPath('temp'), `iter-agent-opencode-${randomUUID()}`)
@@ -8455,7 +8503,7 @@ function setupIpc(): void {
     if (missing.length > 0) return { status: 'input-missing', missing }
     const result = await spawnCapture(python, [generator, '--run-dir', runDir, 'export-task', '--language', 'both'], workspacePath, 120_000)
     if (result.code !== 0) {
-      return { status: 'export-failed', exitCode: result.code, stderr: (result.stderr || '').trim().slice(0, 800) }
+      return { status: 'export-failed', exitCode: result.code, stderr: (result.stderr || '').trim().slice(0, 800), timedOut: result.timedOut }
     }
     return { status: 'ok' }
   }
@@ -8481,8 +8529,7 @@ function setupIpc(): void {
   }
 
   async function retryIterativeAgent(scope: { workspaceId?: string; projectName: string }): Promise<void> {
-    const state = loadState()
-    const workspace = findWorkspace(state, scope.workspaceId)
+    const workspace = autopilotWorkspace(scope)
     const project = findProject(workspace, scope.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
     const fullScope = { workspaceId: workspace.id, projectName: project.name }
@@ -8519,6 +8566,7 @@ function setupIpc(): void {
 
   const runIterativeAgent = async (input: { workspaceId?: string; projectName: string }): Promise<{
     autopilot?: { stopped: string; error?: string }
+    retryable?: boolean
     ok: boolean
     changedFiles?: string[]
     forbiddenMutations?: string[]
@@ -8569,16 +8617,27 @@ function setupIpc(): void {
       recordAttemptLog(runDir, `Agent launch gave up: ${leaseDecision.detail}\n`)
       return { ok: false, error: leaseDecision.detail }
     }
+    if (leaseDecision.action === 'in-progress') {
+      const reason = `AGENT_IN_PROGRESS: ремонт от ${existingLease?.startedAt} (${existingLease?.provider}, сессия ${String(existingLease?.sessionId ?? '').slice(0, 8)}…) ещё не завершён; ждём завершения процесса`
+      const retryAt = Date.now() + 30_000
+      if (autopilot) {
+        ensureAttemptRecord(runDir, project.name, workspace.id)
+        updateAttempt(runDir, { status: 'waiting', stage: 'agent', lastError: undefined, reason, waitUntil: retryAt })
+        publishIterativeAttempt(runDir)
+      }
+      return { ok: false, ...(autopilot ? { waiting: true, retryAt, reason } : {}), error: reason }
+    }
     const carriedLaunchAttempts = leaseDecision.action === 'retry' ? leaseDecision.launchAttempts : 0
     const resumeSessionId = leaseDecision.action === 'resume' || leaseDecision.action === 'retry' ? leaseDecision.sessionId : undefined
     const resuming = resumeSessionId !== undefined
     // L1: journal the agent dispatch so the panel can show "ремонт у агента"
     // and the last error survives a restart.
     resumeAttempt(runDir, project.name, workspace.id)
-    updateAttempt(runDir, { status: 'running', stage: 'agent' })
+    updateAttempt(runDir, { status: 'running', stage: 'agent', waitUntil: undefined })
     publishIterativeAttempt(runDir)
     let agentOutputTail = ''
     let agentSucceeded = false
+    let preserveLease = false
     try {
       const python = resolveExecutable('python')
       const generator = join(bundledToolDir(), 'iterative_migration.py')
@@ -8592,8 +8651,10 @@ function setupIpc(): void {
       // from the durable assignment without the task artifact.
       const taskRefresh = await refreshIterativeTaskArtifact(runDir, generator, python, workspace.path)
       if (taskRefresh.status === 'export-failed') {
+        preserveLease = true
         return {
           ok: false,
+          retryable: taskRefresh.timedOut === true,
           error: `TASK_EXPORT_FAILED: export-task завершился с кодом ${taskRefresh.exitCode}${taskRefresh.stderr ? `: ${taskRefresh.stderr}` : ''}; ремонт не диспатчится — повторите попытку`,
         }
       }
@@ -8602,7 +8663,8 @@ function setupIpc(): void {
         ? parseIterativeStatusPayload(statusResult.stdout) ?? readIterativeStatus(runDir)
         : undefined
       if (!payload) {
-        return { ok: false, error: statusResult.stderr.trim() || 'STATUS_UNREADABLE' }
+        preserveLease = true
+        return { ok: false, retryable: statusResult.timedOut === true || statusResult.code === 0, error: statusResult.timedOut ? 'STATUS_TIMEOUT' : (statusResult.stderr.trim() || statusResult.stdout.trim() || 'STATUS_UNREADABLE') }
       }
       const decision = decideNextStep(runDir, payload)
       if (decision.step !== 'agent') {
@@ -8618,12 +8680,6 @@ function setupIpc(): void {
       // (same attempt, durable trial edits, budget untouched). An absent or
       // expired lease starts fresh. A parked WAIT is handled before the run
       // journal starts (above); here only in-progress/resume/fresh remain.
-      if (leaseDecision.action === 'in-progress') {
-        return {
-          ok: false,
-          error: `AGENT_IN_PROGRESS: ремонт от ${existingLease?.startedAt} (${existingLease?.provider}, сессия ${String(existingLease?.sessionId ?? '').slice(0, 8)}…) ещё не завершён; дождитесь завершения`,
-        }
-      }
       // R7: the bootstrap repair works in the version-neutral C0 trial (run-level
       // bootstrapRefs, no candidate); candidate repair works in the candidate
       // trial. Both branches build the prompt over the durable repair requests.
@@ -8978,7 +9034,7 @@ function setupIpc(): void {
         // A parked launch-wait lease is the durable record of the wait; only a
         // non-waiting lease is cleared here. The waiting return above already
         // published the 'waiting' attempt; the retry timer consumes the lease.
-        if (!readAgentLease(leasePath)?.waiting) clearAgentLease(leasePath)
+        if (!preserveLease && !readAgentLease(leasePath)?.waiting) clearAgentLease(leasePath)
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -8999,6 +9055,23 @@ function setupIpc(): void {
 
   const runIterativeAgentWithAutopilot = iterativeAutopilot.register('agent', async (_event, input: { workspaceId?: string; projectName: string; autopilot?: boolean }) => runIterativeAgent(input))
   ipcMain.handle('flow:iterative:agent', runIterativeAgentWithAutopilot)
+
+  // Recover an explicitly enabled mission even if no renderer is open. Drive
+  // recomputes the next action from Python state, including an existing lease;
+  // it does not replay a completed agent or reset an exhausted Python budget.
+  queueMicrotask(() => {
+    for (const workspace of loadState().workspaces) {
+      for (const project of readProjects(workspace)) {
+        const runDir = iterativeTaskRunDir(workspace, project)
+        if (readAutopilotState(runDir)?.resume !== true || readAttempt(runDir)?.cancelRequested) continue
+        const scope = { workspaceId: workspace.id, projectName: project.name, autopilot: true }
+        void runIterativeDriveWithAutopilot(undefined, scope).catch(error => {
+          writeAutopilotState(runDir, false)
+          recordAttemptLog(runDir, `Autopilot recovery failed: ${String(error)}\n`)
+        })
+      }
+    }
+  })
 
   ipcMain.handle('flow:dependency-graph-snapshot', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()

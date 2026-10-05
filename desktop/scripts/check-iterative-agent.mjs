@@ -395,6 +395,8 @@ const expiredLease = {
 };
 const expired = decideAgentLeaseDispatch(expiredLease, () => true);
 if (expired.action !== "none") throw new Error(`Expired lease must dispatch fresh even with a live pid: ${JSON.stringify(expired)}`);
+assert.equal(decideAgentLeaseDispatch({...expiredLease,childPid:321},pid=>pid===321).action,'in-progress');
+assert.equal(decideAgentLeaseDispatch({...expiredLease,childPid:321},()=>false).action,'none');
 
 // 11b. Launch-wait (rate limit / temporary outage): a PARKED WAIT lease is the
 // durable "repair is parked" record. While its retry time is in the future the

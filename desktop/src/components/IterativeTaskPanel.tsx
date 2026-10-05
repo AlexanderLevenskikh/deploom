@@ -361,7 +361,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     setNote(undefined)
     try {
       await onBeforeStart?.()
-      const outcome = await onDrive(projectName, autopilot, runner?.decision?.infraBlocked === true, discardCandidate)
+      const outcome = await onDrive(projectName, runner?.autopilotEnabled || runner?.autopilotActive || autopilot, runner?.decision?.infraBlocked === true, discardCandidate)
       if (outcome.autopilot) {
         setNote(autopilotNote(outcome.autopilot))
       } else if (!outcome.ok) {
@@ -403,7 +403,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       const profile = validationDraft ?? runner?.validationProfile
       const validationProfile = runner?.present && !discovery?.restart ? undefined : profile && { ...profile, commands: profile.commands.map(c => c.trim()).filter(Boolean) }
       await onBeforeStart?.()
-      const outcome = await onBegin(projectName, { mode: discovery?.mode ?? 'none', autopilot, ...discovery, validationProfile })
+      const outcome = await onBegin(projectName, { mode: discovery?.mode ?? 'none', autopilot: runner?.autopilotEnabled || runner?.autopilotActive || autopilot, ...discovery, validationProfile })
       if (outcome.autopilot) {
         setNote(autopilotNote(outcome.autopilot))
       } else if (outcome.ok) {
@@ -513,7 +513,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     setNote(undefined)
     try {
       await onBeforeStart?.()
-      const outcome = await onAgent(projectName, autopilot)
+      const outcome = await onAgent(projectName, runner?.autopilotEnabled || runner?.autopilotActive || autopilot)
       if (outcome.autopilot) {
         setNote(autopilotNote(outcome.autopilot))
       } else if (outcome.ok) {
@@ -862,7 +862,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
           {/* THE single main action for the current scenario state. */}
           <div className="resume-notice">
             <span>{mainDescription}</span>
-            <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.autopilotActive || autopilot} disabled={disabledExternal === true} onChange={event => { const enabled = event.target.checked; setAutopilot(enabled); void window.dependencyFlow?.setIterativeAutopilot({ workspaceId, projectName, enabled }).then(() => refreshRunner()).catch(error => { setAutopilot(!enabled); setNote(String(error)) }) }} />{text('Автопилот: продолжать автоматически, включая исправления агентом', 'Autopilot: continue automatically, including agent repairs')}</label>
+            <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.autopilotEnabled || runner?.autopilotActive || autopilot} disabled={disabledExternal === true} onChange={event => { const enabled = event.target.checked; setAutopilot(enabled); void window.dependencyFlow?.setIterativeAutopilot({ workspaceId, projectName, enabled }).then(() => refreshRunner()).catch(error => { setAutopilot(!enabled); setNote(String(error)) }) }} />{text('Автопилот: продолжать автоматически, включая исправления агентом', 'Autopilot: continue automatically, including agent repairs')}</label>
             <small>{text('Можно включить во время работы. Автопилот продолжит после текущего шага; выключение остановит автоматические переходы.', 'Enable while running to continue after the current step; disabling stops automatic transitions.')}</small>
             <footer className="baseline-intent-actions">
               <button
