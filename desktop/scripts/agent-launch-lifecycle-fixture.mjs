@@ -256,4 +256,38 @@ for (const verbose of [false,true]) {
   assert.equal(f.launches.length,1);assert.equal(f.drives(),1);
   assert.equal(f.waits.length,0);assert.equal(f.lease(),undefined);
 }
-console.log('agent-launch-lifecycle: production handler + real child wait/resume/cancel/autopilot/recovered error OK');
+// A watchdog after actual tool execution is a candidate deferral, not another
+// model-launch wait. Exercise the real child kill, then inspect typed feedback.
+for (const activity of ['running','completed']) {
+  const f=fixture();
+  const stream=f.bindings.spawnIterativeStreamed;
+  f.bindings.spawnIterativeStreamed=(dir,cmd,args,cwd,_timeout,...rest)=>stream(dir,cmd,args,cwd,1000,...rest);
+  f.setChild(`
+    require('fs').writeFileSync('input.js','unverified repair');
+    console.log(JSON.stringify({type:'tool_use',sessionID:'ses-active',part:{type:'tool',state:{status:'${activity}'}}}));
+    setTimeout(()=>{},10000);
+  `);
+  const result=await f.autonomous(undefined,{projectName:'fixture',autopilot:true});
+  assert.equal(result.autopilot.stopped,'finished',JSON.stringify(result));
+  const feedback=JSON.parse(readFileSync(join(f.runDir,'trial','agent-feedback.json'),'utf8'));
+  assert.equal(feedback.kind,'INCONCLUSIVE');assert.deepEqual(feedback.changedFiles,[]);
+  assert.match(feedback.reason,/deadline exceeded/);
+  assert.equal(f.launches.length,1);assert.equal(f.waits.length,0);
+  assert.equal(f.drives(),1);assert.equal(f.lease(),undefined);
+}
+// Confirmed provider failure after tool work still waits; it is not a failed
+// compatibility proof and must not consume the repair as INCONCLUSIVE.
+{
+  const f=fixture();const stream=f.bindings.spawnIterativeStreamed;
+  f.bindings.spawnIterativeStreamed=(dir,cmd,args,cwd,_timeout,...rest)=>stream(dir,cmd,args,cwd,1000,...rest);
+  f.setChild(`
+    console.log(JSON.stringify({type:'tool_use',sessionID:'ses-provider',part:{type:'tool',state:{status:'completed'}}}));
+    console.log(JSON.stringify({type:'error',sessionID:'ses-provider',error:{message:'APITimeoutError: model unavailable'}}));
+    setTimeout(()=>{},10000);
+  `);
+  const result=await f.run({projectName:'fixture'});
+  assert.equal(result.waiting,true,JSON.stringify(result));
+  assert.equal(f.lease().waiting,true);assert.equal(f.launches.length,1);
+  assert.equal(existsSync(join(f.runDir,'trial','agent-feedback.json')),false);
+}
+console.log('agent-launch-lifecycle: production handler + real child wait/resume/cancel/autopilot/recovered error/active timeout OK');

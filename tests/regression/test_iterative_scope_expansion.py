@@ -98,6 +98,69 @@ class ScopeExpansionTests(unittest.TestCase):
         self.assertEqual(desired['dom'],'10.4.1')
         self.assertFalse(issues)
 
+    def test_overlapping_companions_preserve_cap_and_allow_independent_progress(self):
+        origins=[f'origin-{i:02}' for i in range(24)]
+        old=dict.fromkeys([*origins,'other-a','other-b'],'1.0.0')
+        desired=dict.fromkeys(old,'2.0.0')
+        ledger=self.ledger(['peer-one = 2.0.0'],origins)
+        ledger['scopeExpansions'] += self.ledger(['peer-two = 2.0.0'],origins)['scopeExpansions']
+        desired,normalized,_=prepare_expansions(old,desired,ledger,'C0',[])
+        plan,details=plan_adaptive_cohort(incumbent=old,desired=desired,
+            config={'cohortMaxPackages':24},ledger=normalized,checkpoints=[],base_checkpoint_id='C0',
+            blocked_fingerprints=[],learned_nogoods=[],fingerprint_fn=assignment_fingerprint)
+        self.assertEqual(plan.packages,('other-a','other-b'))
+        self.assertNotIn('peer-one',plan.assignment_dict)
+        self.assertTrue(all(plan.assignment_dict[n]=='1.0.0' for n in origins))
+        self.assertEqual(details['cohortAtomIssues'][0]['packageCount'],26)
+
+    def test_durable_planning_and_status_report_cap_without_changing_policy_or_checkpoint(self):
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('cap_fixture',Path(__file__).with_name('test_iterative_finish_baseline_and_feedback_validation.py'))
+        fixture=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixture)
+        from argparse import Namespace
+        with tempfile.TemporaryDirectory() as tmp:
+            root=fixture._RunDir(Path(tmp));run=fixture._run_dict()
+            origins=[f'origin-{i:02}' for i in range(24)]
+            old=dict.fromkeys([*origins,'other-a','other-b'],'1.0.0')
+            config=fixture._config_dict(targets=dict.fromkeys(old,'2.0.0'),cohortMaxPackages=24)
+            checkpoint=fixture._checkpoint_dict(fullAssignment=old)
+            root.write_run(run);root.write_config(config);root.write_checkpoint(checkpoint)
+            ledger={'schemaVersion':migration.SCHEMA_VERSION,**self.ledger(['peer = 2.0.0'],origins)};migration.save_ledger(root.root,ledger)
+            with patch.object(migration,'_assert_runtime_unchanged'):
+                migration._plan_next_locked(root.root,run,config)
+            candidate=migration.load_candidate(root.root)
+            self.assertEqual(set(candidate['delta']['changed']),{'other-a','other-b'})
+            self.assertNotIn('peer',candidate['fullAssignment'])
+            self.assertEqual(migration.load_checkpoint(root.root,'C0'),checkpoint)
+            self.assertEqual(migration.load_config(root.root),config)
+            self.assertEqual(migration.load_ledger(root.root)['scopeExpansions'],ledger['scopeExpansions'])
+            migration.cmd_status(Namespace(run_dir=str(root.root)))
+            status=json.loads((root.root/'status.json').read_text())
+            self.assertEqual(status['scopeExpansionIssues'][0]['reason'],'COHORT_ATOM_EXCEEDS_CAP')
+            self.assertEqual(status['progressSummary']['accepted'],0)
+            self.assertEqual(status['progressSummary']['denominator'],26)
+
+    def test_active_timeout_feedback_defers_exact_candidate_and_replans_without_acceptance(self):
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('timeout_fixture',Path(__file__).with_name('test_iterative_finish_baseline_and_feedback_validation.py'))
+        fixture=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixture)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=fixture._RunDir(Path(tmp));run=fixture._run_dict(phase='REPAIRING',activeCandidateId='cand-0001')
+            config=fixture._config_dict();checkpoint=fixture._checkpoint_dict()
+            candidate=fixture._candidate_dict(run,fullAssignment={'pkg-a':'2.0.0','pkg-b':'1.1.0'},delta={'changed':{'pkg-a':'2.0.0','pkg-b':'1.1.0'}})
+            root.write_run(run);root.write_config(config);root.write_checkpoint(checkpoint);root.write_candidate(candidate)
+            feedback=fixture._feedback(run,candidate,kind='INCONCLUSIVE',changedFiles=[],reason='Active agent repair deadline exceeded')
+            migration._apply_feedback_locked(root.root,run,config,feedback)
+            ledger=migration.load_ledger(root.root)
+            self.assertTrue(ledger['deferrals']);self.assertFalse(ledger['blocks'])
+            self.assertEqual(migration.load_run(root.root)['activeCheckpointId'],'C0')
+            self.assertEqual(migration.load_candidate(root.root)['stage'],'REJECTED')
+            with patch.object(migration,'_assert_runtime_unchanged'):
+                migration._plan_next_locked(root.root,migration.load_run(root.root),config)
+            self.assertNotEqual(assignment_fingerprint(migration.load_candidate(root.root)['fullAssignment']),assignment_fingerprint(candidate['fullAssignment']))
+            self.assertEqual(migration.load_checkpoint(root.root,'C0'),checkpoint)
+            self.assertEqual(migration.load_config(root.root),config)
+
     def test_scoped_names_and_exact_versions_are_parsed(self):
         self.assertEqual(parse_companion('@testing-library/dom = 10.4.2'),('@testing-library/dom','10.4.2'))
         self.assertEqual(parse_companion('@scope/package@1.0.0'),('@scope/package','1.0.0'))

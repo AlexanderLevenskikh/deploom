@@ -2394,6 +2394,10 @@ def _plan_next_locked(
         blocked_fingerprints=blocked_fingerprints, learned_nogoods=learned_nogoods,
         fingerprint_fn=assignment_fingerprint,
     )
+    if cohort_selection.get("cohortAtomIssues"):
+        _emit_status({"event": "plan-next.cohort-atom-deferred", "runId": run["runId"],
+                      "issues": cohort_selection["cohortAtomIssues"],
+                      "message": "Cohort cap preserved; other independent groups continue."})
     atomic_groups = [list(plan.packages)] if plan else []
     if plan is None:
         if cohort_selection.get("searchBudgetExhausted"):
@@ -4850,6 +4854,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     from iterative_task import build_progress_summary
     progress_summary = build_progress_summary(config, _all_checkpoints(run_dir), checkpoint, ledger)
     from iterative_scope_expansion import prepare_expansions
+    from iterative_cohort_planner import cohort_atom_issues
+    status_incumbent = dict(checkpoint.get("fullAssignment") or {})
+    status_desired, status_ledger, expansion_issues = prepare_expansions(
+        status_incumbent,
+        {n: (config.get("targets") or {}).get(n, v) for n, v in status_incumbent.items()},
+        ledger, checkpoint_id, _all_checkpoints(run_dir),
+        unavailable={(e.get("package"), e.get("target")) for e in ledger.get("targetAvailabilityDeferrals", [])
+                     if e.get("scope") == availability_scope_flat(run, config)})
+    expansion_issues += cohort_atom_issues(status_incumbent, status_desired, config, status_ledger, checkpoint_id)
     payload = {
         "schemaVersion": SCHEMA_VERSION,
         "run": run,
@@ -4868,12 +4881,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "counters": ledger.get("counters", {}),
         },
         "infraBlocked": run.get("infraBlocked") or None,
-        "scopeExpansionIssues": prepare_expansions(
-            dict(checkpoint.get("fullAssignment") or {}),
-            {n: (config.get("targets") or {}).get(n, v) for n, v in (checkpoint.get("fullAssignment") or {}).items()},
-            ledger, checkpoint_id, _all_checkpoints(run_dir),
-            unavailable={(e.get("package"), e.get("target")) for e in ledger.get("targetAvailabilityDeferrals", [])
-                         if e.get("scope") == availability_scope_flat(run, config)})[2],
+        "scopeExpansionIssues": expansion_issues,
         "openRepairRequests": repair_requests,
         "config": {
             "projectName": config.get("projectName"),

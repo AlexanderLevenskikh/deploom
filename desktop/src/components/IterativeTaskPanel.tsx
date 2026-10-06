@@ -837,8 +837,12 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       {runner?.scopeExpansionIssues?.length ? (
         <div className="resume-notice warning" role="status" data-testid="scope-expansion-issues">
           <strong>{text('Для части обновлений нужен уточнённый вариант', 'Some updates need a more specific proposal')}</strong>
-          <span>{text('Проверенный результат сохранён. Для этой группы агенту нужна точная версия обязательного пакета: имя = X.Y.Z. Следующим шагом можно обновить другие группы.', 'The verified result is preserved. This cohort needs an exact required package version from the agent: name = X.Y.Z. Other cohorts can be updated next.')}</span>
-          {runner.scopeExpansionIssues.map((issue, index) => <span key={index}>{issue.packages.join(', ')} · {issue.proposals.join('; ')}</span>)}
+          <span>{text('Проверенный результат сохранён. Заблокированные группы остаются в списке незавершённых обновлений; другие группы можно попробовать отдельно.', 'The verified result is preserved. Blocked groups remain in the pending updates; other groups can be tried separately.')}</span>
+          {runner.scopeExpansionIssues.map((issue, index) => <span key={index}>
+            {issue.reason === 'COHORT_ATOM_EXCEEDS_CAP'
+              ? text(`Обязательная группа: ${issue.packageCount} пакетов при лимите ${issue.maxPackages}. Нужен больший лимит или уточнённое предложение companion-пакетов.`, `Required group: ${issue.packageCount} packages, cap ${issue.maxPackages}. Increase the cap or provide a narrower companion proposal.`)
+              : `${issue.packages.join(', ')} · ${issue.proposals.join('; ')} · ${issue.nextAction}`}
+          </span>)}
         </div>
       ) : null}
       {validationError ? <div className="resume-notice warning" role="alert">{validationError}</div> : null}

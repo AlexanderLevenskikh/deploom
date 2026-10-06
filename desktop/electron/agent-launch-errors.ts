@@ -129,6 +129,15 @@ export function agentLaunchProviderError(output: string, pending?: string): stri
   return pending
 }
 
+/** Started tools establish active repair work, never project correctness. */
+export function agentRepairActivity(line: string): boolean {
+  try {
+    const event = JSON.parse(line)
+    return event.type === 'tool_use' && event.part?.type === 'tool' &&
+      ['running', 'completed', 'error'].includes(event.part.state?.status)
+  } catch { return false }
+}
+
 const HAS_RATE_LIMIT = [
   /\b429\b/,
   /\brate[ _-]?limit/i,

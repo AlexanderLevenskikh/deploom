@@ -45,6 +45,35 @@ def _budget_strategy(config):
     return max(8, min(4096, int(config.get("cohortSearchSteps") or 128)))
 
 
+def _mandatory_atoms(actionable, config, ledger, checkpoint_id):
+    parent = {name: name for name in actionable}
+    def find(name):
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]; name = parent[name]
+        return name
+    def link(names):
+        names = sorted(set(names) & parent.keys())
+        for name in names[1:]: parent[find(name)] = find(names[0])
+    for names in config.get("cohortAtoms") or []: link(names)
+    for entry in ledger.get("scopeExpansions") or []:
+        if entry.get("baseCheckpointId") == checkpoint_id:
+            link([*(entry.get("packages") or []), *(entry.get("companions") or [])])
+    atoms = {}
+    for name in actionable: atoms.setdefault(find(name), []).append(name)
+    return atoms
+
+
+def cohort_atom_issues(incumbent, desired, config, ledger, checkpoint_id):
+    """A scheduling limit defers the atom; it never proves incompatibility."""
+    cap = max(1, min(32, int(config.get("cohortMaxPackages") or 24)))
+    actionable = sorted(name for name in desired if incumbent.get(name) != desired[name])
+    return [{"packages": sorted(group), "proposals": [], "reason": "COHORT_ATOM_EXCEEDS_CAP",
+             "packageCount": len(group), "maxPackages": cap,
+             "nextAction": f"Required group has {len(group)} packages; cohort cap is {cap}. Increase the cap or provide a narrower evidenced companion proposal. Other groups continue."}
+            for group in _mandatory_atoms(actionable, config, ledger, checkpoint_id).values()
+            if len(group) > cap]
+
+
 def plan_adaptive_cohort(*, incumbent, desired, config, ledger, checkpoints, blocked_fingerprints, learned_nogoods, fingerprint_fn, base_checkpoint_id):
     actionable = sorted(name for name in desired if incumbent.get(name) != desired[name])
     if not actionable: return None, {}
@@ -85,26 +114,20 @@ def plan_adaptive_cohort(*, incumbent, desired, config, ledger, checkpoints, blo
             if entry.get("baseCheckpointId") == base_checkpoint_id:
                 link([*(entry.get("packages") or []), *(entry.get("companions") or [])])
     # Mandatory atoms are independent of soft family/locality hints.
-    atom_parent = {n: n for n in actionable}
-    def atom_find(n):
-        while atom_parent[n] != n:
-            atom_parent[n] = atom_parent[atom_parent[n]]; n = atom_parent[n]
-        return n
-    def atom_link(names):
-        names = sorted(set(names) & atom_parent.keys())
-        for n in names[1:]: atom_parent[atom_find(n)] = atom_find(names[0])
-    for names in config.get("cohortAtoms") or []: atom_link(names)
-    for entry in ledger.get("scopeExpansions") or []:
-        if entry.get("baseCheckpointId") == base_checkpoint_id:
-            atom_link([*(entry.get("packages") or []), *(entry.get("companions") or [])])
-    atoms = {}
-    for n in actionable: atoms.setdefault(atom_find(n), []).append(n)
+    atoms = _mandatory_atoms(actionable, config, ledger, base_checkpoint_id)
     atom_for = {n: set(group) for group in atoms.values() for n in group}
-    if any(len(group) > cap for group in atoms.values()):
-        raise ValueError("COHORT_ATOM_EXCEEDS_CAP: increase cap or revise the exact companion proposal")
+    atom_root = {n: root for root, group in atoms.items() for n in group}
+    atom_issues = cohort_atom_issues(incumbent, desired, config, ledger, base_checkpoint_id)
+    deferred_atoms = {n for issue in atom_issues for n in issue["packages"]}
+    actionable_count = len(actionable)
+    actionable = [n for n in actionable if n not in deferred_atoms]
+    if not actionable:
+        return None, {"strategy": "adaptive-greedy", "batchLimit": size,
+                      "cohortAtomIssues": atom_issues, "remainingActionable": actionable_count}
+
     def atomic_parts(names):
         parts = {}
-        for n in names: parts.setdefault(atom_find(n), []).append(n)
+        for n in names: parts.setdefault(atom_root[n], []).append(n)
         return list(parts.values())
     units = {}
     for name in actionable: units.setdefault(find(name), []).append(name)
@@ -279,7 +302,7 @@ def plan_adaptive_cohort(*, incumbent, desired, config, ledger, checkpoints, blo
         # missing prior must not turn an unmeasured action into a free action.
         rank = (not bool(priority.intersection(changed)), -len(changed), sum(_risk(incumbent.get(n),desired[n]) for n in changed), changed)
 
-        options.append((rank, ProgressiveExtensionPlan(tuple(sorted(assignment.items())), changed, fingerprint, len(actionable)-len(changed)), operator, estimate))
+        options.append((rank, ProgressiveExtensionPlan(tuple(sorted(assignment.items())), changed, fingerprint, actionable_count-len(changed)), operator, estimate))
 
     # Prefer another intact cohort before spending work localizing a failure.
     for names in roots:
@@ -334,7 +357,7 @@ def plan_adaptive_cohort(*, incumbent, desired, config, ledger, checkpoints, blo
             details["searchEscalations"] = details.get("searchEscalations", 0) + 1
             return plan, details
         return None, {"strategy": "adaptive-greedy", "batchLimit": size,
-                      "searchBudgetExhausted": exhausted, "searchStepsLimit": limit}
+                      "searchBudgetExhausted": exhausted, "searchStepsLimit": limit, "cohortAtomIssues": atom_issues, "remainingActionable": actionable_count}
     measured = strategy == "cost-aware" and all(option[3] is not None for option in options)
     if measured:
         chosen = min(options, key=lambda option: (option[0][0], -option[3]["expectedPackagesPerSecond"], option[0]))
@@ -344,4 +367,4 @@ def plan_adaptive_cohort(*, incumbent, desired, config, ledger, checkpoints, blo
     from cohort_conflict_regions import selection_region
     region_selection = selection_region(regions, plan.packages) if local_mode else {"operatorReason": selection_phase}
     if region_selection.get("regionIds") and region_selection["operatorReason"] == "opaque-region-local-split": operator = "local-split"
-    return plan, {**region_selection, "localRegionScheduling": local_mode, "selectedAtoms": atomic_parts(plan.packages),"strategy": "adaptive-greedy", "schedulingStrategy": strategy, "operator": operator, "costEstimate": estimate if measured else None, "batchLimit": size, "maxPackages": cap, "selectedPackages": len(plan.packages), "selectionPhase": selection_phase, "remainingActionable": len(actionable), "familyGroups": [names for names in ordered if len(names)>1], "dependencyAtomCount": len(atomic_parts(plan.packages)), "companionPackages": sorted({n for e in ledger.get("scopeExpansions", []) if e.get("baseCheckpointId") == base_checkpoint_id for n in e.get("companions", []) if n in plan.packages}), "peerHintEdges": len(peer_edges)}
+    return plan, {**region_selection, "localRegionScheduling": local_mode, "selectedAtoms": atomic_parts(plan.packages),"strategy": "adaptive-greedy", "schedulingStrategy": strategy, "operator": operator, "costEstimate": estimate if measured else None, "batchLimit": size, "maxPackages": cap, "selectedPackages": len(plan.packages), "selectionPhase": selection_phase, "remainingActionable": actionable_count, "cohortAtomIssues": atom_issues, "familyGroups": [names for names in ordered if len(names)>1], "dependencyAtomCount": len(atomic_parts(plan.packages)), "companionPackages": sorted({n for e in ledger.get("scopeExpansions", []) if e.get("baseCheckpointId") == base_checkpoint_id for n in e.get("companions", []) if n in plan.packages}), "peerHintEdges": len(peer_edges)}

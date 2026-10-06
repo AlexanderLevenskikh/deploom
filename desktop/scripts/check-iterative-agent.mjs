@@ -464,7 +464,7 @@ assert.equal(eof.stdout.trim(), "test-provider/explicit-model");
 assert.equal(eof.stderr.trim(), "EOF received");
 const timeout = await capture(process.execPath, ["-e", "setInterval(()=>{},1000)"], root, 200);
 assert.equal(timeout.timedOut, true);
-assert.ok(mainSource.includes("if (agentTimedOut)"));
+assert.ok(mainSource.includes("if (agentTimedOut && !repairTimedOut)"));
 assert.ok(mainSource.includes("AGENT_PROVIDER_TIMEOUT:"));
 assert.ok(mainSource.includes("Agent dispatch: provider=${provider}; model=${model"));
 const locks = new Set();

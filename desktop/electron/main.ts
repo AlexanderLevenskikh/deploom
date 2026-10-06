@@ -8,7 +8,7 @@ import { buildDependencyGraphSnapshot } from './dependency-graph.js'
 import { BaselineWorkerPool, WORKER_CANCEL } from './baseline-worker.js'
 const { autoUpdater } = updaterPackage
 import { buildClaudeAgentArgs, buildClaudeResumeArgs, buildCodexAgentArgs, buildCodexResumeArgs, buildOpenCodeAgentArgs, buildOpenCodeResumeArgs, parseOpencodeModelsOutput } from './agent-command.js'
-import { AGENT_LAUNCH_RETRY_BUDGET, agentLaunchProviderError, agentLaunchRetryDelayMs, agentLaunchTimeoutMs, canRetryAgentLaunch, classifyAgentLaunchFailure, redactAgentDiagnostics, type AgentLaunchDiagnostics } from './agent-launch-errors.js'
+import { AGENT_LAUNCH_RETRY_BUDGET, agentRepairActivity, agentLaunchProviderError, agentLaunchRetryDelayMs, agentLaunchTimeoutMs, canRetryAgentLaunch, classifyAgentLaunchFailure, redactAgentDiagnostics, type AgentLaunchDiagnostics } from './agent-launch-errors.js'
 import { agentBatchCompletionFingerprint, agentScopeFingerprint, extractAgentSessionId, resumableAgentSessionId } from './agent-session.js'
 import { restoreVerifiedAgentCompletion, updateFlowProgress, type FlowAction } from './flow-state.js'
 import { adoptEmptyContinuationBranches, adoptHistoricalContinuationBranches, adoptPreferredScopeBranches, buildMigrationProgress, continuationMigrationPlan, integratedBranchTargets, leftoverConflictMarkerLines, liveGitWorktreeRecords, mergeInProgressNote, mergePackageJsonThreeWay, migrationBranchStateText, migrationCompletionIssues, migrationBatchScopeDriftIssues, migrationGroupScopeDriftIssues, migrationPlanFromPrompt, migrationScopeManifestFromPrompt, migrationStateSummary, nextIncompleteMigrationBranch, recoverContinuationScopeBranches, rebindMigrationPromptBranchIdentity, replaceMigrationPlanInPrompt, relevantGitStatus, relevantGitStatusLines, workspaceNoiseGitExcludePathspecs, rollbackIncompleteMigrationActions, satisfiedScopePackagesFromPrompt, scopeActionsFromPrompt, scopeTargetsFromPrompt, validateScopeProofEnvelope, type MigrationBranchProgress, type MigrationBranchRuntime, type MigrationBranchRuntimePhase, type MigrationPlan, type MigrationProgress } from './migration-progress.js'
@@ -8823,9 +8823,11 @@ function setupIpc(): void {
         let agentTimedOut = false
         let agentCanceled = false
         let streamedProviderError: string | undefined
+        let agentWorkObserved = false
         const sessionOptions = {
           onLine: (line: string) => {
             streamedProviderError = agentLaunchProviderError(line, streamedProviderError)
+            agentWorkObserved ||= agentRepairActivity(line)
             const actualId = extractAgentSessionId(line, provider)
             if (!actualId || actualId === sessionId) return
             const lease = readAgentLease(leasePath)
@@ -8937,14 +8939,19 @@ function setupIpc(): void {
           updateAttempt(runDir, { status: 'canceled', stage: 'agent', finishedAt: Date.now(), waitUntil: undefined, reason: 'Agent canceled by the user', lastError: undefined })
           return { ok: false, error: 'AGENT_CANCELED', agentOutputTail }
         }
-        const providerFailure = agentProviderFailure(output, exitCode)
+        const repairTimedOut = agentTimedOut && agentWorkObserved && !streamedProviderError && !agentLaunchProviderError(output)
+        const providerFailure = repairTimedOut ? undefined : agentProviderFailure(output, exitCode)
+        if (repairTimedOut && bootstrap) {
+          throw new Error('AGENT_ACTIVE_REPAIR_TIMEOUT: initial control repair exceeded its deadline; no verified checkpoint is available for independent updates.')
+        }
+        if (repairTimedOut) recordAttemptLog(runDir, 'Active agent repair timed out; deferring this exact candidate as INCONCLUSIVE. Other cohorts continue from the verified checkpoint.\n')
         // Launch-failure resilience: classify BEFORE the ordinary provider
         // error handling. A retryable outage (rate limit / temporary / unknown
         // with budget left) parks the repair in a durable wait: the attempt is
         // NOT failed, no repair attempt is consumed, and the launch is retried
         // after the provider's reset time / a bounded backoff. A permanent or
         // budget-exhausted failure falls through to a clear terminal error.
-        if (exitCode !== 0 || agentTimedOut || streamedProviderError || providerFailure) {
+        if (!repairTimedOut && (exitCode !== 0 || agentTimedOut || streamedProviderError || providerFailure)) {
           const launchDiag = classifyAgentLaunchFailure({ code: exitCode, stdout: agentStdout, stderr: agentStderr, timedOut: agentTimedOut, providerError: streamedProviderError })
           const parkedLaunchAttempts = (readAgentLease(leasePath)?.launchAttempts ?? 0) + 1
           const retryAutopilot = iterativeAutopilot.isEnabled(input) ?? (readAgentLease(leasePath)?.autopilot === true)
@@ -8975,7 +8982,7 @@ function setupIpc(): void {
           }
         }
         if (providerFailure) throw new Error(`AGENT_PROVIDER_ERROR: ${provider}; model=${model || '(provider default)'}; ${providerFailure}`)
-        if (agentTimedOut) {
+        if (agentTimedOut && !repairTimedOut) {
           throw new Error(`AGENT_PROVIDER_TIMEOUT: ${provider}; model=${model || '(provider default)'}; agent process exceeded 15 minutes. The verified checkpoint is preserved.`)
         }
         if (exitCode !== 0 && !output.trim()) {
@@ -9008,7 +9015,9 @@ function setupIpc(): void {
         // R5: the TYPED outcome drives the feedback. A zero exit AND real file
         // changes are required for READY_FOR_VERIFY; scheduling kinds carry
         // proposals and deliberately no changed files.
-        const parsed = parseAgentOutcome(output, exitCode, changed)
+        const parsed = repairTimedOut
+          ? parseAgentOutcome('FEEDBACK_KIND: INCONCLUSIVE\nREASON: Active agent repair deadline exceeded; try another cohort from the verified checkpoint.', exitCode, changed)
+          : parseAgentOutcome(output, exitCode, changed)
         if (bootstrap) {
           // No candidate/feedback for bootstrap: the agent gate is a repair run;
           // re-run the C0 control on the repaired trial right away.

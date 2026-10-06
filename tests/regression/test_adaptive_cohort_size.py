@@ -57,9 +57,21 @@ class AdaptiveSizeTests(unittest.TestCase):
         self.assertEqual(first.packages,tuple('ab'))
         second,_=self.plan(list('abc'),blocks=[first.assignment_fingerprint],ledger=ledger)
         self.assertEqual(second.packages,('c',))
-    def test_hard_cap_rejects_oversized_atom_explicitly(self):
-        with self.assertRaisesRegex(ValueError,'COHORT_ATOM_EXCEEDS_CAP'):
-            self.plan([f'p{i}' for i in range(25)],atoms=[[f'p{i}' for i in range(25)]])
+    def test_hard_cap_defers_oversized_atom_without_splitting_or_claiming_incompatibility(self):
+        names=[f'p{i}' for i in range(25)]
+        plan,details=self.plan(names,atoms=[names])
+        self.assertIsNone(plan)
+        self.assertEqual(details['cohortAtomIssues'][0]['reason'],'COHORT_ATOM_EXCEEDS_CAP')
+        self.assertEqual(details['cohortAtomIssues'][0]['packageCount'],25)
+        self.assertEqual(details['remainingActionable'],25)
+
+    def test_oversized_atom_cannot_starve_an_independent_cohort(self):
+        atom=[f'p{i}' for i in range(25)]
+        plan,details=self.plan([*atom,'safe-a','safe-b'],atoms=[atom])
+        self.assertEqual(plan.packages,('safe-a','safe-b'))
+        self.assertTrue(all(plan.assignment_dict[n]=='1.0.0' for n in atom))
+        self.assertEqual(details['remainingActionable'],27)
+        self.assertEqual(len(details['cohortAtomIssues']),1)
 
 class AttemptTelemetryTests(unittest.TestCase):
     candidate={'candidateId':'p1','baseCheckpointId':'C0','delta':{'changed':{'a':'2','b':'2'}},'cohortSelection':{'operator':'whole','familyGroups':[['a','b']]}}
