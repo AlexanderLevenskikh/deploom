@@ -17,6 +17,7 @@
 //     agent text; apply-feedback (the authoritative verifier of staleness and
 //     changed-file scope) is then invoked with the real CLI.
 import { createHash } from 'node:crypto'
+import { agentLaunchProviderError } from './agent-launch-errors.js'
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, lstatSync, statSync, unlinkSync, writeFileSync, renameSync, appendFileSync } from 'node:fs'
 import { dirname, join, resolve, sep } from 'node:path'
 import type { AgentLaunchDiagnostics } from './agent-launch-errors.js'
@@ -467,8 +468,8 @@ export type AgentParsedOutcome = {
 }
 
 const KIND_RE = /FEEDBACK_KIND\s*:\s*([A-Z_]+)/i
-const REASON_RE = /^\s*(?:REASON|ПРИЧИНА)\s*:\s*(.+)$/im
-const PROPOSALS_RE = /^(?:PROPOSALS|ПРЕДЛОЖЕНИЯ|ALTERNATIVES|КОМПАНЬОНЫ)\s*:/im
+const REASON_RE = /^\s*(?:#{1,6}\s+)?(?:REASON|ПРИЧИНА)\s*:\s*([^\r\n]+)$/im
+const PROPOSALS_RE = /^\s*(?:#{1,6}\s+)?(?:PROPOSALS|ПРЕДЛОЖЕНИЯ|ALTERNATIVES|КОМПАНЬОНЫ)\s*:/im
 
 export function parseAgentOutcome(output: string, exitCode: number, changedFiles: string[]): AgentParsedOutcome {
   // OpenCode streams JSON events: parse the final assistant text, never tool
@@ -496,7 +497,7 @@ export function parseAgentOutcome(output: string, exitCode: number, changedFiles
     for (const line of output.slice(start).split(/\r?\n/)) {
       const value = line.trim().replace(/^[-*\d.)\s]+/, '')
       if (value === '' || value.startsWith('```')) continue
-      if (/^(CHANGED_FILES|FEEDBACK_KIND|REASON)\s*:/i.test(value)) break
+      if (/^(?:#{1,6}\s+)?(CHANGED_FILES|FEEDBACK_KIND|REASON|ПРИЧИНА)\s*:/i.test(value)) break
       proposals.push(value.slice(0, 200))
       if (proposals.length >= 10) break
     }
@@ -518,16 +519,17 @@ export function parseAgentOutcome(output: string, exitCode: number, changedFiles
 // lease spans app restarts while the repair (or its verification) runs.
 /** Provider failures are infrastructure, never repair feedback or proof. */
 export function agentProviderFailure(output: string, exitCode: number): string | undefined {
-  for (const line of output.split(/\r?\n/)) {
-    try {
-      const event = JSON.parse(line)
-      if (event.type === 'error' || event.error) {
-        const error = event.error ?? event
-        return String(error.data?.message ?? error.message ?? error.name ?? 'Provider error').slice(0, 2000)
-      }
-    } catch { /* ordinary agent text */ }
+  const providerError = agentLaunchProviderError(output)
+  if (providerError) {
+    const event = JSON.parse(providerError)
+    const error = event.error ?? event
+    return String(error.data?.message ?? error.message ?? error.name ?? 'Provider error').slice(0, 2000)
   }
-  if (/ProviderModelNotFoundError|Model not found:/i.test(output)) return output.trim().slice(-2000)
+  // A model error quoted in assistant/tool JSON is ordinary project evidence.
+  const plain = output.split(/\r?\n/).filter(line => {
+    try { JSON.parse(line); return false } catch { return true }
+  }).join('\n')
+  if (/ProviderModelNotFoundError|Model not found:/i.test(plain)) return plain.trim().slice(-2000)
   if (exitCode !== 0 && output.trim()) return output.trim().slice(-2000)
   return undefined
 }

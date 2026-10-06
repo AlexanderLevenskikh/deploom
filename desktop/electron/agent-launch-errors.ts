@@ -109,16 +109,24 @@ export function extractRetryAfterSeconds(text: string, now = Date.now()): number
 
 /** Only provider error envelopes confer failure authority at exit code zero.
  * Ordinary assistant/tool text mentioning limits is not an outage. */
-export function agentLaunchProviderError(output: string): string | undefined {
+export function agentLaunchProviderError(output: string, pending?: string): string | undefined {
   for (const line of output.split(/\r?\n/)) {
     try {
       const event = JSON.parse(line)
       if (event.type === 'error' || event.error || (event.type === 'result' && event.is_error === true)) {
-        return JSON.stringify(event.error ?? event)
+        pending = JSON.stringify(event)
+      } else if (event.type === 'step_finish' && event.part?.type === 'step-finish' &&
+          event.part.reason === 'stop' && typeof event.part.messageID === 'string' &&
+          typeof event.sessionID === 'string' && event.part.sessionID === event.sessionID) {
+        // OpenCode can recover an earlier request error inside the same process.
+        // Its terminal assistant completion supersedes that error, never a tool
+        // result or prose. This is dispatch evidence; Python still verifies it.
+        const previousSession = pending ? JSON.parse(pending).sessionID : undefined
+        if (!previousSession || previousSession === event.sessionID) pending = undefined
       }
     } catch { /* plain output */ }
   }
-  return undefined
+  return pending
 }
 
 const HAS_RATE_LIMIT = [
@@ -243,7 +251,7 @@ export function classifyAgentLaunchFailure(input: {
     kind: 'unknown',
     detail: bare
       ? `agent exited ${code} with no output; cause unknown`
-      : `${stdout || stderr || `exit ${code}`}`.slice(0, MAX_DETAIL_LENGTH),
+      : `${providerError ? redactAgentDiagnostics(providerError) : stdout || stderr || `exit ${code}`}`.slice(0, MAX_DETAIL_LENGTH),
   }
 }
 

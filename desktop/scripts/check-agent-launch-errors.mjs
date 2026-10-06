@@ -145,4 +145,14 @@ for (let n = 1; n < 20; n++) {
 assert.equal(agentLaunchRetryDelayMs({kind:'temporary',retryAfterSeconds:7200},7,true),7200_000);
 assert.deepEqual([0,1,2,100].map(n=>agentLaunchTimeoutMs(n,true)),[900_000,1800_000,3600_000,3600_000]);
 assert.equal(agentLaunchTimeoutMs(100,false),900_000);
+const recoveredError = JSON.stringify({type:'error',sessionID:'session',error:{message:'unknown request failure'}});
+const completed = JSON.stringify({type:'step_finish',sessionID:'session',part:{type:'step-finish',reason:'stop',sessionID:'session',messageID:'message'}});
+assert.equal(agentLaunchProviderError(recoveredError+'\n'+completed),undefined);
+assert.equal(agentLaunchProviderError(completed,agentLaunchProviderError(recoveredError)),undefined);
+assert.ok(agentLaunchProviderError(completed+'\n'+recoveredError),'errors after completion remain failures');
+assert.ok(agentLaunchProviderError(recoveredError+'\n'+completed.replaceAll('"session"','"other"')),'another session cannot clear the error');
+assert.ok(agentLaunchProviderError(recoveredError+'\n'+completed.replace('"stop"','"tool-calls"')),'an intermediate tool step cannot clear the error');
+assert.ok(agentLaunchProviderError(recoveredError+'\n'+JSON.stringify({type:'text',part:{text:'all done'}})),'prose alone cannot clear the error');
+const unknownError=classifyAgentLaunchFailure({code:0,stdout:'unrelated final prose',stderr:'',providerError:agentLaunchProviderError(recoveredError)});
+assert.match(unknownError.detail,/unknown request failure/);
 console.log(`check-agent-launch-errors: OK (${DESKTOP})`);

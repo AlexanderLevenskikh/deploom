@@ -8825,7 +8825,7 @@ function setupIpc(): void {
         let streamedProviderError: string | undefined
         const sessionOptions = {
           onLine: (line: string) => {
-            streamedProviderError = agentLaunchProviderError(line) ?? streamedProviderError
+            streamedProviderError = agentLaunchProviderError(line, streamedProviderError)
             const actualId = extractAgentSessionId(line, provider)
             if (!actualId || actualId === sessionId) return
             const lease = readAgentLease(leasePath)

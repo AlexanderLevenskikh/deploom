@@ -240,4 +240,20 @@ for (const autopilot of [false,true]) {
   assert.match(result.error,/AGENT_IN_PROGRESS/);
   assert.equal(f.lease()?.sessionId,'ses-alive'); assert.equal(f.launches.length,0);
 }
-console.log('agent-launch-lifecycle: production handler + real child wait/resume/cancel/autopilot OK');
+// A recovered request error must not restart a completed paid repair, even
+// when verbose tool output has pushed the earlier error out of the capture tail.
+for (const verbose of [false,true]) {
+  const f=fixture();
+  f.setChild(`
+    console.log(JSON.stringify({type:'error',sessionID:'ses-recovered',error:{message:'unclassified request failure'}}));
+    if (${verbose}) for(let n=0;n<24;n++) console.log(JSON.stringify({type:'tool_use',part:{type:'tool',output:'x'.repeat(65536)}}));
+    require('fs').writeFileSync('input.js','repaired');
+    console.log(JSON.stringify({type:'text',sessionID:'ses-recovered',part:{text:'FEEDBACK_KIND: READY_FOR_VERIFY'}}));
+    console.log(JSON.stringify({type:'step_finish',sessionID:'ses-recovered',part:{type:'step-finish',reason:'stop',sessionID:'ses-recovered',messageID:'message'}}));
+  `);
+  const result=await f.autonomous(undefined,{projectName:'fixture',autopilot:true});
+  assert.equal(result.autopilot.stopped,'finished',JSON.stringify(result));
+  assert.equal(f.launches.length,1);assert.equal(f.drives(),1);
+  assert.equal(f.waits.length,0);assert.equal(f.lease(),undefined);
+}
+console.log('agent-launch-lifecycle: production handler + real child wait/resume/cancel/autopilot/recovered error OK');

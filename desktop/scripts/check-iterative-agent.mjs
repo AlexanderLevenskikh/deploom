@@ -441,6 +441,11 @@ if (readAgentLease(join(runDir, "trial", "no-such-lease.json")) !== undefined) {
 
 assert.equal(agentProviderFailure(JSON.stringify({type:'error',error:{name:'ProviderModelNotFoundError',data:{message:'Model not found: test-provider/obsolete'}}}),0), 'Model not found: test-provider/obsolete');
 assert.equal(agentProviderFailure('ordinary repair text',0), undefined);
+const markdownAlternative=parseAgentOutcome(JSON.stringify({type:'text',part:{text:'## FEEDBACK_KIND: NEEDS_ALTERNATIVE\n\n## PROPOSALS:\nexample-types = 8.3.4\n\n## REASON:\nRuntime requires compatible declarations'}}),0,[]);
+assert.equal(markdownAlternative.kind,'NEEDS_ALTERNATIVE');
+assert.deepEqual(markdownAlternative.proposals,['example-types = 8.3.4']);
+assert.equal(markdownAlternative.reason,'Runtime requires compatible declarations');
+assert.equal(agentProviderFailure(JSON.stringify({type:'text',part:{text:'Project fixture mentions Model not found: example'}}),0),undefined);
 assert.equal(agentProviderFailure('connection refused',1), 'connection refused');
 // Exercise the actual main capture helper against a child that starts only
 // after stdin EOF. No model/server is contacted and no tokens are consumed.
