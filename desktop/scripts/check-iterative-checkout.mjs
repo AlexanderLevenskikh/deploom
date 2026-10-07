@@ -17,5 +17,8 @@ try {
   assert.equal(iterativeCheckoutView({ ...active, candidate: { materializationRefs: { workspaceRoot: trial, projectRelative: '../../../project' } } }, run, project).kind, 'checkpoint')
   assert.equal(iterativeCheckoutView({ ...active, candidate: { materializationRefs: { workspaceRoot: 'relative' } } }, run, project).kind, 'checkpoint')
   assert.equal(iterativeCheckoutView({}, run, project).kind, 'project')
+
+const terminal = { ...base, run: { phase: 'TERMINAL' }, candidate: { stage: 'REJECTED', materializationRefs: active.candidate.materializationRefs } }
+  assert.equal(iterativeCheckoutView(terminal, run, project).kind, 'checkpoint')
   console.log('check-iterative-checkout: OK (trial, bootstrap, checkpoint, original and path boundaries)')
 } finally { rmSync(root, { recursive: true, force: true }) }

@@ -250,3 +250,16 @@ const mkIo = (overrides = {}) => {
   if(statusRecords.length!==2 || statusRecords.some(line=>line.trim().includes('\n'))) throw Error('status records must remain individually parseable');
 }
 console.log("check-iterative-stream: OK");
+
+// Actual child survives an earned extension; another child is still stopped.
+{
+  const { io } = mkIo()
+  let windows = 0
+  const result = await spawnIterativeStreamed(root, process.execPath,
+    ['-e', "console.log('working');setTimeout(()=>console.log('done'),700)"], root, 450, io, mkPlatform(), undefined,
+    { onDeadline: () => ++windows === 1 ? 600 : 0 })
+  if (result.code !== 0 || result.timedOut || windows !== 1) throw new Error('earned extension must allow completion')
+  const stopped = await spawnIterativeStreamed(root, process.execPath, ['-e', SLEEPY], root, 100, io, mkPlatform(), undefined,
+    { onDeadline: () => 0 })
+  if (!stopped.timedOut || stopped.code === 0) throw new Error('no progress must still stop')
+}

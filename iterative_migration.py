@@ -2171,7 +2171,7 @@ def cmd_verify_bootstrap(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_resume(args: argparse.Namespace) -> int:
-    from iterative_resume import reopen_terminal_run
+    from iterative_resume import reopen_terminal_run, recover_timed_out_candidate
     run_dir = Path(args.run_dir).resolve()
     lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=60)
     lock.acquire()
@@ -2182,10 +2182,22 @@ def cmd_resume(args: argparse.Namespace) -> int:
         _assert_runtime_unchanged(config)
         checkpoint = load_checkpoint(run_dir, str(run["activeCheckpointId"]))
         try:
-            reopened = reopen_terminal_run(run, checkpoint, load_candidate(run_dir))
+            pending = load_candidate(run_dir)
+            reopened = reopen_terminal_run(run, checkpoint, None if pending and pending.get("timeoutRecoveryCount") == 1 and pending.get("stage") == "REPAIRING" else pending)
         except ValueError as exc:
             raise InvalidInputError(str(exc)) from exc
         _open_checkpoint_source(run_dir, checkpoint, config, run_id=str(run["runId"]))
+        try:
+            recovered = recover_timed_out_candidate(run_dir, run, checkpoint, load_candidate(run_dir), load_ledger(run_dir), config)
+        except ValueError as exc:
+            raise InvalidInputError(str(exc)) from exc
+        if not recovered and pending and pending.get("timeoutRecoveryCount") == 1 and pending.get("stage") == "REPAIRING":
+            recovered = pending
+        if recovered:
+            save_candidate(run_dir, recovered)
+            reopened.update(phase="REPAIRING", activeCandidateId=recovered["candidateId"])
+            _emit_status({"event": "resume.repair-restored", "runId": run["runId"], "candidateId": recovered["candidateId"],
+                          "message": "Preserved timed-out repair restored; project verification is still required"})
         save_run(run_dir, reopened)
         _emit_status({"event": "resume.done", "runId": run["runId"], "checkpointId": checkpoint["checkpointId"]})
         return 0

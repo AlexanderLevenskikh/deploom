@@ -547,3 +547,10 @@ Release publication is gated on exact-release-SHA Windows physical acceptance. n
 
 Migration check selection and optional Vitest nonregression control: [validation profiles](docs/MIGRATION_VALIDATION.md).
 See [Iterative FLOW and automatic continuation](docs/MIGRATION_FLOW.md) for run settings, agent selection and autopilot boundaries.
+
+
+### Continuing an interrupted repair
+
+Desktop keeps the isolated trial and provider session when an active repair reaches its deadline. Actual source changes can earn two additional 15-minute windows (three windows total); repeated logs do not earn time. The durable allowance survives restart and respects the whole-run deadline. A pause with allowance left can resume the same session. An exhausted repair offers another package proposal without accepting trial edits.
+
+The continuation action is in the main action row. A checked Autopilot preference does not mean a terminal run is still executing. Terminal results open the verified checkpoint rather than the rejected trial. A legacy trial deferred specifically by the active-agent timeout can be restored once by explicit continuation; constraints, historical checkpoints and spent attempt counters remain intact. Restored edits require ordinary protected-file guards and fresh project verification before acceptance.

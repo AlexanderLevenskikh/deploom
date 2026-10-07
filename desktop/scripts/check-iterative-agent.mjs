@@ -482,3 +482,25 @@ assert.equal(decideAgentLeaseDispatch({...waitEligible, sessionId: ""}, () => fa
 assert.equal(decideAgentLeaseDispatch({...waitEligible, waiting: false, pid: 999, childPid: 321}, pid => pid === 321).action, "in-progress");
 await import("./agent-launch-lifecycle-fixture.mjs");
 console.log("check-iterative-agent: OK (real child, launch wait, session recovery and cancel)");
+
+// File evidence changes, persistent windows, and restart at the last allowance.
+{
+  const { repairProgressFingerprint, extendRepairBudget } = await import('../dist-electron/iterative-agent.js')
+  const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs')
+  const evidenceRoot = mkdtempSync(join(tmpdir(), 'repair-progress-'))
+  const trial = join(evidenceRoot, 'trial'); mkdirSync(trial)
+  const baseline = join(evidenceRoot, 'baseline.json')
+  writeFileSync(join(trial, 'source.ts'), 'old'); writeTrialBaseline(trial, baseline)
+  if (repairProgressFingerprint(trial, baseline)) throw new Error('unchanged files cannot earn time')
+  writeFileSync(join(trial, 'source.ts'), 'fixed')
+  const first = repairProgressFingerprint(trial, baseline)
+  const budget = extendRepairBudget({ windows: 1, deadlineAt: 0, fingerprint: '' }, first, 100)
+  if (!budget || budget.windows !== 2) throw new Error('actual source change earns a bounded extension')
+  if (extendRepairBudget(budget, first, 200)) throw new Error('repeated same edit cannot earn time')
+  writeFileSync(join(trial, 'source.ts'), 'fixed-again')
+  const last = extendRepairBudget(budget, repairProgressFingerprint(trial, baseline), 200)
+  if (!last || last.windows !== 3 || extendRepairBudget(last, 'different')) throw new Error('hard cap must hold')
+  const file = join(evidenceRoot, 'lease.json')
+  writeAgentLease(file, { ...deadOwner, repairBudget: { ...last, paused: true } })
+  if (decideAgentLeaseDispatch(readAgentLease(file), () => false).action !== 'give-up') throw new Error('restart must retain exhausted budget')
+}

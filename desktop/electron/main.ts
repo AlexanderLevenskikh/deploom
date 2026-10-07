@@ -8,7 +8,7 @@ import { buildDependencyGraphSnapshot } from './dependency-graph.js'
 import { BaselineWorkerPool, WORKER_CANCEL } from './baseline-worker.js'
 const { autoUpdater } = updaterPackage
 import { buildClaudeAgentArgs, buildClaudeResumeArgs, buildCodexAgentArgs, buildCodexResumeArgs, buildOpenCodeAgentArgs, buildOpenCodeResumeArgs, parseOpencodeModelsOutput } from './agent-command.js'
-import { AGENT_LAUNCH_RETRY_BUDGET, agentRepairActivity, agentLaunchProviderError, agentLaunchRetryDelayMs, agentLaunchTimeoutMs, canRetryAgentLaunch, classifyAgentLaunchFailure, redactAgentDiagnostics, type AgentLaunchDiagnostics } from './agent-launch-errors.js'
+import { AGENT_LAUNCH_RETRY_BUDGET, agentRepairActivity, agentLaunchProviderError, agentLaunchRetryDelayMs, canRetryAgentLaunch, classifyAgentLaunchFailure, redactAgentDiagnostics, type AgentLaunchDiagnostics } from './agent-launch-errors.js'
 import { agentBatchCompletionFingerprint, agentScopeFingerprint, extractAgentSessionId, resumableAgentSessionId } from './agent-session.js'
 import { restoreVerifiedAgentCompletion, updateFlowProgress, type FlowAction } from './flow-state.js'
 import { adoptEmptyContinuationBranches, adoptHistoricalContinuationBranches, adoptPreferredScopeBranches, buildMigrationProgress, continuationMigrationPlan, integratedBranchTargets, leftoverConflictMarkerLines, liveGitWorktreeRecords, mergeInProgressNote, mergePackageJsonThreeWay, migrationBranchStateText, migrationCompletionIssues, migrationBatchScopeDriftIssues, migrationGroupScopeDriftIssues, migrationPlanFromPrompt, migrationScopeManifestFromPrompt, migrationStateSummary, nextIncompleteMigrationBranch, recoverContinuationScopeBranches, rebindMigrationPromptBranchIdentity, replaceMigrationPlanInPrompt, relevantGitStatus, relevantGitStatusLines, workspaceNoiseGitExcludePathspecs, rollbackIncompleteMigrationActions, satisfiedScopePackagesFromPrompt, scopeActionsFromPrompt, scopeTargetsFromPrompt, validateScopeProofEnvelope, type MigrationBranchProgress, type MigrationBranchRuntime, type MigrationBranchRuntimePhase, type MigrationPlan, type MigrationProgress } from './migration-progress.js'
@@ -66,7 +66,7 @@ import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
 import { beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, readRunLogTail, recordAttemptLog, recordAttemptProgress, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
 import { spawnIterativeStreamed, type CaptureResult, type StreamAttemptIo, type StreamPlatform } from './iterative-stream.js'
-import { agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, agentProviderFailure, openCodeRuntimeManifestPaths, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, recordAgentDispatchTiming, trialBaselineFile, trialProjectPath, withAgentDispatchLock, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
+import { extendRepairBudget, repairProgressFingerprint, agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, agentProviderFailure, openCodeRuntimeManifestPaths, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, recordAgentDispatchTiming, trialBaselineFile, trialProjectPath, withAgentDispatchLock, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
@@ -7762,6 +7762,7 @@ function setupIpc(): void {
     let retryable = false
     let requestedNode: string | undefined
     let runtimeView: Record<string, any> | undefined
+    let stopDetail: { kind: 'repair-timeout'; packageCount: number; recoverable: boolean; auditStatus: string } | undefined
     let workingCheckout: IterativeCheckoutView | undefined
     let scopeExpansionIssues: Array<{ packages: string[]; proposals: string[]; reason: string; nextAction: string }> | undefined
     let progressSummary: { checkpointId: string; remaining: number; denominator: number; accepted: number; deferred: number; targetCount: number; unresolvedGoals: number } | undefined
@@ -7783,6 +7784,15 @@ function setupIpc(): void {
         if (payload) {
           phase = String(payload.run?.phase ?? '')
           progressSummary = payload.progressSummary
+          if (payload.run?.phase === 'TERMINAL') {
+            // Full ledger remains durable; use last exact-candidate timeout only.
+            const ledger = JSON.parse(readFileSync(join(runDir, 'ledger.json'), 'utf8')) as Record<string, any>
+            const deferred = (ledger?.deferrals ?? []).findLast((d: Record<string, any>) => d.candidateId === payload.candidate?.candidateId)
+            if (String(deferred?.reason ?? '').includes('Active agent repair deadline exceeded')) {
+              const count = Object.keys(payload.candidate?.delta?.changed ?? {}).length
+              stopDetail = { kind: 'repair-timeout', packageCount: count, recoverable: !payload.candidate?.timeoutRecoveryCount, auditStatus: payload.activeCheckpoint?.audit?.status ?? 'UNKNOWN' }
+            }
+          }
           workingCheckout = iterativeCheckoutView(payload, runDir, project.path)
           scopeExpansionIssues = Array.isArray(payload.scopeExpansionIssues) ? payload.scopeExpansionIssues : undefined
           decision = decideNextStep(runDir, payload)
@@ -7828,6 +7838,7 @@ function setupIpc(): void {
       // not from a local `stepBusy`.
       inFlight: iterativeStepInFlight.has(stepLockKey(workspace.id, project.name)),
       autopilotActive: waitLease?.waiting === true && waitLease.autopilot === true,
+      repairPause: waitLease?.repairBudget?.paused ? { exhausted: waitLease.repairBudget.windows >= 3, windows: waitLease.repairBudget.windows } : undefined,
       autopilotEnabled: iterativeAutopilot.isEnabled(input) ?? readAutopilotState(runDir)?.enabled ?? (waitLease?.autopilot === true),
       // P1#4: durable "Проверить проект" verdict (only meaningful while no run
       // exists). Lets the panel show a distinct "ready → Начать обновление"
@@ -7840,6 +7851,7 @@ function setupIpc(): void {
       progressSummary,
       scopeExpansionIssues,
       workingCheckout,
+      stopDetail,
       runtime: runtimeView,
       attempt: readAttempt(runDir),
       attemptLog: readAttemptLogTail(runDir),
@@ -8316,7 +8328,8 @@ function setupIpc(): void {
         return { ok: false, steps, stopped: 'error', error, attempt: readAttempt(runDir) }
       }
       const blockedRepair = readAttempt(runDir)
-      if (input.discardCandidate && !/^FORBIDDEN_MUTATION:/.test(blockedRepair?.lastError ?? '')) {
+      const exhaustedRepair = readAgentLease(agentLeaseFile(runDir))?.repairBudget
+      if (input.discardCandidate && !/^(?:FORBIDDEN_MUTATION|AGENT_REPAIR_BUDGET_EXHAUSTED):/.test(blockedRepair?.lastError ?? '') && !(exhaustedRepair?.paused && exhaustedRepair.windows >= 3)) {
         return { ok: false, steps, stopped: 'error', error: 'DISCARD_REPAIR_NOT_BLOCKED' }
       }
       // L1: rebuild the journal after a restart — same attemptId, status running.
@@ -8374,7 +8387,7 @@ function setupIpc(): void {
           const feedback = buildFeedbackPayload({
             runId: String(candidate.runId), candidateId: String(candidate.candidateId),
             baseCheckpointId: String(candidate.baseCheckpointId), attemptId: Number(candidate.attemptId ?? 0),
-          }, [], 'INCONCLUSIVE', 'Protected-file guard rejected this trial; continue from the verified checkpoint without adopting trial changes')
+          }, [], 'INCONCLUSIVE', exhaustedRepair?.paused ? 'Repair budget exhausted; preserved trial is not adopted. Try another assignment from the verified checkpoint.' : 'Protected-file guard rejected this trial; continue from the verified checkpoint without adopting trial changes')
           const feedbackFile = join(runDir, 'trial', 'discard-feedback.json')
           writeFileSync(feedbackFile, JSON.stringify(feedback), 'utf8')
           const applied = await spawnCapture(python, iterativeApplyFeedbackInvocation(runDir, feedbackFile, generator, python).args, workspace.path, 120_000)
@@ -8384,6 +8397,7 @@ function setupIpc(): void {
             publish()
             return { ok: false, steps, stopped: 'error', error }
           }
+          clearAgentLease(agentLeaseFile(runDir))
           recordAttemptLog(runDir, 'Disputed repair trial discarded; continuing from the last verified checkpoint. No trial changes accepted.\n')
           steps.push('discard-repair')
           updateSteps()
@@ -8608,6 +8622,7 @@ function setupIpc(): void {
     step?: string
     next?: IterativeDecision
     agentOutputTail?: string
+    paused?: boolean
     // Launch-wait resilience: a retryable provider outage parks the repair.
     waiting?: boolean
     retryAt?: number
@@ -8644,7 +8659,7 @@ function setupIpc(): void {
       return { ok: false, waiting: true, retryAt: leaseDecision.retryAt, cancelable: true, failureKind: 'wait', reason: leaseDecision.detail, error: `AGENT_LAUNCH_WAIT: ${leaseDecision.detail}` }
     }
     if (leaseDecision.action === 'give-up') {
-      clearAgentLease(leasePath)
+      if (!existingLease?.repairBudget?.paused) clearAgentLease(leasePath)
       ensureAttemptRecord(runDir, project.name, workspace.id)
       updateAttempt(runDir, { status: 'failed', stage: 'agent', lastStep: 'agent', finishedAt: Date.now(), lastError: leaseDecision.detail })
       publishIterativeAttempt(runDir)
@@ -8833,6 +8848,13 @@ function setupIpc(): void {
           : ''
 
         agentTimingStartedAt = Date.now()
+        const savedBudget = existingLease?.repairBudget
+        let repairBudget = savedBudget?.paused
+          ? { ...savedBudget, windows: savedBudget.windows + 1, deadlineAt: Date.now() + 15 * 60_000, paused: false }
+          : savedBudget ?? { windows: 1, deadlineAt: Date.now() + 15 * 60_000, fingerprint: '' }
+        const runDeadline = Date.parse(String(payload.run?.deadlineAt ?? ''))
+        if (Number.isFinite(runDeadline)) repairBudget.deadlineAt = Math.min(repairBudget.deadlineAt, runDeadline)
+        const repairTimeoutMs = Math.max(1, repairBudget.deadlineAt - Date.now())
         let output = ''
         let exitCode = 0
         let agentTimedOut = false
@@ -8840,6 +8862,22 @@ function setupIpc(): void {
         let streamedProviderError: string | undefined
         let agentWorkObserved = false
         const sessionOptions = {
+          onDeadline: () => {
+            if (streamedProviderError || readAttempt(runDir)?.cancelRequested
+              || forbiddenTrialViolations(workspaceRoot, baselineFile, { provider, projectRelative }).length) return 0
+            const fingerprint = repairProgressFingerprint(workspaceRoot, baselineFile)
+            const extended = extendRepairBudget(repairBudget, fingerprint)
+            if (!extended || (Number.isFinite(runDeadline) && Date.now() >= runDeadline)) return 0
+            if (Number.isFinite(runDeadline)) extended.deadlineAt = Math.min(extended.deadlineAt, runDeadline)
+            repairBudget = extended
+            const lease = readAgentLease(leasePath)
+            if (!lease) throw new Error('AGENT_REPAIR_BUDGET_PERSIST_FAILED')
+            writeAgentLease(leasePath, { ...lease, repairBudget })
+            recordAttemptLog(runDir, `Repair budget expanded: observed source changes; window ${repairBudget.windows}/3; another 15 minutes.\n`)
+            updateAttempt(runDir, { reason: `Исправление продвигается; дополнительное окно ${repairBudget.windows}/3 (15 минут)` })
+            publishIterativeAttempt(runDir)
+            return Math.max(1, repairBudget.deadlineAt - Date.now())
+          },
           onLine: (line: string) => {
             streamedProviderError = agentLaunchProviderError(line, streamedProviderError)
             agentWorkObserved ||= agentRepairActivity(line)
@@ -8859,7 +8897,7 @@ function setupIpc(): void {
         let agentStdout = ''
         let agentStderr = ''
         if (provider === 'opencode') {
-          writeAgentLease(leasePath, { schemaVersion: 1, sessionId, provider, databasePath, runId: ctx.runId, candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId, attemptId: ctx.attemptId, pid: process.pid, startedAt: new Date().toISOString(), launchAttempts: carriedLaunchAttempts, autopilot })
+          writeAgentLease(leasePath, { schemaVersion: 1, sessionId, provider, databasePath, runId: ctx.runId, candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId, attemptId: ctx.attemptId, pid: process.pid, startedAt: new Date().toISOString(), launchAttempts: carriedLaunchAttempts, autopilot, repairBudget })
           let transport: Awaited<ReturnType<typeof startStandaloneOpenCodeServer>>
           try { transport = await startStandaloneOpenCodeServer(projectPath, databasePath) } catch (error) {
             exitCode = 1
@@ -8885,6 +8923,7 @@ function setupIpc(): void {
               startedAt: new Date().toISOString(),
               launchAttempts: carriedLaunchAttempts,
               autopilot,
+              repairBudget,
             })
             const agentResult = await spawnIterativeStreamed(
               runDir,
@@ -8893,7 +8932,7 @@ function setupIpc(): void {
                 ? buildOpenCodeResumeArgs(projectPath, resumeSessionId as string, model, promptFile, undefined, undefined, transport?.url)
                 : buildOpenCodeAgentArgs(projectPath, promptFile, model, undefined, transport?.url),
               projectPath,
-              agentLaunchTimeoutMs(carriedLaunchAttempts, autopilot),
+              repairTimeoutMs,
               iterativeStreamIo(runDir),
               { ...iterativeStreamPlatform, commandEnvironment: env => commandEnvironment(openCodeDatabaseEnv(env, databasePath || transport?.databasePath || '')) },
               undefined,
@@ -8922,6 +8961,7 @@ function setupIpc(): void {
             startedAt: new Date().toISOString(),
             launchAttempts: carriedLaunchAttempts,
             autopilot,
+            repairBudget,
           })
           const agentResult = await spawnIterativeStreamed(
             runDir,
@@ -8932,7 +8972,7 @@ function setupIpc(): void {
                 : buildCodexResumeArgs(resumeSessionId as string, model, promptFile))
               : (provider === 'claude' ? buildClaudeAgentArgs(model) : buildCodexAgentArgs(projectPath, model)),
             projectPath,
-            agentLaunchTimeoutMs(carriedLaunchAttempts, autopilot),
+            repairTimeoutMs,
             iterativeStreamIo(runDir),
             iterativeStreamPlatform,
             undefined,
@@ -8956,10 +8996,20 @@ function setupIpc(): void {
         }
         const repairTimedOut = agentTimedOut && agentWorkObserved && !streamedProviderError && !agentLaunchProviderError(output)
         const providerFailure = repairTimedOut ? undefined : agentProviderFailure(output, exitCode)
-        if (repairTimedOut && bootstrap) {
-          throw new Error('AGENT_ACTIVE_REPAIR_TIMEOUT: initial control repair exceeded its deadline; no verified checkpoint is available for independent updates.')
+        if (repairTimedOut) {
+          const forbidden = forbiddenTrialViolations(workspaceRoot, baselineFile, { provider, projectRelative })
+          if (forbidden.length) throw new Error(`FORBIDDEN_MUTATION: ${forbidden.join(', ')}`)
+          const lease = readAgentLease(leasePath)
+          if (!lease) throw new Error('AGENT_REPAIR_SESSION_MISSING')
+          preserveLease = true
+          writeAgentLease(leasePath, { ...lease, childPid: undefined, repairBudget: { ...repairBudget, paused: true } })
+          const reason = repairBudget.windows < 3
+            ? 'Ремонт остановлен по времени без новых подтверждённых изменений. Правки и сессия сохранены; продолжение возобновит эту попытку.'
+            : 'Лимит ремонта исчерпан (3 окна по 15 минут). Правки и сессия сохранены; нужен другой вариант обновления.'
+          recordAttemptLog(runDir, `${reason}\n`)
+          updateAttempt(runDir, { status: 'done', stage: 'agent', lastStep: 'agent', finishedAt: Date.now(), reason, lastError: undefined })
+          return { ok: false, paused: true, reason, error: `AGENT_REPAIR_PAUSED: ${reason}`, agentOutputTail }
         }
-        if (repairTimedOut) recordAttemptLog(runDir, 'Active agent repair timed out; deferring this exact candidate as INCONCLUSIVE. Other cohorts continue from the verified checkpoint.\n')
         // Launch-failure resilience: classify BEFORE the ordinary provider
         // error handling. A retryable outage (rate limit / temporary / unknown
         // with budget left) parks the repair in a durable wait: the attempt is

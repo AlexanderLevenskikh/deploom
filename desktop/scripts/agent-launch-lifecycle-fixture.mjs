@@ -175,7 +175,7 @@ function fixture() {
   assert.equal(result.autopilot.stopped, 'finished', JSON.stringify(result));
   assert.equal(f.launches.length, 7);
   assert.equal(f.drives(), 1);
-  assert.deepEqual(f.launches.slice(0,3).map(x => x.timeout), [900_000,1800_000,3600_000]);
+  assert.ok(f.launches.every(x => x.timeout > 0 && x.timeout <= 900_000));
   assert.ok(f.launches.slice(1).every(x => x.args.includes('ses-timeout')));
   assert.equal(f.lease(), undefined);
 }
@@ -260,6 +260,7 @@ for (const verbose of [false,true]) {
 // model-launch wait. Exercise the real child kill, then inspect typed feedback.
 for (const activity of ['running','completed']) {
   const f=fixture();
+  f.bindings.extendRepairBudget = () => undefined;
   const stream=f.bindings.spawnIterativeStreamed;
   f.bindings.spawnIterativeStreamed=(dir,cmd,args,cwd,_timeout,...rest)=>stream(dir,cmd,args,cwd,1000,...rest);
   f.setChild(`
@@ -268,12 +269,31 @@ for (const activity of ['running','completed']) {
     setTimeout(()=>{},10000);
   `);
   const result=await f.autonomous(undefined,{projectName:'fixture',autopilot:true});
-  assert.equal(result.autopilot.stopped,'finished',JSON.stringify(result));
-  const feedback=JSON.parse(readFileSync(join(f.runDir,'trial','agent-feedback.json'),'utf8'));
-  assert.equal(feedback.kind,'INCONCLUSIVE');assert.deepEqual(feedback.changedFiles,[]);
-  assert.match(feedback.reason,/deadline exceeded/);
+  assert.equal(result.autopilot.stopped,'paused',JSON.stringify(result));
+  assert.equal(existsSync(join(f.runDir,'trial','agent-feedback.json')),false);
   assert.equal(f.launches.length,1);assert.equal(f.waits.length,0);
-  assert.equal(f.drives(),1);assert.equal(f.lease(),undefined);
+  assert.equal(f.drives(),0);assert.equal(f.lease().repairBudget.paused,true);
+  assert.equal(f.lease().sessionId,'ses-active');
+  f.setChild(`require('fs').writeFileSync('input.js','completed repair');console.log('FEEDBACK_KIND: READY_FOR_VERIFY');`);
+  const continued=await f.autonomous(undefined,{projectName:'fixture',autopilot:true});
+  assert.equal(continued.autopilot.stopped,'finished');
+  assert.ok(f.launches[1].args.includes('ses-active'));
+  assert.equal(f.drives(),1); assert.equal(f.lease(),undefined);
+}
+// Production handler earns time from actual trial bytes and completes normally.
+{
+  const f=fixture(); const stream=f.bindings.spawnIterativeStreamed;
+  const budgets=[];
+  f.bindings.writeAgentLease=(file, lease)=>{budgets.push(lease.repairBudget?.windows);agents.writeAgentLease(file,lease)};
+  f.bindings.extendRepairBudget=(budget,fingerprint)=>agents.extendRepairBudget(budget,fingerprint,Date.now(),500);
+  f.bindings.spawnIterativeStreamed=(dir,cmd,args,cwd,_timeout,...rest)=>stream(dir,cmd,args,cwd,300,...rest);
+  f.setChild(`require('fs').writeFileSync('input.js','earned repair');
+    console.log(JSON.stringify({type:'tool_use',sessionID:'ses-extended',part:{type:'tool',state:{status:'completed'}}}));
+    setTimeout(()=>console.log('FEEDBACK_KIND: READY_FOR_VERIFY'),500);`);
+  const result=await f.autonomous(undefined,{projectName:'fixture',autopilot:true});
+  assert.equal(result.autopilot.stopped,'finished',JSON.stringify(result));
+  assert.ok(budgets.includes(2));assert.equal(f.launches.length,1);assert.equal(f.drives(),1);
+  assert.equal(f.lease(),undefined);
 }
 // Confirmed provider failure after tool work still waits; it is not a failed
 // compatibility proof and must not consume the repair as INCONCLUSIVE.

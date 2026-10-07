@@ -54,6 +54,46 @@ class ResumeTests(unittest.TestCase):
             self.assertEqual(self.cli(run.root).returncode, 0)
             self.assertEqual(len(migration.load_run(run.root)["continuations"]), 1)
 
+    def test_real_cli_restores_timed_out_trial_once_without_resetting_history(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            run, _ = self.setup_run(Path(tmp))
+            trial = run.root / "trial/workspace"
+            trial.mkdir(parents=True)
+            (trial / "fixed.ts").write_text("export const fixed = true", encoding="utf-8")
+            candidate = {"schemaVersion":1, "candidateId":"timed-out", "runId":"iter-000000000001", "stage":"REJECTED", "baseCheckpointId":"C4", "attemptId":0,
+                         "materializationRefs":{"workspaceRoot":str(trial), "projectRelative":"."}}
+            migration.save_candidate(run.root, candidate)
+            ledger = {"schemaVersion":1, "nogoods":[{"pkg-a":"2.0.0"}], "counters":{"repairAttemptsForRevision":1},
+                      "deferrals":[{"candidateId":"timed-out", "reason":"Active agent repair deadline exceeded; try another cohort from the verified checkpoint."}],
+                      "feedback":[{"candidateId":"timed-out", "kind":"INCONCLUSIVE"}]}
+            (run.root / "ledger.json").write_text(json.dumps(ledger), encoding="utf-8")
+            before = (run.root / "ledger.json").read_bytes()
+            result = self.cli(run.root)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(migration.load_run(run.root)["phase"], "REPAIRING")
+            recovered = migration.load_candidate(run.root)
+            self.assertEqual(recovered["timeoutRecoveryCount"], 1)
+            self.assertEqual(recovered["attemptId"], 0)
+            self.assertEqual((run.root / "ledger.json").read_bytes(), before)
+            self.assertEqual((trial / "fixed.ts").read_text(), "export const fixed = true")
+            # Simulate a crash between candidate and run publication.
+            state = migration.load_run(run.root)
+            migration.save_run(run.root, {**state, "phase":"TERMINAL", "terminal":"PARTIAL_VERIFIED"})
+            self.assertEqual(self.cli(run.root).returncode, 0)
+            self.assertEqual(migration.load_candidate(run.root)["attemptId"], 0)
+
+    def test_legacy_recovery_rejects_external_trial_and_other_deferrals(self):
+        from iterative_resume import recover_timed_out_candidate
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate = {"candidateId":"x", "stage":"REJECTED", "baseCheckpointId":"C4", "materializationRefs":{"workspaceRoot":str(root)}}
+            ledger = {"deferrals":[{"candidateId":"x", "reason":"Active agent repair deadline exceeded; try another cohort from the verified checkpoint."}],
+                      "feedback":[{"candidateId":"x", "kind":"INCONCLUSIVE"}]}
+            with self.assertRaises(ValueError):
+                recover_timed_out_candidate(root, {}, {"checkpointId":"C4"}, candidate, ledger, {})
+            self.assertIsNone(recover_timed_out_candidate(root, {}, {"checkpointId":"C4"}, candidate, {}, {}))
+
     def test_mutated_source_fails_closed_and_keeps_terminal_result(self):
         with tempfile.TemporaryDirectory() as tmp:
             run, snapshot = self.setup_run(Path(tmp))

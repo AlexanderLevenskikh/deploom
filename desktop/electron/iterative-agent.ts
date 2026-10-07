@@ -575,6 +575,7 @@ export type AgentLease = {
   retryAfterSeconds?: number
   launchAttempts?: number
   launchDiagnostics?: AgentLaunchDiagnostics
+  repairBudget?: { windows: number; deadlineAt: number; fingerprint: string; paused?: boolean }
 }
 
 /** Every exit, including a parked wait and exhausted budget, releases the
@@ -587,6 +588,27 @@ export async function withAgentDispatchLock<T>(inFlight: Set<string>, key: strin
 
 export function agentLeaseFile(runDir: string): string {
   return join(runDir, 'trial', AGENT_LEASE_FILENAME)
+}
+
+export function validRepairBudget(value: unknown): value is NonNullable<AgentLease['repairBudget']> {
+  const b = value as NonNullable<AgentLease['repairBudget']> | undefined
+  return Boolean(b && Number.isInteger(b.windows) && b.windows >= 1 && b.windows <= 3
+    && Number.isFinite(b.deadlineAt) && typeof b.fingerprint === 'string')
+}
+
+/** Hash actual allowed source mutations; provider prose and repeated heartbeats
+ * cannot extend a repair. Protected mutations retain their ordinary guard. */
+export function repairProgressFingerprint(root: string, baseline: string): string {
+  const changes = classifyTrialMutations(root, baseline).filter(m => !m.forbidden)
+  if (!changes.length) return ''
+  return createHash('sha256').update(JSON.stringify(changes.sort((a, b) => a.path.localeCompare(b.path))
+    .map(m => [m.path, m.kind, m.kind === 'removed' ? '' : fileHash(join(root, m.path))]))).digest('hex')
+}
+
+export function extendRepairBudget(budget: NonNullable<AgentLease['repairBudget']>, fingerprint: string,
+  now = Date.now(), windowMs = 15 * 60_000): NonNullable<AgentLease['repairBudget']> | undefined {
+  if (budget.windows >= 3 || !fingerprint || fingerprint === budget.fingerprint) return undefined
+  return { windows: budget.windows + 1, deadlineAt: now + windowMs, fingerprint }
 }
 
 export function writeAgentLease(file: string, lease: AgentLease): void {
@@ -615,6 +637,7 @@ export function readAgentLease(file: string): AgentLease | undefined {
       ...(typeof parsed.childPid === 'number' ? { childPid: parsed.childPid } : {}),
       ...(parsed.autopilot === true ? { autopilot: true } : {}),
       startedAt: parsed.startedAt,
+      ...(validRepairBudget(parsed.repairBudget) ? { repairBudget: parsed.repairBudget } : {}),
       ...(parsed.waiting === true ? { waiting: true } : {}),
       ...(waitKind ? { waitKind } : {}),
       ...(typeof parsed.waitDetail === 'string' && parsed.waitDetail ? { waitDetail: parsed.waitDetail } : {}),
@@ -699,7 +722,11 @@ export function decideAgentLeaseDispatch(
   if (!lease) return { action: 'none' }
   // A child surviving Desktop must not expire into a duplicate paid repair.
   if (!lease.waiting && lease.childPid && isOwnerAlive(lease.childPid)) return { action: 'in-progress' }
-  if (!lease.waiting && !agentLeaseAlive(lease, now)) return { action: 'none' }
+  if (!lease.waiting && !lease.repairBudget && !agentLeaseAlive(lease, now)) return { action: 'none' }
+  if (lease.repairBudget?.paused) {
+    if (lease.repairBudget.windows >= 3) return { action: 'give-up', detail: 'AGENT_REPAIR_BUDGET_EXHAUSTED: три окна ремонта использованы. Принятый результат и правки trial сохранены; нужен другой вариант обновления.' }
+    return lease.sessionId ? { action: 'resume', sessionId: lease.sessionId } : { action: 'retry', launchAttempts: lease.launchAttempts ?? 0, detail: 'Continue preserved trial repair' }
+  }
   if (lease.waiting) {
     const attempts = lease.launchAttempts ?? 0
     if (lease.waitKind !== 'rate-limited' && !(lease.autopilot && lease.waitKind === 'temporary')) {

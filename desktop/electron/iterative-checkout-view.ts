@@ -16,7 +16,8 @@ export function iterativeCheckoutView(payload: Record<string, any>, runDir: stri
     if (!contained(join(runDir, 'trial'), root) || !contained(root, path) || !existsSync(path)) return
     return { path, kind: 'trial', checkpointId: payload.activeCheckpoint?.checkpointId }
   }
-  const active = trial(payload.candidate?.materializationRefs)
+  const active = payload.run?.phase !== 'TERMINAL' && payload.candidate?.stage !== 'REJECTED'
+    ? trial(payload.candidate?.materializationRefs) : undefined
   if (active) return active
   if (payload.run?.phase === 'BLOCKED_C0' || payload.run?.bootstrapRefs) {
     const bootstrap = trial(payload.run?.bootstrapRefs)

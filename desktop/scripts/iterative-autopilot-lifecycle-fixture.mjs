@@ -10,6 +10,7 @@ import { createIterativeAutopilot } from '../dist-electron/iterative-autopilot.j
 import { liveRunWriterPid, readAutopilotState, writeAutopilotState } from '../dist-electron/iterative-autopilot-state.js';
 import * as attempts from '../dist-electron/iterative-attempt.js';
 import * as runner from '../dist-electron/iterative-runner.js';
+import * as agents from '../dist-electron/iterative-agent.js';
 import { parseIterativeFailure } from '../dist-electron/iterative-scenario.js';
 import { existsSync } from 'node:fs';
 
@@ -69,7 +70,7 @@ function fixture(failures = 0, critical = false, infra = false) {
   };
   let auto;
   const bindings = {
-    ...attempts,...runner,parseIterativeFailure, existsSync,join,writeFileSync,
+    ...agents,...attempts,...runner,parseIterativeFailure, existsSync,join,writeFileSync,
     loadState: () => ({workspaces:[workspace]}),findWorkspace: () => workspace,findProject: () => project,
     iterativeTaskRunDir: () => runDir,readProjects: () => [project],stepLockKey: () => 'w:demo',
     iterativeStepInFlight: new Set(),publishIterativeAttempt: () => {},resolveExecutable: () => 'fixture-python',bundledToolDir: () => runDir,
@@ -267,5 +268,24 @@ for (const kind of ['failed','canceled','finished','no-run','last-error','cancel
   const toggle=toggleHandler(f,{runIterativeDriveWithAutopilot:()=>{throw Error(`Unexpected resume: ${kind}`);}});
   assert.equal((await toggle(true)).active,false,kind);
   assert.equal(f.reads(),0);assert.equal(f.mutations(),0);
+}
+// Exhausted repair is a scheduling conclusion: protected checkpoint survives,
+// exact trial is not accepted, and its lease cannot block the next candidate.
+{
+  const f=fixture();
+  f.payload.run.phase='REPAIRING';f.payload.run.activeCandidateId='candidate';
+  f.payload.candidate={runId:'run-1',candidateId:'candidate',baseCheckpointId:'C4',attemptId:1,stage:'REPAIRING'};
+  agents.writeAgentLease(agents.agentLeaseFile(f.runDir),{schemaVersion:1,sessionId:'saved',provider:'opencode',databasePath:'saved.db',runId:'run-1',candidateId:'candidate',attemptId:1,pid:0,startedAt:new Date().toISOString(),repairBudget:{windows:3,deadlineAt:0,fingerprint:'changes',paused:true}});
+  const capture=f.bindings.spawnCapture;
+  f.bindings.spawnCapture=async(cmd,args,...rest)=>{
+    if(args.includes('apply-feedback')){f.payload.run.phase='TERMINAL';return child('process.exit(0)')}
+    return capture(cmd,args,...rest);
+  };
+  const result=await f.drive(undefined,{...f.scope,discardCandidate:true});
+  assert.equal(result.autopilot.stopped,'finished',JSON.stringify(result));
+  const feedback=JSON.parse(readFileSync(join(f.runDir,'trial/discard-feedback.json'),'utf8'));
+  assert.equal(feedback.kind,'INCONCLUSIVE');assert.deepEqual(feedback.changedFiles,[]);
+  assert.match(feedback.reason,/Repair budget exhausted/);
+  assert.equal(agents.readAgentLease(agents.agentLeaseFile(f.runDir)),undefined);
 }
 console.log('autopilot lifecycle: production toggle/drive, durable restart, identity, bounded reads, cancel, critical and exhausted verification boundaries OK');

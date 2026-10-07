@@ -97,6 +97,7 @@ export function createIterativeAutopilot(key: (scope: Scope) => string, persiste
       recoveredRepair = true
       if (session.canceled) return stopped('canceled')
     }
+    if (outcome.paused === true) return stopped('paused')
     if (outcome.ok !== true) return stopped('error', String(outcome.error || 'AUTOPILOT_STEP_FAILED'))
     if (first === 'begin') {
       if (outcome.checked) {
@@ -138,6 +139,7 @@ export function createIterativeAutopilot(key: (scope: Scope) => string, persiste
           pendingDrive = await invoke('drive', { ...input, discardCandidate: true })
           continue
         }
+        if (agent.paused === true) return stopped('paused')
         return stopped('error', String(agent.error || 'AUTOPILOT_AGENT_FAILED'))
       }
     }

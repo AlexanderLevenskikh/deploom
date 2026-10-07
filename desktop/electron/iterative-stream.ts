@@ -75,7 +75,7 @@ export function spawnIterativeStreamed(
   io: StreamAttemptIo,
   platform: StreamPlatform,
   onEvent?: (payload: Record<string, any>) => void,
-  options?: { stdin?: string; onLine?: (line: string) => void; onSpawn?: (pid: number) => void },
+  options?: { stdin?: string; onLine?: (line: string) => void; onSpawn?: (pid: number) => void; onDeadline?: () => number },
 ): Promise<CaptureResult> {
   return new Promise((resolvePromise) => {
     let stdout = ''
@@ -118,9 +118,16 @@ export function spawnIterativeStreamed(
     child.stdin.on('error', () => { /* EPIPE from an early child exit */ })
     child.stdin.end(options?.stdin)
     if (child.pid) observe(() => options?.onSpawn?.(child.pid as number))
-    const timer = timeoutMs > 0
-      ? setTimeout(() => { timedOut = true; platform.killProcessTree(child) }, timeoutMs)
-      : undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = (): void => {
+      if (settled || canceled || observerFailed) return
+      let extension = 0
+      observe(() => { extension = options?.onDeadline?.() ?? 0 })
+      if (observerFailed) return
+      if (Number.isFinite(extension) && extension > 0) timer = setTimeout(deadline, extension)
+      else { timedOut = true; platform.killProcessTree(child) }
+    }
+    if (timeoutMs > 0) timer = setTimeout(deadline, timeoutMs)
     const cancelCheck = setInterval(() => {
       if (!canceled && io.cancelRequested(runDir)) {
         canceled = true

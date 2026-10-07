@@ -569,13 +569,13 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     noTargets: validationChanged ? false : noTargetsStep,
     checked: !validationChanged && runner?.checked?.ok === true,
   })
-  const repairMutationBlocked = mainAction.state === 'agent' && attempt?.status === 'failed' && /^FORBIDDEN_MUTATION:/.test(attempt.lastError ?? '')
+  const repairMutationBlocked = mainAction.state === 'agent' && (runner?.repairPause?.exhausted === true || (attempt?.status === 'failed' && /^(?:FORBIDDEN_MUTATION|AGENT_REPAIR_BUDGET_EXHAUSTED):/.test(attempt.lastError ?? '')))
   const retryIsDiscoverySearch = blocker?.code === 'DISCOVERY_UNSETTLED'
-  const mainLabel = repairMutationBlocked ? text('Подобрать другой набор', 'Try another package set') : mainAction.state === 'retry-check' && retryIsDiscoverySearch
+  const mainLabel = repairMutationBlocked ? text('Подобрать другой набор', 'Try another package set') : mainAction.state === 'agent' && attempt?.status === 'done' && attempt.lastStep === 'agent' ? text('Продолжить исправление', 'Continue repair') : mainAction.state === 'retry-check' && retryIsDiscoverySearch
     ? text('Повторить поиск обновлений', 'Retry the update search')
     : text(...MAIN_LABEL[mainAction.state])
   const mainDescription = repairMutationBlocked
-    ? text('Защищённые файлы отличаются от снимка перед ремонтом. Отбросим эту попытку и продолжим подбор от последнего проверенного результата; спорные изменения не будут приняты.', 'Protected files differ from the pre-repair snapshot. Discard this trial and continue planning from the last verified result; disputed changes will not be accepted.')
+    ? text('Эту попытку нельзя продолжить: исчерпан лимит ремонта или нарушена защита файлов. Продолжим подбор от последнего проверенного результата; непроверенные правки не будут приняты.', 'This attempt cannot continue: its repair budget is exhausted or protected files changed. Continue planning from the last verified result; unverified edits will not be accepted.')
     : retryIsDiscoverySearch
     ? text(
         'Registry-данные не получены или бюджет поиска исчерпан — результат не засчитан. Повторите поиск или настройте состав обновления.',
@@ -583,6 +583,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       )
     : mainAction.state === 'blocked' && (runner?.progressSummary?.accepted ?? 0) > 0
     ? text('Принятые обновления проверены и сохранены. Финальное подтверждение результата заблокировано; откройте результат и данные аудита.', 'Accepted updates are verified and saved. Final confirmation is blocked; open the result and audit evidence.')
+    : mainAction.state === 'agent' && attempt?.status === 'done' && attempt.lastStep === 'agent'
+    ? (attempt.reason || text('Правки сохранены отдельно. Продолжение возобновит ремонт; принятие требует проверки.', 'Trial edits are preserved. Continue resumes repair; acceptance requires verification.'))
     : mainAction.state === 'agent-waiting'
     ? (attempt?.reason || text(...MAIN_DESCRIPTION[mainAction.state]))
     : text(...MAIN_DESCRIPTION[mainAction.state])
@@ -773,8 +775,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
 
       {runner?.phase === 'TERMINAL' && (runner.progressSummary?.accepted ?? 0) > 0 && ['blocked', 'partial', 'budget-stop', 'no-upgrade'].includes(mainAction.state) ? (
         <div className="resume-notice" data-testid="iterative-resume-result">
-          <span>{text('Принятые обновления сохранены. Можно продолжить с последнего проверенного результата; оставшиеся ограничения сохраняются.', 'Accepted updates are saved. Continue from the last verified result; remaining limits are preserved.')}</span>
-          <button type="button" disabled={busyLocked || childAlive} onClick={() => { void driveNow(false, true) }}>{text('Продолжить с сохранённого результата', 'Continue from saved result')}</button>
+          <span>{runner.stopDetail ? text(`Исправление группы из ${runner.stopDetail.packageCount} пакетов остановлено по таймауту. Новых принятых обновлений нет. Правки сохранены отдельно. ${runner.stopDetail.recoverable ? 'Продолжение возобновит ремонт.' : 'Нужен другой вариант обновления.'} Итоговый аудит: ${runner.stopDetail.auditStatus}.`, `Repair of ${runner.stopDetail.packageCount} packages stopped on timeout. No new updates accepted. Trial edits are preserved. ${runner.stopDetail.recoverable ? 'Continue resumes the repair.' : 'A different update proposal is needed.'} Final audit: ${runner.stopDetail.auditStatus}.`) : text('Принятые обновления сохранены. Продолжение сохраняет ограничения и бюджет; непринятые изменения требуют проверки.', 'Accepted updates are saved. Continuing preserves limits and budget; unaccepted changes still need verification.')}</span>
         </div>
       ) : null}
 
@@ -898,11 +899,13 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
           <div className="resume-notice">
             <span>{mainDescription}</span>
             <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.autopilotEnabled || runner?.autopilotActive || autopilot} disabled={disabledExternal === true} onChange={event => { const enabled = event.target.checked; setAutopilot(enabled); void window.dependencyFlow?.setIterativeAutopilot({ workspaceId, projectName, enabled }).then(() => refreshRunner()).catch(error => { setAutopilot(!enabled); setNote(String(error)) }) }} />{text('Автопилот: продолжать автоматически, включая исправления агентом', 'Autopilot: continue automatically, including agent repairs')}</label>
-            <small>{text('Можно включить во время работы. Автопилот продолжит после текущего шага; выключение остановит автоматические переходы.', 'Enable while running to continue after the current step; disabling stops automatic transitions.')}</small>
+            <small>{runner?.phase === 'TERMINAL'
+              ? text('Автопилот сейчас не работает. Флажок задаёт режим следующего запуска; продолжение запускается кнопкой ниже.', 'Autopilot is idle. The checkbox sets the next run mode; use Continue below to start.')
+              : text('Можно включить во время работы. Автопилот продолжит после текущего шага; выключение остановит автоматические переходы.', 'Enable while running to continue after the current step; disabling stops automatic transitions.')}</small>
             <footer className="baseline-intent-actions">
               <button
                 type="button"
-                className="button primary"
+                className={`button ${runner?.phase === 'TERMINAL' && (runner.progressSummary?.accepted ?? 0) > 0 && mainAction.state !== 'result' ? 'secondary' : 'primary'}`}
                 data-testid="iterative-main-action"
                 // P1#2: Stop must stay AVAILABLE while work is running — the
                 // busy lock disables everything EXCEPT the in-flight Stop.
@@ -912,6 +915,12 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
                 {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' || mainAction.state === 'repair-current' ? <Wrench size={16} /> : mainAction.state === 'result' || mainAction.state === 'partial' || mainAction.state === 'budget-stop' || mainAction.state === 'blocked' || mainAction.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}
                 {mainLabel}
               </button>
+              {runner?.phase === 'TERMINAL' && (runner.progressSummary?.accepted ?? 0) > 0 && ['blocked', 'partial', 'budget-stop', 'no-upgrade'].includes(mainAction.state) ? (
+                <button type="button" className="button primary" data-testid="iterative-resume-action"
+                  disabled={busyLocked || childAlive} onClick={() => { void driveNow(false, true) }}>
+                  <Rocket size={16} />{text('Продолжить с сохранённого результата', 'Continue from saved result')}
+                </button>
+              ) : null}
               {(attempt || runner?.present) && mainAction.state !== 'running' ? (
                 <button type="button" className="button secondary" data-testid="iterative-restart"
                   disabled={busyLocked}
@@ -978,9 +987,11 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
               ) : null}
 
               <footer className="baseline-intent-actions">
-                <button type="button" className="button secondary" disabled={busyLocked} onClick={() => setShowDialog(true)}>
-                  <FileText size={16} />{text('Посмотреть', 'View')}
-                </button>
+                {!['result', 'partial', 'budget-stop', 'blocked', 'no-upgrade'].includes(mainAction.state) ? (
+                  <button type="button" className="button secondary" disabled={busyLocked} onClick={() => setShowDialog(true)}>
+                    <FileText size={16} />{text('Посмотреть задание', 'View assignment')}
+                  </button>
+                ) : null}
                 <button type="button" className="button secondary" disabled={busyLocked} onClick={() => void run('copy', () => onCopy(projectName, language))}>
                   {copied && !showDiag ? <Check size={16} /> : <Clipboard size={16} />}{text('Скопировать задание', 'Copy the assignment')}
                 </button>
