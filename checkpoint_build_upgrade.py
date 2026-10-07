@@ -27,10 +27,16 @@ def reopen_checkpoint_source(run_dir, checkpoint, config, *, verify, progress, r
     try:
         return open_source_snapshot(container, expected_key=old_key, timeout_seconds=0, progress=progress)
     except SourceCaptureError as exc:
-        if not str(exc).startswith("SOURCE_SNAPSHOT_TOOL_BUILD_MISMATCH:"):
+        if not str(exc).startswith(("SOURCE_SNAPSHOT_TOOL_BUILD_MISMATCH:", "SOURCE_SNAPSHOT_CONTENT_MISMATCH:")):
             raise
-    progress("Validating preserved checkpoint after the DepLoom update")
-    old = open_source_snapshot(container, expected_key=old_key, timeout_seconds=0, allow_build_upgrade=True, progress=progress)
+    progress("Validating preserved checkpoint before continuing")
+    try:
+        old = open_source_snapshot(container, expected_key=old_key, timeout_seconds=0, allow_build_upgrade=True, progress=progress)
+    except SourceCaptureError as exc:
+        if not str(exc).startswith("SOURCE_SNAPSHOT_CONTENT_MISMATCH:"):
+            raise
+        from checkpoint_index_recovery import inspect_checkpoint_index_drift
+        old = inspect_checkpoint_index_drift(container, old_key, progress=progress)
     manager = detect_package_manager(old.project_path)
     context = build_resolver_context_key(
         old.project_path, manager=manager, manager_executable=resolve_executable(manager) or manager,
@@ -46,6 +52,8 @@ def reopen_checkpoint_source(run_dir, checkpoint, config, *, verify, progress, r
         "runtime": config.get("runtime"),
         "requestedNode": config.get("requestedNode"),
     }
+    if getattr(old, "recovery", None):
+        identity["indexRecovery"] = old.recovery
     key = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     directory = Path(run_dir) / "checkpoint-build-upgrades"
     directory.mkdir(parents=True, exist_ok=True)
@@ -71,6 +79,8 @@ def reopen_checkpoint_source(run_dir, checkpoint, config, *, verify, progress, r
         raise CheckpointBuildUpgradeError(
             "CHECKPOINT_BUILD_UPGRADE_UNCONFIRMED: " + str(result.kind) + ": " + str(result.summary)
         )
+    # The verifier may never mutate the sealed input it claims to verify.
+    open_source_snapshot(snapshot.container, expected_key=snapshot.key, timeout_seconds=0, progress=progress)
     # No old checkpoint is rewritten; publishing this record is the only commit.
     record = {
         "schemaVersion": 1, "identity": identity, "key": snapshot.key,

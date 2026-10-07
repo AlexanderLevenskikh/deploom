@@ -2,6 +2,8 @@
 from __future__ import annotations
 import json
 import tempfile
+import os
+import subprocess
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -95,6 +97,88 @@ class CheckpointBuildUpgradeTests(unittest.TestCase):
             self.assertTrue(messages)
             self.assertTrue(all(event["runId"] == "demo-run" and event["candidateId"] == "demo-candidate" for event in messages))
             self.assertEqual([event["sequence"] for event in messages], list(range(1, len(messages) + 1)))
+
+    def index_fixture(self, root, producer_build="a" * 64):
+        checkpoint, config = self.fixture(root)
+        project = root / "project"
+        for args in (["init"], ["add", "."], ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture"]):
+            subprocess.run(["git", "-C", str(project), *args], check=True, capture_output=True)
+        with mock.patch.object(source, "tool_build_id", return_value=producer_build):
+            snapshot = source.capture_durable_source_snapshot(project, root / "git-snapshot", timeout_seconds=60)
+        checkpoint.update(sourceSnapshotKey=snapshot.key, sourceSnapshotContainer=str(snapshot.container))
+        index = snapshot.root / ".git/index"
+        original = index.read_bytes()
+        # A real Git cache refresh changes the sealed index without source edits.
+        tracked = snapshot.project_path / "check.cjs"
+        os.utime(tracked, (1_700_000_000, 1_700_000_000))
+        subprocess.run(["git", "--no-optional-locks", "-C", str(snapshot.root), "update-index", "--refresh"], check=True, capture_output=True)
+        self.assertNotEqual(original, index.read_bytes())
+        return checkpoint, config, snapshot
+
+    def test_real_git_index_refresh_requires_fresh_real_checks_and_preserves_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint, config, original = self.index_fixture(root)
+            before = (original.container / "manifest.json").read_bytes()
+            index_before = original.root.joinpath(".git/index").read_bytes()
+            recovered = migration._open_checkpoint_source(root / "run", checkpoint, config)
+            self.assertNotEqual(recovered.key, checkpoint["sourceSnapshotKey"])
+            self.assertEqual(before, (original.container / "manifest.json").read_bytes())
+            self.assertEqual(index_before, original.root.joinpath(".git/index").read_bytes())
+            record = json.loads(next((root / "run/checkpoint-build-upgrades").glob("*.json")).read_text())
+            self.assertEqual(record["identity"]["indexRecovery"]["changedPaths"], [".git/index"])
+            self.assertEqual(record["verification"]["status"], "passed")
+            again = migration._open_checkpoint_source(root / "run", checkpoint, config)
+            self.assertEqual(again.key, recovered.key)
+
+    def test_index_drift_in_same_build_still_requires_new_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint, config, original = self.index_fixture(root, producer_build=source.tool_build_id())
+            with self.assertRaisesRegex(source.SourceCaptureError, "CONTENT_MISMATCH"):
+                source.open_source_snapshot(original.container)
+            verify = mock.Mock(return_value=BaselineVerifyResult(True, "passed", "new checks"))
+            recovered = upgrade.reopen_checkpoint_source(root / "run", checkpoint, config, verify=verify, progress=lambda *args: None)
+            self.assertNotEqual(recovered.key, checkpoint["sourceSnapshotKey"])
+            verify.assert_called_once()
+            source.open_source_snapshot(recovered.container, expected_key=recovered.key)
+
+    def test_index_recovery_rejects_source_drift_and_forged_manifest(self):
+        for mode in ("source", "manifest", "index-removed"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                checkpoint, config, original = self.index_fixture(root)
+                if mode == "source":
+                    target = original.project_path / "check.cjs"
+                    target.chmod(0o600)
+                    target.write_text("process.exit(0);", encoding="utf-8")
+                elif mode == "manifest":
+                    target = original.container / "manifest.json"
+                    raw = json.loads(target.read_text())
+                    raw["entries"][0]["path"] = "forged"
+                    target.write_text(json.dumps(raw), encoding="utf-8")
+                else:
+                    target = original.root / ".git/index"
+                    target.chmod(0o600)
+                    target.unlink()
+                with self.assertRaises(migration.ProjectUnreadyError):
+                    migration._open_checkpoint_source(root / "run", checkpoint, config)
+                self.assertFalse(list((root / "run/checkpoint-build-upgrades").glob("*.json")))
+
+    def test_index_recovery_red_checks_and_mutating_verifier_publish_nothing(self):
+        for mode in ("red", "mutated"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                checkpoint, config, _ = self.index_fixture(root)
+                def verify(project, assignment):
+                    if mode == "mutated":
+                        target = project / "check.cjs"
+                        target.chmod(0o600)
+                        target.write_text("changed", encoding="utf-8")
+                    return BaselineVerifyResult(mode != "red", "passed" if mode != "red" else "project-check", "control")
+                with self.assertRaises((source.SourceCaptureError, upgrade.CheckpointBuildUpgradeError)):
+                    upgrade.reopen_checkpoint_source(root / "run", checkpoint, config, verify=verify, progress=lambda *args: None)
+                self.assertEqual(list((root / "run/checkpoint-build-upgrades").glob("*.json")), [])
 
 
 if __name__ == "__main__":

@@ -3581,7 +3581,7 @@ def _open_checkpoint_source(run_dir, checkpoint, config, *, run_id="", candidate
             expected_key=str(checkpoint["sourceSnapshotKey"]), timeout_seconds=0,
         )
     except SourceCaptureError as exc:
-        if not str(exc).startswith("SOURCE_SNAPSHOT_TOOL_BUILD_MISMATCH:"):
+        if not str(exc).startswith(("SOURCE_SNAPSHOT_TOOL_BUILD_MISMATCH:", "SOURCE_SNAPSHOT_CONTENT_MISMATCH:")):
             raise
     from checkpoint_build_upgrade import CheckpointBuildUpgradeError, reopen_checkpoint_source
     verify_config = dataclasses.replace(
@@ -3597,6 +3597,12 @@ def _open_checkpoint_source(run_dir, checkpoint, config, *, run_id="", candidate
             )
         try:
             return reopen_checkpoint_source(run_dir, checkpoint, config, verify=verify, progress=progress, runtime_env=_runtime_env(config))
+        except SourceCaptureError as exc:
+            raise ProjectUnreadyError(
+                "SOURCE_SNAPSHOT_CONTENT_MISMATCH",
+                "Целостность сохранённого результата не подтверждена. Прежний checkpoint сохранён. " + str(exc),
+                command="",
+            ) from exc
         except CheckpointBuildUpgradeError as exc:
             raise ProjectUnreadyError(
                 "CHECKPOINT_BUILD_UPGRADE_UNCONFIRMED",

@@ -1643,7 +1643,9 @@ function spawnCapture(command: string, args: string[], cwd: string, timeoutMs = 
     let stderr = ''
     let settled = false
     let timedOut = false
-    const commandEnv = commandEnvironment(envOverrides ? { ...process.env, ...envOverrides } : process.env)
+    // Reading Git status must not refresh an index inside a sealed checkpoint.
+    const captureEnv = { ...process.env, ...envOverrides, ...(command === 'git' ? { GIT_OPTIONAL_LOCKS: '0' } : {}) }
+    const commandEnv = commandEnvironment(captureEnv)
     const invocation = resolveSpawnInvocation(command, args, { env: commandEnv })
     const child = spawn(invocation.command, invocation.args, { cwd, shell: false, detached: processTreeDetached(), windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments, env: commandEnv })
     const timer = setTimeout(() => { timedOut = true; killProcessTree(child) }, timeoutMs)
