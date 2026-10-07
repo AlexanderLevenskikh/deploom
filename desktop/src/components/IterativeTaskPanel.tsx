@@ -773,7 +773,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         )
       })()}
 
-      {runner?.phase === 'TERMINAL' && (runner.progressSummary?.accepted ?? 0) > 0 && ['blocked', 'partial', 'budget-stop', 'no-upgrade'].includes(mainAction.state) ? (
+      {runner?.phase === 'TERMINAL' && runner.canResumeTerminal === true && ['blocked', 'partial', 'budget-stop', 'no-upgrade'].includes(mainAction.state) ? (
         <div className="resume-notice" data-testid="iterative-resume-result">
           <span>{runner.stopDetail ? text(`Исправление группы из ${runner.stopDetail.packageCount} пакетов остановлено по таймауту. Новых принятых обновлений нет. Правки сохранены отдельно. ${runner.stopDetail.recoverable ? 'Продолжение возобновит ремонт.' : 'Нужен другой вариант обновления.'} Итоговый аудит: ${runner.stopDetail.auditStatus}.`, `Repair of ${runner.stopDetail.packageCount} packages stopped on timeout. No new updates accepted. Trial edits are preserved. ${runner.stopDetail.recoverable ? 'Continue resumes the repair.' : 'A different update proposal is needed.'} Final audit: ${runner.stopDetail.auditStatus}.`) : text('Принятые обновления сохранены. Продолжение сохраняет ограничения и бюджет; непринятые изменения требуют проверки.', 'Accepted updates are saved. Continuing preserves limits and budget; unaccepted changes still need verification.')}</span>
         </div>
@@ -900,7 +900,9 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
             <span>{mainDescription}</span>
             <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.autopilotEnabled || runner?.autopilotActive || autopilot} disabled={disabledExternal === true} onChange={event => { const enabled = event.target.checked; setAutopilot(enabled); void window.dependencyFlow?.setIterativeAutopilot({ workspaceId, projectName, enabled }).then(() => refreshRunner()).catch(error => { setAutopilot(!enabled); setNote(String(error)) }) }} />{text('Автопилот: продолжать автоматически, включая исправления агентом', 'Autopilot: continue automatically, including agent repairs')}</label>
             <small>{runner?.phase === 'TERMINAL'
-              ? text('Автопилот сейчас не работает. Флажок задаёт режим следующего запуска; продолжение запускается кнопкой ниже.', 'Autopilot is idle. The checkbox sets the next run mode; use Continue below to start.')
+              ? runner.canResumeTerminal
+                ? text('Включите автопилот для автоматического продолжения или продолжите вручную кнопкой ниже.', 'Enable autopilot to continue automatically, or use the button below to continue manually.')
+                : text('Прогон завершён. Для продолжения нужен новый вариант обновления; проверенный результат сохранён.', 'The run has ended. Continuing requires a new update proposal; the verified result is preserved.')
               : text('Можно включить во время работы. Автопилот продолжит после текущего шага; выключение остановит автоматические переходы.', 'Enable while running to continue after the current step; disabling stops automatic transitions.')}</small>
             <footer className="baseline-intent-actions">
               <button
@@ -915,7 +917,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
                 {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' || mainAction.state === 'repair-current' ? <Wrench size={16} /> : mainAction.state === 'result' || mainAction.state === 'partial' || mainAction.state === 'budget-stop' || mainAction.state === 'blocked' || mainAction.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}
                 {mainLabel}
               </button>
-              {runner?.phase === 'TERMINAL' && (runner.progressSummary?.accepted ?? 0) > 0 && ['blocked', 'partial', 'budget-stop', 'no-upgrade'].includes(mainAction.state) ? (
+              {runner?.phase === 'TERMINAL' && runner.canResumeTerminal === true && ['blocked', 'partial', 'budget-stop', 'no-upgrade'].includes(mainAction.state) ? (
                 <button type="button" className="button primary" data-testid="iterative-resume-action"
                   disabled={busyLocked || childAlive} onClick={() => { void driveNow(false, true) }}>
                   <Rocket size={16} />{text('Продолжить с сохранённого результата', 'Continue from saved result')}

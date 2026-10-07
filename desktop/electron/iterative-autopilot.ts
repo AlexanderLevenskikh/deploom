@@ -65,7 +65,13 @@ export function createIterativeAutopilot(key: (scope: Scope) => string, persiste
     }
   }
   async function resumeWaitingAgent(outcome: Outcome, input: Input, session: { canceled: boolean; enabled: boolean }): Promise<Outcome> {
-    while (outcome.waiting === true && session.enabled && !session.canceled) {
+    let repairResumes = 0
+    while ((outcome.waiting === true || outcome.continuation === 'resume-repair') && session.enabled && !session.canceled) {
+      if (outcome.continuation === 'resume-repair') {
+        if (++repairResumes > 3) return { ok: false, error: 'AUTOPILOT_REPAIR_CONTINUATION_EXHAUSTED' }
+        outcome = await invoke('agent', input)
+        continue
+      }
       const retryAt = Number(outcome.retryAt)
       if (!Number.isFinite(retryAt)) return { ok: false, error: 'AGENT_WAIT_DEADLINE_MISSING' }
       await waitUntil(retryAt, session)
@@ -91,7 +97,7 @@ export function createIterativeAutopilot(key: (scope: Scope) => string, persiste
     if (session.canceled) return stopped('canceled')
     if (!session.enabled || outcome.waiting === true) return stopped('paused')
     let recoveredRepair = false
-    if (first === 'agent' && outcome.ok !== true && /^FORBIDDEN_MUTATION:/.test(String(outcome.error ?? ''))) {
+    if (first === 'agent' && outcome.ok !== true && (outcome.continuation === 'discard-candidate' || /^(?:FORBIDDEN_MUTATION|AGENT_REPAIR_BUDGET_EXHAUSTED):/.test(String(outcome.error ?? '')))) {
       outcome = await invoke('drive', { ...input, discardCandidate: true })
       initial = outcome
       recoveredRepair = true
@@ -112,6 +118,7 @@ export function createIterativeAutopilot(key: (scope: Scope) => string, persiste
     // Agent budgets and exact-request closure remain authoritative in Python.
     // Do not retry an identical gate after a nominally successful agent call.
     const gates = new Set<string>()
+    const terminalResumes = new Set<string>()
     let pendingDrive = first === 'drive' || recoveredRepair ? outcome : undefined
     while (!session.canceled && session.enabled) {
       const drive = pendingDrive ?? await invoke('drive', input)
@@ -119,6 +126,13 @@ export function createIterativeAutopilot(key: (scope: Scope) => string, persiste
       if (session.canceled) return stopped('canceled')
       if (!session.enabled) return stopped('paused')
       if (drive.ok !== true) return stopped('error', String(drive.error || 'AUTOPILOT_DRIVE_FAILED'))
+      if (drive.continuation === 'resume-terminal') {
+        const identity = JSON.stringify([drive.runId, drive.candidateId, drive.checkpointId])
+        if (terminalResumes.has(identity)) return stopped('error', 'AUTOPILOT_REPEATED_TERMINAL_CONTINUATION')
+        terminalResumes.add(identity)
+        pendingDrive = await invoke('drive', { ...input, resumeTerminal: true })
+        continue
+      }
       if (drive.stopped !== 'agent-gate') return stopped(String(drive.stopped || 'paused'))
       const status = await invoke('status', input)
       if (session.canceled) return stopped('canceled')
@@ -132,7 +146,7 @@ export function createIterativeAutopilot(key: (scope: Scope) => string, persiste
       if (session.canceled) return stopped('canceled')
       if (!session.enabled) return stopped('paused')
       if (agent.ok !== true) {
-        if (/^FORBIDDEN_MUTATION:/.test(String(agent.error ?? ''))) {
+        if (agent.continuation === 'discard-candidate' || /^(?:FORBIDDEN_MUTATION|AGENT_REPAIR_BUDGET_EXHAUSTED):/.test(String(agent.error ?? ''))) {
           // Reject the trial instead of repeating paid repair on disputed bytes.
           // Python keeps the checkpoint and schedules other cohorts; the gate
           // set above still prevents an identical repair loop.

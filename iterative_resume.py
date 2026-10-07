@@ -24,6 +24,17 @@ def reopen_terminal_run(run, checkpoint, candidate):
             "activeCandidateId": None, "continuations": history, "updatedAt": now}
 
 
+def terminal_repair_resumable(run_dir, run, checkpoint, candidate, ledger, config):
+    """Expose only a one-time actionable repair; no budget or proof is reset."""
+    if run.get("phase") != "TERMINAL":
+        return False
+    try:
+        reopen_terminal_run(run, checkpoint, candidate)
+        return recover_timed_out_candidate(run_dir, run, checkpoint, candidate, ledger, config) is not None
+    except (ValueError, OSError):
+        return False
+
+
 def recover_timed_out_candidate(run_dir, run, checkpoint, candidate, ledger, config):
     """Explicit, one-time recovery of a legacy timed-out trial; no proof granted."""
     from pathlib import Path

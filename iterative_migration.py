@@ -4911,6 +4911,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     progress_summary = build_progress_summary(config, _all_checkpoints(run_dir), checkpoint, ledger)
     from iterative_scope_expansion import prepare_expansions
     from iterative_cohort_planner import cohort_atom_issues
+    from iterative_resume import terminal_repair_resumable
     status_incumbent = dict(checkpoint.get("fullAssignment") or {})
     status_desired, status_ledger, expansion_issues = prepare_expansions(
         status_incumbent,
@@ -4929,6 +4930,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "run": run,
         "activeCheckpoint": checkpoint,
         "progressSummary": progress_summary,
+        "terminalRepairResumable": terminal_repair_resumable(run_dir, run, checkpoint, candidate, ledger, config),
         "candidate": candidate,
         "ledgerSummary": {
             "blocks": len(ledger.get("blocks", [])),

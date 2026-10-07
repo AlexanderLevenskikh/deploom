@@ -439,6 +439,7 @@ export type IterativeStatusOutcome = {
   scopeExpansionIssues?: Array<{ packages: string[]; proposals: string[]; reason: string; nextAction: string; packageCount?: number; maxPackages?: number }>
   workingCheckout?: { path: string; kind: 'trial' | 'checkpoint' | 'project'; checkpointId?: string }
   stopDetail?: { kind: 'repair-timeout'; packageCount: number; recoverable: boolean; auditStatus: string }
+  canResumeTerminal?: boolean
   repairPause?: { exhausted: boolean; windows: number }
   // Review P1: Electron-authoritative liveness — a REAL begin/drive child is
   // in-flight for this project, independent of any React component's local busy

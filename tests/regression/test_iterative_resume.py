@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 import iterative_migration as migration
-from iterative_resume import reopen_terminal_run
+from iterative_resume import reopen_terminal_run, terminal_repair_resumable
 from source_snapshot import capture_durable_source_snapshot
 
 spec = importlib.util.spec_from_file_location("resume_fixture", Path(__file__).with_name("test_iterative_finish_baseline_and_feedback_validation.py"))
@@ -69,11 +69,17 @@ class ResumeTests(unittest.TestCase):
                       "feedback":[{"candidateId":"timed-out", "kind":"INCONCLUSIVE"}]}
             (run.root / "ledger.json").write_text(json.dumps(ledger), encoding="utf-8")
             before = (run.root / "ledger.json").read_bytes()
+            self.assertTrue(terminal_repair_resumable(run.root, migration.load_run(run.root), migration.load_checkpoint(run.root, 'C4'), candidate, ledger, migration.load_config(run.root)))
+            status = subprocess.run([sys.executable, str(REPO / "iterative_migration.py"), "--run-dir", str(run.root), "status"], cwd=REPO, capture_output=True, text=True, encoding="utf-8")
+            self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+            self.assertTrue(json.loads((run.root / "status.json").read_text())["terminalRepairResumable"])
+            self.assertEqual((run.root / "ledger.json").read_bytes(), before)
             result = self.cli(run.root)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(migration.load_run(run.root)["phase"], "REPAIRING")
             recovered = migration.load_candidate(run.root)
             self.assertEqual(recovered["timeoutRecoveryCount"], 1)
+            self.assertFalse(terminal_repair_resumable(run.root, {**migration.load_run(run.root), 'phase':'TERMINAL'}, migration.load_checkpoint(run.root, 'C4'), recovered, ledger, migration.load_config(run.root)))
             self.assertEqual(recovered["attemptId"], 0)
             self.assertEqual((run.root / "ledger.json").read_bytes(), before)
             self.assertEqual((trial / "fixed.ts").read_text(), "export const fixed = true")

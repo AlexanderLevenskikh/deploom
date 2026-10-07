@@ -440,10 +440,10 @@ assert.deepEqual(retries,[true,false]);
 assert.deepEqual(resumes,[true,false]);
 // Disputed repair bytes are rejected; other cohorts continue without another
 // paid repair of the same candidate. Exercise both initial and later agent gates.
-for (const initialAgent of [false, true]) {
+for (const error of ['FORBIDDEN_MUTATION: modified:package.json', 'AGENT_REPAIR_BUDGET_EXHAUSTED: repair', 'AGENT_REPAIR_PAUSED: exhausted']) for (const initialAgent of [false, true]) {
  const recovery = owner(); const recoveryFlags = []; let agentCalls = 0;
  recovery.register('status', async () => ({ok:true,decision:{step:'agent'}}));
- const repair = recovery.register('agent', async () => { agentCalls++; return {ok:false,error:'FORBIDDEN_MUTATION: modified:package.json'}; });
+ const repair = recovery.register('agent', async () => { agentCalls++; return {ok:false,error, ...(error.startsWith('AGENT_REPAIR_PAUSED') ? {paused:true,continuation:'discard-candidate'} : {})}; });
  const driving = recovery.register('drive', async (_event, input) => {
   recoveryFlags.push(input.discardCandidate === true);
   return input.discardCandidate ? {ok:true,stopped:'finished'} : {ok:true,stopped:'agent-gate',repairRequests:[{requestId:'bad-trial'}]};
@@ -453,6 +453,17 @@ for (const initialAgent of [false, true]) {
  assert.equal(completed.ok,true);
  assert.equal(agentCalls,1);
  assert.deepEqual(recoveryFlags,initialAgent ? [true] : [false,true]);
+}
+// Manual pauses are untouched; only explicit repair continuation is automatic.
+{
+ const manual=owner();let calls=0;
+ const repair=manual.register('agent',async()=>{calls++;return{ok:false,paused:true,continuation:'resume-repair'};});
+ assert.equal((await repair(null,{...scope,autopilot:false})).paused,true);
+ assert.equal(calls,1);
+ const bounded=owner();let repeats=0;
+ const autoRepair=bounded.register('agent',async()=>{repeats++;return{ok:false,paused:true,continuation:'resume-repair'};});
+ assert.match((await autoRepair(null,scope)).error,/REPAIR_CONTINUATION_EXHAUSTED/);
+ assert.equal(repeats,4);
 }
 const failureOwner = owner(); let failureDrives = 0;
 failureOwner.register('drive',async () => { failureDrives++; return {ok:true}; });

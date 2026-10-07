@@ -263,20 +263,16 @@ for (const activity of ['running','completed']) {
   f.bindings.extendRepairBudget = () => undefined;
   const stream=f.bindings.spawnIterativeStreamed;
   f.bindings.spawnIterativeStreamed=(dir,cmd,args,cwd,_timeout,...rest)=>stream(dir,cmd,args,cwd,1000,...rest);
-  f.setChild(`
+  f.setChild(launch => launch > 1 ? `require('fs').writeFileSync('input.js','completed repair');console.log('FEEDBACK_KIND: READY_FOR_VERIFY');` : `
     require('fs').writeFileSync('input.js','unverified repair');
     console.log(JSON.stringify({type:'tool_use',sessionID:'ses-active',part:{type:'tool',state:{status:'${activity}'}}}));
     setTimeout(()=>{},10000);
   `);
   const result=await f.autonomous(undefined,{projectName:'fixture',autopilot:true});
-  assert.equal(result.autopilot.stopped,'paused',JSON.stringify(result));
-  assert.equal(existsSync(join(f.runDir,'trial','agent-feedback.json')),false);
-  assert.equal(f.launches.length,1);assert.equal(f.waits.length,0);
-  assert.equal(f.drives(),0);assert.equal(f.lease().repairBudget.paused,true);
-  assert.equal(f.lease().sessionId,'ses-active');
-  f.setChild(`require('fs').writeFileSync('input.js','completed repair');console.log('FEEDBACK_KIND: READY_FOR_VERIFY');`);
-  const continued=await f.autonomous(undefined,{projectName:'fixture',autopilot:true});
-  assert.equal(continued.autopilot.stopped,'finished');
+  assert.equal(result.autopilot.stopped,'finished',JSON.stringify(result));
+  assert.equal(f.launches.length,2);assert.equal(f.waits.length,0);
+  const feedback=JSON.parse(readFileSync(join(f.runDir,'trial','agent-feedback.json'),'utf8'));
+  assert.equal(feedback.kind,'READY_FOR_VERIFY');
   assert.ok(f.launches[1].args.includes('ses-active'));
   assert.equal(f.drives(),1); assert.equal(f.lease(),undefined);
 }
@@ -294,6 +290,19 @@ for (const activity of ['running','completed']) {
   assert.equal(result.autopilot.stopped,'finished',JSON.stringify(result));
   assert.ok(budgets.includes(2));assert.equal(f.launches.length,1);assert.equal(f.drives(),1);
   assert.equal(f.lease(),undefined);
+}
+// The exhausted production watchdog exposes the same discard action as the
+// manual button; autopilot consumes it without another paid agent dispatch.
+{
+  const f=fixture();const stream=f.bindings.spawnIterativeStreamed;const discards=[];
+  f.bindings.iterativeAutopilot.register('drive',async(_event,input)=>{discards.push(input.discardCandidate);return{ok:true,stopped:'finished'};});
+  f.bindings.extendRepairBudget=(budget,fingerprint)=>budget.windows===1 ? {...budget,windows:3,deadlineAt:Date.now()+300,fingerprint} : undefined;
+  f.bindings.spawnIterativeStreamed=(dir,cmd,args,cwd,_timeout,...rest)=>stream(dir,cmd,args,cwd,500,...rest);
+  f.setChild(`require('fs').writeFileSync('input.js','unverified repair');console.log(JSON.stringify({type:'tool_use',sessionID:'ses-exhausted',part:{type:'tool',state:{status:'completed'}}}));setTimeout(()=>{},10000);`);
+  const result=await f.autonomous(undefined,{projectName:'fixture',autopilot:true});
+  assert.equal(result.autopilot.stopped,'finished',JSON.stringify(result));
+  assert.deepEqual(discards,[true]);assert.equal(f.launches.length,1);
+  assert.equal(existsSync(join(f.runDir,'trial','agent-feedback.json')),false);
 }
 // Confirmed provider failure after tool work still waits; it is not a failed
 // compatibility proof and must not consume the repair as INCONCLUSIVE.

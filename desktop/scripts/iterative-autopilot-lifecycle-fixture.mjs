@@ -281,11 +281,57 @@ for (const kind of ['failed','canceled','finished','no-run','last-error','cancel
     if(args.includes('apply-feedback')){f.payload.run.phase='TERMINAL';return child('process.exit(0)')}
     return capture(cmd,args,...rest);
   };
-  const result=await f.drive(undefined,{...f.scope,discardCandidate:true});
+  f.auto().register('status',async()=>({ok:true,decision:{step:'agent'}}));
+  let repairs=0;
+  f.auto().register('agent',async()=>{repairs++;return{ok:false,paused:true,continuation:'discard-candidate'};});
+  const result=await f.drive(undefined,f.scope);
+  assert.equal(repairs,1);
   assert.equal(result.autopilot.stopped,'finished',JSON.stringify(result));
   const feedback=JSON.parse(readFileSync(join(f.runDir,'trial/discard-feedback.json'),'utf8'));
   assert.equal(feedback.kind,'INCONCLUSIVE');assert.deepEqual(feedback.changedFiles,[]);
   assert.match(feedback.reason,/Repair budget exhausted/);
   assert.equal(agents.readAgentLease(agents.agentLeaseFile(f.runDir)),undefined);
+}
+// Enabling after a manual repair timeout adopts its lease through production
+// drive; exhausted leases select another set without requiring the button.
+for (const windows of [1,3]) {
+  const f=fixture();f.payload.run.phase='REPAIRING';f.payload.run.activeCandidateId='candidate';
+  f.payload.candidate={runId:'run-1',candidateId:'candidate',baseCheckpointId:'C4',attemptId:1,stage:'REPAIRING'};
+  agents.writeAgentLease(agents.agentLeaseFile(f.runDir),{schemaVersion:1,sessionId:'saved',provider:'opencode',databasePath:'saved.db',runId:'run-1',candidateId:'candidate',attemptId:1,pid:0,startedAt:new Date().toISOString(),repairBudget:{windows,deadlineAt:0,fingerprint:'changes',paused:true}});
+  attempts.updateAttempt(f.runDir,{status:'done',stage:'agent',lastStep:'agent'});
+  f.auto().register('status',async()=>({ok:true,decision:{step:'agent'}}));let repairs=0;
+  f.auto().register('agent',async()=>{repairs++;if(windows===3)return{ok:false,error:'AGENT_REPAIR_BUDGET_EXHAUSTED: fixture'};agents.clearAgentLease(agents.agentLeaseFile(f.runDir));f.payload.run.phase='TERMINAL';return{ok:true};});
+  const capture=f.bindings.spawnCapture;
+  f.bindings.spawnCapture=async(cmd,args,...rest)=>{if(args.includes('apply-feedback')){f.payload.run.phase='TERMINAL';return child('process.exit(0)');}return capture(cmd,args,...rest);};
+  const resumed=[];
+  const toggle=toggleHandler(f,{agentLeaseFile:agents.agentLeaseFile,readAgentLease:agents.readAgentLease,writeAgentLease:agents.writeAgentLease,runIterativeDriveWithAutopilot:(...args)=>{const pending=f.drive(...args);resumed.push(pending);return pending;}});
+  assert.equal((await toggle(true)).active,true);assert.equal(resumed.length,1);
+  assert.equal((await resumed[0]).autopilot.stopped,'finished');assert.equal(repairs,1);
+}
+// A terminal is reopened only when Python marks one concrete legacy repair
+// resumable. A repeated identical hint fails closed instead of replaying finish.
+for (const repeated of [false,true]) {
+  const f=fixture();f.payload.terminalRepairResumable=true;
+  f.payload.run.terminal='PARTIAL_VERIFIED';
+  f.payload.candidate={candidateId:'legacy',stage:'REJECTED'};
+  f.payload.activeCheckpoint={checkpointId:'C4'};
+  const streamed=f.bindings.spawnIterativeStreamed;let resumes=0;
+  f.bindings.spawnIterativeStreamed=async(dir,cmd,args,...rest)=>{
+    if(args.includes('resume')){resumes++;if(!repeated){f.payload.terminalRepairResumable=false;f.payload.run.terminal='COMPLETE';}}
+    return streamed(dir,cmd,args,...rest);
+  };
+  let result;
+  if(repeated)result=await f.drive(undefined,f.scope);
+  else {
+    writeFileSync(join(f.runDir,'status.json'),JSON.stringify(f.payload));
+    attempts.updateAttempt(f.runDir,{status:'done',stage:'drive',lastStep:'finish'});
+    const resumed=[];
+    const toggle=toggleHandler(f,{runIterativeDriveWithAutopilot:(...args)=>{const pending=f.drive(...args);resumed.push(pending);return pending;}});
+    assert.equal((await toggle(true)).active,true);assert.equal(resumed.length,1);
+    result=await resumed[0];
+  }
+  assert.equal(resumes,1);
+  assert.equal(result.autopilot.stopped,repeated?'error':'finished');
+  if(repeated)assert.match(result.error,/REPEATED_TERMINAL_CONTINUATION/);
 }
 console.log('autopilot lifecycle: production toggle/drive, durable restart, identity, bounded reads, cancel, critical and exhausted verification boundaries OK');

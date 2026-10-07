@@ -7556,9 +7556,12 @@ function setupIpc(): void {
     // that stopped run through drive so Python rechecks the current authority.
     // Registering drive claims the session before its first await; repeated
     // toggles therefore cannot dispatch another repair or block this IPC call.
-    if (input.enabled && !iterativeAutopilot.hasSession(scope) && !lease &&
+    if (input.enabled && !iterativeAutopilot.hasSession(scope) &&
         existsSync(join(runDir, 'run.json')) && attempt?.status === 'done' &&
-        attempt.stage === 'drive' && attempt.lastStep === 'agent' && !attempt.cancelRequested && !attempt.lastError) {
+        !attempt.cancelRequested && !attempt.lastError && (
+          (!lease && attempt.stage === 'drive' && attempt.lastStep === 'agent') ||
+          (lease?.repairBudget?.paused && attempt.stage === 'agent' && attempt.lastStep === 'agent') ||
+          (!lease && attempt.lastStep === 'finish' && readIterativeStatus(runDir)?.terminalRepairResumable === true))) {
       void runIterativeDriveWithAutopilot(undefined, { ...scope, autopilot: true })
     }
     return { ...result, active: iterativeAutopilot.isEnabled(scope) === true || (input.enabled && lease?.waiting === true) }
@@ -7765,6 +7768,7 @@ function setupIpc(): void {
     let stopDetail: { kind: 'repair-timeout'; packageCount: number; recoverable: boolean; auditStatus: string } | undefined
     let workingCheckout: IterativeCheckoutView | undefined
     let scopeExpansionIssues: Array<{ packages: string[]; proposals: string[]; reason: string; nextAction: string }> | undefined
+    let canResumeTerminal = false
     let progressSummary: { checkpointId: string; remaining: number; denominator: number; accepted: number; deferred: number; targetCount: number; unresolvedGoals: number } | undefined
     const scalar = (value: unknown): string | undefined =>
       typeof value === 'string' && value ? value : undefined
@@ -7784,6 +7788,7 @@ function setupIpc(): void {
         if (payload) {
           phase = String(payload.run?.phase ?? '')
           progressSummary = payload.progressSummary
+          canResumeTerminal = payload.terminalRepairResumable === true
           if (payload.run?.phase === 'TERMINAL') {
             // Full ledger remains durable; use last exact-candidate timeout only.
             const ledger = JSON.parse(readFileSync(join(runDir, 'ledger.json'), 'utf8')) as Record<string, any>
@@ -7838,6 +7843,7 @@ function setupIpc(): void {
       // not from a local `stepBusy`.
       inFlight: iterativeStepInFlight.has(stepLockKey(workspace.id, project.name)),
       autopilotActive: waitLease?.waiting === true && waitLease.autopilot === true,
+      canResumeTerminal,
       repairPause: waitLease?.repairBudget?.paused ? { exhausted: waitLease.repairBudget.windows >= 3, windows: waitLease.repairBudget.windows } : undefined,
       autopilotEnabled: iterativeAutopilot.isEnabled(input) ?? readAutopilotState(runDir)?.enabled ?? (waitLease?.autopilot === true),
       // P1#4: durable "Проверить проект" verdict (only meaningful while no run
@@ -8486,7 +8492,7 @@ function setupIpc(): void {
         if (decision.step === 'finish') {
           updateAttempt(runDir, { status: 'done', stage: 'drive', phase: 'TERMINAL', reason: decision.reason, lastStep: 'finish' })
           publish()
-          return { ok: true, steps, stopped: 'finished', phase: 'TERMINAL', reason: decision.reason, attempt: readAttempt(runDir) }
+          return { ok: true, steps, stopped: 'finished', phase: 'TERMINAL', reason: decision.reason, continuation: payload.terminalRepairResumable === true ? 'resume-terminal' : undefined, runId: payload.run?.runId, candidateId: payload.candidate?.candidateId, checkpointId: payload.activeCheckpoint?.checkpointId, attempt: readAttempt(runDir) }
         }
       }
     } finally {
@@ -9008,7 +9014,7 @@ function setupIpc(): void {
             : 'Лимит ремонта исчерпан (3 окна по 15 минут). Правки и сессия сохранены; нужен другой вариант обновления.'
           recordAttemptLog(runDir, `${reason}\n`)
           updateAttempt(runDir, { status: 'done', stage: 'agent', lastStep: 'agent', finishedAt: Date.now(), reason, lastError: undefined })
-          return { ok: false, paused: true, reason, error: `AGENT_REPAIR_PAUSED: ${reason}`, agentOutputTail }
+          return { ok: false, paused: true, continuation: repairBudget.windows < 3 ? 'resume-repair' : bootstrap ? undefined : 'discard-candidate', reason, error: `AGENT_REPAIR_PAUSED: ${reason}`, agentOutputTail }
         }
         // Launch-failure resilience: classify BEFORE the ordinary provider
         // error handling. A retryable outage (rate limit / temporary / unknown
