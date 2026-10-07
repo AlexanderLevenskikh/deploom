@@ -21,7 +21,7 @@ type Props = {
   onCopy: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onSave: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
-  onDrive: (projectName: string, autopilot?: boolean, retryInfra?: boolean, discardCandidate?: boolean) => Promise<IterativeDriveOutcome>
+  onDrive: (projectName: string, autopilot?: boolean, retryInfra?: boolean, discardCandidate?: boolean, resumeTerminal?: boolean) => Promise<IterativeDriveOutcome>
   onBegin: (projectName: string, discovery?: { autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
   onAgent: (projectName: string, autopilot?: boolean) => Promise<IterativeAgentOutcome>
   onAttempt: (projectName: string) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
@@ -356,12 +356,12 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         ? text('Автопилот остановлен. Проверенный результат сохранён.', 'Autopilot stopped. The verified result is kept.')
         : text(`Автопилот приостановлен (${summary.stopped}). Проверьте результат и следующий шаг.`, `Autopilot paused (${summary.stopped}). Review the outcome and next step.`)
 
-  const driveNow = async (discardCandidate = false) => {
+  const driveNow = async (discardCandidate = false, resumeTerminal = false) => {
     setStepBusy(true)
     setNote(undefined)
     try {
       await onBeforeStart?.()
-      const outcome = await onDrive(projectName, runner?.autopilotEnabled || runner?.autopilotActive || autopilot, runner?.decision?.infraBlocked === true, discardCandidate)
+      const outcome = await onDrive(projectName, runner?.autopilotEnabled || runner?.autopilotActive || autopilot, runner?.decision?.infraBlocked === true, discardCandidate, resumeTerminal)
       if (outcome.autopilot) {
         setNote(autopilotNote(outcome.autopilot))
       } else if (!outcome.ok) {
@@ -581,6 +581,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         'Registry-данные не получены или бюджет поиска исчерпан — результат не засчитан. Повторите поиск или настройте состав обновления.',
         'Registry data was not obtained or the search budget was exhausted — not counted. Retry the search or configure the update scope.',
       )
+    : mainAction.state === 'blocked' && (runner?.progressSummary?.accepted ?? 0) > 0
+    ? text('Принятые обновления проверены и сохранены. Финальное подтверждение результата заблокировано; откройте результат и данные аудита.', 'Accepted updates are verified and saved. Final confirmation is blocked; open the result and audit evidence.')
     : mainAction.state === 'agent-waiting'
     ? (attempt?.reason || text(...MAIN_DESCRIPTION[mainAction.state]))
     : text(...MAIN_DESCRIPTION[mainAction.state])
@@ -769,6 +771,13 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         )
       })()}
 
+      {runner?.phase === 'TERMINAL' && (runner.progressSummary?.accepted ?? 0) > 0 && ['blocked', 'partial', 'budget-stop', 'no-upgrade'].includes(mainAction.state) ? (
+        <div className="resume-notice" data-testid="iterative-resume-result">
+          <span>{text('Принятые обновления сохранены. Можно продолжить с последнего проверенного результата; оставшиеся ограничения сохраняются.', 'Accepted updates are saved. Continue from the last verified result; remaining limits are preserved.')}</span>
+          <button type="button" disabled={busyLocked || childAlive} onClick={() => { void driveNow(false, true) }}>{text('Продолжить с сохранённого результата', 'Continue from saved result')}</button>
+        </div>
+      ) : null}
+
       <MigrationChecksPanel key={`${workspaceId}:${projectName}`} profile={validationDraft ? { ...runner?.validationProfile, ...validationDraft } : runner?.validationProfile} locked={Boolean(runner?.present || childAlive || stepBusy || disabledExternal)} scope={validationChanged ? undefined : runner?.validationScope ?? runner?.checked?.validationScope} onChange={setValidationDraft} />
 
       {/* L1: durable attempt strip — visible from the very first click, after a
@@ -794,7 +803,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
             {progress && progress.total > 0 && (activity.percent !== undefined || attempt.discoveryCompleted) ? (
               <span className="attempt-meta">
                 {attempt.discoveryCompleted ? text('Подбор версий завершён', 'Version search finished') : text('Подбор версий', 'Finding versions')}: {progress.processed}/{progress.total}{attempt.discoverySkipped ? text(` · не просмотрено по бюджету: ${attempt.discoverySkipped}`, ` · not examined within budget: ${attempt.discoverySkipped}`) : ''}
-                <span className="attempt-progress"><span style={{ width: `${Math.min(100, Math.round((progress.processed / progress.total) * 100))}%` }} /></span>
+                <span className={`attempt-progress ${attempt.discoveryCompleted ? 'done' : ''}`}><span style={{ width: `${Math.min(100, Math.round((progress.processed / progress.total) * 100))}%` }} /></span>
               </span>
             ) : null}
             {attempt.status === 'running' && !childAlive ? (

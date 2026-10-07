@@ -643,9 +643,9 @@ export function useDependencyFlow() {
     if (!api) return { ok: false, present: false, stale: false, error: 'NO_DESKTOP_API' }
     return api.iterativeStatus({ workspaceId: selectedWorkspaceId, projectName })
   }, [api, selectedWorkspaceId])
-  const iterativeDrive = useCallback(async (projectName: string, autopilot?: boolean, retryInfra?: boolean, discardCandidate?: boolean): Promise<IterativeDriveOutcome> => {
+  const iterativeDrive = useCallback(async (projectName: string, autopilot?: boolean, retryInfra?: boolean, discardCandidate?: boolean, resumeTerminal?: boolean): Promise<IterativeDriveOutcome> => {
     if (!api) return { ok: false, steps: [], stopped: 'error', error: 'NO_DESKTOP_API' }
-    return api.iterativeDrive({ workspaceId: selectedWorkspaceId, projectName, autopilot, retryInfra, discardCandidate })
+    return api.iterativeDrive({ workspaceId: selectedWorkspaceId, projectName, autopilot, retryInfra, discardCandidate, resumeTerminal })
   }, [api, selectedWorkspaceId])
   const iterativeBegin = useCallback(async (projectName: string, discovery?: { autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }): Promise<IterativeBeginOutcome> => {
     if (!api) return { ok: false, error: 'NO_DESKTOP_API' }

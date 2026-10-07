@@ -81,7 +81,7 @@ export function createIterativeAutopilot(key: (scope: Scope) => string, persiste
     persistence.setEnabled?.(input, session.enabled && !session.canceled)
     let initial = outcome
     // Explicit infrastructure retry is one user action, never an autopilot loop.
-    input = { ...input, retryInfra: false, discardCandidate: false }
+    input = { ...input, retryInfra: false, discardCandidate: false, resumeTerminal: false }
     if (!session.enabled && !initiallyEnabled) return initial
     const stopped = (reason: string, error?: string): Outcome => {
       const summary = { stopped: reason, ...(error ? { error } : {}) }

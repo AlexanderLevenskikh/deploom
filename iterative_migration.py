@@ -1150,6 +1150,7 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
             wall_budget_s=discovery_timeout_s,
             max_packages=discovery_max_packages,
             progress=_discovery_progress,
+            adaptive=bool(getattr(args, "adaptive_discovery", False)),
         )
 
     commands = tuple(str(item) for item in (verify_raw.get("commands") or []))
@@ -2169,6 +2170,29 @@ def cmd_verify_bootstrap(args: argparse.Namespace) -> int:
 # plan-next
 # ---------------------------------------------------------------------------
 
+def cmd_resume(args: argparse.Namespace) -> int:
+    from iterative_resume import reopen_terminal_run
+    run_dir = Path(args.run_dir).resolve()
+    lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=60)
+    lock.acquire()
+    try:
+        run, config = load_run(run_dir), load_config(run_dir)
+        if not run_budget_ok(config, run):
+            raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+        _assert_runtime_unchanged(config)
+        checkpoint = load_checkpoint(run_dir, str(run["activeCheckpointId"]))
+        try:
+            reopened = reopen_terminal_run(run, checkpoint, load_candidate(run_dir))
+        except ValueError as exc:
+            raise InvalidInputError(str(exc)) from exc
+        _open_checkpoint_source(run_dir, checkpoint, config, run_id=str(run["runId"]))
+        save_run(run_dir, reopened)
+        _emit_status({"event": "resume.done", "runId": run["runId"], "checkpointId": checkpoint["checkpointId"]})
+        return 0
+    finally:
+        lock.release()
+
+
 def cmd_plan_next(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
     run = load_run(run_dir)
@@ -2394,6 +2418,11 @@ def _plan_next_locked(
         blocked_fingerprints=blocked_fingerprints, learned_nogoods=learned_nogoods,
         fingerprint_fn=assignment_fingerprint,
     )
+    if cohort_selection.get("budgetAdapted"):
+        _emit_status({"event": "plan-next.cohort-budget-expanded", "runId": run["runId"],
+                      "configuredMaxPackages": cohort_selection["configuredMaxPackages"],
+                      "maxPackages": cohort_selection["maxPackages"],
+                      "reason": "new mandatory assignment after verified progress; hard cap 32"})
     if cohort_selection.get("cohortAtomIssues"):
         _emit_status({"event": "plan-next.cohort-atom-deferred", "runId": run["runId"],
                       "issues": cohort_selection["cohortAtomIssues"],
@@ -3278,6 +3307,7 @@ def _discover_targets(
     wall_budget_s: int = 0,
     max_packages: int = 0,
     progress: Optional[Callable[[int, int], None]] = None,
+    adaptive: bool = False,
 ) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
     """#2/P1.2 bounded target discovery for begin when no roadmap targets exist.
 
@@ -3317,6 +3347,14 @@ def _discover_targets(
     probe never becomes a proven lag, an invented version or zero findings.
     `progress(processed, total)` is called after each completed probe.
     """
+    if adaptive:
+        from iterative_adaptive_budget import discover_in_waves
+        return discover_in_waves(
+            discover=lambda batch, seconds, on_progress: _discover_targets(
+                project_dir, batch, runtime_env, node_version, parallelism=parallelism,
+                wall_budget_s=seconds, progress=on_progress),
+            current=current, initial_packages=max_packages, wall_budget_s=wall_budget_s,
+            progress=progress, emit=_emit_status, clock=time.monotonic)
     global _ACTIVE_DISCOVERY_DEADLINE
     targets: Dict[str, str] = {}
     evidence: List[Dict[str, Any]] = []
@@ -4863,6 +4901,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         unavailable={(e.get("package"), e.get("target")) for e in ledger.get("targetAvailabilityDeferrals", [])
                      if e.get("scope") == availability_scope_flat(run, config)})
     expansion_issues += cohort_atom_issues(status_incumbent, status_desired, config, status_ledger, checkpoint_id)
+    if candidate and (candidate.get("cohortSelection") or {}).get("budgetAdapted"):
+        selected = set((candidate.get("delta") or {}).get("changed") or {})
+        expansion_issues = [issue for issue in expansion_issues
+                            if issue.get("reason") != "COHORT_ATOM_EXCEEDS_CAP"
+                            or not set(issue.get("packages") or []).issubset(selected)]
     payload = {
         "schemaVersion": SCHEMA_VERSION,
         "run": run,
@@ -4986,6 +5029,7 @@ def _finish_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str, A
                 yarn_audit_engine="auto",
             )
             _audit_locked(run_dir, run, config, audit_args)
+            run = load_run(run_dir)
             checkpoint = load_checkpoint(run_dir, active_id)
             audit = checkpoint.get("audit") or {}
             audit_status = str(audit.get("status") or "")
@@ -5354,6 +5398,24 @@ def cmd_audit(args: argparse.Namespace) -> int:
 def _audit_locked(
     run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], args: argparse.Namespace
 ) -> int:
+    from iterative_adaptive_budget import recover_checkpoint_audit
+    _assert_runtime_unchanged(config)
+    overrides = {key: getattr(args, key, None) for key in (
+        "registry", "lag_months", "min_lag_ok_pct", "max_known_high", "yarn_audit_engine")
+        if getattr(args, key, None) not in (None, "", "auto")}
+    audit_identity = _sha256_text(_stable_json(overrides)) if overrides else ""
+    checkpoint_id = str(run["activeCheckpointId"])
+    return recover_checkpoint_audit(checkpoint_id=checkpoint_id, config=config,
+        read_run=lambda: load_run(run_dir), write_run=lambda value: save_run(run_dir, value),
+        read_checkpoint=lambda: load_checkpoint(run_dir, checkpoint_id),
+        operation=lambda: _audit_once_locked(run_dir, load_run(run_dir), config, args),
+        budget_ok=lambda value: run_budget_ok(config, value), emit=_emit_status, pause=time.sleep,
+        audit_identity=audit_identity)
+
+
+def _audit_once_locked(
+    run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], args: argparse.Namespace
+) -> int:
     _assert_runtime_unchanged(config)
     checkpoint = load_checkpoint(run_dir, str(run["activeCheckpointId"]))
     snapshot = _open_checkpoint_source(run_dir, checkpoint, config, run_id=str(run["runId"]))
@@ -5375,6 +5437,7 @@ def _audit_locked(
     # with the ACTUAL policy captured at begin (lag window, lag-ok threshold,
     # known-High limit) plus the user's package lag policy from dashboard state
     # — never dashboard_state=None.
+    from iterative_audit_policy import audit_engine_for_retry
     audit_started=time.monotonic()
     report = build_report(
         project_path,
@@ -5393,7 +5456,7 @@ def _audit_locked(
         ),
         max_known_high=int((args.max_known_high if args.max_known_high is not None
                             else audit_policy.get("maxKnownHigh", 1))),
-        yarn_audit_engine=args.yarn_audit_engine or "auto",
+        yarn_audit_engine=audit_engine_for_retry(args.yarn_audit_engine, checkpoint.get("audit") or {}),
         runtime_env=_runtime_env(config),
     )
     # R8: persist the FULL report as JSON/Markdown evidence (not just a status +
@@ -5418,11 +5481,14 @@ def _audit_locked(
                    stage="audit",outcome=audit_status,seconds=audit_seconds,
                    stages=[stage_measurement("audit",audit_seconds,audit_status)])
     audit_metrics = report.get("audit") or {}
+    from iterative_audit_policy import audit_recovery_reason
     checkpoint = dict(checkpoint)
     checkpoint["audit"] = {
         "status": audit_status,
         "evidenceRef": evidence_ref,
         "auditComplete": bool(report.get("auditComplete")),
+        "retryableReason": audit_recovery_reason(report, allow_canonical=args.yarn_audit_engine in (None, "", "auto")),
+        "engine": audit_metrics.get("engine"),
         "lagOkPct": audit_metrics.get("lagOkPct"),
         "lagOk": audit_metrics.get("lagOk"),
         "lagLagging": audit_metrics.get("lagLagging"),
@@ -5448,18 +5514,9 @@ def _audit_locked(
 
 
 def _audit_status_from_report(report: Mapping[str, Any]) -> str:
-    if not report:
-        return "UNKNOWN"
-    if report.get("auditComplete") is False:
-        return "UNKNOWN"
-    exit_code = 0
-    from manual_dependency_audit import audit_command_exit_code
+    from iterative_audit_policy import audit_policy_status
 
-    try:
-        exit_code = int(audit_command_exit_code(report))
-    except Exception:
-        exit_code = 1
-    return "PASS" if exit_code == 0 else "FAIL"
+    return audit_policy_status(report)
 
 
 def cmd_export_task(args: argparse.Namespace) -> int:
@@ -5564,6 +5621,7 @@ def build_parser() -> argparse.ArgumentParser:
     begin.add_argument("--max-repair-attempts", type=int, default=None)
     begin.add_argument("--max-infra-retries", type=int, default=None)
     begin.add_argument("--phase-timeout-seconds", type=int, default=None)
+    begin.add_argument("--adaptive-discovery", action="store_true", help="Grow discovery in useful waves within the wall deadline and a hard 200-package limit")
     begin.add_argument("--cohort-max-packages", type=int, choices=range(1, 33), default=24, help="Adaptive cohort cap (default 24; starts at the cap)")
     begin.add_argument("--cohort-initial-packages", type=int, choices=range(1, 33), default=None)
     begin.add_argument("--cohort-exploration-ratio", type=int, choices=range(2, 17), default=2)
@@ -5619,6 +5677,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bootstrap_materialize.add_argument("--timeout-seconds", type=int, default=1800)
 
+    sub.add_parser("resume", help="Продолжить незавершённый прогон с последнего VERIFIED checkpoint без сброса бюджетов")
+
     plan_next = sub.add_parser("plan-next", help="Выбрать следующий небольшой шаг от активного checkpoint")
     plan_next.add_argument(
         "--retry-infra",
@@ -5673,6 +5733,7 @@ COMMANDS = {
     "bootstrap-materialize": cmd_bootstrap_materialize,
     "archive-repair-run": cmd_archive_repair_run,
     "archive-run": cmd_archive_run,
+    "resume": cmd_resume,
     "plan-next": cmd_plan_next,
     "materialize": cmd_materialize,
     "precheck": cmd_precheck,

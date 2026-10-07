@@ -35,6 +35,7 @@ import { join } from 'node:path'
 
 export type IterativeStep =
   | 'begin'
+  | 'resume'
   | 'verify-bootstrap'
   | 'bootstrap-materialize'
   | 'plan-next'

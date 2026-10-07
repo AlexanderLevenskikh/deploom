@@ -268,6 +268,17 @@ expect("pipeline: blocked lands on the result, honestly", () => {
   if (p.current !== "result" || JSON.stringify(p.completed) !== JSON.stringify(["check", "plan"])) throw new Error(`blocked pipeline ${JSON.stringify(p)}`);
 });
 
+expect("pipeline: blocked audit preserves accepted update completion", () => {
+  const context = { runner: { present: true, progressSummary: { accepted: 29 }, phase: "TERMINAL", decision: { step: "finish", satisfied: false, reason: "BLOCKED_BASELINE" } } };
+  const action = deriveMainAction({ inFlight: false, ...context, taskPresent: true, noTargets: false, checked: false });
+  assert.equal(action.state, "blocked");
+  assert.deepEqual(scenarioPipeline(action.state, false, context), { current: "result", completed: ["check", "plan", "upgrade"] });
+  for (const accepted of [0, undefined]) {
+    assert.deepEqual(scenarioPipeline("blocked", false, { runner: { present: true, progressSummary: { accepted } } }).completed, ["check", "plan"]);
+  }
+  assert.deepEqual(scenarioPipeline("no-upgrade", false, context).completed, ["check", "plan"]);
+});
+
 expect("pipeline: live check has no completed stages even with stale old verdict", () => {
   const p = scenarioPipeline("running", true, { attempt: { stage: "begin", phase: "begin.check", targetSource: "none" }, runner: { present: false } });
   if (p.current !== "check" || p.completed.length !== 0) throw new Error(JSON.stringify(p));
@@ -416,15 +427,17 @@ const sharedRead = new Promise(resolve => { resolveRead = resolve; });
 const readStatus = reading.register('status', async () => { readCount++; await sharedRead; return {ok:true}; });
 const reads = [readStatus(null,scope),readStatus(null,scope)]; resolveRead(); await Promise.all(reads); assert.equal(readCount,1);
 // A manual infra retry must not propagate to subsequent automatic drives.
-const retryOwner = owner(); const retries = [];
+const retryOwner = owner(); const retries = []; const resumes = [];
 retryOwner.register('status', async () => ({ok:true, decision:{step:'agent'}}));
 retryOwner.register('agent', async () => ({ok:true}));
 const retryDrive = retryOwner.register('drive', async (_event, input) => {
  retries.push(input.retryInfra === true);
+ resumes.push(input.resumeTerminal === true);
  return retries.length === 1 ? {ok:true, stopped:'agent-gate', repairRequests:[{requestId:'retry'}]} : {ok:true, stopped:'finished'};
 });
-assert.equal((await retryDrive(null,{...scope,retryInfra:true})).autopilot.stopped,'finished');
+assert.equal((await retryDrive(null,{...scope,retryInfra:true,resumeTerminal:true})).autopilot.stopped,'finished');
 assert.deepEqual(retries,[true,false]);
+assert.deepEqual(resumes,[true,false]);
 // Disputed repair bytes are rejected; other cohorts continue without another
 // paid repair of the same candidate. Exercise both initial and later agent gates.
 for (const initialAgent of [false, true]) {

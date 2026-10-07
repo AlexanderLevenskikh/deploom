@@ -963,6 +963,7 @@ textarea::placeholder {
 .attempt-reason { color: inherit; font-weight: 600; }
 .attempt-progress { display: inline-block; width: 90px; height: 6px; margin-left: 6px; border-radius: 3px; background: var(--border); overflow: hidden; vertical-align: middle; }
 .attempt-progress > span { display: block; height: 100%; background: var(--blue); }
+.attempt-progress.done > span { background: var(--green); }
 .attempt-log { margin: 2px 0 0; max-height: 180px; overflow: auto; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel, rgba(0, 0, 0, .08)); color: var(--text-muted); font: 10px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
 
 @media (max-width: 640px) {

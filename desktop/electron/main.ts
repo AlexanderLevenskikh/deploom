@@ -8189,6 +8189,7 @@ function setupIpc(): void {
         invocation.args.push('--discover-parallelism', String(discovery.parallelism))
         invocation.args.push('--discover-timeout-s', String(discovery.timeoutSeconds))
         invocation.args.push('--discover-max-packages', String(discovery.maxPackages))
+        if (input.discovery?.maxPackages === undefined) invocation.args.push('--adaptive-discovery')
       }
       const beginIo = iterativeStreamIo(runDir)
       // P-review: the registry discovery outcome (begin.discovery event) is
@@ -8293,7 +8294,7 @@ function setupIpc(): void {
   // between an accepted cohort and the next one. Restart-safe by design:
   // every iteration recomputes the decision from the DURABLE Python state, so
   // a killed app simply resumes from where the files say the run stands.
-  const runIterativeDriveWithAutopilot = iterativeAutopilot.register('drive', async (_event, input: { workspaceId?: string; projectName: string; autopilot?: boolean; retryInfra?: boolean; discardCandidate?: boolean }) => {
+  const runIterativeDriveWithAutopilot = iterativeAutopilot.register('drive', async (_event, input: { workspaceId?: string; projectName: string; autopilot?: boolean; retryInfra?: boolean; discardCandidate?: boolean; resumeTerminal?: boolean }) => {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -8322,6 +8323,18 @@ function setupIpc(): void {
       publish()
       const python = resolveExecutable('python')
       const generator = join(bundledToolDir(), 'iterative_migration.py')
+      if (input.resumeTerminal === true) {
+        const invocation = iterativeStepInvocation(runDir, 'resume', generator, python)
+        const resumed = await spawnIterativeStreamed(runDir, invocation.command, invocation.args, workspace.path, 0, iterativeStreamIo(runDir), iterativeStreamPlatform)
+        if (resumed.code !== 0) {
+          const error = parseIterativeFailure(resumed.stdout)?.summary || resumed.stderr.trim() || 'RESUME_FAILED'
+          updateAttempt(runDir, { status: 'failed', stage: 'drive', lastError: error, lastStep: 'resume' })
+          publish()
+          return { ok: false, steps, stopped: 'error', error, attempt: readAttempt(runDir) }
+        }
+        steps.push('resume')
+        updateSteps()
+      }
       let retryInfra = input.retryInfra === true
       let discardCandidate = input.discardCandidate === true
       // Continue until a real terminal/agent/error/cancel gate, without a

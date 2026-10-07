@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -514,6 +515,8 @@ def _safe_reset_workspace(workspace: Path) -> None:
             if entry.is_dir() and not entry.is_symlink():
                 shutil.rmtree(entry)
             else:
+                if not entry.is_symlink():
+                    entry.chmod(entry.stat().st_mode | stat.S_IWRITE)
                 entry.unlink()
     else:
         workspace.mkdir(parents=True, exist_ok=True)
@@ -524,7 +527,8 @@ def _safe_reset_workspace(workspace: Path) -> None:
 
 def _copy_if_exists(source: Path, destination: Path) -> None:
     if source.exists():
-        shutil.copy2(source, destination)
+        # Audit inputs are mutable working copies of sealed read-only sources.
+        shutil.copyfile(source, destination)
 
 
 def _write_text(path: Path, value: str) -> None:
@@ -1185,7 +1189,7 @@ def _yarn_npm_lock_audit(
 
     started = time.monotonic()
     try:
-        shutil.copy2(project / "package.json", workspace / "package.json")
+        shutil.copyfile(project / "package.json", workspace / "package.json")
         _copy_if_exists(project / "yarn.lock", workspace / "yarn.lock")
         (workspace / "audit-input.json").write_text(
             json.dumps(input_state, ensure_ascii=False, indent=2), encoding="utf-8"

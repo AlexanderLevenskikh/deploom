@@ -204,6 +204,57 @@ class YarnNpmAuditBridgeRegressionTests(unittest.TestCase):
             self.assertNotIn("nexus.example", reproduce_sh)
             self.assertFalse((project / "package-lock.json").exists())
 
+    def test_bridge_inputs_from_sealed_source_are_writable_and_retryable(self) -> None:
+        import stat
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            workspace = Path(tmp) / "audit"
+            project.mkdir()
+            sources = [project / "package.json", project / "yarn.lock"]
+            sources[0].write_text('{"name":"demo","version":"1.0.0"}', encoding="utf-8")
+            sources[1].write_text("# yarn lockfile v1\n", encoding="utf-8")
+            originals = [p.read_bytes() for p in sources]
+            for p in sources:
+                p.chmod(stat.S_IREAD)
+
+            def fake_run(command, cwd, env=None, timeout=None):
+                if command[:4] == ["npm", "config", "get", "registry"]:
+                    return 0, "https://registry.example/", ""
+                if command[:2] == ["npm", "install"]:
+                    # A real child performs npm's write to the copied inputs.
+                    for name in ("package.json", "yarn.lock"):
+                        self.assertTrue((Path(cwd) / name).stat().st_mode & stat.S_IWRITE)
+                    subprocess.run([sys.executable, "-c",
+                        "from pathlib import Path; "
+                        "[(p.write_bytes(p.read_bytes())) for p in "
+                        "[Path('package.json'), Path('yarn.lock')]]"], cwd=cwd, check=True)
+                    (Path(cwd) / "package-lock.json").write_text(
+                        '{"lockfileVersion":3,"packages":{}}', encoding="utf-8")
+                    return 0, "", ""
+                if command[:2] == ["npm", "audit"]:
+                    return 0, json.dumps({"vulnerabilities": {}, "metadata": {
+                        "vulnerabilities": {s: 0 for s in audit.SEVERITIES}}}), ""
+                raise AssertionError(command)
+
+            try:
+                with patch.object(audit, "run", side_effect=fake_run):
+                    first = audit.run_audit(project, "yarn", "", workspace, yarn_audit_engine="npm-lock-bridge")
+                    self.assertTrue(first["complete"])
+                    # Recover an audit folder left by the older copy2 behavior.
+                    for name in ("package.json", "yarn.lock"):
+                        (workspace / name).chmod(stat.S_IREAD)
+                    second = audit.run_audit(project, "yarn", "", workspace, yarn_audit_engine="npm-lock-bridge")
+                    self.assertTrue(second["complete"])
+                    self.assertTrue(second["lockReused"])
+                for p, original in zip(sources, originals):
+                    self.assertEqual(p.read_bytes(), original)
+                    self.assertFalse(p.stat().st_mode & stat.S_IWRITE)
+            finally:
+                for p in sources:
+                    p.chmod(stat.S_IREAD | stat.S_IWRITE)
+
     def test_persistent_workspace_reuses_existing_package_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

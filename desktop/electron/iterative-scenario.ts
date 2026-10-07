@@ -63,6 +63,7 @@ export type ScenarioAttemptShape = {
 
 export type ScenarioRunnerShape = {
   present: boolean
+  progressSummary?: { accepted: number }
   phase?: string
   decision?: { step: string | null; satisfied?: boolean; reason?: string } | undefined
 } | undefined
@@ -362,8 +363,10 @@ export function scenarioPipeline(state: ScenarioMainActionState, checked: boolea
       // at the result, honestly labelled partial.
       return { current: "result", completed: ["check", "plan", "upgrade"] }
     case "blocked":
+      // Audit can be unavailable after verified updates have been accepted.
+      // Keep the final verdict blocked while showing the completed update step.
+      return { current: "result", completed: (context?.runner?.progressSummary?.accepted ?? 0) > 0 ? ["check", "plan", "upgrade"] : ["check", "plan"] }
     case "no-upgrade":
-      // the flow ended WITHOUT a confirmed upgrade — result, honestly.
       return { current: "result", completed: ["check", "plan"] }
     case "repair-done":
       // the CURRENT state was fixed and verified — the real update starts next.
