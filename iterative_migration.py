@@ -3607,7 +3607,7 @@ def _open_checkpoint_source(run_dir, checkpoint, config, *, run_id="", candidate
             raise ProjectUnreadyError(
                 "CHECKPOINT_BUILD_UPGRADE_UNCONFIRMED",
                 "Сохранённый результат не подтверждён новой версией DepLoom. Прежний checkpoint сохранён. " + str(exc),
-                command="",
+                command=exc.command,
             ) from exc
 
 

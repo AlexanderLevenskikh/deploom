@@ -128,7 +128,7 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertEqual("dependency", result.kind)
 
-    def test_unclassified_lifecycle_failure_is_preparation_not_project_debt(self) -> None:
+    def test_unclassified_lifecycle_failure_is_unknown_not_project_debt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "package.json").write_text(
@@ -149,8 +149,11 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
                     run_project_checks=True,
                 )
             self.assertFalse(result.ok)
-            self.assertEqual("preparation", result.kind)
+            self.assertEqual("unknown", result.kind)
+            self.assertFalse(result.hard_failure)
             self.assertIn("lifecycle/preparation failed", result.summary)
+            self.assertNotIn("deterministically", result.summary)
+            self.assertIn("postinstall deterministic toolchain failure", result.output)
 
 
 

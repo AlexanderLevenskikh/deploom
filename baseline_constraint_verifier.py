@@ -3766,8 +3766,8 @@ def verify_assignment(
                             **common,
                         )
                     return BaselineVerifyResult(
-                        False, "preparation",
-                        "assignment resolves, but lifecycle/preparation failed deterministically",
+                        False, "unknown",
+                        "assignment resolves, but lifecycle/preparation failed; cause is unclassified",
                         **common,
                     )
 

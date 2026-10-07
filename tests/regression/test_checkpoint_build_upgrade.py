@@ -45,8 +45,15 @@ class CheckpointBuildUpgradeTests(unittest.TestCase):
             root = Path(tmp)
             checkpoint, config = self.fixture(root)
             before = json.dumps(checkpoint, sort_keys=True)
-            with self.assertRaisesRegex(upgrade.CheckpointBuildUpgradeError, "UNCONFIRMED"):
-                upgrade.reopen_checkpoint_source(root / "run", checkpoint, config, verify=lambda *args: BaselineVerifyResult(False, "unknown", "no evidence"), progress=lambda *args: None)
+            with self.assertRaisesRegex(upgrade.CheckpointBuildUpgradeError, "UNCONFIRMED") as failure:
+                upgrade.reopen_checkpoint_source(root / "run", checkpoint, config, verify=lambda *args: BaselineVerifyResult(False, "unknown", "no evidence", command="yarn install --frozen-lockfile", output="opaque lifecycle failure XYZ-42"), progress=lambda *args: None)
+            error = failure.exception
+            self.assertEqual(error.command, "yarn install --frozen-lockfile")
+            self.assertIn("opaque lifecycle failure XYZ-42", str(error))
+            diagnostic = json.loads(Path(error.diagnostic_path).read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["kind"], "unknown")
+            self.assertEqual(diagnostic["output"], "opaque lifecycle failure XYZ-42")
+            self.assertEqual(diagnostic["sourceSnapshotKey"], checkpoint["sourceSnapshotKey"])
             self.assertEqual(before, json.dumps(checkpoint, sort_keys=True))
             self.assertEqual(list((root / "run" / "checkpoint-build-upgrades").glob("*.json")), [])
             self.assertTrue(Path(checkpoint["sourceSnapshotContainer"]).is_dir())

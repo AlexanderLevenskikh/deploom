@@ -18,7 +18,10 @@ from verification_proof import build_resolver_context_key, project_verification_
 
 
 class CheckpointBuildUpgradeError(RuntimeError):
-    pass
+    def __init__(self, message, *, command="", diagnostic_path=""):
+        super().__init__(message)
+        self.command = command
+        self.diagnostic_path = diagnostic_path
 
 
 def reopen_checkpoint_source(run_dir, checkpoint, config, *, verify, progress, runtime_env=None):
@@ -76,8 +79,29 @@ def reopen_checkpoint_source(run_dir, checkpoint, config, *, verify, progress, r
     progress("Re-running the selected checks on the preserved checkpoint; old proof is not reused")
     result = verify(snapshot.project_path, checkpoint["fullAssignment"])
     if not result.ok:
+        # Failure evidence has no authority. Preserve captured output after
+        # isolated workspace cleanup; never publish a pass record for failure.
+        diagnostics = directory / "diagnostics"
+        diagnostics.mkdir(parents=True, exist_ok=True)
+        diagnostic_path = diagnostics / (key + "-" + uuid.uuid4().hex + ".json")
+        payload = {
+            "schemaVersion": 1, "type": "checkpoint-reverification-failure",
+            "checkpointId": checkpoint.get("checkpointId"),
+            "sourceSnapshotKey": old_key, "toolBuildId": tool_build_id(),
+            "kind": result.kind, "summary": result.summary,
+            "command": result.command, "output": result.output,
+            "workspace": result.workspace,
+        }
+        temporary = diagnostic_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, diagnostic_path)
+        tail = "\n".join(str(result.output or "").splitlines()[-12:])[-2000:]
+        detail = ("\nCommand: " + result.command if result.command else "")
+        detail += ("\n" + tail if tail else "")
+        detail += "\nDiagnostic: " + str(diagnostic_path)
         raise CheckpointBuildUpgradeError(
-            "CHECKPOINT_BUILD_UPGRADE_UNCONFIRMED: " + str(result.kind) + ": " + str(result.summary)
+            "CHECKPOINT_BUILD_UPGRADE_UNCONFIRMED: " + str(result.kind) + ": " + str(result.summary) + detail,
+            command=result.command, diagnostic_path=str(diagnostic_path),
         )
     # The verifier may never mutate the sealed input it claims to verify.
     open_source_snapshot(snapshot.container, expected_key=snapshot.key, timeout_seconds=0, progress=progress)
