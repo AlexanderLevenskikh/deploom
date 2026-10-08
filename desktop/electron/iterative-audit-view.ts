@@ -7,4 +7,4 @@ export type AuditView = {
   keptPackages?: string[]
   vulnerablePackages?: Array<{ package: string; severity?: string; direct?: boolean; nodes?: string[] }>
 }
-export type DeliveryView = { status: string; branch?: string; requestedBranch?: string; branchResolution?: string; workspaceRoot?: string; projectRelative?: string; head?: string; commits?: string[]; audit?: AuditView; error?: string }
+export type DeliveryView = { status: string; branch?: string; requestedBranch?: string; branchResolution?: string; workspaceRoot?: string; projectRelative?: string; head?: string; commits?: string[]; audit?: AuditView; error?: string; cleanup?: { status: string; archiveRoot?: string; commentCount?: number } }

@@ -593,8 +593,10 @@ def _build_ru(
         f"(запрещены: {', '.join(FORBIDDEN_TRIAL_RELATIVES)})."
     )
     lines.append(
-        "2. Изменения фиксируй в answer вместе с файлом/ключом и причиной; без валидного "
-        "JSON комментария в манифест или lockfile не вставляй."
+        "2. Объясни каждый изменённый файл/ключ/логический блок в answer: что изменилось, зачем и связь "
+        "с обновлением. Неочевидные адаптации поясняй полнострочно с native comment prefix и "
+        f"DEPLOOM-MIGRATION-NOTE:{run.get('runId')}: <причина>; помечай только новые пояснения этого прогона, "
+        "не строки/данные и не обычные комментарии. В JSON/generated lockfile комментарии не вставляй."
     )
     lines.append(
         "3. Отложенные пакеты из раздела выше не изменяй и не удаляй из остатка."
@@ -768,8 +770,10 @@ def _build_en(
         f"(forbidden: {', '.join(FORBIDDEN_TRIAL_RELATIVES)})."
     )
     lines.append(
-        "2. Record every change in your answer with file/key and rationale; never insert "
-        "invalid comments into JSON or generated lockfiles."
+        "2. Explain every changed file/key/logical block in your answer: what changed, why and its upgrade "
+        "connection. Use full-line native why-comments for non-obvious adaptations with "
+        f"DEPLOOM-MIGRATION-NOTE:{run.get('runId')}: <reason>; mark only new explanations introduced by this run, "
+        "never strings/data or ordinary comments. Never add comments to JSON/generated lockfiles."
     )
     lines.append(
         "3. Do not modify deferred packages above and do not remove them from the remainder."

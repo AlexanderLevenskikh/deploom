@@ -114,6 +114,9 @@ class PartBPromptRu(unittest.TestCase):
         # B4 deliverables
         self.assertIn("DEVELOPER_UPGRADE_GUIDE.md", md)
         self.assertIn("MIGRATION_REPORT.md", md)
+        self.assertIn("DEPLOOM-MIGRATION-NOTE:", md)
+        self.assertIn("old/requested/actual", md)
+        self.assertTrue("КАЖДОГО" in md or "EVERY" in md)
         self.assertIn("detailed-why-comments", md)
         # composite test rule for tsapp
         self.assertIn("test:build", md)
@@ -175,6 +178,9 @@ class PartBPromptEn(unittest.TestCase):
         self.assertIn("migration-progress.json", md)
         self.assertIn("DEVELOPER_UPGRADE_GUIDE.md", md)
         self.assertIn("MIGRATION_REPORT.md", md)
+        self.assertIn("DEPLOOM-MIGRATION-NOTE:", md)
+        self.assertIn("old/requested/actual", md)
+        self.assertTrue("КАЖДОГО" in md or "EVERY" in md)
         self.assertIn("detailed-why-comments", md)
         self.assertIn("test:build", md)
         self.assertIn("user-excluded", md)

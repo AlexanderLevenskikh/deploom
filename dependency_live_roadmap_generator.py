@@ -24766,6 +24766,9 @@ def build_draft_prompt(
             "причину, новое ограничение API, workaround и условия его удаления. Не комментируй каждую строку и не "
             "оставляй временный дневник в source. В JSON/generated lockfile комментарии не добавляй — опиши изменение "
             "с file/key reference в MIGRATION_REPORT.",
+            f"  Новые временные пояснения этого прогона помечай полнострочно: native comment prefix + "
+            f"`DEPLOOM-MIGRATION-NOTE:{run_id}: <причина>`. Не помечай обычные комментарии и не размещай "
+            "маркер в строках/данных: он нужен для отдельной очистки после просмотра.",
             f"- `docs/dependency-migration/{run_id}/DEVELOPER_UPGRADE_GUIDE.md`: главные новые возможности именно "
             "фактически обновлённых библиотек, примеры применяемых API/паттернов, ограничения runtime/browser/"
             "toolchain, breaking changes, что учитывать дальше. Не выдавай предположение за найденную возможность и "
@@ -24775,6 +24778,10 @@ def build_draft_prompt(
             "actual; мотивация, breaking changes, изменения файлов, шаги и проверки с exits, before/after метрики, "
             "engine/coverage/unknown, отложенные когорты с причинами, остаточные риски, checkpoint/rollback, ссылки "
             "на raw evidence.",
+            "  Включи строку для КАЖДОГО выбранного прямого пакета, включая unchanged/keep-current/deferred: "
+            "old/requested/actual, статус, что сделано и почему. Полный список изменённых transitive вынеси в "
+            "приложение по diff двух lock inventories. Объясни каждый изменённый source/config файл, ключ и "
+            "логический блок: назначение и связь с обновлением. Отдельно выдели, что дали major-обновления.",
             "",
             "Оба файла обновляй по ходу; в финале они отражают cumulative состояние. Пути из prompt, из state и из "
             "твоего ответа должны совпадать. Отсутствие файлов/docs — отдельный статус поставки, а не успешное "
@@ -24901,6 +24908,9 @@ def build_draft_prompt(
             "- Comments in changed code/config: policy `detailed-why-comments` - explain a non-trivial reason, a new "
             "API constraint, a workaround and when to remove it. No per-line comments, no temporary diary in source. No "
             "comments in JSON/generated lockfiles - describe the change with file/key references in MIGRATION_REPORT.",
+            f"  Mark new temporary explanations introduced by this run as full lines: native comment prefix + "
+            f"`DEPLOOM-MIGRATION-NOTE:{run_id}: <reason>`. Never mark ordinary comments or put a marker inside "
+            "strings/data; this enables a separate cleanup after review.",
             f"- `docs/dependency-migration/{run_id}/DEVELOPER_UPGRADE_GUIDE.md`: the main NEW capabilities of the "
             "actually installed libraries, applicable API/pattern examples, runtime/browser/toolchain constraints, "
             "breaking changes and what to consider next. Never claim a guessed capability or document a not-yet-"
@@ -24910,6 +24920,10 @@ def build_draft_prompt(
             "requested/actual; motivation, breaking changes, file changes, executed steps and checks with exits, "
             "before/after metrics, engine/coverage/unknown, deferred cohorts with reasons, residual risks, checkpoint/"
             "rollback, raw evidence links.",
+            "  Include a row for EVERY selected direct package, including unchanged/keep-current/deferred: "
+            "old/requested/actual, outcome, what was done and why. Include the complete changed-transitive "
+            "inventory as an appendix based on both lock inventories. Explain every changed source/config "
+            "file, key and logical block by purpose and upgrade connection. Highlight what major upgrades enable.",
             "",
             "Update both files as you go; at the end they reflect the cumulative state. Paths in the prompt, in state "
             "and in your answer must match. Missing docs/comments is a separate deliverable status, not build or proof "

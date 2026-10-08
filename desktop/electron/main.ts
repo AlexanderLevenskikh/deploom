@@ -8677,7 +8677,7 @@ function setupIpc(): void {
     }
   }
 
-  const runIterativeAgent = async (input: { workspaceId?: string; projectName: string }): Promise<{
+  const runIterativeAgent = async (input: { workspaceId?: string; projectName: string; cleanupNotes?: boolean }): Promise<{
     autopilot?: { stopped: string; error?: string }
     retryable?: boolean
     ok: boolean
@@ -8704,6 +8704,7 @@ function setupIpc(): void {
     if (!existsSync(join(runDir, 'run.json'))) {
       return { ok: false, error: 'NO_RUN' }
     }
+    if (input.cleanupNotes && readDeliveryJson(join(runDir, 'run.json'))?.phase !== 'TERMINAL') return { ok: false, error: 'DELIVERY_CLEANUP_REQUIRES_VERIFIED_BRANCH' }
     return withAgentDispatchLock(iterativeStepInFlight, stepLockKey(workspace.id, project.name), async () => {
     if (readDeliveryJson(join(runDir, 'run.json'))?.phase === 'TERMINAL') {
       resumeAttempt(runDir, project.name, workspace.id)
@@ -8714,6 +8715,7 @@ function setupIpc(): void {
       const provider = workspace.agent
       const model = workspace.agentModel
       const outcome = await runDeliveryWorkflow(runDir, {
+        cleanup: input.cleanupNotes === true,
         canceled: () => readAttempt(runDir)?.cancelRequested === true,
         processAlive: isPidAlive,
         provider,
@@ -8728,7 +8730,7 @@ function setupIpc(): void {
         },
         launch: async context => {
           if (context.provider && context.provider !== provider) throw new Error('DELIVERY_PROVIDER_CHANGED: resume with the original agent provider')
-          updateAttempt(runDir, { phase: context.phase === 'security' ? 'audit-residual-repair' : 'semantic-commits' })
+          updateAttempt(runDir, { phase: context.phase === 'security' ? 'audit-residual-repair' : context.phase === 'cleanup' ? 'cleanup-notes' : 'semantic-commits' })
           publishIterativeAttempt(runDir)
           const watchdog = createDeliveryAgentWatchdog()
           const promptFile = join(runDir, `delivery-${context.phase}-prompt.md`)
@@ -9264,7 +9266,7 @@ function setupIpc(): void {
     })
   }
 
-  const runIterativeAgentWithAutopilot = iterativeAutopilot.register('agent', async (_event, input: { workspaceId?: string; projectName: string; autopilot?: boolean }) => runIterativeAgent(input))
+  const runIterativeAgentWithAutopilot = iterativeAutopilot.register('agent', async (_event, input: { workspaceId?: string; projectName: string; autopilot?: boolean; cleanupNotes?: boolean }) => runIterativeAgent(input))
   ipcMain.handle('flow:iterative:agent', runIterativeAgentWithAutopilot)
 
   // Recover an explicitly enabled mission even if no renderer is open. Drive

@@ -96,6 +96,37 @@ try {
   assert.equal(retained.status, 'running'); assert.equal(retained.resumeError, 'DELIVERY_AGENT_IDLE_TIMEOUT')
   await runDeliveryWorkflow(root, { ...deps, launch: async context => { assert.equal(context.sessionId, 'same-paid-session') } })
 
+  const cleanupState = { ...deliveryState, status: 'done', cleanup: { status: 'ready', baseHead: 'verified-head', changes: [{path:'docs/dependency-migration/fixture/MIGRATION_REPORT.md',kind:'document'}], archiveRoot: root } }
+  let cleanupLaunches = 0, cleanupChecks = 0
+  const cleanupCommands = []
+  const cleanupDeps = { ...deps, cleanup: true,
+    command: async step => {
+      cleanupCommands.push(step)
+      if (step === 'cleanup-prepare') return cleanupState
+      if (step === 'cleanup-verify') { if (++cleanupChecks === 1) throw new Error('DELIVERY_VERIFICATION_FAILED'); return {status:'done'} }
+      throw new Error(`Unexpected cleanup command: ${step}`)
+    },
+    launch: async context => {
+      cleanupLaunches++
+      assert.equal(context.phase, 'cleanup')
+      assert.match(context.prompt, /Remove only this run/)
+      assert.match(context.prompt, /node check.cjs/)
+      assert.match(context.prompt, /exact prepared cleanup bytes/)
+      context.onSession('cleanup-session')
+    },
+  }
+  assert.equal((await runDeliveryWorkflow(root, cleanupDeps)).ok, false)
+  assert.equal((await runDeliveryWorkflow(root, cleanupDeps)).ok, true)
+  assert.equal(cleanupLaunches, 1, 'failed cleanup verification resumes without another paid agent')
+  assert.deepEqual(cleanupCommands, ['cleanup-prepare','cleanup-verify','cleanup-prepare','cleanup-verify'])
+  for (const phase of ['security','delivery']) {
+    const prompt = workflowPrompt(phase, { ...deliveryState, baseCheckpointId: 'C4' }, {}, root)
+    assert.match(prompt, /EVERY selected direct package/)
+    assert.match(prompt, /major upgrade enables/)
+    assert.match(prompt, /EVERY changed source\/config file/)
+    assert.match(prompt, /DEPLOOM-MIGRATION-NOTE:fixture:/)
+    assert.match(prompt, /complete appendix of changed transitive packages/)
+  }
   const calls = []
   const pilot = createIterativeAutopilot(() => 'fixture')
   pilot.register('drive', async () => { calls.push('drive'); return { ok: true, stopped: 'finished', needsDelivery: true } })

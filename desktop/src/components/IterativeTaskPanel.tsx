@@ -24,7 +24,7 @@ type Props = {
   onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
   onDrive: (projectName: string, autopilot?: boolean, retryInfra?: boolean, discardCandidate?: boolean, resumeTerminal?: boolean) => Promise<IterativeDriveOutcome>
   onBegin: (projectName: string, discovery?: { autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
-  onAgent: (projectName: string, autopilot?: boolean) => Promise<IterativeAgentOutcome>
+  onAgent: (projectName: string, autopilot?: boolean, cleanupNotes?: boolean) => Promise<IterativeAgentOutcome>
   onAttempt: (projectName: string) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
   onCancel: (projectName: string) => Promise<{ ok: boolean }>
   liveAttempt?: IterativeAttemptView
@@ -528,16 +528,16 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     }
   }
 
-  const agentNow = async () => {
+  const agentNow = async (cleanupNotes = false) => {
     setStepBusy(true)
     setNote(undefined)
     try {
       await onBeforeStart?.()
-      const outcome = await onAgent(projectName, runner?.autopilotEnabled || runner?.autopilotActive || autopilot)
+      const outcome = await onAgent(projectName, cleanupNotes ? false : runner?.autopilotEnabled || runner?.autopilotActive || autopilot, cleanupNotes)
       if (outcome.autopilot) {
         setNote(autopilotNote(outcome.autopilot))
       } else if (outcome.ok) {
-        if (outcome.phase === 'TERMINAL') { setNote(text('Ветка с коммитами подготовлена; проверки и аудит обновлены.', 'The branch with commits is prepared; checks and audit are refreshed.')); return }
+        if (outcome.phase === 'TERMINAL') { setNote(cleanupNotes ? text('Пояснения удалены отдельным коммитом; проверки и аудит обновлены. Документы сохранены в артефактах.', 'Notes removed in a separate commit; checks and audit refreshed. Documents remain in the artifacts.') : text('Ветка с коммитами подготовлена; проверки и аудит обновлены.', 'The branch with commits is prepared; checks and audit are refreshed.')); return }
         const changed = (outcome.changedFiles ?? []).length
         setNote(
           text(
@@ -877,6 +877,11 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         <span>{text('Агент разделит принятые изменения на смысловые коммиты в ветке из настроек. Связанные обновления остаются одной когортой. Затем повторим проверки и аудит.', 'An agent groups accepted changes into semantic commits on the configured branch. Related updates remain one cohort. Checks and audit run again afterwards.')}</span>
         {runner.delivery?.branchResolution === 'configured-branch-preserved' ? <span>{text(`Ветка ${runner.delivery.requestedBranch} сохранена. Результат подготовим в ${runner.delivery.branch}.`, `Branch ${runner.delivery.requestedBranch} was preserved. The result uses ${runner.delivery.branch}.`)}</span> : null}
         {runner.delivery?.commits?.map(commit => <code key={commit}>{commit}</code>)}
+        {runner.delivery?.status === 'done' && runner.delivery.cleanup?.status !== 'done' ? <>
+          <span>{text('После просмотра можно удалить два документа и только помеченные пояснения этого прогона. Копии документов останутся в артефактах; агент сделает отдельный коммит, затем повторим проверки и аудит.', 'After review, remove the two documents and only this run’s marked explanations. Copies remain in the artifacts; an agent creates a separate commit, followed by checks and audit.')}</span>
+          <button className="button secondary" disabled={busyLocked || childAlive} onClick={() => void agentNow(true)}>{runner.delivery.cleanup ? text('Продолжить удаление пояснений', 'Resume note cleanup') : text('Удалить доки и миграционные комментарии', 'Remove docs and migration comments')}</button>
+        </> : null}
+        {runner.delivery?.cleanup?.archiveRoot ? <button className="button secondary" onClick={() => void onOpenPath(runner.delivery!.cleanup!.archiveRoot)}><FileText size={16} />{text('Сохранённые документы', 'Archived documents')}</button> : null}
         {runner.delivery?.workspaceRoot ? <button className="button secondary" onClick={() => void onOpenPath(runner.delivery!.workspaceRoot)}><ExternalLink size={16} />{text('Открыть ветку результата', 'Open the result branch')}</button> : null}
         {runner.delivery?.status !== 'done' ? <button className="button secondary" disabled={busyLocked || childAlive} onClick={() => void agentNow()}><Rocket size={16} />{runner.delivery ? text('Продолжить подготовку коммитов', 'Resume commit preparation') : text('Устранить остаток и подготовить коммиты', 'Repair remaining goals and prepare commits')}</button> : null}
       </div> : null}

@@ -709,6 +709,13 @@ def _hash_regular_file(
         else:
             hash_stream()
         after = path.stat(follow_symlinks=False)
+    except FileNotFoundError as exc:
+        # The walker already observed this input. Losing it before/during the
+        # read is a capture race, not permission to omit it from the manifest.
+        # Discard the entire attempt; only a fresh sealed/live match can pass.
+        raise SourceCaptureError(
+            f"SOURCE_CAPTURE_UNSTABLE: SOURCE_FILE_UNREADABLE: file disappeared while hashing: {path}: {exc}"
+        ) from exc
     except OSError as exc:
         raise SourceCaptureError(f"SOURCE_FILE_UNREADABLE: {path}: {exc}") from exc
     if (

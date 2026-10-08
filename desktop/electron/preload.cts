@@ -29,7 +29,7 @@ exportLegacyIterativeTask: (input: { workspaceId?: string; projectName: string }
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:status', input),
   iterativeDrive: (input: { workspaceId?: string; projectName: string; autopilot?: boolean; retryInfra?: boolean; discardCandidate?: boolean; resumeTerminal?: boolean }) => ipcRenderer.invoke('flow:iterative:drive', input),
   iterativeBegin: (input: { workspaceId?: string; projectName: string; autopilot?: boolean; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => ipcRenderer.invoke('flow:iterative:begin', input),
-  iterativeAgent: (input: { workspaceId?: string; projectName: string; autopilot?: boolean }) => ipcRenderer.invoke('flow:iterative:agent', input),
+  iterativeAgent: (input: { workspaceId?: string; projectName: string; autopilot?: boolean; cleanupNotes?: boolean }) => ipcRenderer.invoke('flow:iterative:agent', input),
   iterativeAttempt: (input: { workspaceId?: string; projectName: string; includeRunLog?: boolean }) => ipcRenderer.invoke('flow:iterative:attempt', input),
   iterativeCancel: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:cancel', input),
   runAction: (input: unknown) => ipcRenderer.invoke('flow:run-action', input),

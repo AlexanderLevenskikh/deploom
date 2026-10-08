@@ -4591,9 +4591,10 @@ def _accept_checkpoint(
             "parent": base_id,
         }
     )
-    with MigrationProgress(_emit_status, operation="checkpoint", message="Saving verified source snapshot", run_id=run["runId"], candidate_id=candidate_id):
+    with MigrationProgress(_emit_status, operation="checkpoint", message="Saving verified source snapshot", run_id=run["runId"], candidate_id=candidate_id) as progress:
         snapshot = capture_durable_source_snapshot(
-            project_path, run_dir / SOURCE_DIR / checkpoint_id, timeout_seconds=0
+            project_path, run_dir / SOURCE_DIR / checkpoint_id, timeout_seconds=0,
+            progress=progress,
         )
     project_relative = resolve_project_relative(project_path, snapshot)
 

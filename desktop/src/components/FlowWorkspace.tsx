@@ -56,7 +56,7 @@ type Props = {
   onIterativeStatus: (projectName: string) => Promise<IterativeStatusOutcome>
   onIterativeDrive: (projectName: string, autopilot?: boolean, retryInfra?: boolean, discardCandidate?: boolean, resumeTerminal?: boolean) => Promise<IterativeDriveOutcome>
   onIterativeBegin: (projectName: string, discovery?: { autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
-  onIterativeAgent: (projectName: string, autopilot?: boolean) => Promise<IterativeAgentOutcome>
+  onIterativeAgent: (projectName: string, autopilot?: boolean, cleanupNotes?: boolean) => Promise<IterativeAgentOutcome>
   onIterativeAttempt: (projectName: string, includeRunLog?: boolean) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; runLog?: string; error?: string }>
   onIterativeCancel: (projectName: string) => Promise<{ ok: boolean }>
   liveIterativeAttempt?: IterativeAttemptView

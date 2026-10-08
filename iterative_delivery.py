@@ -476,7 +476,7 @@ def resume_delivery_preparation(run_dir, run, config, checkpoint, state):
     return state
 
 
-def delivery_verify(run_dir, inputs):
+def delivery_verify(run_dir, inputs, *, cleanup=False):
     import iterative_migration as core
     state_file = run_dir / "delivery-state.json"
     state = read(state_file)
@@ -494,9 +494,18 @@ def delivery_verify(run_dir, inputs):
     git(root, "merge-base", "--is-ancestor", state["sourceHead"], "HEAD")
     if git(root, "status", "--porcelain"):
         raise RuntimeError("DELIVERY_UNCOMMITTED_CHANGES: finish semantic commits before verifying")
-    documentation = {f"docs/dependency-migration/{state['runId']}/{name}" for name in ("MIGRATION_REPORT.md", "DEVELOPER_UPGRADE_GUIDE.md")}
-    expected = dict(state["expected"])
-    for name, digest in state["expected"].items():
+    notes = state.get("cleanup") or {}
+    if cleanup and notes.get("status") not in {"ready", "done"}:
+        raise RuntimeError("DELIVERY_CLEANUP_NOT_PREPARED")
+    cleaned = cleanup or notes.get("status") == "done"
+    if cleaned:
+        from iterative_delivery_notes import validate_notes_archive
+        validate_notes_archive(run_dir, state)
+    documentation = set() if cleaned else {f"docs/dependency-migration/{state['runId']}/{name}" for name in ("MIGRATION_REPORT.md", "DEVELOPER_UPGRADE_GUIDE.md")}
+    expected = dict(notes["expected"] if cleanup else state["expected"])
+    if cleanup:
+        git(root, "merge-base", "--is-ancestor", notes["baseHead"], "HEAD")
+    for name, digest in expected.items():
         path = root / name
         current = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
         if name in documentation:
@@ -552,12 +561,16 @@ def delivery_verify(run_dir, inputs):
         current = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
         if current != digest:
             raise RuntimeError(f"DELIVERY_BYTES_CHANGED_DURING_VERIFICATION: {name}")
+    if cleaned:
+        validate_notes_archive(run_dir, state)
     checkpoint["audit"] = audit
     core.save_checkpoint(run_dir, checkpoint)
     refreshed_run = dict(run)
     refreshed_run.pop("terminalOutcome", None)
     core._finish_locked(run_dir, refreshed_run, config)
-    state.update(status="done", head=delivered_head, verificationWorkspace=str(verification),
+    if cleanup:
+        state["cleanup"] = {**notes, "status": "done", "head": delivered_head}
+    state.update(status="done", head=delivered_head, expected=expected, verificationWorkspace=str(verification),
                  documentationHashes={name: expected[name] for name in sorted(documentation)},
                  proofRefs={"resolvedStateKey": result.resolved_state_key, "preparationProofKey": result.preparation_proof_key},
                  commits=git(root, "log", "--format=%h %s", f"{state['sourceHead']}..HEAD").splitlines(),
@@ -571,19 +584,24 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--input-file", required=True)
-    parser.add_argument("command", choices=("current-audit", "security-prepare", "security-verify", "delivery-prepare", "delivery-verify"))
+    parser.add_argument("command", choices=("current-audit", "security-prepare", "security-verify", "delivery-prepare", "delivery-verify", "cleanup-prepare", "cleanup-verify"))
     args = parser.parse_args(argv)
     run_dir = Path(args.run_dir).resolve(); run_dir.mkdir(parents=True, exist_ok=True)
     inputs = read(args.input_file)
     lock = core._RunLock(run_dir, f"delivery-{os.getpid()}", stale_seconds=600)
     lock.acquire()
     try:
-        operation = {"current-audit": current_audit, "security-prepare": security_prepare,
+        from iterative_delivery_notes import cleanup_prepare, cleanup_verify
+        operation = {"cleanup-prepare": cleanup_prepare, "cleanup-verify": cleanup_verify,
+                     "current-audit": current_audit, "security-prepare": security_prepare,
                      "security-verify": security_verify, "delivery-prepare": delivery_prepare,
                      "delivery-verify": delivery_verify}[args.command]
         value = operation(run_dir, inputs)
         # Never print the potentially large source inventory.
-        print("ITERATIVE_DELIVERY_V1 " + json.dumps({k:v for k,v in value.items() if k not in {"before", "expected", "baseFiles", "files"}}, ensure_ascii=False))
+        public = {k:v for k,v in value.items() if k not in {"before", "expected", "baseFiles", "files"}}
+        if isinstance(public.get("cleanup"), dict):
+            public["cleanup"] = {k:v for k,v in public["cleanup"].items() if k not in {"before", "expected"}}
+        print("ITERATIVE_DELIVERY_V1 " + json.dumps(public, ensure_ascii=False))
         return 0
     finally:
         lock.release()

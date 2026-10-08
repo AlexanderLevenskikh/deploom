@@ -361,6 +361,113 @@ class GitDeliveryTests(unittest.TestCase):
         self.assertEqual(len(result["documentationHashes"]), 2)
         self.assert_original_preserved()
 
+    def notes_fixture(self, *, dependent_check=False, second_note=False):
+        import iterative_delivery_notes as notes
+        self.note_bytes = (b"\xef\xbb\xbf// ordinary project comment\r\n"
+                           b"// DEPLOOM-MIGRATION-NOTE:delivery-fixture: upgrade explanation\r\n"
+                           b"module.exports = 1;\r\n")
+        if second_note:
+            self.note_bytes = self.note_bytes.replace(b"module.exports", b"// DEPLOOM-MIGRATION-NOTE:delivery-fixture: second explanation\r\nmodule.exports")
+        (self.source / "note.cjs").write_bytes(self.note_bytes)
+        if dependent_check:
+            (self.source / "check.cjs").write_text(
+                "if (!require('fs').existsSync('docs/dependency-migration/delivery-fixture/MIGRATION_REPORT.md')) process.exit(3);",
+                encoding="utf-8")
+        state = self.prepare(); root = Path(state["workspaceRoot"])
+        guide = root / "docs/dependency-migration/delivery-fixture/DEVELOPER_UPGRADE_GUIDE.md"
+        guide.write_text("Final developer guide authored by the agent", encoding="utf-8")
+        d.git(root, "add", "."); d.git(root, "commit", "-m", "coherent migration")
+        with patch.object(d, "collect_audit", return_value=report()), patch.object(core, "_finish_locked"):
+            delivered = d.delivery_verify(self.run_dir, {})
+        return notes, root, delivered
+
+    def apply_notes_cleanup(self, notes, root, prepared):
+        for change in prepared["cleanup"]["changes"]:
+            path = root / change["path"]
+            if change["kind"] == "document":
+                path.unlink()
+            else:
+                path.write_bytes(notes.without_migration_notes(path.read_bytes(), change["path"], self.run["runId"])[0])
+        d.git(root, "add", "."); d.git(root, "commit", "-m", "docs: remove reviewed migration notes")
+
+    @unittest.skipUnless(shutil.which("node") and (shutil.which("npm") or shutil.which("npm.cmd")), "Node/npm required")
+    def test_notes_cleanup_archives_final_docs_and_reverifies_real_committed_bytes(self):
+        notes, root, delivered = self.notes_fixture()
+        import subprocess
+        import sys
+        input_file = self.run_dir / "cleanup-fixture-input.json"
+        input_file.write_text("{}", encoding="utf-8")
+        completed = subprocess.run([sys.executable, str(Path(d.__file__)), "--run-dir", str(self.run_dir),
+                                    "--input-file", str(input_file), "cleanup-prepare"],
+                                   capture_output=True, text=True, encoding="utf-8", check=True, timeout=60)
+        payload = next(line for line in completed.stdout.splitlines() if line.startswith("ITERATIVE_DELIVERY_V1 "))
+        wire = json.loads(payload.removeprefix("ITERATIVE_DELIVERY_V1 "))
+        self.assertNotIn("before", wire["cleanup"])
+        self.assertNotIn("expected", wire["cleanup"])
+        prepared = d.read(self.run_dir / "delivery-state.json")
+        self.assertEqual(wire["cleanup"]["baseHead"], prepared["cleanup"]["baseHead"])
+        self.assertEqual(prepared, notes.cleanup_prepare(self.run_dir, {}))
+        archive = Path(prepared["cleanup"]["archiveRoot"])
+        self.assertEqual((archive / "DEVELOPER_UPGRADE_GUIDE.md").read_text(), "Final developer guide authored by the agent")
+        self.assertEqual(prepared["cleanup"]["commentCount"], 1)
+        self.apply_notes_cleanup(notes, root, prepared)
+        # Resume a completed agent: original/prepared bytes remain acceptable.
+        notes.cleanup_prepare(self.run_dir, {})
+        with patch.object(d, "collect_audit", return_value=report()) as audit, patch.object(core, "_finish_locked"):
+            result = notes.cleanup_verify(self.run_dir, {})
+        self.assertEqual(result["cleanup"]["status"], "done")
+        self.assertNotEqual(result["head"], delivered["head"])
+        self.assertEqual(len(result["commits"]), 2)
+        self.assertEqual(audit.call_args.args[0], Path(result["verificationWorkspace"]))
+        self.assertEqual((root / "note.cjs").read_bytes(), b"\xef\xbb\xbf// ordinary project comment\r\nmodule.exports = 1;\r\n")
+        self.assertEqual(notes.cleanup_prepare(self.run_dir, {})["cleanup"]["status"], "done")
+        (archive / "MIGRATION_REPORT.md").write_text("tampered archive", encoding="utf-8")
+        with patch.object(core, "verify_assignment") as verify:
+            with self.assertRaisesRegex(RuntimeError, "ARCHIVE_CHANGED"):
+                notes.cleanup_verify(self.run_dir, {})
+            verify.assert_not_called()
+        self.assert_original_preserved()
+
+    @unittest.skipUnless(shutil.which("node") and (shutil.which("npm") or shutil.which("npm.cmd")), "Node/npm required")
+    def test_notes_cleanup_resumes_partial_owned_comment_removal_in_same_file(self):
+        notes, root, _ = self.notes_fixture(second_note=True)
+        prepared = notes.cleanup_prepare(self.run_dir, {})
+        self.assertEqual(prepared["cleanup"]["commentCount"], 2)
+        path = root / "note.cjs"
+        path.write_bytes(path.read_bytes().replace(b"// DEPLOOM-MIGRATION-NOTE:delivery-fixture: upgrade explanation\r\n", b""))
+        self.assertEqual(notes.cleanup_prepare(self.run_dir, {}), prepared)
+        self.assertIn(b"second explanation", path.read_bytes())
+        self.assert_original_preserved()
+
+    @unittest.skipUnless(shutil.which("node") and (shutil.which("npm") or shutil.which("npm.cmd")), "Node/npm required")
+    def test_notes_cleanup_rejects_unrelated_source_edit_before_verifier(self):
+        notes, root, _ = self.notes_fixture()
+        prepared = notes.cleanup_prepare(self.run_dir, {})
+        self.apply_notes_cleanup(notes, root, prepared)
+        (root / "source.txt").write_text("unrelated user edit", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "CLEANUP_BYTES_CHANGED"):
+            notes.cleanup_prepare(self.run_dir, {})
+        d.git(root, "add", "."); d.git(root, "commit", "-m", "unrelated edit")
+        with patch.object(core, "verify_assignment") as verify:
+            with self.assertRaisesRegex(RuntimeError, "DELIVERY_SOURCE_CHANGED"):
+                notes.cleanup_verify(self.run_dir, {})
+            verify.assert_not_called()
+        self.assertEqual((root / "source.txt").read_text(), "unrelated user edit")
+        self.assert_original_preserved()
+
+    @unittest.skipUnless(shutil.which("node") and (shutil.which("npm") or shutil.which("npm.cmd")), "Node/npm required")
+    def test_notes_cleanup_failed_real_check_does_not_publish_success(self):
+        notes, root, _ = self.notes_fixture(dependent_check=True)
+        prepared = notes.cleanup_prepare(self.run_dir, {})
+        self.apply_notes_cleanup(notes, root, prepared)
+        with patch.object(d, "collect_audit") as audit:
+            with self.assertRaisesRegex(RuntimeError, "DELIVERY_VERIFICATION_FAILED"):
+                notes.cleanup_verify(self.run_dir, {})
+            audit.assert_not_called()
+        self.assertEqual(d.read(self.run_dir / "delivery-state.json")["cleanup"]["status"], "ready")
+        self.assertEqual(core.load_run(self.run_dir)["activeCheckpointId"], "C1")
+        self.assert_original_preserved()
+
 
 if __name__ == "__main__":
     unittest.main()
