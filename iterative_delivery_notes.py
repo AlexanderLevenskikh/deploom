@@ -157,7 +157,6 @@ def cleanup_prepare(run_dir, inputs):
         return state
     if delivery.git(root, "rev-parse", "HEAD") != state["head"] or delivery.git(root, "status", "--porcelain"):
         raise RuntimeError("DELIVERY_CLEANUP_BRANCH_CHANGED: preserve user edits")
-    delivery.assert_delivery_inputs_visible(root)
     expected = {**state["expected"], **state.get("documentationHashes", {})}
     before = dict(expected)
     archive = run_dir / "delivery" / "notes-archive"

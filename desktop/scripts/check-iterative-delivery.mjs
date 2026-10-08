@@ -73,6 +73,8 @@ try {
       assert.equal(context.provider, 'codex')
       assert.ok(context.prompt.includes('mutually dependent cohorts'))
       assert.ok(context.prompt.includes('@skbkontur/react-icons'))
+      assert.ok(context.prompt.includes('Never force-add or copy ignored inputs'))
+      assert.ok(context.prompt.includes('checkpoint checks do not prove this new subject'))
     },
   }
   assert.equal((await runDeliveryWorkflow(root, deps)).ok, false)

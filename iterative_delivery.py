@@ -317,14 +317,11 @@ def deliverable_source_file(name):
     return not any(p in {"node_modules", ".artifacts", ".playwright-mcp", "dist", "build"} for p in parts) and not name.endswith((".log", ".tmp"))
 
 
-def assert_delivery_inputs_visible(snapshot_root):
-    # Never silently remove hidden source/config from a verification subject or
-    # copy ignored potentially sensitive payloads into another Git checkout.
-    ignored = set(git(snapshot_root, "ls-files", "--others", "--ignored", "--exclude-standard", "-z").split("\0")) - {""}
-    hidden = sorted(n for n in ignored if deliverable_source_file(n))
-    if hidden:
-        raise RuntimeError("DELIVERY_IGNORED_SOURCE_INPUTS: В проверенном состоянии есть исключённые из Git входы. "
-                           "Checkpoint сохранён; без явно выбранных входов доставка не подтверждается: " + ", ".join(hidden[:8]))
+def ignored_delivery_inputs(snapshot_root):
+    # The sealed checkpoint retains all source inputs. Git delivery is a new
+    # subject: ignored payloads never cross into its checkout or commits, and
+    # its authority comes only from fresh checks/audit of the delivered tree.
+    return sorted(set(git(snapshot_root, "ls-files", "--others", "--ignored", "--exclude-standard", "-z").split("\0")) - {""})
 
 
 def delivery_files(snapshot_root):
@@ -399,7 +396,11 @@ def delivery_prepare(run_dir, inputs):
         raise RuntimeError("DELIVERY_UNREGISTERED_WORKTREE: preserve and inspect the existing directory")
     root.parent.mkdir(parents=True, exist_ok=True)
     head = checkpoint["sourceHead"]
-    assert_delivery_inputs_visible(source)
+    ignored = ignored_delivery_inputs(source)
+    evidence = run_dir / "delivery" / "ignored-inputs.json"
+    core._write_json_atomic(evidence, {"schemaVersion": 1, "runId": run["runId"],
+        "checkpointId": checkpoint["checkpointId"], "sourceSnapshotKey": checkpoint["sourceSnapshotKey"],
+        "policy": "git-visible-files-with-fresh-verification", "omittedPaths": ignored})
     files = delivery_files(source)
     # Publish the intent before Git so a crash leaves a visible recoverable
     # worktree rather than silently creating another branch on restart.
@@ -408,6 +409,8 @@ def delivery_prepare(run_dir, inputs):
              "requestedBranch": requested_branch, "reuseBranch": reuse_branch, "branchResolution": branch_resolution,
              "workspaceRoot": str(root), "projectRelative": checkpoint.get("projectRelative") or ".",
              "sourceHead": head, "status": "preparing", "files": sorted(files),
+             "ignoredInputCount": len(ignored), "ignoredInputsEvidenceRef": str(evidence),
+             "verificationSubject": "committed-git-tree",
              "auditTool": str(Path(__file__).with_name("manual_dependency_audit.py"))}
     core._write_json_atomic(state_file, state)
     return resume_delivery_preparation(run_dir, run, config, checkpoint, state)

@@ -299,13 +299,56 @@ class GitDeliveryTests(unittest.TestCase):
         self.assertEqual(d.git(self.repo, "rev-parse", "codex/fixture-delivery"), moved)
         self.assert_original_preserved()
 
-    def test_ignored_source_inputs_stop_before_worktree_creation(self):
-        (self.source / ".gitignore").write_text("node_modules/\n.private-config.json\n", encoding="utf-8")
-        (self.source / ".private-config.json").write_text('{"checkInput":true}', encoding="utf-8")
-        with self.assertRaisesRegex(RuntimeError, "DELIVERY_IGNORED_SOURCE_INPUTS"):
-            self.prepare()
-        self.assertFalse(d.delivery_root(self.run_dir, self.run["runId"]).exists())
-        self.assertFalse((self.run_dir / "delivery-state.json").exists())
+    def ignored_inputs_fixture(self, *, required=False):
+        (self.source / ".gitignore").write_text("node_modules/\n.private-config.json\n.opencode/\n.husky/_/\nbin/\n", encoding="utf-8")
+        files = {".private-config.json": '{"checkInput":"PRIVATE_FIXTURE_PAYLOAD"}',
+                 ".opencode/package.json": '{}', ".husky/_/h": 'generated hook', "bin/model.pdb": 'generated binary'}
+        for name, value in files.items():
+            path = self.source / name; path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value, encoding="utf-8")
+        if required:
+            (self.source / "check.cjs").write_text("require('fs').readFileSync('.private-config.json')", encoding="utf-8")
+        return files
+
+    def test_ignored_inputs_are_recorded_without_copying_payloads(self):
+        files = self.ignored_inputs_fixture()
+        state = self.prepare(); root = Path(state["workspaceRoot"])
+        evidence = d.read(Path(state["ignoredInputsEvidenceRef"]))
+        self.assertEqual(set(evidence["omittedPaths"]), set(files))
+        self.assertEqual(evidence["sourceSnapshotKey"], self.checkpoint["sourceSnapshotKey"])
+        self.assertEqual(state["ignoredInputCount"], len(files))
+        self.assertNotIn("PRIVATE_FIXTURE_PAYLOAD", Path(state["ignoredInputsEvidenceRef"]).read_text())
+        for name in files:
+            self.assertTrue((self.source / name).is_file())
+            self.assertFalse((root / name).exists())
+        self.assert_original_preserved()
+
+    @unittest.skipUnless(shutil.which("node") and (shutil.which("npm") or shutil.which("npm.cmd")), "Node/npm required")
+    def test_ignored_generated_inputs_require_fresh_delivery_verification(self):
+        files = self.ignored_inputs_fixture()
+        state = self.prepare(); root = Path(state["workspaceRoot"])
+        d.git(root, "add", "."); d.git(root, "commit", "-m", "git-visible upgrade")
+        with patch.object(d, "collect_audit", return_value=report()) as audit, patch.object(core, "_finish_locked"):
+            result = d.delivery_verify(self.run_dir, {})
+        self.assertEqual(result["status"], "done")
+        self.assertEqual(result["verificationSubject"], "committed-git-tree")
+        audit.assert_called_once()
+        for name in files:
+            self.assertFalse((Path(result["verificationWorkspace"]) / name).exists())
+        self.assert_original_preserved()
+
+    @unittest.skipUnless(shutil.which("node") and (shutil.which("npm") or shutil.which("npm.cmd")), "Node/npm required")
+    def test_missing_ignored_required_input_never_reuses_checkpoint_green(self):
+        self.ignored_inputs_fixture(required=True)
+        state = self.prepare(); root = Path(state["workspaceRoot"])
+        d.git(root, "add", "."); d.git(root, "commit", "-m", "requires local input")
+        with patch.object(d, "collect_audit") as audit, patch.object(core, "_finish_locked") as finish:
+            with self.assertRaisesRegex(RuntimeError, "DELIVERY_VERIFICATION_FAILED"):
+                d.delivery_verify(self.run_dir, {})
+        audit.assert_not_called(); finish.assert_not_called()
+        self.assertEqual(d.read(self.run_dir / "delivery-state.json")["status"], "ready")
+        self.assertEqual(core.load_run(self.run_dir)["activeCheckpointId"], "C1")
+        self.assertTrue((self.source / ".private-config.json").is_file())
         self.assert_original_preserved()
 
     def test_interrupted_copy_resumes_without_recreating_branch(self):
