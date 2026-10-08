@@ -351,6 +351,101 @@ class GitDeliveryTests(unittest.TestCase):
         self.assertTrue((self.source / ".private-config.json").is_file())
         self.assert_original_preserved()
 
+    def test_checkout_does_not_run_project_hooks_before_recording_base(self):
+        hooks = self.root / "project-hooks"; hooks.mkdir()
+        hook = hooks / "post-checkout"
+        hook.write_text("#!/bin/sh\nprintf touched > lifecycle-marker.txt\n", encoding="utf-8")
+        hook.chmod(0o755)
+        d.git(self.repo, "config", "core.hooksPath", str(hooks))
+        state = self.prepare(); root = Path(state["workspaceRoot"])
+        self.assertFalse((root / "lifecycle-marker.txt").exists())
+        self.assertIn("baseFiles", state)
+        self.assertEqual(d.git(self.repo, "config", "--get", "core.hooksPath"), str(hooks))
+        self.assert_original_preserved()
+
+    @unittest.skipUnless(shutil.which("git-lfs"), "Git LFS required")
+    def test_real_lfs_asset_worktree_commit_and_clean_clone_preserve_physical_bytes(self):
+        generated = self.repo / ".husky" / "_"; generated.mkdir(parents=True)
+        (generated / ".gitignore").write_text("*\n", encoding="utf-8")
+        d.git(self.repo, "config", "core.hooksPath", ".husky/_")
+        d.git(self.repo, "lfs", "install", "--local")
+        payload = b"physical LFS fixture bytes\n" * 100
+        (self.repo / ".gitattributes").write_text("asset.bin filter=lfs diff=lfs merge=lfs -text\n", encoding="utf-8")
+        (self.repo / "asset.bin").write_bytes(payload)
+        d.git(self.repo, "add", "."); d.git(self.repo, "commit", "-m", "fixture LFS asset")
+        self.head = d.git(self.repo, "rev-parse", "HEAD")
+        self.assertIn("version https://git-lfs.github.com/spec/v1", d.git(self.repo, "show", "HEAD:asset.bin"))
+        self.checkpoint["sourceHead"] = self.head
+        core.save_checkpoint(self.run_dir, self.checkpoint)
+        self.source = self.root / "snapshot-lfs"
+        shutil.copytree(self.repo, self.source)
+        (self.source / "source.txt").write_text("upgraded", encoding="utf-8")
+        core._open_checkpoint_source.return_value = SimpleNamespace(root=self.source)
+        state = self.prepare(); root = Path(state["workspaceRoot"])
+        self.assertEqual((root / "asset.bin").read_bytes(), payload)
+        self.assertNotIn(".husky/_/", d.git(root, "ls-files", "--others", "--exclude-standard"))
+        d.git(root, "add", "."); d.git(root, "commit", "-m", "verified LFS fixture upgrade")
+        with patch.object(d, "collect_audit", return_value=report()), patch.object(core, "_finish_locked"):
+            result = d.delivery_verify(self.run_dir, {})
+        self.assertEqual(result["status"], "done")
+        self.assertEqual((Path(result["verificationWorkspace"]) / "asset.bin").read_bytes(), payload)
+        self.assert_original_preserved()
+
+    def stranded_lfs_fixture(self):
+        d.git(self.repo, "lfs", "version")
+        for repo in (self.repo, self.source):
+            d.git(repo, "config", "core.hooksPath", ".husky/_")
+        hook_source = self.source / ".husky" / "_"; hook_source.mkdir(parents=True)
+        (hook_source / ".gitignore").write_text("*\n", encoding="utf-8")
+        d.git(self.source, "lfs", "install", "--local")
+        with patch.object(d, "inventory", side_effect=OSError("interrupted before base")):
+            with self.assertRaisesRegex(OSError, "interrupted before base"):
+                self.prepare()
+        state = d.read(self.run_dir / "delivery-state.json")
+        root = Path(state["workspaceRoot"])
+        generated = root / ".husky" / "_"
+        (generated / ".gitignore").unlink()  # Reproduce the old release's checkout.
+        for name in ("post-checkout", "post-commit", "post-merge", "pre-push"):
+            shutil.copy2(hook_source / name, generated / name)
+        self.assertNotIn("baseFiles", state)
+        return root, generated
+
+    @unittest.skipUnless(shutil.which("git-lfs"), "Git LFS required")
+    def test_stranded_real_lfs_hooks_resume_and_reverify_without_committing_generated_files(self):
+        root, generated = self.stranded_lfs_fixture()
+        state = self.prepare()
+        self.assertEqual(state["status"], "ready")
+        self.assertEqual((generated / ".gitignore").read_bytes(), b"*\n")
+        self.assertFalse(any(name.startswith(".husky/_/") for name in state["files"]))
+        d.git(root, "add", "."); d.git(root, "commit", "-m", "coherent fixture upgrade")
+        with patch.object(d, "collect_audit", return_value=report()), patch.object(core, "_finish_locked"):
+            result = d.delivery_verify(self.run_dir, {})
+        self.assertEqual(result["status"], "done")
+        self.assertFalse((Path(result["verificationWorkspace"]) / ".husky" / "_").exists())
+        self.assert_original_preserved()
+
+    @unittest.skipUnless(shutil.which("git-lfs"), "Git LFS required")
+    def test_stranded_modified_hook_is_preserved_and_rejected(self):
+        root, generated = self.stranded_lfs_fixture()
+        hook = generated / "post-checkout"
+        hook.write_bytes(hook.read_bytes() + b"# user change\n")
+        prior = hook.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "DELIVERY_UNREGISTERED_EDITS"):
+            self.prepare()
+        self.assertEqual(hook.read_bytes(), prior)
+        self.assertFalse((generated / ".gitignore").exists())
+        self.assert_original_preserved()
+
+    @unittest.skipUnless(shutil.which("git-lfs"), "Git LFS required")
+    def test_stranded_unrelated_untracked_file_is_preserved_and_rejected(self):
+        root, generated = self.stranded_lfs_fixture()
+        (root / "personal.txt").write_text("preserve this", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "DELIVERY_UNREGISTERED_EDITS"):
+            self.prepare()
+        self.assertEqual((root / "personal.txt").read_text(), "preserve this")
+        self.assertFalse((generated / ".gitignore").exists())
+        self.assert_original_preserved()
+
     def test_interrupted_copy_resumes_without_recreating_branch(self):
         original_copy = d.shutil.copy2
         count = 0

@@ -423,16 +423,18 @@ def resume_delivery_preparation(run_dir, run, config, checkpoint, state):
         raise RuntimeError("DELIVERY_PATH_OUTSIDE_RUN")
     repo = Path(git(Path(config["projectDir"]), "rev-parse", "--show-toplevel"))
     if not root.exists():
+        from iterative_delivery_checkout import checkout_hook_args
+        hook_args = checkout_hook_args(run_dir, state)
         refs = git(repo, "for-each-ref", "--format=%(refname)", f"refs/heads/{state['branch']}").splitlines()
         if state.get("reuseBranch"):
             if (f"refs/heads/{state['branch']}" not in refs or
                     git(repo, "rev-parse", f"refs/heads/{state['branch']}") != state["sourceHead"]):
                 raise RuntimeError("DELIVERY_BRANCH_CHANGED: preserve the existing branch")
-            git(repo, "worktree", "add", str(root), state["branch"])
+            git(repo, *hook_args, "worktree", "add", str(root), state["branch"])
         else:
             if f"refs/heads/{state['branch']}" in refs:
                 raise RuntimeError("DELIVERY_BRANCH_CREATED_WITHOUT_WORKTREE: preserve the branch for inspection")
-            git(repo, "worktree", "add", "-b", state["branch"], str(root), state["sourceHead"])
+            git(repo, *hook_args, "worktree", "add", "-b", state["branch"], str(root), state["sourceHead"])
     if (git(root, "branch", "--show-current") != state["branch"] or
             git(root, "rev-parse", "HEAD") != state["sourceHead"] or
             not any(line == f"worktree {root.as_posix()}" for line in git(repo, "worktree", "list", "--porcelain").splitlines())):
@@ -441,6 +443,8 @@ def resume_delivery_preparation(run_dir, run, config, checkpoint, state):
     source = Path(snapshot.root)
     files = set(state["files"])
     if "baseFiles" not in state:
+        from iterative_delivery_checkout import bootstrap_husky_ignore
+        bootstrap_husky_ignore(root, source, state)
         if git(root, "status", "--porcelain"):
             raise RuntimeError("DELIVERY_UNREGISTERED_EDITS: preparation did not record the base")
         state["baseFiles"] = inventory(root)
