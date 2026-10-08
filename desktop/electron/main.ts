@@ -56,7 +56,7 @@ import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStream
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { discoveryProgress } from './iterative-discovery-progress.js'
-import { auditLevel, readAuditView, readDeliveryView, iterationDirectory, readJson as readDeliveryJson, runDeliveryWorkflow } from './iterative-delivery.js'
+import { auditLevel, readAuditView, readDeliveryView, iterationDirectory, readJson as readDeliveryJson, runDeliveryWorkflow, createDeliveryAgentWatchdog } from './iterative-delivery.js'
 import { createIterativeAutopilot } from './iterative-autopilot.js'
 import { liveRunWriterPid, readAutopilotState, writeAutopilotState } from './iterative-autopilot-state.js'
 import { IterativeDecision, decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
@@ -8707,7 +8707,7 @@ function setupIpc(): void {
     return withAgentDispatchLock(iterativeStepInFlight, stepLockKey(workspace.id, project.name), async () => {
     if (readDeliveryJson(join(runDir, 'run.json'))?.phase === 'TERMINAL') {
       resumeAttempt(runDir, project.name, workspace.id)
-      updateAttempt(runDir, { status: 'running', stage: 'agent', lastError: undefined })
+      updateAttempt(runDir, { status: 'running', stage: 'agent', phase: 'TERMINAL', lastError: undefined })
       publishIterativeAttempt(runDir)
       const inputFile = join(runDir, 'delivery-input.json')
       writeFileSync(inputFile, JSON.stringify({ branch: project.git?.baseBranch || project.git?.branchPrefix || 'libs' }), 'utf8')
@@ -8728,6 +8728,9 @@ function setupIpc(): void {
         },
         launch: async context => {
           if (context.provider && context.provider !== provider) throw new Error('DELIVERY_PROVIDER_CHANGED: resume with the original agent provider')
+          updateAttempt(runDir, { phase: context.phase === 'security' ? 'audit-residual-repair' : 'semantic-commits' })
+          publishIterativeAttempt(runDir)
+          const watchdog = createDeliveryAgentWatchdog()
           const promptFile = join(runDir, `delivery-${context.phase}-prompt.md`)
           writeFileSync(promptFile, context.prompt, 'utf8')
           let transport: Awaited<ReturnType<typeof startStandaloneOpenCodeServer>>
@@ -8738,11 +8741,13 @@ function setupIpc(): void {
               : provider === 'claude'
                 ? context.sessionId ? buildClaudeResumeArgs(context.sessionId, model, promptFile) : buildClaudeAgentArgs(model)
                 : context.sessionId ? buildCodexResumeArgs(context.sessionId, model, promptFile) : buildCodexAgentArgs(context.cwd, model)
-            const result = await spawnIterativeStreamed(runDir, provider, args, context.cwd, 45 * 60_000, iterativeStreamIo(runDir),
+            const result = await spawnIterativeStreamed(runDir, provider, args, context.cwd, watchdog.timeoutMs, iterativeStreamIo(runDir),
               provider === 'opencode' ? { ...iterativeStreamPlatform, commandEnvironment: env => commandEnvironment(openCodeDatabaseEnv(env, transport?.databasePath || '')) } : iterativeStreamPlatform,
               undefined, { stdin: provider === 'opencode' ? undefined : context.prompt,
-                onSpawn: context.onSpawn, onLine: line => { const id = extractAgentSessionId(line, provider); if (id) context.onSession(id) } })
-            if (result.code !== 0 || result.canceled || result.timedOut) throw new Error(redactAgentDiagnostics(result.stderr.trim() || 'DELIVERY_AGENT_FAILED'))
+                onSpawn: context.onSpawn, onDeadline: watchdog.onDeadline,
+                onLine: line => { watchdog.observe(line); const id = extractAgentSessionId(line, provider); if (id) context.onSession(id) } })
+            const failure = watchdog.failure(result)
+            if (failure) throw new Error(failure)
           } finally { await transport?.stop() }
         },
       })

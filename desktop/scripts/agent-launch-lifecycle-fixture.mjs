@@ -323,7 +323,7 @@ for (const activity of ['running','completed']) {
 // Final production handler uses the configured branch, persists the real
 // child session, hands off to post-commit verification and closes the journal.
 // Only the Python delivery endpoint is scripted; no migrated project is touched.
-{
+for (const failureKind of ['none', 'exit', 'provider']) {
   const f = fixture(); const stream = f.bindings.spawnIterativeStreamed;
   f.bindings.findProject().git = { baseBranch: 'codex/semantic-fixture' };
   writeFileSync(join(f.runDir, 'run.json'), JSON.stringify({ phase: 'TERMINAL', activeCheckpointId: 'C4' }));
@@ -342,14 +342,30 @@ for (const activity of ['running','completed']) {
     return stream(dir, cmd, args, ...rest);
   };
   f.setChild(`console.log(JSON.stringify({type:'text',sessionID:'ses-semantic',part:{text:'semantic commits prepared'}}));`);
+  if (failureKind !== 'none') {
+    f.setChild(`console.log(JSON.stringify({type:'text',sessionID:'ses-semantic',part:{text:'work started'}}));` + (failureKind === 'exit'
+      ? `console.error('provider connection closed');process.exitCode=2;`
+      : `console.log(JSON.stringify({type:'error',error:{message:'429 rate limited'}}));`))
+    const failed = await f.run({ projectName: 'fixture' })
+    assert.equal(failed.ok, false)
+    assert.match(failed.error, failureKind === 'exit' ? /exit=2/ : /rate-limited/)
+    const interrupted = JSON.parse(readFileSync(join(f.runDir,'delivery-agent.json'),'utf8'))
+    assert.equal(interrupted.sessionId, 'ses-semantic'); assert.equal(interrupted.childPid, undefined)
+    assert.equal(interrupted.status, 'running'); assert.equal(steps.includes('delivery-verify'), false)
+    assert.equal(attempts.readAttempt(f.runDir).phase, 'semantic-commits')
+    steps.length = 0
+    f.setChild(`console.log(JSON.stringify({type:'text',sessionID:'ses-semantic',part:{text:'resumed work completed'}}));`)
+  }
   const result = await f.run({ projectName: 'fixture' });
   assert.equal(result.ok, true, JSON.stringify(result));
   assert.equal(result.phase, 'TERMINAL');
-  assert.deepEqual(steps, ['security-prepare', 'delivery-prepare', 'delivery-verify']);
+  assert.deepEqual(steps, failureKind === 'none' ? ['security-prepare', 'delivery-prepare', 'delivery-verify'] : ['delivery-prepare', 'delivery-verify']);
+  if (failureKind !== 'none') assert.ok(f.launches.at(-1).args.includes('ses-semantic'));
   const lease = JSON.parse(readFileSync(join(f.runDir, 'delivery-agent.json'), 'utf8'));
   assert.equal(lease.sessionId, 'ses-semantic'); assert.equal(lease.status, 'finished');
   assert.equal(attempts.readAttempt(f.runDir).lastStep, 'delivery');
   assert.equal(attempts.readAttempt(f.runDir).status, 'done');
+  assert.equal(attempts.readAttempt(f.runDir).phase, 'semantic-commits');
   assert.equal(f.bindings.iterativeStepInFlight.size, 0);
   assert.ok(readFileSync(join(f.runDir, 'delivery-delivery-prompt.md'), 'utf8').includes('codex/semantic-fixture'));
 }

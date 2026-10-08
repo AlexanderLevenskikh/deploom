@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { auditLevel, readAuditView, runDeliveryWorkflow, workflowPrompt } from '../dist-electron/iterative-delivery.js'
+import { auditLevel, readAuditView, runDeliveryWorkflow, workflowPrompt, createDeliveryAgentWatchdog } from '../dist-electron/iterative-delivery.js'
 import { decideNextStep } from '../dist-electron/iterative-runner.js'
 import { createIterativeAutopilot } from '../dist-electron/iterative-autopilot.js'
 
@@ -10,6 +10,23 @@ const root = mkdtempSync(join(tmpdir(), 'deploom-delivery-contract-'))
 const write = (name, value) => writeFileSync(join(root, name), JSON.stringify(value))
 const audit = { status: 'FAIL', auditComplete: true, generatedAt: new Date().toISOString(), packageTotals: { critical: 1, high: 7 }, lagOkPct: 92.7 }
 try {
+  let tick = 0
+  const guard = createDeliveryAgentWatchdog(() => tick, 45, 180)
+  tick = 40; guard.observe(JSON.stringify({type:'tool_use',part:{type:'tool',state:{status:'completed'}}}))
+  tick = 45; assert.equal(guard.onDeadline(), 40, 'active work survives the previous absolute deadline')
+  tick = 85; assert.equal(guard.onDeadline(), 0, 'inactivity must still stop')
+  tick = 170; guard.observe(JSON.stringify({type:'text',part:{text:'working'}}))
+  assert.equal(guard.onDeadline(), 10, 'activity cannot evade the total ceiling')
+  tick = 180; assert.match(guard.failure({code:1,stdout:'',stderr:'',timedOut:true}), /TIME_BUDGET/)
+  tick = 0
+  const idle = createDeliveryAgentWatchdog(() => tick, 45, 180)
+  tick = 44; idle.observe(JSON.stringify({type:'heartbeat'}))
+  tick = 45; assert.equal(idle.onDeadline(), 0, 'heartbeats are not substantive work')
+  assert.match(idle.failure({code:1,stdout:'',stderr:'',timedOut:true}), /IDLE_TIMEOUT/)
+  assert.match(idle.failure({code:1,stdout:'',stderr:'',timedOut:false,canceled:true}), /CANCELED/)
+  assert.match(idle.failure({code:0,stdout:JSON.stringify({type:'error',error:{message:'rate limited'}}),stderr:'',timedOut:false}), /rate-limited/)
+  idle.observe(JSON.stringify({type:'step_finish',sessionID:'s',part:{type:'step-finish',reason:'stop',messageID:'m',sessionID:'s'}}))
+  assert.equal(idle.failure({code:0,stdout:'',stderr:'',timedOut:false}), undefined)
   write('current-audit.json', audit)
   assert.equal(auditLevel(readAuditView(root)).status, 'red')
   write('current-audit-pending.json', { error: 'registry unavailable' })
@@ -70,6 +87,14 @@ try {
   await runDeliveryWorkflow(root, { ...deps, launch: async context => { resumed = context.sessionId } })
   assert.equal(resumed, 'saved-session')
   assert.ok(workflowPrompt('security', { ...deliveryState, baseCheckpointId: 'C4' }, { packagePolicies: { frozen: 'keep-current' } }, root).includes('shell-quote'))
+
+  write('delivery-agent.json', { identity:'delivery:fixture:C4:0', status:'running', sessionId:'saved-session', provider:'codex' })
+  const interrupted = await runDeliveryWorkflow(root, { ...deps, launch: async context => { context.onSession('same-paid-session'); context.onSpawn(9); throw new Error('DELIVERY_AGENT_IDLE_TIMEOUT') } })
+  assert.equal(interrupted.ok, false)
+  const retained = JSON.parse(readFileSync(join(root,'delivery-agent.json'),'utf8'))
+  assert.equal(retained.sessionId, 'same-paid-session'); assert.equal(retained.childPid, undefined)
+  assert.equal(retained.status, 'running'); assert.equal(retained.resumeError, 'DELIVERY_AGENT_IDLE_TIMEOUT')
+  await runDeliveryWorkflow(root, { ...deps, launch: async context => { assert.equal(context.sessionId, 'same-paid-session') } })
 
   const calls = []
   const pilot = createIterativeAutopilot(() => 'fixture')
