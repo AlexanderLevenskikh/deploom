@@ -424,6 +424,13 @@ export type IterativeAttemptView = {
   waitFailureKind?: string
 }
 export type IterativeStatusOutcome = {
+  audit?: import('../electron/iterative-audit-view').AuditView
+  initialAudit?: import('../electron/iterative-audit-view').AuditView
+  residualRepair?: { status?: string; attempt?: number; reason?: string }
+  delivery?: import('../electron/iterative-audit-view').DeliveryView
+  runDirectory?: string
+  artifactsDirectory?: string
+  iterationDirectory?: string
   progressSummary?: { checkpointId: string; remaining: number; denominator: number; accepted: number; deferred: number; targetCount: number; unresolvedGoals: number }
   autopilotActive?: boolean
   autopilotEnabled?: boolean

@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import * as delivery from '../dist-electron/iterative-delivery.js';
 import * as agents from '../dist-electron/iterative-agent.js';
 import * as attempts from '../dist-electron/iterative-attempt.js';
 import * as commands from '../dist-electron/agent-command.js';
@@ -49,7 +50,7 @@ function fixture() {
   let beforeChild;
   let serverError;
   const bindings = {
-    ...agents, ...attempts, ...commands, ...errors, iterativeAutopilot,
+    ...agents, ...attempts, ...commands, ...errors, ...delivery, readDeliveryJson: delivery.readJson, iterativeAutopilot,
     existsSync, join, readFileSync, writeFileSync, extractAgentSessionId,
     loadState: () => ({}), findWorkspace: () => workspace, autopilotWorkspace: () => workspace, findProject: () => project,
     iterativeTaskRunDir: () => runDir, iterativeStepInFlight: new Set(), stepLockKey: () => 'fixture',
@@ -319,4 +320,37 @@ for (const activity of ['running','completed']) {
   assert.equal(f.lease().waiting,true);assert.equal(f.launches.length,1);
   assert.equal(existsSync(join(f.runDir,'trial','agent-feedback.json')),false);
 }
-console.log('agent-launch-lifecycle: production handler + real child wait/resume/cancel/autopilot/recovered error/active timeout OK');
+// Final production handler uses the configured branch, persists the real
+// child session, hands off to post-commit verification and closes the journal.
+// Only the Python delivery endpoint is scripted; no migrated project is touched.
+{
+  const f = fixture(); const stream = f.bindings.spawnIterativeStreamed;
+  f.bindings.findProject().git = { baseBranch: 'codex/semantic-fixture' };
+  writeFileSync(join(f.runDir, 'run.json'), JSON.stringify({ phase: 'TERMINAL', activeCheckpointId: 'C4' }));
+  writeFileSync(join(f.runDir, 'run-config.json'), JSON.stringify({ projectName: 'fixture', verifyConfig: { commands: ['node check.cjs'] } }));
+  const steps = [];
+  f.bindings.spawnIterativeStreamed = async (dir, cmd, args, ...rest) => {
+    if (args.some(arg => String(arg).endsWith('iterative_delivery.py'))) {
+      const step = args.at(-1); steps.push(step);
+      const branch = JSON.parse(readFileSync(join(f.runDir, 'delivery-input.json'), 'utf8')).branch;
+      assert.equal(branch, 'codex/semantic-fixture');
+      const value = step === 'security-prepare' ? { status: 'not-needed' } : { status: step === 'delivery-verify' ? 'done' : 'ready', runId: 'fixture', checkpointId: 'C4', branch, workspaceRoot: f.projectPath, sourceHead: 'fixture-base' };
+      if (step === 'delivery-prepare') writeFileSync(join(f.runDir, 'delivery-state.json'), JSON.stringify(value));
+      if (step === 'delivery-verify') assert.equal(JSON.parse(readFileSync(join(f.runDir, 'delivery-agent.json'), 'utf8')).status, 'finished');
+      return { code: 0, stdout: 'ITERATIVE_DELIVERY_V1 ' + JSON.stringify(value), stderr: '' };
+    }
+    return stream(dir, cmd, args, ...rest);
+  };
+  f.setChild(`console.log(JSON.stringify({type:'text',sessionID:'ses-semantic',part:{text:'semantic commits prepared'}}));`);
+  const result = await f.run({ projectName: 'fixture' });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.phase, 'TERMINAL');
+  assert.deepEqual(steps, ['security-prepare', 'delivery-prepare', 'delivery-verify']);
+  const lease = JSON.parse(readFileSync(join(f.runDir, 'delivery-agent.json'), 'utf8'));
+  assert.equal(lease.sessionId, 'ses-semantic'); assert.equal(lease.status, 'finished');
+  assert.equal(attempts.readAttempt(f.runDir).lastStep, 'delivery');
+  assert.equal(attempts.readAttempt(f.runDir).status, 'done');
+  assert.equal(f.bindings.iterativeStepInFlight.size, 0);
+  assert.ok(readFileSync(join(f.runDir, 'delivery-delivery-prompt.md'), 'utf8').includes('codex/semantic-fixture'));
+}
+console.log('agent-launch-lifecycle: production handler + real child wait/resume/cancel/autopilot/recovered error/active timeout/final delivery OK');

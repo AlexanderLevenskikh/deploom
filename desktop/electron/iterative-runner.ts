@@ -331,7 +331,9 @@ export function decideNextStep(
             break
         }
       }
-      const satisfied = planSatisfied(readTargets(runDir), assignment)
+      if (checkpoint.audit?.status === 'UNKNOWN' && checkpoint.audit?.generatedAt) return { step: 'finish', phase, reason: 'audit evidence is unavailable; finalize with an unconfirmed result', satisfied: false }
+      if (checkpoint.checkpointId === 'C0' && !checkpoint.audit?.generatedAt && !['PASS', 'FAIL'].includes(String(checkpoint.audit?.status ?? ''))) return { step: 'audit', phase, reason: 'initial independent audit before selecting update cohorts' }
+      const satisfied = payload.goalSatisfied === true || planSatisfied(readTargets(runDir), assignment)
       if (satisfied) {
         // R8: a satisfied policy is finalized only AFTER the independent audit
         // of the exact accepted checkpoint (PASS/FAIL recorded in

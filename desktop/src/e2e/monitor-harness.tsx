@@ -12,6 +12,14 @@ import type { IterativeAttemptView, IterativeStatusOutcome, WorkspaceDetails } f
 import '../index.css'
 import '../App.css'
 
+const qaAudit = new URLSearchParams(location.search).get('audit')
+const initialAudit = { status: 'FAIL', auditComplete: true, generatedAt: new Date(Date.now() - 600_000).toISOString(), lagOkPct: 68, lagOk: 68, lagTotal: 100, lagUnknown: 0, packageTotals: { critical: 1, high: 7 }, policy: { targetLevel: 'yellow', maxKnownHigh: 1, minLagOkPct: 80 }, evidenceRef: 'C:/demo/run/audit/initial', vulnerablePackages: [{ package: 'shell-quote', severity: 'critical' }] }
+const qaFields: Partial<IterativeStatusOutcome> = qaAudit ? {
+  audit: qaAudit === 'final' ? { ...initialAudit, status: 'PASS', checkpointId: 'C4', generatedAt: new Date().toISOString(), packageTotals: { critical: 0, high: 1 }, lagOkPct: 92.7, lagOk: 89, lagTotal: 96, vulnerablePackages: [], requiredTargets: [{ package: '@example/icons', current: '5.0.0', target: '5.0.0', met: true }], keptPackages: ['frozen-lib'] } : qaAudit === 'unknown' ? { ...initialAudit, status: 'UNKNOWN', stale: true, auditComplete: false, checkpointId: 'C4' } : initialAudit,
+  initialAudit, runDirectory: 'C:/demo/run', artifactsDirectory: 'C:/demo/run/reports', iterationDirectory: 'C:/demo/run/trial/workspace',
+  ...(qaAudit === 'final' ? { present: true, phase: 'TERMINAL', inFlight: false, decision: { step: 'finish', phase: 'TERMINAL', reason: 'COMPLETE', satisfied: true }, workingCheckout: { path: 'C:/demo/run/sources/C4/tree', kind: 'checkpoint', checkpointId: 'C4' }, delivery: { status: 'done', branch: 'codex/upgrade', workspaceRoot: 'C:/demo/run/delivery/workspace', commits: ['a1b2c3d chore(deps): update linked cohort', 'c3d4e5f refactor(icons): adapt component API'] } } : {}),
+} : {}
+const openQaPath = async (path?: string) => { document.documentElement.dataset.openedPath = path ?? '' }
 const project = { name: 'Demo.UI', path: 'C:/demo/front' }
 const details: WorkspaceDetails = {
   workspace: { id: 'qa', name: 'Demo workspace', path: 'C:/demo', templateRemote: '', toolRemote: '', settingsPath: '.dependency-roadmap/settings.json', agent: 'codex' },
@@ -35,14 +43,14 @@ function Harness() {
   const canceled = useRef(false)
   const coordinator = useRef(createIterativeAutopilot(s => s.projectName))
   const { setLanguage } = useLanguage()
-  const [attempt, setAttempt] = useState<IterativeAttemptView>({ attemptId: 'current-1', projectName: project.name, workspaceId: 'qa', status: 'running', stage: 'begin', phase: 'source-materialization: source capture sealed-manifest: files=25362, bytes=4589080824', startedAt: Date.now() - 400_000, lastHeartbeatAt: Date.now(), targetSource: 'discovery', packageProgress: { processed: 12, total: 30 }, stepsDone: [], runCreated: false })
+  const [attempt, setAttempt] = useState<IterativeAttemptView>({ attemptId: 'current-1', projectName: project.name, workspaceId: 'qa', status: qaAudit === 'final' ? 'done' : 'running', stage: qaAudit === 'final' ? 'drive' : 'begin', phase: 'source-materialization: source capture sealed-manifest: files=25362, bytes=4589080824', startedAt: Date.now() - 400_000, lastHeartbeatAt: Date.now(), targetSource: 'discovery', packageProgress: { processed: 12, total: 30 }, stepsDone: [], runCreated: false })
   const current = useRef(attempt)
   current.current = attempt
   const log = useRef('CURRENT_RUN_ONLY: source preparation started\n')
   const reads = useRef(0)
   const scope = useRef<IterativeStatusOutcome['validationScope']>(undefined)
   const api = useRef({
-    status: coordinator.current.register('status', async (): Promise<IterativeStatusOutcome> => ({ ok: true, present: present.current, phase: current.current.stage === 'drive' && current.current.status === 'done' ? 'TERMINAL' : present.current ? 'READY' : undefined, decision: current.current.stage === 'drive' && current.current.status === 'done' ? { step: 'finish', phase: 'TERMINAL', reason: 'COMPLETE', satisfied: true } : undefined, checked: { ok: checked.current }, progressSummary: present.current ? {checkpointId:'C2',remaining:86,denominator:88,accepted:2,deferred:0,targetCount:52,unresolvedGoals:36} : undefined, stale: false, inFlight: current.current.status === 'running', attempt: current.current, validationScope: scope.current, validationProfile: { commands: ['npm run typecheck', 'npm run build', 'npm run test'], suggestedUnitCommand: 'npm run test -- --run src', deferredChecks: 'Playwright: requires a separate server' } })),
+    status: coordinator.current.register('status', async (): Promise<IterativeStatusOutcome> => ({ ok: true, present: present.current, phase: current.current.stage === 'drive' && current.current.status === 'done' ? 'TERMINAL' : present.current ? 'READY' : undefined, decision: current.current.stage === 'drive' && current.current.status === 'done' ? { step: 'finish', phase: 'TERMINAL', reason: 'COMPLETE', satisfied: true } : undefined, checked: { ok: checked.current }, progressSummary: present.current ? {checkpointId:'C2',remaining:86,denominator:88,accepted:2,deferred:0,targetCount:52,unresolvedGoals:36} : undefined, stale: false, inFlight: current.current.status === 'running', attempt: current.current, validationScope: scope.current, validationProfile: { commands: ['npm run typecheck', 'npm run build', 'npm run test'], suggestedUnitCommand: 'npm run test -- --run src', deferredChecks: 'Playwright: requires a separate server' }, ...qaFields })),
     attempt: async () => { reads.current++; return { ok: true, present: true, attempt: current.current, attemptLog: log.current, runLog: `CUMULATIVE_FIRST_MESSAGE\n${log.current}` } },
     cancel: coordinator.current.register('cancel', async () => { canceled.current = true; setAttempt(value => ({ ...value, status: 'canceled', finishedAt: Date.now() })); return { ok: true } }),
     begin: coordinator.current.register('begin', async (_event, input: { projectName: string; workspaceId?: string; autopilot?: boolean; checkOnly?: boolean }) => {
@@ -98,7 +106,7 @@ function Harness() {
       onMarkDraftLaunched={() => {}} onResetDraftLaunch={() => {}} onAcknowledgeDraftRun={() => {}}
       onClearBaselineDecision={() => {}} onGetBaselineIntentPlan={getIntent} onGetCurrentDraftResult={async () => undefined}
       onRun={async () => undefined} onSendAgentNote={async () => false} onStartAutopilot={noop} onStopAutopilot={noop} onRecoverWithAgent={noop}
-      onOpenDashboard={() => {}} onOpenPath={noop} onChoosePrompt={noop} onUpdateWorkspace={async patch => { if (patch.agent) setQaProvider(patch.agent) }} onUpdateProjectBranches={noop} onUpdateProjectNode={noop}
+      onOpenDashboard={() => {}} onOpenPath={openQaPath} onChoosePrompt={noop} onUpdateWorkspace={async patch => { if (patch.agent) setQaProvider(patch.agent) }} onUpdateProjectBranches={noop} onUpdateProjectNode={noop}
       onListNodeVersions={models} onListAgentModels={models} onGetIterativeTask={getTask} onExportIterativeTask={outcome} onExportLegacyIterativeTask={outcome} onCopyIterativeTask={outcome} onSaveIterativeTask={outcome}
       onIterativeStatus={name => api.current.status(null, { projectName: name })} onIterativeAttempt={api.current.attempt} onIterativeCancel={name => api.current.cancel(null, { projectName: name })}
       onIterativeBegin={(name, input) => api.current.begin(null, { projectName: name, ...input })} onIterativeDrive={(name, autopilot) => api.current.drive(null, { projectName: name, autopilot })} onIterativeAgent={async () => ({ ok: false })}

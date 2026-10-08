@@ -45,6 +45,11 @@ def archive_for_restart(run_dir, lock_filename, write_json):
     # An agent session must be resumed/closed, never abandoned by moving its trial.
     if (run_dir / 'trial' / 'agent-lease.json').exists():
         raise RestartArchiveError('RESTART_AGENT_PENDING: продолжите и завершите сессию агента перед новым запуском')
+    delivery_lease = run_dir / 'delivery-agent.json'
+    if delivery_lease.exists():
+        lease = json.loads(delivery_lease.read_text(encoding='utf-8-sig'))
+        if lease.get('status') == 'running':
+            raise RestartArchiveError('RESTART_AGENT_PENDING: возобновите и завершите подготовку результата перед новым запуском')
     history = _history(run_dir)
     entries = [entry.name for entry in sorted(run_dir.iterdir())
                if entry.name not in {lock_filename, HISTORY, 'repair-archive', TRANSACTION}]

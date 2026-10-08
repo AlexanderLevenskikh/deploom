@@ -134,6 +134,10 @@ def _targets_satisfied(config: Mapping[str, Any], active: Mapping[str, Any]) -> 
     unmet += len(intents) + len(unknowns)
     denominator = len(targets) + len(intents) + len(unknowns)
     satisfied = denominator > 0 and unmet == 0
+    if config.get("goalMode") == "audit-policy":
+        required = {n for n, policy in (config.get("packagePolicies") or {}).items() if policy == "required"}
+        satisfied = ((active.get("audit") or {}).get("status") == "PASS" and
+                     all(n in targets and assignment.get(n) == targets[n] for n in required))
     return satisfied, denominator, unmet
 
 
@@ -496,10 +500,14 @@ def _build_ru(
         lines.append("")
     lines.append("## Остаток миграции")
     lines.append("")
-    lines.append(
-        f"- Политика выполнена частично: осталось целей **{remaining}** из **{denominator}**. "
-        "Задание не сообщает о полном завершении, пока остаток не равен нулю."
-    )
+    if config.get("goalMode") == "audit-policy":
+        lines.append(f"- До предложенных версий: **{remaining}** из **{denominator}**. Это предложения, а не дополнительные цели политики.")
+        lines.append(f"- Выбранные цели аудита и обязательные версии: **{'выполнены' if satisfied else 'не выполнены'}**. Keep-current сохраняется; неизвестное доказательство не считается успехом.")
+    else:
+        lines.append(
+            f"- Политика выполнена частично: осталось целей **{remaining}** из **{denominator}**. "
+            "Задание не сообщает о полном завершении, пока остаток не равен нулю."
+        )
     if str(verification.get("status") or "") == "legacy-exported-not-reverified":
         deferred_names = {str(entry.get("package")) for entry in deferred}
         goals = [
@@ -667,10 +675,14 @@ def _build_en(
         lines.append("")
     lines.append("## Migration remainder")
     lines.append("")
-    lines.append(
-        f"- Policy is partially met: **{remaining}** of **{denominator}** goals remain. "
-        "Nothing in this task may claim full completion while the remainder is non-zero."
-    )
+    if config.get("goalMode") == "audit-policy":
+        lines.append(f"- Below proposed versions: **{remaining}** of **{denominator}**. Proposals are not extra policy goals.")
+        lines.append(f"- Selected audit goals and required exact versions: **{'met' if satisfied else 'not met'}**. Preserve keep-current packages; unknown evidence cannot establish success.")
+    else:
+        lines.append(
+            f"- Policy is partially met: **{remaining}** of **{denominator}** goals remain. "
+            "Nothing in this task may claim full completion while the remainder is non-zero."
+        )
     if str(verification.get("status") or "") == "legacy-exported-not-reverified":
         deferred_names = {str(entry.get("package")) for entry in deferred}
         goals = [

@@ -10,6 +10,7 @@ import { BaselineIntentDialog } from './BaselineIntentDialog'
 import { LogPanel } from './LogPanel'
 import { PromptPreviewDialog } from './PromptPreviewDialog'
 import { IterativeTaskPanel } from './IterativeTaskPanel'
+import { AuditGoalSummary } from './AuditGoalSummary'
 import { IterativeRunDiagnostics } from './IterativeRunDiagnostics'
 import { normalizeBaselineIntentPlan } from '../data/baselineIntent'
 import type { ScenarioSignal } from '../../electron/iterative-scenario'
@@ -80,6 +81,8 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   const [, setSelectedStageIndex] = useState<number | null>(null)
   const [baselineIntentDialog, setBaselineIntentDialog] = useState<{ mode: 'prepare' | 'decision'; resume: 'auto' | 'continue' | 'restart'; plan: BaselineIntentPlan; decision?: BaselineDecision }>()
   const [draftPromptPreview, setDraftPromptPreview] = useState<ProjectPromptPreview>()
+  const [iterativeView, setIterativeView] = useState<IterativeStatusOutcome>()
+  useEffect(() => setIterativeView(undefined), [details.workspace.id, project.name])
   // Draft completion is resolved by runId from workspace state, not by watching
   // file mtime/size. The launch marker lives in the flow hook (it survives
   // FlowWorkspace remounts across tabs), and the ack map keys by workspace AND
@@ -459,7 +462,8 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
           <div className="human-flow-utility">
             <button className="button secondary" disabled={active || scenarioSignal.running} onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button>
             {draftResult ? <button className="button secondary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Последний Draft', 'Last Draft')}</button> : null}
-            <button className="button secondary" disabled={!run && !activeAction && !scenarioSignal?.attempt} onClick={() => void onOpenPath(artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
+            <button className="button secondary" disabled={!iterativeView?.artifactsDirectory && !run && !activeAction && !scenarioSignal?.attempt} onClick={() => void onOpenPath(iterativeView?.artifactsDirectory || artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
+            {iterativeView?.iterationDirectory ? <button className="button secondary" onClick={() => void onOpenPath(iterativeView.iterationDirectory)}><FileText size={16} />{text('Рабочая директория итерации', 'Iteration working directory')}</button> : null}
             {flowComplete && acceptanceAccepted ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} />{text('Продолжить улучшение', 'Continue improving')}</button> : null}
           </div>
         ) : (
@@ -585,6 +589,8 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         )}
       </section>
 
+      <AuditGoalSummary audit={iterativeView?.audit} initial={iterativeView?.initialAudit} onOpenPath={onOpenPath} />
+
       <section className="roadmap-card migration-launch-settings"><header className="roadmap-card-header"><div><strong>{text('Настройки запуска', 'Run settings')}</strong><span>{text('Агент и модель используются для исправлений. Выберите их до запуска; работа агента может расходовать токены.', 'Agent and model are used for repairs. Choose them before starting; agent work may consume tokens.')}</span></div></header>
       <fieldset className="project-facts" disabled={active || scenarioSignal?.running}>
         <div><span>{t('flow.projectPath')}</span><strong title={project.path}>{project.path}</strong></div>
@@ -622,6 +628,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         // P1#1: the panel mirrors the one main action to the hero and must not
         // allow a start while a legacy activeAction owns the checkout.
         onScenario={scenarioOnScenario}
+        onStatusView={setIterativeView}
         disabledExternal={active}
       />
 

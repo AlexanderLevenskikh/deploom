@@ -1070,6 +1070,18 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
             if isinstance(name, str) and isinstance(version, str) and name.strip() and version.strip():
                 targets[name] = version
 
+    intent_path = getattr(args, "intent_file", "")
+    intent = json.loads(Path(intent_path).read_text(encoding="utf-8-sig")) if intent_path else {}
+    if not isinstance(intent, dict):
+        raise InvalidInputError("INTENT_FILE_INVALID")
+    selected_policy = intent.get("acceptancePolicy") or {}
+    if not isinstance(selected_policy, dict):
+        raise InvalidInputError("ACCEPTANCE_POLICY_INVALID")
+    package_policies = intent.get("policies") or {}
+    if not isinstance(package_policies, dict) or any(v not in {"auto", "keep-current", "required"} for v in package_policies.values()):
+        raise InvalidInputError("PACKAGE_POLICIES_INVALID")
+    targets = {n: v for n, v in targets.items() if package_policies.get(n) != "keep-current"}
+
     # D3: an explicitly requested project/CI Node runtime is resolved to ONE
     # concrete installed executable+exact-version at begin. Empty means "not
     # set by the user" — no CI-compatibility claim, no automatic latest; a set
@@ -1143,7 +1155,8 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
 
         targets, target_discovery = _discover_targets(
             project_dir,
-            direct_dependency_assignment(project_dir),
+            {n: v for n, v in direct_dependency_assignment(project_dir).items()
+             if package_policies.get(n) != "keep-current"},
             discovery_env,
             runtime.get("effectiveVersion"),
             parallelism=discovery_parallelism,
@@ -1168,6 +1181,9 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
                 "commands": commands,
                 "manifestHash": manifest_hash,
                 "lockHash": lock_hash,
+                "intent": intent,
+                "auditPolicy": {key: getattr(args, key, None) for key in
+                                ("lag_months", "min_lag_ok_pct", "max_known_high", "max_known_moderate", "max_known_low")},
             }
         )
     )
@@ -1194,20 +1210,34 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
     if dashboard_state_path is not None and not dashboard_state_path.exists():
         raise InvalidInputError(f"DASHBOARD_STATE_MISSING: {dashboard_state_path}")
 
+    if dashboard_state_path is not None:
+        dashboard_bytes = json.loads(dashboard_state_path.read_text(encoding="utf-8-sig"))
+        lag_overrides = {"packageOverrides": {project_name: ((dashboard_bytes.get("packageOverrides") or {}).get(project_name) or {})}}
+        dashboard_state_path = run_dir / "audit-policy-state.json"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _write_json_atomic(dashboard_state_path, lag_overrides)
+        policy_hash = _sha256_text(_stable_json({"policyHash": policy_hash, "lagOverrides": lag_overrides}))
+
     audit_policy = {
         "lagMonths": _clamp_int(
-            args.lag_months if args.lag_months is not None else 12,
+            args.lag_months if args.lag_months is not None else selected_policy.get("lagPolicyMonths", intent.get("lagPolicyMonths", 12)),
             12, 1, 60,
         ),
         "minLagOkPct": _clamp_int(
-            args.min_lag_ok_pct if args.min_lag_ok_pct is not None else 80,
+            args.min_lag_ok_pct if args.min_lag_ok_pct is not None else selected_policy.get("minLagOkPct", intent.get("minLagOkPct", 80)),
             80, 0, 100,
         ),
         "maxKnownHigh": _clamp_int(
-            args.max_known_high if args.max_known_high is not None else 1,
+            args.max_known_high if args.max_known_high is not None else selected_policy.get("maxKnownHigh", 1),
             1, 0, 100,
         ),
     }
+    for arg, field in (("max_known_moderate", "maxKnownModerate"), ("max_known_low", "maxKnownLow")):
+        value = getattr(args, arg, None)
+        if value is None:
+            value = selected_policy.get(field)
+        if value is not None:
+            audit_policy[field] = _clamp_int(value, 0, 0, 99)
     return {
         "schemaVersion": SCHEMA_VERSION,
         "projectDir": str(project_dir),
@@ -1230,6 +1260,9 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
         "requestedNode": requested_node,
         "runtime": runtime,
         "targetDiscovery": target_discovery,
+        "packagePolicies": package_policies,
+        "goalMode": "audit-policy" if intent_path else "exact-targets",
+        "intent": intent,
         "createdAt": _now_iso(),
         "toolBuildId": args.tool_build_id or "",
     }
@@ -2288,6 +2321,9 @@ def _plan_next_locked(
         incumbent, desired, planning_ledger, checkpoint_id, _all_checkpoints(run_dir),
         unavailable={(e.get("package"), e.get("target")) for e in planning_ledger.get("targetAvailabilityDeferrals", [])
                      if e.get("scope") == availability_scope_flat(run, config)})
+    # Scope expansions cannot override an explicit keep-current instruction.
+    desired = {name: incumbent.get(name) if (config.get("packagePolicies") or {}).get(name) == "keep-current" else version
+               for name, version in desired.items()}
     planning_targets = dict(desired)
     actionable = [name for name, version in sorted(desired.items()) if version != incumbent.get(name)]
     if expansion_issues:
@@ -4535,6 +4571,9 @@ def _accept_checkpoint(
     base_checkpoint: Mapping[str, Any],
     result: BaselineVerifyResult,
 ) -> int:
+    for name, policy in (config.get("packagePolicies") or {}).items():
+        if policy == "keep-current" and (candidate.get("fullAssignment") or {}).get(name) != (base_checkpoint.get("fullAssignment") or {}).get(name):
+            raise InvalidInputError(f"KEEP_CURRENT_CHANGED: {name}")
     candidate_id = str(candidate["candidateId"])
     base_id = str(base_checkpoint["checkpointId"])
     seq = int(base_checkpoint.get("seq", 0)) + 1
@@ -4930,6 +4969,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "run": run,
         "activeCheckpoint": checkpoint,
         "progressSummary": progress_summary,
+        "goalSatisfied": _policy_satisfied(config, checkpoint),
         "terminalRepairResumable": terminal_repair_resumable(run_dir, run, checkpoint, candidate, ledger, config),
         "candidate": candidate,
         "ledgerSummary": {
@@ -4967,9 +5007,13 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def _policy_satisfied(config: Mapping[str, Any], checkpoint: Mapping[str, Any]) -> bool:
     targets = {str(k): str(v) for k, v in (config.get("targets") or {}).items()}
-    if not targets:
+    if not targets and config.get("goalMode") != "audit-policy":
         return False
     incumbent = checkpoint.get("fullAssignment") or {}
+    if config.get("goalMode") == "audit-policy":
+        required = {n for n, policy in (config.get("packagePolicies") or {}).items() if policy == "required"}
+        return ((checkpoint.get("audit") or {}).get("status") == "PASS" and
+                all(n in targets and str(incumbent.get(n)) == str(targets[n]) for n in required))
     return all(
         name in incumbent and str(targets[name]) == str(incumbent[name])
         for name in targets
@@ -5477,6 +5521,8 @@ def _audit_once_locked(
         max_known_high=int((args.max_known_high if args.max_known_high is not None
                             else audit_policy.get("maxKnownHigh", 1))),
         yarn_audit_engine=audit_engine_for_retry(args.yarn_audit_engine, checkpoint.get("audit") or {}),
+        max_known_moderate=audit_policy.get("maxKnownModerate"),
+        max_known_low=audit_policy.get("maxKnownLow"),
         runtime_env=_runtime_env(config),
     )
     # R8: persist the FULL report as JSON/Markdown evidence (not just a status +
@@ -5515,6 +5561,11 @@ def _audit_once_locked(
         "lagUnknown": audit_metrics.get("lagUnknown"),
         "lagTotal": audit_metrics.get("lagTotal"),
         "vulnerabilityPackages": len(audit_metrics.get("packages") or {}),
+        "packageTotals": audit_metrics.get("packageTotals") or {},
+        "advisoryTotals": audit_metrics.get("advisoryTotals") or {},
+        "vulnerablePackages": [{"package": n, "severity": v.get("severity"), "direct": v.get("isDirect"),
+                                "nodes": v.get("nodes") or [], "range": v.get("range")}
+                               for n, v in (audit_metrics.get("packages") or {}).items()],
         "policy": report.get("policy") or {},
         "generatedAt": report.get("generatedAt") or "",
     }
@@ -5614,6 +5665,9 @@ def build_parser() -> argparse.ArgumentParser:
     begin = sub.add_parser("begin", help="Захват C0 (Исходный замер)")
     begin.add_argument("--project-dir", required=True)
     begin.add_argument("--project-name", default="")
+    begin.add_argument("--intent-file", default="")
+    begin.add_argument("--max-known-moderate", type=int, default=None)
+    begin.add_argument("--max-known-low", type=int, default=None)
     begin.add_argument("--workspace-id", default="")
     begin.add_argument("--project-id", default="")
     begin.add_argument("--run-id", default="")

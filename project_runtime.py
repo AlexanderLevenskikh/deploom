@@ -357,7 +357,10 @@ def node_range_satisfied(range_spec: str, exact_version: str) -> bool:
     if parsed is None:
         return False
     try:
-        return bool(NpmSpec(str(range_spec)).match(parsed))
+        # npm permits whitespace between an operator and its version (">= 18").
+        # semantic_version requires the comparator to be one token.
+        normalized = re.sub(r"([<>]=?|[~^=])\s+(?=[vV]?\d)", r"\1", str(range_spec).strip())
+        return bool(NpmSpec(normalized).match(parsed))
     except ValueError:
         return False
 

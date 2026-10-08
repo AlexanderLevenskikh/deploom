@@ -4,6 +4,7 @@ import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import { iterativeLogMessages } from '../data/iterativeLogMessages'
 import { useLanguage } from '../i18n'
 import { MigrationChecksPanel } from './MigrationChecksPanel'
+import { AuditGoalSummary } from './AuditGoalSummary'
 import { validateMigrationProfile, validationProfilesEqual, type MigrationValidationProfile } from '../../electron/migration-validation-profile'
 import { attemptActiveElapsed, canApplyAttemptRead, iterativeActivity } from '../../electron/iterative-activity'
 import { startAttemptJournalPolling } from '../../electron/iterative-journal-poll'
@@ -37,6 +38,7 @@ type Props = {
   // P1#1: an external (legacy) job is running for the same checkout — the single
   // control must not let the user start a second, conflicting scenario.
   disabledExternal?: boolean
+  onStatusView?: (status: IterativeStatusOutcome | undefined) => void
 }
 
 type PanelState =
@@ -125,7 +127,7 @@ const activityText = (attempt?: IterativeAttemptView, text?: (ru: string, en: st
   return t('Работа выполняется', 'Work is in progress')
 }
 
-export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVersion, onGet, onExport, onCopy, onSave, onStatus, onDrive, onBegin, onExportLegacy, onAgent, onAttempt, onCancel, liveAttempt, onConfigureScope, onBeforeStart, onOpenPath, onScenario, disabledExternal }: Props) {
+export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVersion, onGet, onExport, onCopy, onSave, onStatus, onDrive, onBegin, onExportLegacy, onAgent, onAttempt, onCancel, liveAttempt, onConfigureScope, onBeforeStart, onOpenPath, onScenario, disabledExternal, onStatusView }: Props) {
   const { text, language } = useLanguage()
   const [state, setState] = useState<PanelState>({ phase: 'loading' })
   const [validationDraft, setValidationDraft] = useState<MigrationValidationProfile>()
@@ -138,6 +140,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   const [showDialog, setShowDialog] = useState(false)
   const [runner, setRunner] = useState<IterativeStatusOutcome>()
   const [runnerError, setRunnerError] = useState<string>()
+  useEffect(() => { onStatusView?.(runner) }, [onStatusView, runner])
   const [stepBusy, setStepBusy] = useState(false)
   // L1: durable attempt journal — seeded from the IPC read, then merged with the
   // live event stream from main.ts so the first click is observable without a poll.
@@ -170,17 +173,34 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
 
   // L4: never swallow a status error. Keep the last good runner AND remember the
   // failure reason so the UI shows it next to the action buttons.
+  const runnerScope = useRef(`${workspaceId ?? ''}:${projectName}`)
+  runnerScope.current = `${workspaceId ?? ''}:${projectName}`
+  const runnerSeq = useRef(0)
+  useEffect(() => {
+    runnerScope.current = `${workspaceId ?? ''}:${projectName}`
+    return () => { runnerScope.current = '' }
+  }, [workspaceId, projectName])
   const refreshRunner = useCallback(async () => {
+    const scopeKey = `${workspaceId ?? ''}:${projectName}`
+    const seq = ++runnerSeq.current
     try {
       const status = await onStatus(projectName)
+      if (runnerScope.current !== scopeKey || runnerSeq.current !== seq) return undefined
       setRunner(current => status.ok ? status : current ?? status)
       setRunnerError(status.ok || !status.error ? undefined : status.error)
       return status
     } catch (error) {
+      if (runnerScope.current !== scopeKey || runnerSeq.current !== seq) return undefined
       setRunnerError(error instanceof Error ? error.message : String(error))
       return undefined
     }
-  }, [onStatus, projectName])
+  }, [onStatus, projectName, workspaceId])
+
+  useEffect(() => {
+    if (!runner?.audit?.running) return
+    const timer = window.setInterval(() => void refreshRunner(), 2_000)
+    return () => window.clearInterval(timer)
+  }, [runner?.audit?.running, refreshRunner])
 
   const load = useCallback(async () => {
     const seq = ++loadSeq.current
@@ -517,6 +537,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       if (outcome.autopilot) {
         setNote(autopilotNote(outcome.autopilot))
       } else if (outcome.ok) {
+        if (outcome.phase === 'TERMINAL') { setNote(text('Ветка с коммитами подготовлена; проверки и аудит обновлены.', 'The branch with commits is prepared; checks and audit are refreshed.')); return }
         const changed = (outcome.changedFiles ?? []).length
         setNote(
           text(
@@ -703,7 +724,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         : text('Укажите от 1 до 20 обязательных команд и корректное описание отложенных проверок.', 'Select 1–20 required commands and a valid description of deferred checks.')
     }
   }
-  const busyLocked = Boolean(validationError) || stepBusy || busy !== undefined || disabledExternal === true || state.phase === 'loading' || (runner === undefined && !runnerError)
+  const busyLocked = Boolean(validationError) || runner?.audit?.running === true || stepBusy || busy !== undefined || disabledExternal === true || state.phase === 'loading' || (runner === undefined && !runnerError)
 
   // P1#1: the panel is the SINGLE owner of the scenario main action. Mirror it
   // outward so the enclosing workspace hero renders exactly the same control
@@ -746,6 +767,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         </div>
         <button type="button" className="icon-button" aria-label={text('Обновить', 'Reload')} onClick={() => { void load(); void refreshRunner() }} disabled={busy === 'load'}><RefreshCw size={16} /></button>
       </header>
+
+      {!onStatusView ? <AuditGoalSummary audit={runner?.audit} initial={runner?.initialAudit} onOpenPath={onOpenPath} /> : null}
 
       {/* User UX: the one-card pipeline. The migration is a linear flow the user
           reads at a glance — Проверка → Подбор версий → Обновление → Результат.
@@ -843,6 +866,20 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
           </button>
         </div>
       ) : null}
+
+      {runner?.runDirectory ? <div className="human-flow-utility iterative-folder-links" data-testid="iteration-folder-links">
+        <button className="button secondary" onClick={() => void onOpenPath(runner.artifactsDirectory || runner.runDirectory)}><FileText size={16} />{text('Артефакты прогона', 'Run artifacts')}</button>
+        {runner.iterationDirectory ? <button className="button secondary" onClick={() => void onOpenPath(runner.iterationDirectory)}><ExternalLink size={16} />{text('Рабочая директория итерации', 'Iteration working directory')}</button> : null}
+      </div> : null}
+      {runner?.phase === 'TERMINAL' && runner.workingCheckout?.kind === 'checkpoint' ? <div className="resume-notice" data-testid="delivery-result">
+        {runner.residualRepair?.reason ? <p className="warning-text">{text('Оставшиеся цели требуют внимания', 'Remaining goals need attention')} · {runner.residualRepair.attempt}: {runner.residualRepair.reason}</p> : null}
+        <strong>{runner.delivery?.status === 'done' ? text(`Коммиты подготовлены · ${runner.delivery.branch}`, `Commits prepared · ${runner.delivery.branch}`) : text('Подготовить результат в Git', 'Prepare the result in Git')}</strong>
+        <span>{text('Агент разделит принятые изменения на смысловые коммиты в ветке из настроек. Связанные обновления остаются одной когортой. Затем повторим проверки и аудит.', 'An agent groups accepted changes into semantic commits on the configured branch. Related updates remain one cohort. Checks and audit run again afterwards.')}</span>
+        {runner.delivery?.branchResolution === 'configured-branch-preserved' ? <span>{text(`Ветка ${runner.delivery.requestedBranch} сохранена. Результат подготовим в ${runner.delivery.branch}.`, `Branch ${runner.delivery.requestedBranch} was preserved. The result uses ${runner.delivery.branch}.`)}</span> : null}
+        {runner.delivery?.commits?.map(commit => <code key={commit}>{commit}</code>)}
+        {runner.delivery?.workspaceRoot ? <button className="button secondary" onClick={() => void onOpenPath(runner.delivery!.workspaceRoot)}><ExternalLink size={16} />{text('Открыть ветку результата', 'Open the result branch')}</button> : null}
+        {runner.delivery?.status !== 'done' ? <button className="button secondary" disabled={busyLocked || childAlive} onClick={() => void agentNow()}><Rocket size={16} />{runner.delivery ? text('Продолжить подготовку коммитов', 'Resume commit preparation') : text('Устранить остаток и подготовить коммиты', 'Repair remaining goals and prepare commits')}</button> : null}
+      </div> : null}
 
       {runner?.scopeExpansionIssues?.length ? (
         <div className="resume-notice warning" role="status" data-testid="scope-expansion-issues">
@@ -961,7 +998,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
 
           {runner?.progressSummary ? <>
             <div className="roadmap-summary-grid">
-              <div><strong>{runner.progressSummary.remaining}</strong><span>{text('осталось по политике', 'remaining policy goals')}</span></div>
+              <div><strong>{runner.progressSummary.remaining}</strong><span>{text('до предложенных версий', 'below proposed versions')}</span></div>
               <div><strong>{runner.progressSummary.accepted}</strong><span>{text('принято обновлений', 'accepted updates')}</span></div>
               <div><strong>{runner.progressSummary.deferred}</strong><span>{text('отложено', 'deferred')}</span></div>
             </div>

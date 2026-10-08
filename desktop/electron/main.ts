@@ -56,6 +56,7 @@ import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStream
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { discoveryProgress } from './iterative-discovery-progress.js'
+import { auditLevel, readAuditView, readDeliveryView, iterationDirectory, readJson as readDeliveryJson, runDeliveryWorkflow } from './iterative-delivery.js'
 import { createIterativeAutopilot } from './iterative-autopilot.js'
 import { liveRunWriterPid, readAutopilotState, writeAutopilotState } from './iterative-autopilot-state.js'
 import { IterativeDecision, decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
@@ -1424,13 +1425,22 @@ function readProjectLevels(workspace: WorkspaceRecord): Record<string, ProjectLe
     try { current = projectLevelsFromRoadmap(JSON.parse(readFileSync(roadmapPath, 'utf8')), statSync(roadmapPath).mtime.toISOString()) } catch { /* use history below */ }
   }
   const snapshotsDir = join(artifactPath(workspace, 'historyDir', '.dependency-roadmap/history'), 'snapshots')
-  if (!existsSync(snapshotsDir)) return current
-  const snapshots = readdirSync(snapshotsDir)
+  const snapshots = existsSync(snapshotsDir) ? readdirSync(snapshotsDir)
     .filter((name) => name.endsWith('.json')).sort().reverse().slice(0, 100)
     .flatMap((name) => {
       try { return [JSON.parse(readFileSync(join(snapshotsDir, name), 'utf8')) as unknown] } catch { return [] }
-    })
-  return preferNewestProjectLevels(projectLevelsFromHistorySnapshots(snapshots), current)
+    }) : []
+  current = preferNewestProjectLevels(projectLevelsFromHistorySnapshots(snapshots), current)
+  for (const project of readProjects(workspace)) {
+    const runDir = iterativeRunDirPath(workspace.path, project.name)
+    const audit = readAuditView(runDir)
+    if (audit) {
+      const level = auditLevel(audit)
+      if (level) current[project.name] = level
+      else delete current[project.name] // unavailable evidence cannot inherit an old green dot
+    }
+  }
+  return current
 }
 
 function writeBestEffortHandoff(job: JobRecord): string | undefined {
@@ -7701,6 +7711,40 @@ function setupIpc(): void {
   )
 
   const iterativeStepInFlight = new Set<string>()
+  const initialAuditJobs = new Map<string, { identity: string; promise: Promise<void>; finishedAt?: number; error?: string }>()
+  function ensureInitialAudit(workspace: WorkspaceRecord, project: ProjectSpec, runDir: string) {
+    if (existsSync(join(runDir, 'run.json'))) return
+    const intent = loadBaselineIntent(workspace, project.name)
+    const inputs = { projectDir: project.path, projectName: project.name, intent,
+      requestedNode: project.nodeVersion, dashboardState: artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json'),
+      lagOverrides: readDeliveryJson(artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json'))?.packageOverrides?.[project.name] ?? {} }
+    const inputFiles = ['package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'].map(name => {
+      const path = join(project.path, name)
+      return existsSync(path) ? [name, statSync(path).mtimeMs, statSync(path).size] : [name]
+    })
+    const identity = JSON.stringify([inputs, inputFiles])
+    const previous = initialAuditJobs.get(runDir)
+    if (previous && (!previous.finishedAt || previous.identity === identity && Date.now() - previous.finishedAt < (previous.error ? 60_000 : 86_400_000))) return
+    if (iterativeStepInFlight.has(stepLockKey(workspace.id, project.name))) return
+    mkdirSync(runDir, { recursive: true })
+    const inputFile = join(runDir, 'current-audit-input.json')
+    writeFileSync(inputFile, JSON.stringify(inputs), 'utf8')
+    const pendingFile = join(runDir, 'current-audit-pending.json')
+    writeFileSync(pendingFile, JSON.stringify({ identity }), 'utf8')
+    const job = { identity, promise: Promise.resolve(), finishedAt: undefined as number | undefined, error: undefined as string | undefined }
+    initialAuditJobs.set(runDir, job)
+    job.promise = (async () => {
+      try {
+        const result = await spawnCapture(resolveExecutable('python'), [join(bundledToolDir(), 'iterative_delivery.py'), '--run-dir', runDir, '--input-file', inputFile, 'current-audit'], workspace.path, 20 * 60_000)
+        if (result.code !== 0 || result.timedOut) throw new Error(result.stderr.trim() || 'INITIAL_AUDIT_FAILED')
+        if (existsSync(pendingFile)) unlinkSync(pendingFile)
+      } catch (error) {
+        job.error = error instanceof Error ? error.message : String(error)
+        writeFileSync(pendingFile, JSON.stringify({ identity, error: job.error }), 'utf8')
+      }
+      finally { job.finishedAt = Date.now() }
+    })()
+  }
   // P2 (#2): the per-project in-flight lock is scoped to (workspace, project) —
   // the SAME project name living in two workspaces must NOT share a lock: a
   // second workspace would otherwise screen a foreign launch as "in progress",
@@ -7758,6 +7802,7 @@ function setupIpc(): void {
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
     const present = existsSync(join(runDir, 'run.json'))
+    if (!present) ensureInitialAudit(workspace, project, runDir)
     const stale = taskStaleness(runDir).stale
     let phase: string | undefined
     let decision: ReturnType<typeof decideNextStep> | undefined
@@ -7856,6 +7901,13 @@ function setupIpc(): void {
       requestedNode,
       progressSummary,
       scopeExpansionIssues,
+      audit: { ...readAuditView(runDir), ...(initialAuditJobs.get(runDir)?.error ? { error: initialAuditJobs.get(runDir)?.error } : {}), running: !present && Boolean(initialAuditJobs.get(runDir) && !initialAuditJobs.get(runDir)?.finishedAt) },
+      initialAudit: readDeliveryJson(join(runDir, 'current-audit.json')),
+      residualRepair: (() => { const value = readDeliveryJson(join(runDir, 'security-state.json')); return value ? { status: value.status, attempt: value.attempt, reason: value.reason } : undefined })(),
+      delivery: readDeliveryView(runDir),
+      runDirectory: runDir,
+      artifactsDirectory: existsSync(join(runDir, 'reports')) ? join(runDir, 'reports') : runDir,
+      iterationDirectory: iterationDirectory(runDir),
       workingCheckout,
       stopDetail,
       runtime: runtimeView,
@@ -7870,6 +7922,8 @@ function setupIpc(): void {
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
+    const pendingInitialAudit = initialAuditJobs.get(runDir)
+    if (pendingInitialAudit && !pendingInitialAudit.finishedAt) await pendingInitialAudit.promise
     if (input.restart === true || existsSync(join(runDir, 'restart-archive-transaction.json'))) {
       const key = stepLockKey(workspace.id, project.name)
       if (iterativeStepInFlight.has(key)) return { ok: false, step: 'begin', error: 'STEP_IN_PROGRESS' }
@@ -8117,7 +8171,7 @@ function setupIpc(): void {
     const intent = loadBaselineIntent(workspace, project.name)
     const targetLevel = intent.acceptancePolicy?.targetLevel ?? 'yellow'
     const dashboardState = artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json')
-    const targets = targetsFromDashboardState(dashboardState, project.name)
+    const targets = Object.fromEntries(Object.entries(targetsFromDashboardState(dashboardState, project.name)).filter(([name]) => intent.policies[name] !== 'keep-current'))
     const discoveryMode = input.discovery?.mode ?? 'none'
     // Pure begin-plan decision (L2): an empty roadmap target map NEVER launches
     // the long discovery inside a blocking IPC by itself — the user must pick a
@@ -8175,6 +8229,8 @@ function setupIpc(): void {
       beginDirReady = true
       const targetsFile = join(beginDir, 'targets.json')
       writeFileSync(targetsFile, JSON.stringify(targets), 'utf8')
+      const intentFile = join(beginDir, 'intent.json')
+      writeFileSync(intentFile, JSON.stringify(intent), 'utf8')
       const python = resolveExecutable('python')
       const generator = join(bundledToolDir(), 'iterative_migration.py')
       const options = {
@@ -8184,6 +8240,7 @@ function setupIpc(): void {
         workspaceId: workspace.id,
         projectId: project.name,
         targetsFile,
+        intentFile,
         toolBuildId: app.getVersion(),
         requestedNode: project.nodeVersion || undefined,
         // P1 (#1): carry the verified repaired source into the new migration.
@@ -8196,6 +8253,8 @@ function setupIpc(): void {
           lagPolicyMonths: intent.acceptancePolicy?.lagPolicyMonths,
           minLagOkPct: intent.acceptancePolicy?.minLagOkPct,
           maxKnownHigh: intent.acceptancePolicy?.maxKnownHigh,
+          maxKnownModerate: intent.acceptancePolicy?.maxKnownModerate,
+          maxKnownLow: intent.acceptancePolicy?.maxKnownLow,
         },
       }
       if (options.dashboardStatePath === undefined) delete (options as { dashboardStatePath?: string }).dashboardStatePath
@@ -8492,7 +8551,7 @@ function setupIpc(): void {
         if (decision.step === 'finish') {
           updateAttempt(runDir, { status: 'done', stage: 'drive', phase: 'TERMINAL', reason: decision.reason, lastStep: 'finish' })
           publish()
-          return { ok: true, steps, stopped: 'finished', phase: 'TERMINAL', reason: decision.reason, continuation: payload.terminalRepairResumable === true ? 'resume-terminal' : undefined, runId: payload.run?.runId, candidateId: payload.candidate?.candidateId, checkpointId: payload.activeCheckpoint?.checkpointId, attempt: readAttempt(runDir) }
+          return { ok: true, steps, stopped: 'finished', phase: 'TERMINAL', reason: decision.reason, needsDelivery: !payload.terminalRepairResumable && payload.activeCheckpoint?.status === 'VERIFIED' && readDeliveryJson(join(runDir, 'delivery-state.json'))?.status !== 'done', continuation: payload.terminalRepairResumable === true ? 'resume-terminal' : undefined, runId: payload.run?.runId, candidateId: payload.candidate?.candidateId, checkpointId: payload.activeCheckpoint?.checkpointId, attempt: readAttempt(runDir) }
         }
       }
     } finally {
@@ -8646,6 +8705,51 @@ function setupIpc(): void {
       return { ok: false, error: 'NO_RUN' }
     }
     return withAgentDispatchLock(iterativeStepInFlight, stepLockKey(workspace.id, project.name), async () => {
+    if (readDeliveryJson(join(runDir, 'run.json'))?.phase === 'TERMINAL') {
+      resumeAttempt(runDir, project.name, workspace.id)
+      updateAttempt(runDir, { status: 'running', stage: 'agent', lastError: undefined })
+      publishIterativeAttempt(runDir)
+      const inputFile = join(runDir, 'delivery-input.json')
+      writeFileSync(inputFile, JSON.stringify({ branch: project.git?.baseBranch || project.git?.branchPrefix || 'libs' }), 'utf8')
+      const provider = workspace.agent
+      const model = workspace.agentModel
+      const outcome = await runDeliveryWorkflow(runDir, {
+        canceled: () => readAttempt(runDir)?.cancelRequested === true,
+        processAlive: isPidAlive,
+        provider,
+        progress: reason => { updateAttempt(runDir, { reason }); publishIterativeAttempt(runDir) },
+        command: async step => {
+          if (readAttempt(runDir)?.cancelRequested) throw new Error('DELIVERY_CANCELED')
+          const result = await spawnIterativeStreamed(runDir, resolveExecutable('python'), [join(bundledToolDir(), 'iterative_delivery.py'), '--run-dir', runDir, '--input-file', inputFile, step], workspace.path, 0, iterativeStreamIo(runDir), iterativeStreamPlatform)
+          if (result.code !== 0 || result.canceled) throw new Error(result.stderr.trim() || `DELIVERY_STEP_FAILED: ${step}`)
+          const value = result.stdout.split(/\r?\n/).reverse().find(line => line.startsWith('ITERATIVE_DELIVERY_V1 '))
+          if (!value) throw new Error('DELIVERY_RESULT_MISSING')
+          return JSON.parse(value.slice('ITERATIVE_DELIVERY_V1 '.length))
+        },
+        launch: async context => {
+          if (context.provider && context.provider !== provider) throw new Error('DELIVERY_PROVIDER_CHANGED: resume with the original agent provider')
+          const promptFile = join(runDir, `delivery-${context.phase}-prompt.md`)
+          writeFileSync(promptFile, context.prompt, 'utf8')
+          let transport: Awaited<ReturnType<typeof startStandaloneOpenCodeServer>>
+          if (provider === 'opencode') transport = await startStandaloneOpenCodeServer(context.cwd, join(runDir, `delivery-${context.phase}-opencode`, 'opencode.db'))
+          try {
+            const args = provider === 'opencode'
+              ? context.sessionId ? buildOpenCodeResumeArgs(context.cwd, context.sessionId, model, promptFile, undefined, undefined, transport?.url) : buildOpenCodeAgentArgs(context.cwd, promptFile, model, undefined, transport?.url)
+              : provider === 'claude'
+                ? context.sessionId ? buildClaudeResumeArgs(context.sessionId, model, promptFile) : buildClaudeAgentArgs(model)
+                : context.sessionId ? buildCodexResumeArgs(context.sessionId, model, promptFile) : buildCodexAgentArgs(context.cwd, model)
+            const result = await spawnIterativeStreamed(runDir, provider, args, context.cwd, 45 * 60_000, iterativeStreamIo(runDir),
+              provider === 'opencode' ? { ...iterativeStreamPlatform, commandEnvironment: env => commandEnvironment(openCodeDatabaseEnv(env, transport?.databasePath || '')) } : iterativeStreamPlatform,
+              undefined, { stdin: provider === 'opencode' ? undefined : context.prompt,
+                onSpawn: context.onSpawn, onLine: line => { const id = extractAgentSessionId(line, provider); if (id) context.onSession(id) } })
+            if (result.code !== 0 || result.canceled || result.timedOut) throw new Error(redactAgentDiagnostics(result.stderr.trim() || 'DELIVERY_AGENT_FAILED'))
+          } finally { await transport?.stop() }
+        },
+      })
+      updateAttempt(runDir, { status: outcome.ok ? 'done' : readAttempt(runDir)?.cancelRequested ? 'canceled' : 'failed', stage: 'agent', lastStep: outcome.ok ? 'delivery' : 'delivery-failed', lastError: outcome.error, finishedAt: Date.now() })
+      publishIterativeAttempt(runDir)
+      return { ...outcome, phase: 'TERMINAL' }
+    }
     // Launch-wait resilience: classify the durable lease BEFORE marking the
     // attempt running. A parked WAIT (retry time not reached) must not be
     // flipped to running, must not consume a repair attempt, and must not

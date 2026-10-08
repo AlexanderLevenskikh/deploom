@@ -25,7 +25,7 @@ export function iterativeCheckoutView(payload: Record<string, any>, runDir: stri
   }
   const snapshot = payload.activeCheckpoint?.sourceSnapshotContainer
   if (typeof snapshot === 'string' && isAbsolute(snapshot) && contained(runDir, snapshot) && existsSync(snapshot)) {
-    return { path: resolve(snapshot), kind: 'checkpoint', checkpointId: payload.activeCheckpoint?.checkpointId }
+    return { path: existsSync(join(snapshot, 'tree')) ? resolve(snapshot, 'tree') : resolve(snapshot), kind: 'checkpoint', checkpointId: payload.activeCheckpoint?.checkpointId }
   }
   if (existsSync(projectPath)) return { path: resolve(projectPath), kind: 'project' }
   return undefined

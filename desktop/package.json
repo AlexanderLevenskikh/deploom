@@ -81,6 +81,7 @@
     "check:run-slot-isolation": "node scripts/check-run-slot-isolation.mjs",
     "check:artifact-token": "node scripts/check-artifact-token.mjs",
     "precheck:iterative-runner": "tsc -p tsconfig.electron.json",
+    "check:iterative-delivery": "node scripts/check-iterative-delivery.mjs",
     "check:iterative-checkout": "node scripts/check-iterative-checkout.mjs",
     "check:iterative-runner": "node scripts/check-iterative-runner.mjs",
     "precheck:iterative-begin": "tsc -p tsconfig.electron.json",

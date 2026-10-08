@@ -2,6 +2,8 @@
 
 Основной пользовательский продукт DepLoom. Electron Control Plane запускает bundled Python core из того же release, управляет Git/worktree, agent sessions, recovery/merge/release state и показывает прогресс. На машине пользователя нужен Python 3: `python` на Windows или `python3` на Linux/macOS.
 
+Итеративный FLOW показывает исходный/финальный независимый аудит и выбранные цели сверху; рядом с артефактами открывается рабочая директория итерации. Финальный агент готовит смысловые коммиты в отдельном worktree на ветке из настроек и повторяет проверку/аудит. Политика Draft фиксируется на начало прогона. Подробности и QA: [ITERATIVE_AUDIT_AND_DELIVERY.md](../docs/ITERATIVE_AUDIT_AND_DELIVERY.md).
+
 ## Development
 
 ```bash

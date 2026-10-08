@@ -27,10 +27,11 @@ export type IterativeBeginOptions = {
   // file the targets come from); auditPolicy pins the goal thresholds so the
   // audit evidence is bound to the same numbers the roadmap enforces.
   dashboardStatePath?: string
-  auditPolicy?: { lagPolicyMonths?: number; minLagOkPct?: number; maxKnownHigh?: number }
+  auditPolicy?: { lagPolicyMonths?: number; minLagOkPct?: number; maxKnownHigh?: number; maxKnownModerate?: number; maxKnownLow?: number }
   // D3: explicit Node.js for project/CI (exact or major). Empty = no claim —
   // no --requested-node is passed and the run makes no CI-runtime commitment.
   requestedNode?: string
+  intentFile?: string
   // P1 (v0.2.163 #1): start the migration from the VERIFIED REPAIRED source.
   // Set ONLY when a finished repair (TERMINAL REPAIR_VERIFIED) was just
   // archived; begin then reads repair-handoff.json and carries the fixed C0
@@ -115,12 +116,15 @@ export function iterativeBeginInvocation(
   args.push('--target-level', options.targetLevel)
   if (options.validationProfileFile) args.push('--validation-profile', options.validationProfileFile)
   if (options.targetsFile) args.push('--targets-file', options.targetsFile)
+  if (options.intentFile) args.push('--intent-file', options.intentFile)
   if (options.dashboardStatePath) args.push('--dashboard-state', options.dashboardStatePath)
   const auditPolicy = options.auditPolicy
   if (auditPolicy) {
     if (auditPolicy.lagPolicyMonths !== undefined) args.push('--lag-months', String(auditPolicy.lagPolicyMonths))
     if (auditPolicy.minLagOkPct !== undefined) args.push('--min-lag-ok-pct', String(auditPolicy.minLagOkPct))
     if (auditPolicy.maxKnownHigh !== undefined) args.push('--max-known-high', String(auditPolicy.maxKnownHigh))
+    if (auditPolicy.maxKnownModerate !== undefined) args.push('--max-known-moderate', String(auditPolicy.maxKnownModerate))
+    if (auditPolicy.maxKnownLow !== undefined) args.push('--max-known-low', String(auditPolicy.maxKnownLow))
   }
   if (options.workspaceId) args.push('--workspace-id', options.workspaceId)
   if (options.projectId) args.push('--project-id', options.projectId)

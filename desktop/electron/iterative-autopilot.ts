@@ -133,6 +133,11 @@ export function createIterativeAutopilot(key: (scope: Scope) => string, persiste
         pendingDrive = await invoke('drive', { ...input, resumeTerminal: true })
         continue
       }
+      if (drive.stopped === 'finished' && drive.needsDelivery === true) {
+        const delivery = await invoke('agent', input)
+        if (delivery.ok !== true) return stopped('error', String(delivery.error || 'DELIVERY_FAILED'))
+        return stopped('finished')
+      }
       if (drive.stopped !== 'agent-gate') return stopped(String(drive.stopped || 'paused'))
       const status = await invoke('status', input)
       if (session.canceled) return stopped('canceled')

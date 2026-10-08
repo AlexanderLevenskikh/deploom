@@ -140,6 +140,12 @@ class ProjectRuntimeTests(unittest.TestCase):
         self.assertEqual(a.contract_hash(), b.contract_hash())
         self.assertNotEqual(a.contract_hash(), c.contract_hash())
 
+    def test_node_range_satisfied_spaced_npm_comparators(self) -> None:
+        for spec in (">= 18", ">= 0.8.0", ">= 14", "^ 22.18.0 || >= 24.11.0"):
+            self.assertTrue(node_range_satisfied(spec, "24.18.0"), spec)
+        self.assertFalse(node_range_satisfied("< 24", "24.18.0"))
+        self.assertFalse(node_range_satisfied(">= unknown", "24.18.0"))
+
     def test_node_range_satisfied_or_range_boundaries(self) -> None:
         spec = "^22.18.0 || >=24.11.0"
         self.assertTrue(node_range_satisfied(spec, "22.18.0"))
