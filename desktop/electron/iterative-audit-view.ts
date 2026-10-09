@@ -1,6 +1,8 @@
 export type AuditView = {
   status: string; evidenceRef?: string; checkpointId?: string; generatedAt?: string
-  auditComplete?: boolean; stale?: boolean; running?: boolean; error?: string
+  auditComplete?: boolean; securityComplete?: boolean; lagComplete?: boolean; stale?: boolean; running?: boolean; error?: string
+  sourceFileHashes?: Record<string, string | null>
+  projectDir?: string; branch?: string; unknownPackages?: Array<{ package: string; version?: string; reason?: string }>
   lagOkPct?: number; lagOk?: number; lagTotal?: number; lagUnknown?: number
   packageTotals?: Record<string, number>; policy?: Record<string, number | string>
   requiredTargets?: Array<{ package: string; target?: string; current?: string; met: boolean }>

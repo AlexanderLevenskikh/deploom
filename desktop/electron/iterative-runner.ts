@@ -185,6 +185,10 @@ export function decideNextStep(
     })
     .filter((item): item is { requestId: string; summary: string } => Boolean(item))
 
+  // A proposal planned by an older controller must not start an unnecessary
+  // installation after the exact active checkpoint already meets the goals.
+  // Materialized/repairing trials remain subject to their normal closure.
+  if (candidateStage === 'PLANNED' && !run.terminal && payload.goalSatisfied === true && checkpoint.status === 'VERIFIED' && checkpoint.audit?.status === 'PASS') return { step: 'finish', phase, reason: 'selected goals already met; preserve unused proposal and finalize', satisfied: true }
   switch (phase) {
     case '':
       return { step: 'begin', phase, reason: 'NO_RUN: run.json is absent; capture C0' }
@@ -332,8 +336,8 @@ export function decideNextStep(
         }
       }
       if (checkpoint.audit?.status === 'UNKNOWN' && checkpoint.audit?.generatedAt) return { step: 'finish', phase, reason: 'audit evidence is unavailable; finalize with an unconfirmed result', satisfied: false }
-      if (checkpoint.checkpointId === 'C0' && !checkpoint.audit?.generatedAt && !['PASS', 'FAIL'].includes(String(checkpoint.audit?.status ?? ''))) return { step: 'audit', phase, reason: 'initial independent audit before selecting update cohorts' }
-      const satisfied = payload.goalSatisfied === true || planSatisfied(readTargets(runDir), assignment)
+      if ((checkpoint.checkpointId === 'C0' || payload.config?.goalMode === 'audit-policy') && !checkpoint.audit?.generatedAt && !['PASS', 'FAIL'].includes(String(checkpoint.audit?.status ?? ''))) return { step: 'audit', phase, reason: 'initial independent audit before selecting update cohorts' }
+      const satisfied = payload.goalSatisfied === true || (payload.config?.goalMode !== 'audit-policy' && planSatisfied(readTargets(runDir), assignment))
       if (satisfied) {
         // R8: a satisfied policy is finalized only AFTER the independent audit
         // of the exact accepted checkpoint (PASS/FAIL recorded in

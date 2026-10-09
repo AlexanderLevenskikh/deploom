@@ -45,6 +45,7 @@ Grouping is heuristic. You can override package/group/reason with --groups-confi
 from __future__ import annotations
 
 import argparse
+import atexit
 import copy
 import html
 import dataclasses
@@ -2455,6 +2456,7 @@ class LiveDataClient:
             target=self._heartbeat_loop, name="draft-progress-heartbeat", daemon=True,
         )
         self._heartbeat_thread.start()
+        atexit.register(self.mark_draft_terminal)
 
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(DRAFT_PROGRESS_HEARTBEAT_SECONDS):
@@ -2474,6 +2476,10 @@ class LiveDataClient:
         must not keep emitting, and elapsed/budget are no longer extended."""
         self._draft_terminal = True
         self._heartbeat_stop.set()
+        thread = self._heartbeat_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        atexit.unregister(self.mark_draft_terminal)
 
     def _emit_payload(self, payload: Dict[str, Any]) -> None:
         try:
@@ -26189,6 +26195,7 @@ def main() -> None:
     )
     ap.add_argument("--knowledge-log", help="Append-only, revisioned package migration knowledge JSON. Overrides settings.knowledgeLog.")
     ap.add_argument("--only-project", action="append", help="Analyze only the named project from settings/projects. Can be passed multiple times.")
+    ap.add_argument("--refresh-source-branch", action="store_true", help="Refresh from the configured source branch (master by default), using the normal clean-checkout/provenance guard.")
     ap.add_argument("--capture-baseline", action="store_true", help="Store the current project state as a migration baseline in history/baselines after generating the report.")
     ap.add_argument(
         "--draft-baseline",
@@ -26533,6 +26540,8 @@ def main() -> None:
                 "run manual_dependency_audit.py explicitly when a manual vulnerability cross-check is needed"
             )
 
+        if args.refresh_source_branch and not project.source_branch:
+            project.source_branch = "master"
         configured_guard = (
             source_checkout_guard_enabled
             if project.source_checkout_guard is None
@@ -26540,8 +26549,8 @@ def main() -> None:
         )
         guard_enabled = bool(
             args.draft_baseline is False
-            and source_baseline_mode
-            and configured_guard
+            and (source_baseline_mode or args.refresh_source_branch)
+            and (configured_guard or args.refresh_source_branch)
         )
         if not guard_enabled:
             project.source_checkout = {
@@ -26614,7 +26623,7 @@ def main() -> None:
             # theoretical plan -- it only lowers precision, which is recorded.
             lock_mode = "off"
         else:
-            lock_mode = args.lockfile_mode or (baseline_mode if source_baseline_mode else current_mode)
+            lock_mode = args.lockfile_mode or (baseline_mode if source_baseline_mode or args.refresh_source_branch else current_mode)
         try:
             lock_state = ensure_lockfile_consistency(
                 project.path,
@@ -27102,6 +27111,7 @@ def main() -> None:
             f"[done] Draft result published: status={draft_manifest['status']} "
             f"summary={draft_manifest['summary']}"
         )
+        client.mark_draft_terminal()
         eprint(f"[info] Draft manifest: {draft_manifest['artifacts']['manifest']}")
     enrich_release_intelligence(rows_by_project, client, enabled=release_intel_enabled, max_packages=release_intel_max)
     captured_baselines: Dict[str, Dict[str, Any]] = {}

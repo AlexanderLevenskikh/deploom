@@ -1738,6 +1738,8 @@ def check_lag(
             available_versions = sum(1 for key in times if version_text(str(key)) != str(key) or re.fullmatch(r"v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", str(key))) if isinstance(times, dict) else 0
             detail = ", ".join(missing) or "publication metadata"
             item["error"] = f"missing {detail}; npm time entries={available_versions}"
+            if current_date is None and latest and latest_date:
+                item["error"] += f"; registry latest={latest}; verify package registry/namespace for installed version {current}"
         result.append(item)
     return result
 

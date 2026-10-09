@@ -3,6 +3,13 @@ export type BranchProject = {
   git?: Record<string, unknown>
 }
 
+export function projectBranchNames(refs: string, remote = 'origin'): string[] {
+  return [...new Set(refs.split(/\r?\n/).flatMap(ref => {
+    const name = ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref.startsWith(`refs/remotes/${remote}/`) ? ref.slice(`refs/remotes/${remote}/`.length) : ''
+    return name && name !== 'HEAD' ? [name] : []
+  }))].sort((a, b) => a.localeCompare(b))
+}
+
 export type ProjectLevel = {
   status: 'red' | 'yellow' | 'green'
   lagOkPct?: number

@@ -918,7 +918,8 @@ textarea::placeholder {
 .iterative-log-message { margin: 6px 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
 .iterative-autopilot-option { display: flex; align-items: center; gap: 10px; margin: 12px 0; padding: 12px; border: 1px solid var(--border); border-radius: 10px; font-size: 13px; font-weight: 600; }
 .migration-launch-settings { margin: 16px auto; max-width: 980px; }
-.migration-launch-settings .project-facts { margin-bottom: 0; border: 0; padding: 0; min-width: 0; }
+.migration-launch-settings .project-facts { margin-bottom: 0; border: 0; padding: 0; min-width: 0; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 16px; }
+.migration-launch-settings .project-facts > div:last-child { display: flex; }
 .iterative-pipeline-dot { width: 20px; height: 20px; flex: 0 0 20px; display: grid; place-items: center; border-radius: 50%; font-size: 10px; font-weight: 700; color: var(--text-muted); background: var(--surface-hover); border: 1px solid var(--border); }
 .iterative-pipeline-step.done .iterative-pipeline-dot { color: var(--green); background: var(--green-soft); border-color: var(--green); }
 .iterative-pipeline-step.active .iterative-pipeline-dot { color: #fff; background: var(--blue); border-color: var(--blue); }

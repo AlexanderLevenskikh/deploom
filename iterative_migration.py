@@ -2312,6 +2312,10 @@ def _plan_next_locked(
             f"CHECKPOINT_NOT_VERIFIED: {checkpoint_id} status={checkpoint.get('status')}"
         )
 
+    if _policy_satisfied(config, checkpoint):
+        _emit_status({"event": "plan-next.no-candidate", "runId": run["runId"],
+                      "checkpointId": checkpoint_id, "reason": "POLICY_SATISFIED_NEEDS_AUDIT"})
+        return 0
     incumbent = {str(k): str(v) for k, v in (checkpoint.get("fullAssignment") or {}).items()}
     targets = {str(k): str(v) for k, v in (config.get("targets") or {}).items()}
     desired = {name: targets.get(name, version) for name, version in incumbent.items()}
@@ -2324,6 +2328,9 @@ def _plan_next_locked(
     # Scope expansions cannot override an explicit keep-current instruction.
     desired = {name: incumbent.get(name) if (config.get("packagePolicies") or {}).get(name) == "keep-current" else version
                for name, version in desired.items()}
+    excluded = set(planning_ledger.get("userDeferredPackages", []))
+    desired = {name: incumbent.get(name) if name in excluded else version for name, version in desired.items()
+               if name in incumbent or name not in excluded}
     planning_targets = dict(desired)
     actionable = [name for name, version in sorted(desired.items()) if version != incumbent.get(name)]
     if expansion_issues:
@@ -4574,6 +4581,9 @@ def _accept_checkpoint(
     for name, policy in (config.get("packagePolicies") or {}).items():
         if policy == "keep-current" and (candidate.get("fullAssignment") or {}).get(name) != (base_checkpoint.get("fullAssignment") or {}).get(name):
             raise InvalidInputError(f"KEEP_CURRENT_CHANGED: {name}")
+    for name in load_ledger(run_dir).get("userDeferredPackages", []):
+        if (candidate.get("fullAssignment") or {}).get(name) != (base_checkpoint.get("fullAssignment") or {}).get(name):
+            raise InvalidInputError(f"USER_DEFERRED_PACKAGE_CHANGED: {name}")
     candidate_id = str(candidate["candidateId"])
     base_id = str(base_checkpoint["checkpointId"])
     seq = int(base_checkpoint.get("seq", 0)) + 1
@@ -4995,6 +5005,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             # D2.4: the UI needs the requested-vs-effective runtime contract and
             # the CI evidence source to render, not to decide. The durable
             # runtime block lives in run-config.json; this is its view.
+            "goalMode": config.get("goalMode"),
             "requestedNode": config.get("requestedNode") or "",
             "runtime": config.get("runtime") or {},
         },
@@ -5553,7 +5564,11 @@ def _audit_once_locked(
     checkpoint["audit"] = {
         "status": audit_status,
         "evidenceRef": evidence_ref,
-        "auditComplete": bool(report.get("auditComplete")),
+        "auditComplete": report.get("auditComplete") is True and report.get("lagComplete") is True,
+        "securityComplete": _audit_status_from_report({**report, "lagComplete": True}) in {"PASS", "FAIL"},
+        "lagComplete": bool(report.get("lagComplete")),
+        "unknownPackages": [{"package": item.get("name"), "version": item.get("current"), "reason": item.get("error")}
+                            for item in report.get("lag", []) if item.get("status") == "unknown"],
         "retryableReason": audit_recovery_reason(report, allow_canonical=args.yarn_audit_engine in (None, "", "auto")),
         "engine": audit_metrics.get("engine"),
         "lagOkPct": audit_metrics.get("lagOkPct"),
@@ -5564,7 +5579,7 @@ def _audit_once_locked(
         "vulnerabilityPackages": len(audit_metrics.get("packages") or {}),
         "packageTotals": audit_metrics.get("packageTotals") or {},
         "advisoryTotals": audit_metrics.get("advisoryTotals") or {},
-        "vulnerablePackages": [{"package": n, "severity": v.get("severity"), "direct": v.get("isDirect"),
+        "vulnerablePackages": [{"package": n, "severity": v.get("severity") or next((s for s in ("critical", "high", "moderate", "low") if v.get(s, 0)), None), "direct": v.get("isDirect"),
                                 "nodes": v.get("nodes") or [], "range": v.get("range")}
                                for n, v in (audit_metrics.get("packages") or {}).items()],
         "policy": report.get("policy") or {},
@@ -5754,6 +5769,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("resume", help="Продолжить незавершённый прогон с последнего VERIFIED checkpoint без сброса бюджетов")
 
+    review = sub.add_parser("review-cohort", help="Согласовать состав когорты или отложить исключённые пакеты")
+    review.add_argument("--input-file", required=True)
+
     plan_next = sub.add_parser("plan-next", help="Выбрать следующий небольшой шаг от активного checkpoint")
     plan_next.add_argument(
         "--retry-infra",
@@ -5802,7 +5820,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+from iterative_cohort_review import command as cmd_review_cohort
+
 COMMANDS = {
+    "review-cohort": cmd_review_cohort,
     "begin": cmd_begin,
     "verify-bootstrap": cmd_verify_bootstrap,
     "bootstrap-materialize": cmd_bootstrap_materialize,
@@ -5862,6 +5883,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 _recover_repair_archive(recovery_dir)
             finally:
                 recovery_lock.release()
+        from iterative_cohort_review import recover as recover_cohort_review
+        recover_cohort_review(recovery_dir)
         return int(COMMANDS[args.command](args) or 0)
     except ProjectUnreadyError as exc:
         print(f"ITERATIVE_MIGRATION_FAILURE_V1 {json.dumps({'code': exc.code, 'summary': str(exc), 'command': exc.command, 'fixable': True})}")

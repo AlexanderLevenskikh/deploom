@@ -226,6 +226,11 @@ class GitDeliveryTests(unittest.TestCase):
             (self.repo / "package-lock.json").write_text('{"changed":true}', encoding="utf-8")
             d.current_audit(self.run_dir, inputs)
             self.assertEqual(collect.call_count, 4)
+            d.current_audit(self.run_dir, {**inputs, "forceRefresh": True})
+            self.assertEqual(collect.call_count, 5, "explicit refresh bypasses the successful cache")
+            (self.repo / ".npmrc").write_text("registry=https://registry.example.invalid/", encoding="utf-8")
+            d.current_audit(self.run_dir, inputs)
+            self.assertEqual(collect.call_count, 6, "registry config invalidates the audit subject")
 
     def test_unknown_selection_evidence_is_not_reused_as_a_success_cache(self):
         inputs = {"projectDir": str(self.repo), "projectName": "fixture", "intent": {}}

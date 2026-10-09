@@ -1,5 +1,7 @@
-import { applyBranchBase, preferNewestProjectLevels, projectLevelsFromHistorySnapshots, projectLevelsFromRoadmap } from "../dist-electron/project-settings.js";
+import { projectBranchNames, applyBranchBase, preferNewestProjectLevels, projectLevelsFromHistorySnapshots, projectLevelsFromRoadmap } from "../dist-electron/project-settings.js";
 
+const names = projectBranchNames('refs/heads/master\r\nrefs/heads/feature/icons\r\nrefs/remotes/company/master\r\nrefs/remotes/company/develop\r\nrefs/remotes/company/HEAD\r\nrefs/remotes/origin/other', 'company');
+if (JSON.stringify(names) !== JSON.stringify(['develop', 'feature/icons', 'master'])) throw new Error(`Branch suggestions: ${names}`);
 const original = {
   name: "Demo",
   git: {

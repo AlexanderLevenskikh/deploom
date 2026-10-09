@@ -499,14 +499,14 @@ export function useDependencyFlow() {
     applyWorkspaceResult(await api.updateWorkspace(patch))
   }, [api, applyWorkspaceResult])
 
-  const updateProjectBranches = useCallback(async (input: { workspaceId?: string; projectName: string; branchBase?: string; push?: boolean }) => {
+  const updateProjectBranches = useCallback(async (input: { workspaceId?: string; projectName: string; branchBase?: string; sourceBranch?: string; push?: boolean }) => {
     if (!api) {
       setPayload((current) => {
         if (!current?.details) return current
         const branchBase = input.branchBase?.trim() || 'libs'
         const projects = current.details.projects.map((project) => project.name === input.projectName ? {
           ...project,
-          git: { ...project.git, baseBranch: branchBase, branchPrefix: branchBase, mergedBranch: `${branchBase}-merged`, ...(typeof input.push === 'boolean' ? { push: input.push } : {}) },
+          git: { ...project.git, ...(input.sourceBranch !== undefined ? { sourceBranch: input.sourceBranch.trim() || 'master' } : {}), baseBranch: branchBase, branchPrefix: branchBase, mergedBranch: `${branchBase}-merged`, ...(typeof input.push === 'boolean' ? { push: input.push } : {}) },
         } : project)
         return { ...current, details: { ...current.details, projects } }
       })

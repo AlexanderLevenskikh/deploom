@@ -59,10 +59,15 @@ def summary(report, evidence, checkpoint_id=None):
     return {"status": audit_policy_status(report), "evidenceRef": str(evidence),
             "checkpointId": checkpoint_id, "generatedAt": report.get("generatedAt"),
             "auditComplete": report.get("auditComplete") is True and report.get("lagComplete") is True,
+            "securityComplete": audit_policy_status({**report, "lagComplete": True}) in {"PASS", "FAIL"},
+            "lagComplete": report.get("lagComplete") is True,
+            "unknownPackages": [{"package": item.get("name"), "version": item.get("current"),
+                                 "reason": item.get("error")} for item in report.get("lag", [])
+                                if item.get("status") == "unknown"],
             "lagOkPct": audit.get("lagOkPct"), "lagOk": audit.get("lagOk"),
             "lagTotal": audit.get("lagTotal"), "lagUnknown": audit.get("lagUnknown"),
             "packageTotals": audit.get("packageTotals") or {}, "policy": report.get("policy") or {},
-            "vulnerablePackages": [{"package": name, "severity": value.get("severity"),
+            "vulnerablePackages": [{"package": name, "severity": value.get("severity") or next((s for s in ("critical", "high", "moderate", "low") if value.get(s, 0)), None),
                                     "direct": value.get("isDirect"), "nodes": value.get("nodes") or []}
                                    for name, value in (audit.get("packages") or {}).items()]}
 
@@ -110,7 +115,11 @@ def current_audit(run_dir, inputs):
         if not runtime.found:
             raise RuntimeError("ENVIRONMENT_UNAVAILABLE: selected Node is not installed")
         config["runtime"] = {"nodePath": runtime.node_path, "effectiveVersion": runtime.effective_version}
-    identity = hashlib.sha256(json.dumps([dependency_input_identity(project)[0], inputs, config.get("runtime") or {}], sort_keys=True).encode()).hexdigest()
+    source_hashes = {name: hashlib.sha256((project / name).read_bytes()).hexdigest() if (project / name).is_file() else None
+                     for name in ("package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", ".npmrc", ".yarnrc", ".yarnrc.yml")}
+    registry_inputs = {name: hashlib.sha256((project / name).read_bytes()).hexdigest() if (project / name).is_file() else None
+                       for name in (".npmrc", ".yarnrc", ".yarnrc.yml")}
+    identity = hashlib.sha256(json.dumps([dependency_input_identity(project)[0], {k: v for k, v in inputs.items() if k != "forceRefresh"}, config.get("runtime") or {}, registry_inputs], sort_keys=True).encode()).hexdigest()
     cache = run_dir / "current-audit.json"
     if cache.exists():
         try:
@@ -124,14 +133,18 @@ def current_audit(run_dir, inputs):
             fresh = 0 <= (datetime.now(timezone.utc) - generated).total_seconds() < 86400
         except (ValueError, TypeError):
             fresh = False
-        if previous.get("inputIdentity") == identity and fresh and previous.get("status") in {"PASS", "FAIL"}:
+        if not inputs.get("forceRefresh") and previous.get("inputIdentity") == identity and fresh and previous.get("status") in {"PASS", "FAIL"}:
             return previous
     before = dependency_input_identity(project)[0]
     evidence = run_dir / "audit" / "initial"
+    metadata_cache = evidence / "npm-metadata-cache.json"
+    if inputs.get("forceRefresh") and metadata_cache.exists():
+        metadata_cache.unlink()
     report = collect_audit(project, config, evidence)
-    if dependency_input_identity(project)[0] != before:
-        raise RuntimeError("AUDIT_INPUT_CHANGED: dependency files changed during the audit")
-    result = {**summary(report, evidence), "inputIdentity": identity}
+    if dependency_input_identity(project)[0] != before or any((hashlib.sha256((project / name).read_bytes()).hexdigest() if (project / name).is_file() else None) != value for name, value in source_hashes.items()):
+        raise RuntimeError("AUDIT_INPUT_CHANGED: dependency files or registry configuration changed during the audit")
+    result = {**summary(report, evidence), "inputIdentity": identity, "projectDir": str(project),
+              "branch": git(project, "branch", "--show-current"), "sourceFileHashes": source_hashes}
     core._write_json_atomic(cache, result)
     return result
 
@@ -268,6 +281,9 @@ def security_verify(run_dir, inputs):
     for name, policy in (config.get("packagePolicies") or {}).items():
         if policy == "keep-current" and assignment.get(name) != old_assignment.get(name):
             raise RuntimeError(f"SECURITY_KEEP_CURRENT_CHANGED: {name}")
+    for name in core.load_ledger(run_dir).get("userDeferredPackages", []):
+        if assignment.get(name) != old_assignment.get(name):
+            raise RuntimeError(f"SECURITY_USER_DEFERRED_PACKAGE_CHANGED: {name}")
     verify_config = dataclasses.replace(core.verify_config_from(config["verifyConfig"], run_dir),
                                        verification_purpose="intermediate-candidate")
     result = core.verify_assignment(project, assignment, config=verify_config, run_project_checks=True,

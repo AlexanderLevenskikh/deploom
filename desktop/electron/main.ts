@@ -23,7 +23,7 @@ import { loadProvenResolvedState, resolvedStateTargetPath, restoreProvenResolved
 import { buildGroupVerificationRepairPrompt } from './group-repair.js'
 import { batchRoadmapDocument, replaceRoadmapPath } from './roadmap-dossier.js'
 import { latestAgentCheckpoint } from './agent-checkpoint.js'
-import { applyBranchBase, preferNewestProjectLevels, projectLevelsFromHistorySnapshots, projectLevelsFromRoadmap, type ProjectLevel } from './project-settings.js'
+import { applyBranchBase, projectBranchNames, preferNewestProjectLevels, projectLevelsFromHistorySnapshots, projectLevelsFromRoadmap, type ProjectLevel } from './project-settings.js'
 import { releaseBranchForAction } from './publication.js'
 import { releaseGateCommands, releasePolicyForProject } from './release-policy.js'
 import { buildMergeRecoveryPrompt } from './merge-recovery.js'
@@ -57,7 +57,8 @@ import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStream
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { discoveryProgress } from './iterative-discovery-progress.js'
-import { auditLevel, readAuditView, readDeliveryView, iterationDirectory, readJson as readDeliveryJson, runDeliveryWorkflow, createDeliveryAgentWatchdog } from './iterative-delivery.js'
+import { pendingCohortReview, cohortReviewEnabled, saveCohortReviewEnabled } from './iterative-cohort-review.js'
+import { auditLevel, readCurrentAuditView, readAuditView, readDeliveryView, iterationDirectory, readJson as readDeliveryJson, runDeliveryWorkflow, createDeliveryAgentWatchdog } from './iterative-delivery.js'
 import { createIterativeAutopilot } from './iterative-autopilot.js'
 import { liveRunWriterPid, readAutopilotState, writeAutopilotState } from './iterative-autopilot-state.js'
 import { IterativeDecision, decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
@@ -105,6 +106,7 @@ type BaselineRecoveryInfo = { available: boolean; mode?: 'yellow' | 'green'; sta
 
 
 type GitPlan = {
+  remote?: string
   sourceBranch?: string
   baseBranch?: string
   branchPrefix?: string
@@ -117,6 +119,8 @@ type ProjectSpec = {
   name: string
   path: string
   git?: GitPlan
+  gitRemote?: string
+  sourceBranch?: string
   // Explicit Node.js for project/CI: exact version or major. Empty (unset)
   // means "no CI-compatibility claim" — the child runtime stays the host
   // ambient one and verification makes no requested-runtime commitment.
@@ -569,6 +573,7 @@ let downloadedUpdateVersion: string | undefined
 let updateCheckInFlight: ReturnType<typeof autoUpdater.checkForUpdates> | undefined
 let updateInstallInProgress = false
 let stopUpdateChecks: (() => void) | undefined
+let refreshWorkspaceAudits: ((workspace: WorkspaceRecord, projectName?: string) => Promise<void>) | undefined
 
 function statePath(): string {
   return join(app.getPath('userData'), 'dependency-flow-state.json')
@@ -1105,7 +1110,7 @@ function readProjects(workspace: WorkspaceRecord): ProjectSpec[] {
       const path = resolveProjectPackageDirectory(absolute)
       // D2.4: display-only Node hints from the repo pins (engines.node and
       // .nvmrc/.node-version). The UI may suggest them, never auto-fills.
-      return { ...project, path, nodeHints: projectNodeHints(path) }
+      return { ...project, git: { ...project.git, sourceBranch: project.sourceBranch || project.git?.sourceBranch || 'master' }, path, nodeHints: projectNodeHints(path) }
     })
   } catch {
     return []
@@ -1434,7 +1439,7 @@ function readProjectLevels(workspace: WorkspaceRecord): Record<string, ProjectLe
   current = preferNewestProjectLevels(projectLevelsFromHistorySnapshots(snapshots), current)
   for (const project of readProjects(workspace)) {
     const runDir = iterativeRunDirPath(workspace.path, project.name)
-    const audit = readAuditView(runDir)
+    const audit = readCurrentAuditView(runDir) ?? readAuditView(runDir)
     if (audit) {
       const level = auditLevel(audit)
       if (level) current[project.name] = level
@@ -2986,7 +2991,7 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
 
       const baselineModeArgs = proofMode === 'DRAFT'
         ? ['--draft-baseline']
-        : ['--capture-baseline', '--baseline-label', input.label?.trim() || `dependency-flow-${new Date().toISOString().slice(0, 10)}`]
+        : ['--capture-baseline', '--refresh-source-branch', '--baseline-label', input.label?.trim() || `dependency-flow-${new Date().toISOString().slice(0, 10)}`]
 
       // A Draft is a bounded, run-scoped planning artifact: the planner gets
       // a stable runId/workspaceId/projectId and publishes
@@ -3063,7 +3068,7 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
     case 'generate':
       return [{
         label: 'Построение свежего roadmap', command: 'python', cwd: workspace.path,
-        args: [...commonGeneratorArgs, '--history-snapshot-label', input.label?.trim() || 'DepLoom: после итерации'],
+        args: [...commonGeneratorArgs, '--refresh-source-branch', '--history-snapshot-label', input.label?.trim() || 'DepLoom: после итерации'],
         stallWarningMs: 2 * 60_000,
         stallAbortMs: 15 * 60_000,
         // F1: a regeneration must re-apply the saved goal policy, or a
@@ -3074,7 +3079,7 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
     case 'generate-all':
       return [{
         label: 'Актуализация roadmap всех проектов', command: 'python', cwd: workspace.path,
-        args: [generatorPath(), '--project-settings', settingsPath, '--history-snapshot-label', input.label?.trim() || 'DepLoom: все проекты'],
+        args: [generatorPath(), '--project-settings', settingsPath, '--refresh-source-branch', '--history-snapshot-label', input.label?.trim() || 'DepLoom: все проекты'],
         stallWarningMs: 2 * 60_000,
         stallAbortMs: 15 * 60_000,
         // G1: each project runs under its OWN saved goal policy via the
@@ -6998,6 +7003,10 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
       }
     }
   } finally {
+    if (!job.cancelled && (job.action === 'generate-all' || job.action === 'generate')) {
+      try { await refreshWorkspaceAudits?.(job.workspace, job.action === 'generate' ? job.projectName : undefined) }
+      catch (error) { send('flow:job-output', { jobId: job.id, stream: 'system', line: `Current audit refresh failed: ${String(error)}` }) }
+    }
     stopOpenCodeServer(job)
     jobs.delete(job.id)
     send('flow:job-finished', { jobId: job.id, action: job.action, workspaceId: job.workspace.id, projectName: job.projectName, exitCode, error: errorMessage, ...(job.baselineProofMode === 'DRAFT' && job.runId ? { runId: job.runId } : {}), ...(draftResult ? { draftResult } : {}) })
@@ -7234,18 +7243,26 @@ function setupIpc(): void {
     return { state, details: await workspaceDetails(state.workspaces[index]) }
   })
 
-  ipcMain.handle('flow:update-project-branches', async (_event, raw: { workspaceId?: string; projectName: string; branchBase?: string; push?: boolean }) => {
+  ipcMain.handle('flow:update-project-branches', async (_event, raw: { workspaceId?: string; projectName: string; branchBase?: string; sourceBranch?: string; push?: boolean }) => {
     const state = loadState()
     const workspace = findWorkspace(state, raw.workspaceId)
     const branchBase = raw.branchBase?.trim() || 'libs'
     const branchCheck = await spawnCapture('git', ['check-ref-format', '--branch', branchBase], workspace.path)
     if (branchCheck.code !== 0) throw new Error(branchCheck.stderr.trim() || `Некорректное имя ветки: ${branchBase}`)
+    const sourceBranch = raw.sourceBranch !== undefined ? raw.sourceBranch.trim() || 'master' : undefined
+    if (sourceBranch !== undefined) {
+      const sourceCheck = await spawnCapture('git', ['check-ref-format', '--branch', sourceBranch], workspace.path)
+      if (sourceCheck.code !== 0) throw new Error(sourceCheck.stderr.trim() || `Некорректное имя базовой ветки: ${sourceBranch}`)
+    }
     const settingsPath = resolveSettingsPath(workspace)
     if (!existsSync(settingsPath)) throw new Error('settings.project.json не найден.')
     const settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as Record<string, unknown>
     const projects = Array.isArray(settings.projects) ? settings.projects as ProjectSpec[] : []
     const projectIndex = projects.findIndex((project) => project.name === raw.projectName)
     if (projectIndex < 0) throw new Error(`Проект ${raw.projectName} не найден в settings.project.json.`)
+    if (sourceBranch !== undefined) {
+      projects[projectIndex] = { ...projects[projectIndex], ...(projects[projectIndex].sourceBranch !== undefined ? { sourceBranch } : {}), git: { ...projects[projectIndex].git, sourceBranch } }
+    }
     projects[projectIndex] = applyBranchBase(projects[projectIndex], branchBase, raw.push)
     settings.projects = projects
     const temporary = `${settingsPath}.dependency-flow-tmp`
@@ -7275,6 +7292,14 @@ function setupIpc(): void {
     writeFileSync(temporary, `${JSON.stringify(settings, null, 2)}\n`, 'utf8')
     renameSync(temporary, settingsPath)
     return { state, details: await workspaceDetails(workspace) }
+  })
+  ipcMain.handle('flow:list-project-branches', async (_event, input: { workspaceId?: string; projectName: string }) => {
+    const workspace = findWorkspace(loadState(), input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    const remote = project.gitRemote || project.git?.remote || 'origin'
+    const result = await spawnCapture('git', ['-C', project.path, 'for-each-ref', '--format=%(refname)', 'refs/heads', `refs/remotes/${remote}`], project.path, 15_000)
+    if (result.code !== 0) throw new Error(result.stderr.trim() || 'BRANCH_LIST_UNAVAILABLE')
+    return projectBranchNames(result.stdout, remote)
   })
   ipcMain.handle('flow:list-node-versions', async () => {
     // Discovery runs in the main process via the Python runtime module; the
@@ -7713,19 +7738,19 @@ function setupIpc(): void {
 
   const iterativeStepInFlight = new Set<string>()
   const initialAuditJobs = new Map<string, { identity: string; promise: Promise<void>; finishedAt?: number; error?: string }>()
-  function ensureInitialAudit(workspace: WorkspaceRecord, project: ProjectSpec, runDir: string) {
-    if (existsSync(join(runDir, 'run.json'))) return
+  function ensureInitialAudit(workspace: WorkspaceRecord, project: ProjectSpec, runDir: string, force = false) {
+    if (!force && existsSync(join(runDir, 'run.json'))) return
     const intent = loadBaselineIntent(workspace, project.name)
     const inputs = { projectDir: project.path, projectName: project.name, intent,
-      requestedNode: project.nodeVersion, dashboardState: artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json'),
+      forceRefresh: force, requestedNode: project.nodeVersion, dashboardState: artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json'),
       lagOverrides: readDeliveryJson(artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json'))?.packageOverrides?.[project.name] ?? {} }
-    const inputFiles = ['package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'].map(name => {
+    const inputFiles = ['package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', '.npmrc', '.yarnrc', '.yarnrc.yml'].map(name => {
       const path = join(project.path, name)
-      return existsSync(path) ? [name, statSync(path).mtimeMs, statSync(path).size] : [name]
+      return existsSync(path) ? [name, createHash('sha256').update(readFileSync(path)).digest('hex')] : [name]
     })
-    const identity = JSON.stringify([inputs, inputFiles])
+    const identity = JSON.stringify([{ ...inputs, forceRefresh: undefined }, inputFiles])
     const previous = initialAuditJobs.get(runDir)
-    if (previous && (!previous.finishedAt || previous.identity === identity && Date.now() - previous.finishedAt < (previous.error ? 60_000 : 86_400_000))) return
+    if (previous && (!previous.finishedAt || !force && previous.identity === identity && Date.now() - previous.finishedAt < (previous.error ? 60_000 : 86_400_000))) return
     if (iterativeStepInFlight.has(stepLockKey(workspace.id, project.name))) return
     mkdirSync(runDir, { recursive: true })
     const inputFile = join(runDir, 'current-audit-input.json')
@@ -7745,6 +7770,17 @@ function setupIpc(): void {
       }
       finally { job.finishedAt = Date.now() }
     })()
+  }
+  refreshWorkspaceAudits = async (workspace, projectName) => {
+    for (const project of readProjects(workspace).filter(project => !projectName || project.name === projectName)) {
+      const runDir = iterativeTaskRunDir(workspace, project)
+      // Finish an older collection first: its source may have changed during
+      // refresh, so it cannot substitute for this explicit fresh request.
+      const previous = initialAuditJobs.get(runDir)
+      if (previous && !previous.finishedAt) await previous.promise
+      ensureInitialAudit(workspace, project, runDir, true)
+      await initialAuditJobs.get(runDir)?.promise
+    }
   }
   // P2 (#2): the per-project in-flight lock is scoped to (workspace, project) —
   // the SAME project name living in two workspaces must NOT share a lock: a
@@ -7903,6 +7939,8 @@ function setupIpc(): void {
       progressSummary,
       scopeExpansionIssues,
       audit: { ...readAuditView(runDir), ...(initialAuditJobs.get(runDir)?.error ? { error: initialAuditJobs.get(runDir)?.error } : {}), running: !present && Boolean(initialAuditJobs.get(runDir) && !initialAuditJobs.get(runDir)?.finishedAt) },
+      cohortReviewEnabled: cohortReviewEnabled(runDir),
+      cohortReview: decision?.step === 'materialize' ? pendingCohortReview(runDir) : undefined,
       initialAudit: readDeliveryJson(join(runDir, 'current-audit.json')),
       residualRepair: (() => { const value = readDeliveryJson(join(runDir, 'security-state.json')); return value ? { status: value.status, attempt: value.attempt, reason: value.reason } : undefined })(),
       delivery: readDeliveryView(runDir),
@@ -7925,7 +7963,7 @@ function setupIpc(): void {
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
     const pendingInitialAudit = initialAuditJobs.get(runDir)
-    if (pendingInitialAudit && !pendingInitialAudit.finishedAt) await pendingInitialAudit.promise
+    if (!input.checkOnly && pendingInitialAudit && !pendingInitialAudit.finishedAt) await pendingInitialAudit.promise
     if (input.restart === true || existsSync(join(runDir, 'restart-archive-transaction.json'))) {
       const key = stepLockKey(workspace.id, project.name)
       if (iterativeStepInFlight.has(key)) return { ok: false, step: 'begin', error: 'STEP_IN_PROGRESS' }
@@ -8490,6 +8528,11 @@ function setupIpc(): void {
         publish()
         // Return the exact repair gate; the Electron coordinator dispatches
         // the agent only while the user has enabled autopilot.
+        if (decision.step === 'materialize' && pendingCohortReview(runDir, payload)) {
+          updateAttempt(runDir, { status: 'done', stage: 'drive', lastStep: 'cohort-review', reason: 'Группа зависимостей ожидает согласования' })
+          publish()
+          return { ok: true, steps, stopped: 'cohort-review', reason: 'Группа зависимостей ожидает согласования', attempt: readAttempt(runDir) }
+        }
         if (decision.step === 'agent') {
           // P1.1: keep the human-facing ТЗ fresh at the gate — rebuilt from the
           // current durable state, never a stale C0-bound artifact.
@@ -8562,6 +8605,23 @@ function setupIpc(): void {
     }
   })
   ipcMain.handle('flow:iterative:drive', runIterativeDriveWithAutopilot)
+  ipcMain.handle('flow:iterative:cohort-review', async (_event, input: { workspaceId?: string; projectName: string; enabled?: boolean; candidateId?: string; selected?: string[] }) => {
+    const workspace = findWorkspace(loadState(), input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    const runDir = iterativeTaskRunDir(workspace, project)
+    const key = stepLockKey(workspace.id, project.name)
+    if (iterativeStepInFlight.has(key) || iterativeAutopilot.hasSession(input)) return { ok: false, error: 'STEP_IN_PROGRESS' }
+    if (typeof input.enabled === 'boolean') { saveCohortReviewEnabled(runDir, input.enabled); return { ok: true } }
+    const pending = pendingCohortReview(runDir)
+    if (!pending || pending.candidateId !== input.candidateId) return { ok: false, error: 'COHORT_REVIEW_STALE' }
+    iterativeStepInFlight.add(key)
+    try {
+      const file = join(runDir, 'cohort-review-input.json')
+      writeFileSync(file, JSON.stringify({ candidateId: input.candidateId, selected: input.selected }), 'utf8')
+      const result = await spawnCapture(resolveExecutable('python'), [join(bundledToolDir(), 'iterative_migration.py'), '--run-dir', runDir, 'review-cohort', '--input-file', file], workspace.path, 120_000)
+      return result.code === 0 ? { ok: true } : { ok: false, error: result.stderr.trim() || result.stdout.trim() || 'COHORT_REVIEW_FAILED' }
+    } finally { iterativeStepInFlight.delete(key) }
+  })
 
   async function startStandaloneOpenCodeServer(cwd: string, savedDatabasePath?: string): Promise<{ url: string; databasePath: string; stop: () => Promise<void> } | undefined> {
     const directory = savedDatabasePath ? dirname(savedDatabasePath) : join(app.getPath('temp'), `iter-agent-opencode-${randomUUID()}`)

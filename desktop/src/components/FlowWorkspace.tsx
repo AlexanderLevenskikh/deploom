@@ -44,7 +44,7 @@ type Props = {
   onOpenPath: (path?: string) => Promise<void>
   onChoosePrompt: (projectName: string) => Promise<void>
   onUpdateWorkspace: (patch: { id: string; agent?: AgentProvider; agentModel?: string }) => Promise<void>
-  onUpdateProjectBranches: (input: { workspaceId?: string; projectName: string; branchBase?: string; push?: boolean }) => Promise<void>
+  onUpdateProjectBranches: (input: { workspaceId?: string; projectName: string; branchBase?: string; sourceBranch?: string; push?: boolean }) => Promise<void>
   onUpdateProjectNode: (input: { workspaceId?: string; projectName: string; nodeVersion?: string }) => Promise<void>
   onListNodeVersions: () => Promise<string[]>
   onListAgentModels: (agentProvider: AgentProvider, cwd?: string) => Promise<string[]>
@@ -182,6 +182,18 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   const acceptanceLabel = acceptanceAccepted ? 'ACCEPTED' : acceptanceNeedsRemediation ? 'REMEDIATION_REQUIRED' : 'UNKNOWN'
   const configuredBranch = project.git?.baseBranch || project.git?.branchPrefix || 'libs'
   const [branchBase, setBranchBase] = useState(configuredBranch)
+  const configuredSourceBranch = project.git?.sourceBranch || 'master'
+  const [sourceBranch, setSourceBranch] = useState(configuredSourceBranch)
+  const gitSettingsSaves = useRef(Promise.resolve())
+  const [branchSuggestions, setBranchSuggestions] = useState<string[]>([])
+  const [branchListError, setBranchListError] = useState<string>()
+  useEffect(() => {
+    let alive = true
+    setBranchSuggestions([]); setBranchListError(undefined)
+    void window.dependencyFlow?.listProjectBranches({ workspaceId: details.workspace.id, projectName: project.name }).then(branches => { if (alive) setBranchSuggestions(branches) }).catch(error => { if (alive) setBranchListError(String(error)) })
+    return () => { alive = false }
+  }, [details.workspace.id, project.name, project.path])
+  useEffect(() => setSourceBranch(configuredSourceBranch), [configuredSourceBranch, project.name])
   const [pushEnabled, setPushEnabled] = useState(Boolean(project.git?.push))
   const configuredNodeVersion = project.nodeVersion ?? ''
   const [nodeVersionDraft, setNodeVersionDraft] = useState(configuredNodeVersion)
@@ -273,6 +285,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
     // Draft launch the marker is then re-armed with autoOpen and bound to the
     // exact runId only after the job actually started (ack).
     onResetDraftLaunch(details.workspace.id, project.name, intent.proofMode === 'DRAFT' ? autoOpenPrompt : false, intent.proofMode)
+    await persistGitSettings()
     const started = await onRun({ action: 'baseline', workspaceId: details.workspace.id, projectName: project.name, target: effectiveTarget, label, releaseBranch, gateCommand, baselineResume: effectiveBaselineResume, baselineIntent: intent, commitMessage: `chore(deps): save ${project.name} roadmap state` })
     // A failed start must not arm the completion banner or close the intent
     // dialog: runAction already surfaced the error to the user, and the marker
@@ -330,6 +343,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
     }
     const noteToSend = stage.action === 'agent' && !restartMigration ? agentNote.trim() || undefined : undefined
     await persistAgentModel()
+    await persistGitSettings()
     await onRun({ action: stage.action, workspaceId: details.workspace.id, projectName: project.name, target, label, releaseBranch, gateCommand, resumeAgent, restartMigration, baselineResume: stage.action === 'baseline' ? (baselineResume ?? 'auto') : undefined, agentNote: noteToSend, commitMessage: `chore(deps): save ${project.name} roadmap state` })
     if (noteToSend) setAgentNote('')
   }
@@ -363,21 +377,25 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   }
 
 
-  const persistGitSettings = async (nextBranch = branchBase, nextPush = pushEnabled) => {
+  const persistGitSettings = async (nextBranch = branchBase, nextPush = pushEnabled, nextSource = sourceBranch) => {
     const normalizedBranch = nextBranch.trim() || 'libs'
     setBranchBase(normalizedBranch)
     setPushEnabled(nextPush)
     try {
-      await onUpdateProjectBranches({
+      const save = gitSettingsSaves.current.catch(() => {}).then(() => onUpdateProjectBranches({
         workspaceId: details.workspace.id,
         projectName: project.name,
         branchBase: normalizedBranch,
+        sourceBranch: nextSource.trim() || 'master',
         push: nextPush,
-      })
+      }))
+      gitSettingsSaves.current = save
+      await save
     } catch (error) {
       setBranchBase(configuredBranch)
+      setSourceBranch(configuredSourceBranch)
       setPushEnabled(Boolean(project.git?.push))
-      window.alert(error instanceof Error ? error.message : String(error))
+      throw error
     }
   }
 
@@ -594,7 +612,8 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
       <section className="roadmap-card migration-launch-settings"><header className="roadmap-card-header"><div><strong>{text('Настройки запуска', 'Run settings')}</strong><span>{text('Агент и модель используются для исправлений. Выберите их до запуска; работа агента может расходовать токены.', 'Agent and model are used for repairs. Choose them before starting; agent work may consume tokens.')}</span></div></header>
       <fieldset className="project-facts" disabled={active || scenarioSignal?.running}>
         <div><span>{t('flow.projectPath')}</span><strong title={project.path}>{project.path}</strong></div>
-        <div><span>{t('common.branch')}</span><div className="git-plan-control"><input aria-label={t('flow.updateBranch')} value={branchBase} onChange={(event) => setBranchBase(event.target.value)} onBlur={() => void persistGitSettings()} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }} placeholder="libs" /><label className="push-toggle" title={t('flow.pushTitle')}><input type="checkbox" checked={pushEnabled} onChange={(event) => void persistGitSettings(branchBase, event.target.checked)} />Push</label></div></div>
+        <div><span>{t('common.branch')}</span><div className="git-plan-control"><ModelPicker ariaLabel={t('flow.updateBranch')} value={branchBase} options={branchSuggestions} onChange={setBranchBase} onCommit={value => persistGitSettings(value).catch(error => window.alert(String(error)))} placeholder="libs" /><label className="push-toggle" title={t('flow.pushTitle')}><input type="checkbox" checked={pushEnabled} onChange={(event) => void persistGitSettings(branchBase, event.target.checked).catch(error => window.alert(String(error)))} />Push</label></div></div>
+        <div><span>{text('Базовая ветка для актуализации / Baseline', 'Source branch for refresh / Baseline')}</span><ModelPicker ariaLabel={text('Базовая ветка', 'Baseline source branch')} value={sourceBranch} options={branchSuggestions} onChange={setSourceBranch} onCommit={value => persistGitSettings(branchBase, pushEnabled, value).catch(error => window.alert(String(error)))} placeholder="master" title={text('Актуализация и проверенный Baseline берут исходное состояние из этой ветки. Непринятые изменения не удаляются; защита Git может остановить переключение.', 'Refresh and verified Baseline use this source branch. Local changes are preserved; the Git guard can block switching.')} />{branchListError ? <span className="error-text" role="alert">{branchListError}</span> : null}</div>
         <div><span>{t('flow.workspace')}</span><strong className={details.git.dirty ? 'warning-text' : 'success-text'}>{details.git.dirty ? t('flow.workspaceDirty', { count: details.git.summary.length }) : t('flow.workspaceClean')}</strong></div>
         <div><span>{t('flow.agent')}</span><QuickSelect value={details.workspace.agent} options={[{ value: 'codex', label: 'Codex' }, { value: 'opencode', label: 'OpenCode' }, { value: 'claude', label: 'Claude' }]} onChange={(value) => void onUpdateWorkspace({ id: details.workspace.id, agent: value as AgentProvider })} ariaLabel={t('flow.agent')} /></div>
         <div><span>{t('flow.model')}</span><ModelPicker value={agentModel} options={modelSuggestions} onChange={setAgentModel} onCommit={value => persistAgentModel(value).catch(error => window.alert(error instanceof Error ? error.message : String(error)))} placeholder={t('flow.modelDefault')} ariaLabel={t('flow.modelAria')} title={t('flow.modelTitle')} />{modelValidationError ? <span className="error-text" role="alert">{modelValidationError}</span> : null}</div>
@@ -622,7 +641,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         onAttempt={onIterativeAttempt}
         onCancel={onIterativeCancel}
         liveAttempt={liveIterativeAttempt}
-        onBeforeStart={async () => { await validateAgentSelection(); await persistAgentModel(); await persistNodeVersion(nodeVersionDraft) }}
+        onBeforeStart={async () => { await validateAgentSelection(); await persistAgentModel(); await persistNodeVersion(nodeVersionDraft); await persistGitSettings() }}
         onConfigureScope={() => void openBaselineIntentDialog('prepare', 'auto')}
         onOpenPath={onOpenPath}
         // P1#1: the panel mirrors the one main action to the hero and must not

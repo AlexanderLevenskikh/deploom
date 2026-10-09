@@ -29,7 +29,7 @@ def audit_policy_status(report):
     # A successful audit CLI proves collection, not compliance with the goal.
     audit = report.get("audit") or {}
     policy = report.get("policy") or {}
-    if report.get("auditComplete") is not True or report.get("lagComplete") is not True:
+    if report.get("auditComplete") is not True:
         return "UNKNOWN"
     engine = audit.get("engine")
     if engine == "yarn-inventory":
@@ -67,5 +67,13 @@ def audit_policy_status(report):
             failed = failed or totals[severity] > policy[key]
     green = policy["targetLevel"] == "green"
     failed = failed or (green and policy["maxKnownHigh"] != 0)
-    failed = failed or audit["lagOkPct"] < (100 if green else policy["minLagOkPct"])
-    return "FAIL" if failed else "PASS"
+    lag_target = 100 if green else policy["minLagOkPct"]
+    lag_complete = report.get("lagComplete") is True
+    if lag_complete:
+        failed = failed or audit["lagOkPct"] < lag_target
+    elif _number(audit.get("lagTotal"), 1) and _number(audit.get("lagOk")) and _number(audit.get("lagUnknown")):
+        # Even the best possible value of unknown publication dates cannot
+        # rescue this goal. Negative evidence is useful; acceptance still
+        # requires complete canonical evidence for every selected metric.
+        failed = failed or 100 * (audit["lagOk"] + audit["lagUnknown"]) / audit["lagTotal"] < lag_target
+    return "FAIL" if failed else "PASS" if lag_complete else "UNKNOWN"

@@ -448,6 +448,8 @@ export type IterativeStatusOutcome = {
   staleReason?: string
   phase?: string
   decision?: IterativeRunnerDecision
+  cohortReviewEnabled?: boolean
+  cohortReview?: { candidateId: string; checkpointId: string; packages: Array<{ name: string; current: string; target: string }>; atomicGroups?: string[][] }
   scopeExpansionIssues?: Array<{ packages: string[]; proposals: string[]; reason: string; nextAction: string; packageCount?: number; maxPackages?: number }>
   workingCheckout?: { path: string; kind: 'trial' | 'checkpoint' | 'project'; checkpointId?: string }
   stopDetail?: { kind: 'repair-timeout'; packageCount: number; recoverable: boolean; auditStatus: string }
@@ -481,7 +483,7 @@ export type IterativeDriveOutcome = {
   autopilot?: { stopped: string; error?: string }
   ok: boolean
   steps: string[]
-  stopped: 'agent-gate' | 'finished' | 'error' | 'time-budget' | 'iteration-budget' | 'canceled' | 'infra-blocked'
+  stopped: 'cohort-review' | 'agent-gate' | 'finished' | 'error' | 'time-budget' | 'iteration-budget' | 'canceled' | 'infra-blocked'
   phase?: string
   step?: string
   reason?: string
@@ -564,7 +566,8 @@ export type DependencyFlowApi = {
   removeProject: (input: { workspaceId?: string; projectName: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   selectWorkspace: (workspaceId: string) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   updateWorkspace: (input: Partial<WorkspaceRecord> & { id: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
-  updateProjectBranches: (input: { workspaceId?: string; projectName: string; branchBase?: string; push?: boolean }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
+  listProjectBranches: (input: { workspaceId?: string; projectName: string }) => Promise<string[]>
+  updateProjectBranches: (input: { workspaceId?: string; projectName: string; branchBase?: string; sourceBranch?: string; push?: boolean }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   listNodeVersions: () => Promise<{ runtimes: string[] }>
   updateProjectNode: (input: { workspaceId?: string; projectName: string; nodeVersion?: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   refreshWorkspace: () => Promise<{ state: DesktopState; details: WorkspaceDetails }>
@@ -579,6 +582,7 @@ export type DependencyFlowApi = {
   saveIterativeTask: (input: { workspaceId?: string; projectName: string; language?: string }) => Promise<IterativeTaskActionOutcome>
   setIterativeAutopilot: (input: { workspaceId?: string; projectName: string; enabled: boolean }) => Promise<{ ok: boolean; active: boolean }>
   iterativeStatus: (input: { workspaceId?: string; projectName: string }) => Promise<IterativeStatusOutcome>
+  reviewIterativeCohort: (input: { workspaceId?: string; projectName: string; enabled?: boolean; candidateId?: string; selected?: string[] }) => Promise<{ ok: boolean; error?: string }>
   iterativeDrive: (input: { workspaceId?: string; projectName: string; autopilot?: boolean; retryInfra?: boolean; discardCandidate?: boolean; resumeTerminal?: boolean }) => Promise<IterativeDriveOutcome>
   iterativeBegin: (input: { workspaceId?: string; projectName: string; autopilot?: boolean; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
   iterativeAgent: (input: { workspaceId?: string; projectName: string; autopilot?: boolean; cleanupNotes?: boolean }) => Promise<IterativeAgentOutcome>

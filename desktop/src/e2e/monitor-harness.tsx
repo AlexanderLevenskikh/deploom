@@ -13,10 +13,12 @@ import type { IterativeAttemptView, IterativeStatusOutcome, WorkspaceDetails, St
 import '../index.css'
 import '../App.css'
 
+const qaCohort = new URLSearchParams(window.location.search).has('cohort')
 const qaAudit = new URLSearchParams(location.search).get('audit')
 const initialAudit = { status: 'FAIL', auditComplete: true, generatedAt: new Date(Date.now() - 600_000).toISOString(), lagOkPct: 68, lagOk: 68, lagTotal: 100, lagUnknown: 0, packageTotals: { critical: 1, high: 7 }, policy: { targetLevel: 'yellow', maxKnownHigh: 1, minLagOkPct: 80 }, evidenceRef: 'C:/demo/run/audit/initial', vulnerablePackages: [{ package: 'shell-quote', severity: 'critical' }] }
-const qaFields: Partial<IterativeStatusOutcome> = qaAudit ? {
-  audit: qaAudit === 'final' ? { ...initialAudit, status: 'PASS', checkpointId: 'C4', generatedAt: new Date().toISOString(), packageTotals: { critical: 0, high: 1 }, lagOkPct: 92.7, lagOk: 89, lagTotal: 96, vulnerablePackages: [], requiredTargets: [{ package: '@example/icons', current: '5.0.0', target: '5.0.0', met: true }], keptPackages: ['frozen-lib'] } : qaAudit === 'unknown' ? { ...initialAudit, status: 'UNKNOWN', stale: true, auditComplete: false, checkpointId: 'C4' } : initialAudit,
+const qaFields: Partial<IterativeStatusOutcome> = qaAudit || qaCohort ? {
+  ...(qaCohort ? { present: true, phase: 'PLANNING', inFlight: false, cohortReviewEnabled: true, cohortReview: { candidateId: 'review-1', checkpointId: 'C1', packages: [{name:'linked-one',current:'1.0.0',target:'2.0.0'}, {name:'linked-two',current:'1.0.0',target:'2.0.0'}, {name:'independent',current:'1.0.0',target:'3.0.0'}], atomicGroups: [['linked-one','linked-two']] } } : {}),
+  audit: qaAudit === 'partial' ? { ...initialAudit, status: 'UNKNOWN', auditComplete: false, securityComplete: true, lagComplete: false, lagUnknown: 1, unknownPackages: [{package:'private-lib',version:'2.0.0',reason:'Registry does not return publication date'}] } : qaAudit === 'final' ? { ...initialAudit, status: 'PASS', checkpointId: 'C4', generatedAt: new Date().toISOString(), packageTotals: { critical: 0, high: 1 }, lagOkPct: 92.7, lagOk: 89, lagTotal: 96, vulnerablePackages: [], requiredTargets: [{ package: '@example/icons', current: '5.0.0', target: '5.0.0', met: true }], keptPackages: ['frozen-lib'] } : qaAudit === 'unknown' ? { ...initialAudit, status: 'UNKNOWN', stale: true, auditComplete: false, checkpointId: 'C4' } : initialAudit,
   initialAudit, runDirectory: 'C:/demo/run', artifactsDirectory: 'C:/demo/run/reports', iterationDirectory: 'C:/demo/run/trial/workspace',
   ...(qaAudit === 'final' ? { present: true, phase: 'TERMINAL', inFlight: false, decision: { step: 'finish', phase: 'TERMINAL', reason: 'COMPLETE', satisfied: true }, workingCheckout: { path: 'C:/demo/run/sources/C4/tree', kind: 'checkpoint', checkpointId: 'C4' }, delivery: { status: 'done', branch: 'codex/upgrade', workspaceRoot: 'C:/demo/run/delivery/workspace', commits: ['a1b2c3d chore(deps): update linked cohort', 'c3d4e5f refactor(icons): adapt component API'] } } : {}),
 } : {}
@@ -34,6 +36,8 @@ const outcome = async () => ({ ok: true })
 const models = async () => ['default']
 const getIntent: ComponentProps<typeof FlowWorkspace>['onGetBaselineIntentPlan'] = async () => ({ candidates: [], intent: { schemaVersion: 2, policies: {}, controlMode: 'AUTONOMOUS', targetLevel: 'yellow' } })
 
+window.dependencyFlow = { ...window.dependencyFlow, listProjectBranches: async () => ['master', 'develop', 'libs', 'feature/icons'] } as typeof window.dependencyFlow
+
 function Harness() {
   const [qaProvider, setQaProvider] = useState<'codex' | 'opencode' | 'claude'>('codex')
   const [showWorkspace, setShowWorkspace] = useState(false)
@@ -46,7 +50,7 @@ function Harness() {
   const canceled = useRef(false)
   const coordinator = useRef(createIterativeAutopilot(s => s.projectName))
   const { setLanguage } = useLanguage()
-  const [attempt, setAttempt] = useState<IterativeAttemptView>({ attemptId: 'current-1', projectName: project.name, workspaceId: 'qa', status: qaAudit === 'final' ? 'done' : 'running', stage: qaAudit === 'final' ? 'drive' : 'begin', phase: 'source-materialization: source capture sealed-manifest: files=25362, bytes=4589080824', startedAt: Date.now() - 400_000, lastHeartbeatAt: Date.now(), targetSource: 'discovery', packageProgress: { processed: 12, total: 30 }, stepsDone: [], runCreated: false })
+  const [attempt, setAttempt] = useState<IterativeAttemptView>({ attemptId: 'current-1', projectName: project.name, workspaceId: 'qa', status: qaAudit === 'final' || qaCohort ? 'done' : 'running', stage: qaAudit === 'final' ? 'drive' : 'begin', phase: 'source-materialization: source capture sealed-manifest: files=25362, bytes=4589080824', startedAt: Date.now() - 400_000, lastHeartbeatAt: Date.now(), targetSource: 'discovery', packageProgress: { processed: 12, total: 30 }, stepsDone: [], runCreated: false })
   const current = useRef(attempt)
   current.current = attempt
   const log = useRef('CURRENT_RUN_ONLY: source preparation started\n')
@@ -70,7 +74,7 @@ function Harness() {
     }),
   })
   useEffect(() => {
-    window.dependencyFlow = { ...window.dependencyFlow, setIterativeAutopilot: async input => coordinator.current.setEnabled(input, input.enabled) } as typeof window.dependencyFlow
+    window.dependencyFlow = { ...window.dependencyFlow, listProjectBranches: async () => ['master', 'develop', 'libs', 'feature/icons'], reviewIterativeCohort: async input => { document.documentElement.dataset.cohortSelection = JSON.stringify(input); return { ok: true } }, setIterativeAutopilot: async input => coordinator.current.setEnabled(input, input.enabled) } as typeof window.dependencyFlow
     setLanguage('ru')
     const timer = window.setInterval(() => {
       if (current.current.status !== 'running') return
@@ -109,7 +113,7 @@ function Harness() {
       onMarkDraftLaunched={() => {}} onResetDraftLaunch={() => {}} onAcknowledgeDraftRun={() => {}}
       onClearBaselineDecision={() => {}} onGetBaselineIntentPlan={getIntent} onGetCurrentDraftResult={async () => undefined}
       onRun={async () => undefined} onSendAgentNote={async () => false} onStartAutopilot={noop} onStopAutopilot={noop} onRecoverWithAgent={noop}
-      onOpenDashboard={() => {}} onOpenPath={openQaPath} onChoosePrompt={noop} onUpdateWorkspace={async patch => { if (patch.agent) setQaProvider(patch.agent) }} onUpdateProjectBranches={noop} onUpdateProjectNode={noop}
+      onOpenDashboard={() => {}} onOpenPath={openQaPath} onChoosePrompt={noop} onUpdateWorkspace={async patch => { if (patch.agent) setQaProvider(patch.agent) }} onUpdateProjectBranches={async input => { document.documentElement.dataset.branchSettings = JSON.stringify(input) }} onUpdateProjectNode={noop}
       onListNodeVersions={models} onListAgentModels={models} onGetIterativeTask={getTask} onExportIterativeTask={outcome} onExportLegacyIterativeTask={outcome} onCopyIterativeTask={outcome} onSaveIterativeTask={outcome}
       onIterativeStatus={name => api.current.status(null, { projectName: name })} onIterativeAttempt={api.current.attempt} onIterativeCancel={name => api.current.cancel(null, { projectName: name })}
       onIterativeBegin={(name, input) => api.current.begin(null, { projectName: name, ...input })} onIterativeDrive={(name, autopilot) => api.current.drive(null, { projectName: name, autopilot })} onIterativeAgent={async () => ({ ok: false })}

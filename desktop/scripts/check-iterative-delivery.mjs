@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { pendingCohortReview, saveCohortReviewEnabled } from '../dist-electron/iterative-cohort-review.js'
 import { auditLevel, readAuditView, runDeliveryWorkflow, workflowPrompt, createDeliveryAgentWatchdog } from '../dist-electron/iterative-delivery.js'
 import { decideNextStep } from '../dist-electron/iterative-runner.js'
 import { createIterativeAutopilot } from '../dist-electron/iterative-autopilot.js'
@@ -10,6 +11,21 @@ const root = mkdtempSync(join(tmpdir(), 'deploom-delivery-contract-'))
 const write = (name, value) => writeFileSync(join(root, name), JSON.stringify(value))
 const audit = { status: 'FAIL', auditComplete: true, generatedAt: new Date().toISOString(), packageTotals: { critical: 1, high: 7 }, lagOkPct: 92.7 }
 try {
+  const cohort = { candidateId: 'review-1', baseCheckpointId: 'C1', policyHash: 'policy', stage: 'PLANNED', fullAssignment: { one: '2.0.0' }, delta: { changed: { one: '2.0.0' } } }
+  const reviewPayload = { run: { activeCandidateId: 'review-1', activeCheckpointId: 'C1' }, candidate: cohort, activeCheckpoint: { fullAssignment: { one: '1.0.0' } } }
+  assert.equal(pendingCohortReview(root, reviewPayload).packages[0].current, '1.0.0')
+  write('cohort-approval.json', { ...cohort })
+  assert.equal(pendingCohortReview(root, reviewPayload), undefined)
+  assert.ok(pendingCohortReview(root, { ...reviewPayload, candidate: { ...cohort, fullAssignment: { one: '3.0.0' } } }), 'changed assignment invalidates approval')
+  assert.ok(pendingCohortReview(root, { ...reviewPayload, activeCheckpoint: { ...reviewPayload.activeCheckpoint, sourceSnapshotKey: 'different-source' } }), 'source repair invalidates approval')
+  saveCohortReviewEnabled(root, false)
+  assert.equal(pendingCohortReview(root, reviewPayload), undefined)
+  saveCohortReviewEnabled(root, true)
+  assert.equal(auditLevel({ ...audit, status: 'UNKNOWN', auditComplete: false, securityComplete: true }).status, 'red', 'confirmed critical is visible despite incomplete lag')
+  const auditPolicyReady = { run: { phase: 'READY', activeCandidateId: null }, activeCheckpoint: { checkpointId: 'C1', status: 'VERIFIED', fullAssignment: {}, audit: { status: 'UNKNOWN' } }, config: { goalMode: 'audit-policy' } }
+  assert.equal(decideNextStep(root, auditPolicyReady).step, 'audit', 'every accepted cohort gets an audit before further planning')
+  assert.equal(decideNextStep(root, { ...auditPolicyReady, goalSatisfied: true, activeCheckpoint: { ...auditPolicyReady.activeCheckpoint, audit: { status: 'PASS', generatedAt: new Date().toISOString() } } }).step, 'finish', 'goal attainment stops planning')
+  assert.equal(decideNextStep(root, { ...auditPolicyReady, goalSatisfied: true, run: { phase: 'PLANNING', activeCandidateId: 'old-proposal' }, candidate: { candidateId: 'old-proposal', stage: 'PLANNED' }, activeCheckpoint: { ...auditPolicyReady.activeCheckpoint, audit: { status: 'PASS' } } }).step, 'finish', 'an old unused proposal cannot extend an achieved goal')
   let tick = 0
   const guard = createDeliveryAgentWatchdog(() => tick, 45, 180)
   tick = 40; guard.observe(JSON.stringify({type:'tool_use',part:{type:'tool',state:{status:'completed'}}}))
