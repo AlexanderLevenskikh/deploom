@@ -281,6 +281,8 @@ class SameRunResolverSeedStore:
                 prefix="dependency-flow-resolver-seed-",
                 dir=str(base) if base is not None else None,
             ))
+            from verification_storage_maintenance import register_trial_owner
+            register_trial_owner(self._root)
             return self._root
 
     @staticmethod
@@ -560,6 +562,9 @@ class SameRunResolverSeedStore:
             self._miss_reasons.clear()
         if root is not None:
             shutil.rmtree(root, ignore_errors=True)
+            if root.exists():
+                from verification_storage_maintenance import retire_trial
+                retire_trial(root)
 
     def miss_reason(self, key: str) -> str:
         with self._lock:

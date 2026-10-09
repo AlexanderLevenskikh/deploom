@@ -98,7 +98,7 @@ function App() {
 
       {showAddProject ? <AddProjectDialog workspaceId={details.workspace.id} onClose={() => setShowAddProject(false)} onPickDirectory={flow.pickDirectory} onSubmit={flow.addProject} /> : null}
 
-      {showStorage ? <StorageMaintenanceDialog onClose={() => setShowStorage(false)} onMaintenance={action => window.dependencyFlow!.storageMaintenance(action)} /> : null}
+      {showStorage ? <StorageMaintenanceDialog onClose={() => setShowStorage(false)} onMaintenance={(action, operationId) => window.dependencyFlow!.storageMaintenance(action, operationId)} onProgress={window.dependencyFlow!.onStorageProgress} /> : null}
       {showWorkspaceDialog ? <WorkspaceDialog onClose={() => setShowWorkspaceDialog(false)} onPickDirectory={flow.pickDirectory} onConnectExisting={(path, agent) => flow.registerExisting(path, agent)} onCreate={flow.cloneWorkspace} /> : null}
 
       <footer className="status-bar">

@@ -8,7 +8,7 @@ import { StorageMaintenanceDialog } from '../components/StorageMaintenanceDialog
 import { createIterativeAutopilot } from '../../electron/iterative-autopilot'
 import { FlowWorkspace } from '../components/FlowWorkspace'
 import { LanguageProvider, useLanguage } from '../i18n'
-import type { IterativeAttemptView, IterativeStatusOutcome, WorkspaceDetails } from '../types'
+import type { IterativeAttemptView, IterativeStatusOutcome, WorkspaceDetails, StorageProgress } from '../types'
 import '../index.css'
 import '../App.css'
 
@@ -37,6 +37,7 @@ function Harness() {
   const [qaProvider, setQaProvider] = useState<'codex' | 'opencode' | 'claude'>('codex')
   const [showWorkspace, setShowWorkspace] = useState(false)
   const [showStorage, setShowStorage] = useState(false)
+  const storageProgress = useRef<((event: StorageProgress) => void) | undefined>(undefined)
   const storageCleaned = useRef(false)
   const checked = useRef(false)
   const present = useRef(false)
@@ -111,10 +112,13 @@ function Harness() {
       onIterativeStatus={name => api.current.status(null, { projectName: name })} onIterativeAttempt={api.current.attempt} onIterativeCancel={name => api.current.cancel(null, { projectName: name })}
       onIterativeBegin={(name, input) => api.current.begin(null, { projectName: name, ...input })} onIterativeDrive={(name, autopilot) => api.current.drive(null, { projectName: name, autopilot })} onIterativeAgent={async () => ({ ok: false })}
       logs={[{ jobId: 'old', stream: 'stderr', line: 'SAVED_OLD_FLOW_ONLY: historical error' }]} />
-    {showStorage ? <StorageMaintenanceDialog onClose={() => setShowStorage(false)} onMaintenance={async action => {
+    {showStorage ? <StorageMaintenanceDialog onClose={() => setShowStorage(false)} onProgress={handler => { storageProgress.current = handler; return () => { storageProgress.current = undefined } }} onMaintenance={async (action, operationId) => {
       const eligible = storageCleaned.current ? 0 : 3
-      if (action === 'clean') storageCleaned.current = true
-      return { root: 'D:/QA/verification', filesystem: 'refs', freeBytes: 20 * 1024 ** 3, eligible, removed: action === 'clean' ? eligible : 0, failed: 0, protected: 0 }
+      const clean = action === 'clean'
+      storageProgress.current?.({ operationId, stage: clean ? 'clean' : 'scan', path: 'E:/QA/verification/trials/example', processed: 50, total: 100, percent: clean ? 50 : null, files: 50, bytes: 1024 })
+      await new Promise(resolve => setTimeout(resolve, 1000))
+      if (clean) storageCleaned.current = true
+      return { root: 'E:/QA/verification', items: [{ path: 'E:/QA/verification/trials/example', category: 'verification-trials', reason: '', eligible: true, bytes: 3 * 1024 ** 3, files: 100 }, { path: 'C:/QA/.dependency-roadmap/iterative/demo/sources/C6', category: 'current-run', reason: 'current-checkpoint-or-run-data', eligible: false, bytes: 5 * 1024 ** 3, files: 500 }], volumes: [{ path: 'E:/', freeBytes: (clean ? 23 : 20) * 1024 ** 3 }, { path: 'C:/', freeBytes: 18 * 1024 ** 3 }], eligible, eligibleBytes: 3 * 1024 ** 3, protectedBytes: 5 * 1024 ** 3, removed: clean ? eligible : 0, failed: 0, protected: 1, reclaimedBytes: clean ? 3 * 1024 ** 3 : 0, ...(clean ? { results: [{ path: 'E:/QA/verification/trials/example', status: 'removed' }] } : {}) }
     }} /> : null}
     {showWorkspace ? <WorkspaceDialog onClose={() => setShowWorkspace(false)} onPickDirectory={async () => 'C:/demo/workspaces'} onConnectExisting={async () => {}} onCreate={async () => {}} /> : null}
   </main>

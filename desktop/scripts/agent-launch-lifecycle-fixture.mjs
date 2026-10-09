@@ -13,6 +13,7 @@ import * as attempts from '../dist-electron/iterative-attempt.js';
 import * as commands from '../dist-electron/agent-command.js';
 import * as errors from '../dist-electron/agent-launch-errors.js';
 import { createIterativeAutopilot } from '../dist-electron/iterative-autopilot.js';
+import { StorageCleanupController } from '../dist-electron/storage-cleanup.js';
 import { extractAgentSessionId } from '../dist-electron/agent-session.js';
 import { spawnIterativeStreamed } from '../dist-electron/iterative-stream.js';
 
@@ -50,6 +51,7 @@ function fixture() {
   let beforeChild;
   let serverError;
   const bindings = {
+    storageCleanup: new StorageCleanupController(async () => { throw Error('Unexpected cleanup in migration fixture'); }, () => [], () => false),
     ...agents, ...attempts, ...commands, ...errors, ...delivery, readDeliveryJson: delivery.readJson, iterativeAutopilot,
     existsSync, join, readFileSync, writeFileSync, extractAgentSessionId,
     loadState: () => ({}), findWorkspace: () => workspace, autopilotWorkspace: () => workspace, findProject: () => project,

@@ -974,6 +974,8 @@ def _same_run_private_prepared_root(parent: Optional[Path] = None) -> Path:
             prefix="dependency-flow-same-run-prepared-",
             dir=str(base) if base is not None else None,
         ))
+        from verification_storage_maintenance import register_trial_owner
+        register_trial_owner(created)
         _SAME_RUN_PRIVATE_PREPARED_ROOT = created
         return created
 
@@ -1275,6 +1277,9 @@ def _cleanup_same_run_private_prepared_snapshots() -> None:
             pass
     if root is not None:
         shutil.rmtree(root, ignore_errors=True)
+        if root.exists():
+            from verification_storage_maintenance import retire_trial
+            retire_trial(root)
 
 def reset_same_run_verification_reuse() -> None:
     """Start a new Baseline run without restoring process-local trust."""

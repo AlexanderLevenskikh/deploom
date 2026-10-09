@@ -146,3 +146,11 @@ Desktop автоматически передаёт в release все `release.f
 ## Security
 
 Renderer работает с `nodeIntegration: false`, `contextIsolation: true` и sandboxed CommonJS preload. Команды запускаются без shell. Доступ к dashboard ограничен выбранным workspace через custom protocol. Git push, baseline и release остаются явными действиями пользователя.
+
+### Storage inspection and safe cleanup
+
+The storage dialog discovers the configured verification root and every registered workspace; it does not assume a particular drive letter. Inspection is read-only and lists file volume, free space by volume, cleanup eligibility, and protection reasons. Shared ReFS blocks and compression mean file volume is an estimate rather than guaranteed reclaimed disk space.
+
+Explicit cleanup uses the last successful preview and rechecks ownership, paths, references, and the complete tree identity before deletion. It reports live progress and the percentage of files processed, then refreshes actual free space. Failures and protected folders stay visible; the next cleanup requires another inspection. Inspection uses an indeterminate bar because its total is not known yet.
+
+Only old detached verification/prepared garbage and dead-owner private temporary roots are eligible. Archived trial workspaces additionally require a completed run, preserved sealed checkpoint sources, no saved candidate/agent session, no current references, and the current run lock. Current runs, checkpoint source snapshots, archive history/reports, delivery branches, package caches, unknown legacy folders, junctions, symlinks, and shared hardlinked files are retained. New process-local resolver/prepared roots record their owner so abandoned copies can be identified conservatively. Stop active migrations before cleanup; new migration starts are blocked while cleaning.

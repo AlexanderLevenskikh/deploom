@@ -1022,3 +1022,23 @@ textarea::placeholder {
   .app-grid { grid-template-columns: 200px minmax(0, 1fr); }
   .human-flow-metrics { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
 }
+
+.storage-dialog { width: min(920px, calc(100vw - 32px)); max-height: calc(100vh - 48px); overflow-y: auto; grid-template-columns: minmax(0, 1fr); }
+.storage-metrics { display: flex; gap: 12px; flex-wrap: wrap; }
+.storage-metrics p { display: flex; flex: 1 1 160px; flex-direction: column; padding: 14px; border: 1px solid var(--border); border-radius: 8px; }
+.storage-metrics strong { font-size: 22px; }
+.storage-metrics span, .storage-path small { color: var(--muted); font-size: 12px; }
+.storage-progress { display: grid; gap: 8px; padding: 14px; background: var(--surface); border-radius: 8px; }
+.storage-progress progress { width: 100%; height: 14px; accent-color: var(--blue); }
+.storage-path { overflow-wrap: anywhere; min-width: 0; }
+.storage-path small, .storage-table small { display: block; }
+.storage-table-scroll { overflow-x: auto; margin-bottom: 14px; }
+.storage-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.storage-table th, .storage-table td { padding: 9px; text-align: left; border-bottom: 1px solid var(--border); }
+.storage-folder-list { max-height: 240px; overflow-y: auto; margin-top: 10px; }
+.storage-folder-list > div { display: flex; gap: 8px; padding: 7px 0; font-size: 12px; }
+
+.storage-dialog > * { min-width: 0; }
+.storage-dialog .dialog-actions { flex-wrap: wrap; }
+.storage-dialog .dialog-actions button { white-space: normal; }
+@media (max-width: 600px) { .storage-dialog .dialog-actions button { width: 100%; } }

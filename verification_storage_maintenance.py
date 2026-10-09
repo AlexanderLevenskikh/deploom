@@ -37,6 +37,9 @@ def register_trial_owner(path):
 def retire_trial(path):
     # Called only by the process that created this private tree, after use.
     if not _plain_directory(path): return
+    # A partially failed rmtree may already have removed the owner marker.
+    # Re-establish it before detaching the remaining process-owned tree.
+    register_trial_owner(path)
     target = path.with_name(f'.deploom-trial-trash-{path.name}-{os.getpid()}-{time.time_ns()}')
     try: os.rename(path, target)
     except OSError: pass
@@ -63,7 +66,9 @@ MIN_AGE_SECONDS = 24 * 3600
 HOT_SWEEP_BYTES = 64 * 1024          # ~64 KiB of file content counted
 HOT_SWEEP_FILES = 1024               # ~1024 entries lstat'ed
 HOT_SWEEP_SECONDS = 0.5              # ~0.5 s of traversal wall
-MAINT_SWEEP_BYTES = 512 * 1024 * 1024
+# Maintenance scans metadata, not file contents. A byte cap permanently
+# stranded multi-GiB trees; retain entry/time bounds instead.
+MAINT_SWEEP_BYTES = 2**63 - 1
 MAINT_SWEEP_FILES = 200_000
 MAINT_SWEEP_SECONDS = 120.0
 

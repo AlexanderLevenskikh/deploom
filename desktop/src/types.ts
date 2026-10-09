@@ -1,3 +1,7 @@
+export type StorageProgress = { operationId: string; stage: 'scan' | 'validate' | 'clean' | 'done'; path: string; processed: number; total: number; percent: number | null; files: number; bytes: number }
+export type StorageItem = { path: string; category: string; reason: string; eligible: boolean; bytes: number; files: number }
+export type StorageResult = { root: string; items: StorageItem[]; volumes: { path: string; freeBytes: number }[]; eligible: number; eligibleBytes: number; protectedBytes: number; removed: number; failed: number; protected: number; reclaimedBytes: number; results?: { path: string; status: string; reason?: string }[] }
+
 export type AgentProvider = 'codex' | 'opencode' | 'claude'
 export type FlowAction = 'preflight' | 'sync-tool' | 'baseline' | 'generate' | 'generate-all' | 'audit' | 'agent' | 'recover' | 'release' | 'commit-state' | 'push-workspace'
 export type TargetLevel = 'yellow' | 'green'
@@ -587,7 +591,8 @@ export type DependencyFlowApi = {
   setNotificationsEnabled: (enabled: boolean) => Promise<{ enabled: boolean }>
   notifyAutopilotComplete: (input: { projectName: string; published: boolean }) => Promise<void>
   installUpdate: () => Promise<void>
-  storageMaintenance: (action: 'inspect' | 'clean') => Promise<{ root: string; filesystem: string; freeBytes: number; eligible: number; removed: number; failed: number; protected: number }>
+  storageMaintenance: (action: 'inspect' | 'clean', operationId: string) => Promise<StorageResult>
+  onStorageProgress: (handler: (event: StorageProgress) => void) => () => void
   getHardwareSnapshot: () => Promise<HardwareSnapshot>
   getThemePreference: () => Promise<ThemePreference>
   setThemePreference: (preference: ThemePreference) => Promise<{ preference: ThemePreference }>

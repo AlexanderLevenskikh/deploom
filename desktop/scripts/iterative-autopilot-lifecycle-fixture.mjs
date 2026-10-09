@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import ts from 'typescript';
 import { createIterativeAutopilot } from '../dist-electron/iterative-autopilot.js';
+import { StorageCleanupController } from '../dist-electron/storage-cleanup.js';
 import { liveRunWriterPid, readAutopilotState, writeAutopilotState } from '../dist-electron/iterative-autopilot-state.js';
 import * as attempts from '../dist-electron/iterative-attempt.js';
 import * as runner from '../dist-electron/iterative-runner.js';
@@ -70,6 +71,7 @@ function fixture(failures = 0, critical = false, infra = false) {
   };
   let auto;
   const bindings = {
+    storageCleanup: new StorageCleanupController(async () => { throw Error('Unexpected cleanup in migration fixture'); }, () => [], () => false),
     ...agents,...attempts,...runner,parseIterativeFailure, existsSync,join,writeFileSync,
     loadState: () => ({workspaces:[workspace]}),findWorkspace: () => workspace,findProject: () => project,
     iterativeTaskRunDir: () => runDir,readProjects: () => [project],stepLockKey: () => 'w:demo',

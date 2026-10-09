@@ -43,7 +43,12 @@ exportLegacyIterativeTask: (input: { workspaceId?: string; projectName: string }
   notifyAutopilotComplete: (input: { projectName: string; published: boolean }) => ipcRenderer.invoke('flow:notify-autopilot-complete', input),
   installUpdate: () => ipcRenderer.invoke('flow:install-update'),
   getHardwareSnapshot: () => ipcRenderer.invoke('flow:get-hardware-snapshot'),
-  storageMaintenance: (action: 'inspect' | 'clean') => ipcRenderer.invoke('flow:storage-maintenance', action),
+  storageMaintenance: (action: 'inspect' | 'clean', operationId: string) => ipcRenderer.invoke('flow:storage-maintenance', action, operationId),
+  onStorageProgress: (handler: (event: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => handler(payload)
+    ipcRenderer.on('flow:storage-progress', listener)
+    return () => ipcRenderer.removeListener('flow:storage-progress', listener)
+  },
   getThemePreference: () => ipcRenderer.invoke('flow:get-theme-preference'),
   setThemePreference: (preference: string) => ipcRenderer.invoke('flow:set-theme-preference', preference),
   onUpdateStatus: (handler: (event: unknown) => void) => {

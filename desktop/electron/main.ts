@@ -1,6 +1,7 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
 import updaterPackage from 'electron-updater'
 import { isDeterministicToolFailure, isDeterministicSourcePreflightFailure, formatSourceCheckoutDirtyFailure } from './baseline-retry.js'
+import { StorageCleanupController } from './storage-cleanup.js'
 import { baselineFailureMessage } from './baseline-failure.js'
 import { draftArtifactsRoot, draftManifestPath, draftReadFailureText, draftResultStaleness, readDraftResultArtifact, type DraftResultArtifact as ParsedDraftResultArtifact, type DraftReadResult } from './draft-artifact-reader.js'
 import { BASELINE_DECISION_MARKER, extractBaselineDecisionEnvelope } from './migration-baseline-decision.js'
@@ -7918,6 +7919,7 @@ function setupIpc(): void {
   }))
 
   ipcMain.handle('flow:iterative:begin', iterativeAutopilot.register('begin', async (_event, input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
+    storageCleanup.assertMigrationAllowed()
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -8374,6 +8376,7 @@ function setupIpc(): void {
   // every iteration recomputes the decision from the DURABLE Python state, so
   // a killed app simply resumes from where the files say the run stands.
   const runIterativeDriveWithAutopilot = iterativeAutopilot.register('drive', async (_event, input: { workspaceId?: string; projectName: string; autopilot?: boolean; retryInfra?: boolean; discardCandidate?: boolean; resumeTerminal?: boolean }) => {
+    storageCleanup.assertMigrationAllowed()
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -8697,6 +8700,7 @@ function setupIpc(): void {
     reason?: string
     error?: string
   }> => {
+    storageCleanup.assertMigrationAllowed()
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -9294,6 +9298,7 @@ function setupIpc(): void {
   })
 
   ipcMain.handle('flow:run-action', async (_event, input: ActionInput) => {
+    storageCleanup.assertMigrationAllowed()
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -9383,13 +9388,16 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('flow:storage-maintenance', async (_event, action: unknown) => {
-    if (action !== 'inspect' && action !== 'clean') throw new Error('Invalid storage action')
+  const storageCleanup = new StorageCleanupController(async (action, payload, onLine) => {
     const toolDir = bundledToolDir()
-    const result = await spawnIterativeStreamed(toolDir, 'python', [join(toolDir, 'verification_storage_maintenance.py'), action], toolDir, 0, { cancelRequested: () => false, recordLine: () => {}, trimLog: () => {} }, iterativeStreamPlatform)
+    const result = await spawnIterativeStreamed(toolDir, 'python', [join(toolDir, 'storage_cleanup_inventory.py'), action], toolDir, 0,
+      { cancelRequested: () => false, recordLine: () => {}, trimLog: () => {} }, iterativeStreamPlatform, undefined,
+      { stdin: JSON.stringify(payload), onLine })
     if (result.code !== 0) throw new Error(result.stderr || 'Storage maintenance failed')
-    return JSON.parse(result.stdout.trim())
-  })
+    return result.stdout
+  }, () => loadState().workspaces.map(workspace => workspace.path), () => jobs.size > 0 || iterativeStepInFlight.size > 0 || [...initialAuditJobs.values()].some(job => !job.finishedAt))
+  ipcMain.handle('flow:storage-maintenance', async (event, action: unknown, operationId: unknown) =>
+    storageCleanup.maintenance(action, operationId, progress => event.sender.send('flow:storage-progress', progress)))
   ipcMain.handle('flow:get-hardware-snapshot', () => hardwareSnapshot())
   ipcMain.handle('flow:get-theme-preference', () => currentThemePreference())
   ipcMain.handle('flow:set-theme-preference', (_event, value: unknown) => { const state = loadState(); const preference = applyThemePreference(value); saveState({ ...state, themePreference: preference }); return { preference } })
