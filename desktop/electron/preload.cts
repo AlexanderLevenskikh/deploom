@@ -44,6 +44,12 @@ exportLegacyIterativeTask: (input: { workspaceId?: string; projectName: string }
   installUpdate: () => ipcRenderer.invoke('flow:install-update'),
   getHardwareSnapshot: () => ipcRenderer.invoke('flow:get-hardware-snapshot'),
   storageMaintenance: (action: 'inspect' | 'clean', operationId: string) => ipcRenderer.invoke('flow:storage-maintenance', action, operationId),
+  storageStatus: () => ipcRenderer.invoke('flow:storage-status'),
+  onStorageStatus: (handler: (event: unknown) => void) => {
+    const listener = (_event: unknown, status: unknown) => handler(status)
+    ipcRenderer.on('flow:storage-status', listener)
+    return () => ipcRenderer.removeListener('flow:storage-status', listener)
+  },
   onStorageProgress: (handler: (event: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => handler(payload)
     ipcRenderer.on('flow:storage-progress', listener)

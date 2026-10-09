@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { X, FolderOpen } from 'lucide-react'
 import { useLanguage } from '../i18n'
-import type { DependencyFlowApi, StorageProgress, StorageResult } from '../types'
+import type { DependencyFlowApi, StorageProgress, StorageResult, StorageStatus } from '../types'
 
-export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress }: { onClose: () => void; onMaintenance: DependencyFlowApi['storageMaintenance']; onProgress: DependencyFlowApi['onStorageProgress'] }) {
+export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress, status }: { status?: StorageStatus; onClose: () => void; onMaintenance: DependencyFlowApi['storageMaintenance']; onProgress: DependencyFlowApi['onStorageProgress'] }) {
   const { language } = useLanguage()
   const text = (ru: string, en: string) => language === 'ru' ? ru : en
   const [result, setResult] = useState<StorageResult>()
@@ -12,6 +12,13 @@ export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress }:
   const [progress, setProgress] = useState<StorageProgress>()
   const [error, setError] = useState<string>()
   const activeOperation = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    if (!status || status.phase === 'idle') return
+    setBusy(status.phase === 'inspect' || status.phase === 'clean')
+    if (status.action) setAction(status.action)
+    setProgress(status.progress); setResult(status.result); setError(status.error)
+    activeOperation.current = status.phase === 'inspect' || status.phase === 'clean' ? status.operationId : undefined
+  }, [status])
   useEffect(() => onProgress(event => {
     if (event.operationId === activeOperation.current) setProgress(event)
   }), [onProgress])
@@ -29,6 +36,8 @@ export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress }:
   }
   const gib = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} ${text('ГиБ', 'GiB')}`
   const label = (category: string) => ({
+    'retired-materialization': text('Сохранённые рабочие копии', 'Preserved working copies'),
+    'obsolete-upgrade-copy': text('Копии предыдущих проверок', 'Previous verification copies'),
     'verification-trials': text('Временные проверки', 'Temporary verification'),
     'prepared-trash': text('Отсоединённые подготовленные копии', 'Detached prepared copies'),
     'verification-cache': text('Общие кэши', 'Shared caches'),
@@ -60,6 +69,10 @@ export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress }:
     'restart-pending': text('Не завершено архивирование', 'Archival transaction pending'),
     'no-verified-archive-checkpoint': text('Нет сохранённого проверенного результата', 'No saved verified result'),
     'unsafe-path': text('Безопасность пути не подтверждена', 'Path safety unconfirmed'),
+    'unpreserved-materialization-edits': text('Есть изменения без сохранённого снимка', 'Edits without a preserved snapshot'),
+    'unknown-materialization-evidence': text('Не удалось подтвердить сохранность копии', 'Copy preservation could not be verified'),
+    'active-materialization': text('Рабочая копия незавершённой операции', 'Unfinished operation workspace'),
+    'current-verifier-copy': text('Копия текущей версии инструмента', 'Current verifier copy'),
     'scope-changed': text('Изменился состав папок', 'Folder scope changed'),
   }
   const groups = new Map<string, { category: string; volume: string; bytes: number; eligible: number; count: number }>()
@@ -76,8 +89,8 @@ export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress }:
   const stage = progress?.stage === 'clean' ? text('Удаляем подтверждённый мусор', 'Removing confirmed garbage') : progress?.stage === 'validate' ? text('Повторно проверяем папки перед удалением', 'Rechecking folders before deletion') : text('Измеряем папки и проверяем принадлежность', 'Measuring folders and verifying ownership')
   return <div className="dialog-backdrop">
     <section className="dialog workspace-dialog storage-dialog" role="dialog" aria-modal="true" aria-labelledby="storage-title">
-      <div className="dialog-title"><h2 id="storage-title">{text('Хранилище и безопасная очистка', 'Storage and safe cleanup')}</h2><button className="icon-button" aria-label={text('Закрыть', 'Close')} disabled={busy} onClick={onClose}><X size={17} /></button></div>
-      <p>{text('Сначала диагностика. Удаляем только подтверждённые ненужные рабочие копии старше суток. Checkpoints, исходные снимки, отчёты, проекты и ветки результата сохраняются.', 'Inspect first. Remove only confirmed unused working copies older than one day. Checkpoints, source snapshots, reports, projects and result branches are preserved.')}</p>
+      <div className="dialog-title"><h2 id="storage-title">{text('Хранилище и безопасная очистка', 'Storage and safe cleanup')}</h2><button className="icon-button" aria-label={text('Закрыть', 'Close')} onClick={onClose}><X size={17} /></button></div>
+      <p>{text('Очистка работает в фоне, диалог можно закрыть. Удаляем только подтверждённый мусор и рабочие копии, сохранность которых проверена. Checkpoints, исходные снимки, отчёты, проекты и ветки результата сохраняются.', 'Cleanup runs in the background; you can close this dialog. Remove only confirmed garbage and working copies whose preservation was verified. Checkpoints, source snapshots, reports, projects and result branches are preserved.')}</p>
       {busy ? <div className="storage-progress" role="status" aria-live="polite">
         <strong>{stage}{progress?.percent != null && progress.stage === 'clean' ? ` · ${progress.percent}%` : ''}</strong>
         <progress max={100} value={progress?.stage === 'clean' && progress.percent != null ? progress.percent : undefined} aria-label={stage} />

@@ -1084,6 +1084,8 @@ def _capture_once(
             f"container={container}; captureRoot={capture_root}"
         )
     _ALL_CONTAINERS.add(container)
+    from verification_storage_maintenance import register_trial_owner
+    register_trial_owner(container)
     snapshot_root = container / "tree"
     try:
         try:
@@ -1684,12 +1686,12 @@ def reap_orphaned_source_snapshots(
     stop leaves the whole sealed tree behind forever. This reaper is bounded on
     purpose: it does a little work per process rather than an unbounded sweep.
 
-    Liveness is decided by the rename itself. Windows refuses to rename a
-    directory that another process still has open, so a successful atomic
-    rename into a trash name is the proof that nothing is using the container.
-    A container this process owns is never considered. Failing to reap is
-    telemetry, never corruption -- the tree is simply left for a later run.
+    A successful rename does not establish liveness: directory watchers may
+    allow deletion sharing. Require a registered dead owner and reject shared
+    or linked trees before retirement. Unknown legacy containers and live
+    owners are retained. Failing to reap leaves the tree for a later run.
     """
+    from verification_storage_maintenance import dead_trial_owner, _plain_directory, _has_links
     reaped = skipped = failed = 0
     base = Path(tempfile.gettempdir())
     now = time.time()
@@ -1706,6 +1708,12 @@ def reap_orphaned_source_snapshots(
             skipped += 1
             continue
         try:
+            if not all(_plain_directory(p) for p in [container, *container.parents]) or not dead_trial_owner(container):
+                skipped += 1
+                continue
+            if _has_links(container):
+                skipped += 1
+                continue
             age = now - container.stat().st_mtime
         except OSError:
             skipped += 1
@@ -2126,12 +2134,16 @@ def capture_durable_source_snapshot(
         timeout_seconds=timeout_seconds,
         progress=progress,
     )
-    return persist_source_snapshot(
-        snapshot,
-        destination,
-        timeout_seconds=timeout_seconds,
-        progress=progress,
-    )
+    try:
+        return persist_source_snapshot(
+            snapshot, destination, timeout_seconds=timeout_seconds, progress=progress,
+        )
+    finally:
+        # This capture is private to this call. The published durable copy has
+        # its own identity; keeping the temporary 4+ GiB tree until exit is waste.
+        _retire_snapshot_watcher(snapshot)
+        _force_rmtree(snapshot.container)
+        _ALL_CONTAINERS.discard(snapshot.container)
 
 
 def _main() -> int:

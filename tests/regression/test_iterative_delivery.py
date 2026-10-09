@@ -180,6 +180,27 @@ class GitDeliveryTests(unittest.TestCase):
         self.assertEqual((self.repo / "source.txt").read_text(), "original")
         self.assertEqual(d.git(self.repo, "status", "--porcelain"), "")
 
+    def test_absent_sibling_submodule_preserves_gitlink_and_rejects_pointer_drift(self):
+        module=self.root/'module';module.mkdir();(module/'source').write_text('submodule')
+        d.git(module,'init','-b','fixture');d.git(module,'config','user.email','fixture@example.invalid');d.git(module,'config','user.name','Fixture')
+        d.git(module,'add','.');d.git(module,'commit','-m','module')
+        commit=d.git(module,'rev-parse','HEAD')
+        d.git(self.repo,'-c','protocol.file.allow=always','submodule','add',str(module),'src/Selenium')
+        d.git(self.repo,'commit','-am','declare sibling');self.head=d.git(self.repo,'rev-parse','HEAD')
+        self.checkpoint['sourceHead']=self.head;core.save_checkpoint(self.run_dir,self.checkpoint)
+        d.git(self.repo,'submodule','deinit','-f','--','src/Selenium')
+        d.git(self.source,'update-index','--add','--cacheinfo',f'160000,{commit},src/Selenium')
+        shutil.copy2(self.repo/'.gitmodules',self.source/'.gitmodules')
+        (self.source/'src/Selenium').mkdir(parents=True)
+        state=self.prepare();root=Path(state['workspaceRoot'])
+        self.assertEqual(state['gitlinks'],{'src/Selenium':commit})
+        from iterative_delivery_submodules import validate_gitlinks
+        validate_gitlinks(root,state['gitlinks']);self.assert_original_preserved()
+        d.git(root,'add','-A');validate_gitlinks(root,state['gitlinks'])
+        d.git(root,'update-index','--cacheinfo',f'160000,{self.head},src/Selenium')
+        with self.assertRaisesRegex(RuntimeError,'DELIVERY_SUBMODULE_COMMIT_CHANGED'):
+            validate_gitlinks(root,state['gitlinks'])
+
     def test_registered_branch_preserves_original_and_text_fixtures(self):
         state = self.prepare(); root = Path(state["workspaceRoot"])
         self.assertEqual(state["status"], "ready")

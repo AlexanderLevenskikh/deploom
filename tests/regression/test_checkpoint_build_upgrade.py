@@ -27,6 +27,29 @@ class CheckpointBuildUpgradeTests(unittest.TestCase):
         config = {"verifyConfig": {"commands": ["node check.cjs"], "projectChecks": "strict", "timeoutSeconds": 60}}
         return checkpoint, config
 
+    def test_evicted_upgrade_copy_requires_fresh_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); checkpoint,config=self.fixture(root)
+            verify=mock.Mock(return_value=BaselineVerifyResult(True,'passed','fresh'))
+            first=upgrade.reopen_checkpoint_source(root/'run',checkpoint,config,verify=verify,progress=lambda *args:None)
+            source._force_rmtree(first.container)
+            second=upgrade.reopen_checkpoint_source(root/'run',checkpoint,config,verify=verify,progress=lambda *args:None)
+            self.assertEqual(verify.call_count,2);self.assertTrue(second.root.is_dir())
+            self.assertTrue(Path(checkpoint['sourceSnapshotContainer']).is_dir())
+    def test_durable_capture_releases_private_temp_on_success_and_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); project=root/'project';project.mkdir();(project/'payload').write_text('keep')
+            capture=source.capture_source_snapshot
+            seen=[]
+            def track(*args,**kwargs):
+                snapshot=capture(*args,**kwargs);seen.append(snapshot.container);return snapshot
+            with mock.patch.object(source,'capture_source_snapshot',side_effect=track):
+                saved=source.capture_durable_source_snapshot(project,root/'saved')
+                self.assertFalse(seen[-1].exists());self.assertTrue((saved.root/'payload').exists())
+                with mock.patch.object(source,'persist_source_snapshot',side_effect=RuntimeError('publication failed')):
+                    with self.assertRaisesRegex(RuntimeError,'publication failed'):
+                        source.capture_durable_source_snapshot(project,root/'failed')
+                self.assertFalse(seen[-1].exists());self.assertTrue((project/'payload').exists())
     def test_default_opener_stays_strict_and_upgrade_validates_content(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint, _ = self.fixture(Path(tmp))

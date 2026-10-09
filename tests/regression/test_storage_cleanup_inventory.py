@@ -30,13 +30,52 @@ class StorageInventorySafetyTests(unittest.TestCase):
     def archive(self):
         archive = self.run / 'run-archive' / 'saved'; (archive / 'trial' / 'workspace').mkdir(parents=True)
         (archive / 'trial' / 'workspace' / 'payload').write_text('generated trial')
-        (archive / 'sources' / 'C6' / 'tree').mkdir(parents=True); (archive / 'sources' / 'C6' / 'keep').write_text('verified')
-        (archive / 'sources' / 'C6' / 'manifest.json').write_text(json.dumps({'type':'deploom-source-snapshot','sourceSnapshotKey':'sealed-key'}))
+        from source_snapshot import capture_durable_source_snapshot
+        source = capture_durable_source_snapshot(archive / 'trial' / 'workspace', archive / 'sources' / 'C6')
+        (archive / 'sources' / 'C6' / 'keep').write_text('verified')
         (archive / 'reports').mkdir(); (archive / 'reports' / 'keep.md').write_text('report')
-        (archive / 'checkpoints').mkdir(); (archive / 'checkpoints' / 'C6.json').write_text(json.dumps({'status':'VERIFIED','checkpointId':'C6','sourceSnapshotKey':'sealed-key'}))
+        (archive / 'checkpoints').mkdir(); (archive / 'checkpoints' / 'C6.json').write_text(json.dumps({'status':'VERIFIED','checkpointId':'C6','sourceSnapshotKey':source.key}))
         (archive / 'run.json').write_text(json.dumps({'phase':'TERMINAL','runId':'old'}))
         os.utime(archive, (time.time()-3*s.MIN_AGE_SECONDS,)*2)
         return archive
+    def test_obsolete_verifier_copy_requires_preserved_source_and_matching_record(self):
+        archive=self.archive()
+        from source_snapshot import capture_durable_source_snapshot
+        import hashlib
+        directory=archive/'checkpoint-build-upgrades';directory.mkdir()
+        original=json.loads((archive/'checkpoints/C6.json').read_text())['sourceSnapshotKey']
+        identity={'sourceSnapshotKey':original,'toolBuildId':'a'*64}
+        key=hashlib.sha256(json.dumps(identity,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        copied=capture_durable_source_snapshot(archive/'sources/C6/tree',directory/(key+'-source'))
+        record={'identity':identity,'key':copied.key,'verification':{'status':'passed'}}
+        receipt=directory/(key+'.json');receipt.write_text(json.dumps(record))
+        os.utime(archive,(time.time()-3*s.MIN_AGE_SECONDS,)*2)
+        with patch('substrate_identity.tool_build_id',return_value='a'*64):
+            current=self.inspect();self.assertFalse(next(i for i in current['items'] if Path(i['path']).resolve()==copied.container.resolve())['eligible'])
+            (archive/'delivery-state.json').write_text(json.dumps({'status':'done'}))
+            os.utime(archive,(time.time()-3*s.MIN_AGE_SECONDS,)*2)
+            final=self.inspect();self.assertTrue(next(i for i in final['items'] if Path(i['path']).resolve()==copied.container.resolve())['eligible'])
+        plan=self.inspect();self.assertTrue(next(i for i in plan['items'] if Path(i['path']).resolve()==copied.container.resolve())['eligible'])
+        result,_=self.clean(plan);self.assertFalse(copied.container.exists())
+        self.assertTrue((archive/'sources/C6/tree/payload').exists());self.assertTrue(receipt.exists())
+    def test_materialization_edits_are_preserved_even_in_completed_archive(self):
+        archive=self.archive(); (archive/'trial/workspace/new-feature.py').write_text('unique edits')
+        plan=self.inspect(); self.assertEqual(plan['eligible'],0)
+        self.clean(plan); self.assertTrue((archive/'trial/workspace/new-feature.py').exists())
+    def test_source_corruption_after_preview_preserves_materialization(self):
+        archive=self.archive(); plan=self.inspect(); self.assertEqual(plan['eligible'],1)
+        target=archive/'sources/C6/tree/payload'; target.chmod(0o600); target.write_text('corrupt')
+        result,_=self.clean(plan); self.assertEqual(result['removed'],0)
+        self.assertTrue((archive/'trial/workspace/payload').exists())
+    def test_current_terminal_materialization_can_be_cleaned_with_exact_snapshot(self):
+        archive=self.archive()
+        import shutil
+        for name in ['sources','checkpoints','trial']:
+            shutil.copytree(archive/name,self.run/name)
+        (self.run/'run.json').write_text(json.dumps({'runId':'current','phase':'TERMINAL'}))
+        plan=self.inspect();self.assertEqual(plan['eligible'],2)
+        result,_=self.clean(plan);self.assertEqual(result['removed'],2)
+        self.assertTrue((self.run/'sources/C6/tree/payload').exists())
     def test_inspection_does_not_rename_delete_or_write(self):
         garbage=self.trash(); before=list(self.root.rglob('*')); plan=self.inspect()
         self.assertTrue(garbage.exists()); self.assertEqual(before,list(self.root.rglob('*')))
@@ -60,6 +99,14 @@ class StorageInventorySafetyTests(unittest.TestCase):
         p=self.root/'trials'/'dependency-flow-same-run-prepared-legacy';p.mkdir();(p/'keep').write_text('unknown')
         os.utime(p,(time.time()-3*s.MIN_AGE_SECONDS,)*2)
         self.assertEqual(self.inspect()['eligible'],0);self.assertTrue((p/'keep').exists())
+    def test_recent_registered_private_copy_is_disposable_only_after_owner_exits(self):
+        p=self.root/'trials'/'dependency-flow-resolver-seed-recent';p.mkdir();(p/'payload').write_text('cache')
+        (p/'.deploom-trial-owner.json').write_text(json.dumps({'pid':999999}))
+        with patch('verification_storage_maintenance.owner_alive',return_value=True):
+            self.assertEqual(self.inspect()['eligible'],0)
+        with patch('verification_storage_maintenance.owner_alive',return_value=False):
+            plan=self.inspect();self.assertEqual(plan['eligible'],1);result,_=self.clean(plan)
+        self.assertEqual(result['removed'],1);self.assertFalse(p.exists())
     def test_dead_owner_private_root_is_recognized_only_with_evidence(self):
         p=self.root/'trials'/'dependency-flow-resolver-seed-owned';p.mkdir();(p/'payload').write_text('cache')
         (p/'.deploom-trial-owner.json').write_text(json.dumps({'pid':999999}))

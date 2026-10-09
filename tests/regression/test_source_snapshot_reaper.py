@@ -43,6 +43,8 @@ class SourceSnapshotReaper(unittest.TestCase):
         (container / "tree").mkdir(parents=True)
         sealed = container / "tree" / "index.js"
         sealed.write_text("sealed\n", encoding="utf-8")
+        import json
+        (container / ".deploom-trial-owner.json").write_text(json.dumps({"pid": 999999999}), encoding="utf-8")
         if readonly:
             # Reproduce a real sealed container: a plain rmtree cannot remove it.
             source_snapshot._apply_tree_write_protection(container, readonly=True)
@@ -55,6 +57,26 @@ class SourceSnapshotReaper(unittest.TestCase):
         result = source_snapshot.reap_orphaned_source_snapshots()
         self.assertGreaterEqual(result["reaped"], 1)
         self.assertFalse(container.exists(), "write-protected orphan survived")
+
+    def test_other_live_process_is_retained_even_when_rename_would_succeed(self) -> None:
+        from unittest.mock import patch
+        container = self._orphan(age_seconds=48 * 3600)
+        with patch('verification_storage_maintenance.owner_alive', return_value=True), patch.object(os, 'rename') as rename:
+            source_snapshot.reap_orphaned_source_snapshots()
+        rename.assert_not_called(); self.assertTrue(container.exists())
+
+    def test_unknown_legacy_container_is_retained(self) -> None:
+        container = self._orphan(age_seconds=48 * 3600)
+        marker=container/'.deploom-trial-owner.json';marker.chmod(0o600);marker.unlink()
+        old=time.time()-48*3600;os.utime(container,(old,old))
+        source_snapshot.reap_orphaned_source_snapshots();self.assertTrue(container.exists())
+
+    def test_shared_file_is_retained_without_changing_original_permissions(self) -> None:
+        container = self._orphan(age_seconds=48 * 3600)
+        original=Path(self._tmp.name)/'original';original.write_text('keep')
+        os.link(original,container/'tree/shared');before=original.stat().st_mode
+        source_snapshot.reap_orphaned_source_snapshots()
+        self.assertTrue(container.exists());self.assertEqual(original.stat().st_mode,before)
 
     def test_recent_container_is_not_reaped(self) -> None:
         container = self._orphan(age_seconds=5)

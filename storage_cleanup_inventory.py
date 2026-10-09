@@ -66,6 +66,9 @@ def scan(path, stage='scan', *, identify=True):
 
 def eligible_trial(path):
     if not _plain_directory(path): return 'unsafe-path'
+    # Registered process-private copies become disposable when their owner exits.
+    # Do not retain new multi-GiB materializations for another day after completion.
+    if (PRIVATE.fullmatch(path.name) or RETIRED_PRIVATE.fullmatch(path.name)) and dead_trial_owner(path): return ''
     if time.time() - path.stat().st_mtime < MIN_AGE_SECONDS: return 'recent'
     if TRASH_NAME.fullmatch(path.name):
         stamp = int(path.name.rsplit('-', 1)[1]) / 1e9
@@ -150,6 +153,21 @@ def archive_reason(run, archive, path):
     except (OSError, ValueError, TypeError): return 'unknown-archive-evidence'
 
 
+def materialization_children(run, archive, parent, category, reason):
+    from materialization_retention import locations as owned_locations
+    owned = {str(p):(kind,why,r,a) for p,kind,why,r,a in owned_locations(run,archive)}
+    def children(folder):
+        for child in sorted(folder.iterdir()):
+            if not _plain_directory(child): continue
+            entry=owned.get(str(child))
+            if entry:
+                kind,why,r,a=entry; yield child,kind,why,r,a
+            elif folder.name=='security' and child.name.startswith('attempt-'):
+                yield from children(child)
+            else: yield child,category,reason,None,None
+    yield from children(parent)
+
+
 def locations(root, workspaces):
     if root is not None and _trusted_parent(root):
         for p in sorted((root / 'trials').iterdir()):
@@ -173,27 +191,35 @@ def locations(root, workspaces):
             for p in sorted(run.iterdir()):
                 if not _plain_directory(p): continue
                 if p.name != 'run-archive':
-                    yield p, 'current-run', 'current-checkpoint-or-run-data', None, None; continue
+                    if p.name in {'trial','bootstrap','security','checkpoint-build-upgrades'}:
+                        yield from materialization_children(run,None,p,'current-run','current-checkpoint-or-run-data')
+                    else: yield p, 'current-run', 'current-checkpoint-or-run-data', None, None
+                    continue
                 for archive in sorted(p.iterdir()):
                     if not _plain_directory(archive): continue
                     for child in sorted(archive.iterdir()):
                         if not _plain_directory(child): continue
-                        if child.name == 'trial' and (child / 'workspace').is_dir():
-                            target = child / 'workspace'
-                            yield target, 'archived-workspace', archive_reason(run, archive, target), run, archive
+                        if child.name in {'trial','bootstrap','security','checkpoint-build-upgrades'}:
+                            yield from materialization_children(run,archive,child,'archive-history','archive-checkpoints-and-evidence')
                         else:
                             yield child, 'archive-history', 'archive-checkpoints-and-evidence', None, None
 
 
-def inspect(root, workspaces):
+def inspect(root, workspaces, *, eligible_only=False):
     items = []; volumes = {}
     for path, category, reason, run, archive in locations(root, workspaces):
+        if eligible_only and reason: continue
         try:
             # Protected entries cannot be cleaned; only eligible entries need a preview identity.
             measure = scan(path, identify=not reason)
+            if not reason and category in {'obsolete-upgrade-copy','retired-materialization'}:
+                from materialization_retention import reason as retention_reason
+                reason = retention_reason(run,archive,path,category,verify_bytes=True,
+                                          progress=lambda p: progress('validate',p))
             if not plain_ancestors(path) or measure['unsafe']: reason = 'links-or-shared-files'
+            if eligible_only and reason: continue
             item = dict(path=str(path), category=category, reason=reason, eligible=not reason, **measure)
-            if run: item.update(run=str(run), archive=str(archive))
+            if run: item.update(run=str(run), archive=str(archive) if archive else None)
             items.append(item)
             drive = path.anchor
             volumes[drive] = dict(path=drive, freeBytes=shutil.disk_usage(path).free)
@@ -246,7 +272,11 @@ def clean(root, workspaces, plan):
                 lock = Lock()
             try:
                 with lock:
-                    if run: reason = archive_reason(run, archive, path)
+                    if run and item['category'] in {'obsolete-upgrade-copy','retired-materialization'}:
+                        from materialization_retention import reason as retention_reason
+                        reason=retention_reason(run,archive,path,item['category'],verify_bytes=True,
+                                                progress=lambda p: progress('validate',p))
+                    elif run: reason = archive_reason(run, archive, path)
                     elif root is not None and path.parent == root / 'baseline-prepared-artifacts' / 'trash':
                         reason = cache_trash_reason(path, path.parent.parent)
                     else: reason = eligible_trial(path)
@@ -277,7 +307,7 @@ def main():
     payload = json.load(sys.stdin)
     root = profile.root.absolute() if profile.root is not None else None
     workspaces = payload.get('workspaces', [])
-    result = inspect(root, workspaces) if sys.argv[1] == 'inspect' else clean(root, workspaces, payload['plan'])
+    result = inspect(root, workspaces, eligible_only=bool(payload.get('eligibleOnly'))) if sys.argv[1] == 'inspect' else clean(root, workspaces, payload['plan'])
     print('STORAGE_RESULT_V1 ' + json.dumps(result), flush=True)
 
 if __name__ == '__main__': main()

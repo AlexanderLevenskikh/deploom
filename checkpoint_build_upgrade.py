@@ -66,10 +66,13 @@ def reopen_checkpoint_source(run_dir, checkpoint, config, *, verify, progress, r
         record = json.loads(record_path.read_text(encoding="utf-8"))
         if record.get("identity") != identity or record.get("verification", {}).get("status") != "passed":
             raise CheckpointBuildUpgradeError("CHECKPOINT_BUILD_UPGRADE_RECORD_INVALID")
-        snapshot = open_source_snapshot(Path(record["container"]), expected_key=record["key"], timeout_seconds=0, progress=progress)
-        if snapshot.manifest_key != old.manifest_key:
-            raise CheckpointBuildUpgradeError("CHECKPOINT_BUILD_UPGRADE_CONTENT_MISMATCH")
-        return snapshot
+        # Explicit maintenance may evict this reproducible copy. Missing bytes
+        # require materialization and fresh verification, never reuse of proof.
+        if Path(record["container"]).is_dir():
+            snapshot = open_source_snapshot(Path(record["container"]), expected_key=record["key"], timeout_seconds=0, progress=progress)
+            if snapshot.manifest_key != old.manifest_key:
+                raise CheckpointBuildUpgradeError("CHECKPOINT_BUILD_UPGRADE_CONTENT_MISMATCH")
+            return snapshot
     progress("Preparing checkpoint copy for fresh verification with the updated DepLoom")
     destination = directory / (key + "-source")
     snapshot = (open_source_snapshot(destination, timeout_seconds=0, progress=progress) if destination.exists()

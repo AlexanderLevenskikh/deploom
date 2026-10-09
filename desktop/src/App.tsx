@@ -1,5 +1,5 @@
 import { Bell, Boxes, Download, ExternalLink, GitFork, Network, Pause, Play, Settings, Trash2, Workflow } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import './App.css'
 import { AddProjectDialog } from './components/AddProjectDialog'
 import { WorkspaceDialog } from './components/WorkspaceDialog'
@@ -12,6 +12,9 @@ import { SetupScreen } from './components/SetupScreen'
 import { useDependencyFlow } from './hooks/useDependencyFlow'
 import { useLanguage } from './i18n'
 import { StorageMaintenanceDialog } from './components/StorageMaintenanceDialog'
+import { StorageBackgroundStatus } from './components/StorageBackgroundStatus'
+
+import type { StorageStatus } from './types'
 
 type WorkspaceTab = 'flow' | 'graph' | 'dashboard'
 
@@ -23,6 +26,15 @@ function App() {
   const [showAddProject, setShowAddProject] = useState(false)
   const [showWorkspaceDialog, setShowWorkspaceDialog] = useState(false)
   const [showStorage, setShowStorage] = useState(false)
+  const [storageStatus, setStorageStatus] = useState<StorageStatus>()
+  useEffect(() => {
+    const api = window.dependencyFlow
+    if (!api?.onStorageStatus) return
+    let live = true; let received = false
+    const unsubscribe = api.onStorageStatus(status => { received = true; if (live) setStorageStatus(status) })
+    void api.storageStatus().then(status => { if (live && !received) setStorageStatus(status) }).catch(() => {})
+    return () => { live = false; unsubscribe() }
+  }, [])
   const [graphFullscreen, setGraphFullscreen] = useState(false)
   const [graphLeftHidden, setGraphLeftHidden] = useState(false)
   const themePreference = flow.themePreference
@@ -98,10 +110,11 @@ function App() {
 
       {showAddProject ? <AddProjectDialog workspaceId={details.workspace.id} onClose={() => setShowAddProject(false)} onPickDirectory={flow.pickDirectory} onSubmit={flow.addProject} /> : null}
 
-      {showStorage ? <StorageMaintenanceDialog onClose={() => setShowStorage(false)} onMaintenance={(action, operationId) => window.dependencyFlow!.storageMaintenance(action, operationId)} onProgress={window.dependencyFlow!.onStorageProgress} /> : null}
+      {showStorage ? <StorageMaintenanceDialog status={storageStatus} onClose={() => setShowStorage(false)} onMaintenance={(action, operationId) => window.dependencyFlow!.storageMaintenance(action, operationId)} onProgress={window.dependencyFlow!.onStorageProgress} /> : null}
       {showWorkspaceDialog ? <WorkspaceDialog onClose={() => setShowWorkspaceDialog(false)} onPickDirectory={flow.pickDirectory} onConnectExisting={(path, agent) => flow.registerExisting(path, agent)} onCreate={flow.cloneWorkspace} /> : null}
 
       <footer className="status-bar">
+        <StorageBackgroundStatus status={storageStatus} onOpen={() => setShowStorage(true)} />
         <span>DepLoom {payload.appVersion}</span><span>Template: {details.git.branch}</span><span>Tool: {payload.environment.python.available ? t('app.footer.toolReady') : t('app.footer.noPython')}</span><span className="status-spacer" /><span><i className={`status-dot ${payload.environment[details.workspace.agent]?.available ? 'success' : 'danger'}`} />{details.workspace.agent}: {payload.environment[details.workspace.agent]?.available ? t('app.footer.available') : t('app.footer.notFound')}</span><span>{details.git.dirty ? t('app.footer.workspaceChanged') : t('app.footer.workspaceClean')}</span>
       </footer>
     </div>

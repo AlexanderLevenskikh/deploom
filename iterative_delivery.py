@@ -442,6 +442,11 @@ def resume_delivery_preparation(run_dir, run, config, checkpoint, state):
     snapshot = core._open_checkpoint_source(run_dir, checkpoint, config, run_id=run["runId"])
     source = Path(snapshot.root)
     files = set(state["files"])
+    from iterative_delivery_submodules import gitlinks, preserve_absent_gitlink
+    links = gitlinks(source)
+    if state.get('gitlinks', links) != links:
+        raise RuntimeError('DELIVERY_SUBMODULE_PLAN_CHANGED')
+    state['gitlinks'] = links
     if "baseFiles" not in state:
         from iterative_delivery_checkout import bootstrap_husky_ignore
         bootstrap_husky_ignore(root, source, state)
@@ -463,7 +468,9 @@ def resume_delivery_preparation(run_dir, run, config, checkpoint, state):
         src, dst = source / name, root / name
         if not contained(root, dst) or src.is_symlink():
             raise RuntimeError(f"DELIVERY_INVALID_PATH: {name}")
-        if src.is_file():
+        if name in links:
+            preserve_absent_gitlink(source, root, name, links[name])
+        elif src.is_file():
             dst.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(src, dst)
             dst.chmod(dst.stat().st_mode | 0o200)
         elif not src.exists() and dst.is_file():
@@ -521,6 +528,8 @@ def delivery_verify(run_dir, inputs, *, cleanup=False):
             expected[name] = current
         elif current != digest:
             raise RuntimeError(f"DELIVERY_SOURCE_CHANGED: commit grouping must preserve verified bytes ({name})")
+    from iterative_delivery_submodules import validate_gitlinks
+    validate_gitlinks(root, state.get('gitlinks', {}))
     actual = set(git(root, "ls-files", "-z").split("\0")) - {""}
     if not actual.issubset(set(state["files"])):
         raise RuntimeError("DELIVERY_UNEXPECTED_TRACKED_FILES")

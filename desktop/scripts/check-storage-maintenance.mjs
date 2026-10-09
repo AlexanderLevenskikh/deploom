@@ -72,6 +72,26 @@ try {
   assert.throws(() => cleaning.assertMigrationAllowed(), /cleanup is running/);
   finishClean('STORAGE_RESULT_V1 ' + JSON.stringify(final)); await pendingClean;
   assert.doesNotThrow(() => cleaning.assertMigrationAllowed());
+  assert.equal(cleaning.status().phase, 'done'); assert.equal(cleaning.status().result.removed, 1);
+  let resolveBackground; const states = [];
+  const background = new StorageCleanupController(async (action, payload, line) => {
+    assert.equal(payload.eligibleOnly, true);
+    line('STORAGE_PROGRESS_V1 ' + JSON.stringify({ stage: 'validate', percent: null }));
+    return new Promise(done => { resolveBackground = done });
+  }, () => [], () => false, state => states.push(state));
+  const running = background.maintenance('inspect', 'background', () => {}, true);
+  assert.equal(background.status().phase, 'inspect'); assert.equal(background.status().progress.stage, 'validate');
+  resolveBackground('STORAGE_RESULT_V1 ' + JSON.stringify(inventory)); await running;
+  assert.equal(background.status().phase, 'done'); assert.equal(states.at(-1).automatic, true);
+  let automaticActive = true; const calls = [];
+  const automatic = new StorageCleanupController(async (action, payload) => {
+    calls.push(action); if (action === 'inspect') assert.equal(payload.eligibleOnly, true);
+    return 'STORAGE_RESULT_V1 ' + JSON.stringify(action === 'inspect' ? inventory : final);
+  }, () => [], () => automaticActive);
+  automatic.scheduleAutomatic(); automatic.scheduleAutomatic();
+  await new Promise(done => setTimeout(done, 1100)); assert.deepEqual(calls, []);
+  automaticActive = false; await new Promise(done => setTimeout(done, 2100));
+  assert.deepEqual(calls, ['inspect', 'clean']); assert.equal(automatic.status().phase, 'done');
   let inspectFails = false;
   const invalidation = new StorageCleanupController(async () => { if (inspectFails) throw new Error('read failed'); return 'STORAGE_RESULT_V1 ' + JSON.stringify(inventory) }, () => [], () => false);
   await invalidation.maintenance('inspect', 'old-preview', () => {}); inspectFails = true;

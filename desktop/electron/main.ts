@@ -8759,6 +8759,7 @@ function setupIpc(): void {
       })
       updateAttempt(runDir, { status: outcome.ok ? 'done' : readAttempt(runDir)?.cancelRequested ? 'canceled' : 'failed', stage: 'agent', lastStep: outcome.ok ? 'delivery' : 'delivery-failed', lastError: outcome.error, finishedAt: Date.now() })
       publishIterativeAttempt(runDir)
+      if (outcome.ok && readDeliveryJson(join(runDir, 'delivery-state.json'))?.status === 'done') storageCleanup.scheduleAutomatic()
       return { ...outcome, phase: 'TERMINAL' }
     }
     // Launch-wait resilience: classify the durable lease BEFORE marking the
@@ -9395,7 +9396,10 @@ function setupIpc(): void {
       { stdin: JSON.stringify(payload), onLine })
     if (result.code !== 0) throw new Error(result.stderr || 'Storage maintenance failed')
     return result.stdout
-  }, () => loadState().workspaces.map(workspace => workspace.path), () => jobs.size > 0 || iterativeStepInFlight.size > 0 || [...initialAuditJobs.values()].some(job => !job.finishedAt))
+  }, () => loadState().workspaces.map(workspace => workspace.path), () => jobs.size > 0 || iterativeStepInFlight.size > 0 || [...initialAuditJobs.values()].some(job => !job.finishedAt), status => {
+    for (const window of BrowserWindow.getAllWindows()) if (!window.webContents.isDestroyed()) window.webContents.send('flow:storage-status', status)
+  })
+  ipcMain.handle('flow:storage-status', () => storageCleanup.status())
   ipcMain.handle('flow:storage-maintenance', async (event, action: unknown, operationId: unknown) =>
     storageCleanup.maintenance(action, operationId, progress => event.sender.send('flow:storage-progress', progress)))
   ipcMain.handle('flow:get-hardware-snapshot', () => hardwareSnapshot())
