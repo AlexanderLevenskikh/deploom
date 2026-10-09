@@ -391,12 +391,12 @@ class GitDeliveryTests(unittest.TestCase):
         self.assertEqual((Path(result["verificationWorkspace"]) / "asset.bin").read_bytes(), payload)
         self.assert_original_preserved()
 
-    def stranded_lfs_fixture(self):
+    def stranded_lfs_fixture(self, ignore=b"*\n"):
         d.git(self.repo, "lfs", "version")
         for repo in (self.repo, self.source):
             d.git(repo, "config", "core.hooksPath", ".husky/_")
         hook_source = self.source / ".husky" / "_"; hook_source.mkdir(parents=True)
-        (hook_source / ".gitignore").write_text("*\n", encoding="utf-8")
+        (hook_source / ".gitignore").write_bytes(ignore)
         d.git(self.source, "lfs", "install", "--local")
         with patch.object(d, "inventory", side_effect=OSError("interrupted before base")):
             with self.assertRaisesRegex(OSError, "interrupted before base"):
@@ -422,6 +422,17 @@ class GitDeliveryTests(unittest.TestCase):
             result = d.delivery_verify(self.run_dir, {})
         self.assertEqual(result["status"], "done")
         self.assertFalse((Path(result["verificationWorkspace"]) / ".husky" / "_").exists())
+        self.assert_original_preserved()
+
+    @unittest.skipUnless(shutil.which("git-lfs"), "Git LFS required")
+    def test_stranded_husky_ignore_without_final_newline_resumes_and_reverifies(self):
+        root, generated = self.stranded_lfs_fixture(ignore=b"*")
+        self.assertEqual(self.prepare()["status"], "ready")
+        self.assertEqual((generated / ".gitignore").read_bytes(), b"*\n")
+        d.git(root, "add", "."); d.git(root, "commit", "-m", "coherent fixture upgrade")
+        with patch.object(d, "collect_audit", return_value=report()), patch.object(core, "_finish_locked"):
+            result = d.delivery_verify(self.run_dir, {})
+        self.assertEqual(result["status"], "done")
         self.assert_original_preserved()
 
     @unittest.skipUnless(shutil.which("git-lfs"), "Git LFS required")

@@ -44,7 +44,7 @@ def bootstrap_husky_ignore(root, source, state):
     original = source / hook_name / ".gitignore"
     if (not delivery.contained(root, target) or not delivery.contained(source, original)
             or target.exists() or not original.is_file() or original.is_symlink()
-            or original.read_bytes().replace(b"\r\n", b"\n") != b"*\n"):
+            or original.read_bytes().replace(b"\r\n", b"\n") not in {b"*", b"*\n"}):
         return
     for name in untracked:
         path = Path(name)
