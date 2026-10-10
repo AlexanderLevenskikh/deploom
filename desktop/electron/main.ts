@@ -7574,7 +7574,10 @@ function setupIpc(): void {
       const runDir = autopilotRunDir(input)
       const previous = readAutopilotState(runDir)
       const resume = resumeIntent ?? (enabled && (iterativeAutopilot.hasSession(input) || readAgentLease(agentLeaseFile(runDir))?.waiting === true))
-      writeAutopilotState(runDir, enabled, enabled && previous?.enabled === false ? undefined : previous?.retry, resume)
+      // A manual step (such as notes cleanup) stops automatic execution,
+      // but only the explicit checkbox toggle may clear the user preference.
+      const selected = enabled || (input.autopilot === false && previous?.enabled === true)
+      writeAutopilotState(runDir, selected, selected && previous?.enabled === false ? undefined : previous?.retry, resume)
     },
     readRetry: input => readAutopilotState(autopilotRunDir(input))?.retry,
     waitForWriter: input => liveRunWriterPid(autopilotRunDir(input), isPidAlive) ? Date.now() + 1_000 : undefined,

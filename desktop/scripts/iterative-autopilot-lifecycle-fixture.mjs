@@ -341,4 +341,26 @@ for (const repeated of [false,true]) {
   assert.equal(result.autopilot.stopped,repeated?'error':'finished');
   if(repeated)assert.match(result.error,/REPEATED_TERMINAL_CONTINUATION/);
 }
+// Run the actual persistence callback: a manual notes-cleanup session must
+// retain the checkbox, while an explicit user toggle still clears it.
+{
+  const begin = source.indexOf('    setEnabled: (input, enabled, resumeIntent) => {');
+  const finish = source.indexOf('    readRetry:', begin);
+  assert.ok(begin >= 0 && finish > begin);
+  const callback = source.slice(begin, finish).trim().replace(/^setEnabled:\s*/, '').replace(/,\s*$/, '');
+  const runDir = mkdtempSync(join(tmpdir(), 'autopilot-manual-preference-'));
+  writeFileSync(join(runDir, 'run.json'), JSON.stringify({runId:'manual-preference'}));
+  const persist = new Function('bindings', `with(bindings) { ${compile('const persist = '+callback)}; return persist; }`)({
+    autopilotRunDir: () => runDir, readAutopilotState, writeAutopilotState,
+    iterativeAutopilot: {hasSession: () => true}, readAgentLease: () => undefined, agentLeaseFile: () => '',
+  });
+  writeAutopilotState(runDir, true, undefined, false);
+  persist({workspaceId:'w',projectName:'demo',autopilot:false}, false);
+  assert.equal(readAutopilotState(runDir).enabled, true);
+  assert.equal(readAutopilotState(runDir).resume, false);
+  persist({workspaceId:'w',projectName:'demo',autopilot:false}, false, false);
+  assert.equal(readAutopilotState(runDir).enabled, true);
+  persist({workspaceId:'w',projectName:'demo'}, false);
+  assert.equal(readAutopilotState(runDir).enabled, false);
+}
 console.log('autopilot lifecycle: production toggle/drive, durable restart, identity, bounded reads, cancel, critical and exhausted verification boundaries OK');
