@@ -350,9 +350,10 @@ python validate_dependency_regression.py \
 ```bash
 python run_tool_tests.py --suite unit
 python run_tool_tests.py --suite regression
+python run_tool_tests.py --suite storage-delivery
 ```
 
-Unit-команда намеренно не собирает `tests/regression/`.
+Unit-команда намеренно не собирает `tests/regression/`. Демо small/medium/large вынесены в `storage-delivery`: они не входят в `all` и `acceptance`. Отдельный workflow **Storage delivery demos** запускает их на Linux и Windows вручную, при изменениях связанных модулей и как обязательную проверку релиза.
 
 После каждого merge prompt требует cumulative reconciliation (`MERGE_TARGET_REGRESSION`), а финальный validator сравнивает исходный scope с фактом и со свежим roadmap. Если целевой статус не достигнут или появились новые action rows, run обязан продолжиться closure-веткой.
 

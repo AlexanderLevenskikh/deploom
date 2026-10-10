@@ -2,6 +2,7 @@
 
 - [ ] Run `python scripts/check-public-sanitization.py`.
 - [ ] Run `python run_tool_tests.py --suite all`.
+- [ ] Confirm the separate Storage delivery demos workflow passes small/medium/large on Linux and Windows for the release commit (`python run_tool_tests.py --suite storage-delivery` locally).
 - [ ] Run Desktop install/lint/build/contract checks, including `npm run check:cross-platform`.
 - [ ] Confirm Windows x64 and Linux x64 package jobs produce `DepLoom-*` artifacts plus `latest.yml` / `latest-linux.yml`.
 - [ ] Confirm both macOS x64 and arm64 unsigned smoke builds pass. Do **not** publish macOS artifacts until Developer ID signing and notarization are configured.

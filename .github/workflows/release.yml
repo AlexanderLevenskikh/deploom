@@ -13,6 +13,9 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
+  storage-delivery:
+    uses: ./.github/workflows/storage-delivery.yml
+
   validate:
     runs-on: ubuntu-latest
     steps:
@@ -300,7 +303,7 @@ jobs:
 
   publish-release:
     if: github.ref_type == 'tag'
-    needs: [validate, package-windows, package-linux, package-macos]
+    needs: [validate, storage-delivery, package-windows, package-linux, package-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262

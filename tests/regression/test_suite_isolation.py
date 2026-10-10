@@ -27,6 +27,26 @@ class ToolSuiteIsolationTests(unittest.TestCase):
         self.assertNotIn("tests/test_dependency_roadmap.py", files)
         self.assertTrue(all(path.startswith("tests/regression/") for path in files))
 
+    def test_storage_demos_have_a_separate_suite(self) -> None:
+        demos = self.relative(run_tool_tests.files_for("storage-delivery"))
+        self.assertEqual(demos, ["tests/storage_delivery/test_storage_delivery_demo.py"])
+        self.assertGreater(run_tool_tests.load_files(run_tool_tests.files_for("storage-delivery")).countTestCases(), 0)
+        for name in ("unit", "regression", "acceptance", "all", "production-fast"):
+            with self.subTest(suite=name):
+                self.assertTrue(set(demos).isdisjoint(self.relative(run_tool_tests.files_for(name))))
+
+    def test_release_requires_separate_cross_platform_demos(self) -> None:
+        import yaml
+        workflow = yaml.load((ROOT / ".github/workflows/storage-delivery.yml").read_text(), Loader=yaml.BaseLoader)
+        self.assertIn("workflow_call", workflow["on"])
+        self.assertIn("workflow_dispatch", workflow["on"])
+        job = workflow["jobs"]["storage-delivery"]
+        self.assertEqual(set(job["strategy"]["matrix"]["os"]), {"ubuntu-latest", "windows-latest"})
+        self.assertIn("python run_tool_tests.py --suite storage-delivery", [step.get("run") for step in job["steps"]])
+        release = yaml.load((ROOT / ".github/workflows/release.yml").read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(release["jobs"]["storage-delivery"]["uses"], "./.github/workflows/storage-delivery.yml")
+        self.assertIn("storage-delivery", release["jobs"]["publish-release"]["needs"])
+
 
 if __name__ == "__main__":
     unittest.main()
