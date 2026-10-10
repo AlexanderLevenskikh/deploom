@@ -68,6 +68,21 @@ def make_repo_with_uninitialized_submodule(root: Path, subtmp: Path) -> Path:
     return root
 
 
+def add_empty_lockfile(root: Path) -> None:
+    # Scoped capture resolves installation inputs through the owning lockfile.
+    # These readiness fixtures have no dependencies, so no registry is needed.
+    manifest = json.loads((root / "package.json").read_text(encoding="utf-8"))
+    (root / "package-lock.json").write_text(
+        json.dumps({
+            "name": manifest["name"], "lockfileVersion": 3, "requires": True,
+            "packages": {"": manifest},
+        }),
+        encoding="utf-8",
+    )
+    git(root, "add", "package-lock.json")
+    git(root, "commit", "-m", "record owning empty lockfile")
+
+
 def make_plain_repo(root: Path) -> Path:
     init_repo(root)
     (root / "package.json").write_text(
@@ -231,8 +246,10 @@ class IterativePreflightReadinessTests(unittest.TestCase):
                 self.assertEqual(iterative_migration._begin_check_only_locked(run_dir, args, check_config), 0)
             check = json.loads((run_dir / "project-check.json").read_text(encoding="utf-8"))
             self.assertTrue(check["ok"])
-            # A real begin now proceeds end-to-end (its C0 control on the plain
-            # repo is unknown-but-not-blocking; the run is still created).
+            # A real scoped begin needs an owning lockfile even when the
+            # assignment is empty. Keep missing-lock infrastructure fixtures
+            # above unchanged; supply valid topology for this end-to-end retry.
+            add_empty_lockfile(project)
             full = self._cli(project)
             self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
             self.assertIn("begin.capture", full.stdout)
@@ -378,6 +395,7 @@ class IterativePreflightReadinessTests(unittest.TestCase):
             self.assertEqual(fixed.returncode, 0, fixed.stderr)
             self.assertEqual(incomplete_submodules(project), [])
             project_readiness_preflight(project)  # does not raise
+            add_empty_lockfile(project)
             # A re-run of the SAME command (no manual file deletion) completes
             # begin end-to-end and creates the durable run.
             result = self._cli(project)
