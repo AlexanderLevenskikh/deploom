@@ -224,8 +224,6 @@ def inspect(root, workspaces, *, eligible_only=False):
     for path, category, reason, run, archive in locations(root, workspaces):
         if eligible_only and reason: continue
         try:
-            # Protected entries cannot be cleaned; only eligible entries need a preview identity.
-            measure = scan(path, identify=not reason)
             if not reason and category in {'obsolete-upgrade-copy','retired-materialization'}:
                 from materialization_retention import reason as retention_reason
                 reason = retention_reason(run,archive,path,category,verify_bytes=True,
@@ -233,6 +231,9 @@ def inspect(root, workspaces, *, eligible_only=False):
             if not reason and category == 'packed-tree-garbage':
                 from snapshot_compaction import residue_reason
                 reason = residue_reason(path.parent, path, verify_bytes=True)
+            # Validation can refresh Git metadata. Bind the preview only after
+            # preservation checks; later changes still fail closed in clean().
+            measure = scan(path, identify=not reason)
             if not plain_ancestors(path) or measure['unsafe']: reason = 'links-or-shared-files'
             if eligible_only and reason: continue
             item = dict(path=str(path), category=category, reason=reason, eligible=not reason, **measure)

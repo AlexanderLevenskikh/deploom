@@ -89,6 +89,24 @@ class StorageInventorySafetyTests(unittest.TestCase):
         self.assertEqual(result['removed'],1);self.assertEqual(result['reclaimedBytes'],7)
         parsed=[json.loads(line.split(' ',1)[1]) for line in events.splitlines()]
         self.assertEqual(parsed[-1]['percent'],100);self.assertEqual(parsed[-1]['processed'],1)
+    def test_preview_is_bound_after_preservation_validation_refreshes_metadata(self):
+        archive=self.archive()
+        import materialization_retention as retention
+        original=retention.reason; refreshed=False
+        target=archive/'trial/workspace/payload'
+        def validating(*args, **kwargs):
+            nonlocal refreshed
+            result=original(*args, **kwargs)
+            if kwargs.get('verify_bytes') and not refreshed:
+                info=target.stat(); os.utime(target,ns=(info.st_atime_ns,info.st_mtime_ns+1000000000)); refreshed=True
+            return result
+        with patch.object(retention,'reason',side_effect=validating):
+            plan=self.inspect(); result,_=self.clean(plan)
+        self.assertTrue(refreshed)
+        self.assertEqual(result['removed'],1)
+        self.assertFalse(target.exists())
+        self.assertTrue((archive/'sources/C6/tree/payload').exists())
+
     def test_changed_tree_after_preview_is_preserved(self):
         garbage=self.trash();plan=self.inspect();(garbage/'new-user-file').write_text('keep')
         os.utime(garbage,(time.time()-3*s.MIN_AGE_SECONDS,)*2)
