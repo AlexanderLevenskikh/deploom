@@ -17,8 +17,6 @@ import tempfile
 import threading
 import time
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
 import iterative_delivery as d
 import iterative_migration as core
@@ -108,38 +106,14 @@ class StorageDeliveryDemoTests(unittest.TestCase):
                 d.git(root,'add','docs');d.git(root,'commit','-m','docs: developer guide and migration report')
                 with contextlib.redirect_stdout(io.StringIO()):
                     delivered=d.delivery_verify(run_dir,{})
-                    scan_records = []
-                    original_scan = storage.scan
-                    def record_scan(path, *args, **kwargs):
-                        records = []
-                        class RecordedDigest:
-                            def __init__(self): self.digest = hashlib.sha256()
-                            def update(self, value):
-                                records.append(value.decode()); self.digest.update(value)
-                            def hexdigest(self): return self.digest.hexdigest()
-                        with patch.object(storage, 'hashlib', SimpleNamespace(sha256=RecordedDigest)):
-                            result = original_scan(path, *args, **kwargs)
-                        scan_records.append((str(path), records, result['signature']))
-                        return result
-                    with patch.object(storage, 'scan', record_scan):
-                        plan=storage.inspect(None,[str(workspace)]);cleaned=storage.clean(None,[str(workspace)],plan)
+                    plan=storage.inspect(None,[str(workspace)]);cleaned=storage.clean(None,[str(workspace)],plan)
                 self.assertEqual(delivered['status'],'done')
                 self.assertEqual(delivered['audit']['status'],'PASS',delivered['audit'])
                 self.assertEqual(core.load_run(run_dir)['terminal'],'COMPLETE')
+                cleanup_evidence = {key:cleaned[key] for key in ['removed','failed','protected','reclaimedBytes','results']}
                 if cleaned['removed'] < 1:
                     import materialization_retention as retention
-                    evidence = {'cleanup':cleaned, 'sourceValidation':[]}
-                    failed_path = next((r['path'] for r in cleaned['results'] if r.get('reason') == 'changed-after-preview'), str(trial))
-                    evidence['scanPaths'] = [path for path, _, _ in scan_records]
-                    evidence['trialPath'] = str(trial)
-                    trial_scans = [(records, digest) for path, records, digest in scan_records if path == failed_path]
-                    evidence['scanSignatures'] = [digest for _, digest in trial_scans]
-                    if len(trial_scans) >= 2:
-                        before, after = trial_scans[0][0], trial_scans[-1][0]
-                        evidence['scanRemoved'] = sorted(set(before) - set(after))[:10]
-                        evidence['scanAdded'] = sorted(set(after) - set(before))[:10]
-                        evidence['scanCounts'] = [len(before), len(after)]
-                        evidence['scanFirstMismatch'] = next(([a,b] for a,b in zip(before,after) if a != b), None)
+                    evidence = {'cleanup':cleanup_evidence, 'sourceValidation':[]}
                     for cp, source, manifest in retention.preserved_checkpoints(run_dir):
                         actual_files, actual_dirs = retention.fingerprint(trial)
                         expected_files, expected_dirs = retention.manifest_fingerprint(manifest)
@@ -149,7 +123,7 @@ class StorageDeliveryDemoTests(unittest.TestCase):
                         except Exception as exc: record['validation']=str(exc)
                         evidence['sourceValidation'].append(record)
                     print('DEMO cleanup failure evidence: '+json.dumps(evidence),flush=True)
-                self.assertGreaterEqual(cleaned['removed'],1, json.dumps(cleaned))
+                self.assertGreaterEqual(cleaned['removed'],1, json.dumps(cleanup_evidence))
                 self.assertGreater(cleaned['reclaimedBytes'],megabytes*1024*1024//2)
                 self.assertFalse((initial/'tree').exists());self.assertTrue((latest/'tree').exists());self.assertTrue(root.exists())
                 self.assertEqual(open_source_snapshot(initial,expected_key=initial_checkpoint['sourceSnapshotKey']).key,initial_checkpoint['sourceSnapshotKey'])

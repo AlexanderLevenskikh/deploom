@@ -50,7 +50,10 @@ def scan(path, stage='scan', *, identify=True):
             signature.update(f'D:{folder.relative_to(path)}:{info.st_dev}:{info.st_ino}:{info.st_mtime_ns}'.encode())
         with os.scandir(folder) as entries:
             for entry in sorted(entries, key=lambda e: e.name):
-                info = entry.stat(follow_symlinks=False)
+                # Windows directory listings can return stale timestamps and
+                # omit object/link identity. Bind the preview to fresh no-follow
+                # metadata, also used when inspecting each directory below.
+                info = Path(entry.path).lstat()
                 if identify:
                     signature.update(f'E:{Path(entry.path).relative_to(path)}:{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}:{info.st_mode}'.encode())
                 if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:

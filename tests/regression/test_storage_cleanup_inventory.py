@@ -107,6 +107,56 @@ class StorageInventorySafetyTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertTrue((archive/'sources/C6/tree/payload').exists())
 
+    def stale_enumeration(self):
+        # Model Windows directory-listing metadata that disagrees with lstat:
+        # changing cached directory dates and a hidden external hardlink count.
+        from types import SimpleNamespace
+        import stat
+        original = os.scandir
+        generation = 0
+        class Entry:
+            def __init__(self, entry, stamp): self.entry = entry; self.stamp = stamp
+            def __getattr__(self, name): return getattr(self.entry, name)
+            def stat(self, **kwargs):
+                info = self.entry.stat(**kwargs)
+                fields = {name:getattr(info,name) for name in dir(info) if name.startswith('st_')}
+                if stat.S_ISDIR(info.st_mode): fields['st_mtime_ns'] += self.stamp
+                fields['st_nlink'] = 1
+                return SimpleNamespace(**fields)
+        class Listing:
+            def __init__(self,path,stamp): self.entries=original(path); self.stamp=stamp
+            def __iter__(self): return self
+            def __next__(self): return Entry(next(self.entries),self.stamp)
+            def __enter__(self): self.entries.__enter__(); return self
+            def __exit__(self,*args): return self.entries.__exit__(*args)
+            def close(self): self.entries.close()
+        def listing(path):
+            nonlocal generation
+            generation += 1000000000
+            return Listing(path,generation)
+        return listing
+
+    def test_stale_directory_listing_dates_do_not_block_unchanged_cleanup(self):
+        garbage=self.trash(); nested=garbage/'node_modules'/'package'; nested.mkdir(parents=True)
+        (nested/'index.js').write_text('installed dependency')
+        os.utime(garbage,(time.time()-3*s.MIN_AGE_SECONDS,)*2)
+        with patch.object(os,'scandir',self.stale_enumeration()):
+            plan=self.inspect(); result,_=self.clean(plan)
+        self.assertEqual(result['removed'],1,result['results'])
+        self.assertFalse(garbage.exists())
+
+    def test_stale_listing_cannot_hide_an_external_hardlink(self):
+        garbage=self.trash(); original=self.base/'external-source'; original.write_text('keep')
+        os.link(original,garbage/'shared')
+        os.utime(garbage,(time.time()-3*s.MIN_AGE_SECONDS,)*2)
+        before=original.stat().st_mode
+        with patch.object(os,'scandir',self.stale_enumeration()):
+            plan=self.inspect(); result,_=self.clean(plan)
+        self.assertFalse(next(i for i in plan['items'] if Path(i['path'])==garbage)['eligible'])
+        self.assertEqual(result['removed'],0)
+        self.assertEqual(original.read_text(),'keep'); self.assertEqual(original.stat().st_mode,before)
+        self.assertTrue((garbage/'shared').exists())
+
     def test_changed_tree_after_preview_is_preserved(self):
         garbage=self.trash();plan=self.inspect();(garbage/'new-user-file').write_text('keep')
         os.utime(garbage,(time.time()-3*s.MIN_AGE_SECONDS,)*2)
