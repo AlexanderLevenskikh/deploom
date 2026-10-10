@@ -361,7 +361,7 @@ for (const failureKind of ['none', 'exit', 'provider']) {
   const result = await f.run({ projectName: 'fixture' });
   assert.equal(result.ok, true, JSON.stringify(result));
   assert.equal(result.phase, 'TERMINAL');
-  assert.deepEqual(steps, failureKind === 'none' ? ['security-prepare', 'delivery-prepare', 'delivery-verify'] : ['delivery-prepare', 'delivery-verify']);
+  assert.deepEqual(steps, failureKind === 'none' ? ['security-prepare', 'delivery-prepare', 'delivery-preflight', 'delivery-verify'] : ['delivery-prepare', 'delivery-preflight', 'delivery-verify']);
   if (failureKind !== 'none') assert.ok(f.launches.at(-1).args.includes('ses-semantic'));
   const lease = JSON.parse(readFileSync(join(f.runDir, 'delivery-agent.json'), 'utf8'));
   assert.equal(lease.sessionId, 'ses-semantic'); assert.equal(lease.status, 'finished');
