@@ -110,7 +110,19 @@ class StorageDeliveryDemoTests(unittest.TestCase):
                 self.assertEqual(delivered['status'],'done')
                 self.assertEqual(delivered['audit']['status'],'PASS',delivered['audit'])
                 self.assertEqual(core.load_run(run_dir)['terminal'],'COMPLETE')
-                self.assertGreaterEqual(cleaned['removed'],1)
+                if cleaned['removed'] < 1:
+                    import materialization_retention as retention
+                    evidence = {'cleanup':cleaned, 'sourceValidation':[]}
+                    for cp, source, manifest in retention.preserved_checkpoints(run_dir):
+                        actual_files, actual_dirs = retention.fingerprint(trial)
+                        expected_files, expected_dirs = retention.manifest_fingerprint(manifest)
+                        diff = [name for name in set(actual_files) | set(expected_files) if actual_files.get(name) != expected_files.get(name)]
+                        record = {'checkpoint':cp['checkpointId'], 'filesDiffer':sorted(diff)[:10], 'dirsDiffer':sorted(actual_dirs ^ expected_dirs)[:10]}
+                        try: retention.validate_source(source,cp['sourceSnapshotKey']); record['validation']='passed'
+                        except Exception as exc: record['validation']=str(exc)
+                        evidence['sourceValidation'].append(record)
+                    print('DEMO cleanup failure evidence: '+json.dumps(evidence),flush=True)
+                self.assertGreaterEqual(cleaned['removed'],1, json.dumps(cleaned))
                 self.assertGreater(cleaned['reclaimedBytes'],megabytes*1024*1024//2)
                 self.assertFalse((initial/'tree').exists());self.assertTrue((latest/'tree').exists());self.assertTrue(root.exists())
                 self.assertEqual(open_source_snapshot(initial,expected_key=initial_checkpoint['sourceSnapshotKey']).key,initial_checkpoint['sourceSnapshotKey'])
