@@ -78,6 +78,9 @@ jobs:
           python -m pip install -r requirements-solver.txt
       - name: Install Yarn Classic for physical workspace acceptance
         run: npm install --global yarn@1.22.22
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
       - name: Run Windows verification substrate gate
         run: |
           python -m unittest tests.test_prepared_workspace_fastpath
@@ -89,9 +92,6 @@ jobs:
           python -m unittest discover -s tests/regression -p test_iterative_delivery.py -v
           python -m unittest discover -s tests/regression -p test_delivery_source_identity.py -v
           python run_tool_tests.py --suite acceptance
-      - name: Install desktop dependencies
-        working-directory: desktop
-        run: npm ci
       - name: Build and verify resolved-state handoff
         working-directory: desktop
         run: |

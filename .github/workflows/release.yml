@@ -109,6 +109,9 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install -r requirements-solver.txt
           npm install --global yarn@1.22.22
+      - name: Install desktop parsers for Windows delivery checks
+        working-directory: desktop
+        run: npm ci
       - name: Run exact-release-SHA Windows physical acceptance
         run: |
           python -m unittest tests.test_block_lambda_release_closure
