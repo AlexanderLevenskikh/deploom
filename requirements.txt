@@ -1,3 +1,4 @@
 requests
 semantic_version
 python-dateutil
+PyYAML>=6,<7

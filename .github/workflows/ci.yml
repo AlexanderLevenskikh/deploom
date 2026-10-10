@@ -47,6 +47,8 @@ jobs:
       - name: Build Electron reader modules
         working-directory: desktop
         run: npx tsc -p tsconfig.electron.json
+      - name: Install pinned modern Yarn acceptance runtimes
+        run: node scripts/prepare-yarn-test-runtimes.mjs
       - name: Run production-fast regressions
         run: python run_tool_tests.py --suite production-fast
       - name: Run all tool tests
@@ -81,6 +83,8 @@ jobs:
       - name: Install desktop dependencies
         working-directory: desktop
         run: npm ci
+      - name: Install pinned modern Yarn acceptance runtimes
+        run: node scripts/prepare-yarn-test-runtimes.mjs
       - name: Run Windows verification substrate gate
         run: |
           python -m unittest tests.test_prepared_workspace_fastpath

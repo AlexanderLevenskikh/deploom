@@ -19,6 +19,8 @@ class PackageManagerSupportMatrixTests(unittest.TestCase):
         (root / "package.json").write_text(json.dumps(package), encoding="utf-8")
         lock = root / lockfile
         lock.write_text(lock_text, encoding="utf-8")
+        if package_manager.startswith("yarn@4"):
+            (root / ".yarnrc.yml").write_text("nodeLinker: node-modules\n", encoding="utf-8")
         return resolve_package_manager_profile(root, package_json=package, lockfile=lock)
 
     def test_release_support_matrix_matches_profile_authority(self) -> None:
@@ -29,8 +31,8 @@ class PackageManagerSupportMatrixTests(unittest.TestCase):
 
         self.assertTrue(npm.authoritative_supported)
         self.assertTrue(yarn1.authoritative_supported)
-        self.assertFalse(berry.authoritative_supported)
-        self.assertEqual("PACKAGE_MANAGER_YARN_BERRY_UNSUPPORTED", berry.unsupported_code)
+        self.assertTrue(berry.authoritative_supported)
+        self.assertEqual("", berry.unsupported_code)
         self.assertFalse(pnpm.authoritative_supported)
         self.assertEqual("PACKAGE_MANAGER_PNPM_UNSUPPORTED", pnpm.unsupported_code)
 

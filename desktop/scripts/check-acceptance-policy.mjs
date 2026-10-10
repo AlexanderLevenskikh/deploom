@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import ts from 'typescript'
+import { execFileSync } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
@@ -202,6 +203,22 @@ fs.writeFileSync(path.join(fixture, 'package.json'), '{"dependencies":{"a":"1.0.
 const changed = dependencyInputIdentity(fixture)
 const stale = acceptanceVerdictFromManualAudit(report(0, 0), changed.hash)
 if (stale.status !== 'UNKNOWN' || stale.dependencyEvidenceFresh) throw new Error('changed dependency inputs must invalidate audit authority')
+
+// Nested root lock evidence must agree across the Python/Node handoff.
+const nestedRoot = path.join(tempRoot, 'nested-root')
+const nested = path.join(nestedRoot, 'packages', 'app')
+fs.mkdirSync(nested, { recursive: true })
+fs.mkdirSync(path.join(nestedRoot, '.git'))
+fs.writeFileSync(path.join(nested, 'package.json'), '{}')
+fs.writeFileSync(path.join(nestedRoot, 'package.json'), '{"workspaces":["packages/*"]}')
+fs.writeFileSync(path.join(nestedRoot, 'yarn.lock'), '__metadata:\n  version: 8\n')
+fs.writeFileSync(path.join(nestedRoot, '.yarnrc.yml'), 'nodeLinker: node-modules\n')
+const nestedIdentity = dependencyInputIdentity(nested)
+const python = process.env.DEPLOOM_VALIDATION_PYTHON || process.env.PYTHON || 'python'
+const pythonIdentity = JSON.parse(execFileSync(python, ['-c', 'import json, sys; from pathlib import Path; from manual_dependency_audit import dependency_input_identity; h, files = dependency_input_identity(Path(sys.argv[1])); print(json.dumps({"hash":h,"files":files}))', nested], { cwd: path.resolve(desktop, '..'), encoding: 'utf8' }))
+if (JSON.stringify(nestedIdentity) !== JSON.stringify(pythonIdentity)) throw new Error('nested audit identity differs across Python/Node')
+fs.appendFileSync(path.join(nestedRoot, 'yarn.lock'), '# root changed\n')
+if (dependencyInputIdentity(nested).hash === nestedIdentity.hash) throw new Error('root lock change must invalidate workspace audit')
 
 fs.rmSync(tempRoot, { recursive: true, force: true })
 console.log('Acceptance policy scenarios OK')

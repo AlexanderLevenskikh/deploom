@@ -395,6 +395,25 @@ def _workspace_member_manifests(
     if not patterns:
         return (root_manifest,)
 
+    # Literal/member globs need not traverse an entire mixed-language repo.
+    # Retain the pruned recursive path for ** patterns, whose depth is unbounded.
+    if not any("**" in pattern for pattern in patterns if not pattern.startswith("!")):
+        import glob
+        for pattern in patterns:
+            if pattern.startswith("!"):
+                continue
+            for name in glob.glob(str(manager_root / pattern / "package.json")):
+                manifest = Path(name).resolve()
+                try:
+                    relative = manifest.relative_to(manager_root.resolve())
+                except ValueError:
+                    continue
+                if any(part in PROJECT_MANIFEST_DISCOVERY_IGNORED_DIRS for part in relative.parts[:-1]):
+                    continue
+                if _workspace_owns(manager_root, manifest.parent, patterns):
+                    result.add(manifest)
+        return tuple(sorted(result, key=lambda item: str(item).lower()))
+
     # Bound discovery to package manifests and prune dependency/build payloads.
     for current, dirs, files in os.walk(manager_root):
         current_path = Path(current)

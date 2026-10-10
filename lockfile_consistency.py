@@ -232,10 +232,8 @@ def parse_yarn_lock_v1(path: Path) -> Dict[str, str]:
     current_keys: List[str] = []
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     if any(line.startswith("__metadata:") for line in lines[:30]):
-        raise LockfileConsistencyError(
-            "YARN_LOCK_VERSION_UNSUPPORTED",
-            f"{path} looks like Yarn Berry lockfile; configure command-based validation or use a supported parser",
-        )
+        from yarn_berry import lock_mapping
+        return lock_mapping(path)
     for line in lines:
         if not line.strip() or line.startswith("#"):
             continue
@@ -288,6 +286,10 @@ def registry_artifact_url_allowed(registry: str, url: str) -> bool:
 
 
 def _yarn_lock_resolved_urls(lockfile: Path) -> List[str]:
+    from yarn_berry import is_berry_lock, lock_entries
+    if is_berry_lock(lockfile):
+        return [str(entry["resolution"]) for entry in lock_entries(lockfile)
+                if str(entry.get("resolution") or "").startswith(("https://", "http://"))]
     result: List[str] = []
     for line in lockfile.read_text(encoding="utf-8", errors="replace").splitlines():
         match = re.match(r'^\s+resolved\s+["\']?([^"\'\s]+)', line)
@@ -584,6 +586,9 @@ def update_lockfile(
     runner: Optional[Callable[..., subprocess.CompletedProcess[str]]] = None,
 ) -> Tuple[List[str], List[str], List[str]]:
     if manager == "yarn":
+        from yarn_berry import is_berry_lock, update_berry_lockfile
+        if is_berry_lock(lockfile):
+            return update_berry_lockfile(project, package_json, lockfile, registry, config, runner=runner)
         yarn = resolve_executable(str(config.get("yarnExecutable") or "yarn"))
         install_extra = normalize_command(config.get("yarnInstallArgs"))
         if not install_extra:

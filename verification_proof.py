@@ -401,6 +401,13 @@ def _yarn_lock_fixed_record(
             f"FIXED_SOURCE_LOCKFILE_UNREADABLE: {lock}: {exc}"
         ) from exc
 
+    from yarn_berry import is_berry_lock, lock_entries
+    if is_berry_lock(lock):
+        for entry in lock_entries(lock):
+            if f"{package_name}@{spec}" in entry["selectors"]:
+                return {"version": entry["version"], "resolved": entry["resolution"],
+                        "integrity": str(entry.get("checksum") or "")}
+        return {}
     wanted = f"{package_name}@{spec}"
     keys: list[str] = []
     record: dict[str, object] = {}

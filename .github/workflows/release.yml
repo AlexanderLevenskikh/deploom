@@ -112,6 +112,8 @@ jobs:
       - name: Install desktop parsers for Windows delivery checks
         working-directory: desktop
         run: npm ci
+      - name: Install pinned modern Yarn acceptance runtimes
+        run: node scripts/prepare-yarn-test-runtimes.mjs
       - name: Run exact-release-SHA Windows physical acceptance
         run: |
           python -m unittest tests.test_block_lambda_release_closure

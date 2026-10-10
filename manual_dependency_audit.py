@@ -50,9 +50,22 @@ def dependency_input_identity(project: Path) -> Tuple[str, List[str]]:
     Unknown/extra lockfile situations remain visible because every recognized
     dependency input present in the project participates in the digest.
     """
+    project = project.resolve()
     digest = hashlib.sha256()
     files: List[str] = []
-    for name in DEPENDENCY_INPUT_FILES:
+    names = list(DEPENDENCY_INPUT_FILES)
+    # Bind root installation inputs when the selected workspace has no own lock.
+    # Node uses the same ordering and names, so a changed root invalidates audit.
+    if not any((project / name).is_file() for name in DEPENDENCY_INPUT_FILES[1:]):
+        ancestors = list(project.resolve().parents)
+        boundary = next((folder for folder in ancestors if (folder / ".git").exists()), None)
+        if boundary is not None:
+            for folder in ancestors:
+                names.extend(os.path.relpath(folder / name, project).replace("\\", "/")
+                             for name in (*DEPENDENCY_INPUT_FILES, ".yarnrc.yml"))
+                if folder == boundary:
+                    break
+    for name in names:
         path = project / name
         if not path.exists() or not path.is_file():
             continue
@@ -142,6 +155,9 @@ def split_yarn_keys(line: str) -> List[str]:
 
 
 def parse_yarn_lock(path: Path) -> Dict[str, str]:
+    from yarn_berry import is_berry_lock, lock_mapping
+    if is_berry_lock(path):
+        return lock_mapping(path)
     mapping: Dict[str, str] = {}
     keys: List[str] = []
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -168,6 +184,9 @@ def parse_yarn_lock_entries(path: Path) -> List[Dict[str, Any]]:
     handles only stable Yarn v1 fields: selectors, version, dependencies and
     optionalDependencies. Unknown fields are ignored.
     """
+    from yarn_berry import is_berry_lock, lock_entries
+    if is_berry_lock(path):
+        return lock_entries(path)
     entries: List[Dict[str, Any]] = []
     current: Optional[Dict[str, Any]] = None
     dependency_block = ""
@@ -254,8 +273,11 @@ def canonical_yarn_inventory(project: Path) -> Dict[str, Any]:
     Any unresolved edge is reported and makes the inventory incomplete rather
     than silently claiming a complete vulnerability audit.
     """
-    lock_path = project / "yarn.lock"
+    from yarn_berry import owning_yarn_lock
+    lock_path = owning_yarn_lock(project)
     entries = parse_yarn_lock_entries(lock_path)
+    from yarn_berry import is_berry_lock
+    modern = is_berry_lock(lock_path)
     selector_map: Dict[str, Dict[str, Any]] = {}
     entries_by_name: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for entry in entries:
@@ -266,8 +288,19 @@ def canonical_yarn_inventory(project: Path) -> Dict[str, Any]:
                 entries_by_name[selector_name].append(entry)
 
     unresolved: List[str] = []
+    resolutions = (read_json(lock_path.parent / "package.json").get("resolutions") or {}) if modern else {}
 
-    def resolve(name: str, spec: str) -> Optional[Dict[str, Any]]:
+    def resolve(name: str, spec: str, parent: str = "") -> Optional[Dict[str, Any]]:
+        # Yarn root resolutions rewrite descriptors before lock lookup. Support
+        # exact package and parent/package rules, preserving declaration order.
+        # Other forms stay incomplete rather than inventing an installed version.
+        for pattern, replacement in resolutions.items():
+            if pattern == name or (parent and pattern == f"{parent}/{name}"):
+                spec = str(replacement)
+                break
+            if name in str(pattern) and not re.fullmatch(r"(?:@[^/]+/)?[^/@*]+(?:/(?:@[^/]+/)?[^/@*]+)?", str(pattern)):
+                unresolved.append(f"unsupported-resolution:{pattern}")
+                return None
         candidates = [f"{name}@{spec}"]
         if not str(spec).startswith("npm:"):
             candidates.append(f"{name}@npm:{spec}")
@@ -275,7 +308,7 @@ def canonical_yarn_inventory(project: Path) -> Dict[str, Any]:
             if candidate in selector_map:
                 return selector_map[candidate]
         matching = entries_by_name.get(name) or []
-        if len(matching) == 1:
+        if len(matching) == 1 and (not modern or str(spec).startswith(("workspace:", "file:", "link:", "portal:"))):
             # This is safe for git/file selectors and lockfiles produced by
             # tools that normalize selector spelling, because no alternative
             # version exists for the requested package name.
@@ -291,7 +324,7 @@ def canonical_yarn_inventory(project: Path) -> Dict[str, Any]:
             continue
         for raw_name, raw_spec in declared.items():
             name, spec = str(raw_name), str(raw_spec)
-            entry = resolve(name, spec)
+            entry = resolve(name, spec, str(package_json.get("name") or ""))
             if entry is None:
                 unresolved.append(f"root:{section}:{name}@{spec}")
                 continue
@@ -305,8 +338,12 @@ def canonical_yarn_inventory(project: Path) -> Dict[str, Any]:
         audit_name, requested_spec, entry, _is_direct = queue.pop()
         entry_id = id(entry)
         version = str(entry.get("version") or "").strip()
-        if audit_name and version:
-            pairs.add((audit_name, version))
+        # Workspace/file/patch locators are not published npm versions. Their
+        # dependencies still participate in graph reachability and coverage.
+        from yarn_berry import registry_identity
+        identity = registry_identity(entry, audit_name)
+        if identity is not None and version:
+            pairs.add((identity, version))
         if entry_id in visited_entries:
             continue
         visited_entries.add(entry_id)
@@ -316,7 +353,7 @@ def canonical_yarn_inventory(project: Path) -> Dict[str, Any]:
                 continue
             for raw_name, raw_spec in dependencies.items():
                 name, spec = str(raw_name), str(raw_spec)
-                child = resolve(name, spec)
+                child = resolve(name, spec, audit_name)
                 if child is None:
                     parent = f"{audit_name}@{version}" if version else audit_name
                     unresolved.append(f"{parent}->{name}@{spec}")
@@ -332,7 +369,7 @@ def canonical_yarn_inventory(project: Path) -> Dict[str, Any]:
         for values in [package_json.get(section) or {}]
         if isinstance(values, dict)
     )
-    complete = not unresolved and (bool(pairs) or declared_count == 0)
+    complete = not unresolved and (bool(visited_entries) or declared_count == 0)
     return {
         "pairs": sorted(pairs),
         "directPackages": sorted(direct_names),
@@ -536,6 +573,11 @@ def _write_text(path: Path, value: str) -> None:
 
 
 def package_manager(project: Path) -> str:
+    from project_topology import resolve_project_topology, ProjectTopologyError
+    try:
+        return resolve_project_topology(project, allow_discovery=False, require_supported=False).profile.manager
+    except ProjectTopologyError:
+        pass  # Existing standalone audit diagnostics also support missing locks.
     package_json = read_json(project / "package.json")
     declared = str(package_json.get("packageManager") or "").lower()
     if declared.startswith("pnpm@") or (project / "pnpm-lock.yaml").exists():
@@ -1409,6 +1451,11 @@ def run_audit(
                     "yarn-inventory or npm-lock-bridge"
                 ],
             }
+        from yarn_berry import is_berry_lock
+        from yarn_berry import owning_yarn_lock
+        if is_berry_lock(owning_yarn_lock(project)):
+            # Audit the canonical exact inventory; never re-resolve Berry with npm.
+            return _yarn_inventory_audit(project, registry, audit_workspace, runtime_env=runtime_env)
         if mode == "auto":
             _progress("using reproducible isolated package-lock audit for Yarn Classic")
             return _yarn_npm_lock_audit(project, registry, audit_workspace, runtime_env=runtime_env)

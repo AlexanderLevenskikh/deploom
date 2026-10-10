@@ -250,6 +250,9 @@ def split_yarn_keys(key_line: str) -> List[str]:
 
 
 def parse_yarn_lock_v1(lock_path: Path) -> Dict[str, str]:
+    from yarn_berry import is_berry_lock, lock_mapping
+    if is_berry_lock(lock_path):
+        return lock_mapping(lock_path)
     mapping: Dict[str, str] = {}
     current_keys: List[str] = []
     try:

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { dirname, join, relative, resolve } from 'node:path'
 
 export type AcceptancePolicy = {
   maxKnownCritical: number
@@ -157,7 +157,25 @@ export function mergeTargetPolicy(
 }
 
 export function dependencyInputIdentity(projectPath: string): { hash: string; files: string[] } {
-  const files = DEPENDENCY_INPUT_FILES.filter((name) => existsSync(join(projectPath, name)))
+  projectPath = realpathSync.native(projectPath)
+  const names: string[] = [...DEPENDENCY_INPUT_FILES]
+  if (!DEPENDENCY_INPUT_FILES.slice(1).some((name) => existsSync(join(projectPath, name)))) {
+    const ancestors: string[] = []
+    let folder = dirname(resolve(projectPath))
+    while (dirname(folder) !== folder) {
+      ancestors.push(folder)
+      if (existsSync(join(folder, '.git'))) break
+      folder = dirname(folder)
+    }
+    if (ancestors.some((ancestor) => existsSync(join(ancestor, '.git')))) {
+      for (const ancestor of ancestors) {
+        for (const name of [...DEPENDENCY_INPUT_FILES, '.yarnrc.yml']) {
+          names.push(relative(projectPath, join(ancestor, name)).replaceAll('\\', '/'))
+        }
+      }
+    }
+  }
+  const files = names.filter((name) => existsSync(join(projectPath, name)))
   const hash = createHash('sha256')
   for (const name of files) {
     hash.update(name, 'utf8')

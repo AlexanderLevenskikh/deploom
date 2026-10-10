@@ -8,7 +8,7 @@ The exact input policy is recorded in the snapshot manifest and included in the 
 
 If validation depends on omitted inputs, it must fail rather than reuse an earlier green result. The explicit CLI escape hatch `--source-scope repository` retains the historical repository input policy. Existing runs without a stored scope keep their original policy; restarting creates a new run using the current default. No historical checkpoint is silently reinterpreted.
 
-Yarn workspace paths beginning with `./` are normalized while preserving exclusions. This does not add authoritative Yarn Berry/4 verification support or authorize converting a Yarn project to npm. Its configured package manager and owning lockfile remain authoritative.
+Yarn workspace paths beginning with `./` are normalized while preserving exclusions. Yarn 2/3/4 with node-modules uses its own immutable verification path (see MODERN_YARN.md); this does not authorize converting a Yarn project to npm. Its configured package manager and owning lockfile remain authoritative.
 
 After verified delivery, the inspection checkout is detached at the verified commit, freeing the result branch for checkout elsewhere. Files and migration documents remain available. A changed result checkout is preserved. Optional documentation cleanup temporarily reacquires the branch and refuses to run if it is in use elsewhere.
 

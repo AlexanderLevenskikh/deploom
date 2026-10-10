@@ -253,6 +253,9 @@ def resolve_package_manager_profile(
     )
     if berry:
         linker = _berry_node_linker(root)
+        supported = linker == "node-modules" and declared_major in {2, 3, 4} and bool(
+            re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", declared_version)
+        )
         return PackageManagerProfile(
             manager="yarn",
             family="yarn-berry",
@@ -260,12 +263,10 @@ def resolve_package_manager_profile(
             declared_version=declared_version,
             lockfile_name=lockfile.name,
             node_linker=linker,
-            authoritative_supported=False,
-            unsupported_code="PACKAGE_MANAGER_YARN_BERRY_UNSUPPORTED",
-            unsupported_detail=(
-                f"Yarn Berry ({declared_version or '2+'}, nodeLinker={linker}) "
-                "cannot use Yarn Classic --frozen-lockfile proof semantics"
-            ),
+            authoritative_supported=supported,
+            unsupported_code=("" if supported else "PACKAGE_MANAGER_YARN_BERRY_UNSUPPORTED"),
+            unsupported_detail=("" if supported
+                                else f"Yarn Berry requires a pinned 2/3/4 version and nodeLinker=node-modules; observed {declared_version or 'unversioned'}, {linker}"),
         )
 
     return PackageManagerProfile(
@@ -292,6 +293,13 @@ def install_args_for_profile(
             args.append("--frozen-lockfile")
         if ignore_scripts:
             args.append("--ignore-scripts")
+        return args
+    if profile.family == "yarn-berry":
+        args = ["install"]
+        if frozen:
+            args.append("--immutable")
+        if ignore_scripts:
+            args.append("--skip-builds" if _major(profile.declared_version) == 2 else "--mode=skip-build")
         return args
     if profile.family == "npm":
         args = ["ci", "--no-audit", "--no-fund"] if frozen else [

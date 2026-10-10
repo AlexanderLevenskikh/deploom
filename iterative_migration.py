@@ -3079,6 +3079,13 @@ def _yarn_lock_installed_version(lock_path: Path, package_name: str, declared_sp
     never a guess). Without a declared spec (pure helper use) a single
     resolution across all selectors of the package is accepted.
     """
+    from yarn_berry import is_berry_lock, lock_mapping
+    if is_berry_lock(lock_path):
+        mapping = lock_mapping(lock_path)
+        if declared_spec is not None:
+            return mapping.get(f"{package_name}@{declared_spec}") or mapping.get(f"{package_name}@npm:{declared_spec}")
+        versions = {version for selector, version in mapping.items() if _yarn_selector_for(selector, str(package_name))}
+        return versions.pop() if len(versions) == 1 else None
     try:
         lines = lock_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:

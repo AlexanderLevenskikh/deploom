@@ -2843,6 +2843,13 @@ def verify_assignment(
                 workspace=str(workspace_project),
             )
 
+        if workspace_topology.profile.family == "yarn-berry":
+            from yarn_berry import require_runtime_version
+            try:
+                require_runtime_version(workspace_topology.profile, executable, package_manager_project, base_env)
+            except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                return BaselineVerifyResult(False, "infrastructure", str(exc), workspace=str(workspace_project))
+
         if proof_identity is None:
             proof_identity = build_verification_proof_identity(
                 source_snapshot.project_path,
@@ -2998,6 +3005,10 @@ def verify_assignment(
             "npm_config_ignore_scripts": "true",
         }
         install_env.update(_package_manager_cache_environment(config, manager))
+        if workspace_topology.profile.family == "yarn-berry":
+            install_env["YARN_ENABLE_SCRIPTS"] = "true"  # skip-build suppresses execution without changing install artifacts
+            if config.registry:
+                install_env["YARN_NPM_REGISTRY_SERVER"] = config.registry
         # Recovery may reuse a durable ResolverProof only when the Desktop
         # explicitly marks this command as a Continue/transient-retry replay.
         # A normal fresh Baseline still performs fresh resolver work unless its
@@ -3700,6 +3711,8 @@ def verify_assignment(
                     "npm_config_ignore_scripts": "false",
                 }
                 lifecycle_env.update(_package_manager_cache_environment(config, manager))
+                if workspace_topology.profile.family == "yarn-berry" and config.registry:
+                    lifecycle_env["YARN_NPM_REGISTRY_SERVER"] = config.registry
                 preparation_started = time.monotonic()
                 lifecycle_operation_id = new_observability_id("lifecycle-install")
                 event(

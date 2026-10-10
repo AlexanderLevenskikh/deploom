@@ -140,7 +140,7 @@ python -m pip install -r requirements-solver.txt
 }
 ```
 
-Авторитетный Baseline resolver/proof-oracle сейчас поддерживает **npm** и **Yarn Classic 1.x**. Yarn Berry 2/3/4 (как PnP, так и `node-modules`) и pnpm распознаются, но для authoritative Baseline намеренно завершаются typed fail-closed (`PACKAGE_MANAGER_YARN_BERRY_UNSUPPORTED` / `PACKAGE_MANAGER_PNPM_UNSUPPORTED`): это infrastructure/UNKNOWN-equivalent capability boundary, из которого никогда не учится dependency nogood. Ручной vulnerability audit остаётся отдельным workflow и может использовать npm/pnpm независимо от этой Baseline support matrix. В persistent cache сохраняются только воспроизведённые exact-assignment dependency exclusions; project/build/infra/unknown failures туда не попадают.
+Авторитетный Baseline resolver/proof-oracle поддерживает **npm**, **Yarn Classic 1.x** и **Yarn Berry 2/3/4 с `nodeLinker: node-modules`**. Для Berry нужен точный `packageManager: yarn@X.Y.Z`: фактически запущенная версия проверяется, resolver пропускает build scripts, а lifecycle устанавливает точный lockfile с `--immutable` и выполняет scripts. PnP и pnpm остаются typed fail-closed (`PACKAGE_MANAGER_YARN_BERRY_UNSUPPORTED` / `PACKAGE_MANAGER_PNPM_UNSUPPORTED`); infrastructure/UNKNOWN не становится dependency nogood. См. [Modern Yarn](docs/MODERN_YARN.md).
 
 ### Package-manager support matrix
 
@@ -148,7 +148,7 @@ python -m pip install -r requirements-solver.txt
 | --- | --- | --- |
 | npm | **Supported** | real package-manager verification |
 | Yarn Classic 1.x | **Supported** | real Yarn 1 verification |
-| Yarn Berry 2/3/4 + `node-modules` | **Typed unsupported** | fail closed, no nogood |
+| Yarn Berry 2/3/4 + `node-modules` | **Supported** | native immutable install, pinned runtime |
 | Yarn Berry 2/3/4 + PnP | **Typed unsupported** | fail closed, no nogood |
 | pnpm | **Typed unsupported** | fail closed, no nogood |
 
@@ -513,7 +513,7 @@ Desktop state-коммит сначала обновляет уже отслеж
 - npm → `package-lock.json`/`npm-shrinkwrap.json`;
 - pnpm → `pnpm-lock.yaml`.
 
-Чтение/распознавание lockfile не означает authoritative Baseline support: на release boundary real solve-and-verify сейчас доказан только для npm и Yarn Classic 1.x; Berry и pnpm fail closed согласно matrix выше.
+Чтение lockfile само по себе не является доказательством: поддержка npm, Yarn Classic и современного Yarn с node-modules проверяется реальными installs и project checks. PnP и pnpm fail closed согласно matrix выше.
 
 `--capture-baseline` validates and records the fetched source branch. Every ordinary run analyzes the current checkout, refreshes a stale **canonical project lockfile** by default and optionally deduplicates Yarn when tooling exists. Mixed root lockfiles are rejected.
 
@@ -543,7 +543,7 @@ Project command output is project evidence, not DepLoom infrastructure authority
 
 Durable ProjectProof reuse for arbitrary shell commands is disabled until the command's external tool closure is explicitly declared and identity-bound. Production toolBuildId is computed from proof-semantic code and cannot be replaced by DEPLOOM_TOOL_BUILD_ID.
 
-Release publication is gated on exact-release-SHA Windows physical acceptance. npm and Yarn Classic remain the supported package managers; Yarn Berry and pnpm remain typed unsupported. Windows NTFS is the proof-grade physical substrate. ReFS has no independent Lambda acceptance claim. macOS and Linux do not claim proof-grade descendant-tree supervision.
+Release publication is gated on exact-release-SHA Windows physical acceptance. npm, Yarn Classic and pinned Yarn 2/3/4 with node-modules are supported; PnP and pnpm remain typed unsupported. Windows NTFS is the proof-grade physical substrate. ReFS has no independent Lambda acceptance claim. macOS and Linux do not claim proof-grade descendant-tree supervision.
 
 Migration check selection and optional Vitest nonregression control: [validation profiles](docs/MIGRATION_VALIDATION.md).
 See [Iterative FLOW and automatic continuation](docs/MIGRATION_FLOW.md) for run settings, agent selection and autopilot boundaries.

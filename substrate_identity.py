@@ -32,6 +32,7 @@ _COMPONENT_FILES: Mapping[str, tuple[str, ...]] = {
         "constraint_cache.py",
         "project_topology.py",
         "package_manager_profile.py",
+        "yarn_berry.py",
         "lockfile_consistency.py",
         "resolved_dependency_state.py",
         "proven_dependency_state.py",

@@ -184,7 +184,7 @@ class BlockZProjectTopologyTests(unittest.TestCase):
             self.assertEqual("yarn-classic", topology.profile.family)
             self.assertEqual(root.resolve(), topology.package_manager_root)
 
-    def test_yarn_berry_fails_closed_even_with_node_modules_linker(self) -> None:
+    def test_yarn_berry_node_modules_has_native_immutable_profile(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             _write_json(root / "package.json", {
@@ -197,10 +197,9 @@ class BlockZProjectTopologyTests(unittest.TestCase):
             (root / ".yarnrc.yml").write_text(
                 "nodeLinker: node-modules\n", encoding="utf-8"
             )
-            with self.assertRaisesRegex(
-                ProjectTopologyError, "PACKAGE_MANAGER_YARN_BERRY_UNSUPPORTED"
-            ):
-                resolve_project_topology(root, require_supported=True)
+            topology = resolve_project_topology(root, require_supported=True)
+            self.assertEqual("yarn-berry", topology.profile.family)
+            self.assertEqual("node-modules", topology.profile.node_linker)
 
     def test_pnpm_fails_closed_until_importer_proof_is_implemented(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
