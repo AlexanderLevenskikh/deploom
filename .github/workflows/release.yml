@@ -175,7 +175,7 @@ jobs:
             if ($feed -notmatch [regex]::Escape($expected)) { throw "Packaged updater feed does not target deploom: missing '$expected'" }
           }
           $env:PYTHONPATH = (Resolve-Path 'release/win-unpacked/resources/tool/vendor').Path
-          python -c "import z3; print('packaged z3', z3.get_version_string())"
+          python -S -c "import z3, yaml; assert not yaml.__with_libyaml__; assert yaml.safe_load('version: 4') == {'version': 4}; print('packaged z3', z3.get_version_string(), 'portable YAML', yaml.__version__)"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: deploom-windows-x64
@@ -225,7 +225,7 @@ jobs:
           grep -F 'provider: github' release/linux-unpacked/resources/app-update.yml
           grep -F 'owner: AlexanderLevenskikh' release/linux-unpacked/resources/app-update.yml
           grep -F 'repo: deploom' release/linux-unpacked/resources/app-update.yml
-          PYTHONPATH="$PWD/release/linux-unpacked/resources/tool/vendor" python3 -c "import z3; print('packaged z3', z3.get_version_string())"
+          PYTHONPATH="$PWD/release/linux-unpacked/resources/tool/vendor" python3 -S -c "import z3, yaml; assert not yaml.__with_libyaml__; assert yaml.safe_load('version: 4') == {'version': 4}; print('packaged z3', z3.get_version_string(), 'portable YAML', yaml.__version__)"
           chmod +x "$appimage"
           rm -rf squashfs-root
           "$appimage" --appimage-extract >/dev/null
@@ -287,7 +287,7 @@ jobs:
           grep -F 'repo: deploom' "$app_update"
           vendor="$(find release -path '*/DepLoom.app/Contents/Resources/tool/vendor' -type d -print -quit)"
           test -n "$vendor"
-          PYTHONPATH="$vendor" python3 -c "import z3; print('packaged z3', z3.get_version_string())"
+          PYTHONPATH="$vendor" python3 -S -c "import z3, yaml; assert not yaml.__with_libyaml__; assert yaml.safe_load('version: 4') == {'version': 4}; print('packaged z3', z3.get_version_string(), 'portable YAML', yaml.__version__)"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: deploom-macos-${{ matrix.arch }}-unsigned-smoke
