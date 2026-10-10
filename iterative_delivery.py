@@ -522,7 +522,8 @@ def delivery_verify(run_dir, inputs, *, cleanup=False):
     if git(root, "branch", "--show-current") != state["branch"]:
         raise RuntimeError("DELIVERY_BRANCH_CHANGED")
     git(root, "merge-base", "--is-ancestor", state["sourceHead"], "HEAD")
-    if git(root, "status", "--porcelain"):
+    from delivery_git_status import committed_worktree
+    if not committed_worktree(root):
         raise RuntimeError("DELIVERY_UNCOMMITTED_CHANGES: finish semantic commits before verifying")
     notes = state.get("cleanup") or {}
     if cleanup and notes.get("status") not in {"ready", "done"}:
@@ -559,7 +560,7 @@ def delivery_verify(run_dir, inputs, *, cleanup=False):
         verification.parent.mkdir(parents=True, exist_ok=True)
         git(root, "clone", "--no-hardlinks", "--no-checkout", str(root), str(verification))
         git(verification, "checkout", "--detach", delivered_head)
-    if git(verification, "rev-parse", "HEAD") != delivered_head or git(verification, "status", "--porcelain"):
+    if git(verification, "rev-parse", "HEAD") != delivered_head or not committed_worktree(verification):
         raise RuntimeError("DELIVERY_VERIFICATION_COPY_CHANGED")
     # Git's autocrlf / checkout filters can change working bytes without a
     # semantic diff. Copy the exact already validated delivered bytes before
@@ -586,7 +587,7 @@ def delivery_verify(run_dir, inputs, *, cleanup=False):
     # Repeat audit can change the final verdict (e.g. a new advisory). Persist
     # that fact in the run as well as in the delivery UI; an old COMPLETE is
     # never reused after a failed or unknown delivered audit.
-    if git(root, "rev-parse", "HEAD") != delivered_head or git(root, "status", "--porcelain"):
+    if git(root, "rev-parse", "HEAD") != delivered_head or not committed_worktree(root):
         raise RuntimeError("DELIVERY_CHANGED_DURING_VERIFICATION")
     for name, digest in expected.items():
         path = root / name

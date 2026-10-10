@@ -213,7 +213,22 @@ export async function runDeliveryWorkflow(runDir: string, deps: WorkflowDependen
     const delivery = await deps.command('delivery-prepare')
     if (delivery.status === 'done') return { ok: true }
     const lease = readJson(join(runDir, 'delivery-agent.json'))
-    const finished = lease?.status === 'finished' && lease.identity === `delivery:${delivery.runId}:${delivery.checkpointId}:0`
+    const identity = `delivery:${delivery.runId}:${delivery.checkpointId}:0`
+    // A previous controller can have rejected a finished agent on stale
+    // EOL/stat status. Let the authoritative verifier decide before spending
+    // another agent turn; actual missing commits still resume the same session.
+    if (lease?.status === 'needs-agent' && lease.identity === identity && String(lease.verificationError || '').includes('DELIVERY_UNCOMMITTED_CHANGES')) {
+      if (deps.canceled()) throw new Error('DELIVERY_CANCELED')
+      deps.progress('Проверяем сохранённые коммиты / Checking preserved commits')
+      try {
+        await deps.command('delivery-verify')
+        writeJson(join(runDir, 'delivery-agent.json'), { ...lease, status: 'finished', verificationError: undefined })
+        return { ok: true }
+      } catch (error) {
+        if (!(error instanceof Error ? error.message : String(error)).includes('DELIVERY_UNCOMMITTED_CHANGES')) throw error
+      }
+    }
+    const finished = lease?.status === 'finished' && lease.identity === identity
     if (!finished) await dispatch('delivery', delivery)
     if (deps.canceled()) throw new Error('DELIVERY_CANCELED')
     deps.progress('Повторяем проверки и аудит ветки / Rechecking and auditing the branch')

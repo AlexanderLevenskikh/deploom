@@ -44,7 +44,7 @@ import { autonomyPolicy, normalizedPlannerFailure } from './autonomy-policy.js'
 import { runParallelQueue, selectParallelGroupQueue } from './parallel-groups.js'
 import { isToolManagedWorktreePath, portablePathKey, restartWorktreeCleanupTargets, toolManagedWorktreeFromLegacyDeferral, toolManagedWorktreePaths } from './worktree-ownership.js'
 import { scheduleUpdateChecks } from './updater-schedule.js'
-import { teamStatePaths } from './state-commit.js'
+import { teamStatePaths, teamStatePathspecs } from './state-commit.js'
 import { changedOverrideProjects } from './dashboard-state.js'
 import { forgetScopedPromptPath, rememberScopedPromptPath, roadmapContainsProject, scopedPromptPath } from './project-context.js'
 import { targetClosureFromRoadmap, targetClosureFromRoadmapWithTargets, type ClosureTarget, type TargetClosure } from './target-closure.js'
@@ -3148,12 +3148,11 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
     }
     case 'commit-state': {
       const settings = readSettings(workspace)
-      const trackedRoots = ['.dependency-roadmap', 'knowledge'].filter((value) => existsSync(resolve(workspace.path, value)))
-      const newStatePaths = teamStatePaths(workspace.settingsPath, settings).filter((value) => existsSync(resolve(workspace.path, value)))
+      const statePaths = teamStatePaths(workspace.settingsPath, settings, workspace.path).filter(value => existsSync(resolve(workspace.path, value)))
+      const statePathspecs = teamStatePathspecs(statePaths)
       return [
-        ...(trackedRoots.length ? [{ label: 'Обновление отслеживаемых state-файлов', command: 'git', cwd: workspace.path, args: ['-C', workspace.path, 'add', '-u', '--', ...trackedRoots] }] : []),
-        ...(newStatePaths.length ? [{ label: 'Добавление новых state-файлов', command: 'git', cwd: workspace.path, args: ['-C', workspace.path, 'add', '--', ...newStatePaths] }] : []),
-        { label: 'Коммит состояния команды', command: 'git', cwd: workspace.path, args: ['-C', workspace.path, 'commit', '-m', input.commitMessage?.trim() || `chore(deps): save ${project.name} roadmap state`], skipWhenNoStagedChanges: true },
+        ...(statePaths.length ? [{ label: 'Обновление нужных state-файлов', command: 'git', cwd: workspace.path, args: ['-C', workspace.path, 'add', '-A', '--', ...statePathspecs] }] : []),
+        { label: 'Коммит состояния команды', command: 'git', cwd: workspace.path, args: ['-C', workspace.path, 'commit', '-m', input.commitMessage?.trim() || `chore(deps): save ${project.name} roadmap state`, '--only', '--', ...statePathspecs], skipWhenNoStagedChanges: true },
       ]
     }
     case 'push-workspace': {
@@ -3161,7 +3160,7 @@ function actionCommands(input: ActionInput, workspace: WorkspaceRecord, project:
       return [
         { label: `Публикация release-ветки ${releaseBranch}`, command: 'git', cwd: project.path, args: ['-C', project.path, 'push', '-u', 'origin', releaseBranch] },
         { label: 'Подготовка финального состояния FLOW', command: 'git', cwd: workspace.path, args: ['-C', workspace.path, 'add', '--', '.dependency-roadmap/desktop/flow-state.json'], finalizeTeamStateBeforeRun: true },
-        { label: 'Коммит финального состояния FLOW', command: 'git', cwd: workspace.path, args: ['-C', workspace.path, 'commit', '-m', `chore(deps): complete ${project.name} dependency flow`], skipWhenNoStagedChanges: true },
+        { label: 'Коммит финального состояния FLOW', command: 'git', cwd: workspace.path, args: ['-C', workspace.path, 'commit', '-m', `chore(deps): complete ${project.name} dependency flow`, '--only', '--', '.dependency-roadmap/desktop/flow-state.json'], skipWhenNoStagedChanges: true },
         { label: 'Публикация командного state', command: 'git', cwd: workspace.path, args: ['-C', workspace.path, 'push', 'origin', 'HEAD'] },
       ]
     }
@@ -6713,7 +6712,9 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
         teamStateFinalized = true
       }
       if (spec.skipWhenNoStagedChanges) {
-        const staged = await spawnCapture('git', ['-C', spec.cwd, 'diff', '--cached', '--quiet'], spec.cwd)
+        const separator = spec.args.indexOf('--')
+        const stagedScope = separator >= 0 ? ['--', ...spec.args.slice(separator + 1)] : []
+        const staged = await spawnCapture('git', ['-C', spec.cwd, 'diff', '--cached', '--quiet', ...stagedScope], spec.cwd)
         if (staged.code === 0) {
           send('flow:job-output', { jobId: job.id, stream: 'system', line: `${spec.label}: новых изменений нет, шаг уже актуален.` })
           continue
@@ -8602,6 +8603,7 @@ function setupIpc(): void {
       }
     } finally {
       iterativeStepInFlight.delete(stepLockKey(workspace.id, project.name))
+      storageCleanup.scheduleAutomatic()
     }
   })
   ipcMain.handle('flow:iterative:drive', runIterativeDriveWithAutopilot)
@@ -8819,7 +8821,7 @@ function setupIpc(): void {
       })
       updateAttempt(runDir, { status: outcome.ok ? 'done' : readAttempt(runDir)?.cancelRequested ? 'canceled' : 'failed', stage: 'agent', lastStep: outcome.ok ? 'delivery' : 'delivery-failed', lastError: outcome.error, finishedAt: Date.now() })
       publishIterativeAttempt(runDir)
-      if (outcome.ok && readDeliveryJson(join(runDir, 'delivery-state.json'))?.status === 'done') storageCleanup.scheduleAutomatic()
+      storageCleanup.scheduleAutomatic()
       return { ...outcome, phase: 'TERMINAL' }
     }
     // Launch-wait resilience: classify the durable lease BEFORE marking the
@@ -9327,6 +9329,7 @@ function setupIpc(): void {
       }
       updateAttempt(runDir, { lastHeartbeatAt: Date.now() })
       publishIterativeAttempt(runDir)
+      storageCleanup.scheduleAutomatic()
     }
     })
   }

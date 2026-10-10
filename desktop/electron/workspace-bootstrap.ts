@@ -11,6 +11,11 @@ const WORKSPACE_GITIGNORE = `# DepLoom local/generated files
 .dependency-roadmap/artifacts/*
 !.dependency-roadmap/artifacts/.gitkeep
 .dependency-roadmap/desktop/downloads/
+.dependency-roadmap/iterative/
+.dependency-roadmap/snapshot-objects/
+.dependency-roadmap/cache/
+.dependency-roadmap/tmp/
+.dependency-roadmap-worktrees/
 
 # Common local noise
 .DS_Store

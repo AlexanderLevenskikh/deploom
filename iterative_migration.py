@@ -77,6 +77,7 @@ from package_manager_profile import (
     resolve_package_manager_profile,
 )
 from project_topology import ProjectTopologyError, resolve_project_topology
+from storage_capacity import StorageCapacityError
 from source_snapshot import (
     SourceCaptureError,
     SourceSnapshot,
@@ -3985,6 +3986,8 @@ def _handle_materialize_failure(
 def _materialize_trial_tree(
     snapshot: SourceSnapshot, workspace_root: Path, timeout_seconds: int
 ) -> None:
+    from storage_capacity import require_capacity
+    require_capacity(workspace_root, snapshot.byte_count, "trial materialization")
     workspace_root.parent.mkdir(parents=True, exist_ok=True)
     with MigrationProgress(_emit_status, operation="materialize", message="Preparing isolated source snapshot copy"):
         method = materialize_private_tree(
@@ -4658,6 +4661,13 @@ def _accept_checkpoint(
     save_run(run_dir, run)
     clear_candidate(run_dir)
     write_repair_requests(run_dir, [])
+
+    # The accepted pointer is durable first. Lossless cold storage failure
+    # cannot revoke it or erase the previous snapshot; expose the failure.
+    from snapshot_compaction import compact_superseded
+    with MigrationProgress(_emit_status, operation="storage", message="Compacting superseded source snapshots", run_id=run["runId"]) as progress:
+        storage = compact_superseded(run_dir, progress=progress)
+    _emit_status({"event": "storage.compaction", "runId": run["runId"], **storage})
 
     # Physical acceptance telemetry follows the durable pointer switch too.
     from cohort_attempt_telemetry import record_attempt
@@ -5892,6 +5902,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (StaleFeedbackError, InvalidInputError) as exc:
         print(f"ITERATIVE_MIGRATION_FAILURE_V1 {json.dumps({'code': exc.code, 'summary': str(exc)})}")
         return 2
+    except StorageCapacityError as exc:
+        print(f"ITERATIVE_MIGRATION_FAILURE_V1 {json.dumps({'code': 'DISK_SPACE_LOW', 'summary': str(exc), 'fixable': False})}")
+        return 5
     except BudgetExceededError as exc:
         print(f"ITERATIVE_MIGRATION_FAILURE_V1 {json.dumps({'code': exc.code, 'summary': str(exc)})}")
         return 4

@@ -120,14 +120,14 @@ function Harness() {
       logs={[{ jobId: 'old', stream: 'stderr', line: 'SAVED_OLD_FLOW_ONLY: historical error' }]} />
     <footer className="status-bar" style={{ position: 'fixed', bottom: 0, left: 0, right: 0 }}><StorageBackgroundStatus status={storageStatus} onOpen={() => setShowStorage(true)} /></footer>
     {showStorage ? <StorageMaintenanceDialog status={storageStatus} onClose={() => setShowStorage(false)} onProgress={handler => { storageProgress.current = handler; return () => { storageProgress.current = undefined } }} onMaintenance={async (action, operationId) => {
-      const eligible = storageCleaned.current ? 0 : 3
+      const eligible = storageCleaned.current ? 0 : 2
       const clean = action === 'clean'
       const progress: StorageProgress = { operationId, stage: clean ? 'clean' : 'scan', path: 'E:/QA/verification/trials/example', processed: 50, total: 100, percent: clean ? 50 : null, files: 50, bytes: 1024 }
       setStorageStatus({ phase: action, action, operationId, progress })
       storageProgress.current?.(progress)
       await new Promise(resolve => setTimeout(resolve, 1000))
       if (clean) storageCleaned.current = true
-      const result: StorageResult = { root: 'E:/QA/verification', items: [{ path: 'E:/QA/verification/trials/example', category: 'verification-trials', reason: '', eligible: true, bytes: 3 * 1024 ** 3, files: 100 }, { path: 'C:/QA/.dependency-roadmap/iterative/demo/sources/C6', category: 'current-run', reason: 'current-checkpoint-or-run-data', eligible: false, bytes: 5 * 1024 ** 3, files: 500 }], volumes: [{ path: 'E:/', freeBytes: (clean ? 23 : 20) * 1024 ** 3 }, { path: 'C:/', freeBytes: 18 * 1024 ** 3 }], eligible, eligibleBytes: 3 * 1024 ** 3, protectedBytes: 5 * 1024 ** 3, removed: clean ? eligible : 0, failed: 0, protected: 1, reclaimedBytes: clean ? 3 * 1024 ** 3 : 0, ...(clean ? { results: [{ path: 'E:/QA/verification/trials/example', status: 'removed' }] } : {}) }
+      const result: StorageResult = { root: 'E:/QA/verification', items: [{ path: 'C:/QA/.dependency-roadmap/iterative/demo/sources/C0', category: 'snapshot-compaction', reason: '', eligible: true, bytes: 4 * 1024 ** 3, files: 500 }, { path: 'E:/QA/verification/trials/example', category: 'verification-trials', reason: '', eligible: true, bytes: 3 * 1024 ** 3, files: 100 }, { path: 'C:/QA/.dependency-roadmap/iterative/demo/sources/C6', category: 'current-run', reason: 'current-checkpoint-or-run-data', eligible: false, bytes: 5 * 1024 ** 3, files: 500 }], volumes: [{ path: 'E:/', freeBytes: (clean ? 23 : 20) * 1024 ** 3 }, { path: 'C:/', freeBytes: 18 * 1024 ** 3 }], eligible, eligibleBytes: 7 * 1024 ** 3, protectedBytes: 5 * 1024 ** 3, removed: clean ? 1 : 0, compacted: clean ? 1 : 0, failed: 0, protected: 1, reclaimedBytes: clean ? 3 * 1024 ** 3 : 0, ...(clean ? { results: [{ path: 'E:/QA/verification/trials/example', status: 'removed' }, { path: 'C:/QA/.dependency-roadmap/iterative/demo/sources/C0', status: 'compacted' }] } : {}) }
       setStorageStatus({ phase: 'done', action, operationId, result }); return result
     }} /> : null}
     {showWorkspace ? <WorkspaceDialog onClose={() => setShowWorkspace(false)} onPickDirectory={async () => 'C:/demo/workspaces'} onConnectExisting={async () => {}} onCreate={async () => {}} /> : null}

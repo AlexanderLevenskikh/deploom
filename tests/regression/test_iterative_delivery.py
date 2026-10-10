@@ -201,6 +201,41 @@ class GitDeliveryTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'DELIVERY_SUBMODULE_COMMIT_CHANGED'):
             validate_gitlinks(root,state['gitlinks'])
 
+    def test_eol_only_status_is_accepted_but_real_staged_untracked_changes_are_rejected(self):
+        from delivery_git_status import committed_worktree
+        state = self.prepare(); root = Path(state['workspaceRoot'])
+        d.git(root, 'add', '-A'); d.git(root, 'commit', '-m', 'verified changes')
+        self.assertTrue(committed_worktree(root))
+        original = (root/'source.txt').read_bytes()
+        (root/'source.txt').write_bytes(original+b'real edit')
+        self.assertFalse(committed_worktree(root))
+        (root/'source.txt').write_bytes(original)
+        (root/'personal.txt').write_text('untracked')
+        self.assertFalse(committed_worktree(root))
+        (root/'personal.txt').unlink()
+        (root/'source.txt').write_bytes(original+b'staged edit')
+        d.git(root,'add','source.txt')
+        self.assertFalse(committed_worktree(root))
+
+    def test_git_stat_cache_eol_noise_does_not_block_exact_delivery_checks(self):
+        from delivery_git_status import committed_worktree
+        # Git normalizes these files to LF, while the source snapshot is CRLF.
+        (self.source/'.gitattributes').write_bytes(b'*.txt text eol=lf\n')
+        (self.source/'fixture-eol.txt').write_bytes(b'first\r\nsecond\r\n')
+        state = self.prepare(); root = Path(state['workspaceRoot'])
+        d.git(root,'add','-A'); d.git(root,'commit','-m','verified migration')
+        self.assertEqual((root/'fixture-eol.txt').read_bytes(),b'first\r\nsecond\r\n')
+        self.assertTrue(committed_worktree(root))
+        with patch.object(d,'collect_audit',return_value=report()), patch.object(core,'_finish_locked'):
+            result=d.delivery_verify(self.run_dir,{})
+            self.assertEqual(d.delivery_verify(self.run_dir,{})['status'], 'done')
+            (Path(result['verificationWorkspace'])/'fixture-eol.txt').write_bytes(b'real changed content')
+            with self.assertRaisesRegex(RuntimeError, 'DELIVERY_VERIFICATION_COPY_CHANGED'):
+                d.delivery_verify(self.run_dir,{})
+        self.assertEqual(result['status'],'done')
+        self.assertEqual((root/'fixture-eol.txt').read_bytes(),b'first\r\nsecond\r\n')
+        self.assert_original_preserved()
+
     def test_registered_branch_preserves_original_and_text_fixtures(self):
         state = self.prepare(); root = Path(state["workspaceRoot"])
         self.assertEqual(state["status"], "ready")

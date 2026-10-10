@@ -98,6 +98,18 @@ try {
   assert.equal(paidLaunches, 1, 'restart after verification failure must not replay a finished paid agent')
   assert.equal(verifyCalls, 2)
 
+  write('delivery-agent.json', { identity: 'delivery:fixture:C4:0', status: 'needs-agent', sessionId: 'saved-session', provider: 'codex', verificationError: 'DELIVERY_UNCOMMITTED_CHANGES: stale EOL status' })
+  assert.equal((await runDeliveryWorkflow(root, deps)).ok, true)
+  assert.equal(paidLaunches, 1, 'an authoritative retry can close EOL-only rejection without replaying the paid agent')
+  assert.equal(JSON.parse(readFileSync(join(root, 'delivery-agent.json'), 'utf8')).status, 'finished')
+  let realUncommittedLaunches = 0, retryCommitCalls = 0
+  write('delivery-agent.json', { identity: 'delivery:fixture:C4:0', status: 'needs-agent', sessionId: 'saved-session', provider: 'codex', verificationError: 'DELIVERY_UNCOMMITTED_CHANGES' })
+  const realUncommitted = await runDeliveryWorkflow(root, { ...deps,
+    command: async step => { if (step === 'delivery-verify' && ++retryCommitCalls === 1) throw new Error('DELIVERY_UNCOMMITTED_CHANGES'); return deps.command(step) },
+    launch: async context => { realUncommittedLaunches++; assert.equal(context.sessionId, 'saved-session') },
+  })
+  assert.equal(realUncommitted.ok, true); assert.equal(realUncommittedLaunches, 1)
+
   write('delivery-agent.json', { identity: 'delivery:fixture:C4:0', status: 'running', childPid: 55, sessionId: 'saved-session', provider: 'codex' })
   assert.equal((await runDeliveryWorkflow(root, { ...deps, processAlive: () => true })).error, 'DELIVERY_AGENT_IN_PROGRESS')
   assert.equal(paidLaunches, 1)

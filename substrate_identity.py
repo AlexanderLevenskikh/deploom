@@ -19,6 +19,8 @@ _COMPONENT_FILES: Mapping[str, tuple[str, ...]] = {
         "checkpoint_build_upgrade.py",
         "checkpoint_index_recovery.py",
         "source_snapshot.py",
+        "snapshot_compaction.py",
+        "storage_capacity.py",
         "project_topology.py",
         "verification_workspace_backend.py",
         "reparse_materialization.py",

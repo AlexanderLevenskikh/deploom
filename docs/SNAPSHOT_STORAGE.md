@@ -1,0 +1,15 @@
+# Migration snapshot storage
+
+DepLoom keeps the latest verified cumulative checkpoint as a private usable tree. After accepting the next checkpoint, older source trees are moved into lossless cold storage: identical file contents are stored once per workspace as SHA-256 addressed gzip objects. Snapshot manifests, checkpoint history, reports and proof identities remain unchanged. Build output and ignored inputs are not silently removed from the verification subject.
+
+Cold snapshots restore on access into a fresh private tree. They never use writable hardlinks. The ordinary manifest, content, policy and producer-build checks still run; a missing or corrupt object stops recovery instead of yielding verification success. Storage representation does not grant a new proof or bypass re-verification after a tool update.
+
+The background cleanup button also compacts historical snapshots and protected verifier copies. Current result worktrees and unique materialization edits remain protected. Cleanup rechecks the preview and run lock before changing storage. It removes an interrupted packing/restoration residue only when every remaining byte is represented by verified packed evidence. A failed write leaves the original tree; a failed removal leaves recoverable packed evidence. Disk capacity checks use the actual destination volume, not a fixed drive letter.
+
+Automatic maintenance is queued after drive and agent completion, including partial outcomes, and runs when migration activity permits it. Superseded checkpoint compaction also runs between accepted cohorts through the asynchronous CLI, so a long run does not retain every full source tree until final delivery. The UI reports compacted snapshots separately from deleted folders and subtracts newly stored object bytes from reclaimed file volume. Physical free space is refreshed independently.
+
+The object store is retained while historical snapshots reference it. This preserves historical source changes; it is not an unlimited cache deletion command. Archived unique agent work, incomplete/unknown ownership, links and result branches are protected. A first cleanup of a legacy workspace can take time because exact content checks are required.
+
+Validation includes corruption, new user files, interrupted writes/removals, changed previews, active candidates and low-space cases. The local size demos use real Git/npm/Node, a local tarball registry and the production CLI from baseline through repair, audit, semantic commits, delivery and cleanup; they do not run against a user project or invoke a paid agent.
+
+Team workspace commits select only settings, history, dashboard state and knowledge paths. Runtime directories and shared snapshot objects are excluded even when already tracked or staged; unrelated staged files remain in the index. New workspace Git ignore rules also exclude isolated migration data. Existing workspace files are not rewritten by this release.

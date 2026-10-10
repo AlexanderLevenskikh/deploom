@@ -36,6 +36,9 @@ export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress, s
   }
   const gib = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} ${text('ГиБ', 'GiB')}`
   const label = (category: string) => ({
+    'snapshot-compaction': text('Уплотнение старых снимков', 'Compact historical snapshots'),
+    'snapshot-objects': text('Сжатое содержимое снимков', 'Compressed snapshot contents'),
+    'packed-tree-garbage': text('Остатки завершённого уплотнения', 'Completed compaction residue'),
     'retired-materialization': text('Сохранённые рабочие копии', 'Preserved working copies'),
     'obsolete-upgrade-copy': text('Копии предыдущих проверок', 'Previous verification copies'),
     'verification-trials': text('Временные проверки', 'Temporary verification'),
@@ -54,6 +57,7 @@ export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress, s
     'links-or-shared-files': text('Ссылки или общие файлы', 'Links or shared files'),
     recent: text('Создано менее суток назад', 'Less than one day old'),
     'shared-cache': text('Общий действующий кэш', 'Active shared cache'),
+    'shared-snapshot-objects': text('Общие данные для восстановления снимков', 'Shared contents for snapshot restoration'),
     'delivery-branch': text('Рабочая ветка результата', 'Result worktree'),
     'current-run-reference': text('Используется текущим прогоном', 'Referenced by current run'),
     'changed-after-preview': text('Изменилось после диагностики', 'Changed after inspection'),
@@ -74,6 +78,7 @@ export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress, s
     'active-materialization': text('Рабочая копия незавершённой операции', 'Unfinished operation workspace'),
     'current-verifier-copy': text('Копия текущей версии инструмента', 'Current verifier copy'),
     'scope-changed': text('Изменился состав папок', 'Folder scope changed'),
+    'disk-space-low': text('Недостаточно места для безопасной операции; прежние данные сохранены', 'Insufficient room for a safe operation; previous data preserved'),
   }
   const groups = new Map<string, { category: string; volume: string; bytes: number; eligible: number; count: number }>()
   for (const item of result?.items || []) {
@@ -90,7 +95,7 @@ export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress, s
   return <div className="dialog-backdrop">
     <section className="dialog workspace-dialog storage-dialog" role="dialog" aria-modal="true" aria-labelledby="storage-title">
       <div className="dialog-title"><h2 id="storage-title">{text('Хранилище и безопасная очистка', 'Storage and safe cleanup')}</h2><button className="icon-button" aria-label={text('Закрыть', 'Close')} onClick={onClose}><X size={17} /></button></div>
-      <p>{text('Очистка работает в фоне, диалог можно закрыть. Удаляем только подтверждённый мусор и рабочие копии, сохранность которых проверена. Checkpoints, исходные снимки, отчёты, проекты и ветки результата сохраняются.', 'Cleanup runs in the background; you can close this dialog. Remove only confirmed garbage and working copies whose preservation was verified. Checkpoints, source snapshots, reports, projects and result branches are preserved.')}</p>
+      <p>{text('Очистка работает в фоне, диалог можно закрыть. Удаляем подтверждённый мусор; старые снимки уплотняем без потери файлов, одинаковое содержимое храним один раз. Последний результат, отчёты, настройки и рабочие ветки сохраняются.', 'Cleanup runs in the background; you can close this dialog. Remove confirmed garbage; compact historical snapshots losslessly, storing identical contents once. Preserve the latest result, reports, settings and result worktrees.')}</p>
       {busy ? <div className="storage-progress" role="status" aria-live="polite">
         <strong>{stage}{progress?.percent != null && progress.stage === 'clean' ? ` · ${progress.percent}%` : ''}</strong>
         <progress max={100} value={progress?.stage === 'clean' && progress.percent != null ? progress.percent : undefined} aria-label={stage} />
@@ -104,9 +109,9 @@ export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress, s
           {result.volumes.map(volume => <p key={volume.path}><strong>{gib(volume.freeBytes)}</strong><span>{text('Свободно', 'Free')} · {volume.path}</span></p>)}
         </div>
         <p className="muted">{text('Объём файлов — оценка: общие блоки и сжатие могут влиять на фактически освобождённое место.', 'File volume is an estimate: shared blocks and compression can affect actual disk space reclaimed.')}</p>
-        <div className="storage-table-scroll"><table className="storage-table"><thead><tr><th>{text('Категория / том', 'Category / volume')}</th><th>{text('Всего', 'Total')}</th><th>{text('Можно очистить', 'Can clean')}</th></tr></thead><tbody>{[...groups.values()].map(group => <tr key={`${group.volume}:${group.category}`}><td>{label(group.category)} · {group.volume}<small>{group.count} {text('каталогов', 'folders')}</small></td><td>{gib(group.bytes)}</td><td>{gib(group.eligible)}</td></tr>)}</tbody></table></div>
-        <details><summary>{text('Папки и причины защиты', 'Folders and protection reasons')}</summary><div className="storage-folder-list">{result.items.map(item => <div key={item.path}><button className="icon-button" title={text('Открыть папку', 'Open folder')} aria-label={text('Открыть папку', 'Open folder')} disabled={outcomes.get(item.path)?.status === 'removed'} onClick={() => void window.dependencyFlow?.openPath(item.path)}><FolderOpen size={15} /></button><span className="storage-path">{item.path}<small>{gib(item.bytes)} · {outcomes.get(item.path)?.status === 'removed' ? text('Удалено', 'Removed') : outcomes.get(item.path)?.status === 'failed' ? text('Не удалось удалить; папка сохранена или удалена частично', 'Deletion failed; folder retained or partially removed') : outcomes.get(item.path)?.reason ? reasons[outcomes.get(item.path)!.reason!] || outcomes.get(item.path)!.reason : item.eligible ? text('Можно очистить', 'Can clean') : reasons[item.reason] || item.reason}</small></span></div>)}</div></details>
-        {completed ? <p role="status">{text('Очистка завершена', 'Cleanup finished')}: {result.removed} {text('каталогов удалено', 'folders removed')}; {gib(result.reclaimedBytes)} {text('файлов удалено', 'of files removed')}. {text('Пропущено', 'Skipped')}: {result.protected}; {text('ошибок', 'errors')}: {result.failed}. {text('Свободное место на томах обновлено.', 'Volume free space refreshed.')}</p> : null}
+        <div className="storage-table-scroll"><table className="storage-table"><thead><tr><th>{text('Категория / том', 'Category / volume')}</th><th>{text('Всего', 'Total')}</th><th>{text('Можно очистить', 'Can clean')}</th></tr></thead><tbody>{[...groups.values()].map(group => <tr key={`${group.volume}:${group.category}`}><td>{label(group.category)} · {group.volume}<small>{text('Каталогов', 'Folders')}: {group.count}</small></td><td>{gib(group.bytes)}</td><td>{gib(group.eligible)}</td></tr>)}</tbody></table></div>
+        <details><summary>{text('Папки и причины защиты', 'Folders and protection reasons')}</summary><div className="storage-folder-list">{result.items.map(item => <div key={item.path}><button className="icon-button" title={text('Открыть папку', 'Open folder')} aria-label={text('Открыть папку', 'Open folder')} disabled={outcomes.get(item.path)?.status === 'removed'} onClick={() => void window.dependencyFlow?.openPath(item.path)}><FolderOpen size={15} /></button><span className="storage-path">{item.path}<small>{gib(item.bytes)} · {outcomes.get(item.path)?.status === 'removed' ? text('Удалено', 'Removed') : outcomes.get(item.path)?.status === 'compacted' ? text('Сохранено в сжатом виде; восстановится при обращении', 'Compacted; restored on access') : outcomes.get(item.path)?.status === 'failed' ? text('Не удалось удалить; папка сохранена или удалена частично', 'Deletion failed; folder retained or partially removed') : outcomes.get(item.path)?.reason ? reasons[outcomes.get(item.path)!.reason!] || outcomes.get(item.path)!.reason : item.eligible ? text('Можно очистить', 'Can clean') : reasons[item.reason] || item.reason}</small></span></div>)}</div></details>
+        {completed ? <p role="status">{text('Очистка завершена', 'Cleanup finished')}: {text('удалено каталогов', 'folders removed')}: {result.removed}; {text('уплотнено снимков', 'snapshots compacted')}: {result.compacted || 0}; {gib(result.reclaimedBytes)} {text('освобождено по объёму файлов', 'reclaimed by file volume')}. {text('Пропущено', 'Skipped')}: {result.protected}; {text('ошибок', 'errors')}: {result.failed}. {text('Свободное место на томах обновлено.', 'Volume free space refreshed.')}</p> : null}
       </> : null}
       {error ? <p role="alert">{error}</p> : null}
       <div className="dialog-actions"><button className="button secondary" disabled={busy} onClick={() => void run('inspect')}>{text('Диагностика всех хранилищ', 'Inspect all storage')}</button><button className="button primary" disabled={!canClean} onClick={() => void run('clean')}>{text('Очистить весь подтверждённый мусор', 'Clean all confirmed garbage')}</button></div>

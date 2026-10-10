@@ -135,7 +135,9 @@ def archive_reason(run, archive, path):
             key = checkpoint.get('checkpointId', '')
             if not isinstance(key, str) or not re.fullmatch(r'C\d+', key): return 'missing-archive-source'
             source = archive / 'sources' / key
-            if not plain_ancestors(source / 'tree'): return 'missing-archive-source'
+            from snapshot_compaction import has_packed_source
+            if not plain_ancestors(source / 'tree') and not (plain_ancestors(source) and has_packed_source(source)):
+                return 'missing-archive-source'
             source_key = checkpoint.get('sourceSnapshotKey')
             if not isinstance(source_key, str) or not source_key: return 'missing-archive-source'
             manifest = json.loads((source / 'manifest.json').read_text(encoding='utf-8-sig'))
@@ -156,6 +158,9 @@ def archive_reason(run, archive, path):
 def materialization_children(run, archive, parent, category, reason):
     from materialization_retention import locations as owned_locations
     owned = {str(p):(kind,why,r,a) for p,kind,why,r,a in owned_locations(run,archive)}
+    from snapshot_compaction import locations as compact_locations
+    for p,kind,why,r,a in compact_locations(run,archive):
+        if str(p) in owned and owned[str(p)][1]: owned[str(p)] = (kind,why,r,a)
     def children(folder):
         for child in sorted(folder.iterdir()):
             if not _plain_directory(child): continue
@@ -182,6 +187,9 @@ def locations(root, workspaces):
                     elif _plain_directory(child): yield child, 'verification-cache', 'shared-cache', None, None
             else: yield p, 'verification-cache', 'shared-cache', None, None
     for workspace in dict.fromkeys(workspaces):
+        objects = Path(workspace) / '.dependency-roadmap' / 'snapshot-objects'
+        if objects.is_dir() and plain_ancestors(objects):
+            yield objects, 'snapshot-objects', 'shared-snapshot-objects', None, None
         base = Path(workspace) / '.dependency-roadmap' / 'iterative'
         if not base.is_dir() or not plain_ancestors(base): continue
         for run in sorted(base.iterdir()):
@@ -193,6 +201,9 @@ def locations(root, workspaces):
                 if p.name != 'run-archive':
                     if p.name in {'trial','bootstrap','security','checkpoint-build-upgrades'}:
                         yield from materialization_children(run,None,p,'current-run','current-checkpoint-or-run-data')
+                    elif p.name == 'sources':
+                        from snapshot_compaction import source_locations
+                        yield from source_locations(run)
                     else: yield p, 'current-run', 'current-checkpoint-or-run-data', None, None
                     continue
                 for archive in sorted(p.iterdir()):
@@ -201,6 +212,9 @@ def locations(root, workspaces):
                         if not _plain_directory(child): continue
                         if child.name in {'trial','bootstrap','security','checkpoint-build-upgrades'}:
                             yield from materialization_children(run,archive,child,'archive-history','archive-checkpoints-and-evidence')
+                        elif child.name == 'sources':
+                            from snapshot_compaction import source_locations
+                            yield from source_locations(run, archive)
                         else:
                             yield child, 'archive-history', 'archive-checkpoints-and-evidence', None, None
 
@@ -216,6 +230,9 @@ def inspect(root, workspaces, *, eligible_only=False):
                 from materialization_retention import reason as retention_reason
                 reason = retention_reason(run,archive,path,category,verify_bytes=True,
                                           progress=lambda p: progress('validate',p))
+            if not reason and category == 'packed-tree-garbage':
+                from snapshot_compaction import residue_reason
+                reason = residue_reason(path.parent, path, verify_bytes=True)
             if not plain_ancestors(path) or measure['unsafe']: reason = 'links-or-shared-files'
             if eligible_only and reason: continue
             item = dict(path=str(path), category=category, reason=reason, eligible=not reason, **measure)
@@ -253,7 +270,8 @@ def remove_tree(path, advance):
 def clean(root, workspaces, plan):
     allowed = {str(p): (reason, run, archive) for p, _, reason, run, archive in locations(root, workspaces)}
     selected = [i for i in plan.get('items', []) if i.get('eligible')]
-    total = sum(i['files'] for i in selected); processed = freed = removed = failed = protected = 0
+    total = sum(i['files'] - (1 if i['category'] == 'snapshot-compaction' else 0) for i in selected)
+    processed = freed = removed = failed = protected = compacted = 0
     results = []
     for item in selected:
         path = Path(item['path']); entry = allowed.get(str(path)); reason = 'scope-changed'
@@ -276,6 +294,12 @@ def clean(root, workspaces, plan):
                         from materialization_retention import reason as retention_reason
                         reason=retention_reason(run,archive,path,item['category'],verify_bytes=True,
                                                 progress=lambda p: progress('validate',p))
+                    elif run and item['category'] == 'packed-tree-garbage':
+                        from snapshot_compaction import residue_reason
+                        reason = residue_reason(path.parent, path, verify_bytes=True)
+                    elif run and item['category'] == 'snapshot-compaction':
+                        from snapshot_compaction import locations as compact_locations
+                        reason = '' if any(p == path for p, *_ in compact_locations(run, archive)) else 'scope-changed'
                     elif run: reason = archive_reason(run, archive, path)
                     elif root is not None and path.parent == root / 'baseline-prepared-artifacts' / 'trash':
                         reason = cache_trash_reason(path, path.parent.parent)
@@ -286,10 +310,31 @@ def clean(root, workspaces, plan):
                         elif measure['signature'] != item['signature']: reason = 'changed-after-preview'
                         else:
                             progress('clean', path, processed=processed, total=total, force=True)
-                            remove_tree(path, advance); removed += 1
-                            results.append(dict(path=str(path), status='removed')); continue
+                            if item['category'] == 'snapshot-compaction':
+                                from snapshot_compaction import compact
+                                before, before_processed = freed, processed
+                                def packing(done, file_total):
+                                    nonlocal processed
+                                    processed = before_processed + done
+                                    progress('clean', path, processed=processed, total=total, bytes=before)
+                                def packed_removed(size):
+                                    nonlocal freed
+                                    freed += size
+                                    progress('clean', path, processed=processed, total=total, bytes=freed)
+                                reclaimed = compact(path, packed_removed, lambda p: progress('clean', p, processed=processed, total=total, bytes=freed), packing)
+                                freed = before + reclaimed
+                                compacted += 1
+                                results.append(dict(path=str(path), status='compacted'))
+                            else:
+                                remove_tree(path, advance); removed += 1
+                                results.append(dict(path=str(path), status='removed'))
+                            continue
             except Exception as exc:
-                failed += 1; results.append(dict(path=str(path), status='failed', reason=type(exc).__name__))
+                # A failed compaction may have allocated objects before a
+                # partial removal. Never advertise those bytes as reclaimed.
+                if item['category'] == 'snapshot-compaction': freed = 0
+                error_reason = 'disk-space-low' if str(exc).startswith('DISK_SPACE_LOW:') else type(exc).__name__
+                failed += 1; results.append(dict(path=str(path), status='failed', reason=error_reason))
                 continue
         protected += 1; results.append(dict(path=str(path), status='protected', reason=reason))
     progress('done', processed=processed, total=total, bytes=freed, force=True)
@@ -297,7 +342,7 @@ def clean(root, workspaces, plan):
     for old in plan.get('volumes', []):
         try: volumes.append(dict(path=old['path'], freeBytes=shutil.disk_usage(old['path']).free))
         except OSError: pass
-    return {**plan, 'removed': removed, 'failed': failed, 'protected': protected,
+    return {**plan, 'removed': removed, 'compacted': compacted, 'failed': failed, 'protected': protected,
             'reclaimedBytes': freed, 'volumes': volumes, 'results': results}
 
 

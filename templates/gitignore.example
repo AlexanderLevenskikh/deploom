@@ -12,6 +12,14 @@ artifacts/*
 # Keep the migration history: this is the process memory.
 # Do NOT ignore .dependency-update-history/ if you want to commit state after each migration.
 
+# Isolated migration copies and lossless snapshot objects are local only
+.dependency-roadmap/iterative/
+.dependency-roadmap/snapshot-objects/
+.dependency-roadmap/cache/
+.dependency-roadmap/tmp/
+.dependency-roadmap/desktop/downloads/
+.dependency-roadmap-worktrees/
+
 # Optional local scratch
 *.tmp
 *.bak

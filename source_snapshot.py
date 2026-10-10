@@ -43,6 +43,7 @@ from project_topology import (
     ProjectTopologyError,
     semantic_manifest_paths,
 )
+from storage_capacity import StorageCapacityError
 from substrate_identity import tool_build_id
 # BLOCK_Z_PROJECT_TOPOLOGY_V1
 
@@ -1971,8 +1972,6 @@ def open_source_snapshot(
         or raw.get("type") != "deploom-source-snapshot"
     ):
         raise SourceCaptureError("SOURCE_SNAPSHOT_MANIFEST_SCHEMA_INVALID")
-    if not root.is_dir():
-        raise SourceCaptureError(f"SOURCE_SNAPSHOT_TREE_MISSING: {root}")
 
     key = str(raw.get("sourceSnapshotKey") or "")
     manifest_key = str(raw.get("manifestKey") or "")
@@ -2003,6 +2002,17 @@ def open_source_snapshot(
         raise SourceCaptureError(
             f"SOURCE_SNAPSHOT_PROJECT_RELATIVE_INVALID: {relative_text}"
         )
+    if not root.is_dir():
+        from snapshot_compaction import has_packed_source, restore
+        if has_packed_source(container):
+            try:
+                restore(container, progress=progress or (lambda path: None))
+            except StorageCapacityError:
+                raise
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise SourceCaptureError(f"SOURCE_SNAPSHOT_PACKED_INVALID: {container}: {exc}") from exc
+        if not root.is_dir():
+            raise SourceCaptureError(f"SOURCE_SNAPSHOT_TREE_MISSING: {root}")
     project_path = (root / relative).resolve()
     if not _within(project_path, root) or not project_path.is_dir():
         raise SourceCaptureError(
@@ -2076,6 +2086,8 @@ def persist_source_snapshot(
         raise SourceCaptureError(
             f"SOURCE_SNAPSHOT_DESTINATION_EXISTS: {destination}"
         )
+    from storage_capacity import require_capacity
+    require_capacity(destination, snapshot.byte_count, "durable snapshot")
     stage = Path(tempfile.mkdtemp(
         prefix=f".{destination.name}.tmp-",
         dir=str(destination.parent),

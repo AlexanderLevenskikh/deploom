@@ -49,7 +49,8 @@ def preserved_checkpoints(history):
         cp=read(record);identity=cp.get('checkpointId','')
         if not isinstance(identity,str) or not re.fullmatch(r'C\d+',identity): continue
         source=history/'sources'/identity
-        if not _plain_directory(source/'tree'): continue
+        from snapshot_compaction import has_packed_source
+        if not _plain_directory(source/'tree') and not has_packed_source(source): continue
         manifest=read(source/'manifest.json');key=cp.get('sourceSnapshotKey')
         if key and manifest.get('type')=='deploom-source-snapshot' and manifest.get('sourceSnapshotKey')==key:
             yield cp,source,manifest
@@ -57,6 +58,11 @@ def preserved_checkpoints(history):
 
 def validate_source(source,key):
     from source_snapshot import SourceCaptureError,open_source_snapshot
+    from snapshot_compaction import has_packed_source, validate_packed
+    if not (source/'tree').exists() and has_packed_source(source):
+        raw = validate_packed(source)
+        if raw.get('sourceSnapshotKey') != key: raise ValueError('packed source key mismatch')
+        return
     try: open_source_snapshot(source,expected_key=key,allow_build_upgrade=True,timeout_seconds=0)
     except SourceCaptureError as exc:
         if not str(exc).startswith('SOURCE_SNAPSHOT_CONTENT_MISMATCH:'): raise

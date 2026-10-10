@@ -50,7 +50,7 @@ try {
   await assert.rejects(controller.maintenance('clean', 'early', () => {}), /Inspect storage/);
   const inventory = await controller.maintenance('inspect', 'preview', event => progress.push(event));
   assert.equal(inventory.eligible, 1);
-  assert.ok(inventory.items.some(item => item.path === currentSource.replace(/[\\/]C6$/, '') && !item.eligible));
+  assert.ok(inventory.items.some(item => item.path === currentSource && !item.eligible));
   assert.ok(progress.every(event => event.operationId === 'preview'));
   activeWork = true;
   await assert.rejects(controller.maintenance('clean', 'blocked', () => {}), /Stop active migrations/);
