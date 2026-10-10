@@ -36,6 +36,7 @@ export type ProjectLevel = { status: 'red' | 'yellow' | 'green'; lagOkPct?: numb
 export type ProjectSpec = {
   name: string
   path: string
+  repositoryPath?: string
   // D2.4: display-only Node hints from repo pins (engines.node, .nvmrc,
   // .node-version). The UI may suggest them, never auto-fills the runtime.
   nodeHints?: string[]
@@ -562,7 +563,8 @@ export type DependencyFlowApi = {
   listAgentModels: (agentProvider: AgentProvider, cwd?: string) => Promise<string[]>
   registerWorkspace: (input: { path: string; name?: string; agent?: AgentProvider }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   cloneWorkspace: (input: { parentPath: string; folderName: string; teamRemote?: string; templateRemote?: string; agent?: AgentProvider }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
-  addProject: (input: { workspaceId?: string; name: string; path: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
+  addProject: (input: { workspaceId?: string; name: string; path: string; repositoryPath?: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
+  removeWorkspace: (workspaceId: string) => Promise<{ state: DesktopState; details?: WorkspaceDetails }>
   removeProject: (input: { workspaceId?: string; projectName: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   selectWorkspace: (workspaceId: string) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   updateWorkspace: (input: Partial<WorkspaceRecord> & { id: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>

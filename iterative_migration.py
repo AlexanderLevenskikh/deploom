@@ -1242,6 +1242,7 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
     return {
         "schemaVersion": SCHEMA_VERSION,
         "projectDir": str(project_dir),
+        "sourceScope": getattr(args, "source_scope", "project-gitignore"),
         "projectName": project_name,
         "workspaceId": (args.workspace_id or "").strip(),
         "projectId": (args.project_id or project_name).strip(),
@@ -5690,6 +5691,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     begin = sub.add_parser("begin", help="Захват C0 (Исходный замер)")
     begin.add_argument("--project-dir", required=True)
+    begin.add_argument("--source-scope", choices=("project-gitignore", "repository"), default="project-gitignore",
+                       help="Copy working project/workspace inputs respecting gitignore, or the legacy whole repository")
     begin.add_argument("--project-name", default="")
     begin.add_argument("--intent-file", default="")
     begin.add_argument("--max-known-moderate", type=int, default=None)
@@ -5895,7 +5898,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 recovery_lock.release()
         from iterative_cohort_review import recover as recover_cohort_review
         recover_cohort_review(recovery_dir)
-        return int(COMMANDS[args.command](args) or 0)
+        from scoped_source_policy import MODE_ENV
+        previous_scope = os.environ.get(MODE_ENV)
+        if args.command == "begin":
+            mode = args.source_scope
+        else:
+            mode = load_config(recovery_dir).get("sourceScope", "repository") if (recovery_dir / CONFIG_FILENAME).exists() else "repository"
+        os.environ[MODE_ENV] = mode
+        try:
+            return int(COMMANDS[args.command](args) or 0)
+        finally:
+            if previous_scope is None: os.environ.pop(MODE_ENV, None)
+            else: os.environ[MODE_ENV] = previous_scope
     except ProjectUnreadyError as exc:
         print(f"ITERATIVE_MIGRATION_FAILURE_V1 {json.dumps({'code': exc.code, 'summary': str(exc), 'command': exc.command, 'fixable': True})}")
         return 2

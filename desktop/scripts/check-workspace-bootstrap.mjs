@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -45,4 +45,75 @@ try {
   rmSync(parent, { recursive: true, force: true })
 }
 
-console.log('workspace bootstrap check: ok')
+// Exercise the production IPC handlers against a real nested Git repository.
+const ts = (await import('typescript')).default
+const fs = await import('node:fs')
+const paths = await import('node:path')
+const { execFileSync } = await import('node:child_process')
+const mainSource = readFileSync(join(root, 'electron/main.ts'), 'utf8')
+const ast = ts.createSourceFile('main.ts', mainSource, ts.ScriptTarget.Latest, true)
+function ipcHandler(name, bindings) {
+  let callback
+  function visit(node) {
+    if (ts.isCallExpression(node) && node.expression.getText(ast) === 'ipcMain.handle' && node.arguments[0]?.text === name) callback = node.arguments[1].getText(ast)
+    ts.forEachChild(node, visit)
+  }
+  visit(ast)
+  assert.ok(callback, `missing production handler ${name}`)
+  const js = ts.transpileModule(`const handler = ${callback}`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+  return new Function('bindings', `with(bindings) { ${js}; return handler; }`)(bindings)
+}
+const fixture = mkdtempSync(join(tmpdir(), 'deploom-project-boundary-'))
+try {
+  const repository = join(fixture, 'repo'), working = join(repository, 'front'), workspaceRoot = join(fixture, 'workspace')
+  mkdirSync(working, { recursive: true }); mkdirSync(workspaceRoot)
+  writeFileSync(join(working, 'package.json'), '{"name":"front"}')
+  writeFileSync(join(repository, 'package.json'), '{"name":"root"}')
+  writeFileSync(join(repository, 'preserved.txt'), 'never delete user files')
+  execFileSync('git', ['init', repository], { stdio: 'pipe' })
+  const workspace = { id: 'ws', path: workspaceRoot }, other = { id: 'other', path: workspaceRoot }
+  const state = { workspaces: [workspace, other], selectedWorkspaceId: 'ws' }
+  const settingsPath = join(workspaceRoot, 'settings.json'), jobs = new Map()
+  const bindings = {
+    ...fs, ...paths, jobs,
+    loadState: () => state, saveState: () => {},
+    findWorkspace: (current, id) => { const value = current.workspaces.find(w => w.id === id); if (!value) throw Error('missing workspace'); return value },
+    selectedWorkspace: current => current.workspaces.find(w => w.id === current.selectedWorkspaceId),
+    resolveSettingsPath: () => settingsPath,
+    workspaceDetails: async value => ({ workspace: value }),
+    readProjects: () => JSON.parse(readFileSync(settingsPath, 'utf8')).projects,
+    iterativeAutopilot: { hasSession: () => false },
+    spawnCapture: async (command, args, cwd) => {
+      try { return { code: 0, stdout: execFileSync(command, args, { cwd, encoding: 'utf8', stdio: 'pipe' }), stderr: '' } }
+      catch(error) { return { code: error.status || 1, stdout: '', stderr: String(error.stderr) } }
+    },
+  }
+  const layoutStart = mainSource.indexOf('async function resolveProjectGitLayout(')
+  const layoutEnd = mainSource.indexOf('function projectPathInWorktree(', layoutStart)
+  const layoutJs = ts.transpileModule(mainSource.slice(layoutStart, layoutEnd), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+  bindings.resolveProjectGitLayout = new Function('bindings', `with(bindings) { ${layoutJs}; return resolveProjectGitLayout; }`)(bindings)
+  const add = ipcHandler('flow:add-project', bindings)
+  await add(null, { workspaceId: 'ws', name: 'front', path: working, repositoryPath: repository })
+  let saved = JSON.parse(readFileSync(settingsPath, 'utf8')).projects
+  assert.equal(saved[0].path, working)
+  assert.equal(saved[0].repositoryPath.toLowerCase(), fs.realpathSync.native(repository).toLowerCase())
+  await assert.rejects(add(null, { workspaceId: 'ws', name: 'wrong', path: working, repositoryPath: fixture }), /Git/)
+  await assert.rejects(add(null, { workspaceId: 'ws', name: 'missing', path: fixture }), /package.json/)
+  await add(null, { workspaceId: 'ws', name: 'root-only', path: repository })
+  saved = JSON.parse(readFileSync(settingsPath, 'utf8')).projects
+  assert.equal(saved.length, 2, 'root selection must not add discovered subprojects')
+  assert.equal(saved[1].path, repository)
+  const remove = ipcHandler('flow:remove-workspace', bindings)
+  jobs.set('busy', { workspace }); await assert.rejects(remove(null, 'ws'), /активные/); jobs.clear()
+  bindings.iterativeAutopilot.hasSession = () => true
+  await assert.rejects(remove(null, 'ws'), /активные/)
+  bindings.iterativeAutopilot.hasSession = () => false
+  const removed = await remove(null, 'ws')
+  assert.equal(removed.state.selectedWorkspaceId, 'other')
+  assert.ok(fs.existsSync(settingsPath)); assert.ok(fs.existsSync(join(repository, 'preserved.txt')))
+  const last = await remove(null, 'other')
+  assert.equal(last.details, undefined); assert.equal(last.state.workspaces.length, 0)
+  assert.ok(fs.existsSync(working))
+} finally { rmSync(fixture, { recursive: true, force: true }) }
+
+console.log('workspace bootstrap and project boundaries: ok')

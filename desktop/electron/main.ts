@@ -118,6 +118,7 @@ type GitPlan = {
 type ProjectSpec = {
   name: string
   path: string
+  repositoryPath?: string
   git?: GitPlan
   gitRemote?: string
   sourceBranch?: string
@@ -1075,12 +1076,12 @@ function resolveProjectPackageDirectory(inputPath: string, strict = false): stri
 }
 
 async function resolveProjectGitLayout(project: ProjectSpec): Promise<{ gitRoot: string; packageRelativePath: string }> {
-  const packageRoot = resolve(project.path)
+  const packageRoot = realpathSync.native(resolve(project.path))
   const probe = await spawnCapture('git', ['-C', packageRoot, 'rev-parse', '--show-toplevel'], packageRoot, 15_000)
   if (probe.timedOut || probe.code !== 0) {
     throw new Error(probe.stderr.trim() || `Не удалось определить Git root для ${packageRoot}`)
   }
-  const gitRoot = resolve(probe.stdout.trim())
+  const gitRoot = realpathSync.native(resolve(probe.stdout.trim()))
   const relativePath = relative(gitRoot, packageRoot)
   if (relativePath.startsWith('..') || isAbsolute(relativePath)) {
     throw new Error(`PROJECT_PACKAGE_OUTSIDE_GIT_ROOT: package=${packageRoot}, gitRoot=${gitRoot}`)
@@ -7098,21 +7099,26 @@ function setupIpc(): void {
     return { state, details: await workspaceDetails(workspace) }
   })
 
-  ipcMain.handle('flow:add-project', async (_event, raw: { workspaceId?: string; name: string; path: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }) => {
+  ipcMain.handle('flow:add-project', async (_event, raw: { workspaceId?: string; name: string; path: string; repositoryPath?: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }) => {
     const state = loadState()
     const workspace = findWorkspace(state, raw.workspaceId)
     const selectedPath = resolve(raw.path)
-    const projectPath = resolveProjectPackageDirectory(selectedPath, true)
+    const projectPath = selectedPath
+    if (!existsSync(join(projectPath, 'package.json'))) throw new Error('Выберите рабочую директорию с package.json. Подпроекты автоматически не выбираются.')
     const gitProbe = await spawnCapture('git', ['-C', projectPath, 'rev-parse', '--is-inside-work-tree'], projectPath, 15_000)
     if (gitProbe.timedOut || gitProbe.code !== 0 || gitProbe.stdout.trim().toLowerCase() !== 'true') {
       throw new Error('Папка проекта не находится внутри Git-репозитория.')
+    }
+    const layout = await resolveProjectGitLayout({ name: raw.name, path: projectPath })
+    if (raw.repositoryPath?.trim() && relative(realpathSync.native(resolve(raw.repositoryPath.trim())), layout.gitRoot) !== '') {
+      throw new Error(`Git-репозиторий рабочей директории: ${layout.gitRoot}. Укажите его корень.`)
     }
     const settingsPath = resolveSettingsPath(workspace)
     const settings = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, 'utf8')) as Record<string, unknown> : { schemaVersion: 1 }
     const projects = Array.isArray(settings.projects) ? settings.projects as ProjectSpec[] : []
     if (projects.some((project) => project.name === raw.name.trim())) throw new Error(`Проект ${raw.name.trim()} уже есть в настройках.`)
     projects.push({
-      name: raw.name.trim(), path: projectPath,
+      name: raw.name.trim(), path: projectPath, repositoryPath: layout.gitRoot,
       git: {
         sourceBranch: raw.sourceBranch?.trim() || 'master',
         baseBranch: raw.baseBranch?.trim() || 'libs',
@@ -7216,6 +7222,19 @@ function setupIpc(): void {
     state.selectedWorkspaceId = workspace.id
     saveState(state)
     return { state, details: await workspaceDetails(workspace) }
+  })
+
+  ipcMain.handle('flow:remove-workspace', async (_event, workspaceId: string) => {
+    const state = loadState()
+    const workspace = findWorkspace(state, workspaceId)
+    if ([...jobs.values()].some(job => job.workspace.id === workspace.id) || readProjects(workspace).some(project => iterativeAutopilot.hasSession({ workspaceId, projectName: project.name }))) {
+      throw new Error('Остановите активные операции workspace перед удалением из списка.')
+    }
+    state.workspaces = state.workspaces.filter(item => item.id !== workspace.id)
+    if (state.selectedWorkspaceId === workspace.id) state.selectedWorkspaceId = state.workspaces[0]?.id
+    saveState(state)
+    const selected = selectedWorkspace(state)
+    return { state, details: selected ? await workspaceDetails(selected) : undefined }
   })
 
   ipcMain.handle('flow:select-workspace', async (_event, workspaceId: string) => {
@@ -7551,10 +7570,10 @@ function setupIpc(): void {
     return stepLockKey(workspace.id, input.projectName)
   }, {
     normalizeScope: input => ({ ...input, workspaceId: autopilotWorkspace(input).id }),
-    setEnabled: (input, enabled) => {
+    setEnabled: (input, enabled, resumeIntent) => {
       const runDir = autopilotRunDir(input)
       const previous = readAutopilotState(runDir)
-      const resume = enabled && (iterativeAutopilot.hasSession(input) || readAgentLease(agentLeaseFile(runDir))?.waiting === true)
+      const resume = resumeIntent ?? (enabled && (iterativeAutopilot.hasSession(input) || readAgentLease(agentLeaseFile(runDir))?.waiting === true))
       writeAutopilotState(runDir, enabled, enabled && previous?.enabled === false ? undefined : previous?.retry, resume)
     },
     readRetry: input => readAutopilotState(autopilotRunDir(input))?.retry,
@@ -9347,7 +9366,7 @@ function setupIpc(): void {
         if (readAutopilotState(runDir)?.resume !== true || readAttempt(runDir)?.cancelRequested) continue
         const scope = { workspaceId: workspace.id, projectName: project.name, autopilot: true }
         void runIterativeDriveWithAutopilot(undefined, scope).catch(error => {
-          writeAutopilotState(runDir, false)
+          writeAutopilotState(runDir, readAutopilotState(runDir)?.enabled === true, undefined, false)
           recordAttemptLog(runDir, `Autopilot recovery failed: ${String(error)}\n`)
         })
       }

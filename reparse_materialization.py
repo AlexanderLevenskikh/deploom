@@ -79,11 +79,13 @@ def inventory_reparse_plan(
     *,
     excluded_dir_names: Iterable[str] = (),
     excluded_file_names: Iterable[str] = (),
+    excluded_relative_paths: Iterable[str] = (),
     workspace_package_targets: Optional[Mapping[str, Path]] = None,
 ) -> tuple[ReparseLink, ...]:
     root = root.resolve()
     excluded_dirs = set(excluded_dir_names)
     excluded_files = set(excluded_file_names)
+    excluded_paths = set(excluded_relative_paths)
     workspace_targets = {
         str(name): Path(target).resolve()
         for name, target in (workspace_package_targets or {}).items()
@@ -107,6 +109,8 @@ def inventory_reparse_plan(
                 raise ReparseMaterializationError(
                     f"REPARSE_INVENTORY_ESCAPE: {path}"
                 ) from exc
+            if relative.as_posix() in excluded_paths:
+                continue
             if is_reparse(path):
                 try:
                     target = path.resolve(strict=True)

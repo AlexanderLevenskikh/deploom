@@ -11,7 +11,7 @@ export type AutopilotSummary = { stopped: string; error?: string }
 type Retry = { count: number; retryAt: number; error: string }
 type Persistence = {
   normalizeScope?: (scope: Scope) => Scope
-  setEnabled?: (scope: Scope, enabled: boolean) => void
+  setEnabled?: (scope: Scope, enabled: boolean, resume?: boolean) => void
   readRetry?: (scope: Scope) => Retry | undefined
   writeRetry?: (scope: Scope, retry?: Retry) => void
   retryDelayMs?: (count: number) => number
@@ -32,7 +32,7 @@ export function createIterativeAutopilot(key: (scope: Scope) => string, persiste
     const handler = handlers.get(step)
     if (!handler) throw new Error(`AUTOPILOT_HANDLER_MISSING: ${step}`)
     const session = sessions.get(key(input))
-    if (session && step !== 'status') persistence.setEnabled?.(input, step !== 'begin' && session.enabled && !session.canceled)
+    if (session && step !== 'status') persistence.setEnabled?.(input, session.enabled)
     let retry = persistence.readRetry?.(input)
     if (retry && session?.enabled) {
       await waitUntil(retry.retryAt, session)
@@ -84,7 +84,7 @@ export function createIterativeAutopilot(key: (scope: Scope) => string, persiste
     const initiallyEnabled = session.enabled
     let outcome = await invoke(first, input)
     if (first === 'agent') outcome = await resumeWaitingAgent(outcome, input, session)
-    persistence.setEnabled?.(input, session.enabled && !session.canceled)
+    persistence.setEnabled?.(input, session.enabled)
     let initial = outcome
     // Explicit infrastructure retry is one user action, never an autopilot loop.
     input = { ...input, retryInfra: false, discardCandidate: false, resumeTerminal: false }
@@ -192,7 +192,7 @@ export function createIterativeAutopilot(key: (scope: Scope) => string, persiste
         }
         if (step === 'cancel') {
           if (session) session.canceled = true
-          persistence.setEnabled?.(input, false)
+          // Stop execution without changing the user's selected mode.
           return handler(event, input)
         }
         if (session) return { ok: false, error: 'AUTOPILOT_IN_PROGRESS' } as R
@@ -205,7 +205,9 @@ export function createIterativeAutopilot(key: (scope: Scope) => string, persiste
           persistence.onStopped?.(input, { stopped: 'error', error: message })
           return { ok: false, error: message, autopilot: { stopped: 'error', error: message } } as R
         } finally {
-          try { persistence.setEnabled?.(input, false) } finally { sessions.delete(id) }
+          sessions.delete(id)
+          // Keep the preference, but never restart a concluded session on launch.
+          persistence.setEnabled?.(input, own.enabled, false)
         }
       }
     },

@@ -226,6 +226,7 @@ class GitDeliveryTests(unittest.TestCase):
         core._write_json_atomic(self.run_dir/'delivery-state.json', state)
         for ending in (b'\n', b'\r', b'\r\n'):
             with self.subTest(ending=ending):
+                d.git(root, 'checkout', state['branch'])
                 data = ending.join((b'node_modules/', b'.dependency-roadmap/', b''))
                 (root/'.gitignore').write_bytes(data)
                 d.git(root,'add','-A'); d.git(root,'commit','--allow-empty','-m','semantic migration')
@@ -235,6 +236,7 @@ class GitDeliveryTests(unittest.TestCase):
                 self.assertEqual(result['status'],'done')
                 self.assertEqual((Path(result['verificationWorkspace'])/'.gitignore').read_bytes(), data)
                 self.assertEqual(result['expected']['.gitignore'],hashlib.sha256(data).hexdigest())
+        d.git(root, 'checkout', state['branch'])
         (root/'.gitignore').write_bytes(b'node_modules/\n.dependency-roadmap/\nsecret/\n')
         d.git(root,'add','.gitignore'); d.git(root,'commit','-m','unexpected rule')
         with patch.object(core,'verify_assignment') as verify:
@@ -699,6 +701,31 @@ class GitDeliveryTests(unittest.TestCase):
         self.assertEqual(len(result["commits"]), 1)
         self.assertEqual(len(result["documentationHashes"]), 2)
         self.assert_original_preserved()
+
+    def test_verified_delivery_releases_branch_and_preserves_inspection_files(self):
+        state = self.prepare(); root = Path(state["workspaceRoot"])
+        d.git(root, "add", "."); d.git(root, "commit", "-m", "coherent migration")
+        with patch.object(d, "collect_audit", return_value=report()), patch.object(core, "_finish_locked"):
+            delivered = d.delivery_verify(self.run_dir, {})
+        self.assertEqual(delivered["branchRelease"], "released")
+        self.assertEqual(d.git(root, "branch", "--show-current"), "")
+        self.assertEqual(d.git(root, "rev-parse", "HEAD"), delivered["head"])
+        self.assertTrue((root / "docs/dependency-migration/delivery-fixture/MIGRATION_REPORT.md").is_file())
+        d.git(self.repo, "checkout", delivered["branch"])
+        self.assertEqual(d.git(self.repo, "rev-parse", "HEAD"), delivered["head"])
+        d.git(self.repo, "checkout", "fixture-base")
+        self.assertEqual(self.prepare()["branchRelease"], "released")
+        self.assert_original_preserved()
+
+    def test_cleanup_preserves_result_when_branch_is_in_use_elsewhere(self):
+        notes, root, delivered = self.notes_fixture()
+        d.git(self.repo, "checkout", delivered["branch"])
+        with self.assertRaisesRegex(RuntimeError, "DELIVERY_CLEANUP_BRANCH_IN_USE"):
+            notes.cleanup_prepare(self.run_dir, {})
+        self.assertEqual(d.git(root, "rev-parse", "HEAD"), delivered["head"])
+        self.assertTrue((root / "note.cjs").is_file())
+        d.git(self.repo, "checkout", "fixture-base")
+        self.assertEqual(notes.cleanup_prepare(self.run_dir, {})["cleanup"]["status"], "ready")
 
     def notes_fixture(self, *, dependent_check=False, second_note=False):
         import iterative_delivery_notes as notes

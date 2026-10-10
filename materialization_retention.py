@@ -67,7 +67,7 @@ def validate_source(source,key):
     except SourceCaptureError as exc:
         if not str(exc).startswith('SOURCE_SNAPSHOT_CONTENT_MISMATCH:'): raise
         from checkpoint_index_recovery import inspect_checkpoint_index_drift
-        inspect_checkpoint_index_drift(source,key)
+        inspect_checkpoint_index_drift(source,key,progress=lambda path: None)
 
 
 def reason(run,archive,path,category, *, verify_bytes=False,progress=lambda path:None):

@@ -57,11 +57,11 @@ class StorageDeliveryDemoTests(unittest.TestCase):
         npm=shutil.which('npm') or shutil.which('npm.cmd')
         for label, count, megabytes in [('small',10,1),('medium',200,8),('large',2000,64)]:
             with self.subTest(size=label), tempfile.TemporaryDirectory(prefix='deploom-size-demo-') as temp:
-                base=Path(temp);repo=base/'original';repo.mkdir()
+                base=Path(temp);git_root=base/'original';repo=git_root/'front';repo.mkdir(parents=True)
                 workspace=base/'workspace';run_dir=workspace/'.dependency-roadmap/iterative/demo';run_dir.mkdir(parents=True)
-                (repo/'.gitignore').write_bytes(b'node_modules/\r\n')
-                (repo/'.gitattributes').write_text('*.txt text eol=lf\n')
-                (repo/'backend.sql').write_bytes('-- обновление\r\nSELECT 1;\r\n'.encode('cp1251'))
+                (git_root/'.gitignore').write_bytes(b'node_modules/\r\n')
+                (git_root/'.gitattributes').write_text('*.txt text eol=lf\n')
+                (git_root/'backend.sql').write_bytes('-- обновление\r\nSELECT 1;\r\n'.encode('cp1251'))
                 (repo/'.npmrc').write_text(f'registry={registry}\naudit=false\n')
                 def install(version):
                     (repo/'package.json').write_text(json.dumps({'name':'deploom-size-demo','version':'1.0.0','private':True,'dependencies':{'deploom-demo-package':version}}))
@@ -73,8 +73,8 @@ class StorageDeliveryDemoTests(unittest.TestCase):
                 data=repo/'data';data.mkdir()
                 for index in range(count): (data/f'{index:05}.txt').write_bytes(b'unchanged fixture\r\n')
                 (data/'large.bin').write_bytes(b'unchanged-binary-'*(megabytes*1024*1024//17))
-                d.git(repo,'init','-b','demo-base');d.git(repo,'config','user.name','Demo');d.git(repo,'config','user.email','demo@example.invalid')
-                d.git(repo,'add','.');d.git(repo,'commit','-m','initial demo');head=d.git(repo,'rev-parse','HEAD')
+                d.git(git_root,'init','-b','demo-base');d.git(repo,'config','user.name','Demo');d.git(repo,'config','user.email','demo@example.invalid')
+                d.git(git_root,'add','.');d.git(repo,'commit','-m','initial demo');head=d.git(repo,'rev-parse','HEAD')
                 targets=base/'targets.json';targets.write_text(json.dumps({'deploom-demo-package':'2.0.0'}))
                 verification=base/'verify.json';verification.write_text(json.dumps({'commands':['node check.cjs'],'projectChecks':'adaptive','registry':registry}))
                 def cli(*args, allowed=(0,)):
@@ -86,7 +86,10 @@ class StorageDeliveryDemoTests(unittest.TestCase):
                 started=time.monotonic()
                 cli('begin','--project-dir',str(repo),'--project-name','Demo','--targets-file',str(targets),'--verify-config',str(verification),'--run-budget-minutes','15')
                 self.assertEqual(core.load_checkpoint(run_dir,'C0')['status'],'VERIFIED')
+                self.assertEqual(core.load_config(run_dir)['sourceScope'], 'project-gitignore')
                 initial_checkpoint=core.load_checkpoint(run_dir,'C0');initial=Path(initial_checkpoint['sourceSnapshotContainer'])
+                self.assertFalse((initial/'tree/backend.sql').exists())
+                self.assertTrue((initial/'tree/front/check.cjs').is_file())
                 cli('plan-next');cli('materialize',allowed=(0,2,4));cli('precheck',allowed=(0,2,4))
                 candidate=core.load_candidate(run_dir)
                 trial=Path(candidate['materializationRefs']['workspaceRoot'])/candidate['materializationRefs']['projectRelative']
@@ -102,8 +105,8 @@ class StorageDeliveryDemoTests(unittest.TestCase):
                 self.assertEqual(core.load_run(run_dir)['terminal'],'COMPLETE')
                 latest=Path(core.load_checkpoint(run_dir,'C1')['sourceSnapshotContainer'])
                 state=d.delivery_prepare(run_dir,{'branch':'codex/demo-'+label});root=Path(state['workspaceRoot'])
-                d.git(root,'add','package.json','package-lock.json');d.git(root,'commit','-m','deps: upgrade demo package')
-                d.git(root,'add','migration-mode.txt');d.git(root,'commit','-m','refactor: adapt capability contract')
+                d.git(root,'add','front/package.json','front/package-lock.json');d.git(root,'commit','-m','deps: upgrade demo package')
+                d.git(root,'add','front/migration-mode.txt');d.git(root,'commit','-m','refactor: adapt capability contract')
                 d.git(root,'add','docs');d.git(root,'commit','-m','docs: developer guide and migration report')
                 # The agent/Git may normalize a prepared config after grouping.
                 (root/'.gitignore').write_bytes(b'node_modules/\n')

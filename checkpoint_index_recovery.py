@@ -24,7 +24,8 @@ class IndexRecoveryInput:
 def inspect_checkpoint_index_drift(container, expected_key, *, progress):
     container = Path(container).resolve()
     raw = json.loads((container / "manifest.json").read_text(encoding="utf-8"))
-    policy = SourceInputPolicy()
+    from scoped_source_policy import policy_from_payload
+    policy = policy_from_payload(raw.get("inputPolicy"))
     entries = raw.get("entries")
     if (raw.get("schemaVersion") != 1 or raw.get("type") != "deploom-source-snapshot"
             or raw.get("policyKey") != policy.key or not isinstance(entries, list)

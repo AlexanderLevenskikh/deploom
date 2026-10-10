@@ -100,8 +100,8 @@ def delivery_preflight(run_dir, inputs):
         raise RuntimeError("DELIVERY_STALE_CHECKPOINT")
     if root != delivery.delivery_root(run_dir, run["runId"]).resolve():
         raise RuntimeError("DELIVERY_PATH_OUTSIDE_RUN")
-    if delivery.git(root, "branch", "--show-current") != state["branch"]:
-        raise RuntimeError("DELIVERY_BRANCH_CHANGED")
+    from delivery_worktree import assert_delivery_branch
+    assert_delivery_branch(root, state)
     delivery.git(root, "merge-base", "--is-ancestor", state["sourceHead"], "HEAD")
     _, _, report = inspect_delivery(run_dir, state, checkpoint)
     return {key: value for key, value in report.items() if key not in {"lineEndingChanges", "blockedChanges"}}

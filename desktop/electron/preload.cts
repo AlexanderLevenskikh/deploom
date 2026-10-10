@@ -8,6 +8,7 @@ const api = {
   listAgentModels: (agentProvider: string, cwd?: string) => ipcRenderer.invoke('flow:list-agent-models', agentProvider, cwd),
   registerWorkspace: (input: unknown) => ipcRenderer.invoke('flow:register-workspace', input),
   cloneWorkspace: (input: unknown) => ipcRenderer.invoke('flow:clone-workspace', input),
+  removeWorkspace: (workspaceId: string) => ipcRenderer.invoke('flow:remove-workspace', workspaceId),
   addProject: (input: unknown) => ipcRenderer.invoke('flow:add-project', input),
   removeProject: (input: unknown) => ipcRenderer.invoke('flow:remove-project', input),
   selectWorkspace: (workspaceId: string) => ipcRenderer.invoke('flow:select-workspace', workspaceId),

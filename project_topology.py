@@ -264,7 +264,16 @@ def _workspace_patterns(manifest: Mapping[str, object], root: Path) -> tuple[str
                 match = re.match(r"^-\s*[\"']?(.+?)[\"']?\s*$", stripped)
                 if match:
                     result.append(match.group(1).strip().replace("\\", "/").rstrip("/"))
-    return tuple(sorted(set(item for item in result if item)))
+    # npm/Yarn workspace paths commonly carry a relative ./ prefix.
+    normalized = []
+    for item in result:
+        excluded = item.startswith("!")
+        value = item[1:] if excluded else item
+        while value.startswith("./"):
+            value = value[2:]
+        if value:
+            normalized.append(("!" if excluded else "") + value)
+    return tuple(sorted(set(normalized)))
 
 
 def _glob_match(relative: str, pattern: str) -> bool:

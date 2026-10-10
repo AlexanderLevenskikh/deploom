@@ -91,7 +91,8 @@ def validate_packed(container, progress=lambda path: None):
         if entry["kind"] == "file": read_object(store, entry)
         progress(container / entry["path"])
     from source_snapshot import _canonical_hash, SOURCE_SNAPSHOT_SCHEMA, SourceInputPolicy
-    if raw.get('policyKey') != SourceInputPolicy().key: raise ValueError('unsupported source policy')
+    from scoped_source_policy import policy_from_payload
+    if raw.get('policyKey') != policy_from_payload(raw.get('inputPolicy')).key: raise ValueError('unsupported source policy')
     producer = raw.get('toolBuildId')
     if not isinstance(producer, str) or not producer: raise ValueError('missing producer identity')
     manifest_key = _canonical_hash({'schema': SOURCE_SNAPSHOT_SCHEMA, 'toolBuildId': producer,

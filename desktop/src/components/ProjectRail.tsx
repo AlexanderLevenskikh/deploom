@@ -10,10 +10,11 @@ type Props = {
   onRefreshAll: () => void
   onAddProject: () => void
   onAddWorkspace: () => void
+  onRemoveWorkspace: () => void
   onRemoveProject: (name: string) => void
 }
 
-export function ProjectRail({ details, selected, active, onSelectProject, onRefreshAll, onAddProject, onAddWorkspace, onRemoveProject }: Props) {
+export function ProjectRail({ details, selected, active, onSelectProject, onRefreshAll, onAddProject, onAddWorkspace, onRemoveWorkspace, onRemoveProject }: Props) {
   const { t } = useLanguage()
 
   const requestRemove = (project: ProjectSpec) => {
@@ -50,8 +51,9 @@ export function ProjectRail({ details, selected, active, onSelectProject, onRefr
       </div>
       <div className="rail-actions">
         <button className="button secondary wide rail-refresh" disabled={active || details.projects.length === 0} onClick={onRefreshAll}><RefreshCw className={active ? 'spin' : ''} size={16} /> {t('projectRail.refreshAll')}</button>
-        <button className="add-workspace" disabled={active} onClick={onAddProject}><FolderPlus size={17} /> {t('projectRail.addProject')}</button>
+        <button className="button secondary wide" disabled={active} onClick={onAddProject}><FolderPlus size={17} /> {t('projectRail.addProject')}</button>
         <button className="add-workspace subtle" onClick={onAddWorkspace}><FolderPlus size={16} /> {t('projectRail.workspaceAction')}</button>
+        <button className="button secondary wide" disabled={active} onClick={() => { if (window.confirm(t('projectRail.removeWorkspace.confirm', { name: details.workspace.name }))) onRemoveWorkspace() }}><Trash2 size={16} /> {t('projectRail.removeWorkspace')}</button>
       </div>
     </aside>
   )

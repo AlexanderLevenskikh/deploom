@@ -108,6 +108,7 @@ def _materialize_private_tree_impl(
     runner=run_supervised,
     exclude_dir_names: tuple[str, ...] = (),
     exclude_file_names: tuple[str, ...] = (),
+    exclude_relative_paths: tuple[str, ...] = (),
     reparse_plan: Optional[tuple[ReparseLink, ...]] = None,
 ) -> str:
     # BLOCK_X_SOURCE_TRUTH_V1
@@ -123,8 +124,19 @@ def _materialize_private_tree_impl(
             source,
             excluded_dir_names=exclude_dir_names,
             excluded_file_names=exclude_file_names,
+            excluded_relative_paths=exclude_relative_paths,
         )
     )
+
+    if exclude_relative_paths:
+        excluded = set(exclude_relative_paths)
+        names = set(exclude_dir_names) | set(exclude_file_names)
+        def ignore(directory, entries):
+            relative = Path(directory).relative_to(source)
+            return [name for name in entries if name in names or (relative / name).as_posix() in excluded]
+        shutil.copytree(source, target, symlinks=True, ignore=ignore)
+        recreate_reparse_plan(source, target, canonical_plan)
+        return "portable-scoped-private-copy"
 
     if os.name == "nt":
         source_fs = windows_filesystem(source)
@@ -237,6 +249,7 @@ def materialize_private_tree(
     runner=run_supervised,
     exclude_dir_names: tuple[str, ...] = (),
     exclude_file_names: tuple[str, ...] = (),
+    exclude_relative_paths: tuple[str, ...] = (),
     reparse_plan: Optional[tuple[ReparseLink, ...]] = None,
 ) -> str:
     """Instrumented private materialization without following reparse points."""
@@ -283,6 +296,7 @@ def materialize_private_tree(
                 runner=runner,
                 exclude_dir_names=exclude_dir_names,
                 exclude_file_names=exclude_file_names,
+                exclude_relative_paths=exclude_relative_paths,
                 reparse_plan=reparse_plan,
             )
     except BaseException as exc:

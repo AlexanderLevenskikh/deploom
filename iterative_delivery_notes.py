@@ -126,8 +126,8 @@ def cleanup_prepare(run_dir, inputs):
     root = Path(state["workspaceRoot"]).resolve()
     if root != delivery.delivery_root(run_dir, run["runId"]).resolve():
         raise RuntimeError("DELIVERY_PATH_OUTSIDE_RUN")
-    if delivery.git(root, "branch", "--show-current") != state["branch"]:
-        raise RuntimeError("DELIVERY_BRANCH_CHANGED")
+    from delivery_worktree import prepare_cleanup_branch
+    prepare_cleanup_branch(run_dir, state)
     previous = state.get("cleanup")
     if previous:
         validate_notes_archive(run_dir, state)

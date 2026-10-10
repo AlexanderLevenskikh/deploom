@@ -45,6 +45,10 @@
               "path": {
                 "type": "string"
               },
+              "repositoryPath": {
+                "type": "string",
+                "description": "Git repository root; path remains the single selected project working directory. Desktop validates both belong to the same repository."
+              },
               "nodeVersion": {
                 "type": "string",
                 "pattern": "^(v?\\d+(\\.\\d+){0,2})$",

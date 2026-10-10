@@ -141,6 +141,23 @@ class BlockZProjectTopologyTests(unittest.TestCase):
             self.assertEqual(Path("packages/app"), topology.package_relative_to_manager)
             self.assertTrue(topology.is_workspace_package)
 
+    def test_relative_workspace_prefixes_and_exclusions_find_root_lockfile(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            app = root / "packages" / "app"
+            excluded = root / "packages" / "excluded"
+            _write_json(root / "package.json", {"name": "root", "private": True,
+                "packageManager": "npm@11.0.0", "workspaces": ["./packages/*/", "!./packages/excluded/"]})
+            _write_json(app / "package.json", {"name": "app", "version": "1.0.0"})
+            _write_json(excluded / "package.json", {"name": "excluded", "version": "1.0.0"})
+            _npm_workspace_lock(root)
+            _init_git(root)
+            topology = resolve_project_topology(app, require_supported=True)
+            self.assertEqual(root.resolve(), topology.package_manager_root)
+            self.assertNotIn((excluded / "package.json").resolve(), topology.workspace_member_manifests)
+            with self.assertRaisesRegex(ProjectTopologyError, "PROJECT_CANONICAL_LOCKFILE_MISSING"):
+                resolve_project_topology(excluded, require_supported=True)
+
     def test_yarn_classic_workspace_is_supported(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

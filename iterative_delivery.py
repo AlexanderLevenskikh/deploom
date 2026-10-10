@@ -345,7 +345,14 @@ def delivery_files(snapshot_root):
     untracked = set(git(snapshot_root, "ls-files", "--others", "--exclude-standard", "-z").split("\0")) - {""}
     # Agent scratch files never become migration deliverables. Tracked files
     # are preserved even when their names also match this scratch policy.
-    return tracked | {n for n in untracked if deliverable_source_file(n)}
+    files = tracked | {n for n in untracked if deliverable_source_file(n)}
+    manifest = snapshot_root.parent / "manifest.json"
+    if manifest.is_file():
+        scope = read(manifest).get("inputPolicy") or {}
+        if scope.get("roots"):
+            from scoped_source_policy import in_scope
+            files = {name for name in files if in_scope(name, scope["roots"])}
+    return files
 
 
 def delivery_root(run_dir, run_id):
@@ -398,6 +405,9 @@ def delivery_prepare(run_dir, inputs):
             raise RuntimeError("DELIVERY_SCOPE_CHANGED: preserve the prepared branch; do not overwrite it")
         if state.get("status") == "preparing":
             return resume_delivery_preparation(run_dir, run, config, checkpoint, state)
+        if state.get("status") == "done":
+            from delivery_worktree import release_branch
+            return release_branch(run_dir, state)
         return state
     snapshot = core._open_checkpoint_source(run_dir, checkpoint, config, run_id=run["runId"])
     source = Path(snapshot.root)
@@ -470,7 +480,8 @@ def resume_delivery_preparation(run_dir, run, config, checkpoint, state):
             raise RuntimeError("DELIVERY_UNREGISTERED_EDITS: preparation did not record the base")
         state["baseFiles"] = inventory(root)
         core._write_json_atomic(run_dir / "delivery-state.json", state)
-    expected = {n: hashlib.sha256((source/n).read_bytes()).hexdigest() if (source/n).is_file() else None for n in files}
+    expected = dict(state["baseFiles"])
+    expected.update({n: hashlib.sha256((source/n).read_bytes()).hexdigest() if (source/n).is_file() else None for n in files})
     allowed = f"docs/dependency-migration/{run['runId']}/"
     for name in ("MIGRATION_REPORT.md", "DEVELOPER_UPGRADE_GUIDE.md"):
         path = allowed + name
@@ -500,6 +511,12 @@ def resume_delivery_preparation(run_dir, run, config, checkpoint, state):
         if not target.exists():
             shutil.copy2(run_dir / "reports" / name, target)
         files.add(target.relative_to(root).as_posix())
+    # Preserve unselected tracked files from the original base; their absence
+    # in the scoped snapshot is never a request to delete them.
+    scope = getattr(getattr(snapshot, 'input_policy', None), 'scope_roots', ())
+    if scope:
+        from scoped_source_policy import in_scope
+        files.update(name for name in state['baseFiles'] if not in_scope(name, scope))
     from delivery_source_identity import file_identities
     expected, identities = file_identities(root, files)
     state.update(status="ready", files=sorted(files), expected=expected, textIdentities=identities)
@@ -520,8 +537,8 @@ def delivery_verify(run_dir, inputs, *, cleanup=False):
     root = Path(state["workspaceRoot"]).resolve()
     if root != delivery_root(run_dir, run["runId"]).resolve():
         raise RuntimeError("DELIVERY_PATH_OUTSIDE_RUN")
-    if git(root, "branch", "--show-current") != state["branch"]:
-        raise RuntimeError("DELIVERY_BRANCH_CHANGED")
+    from delivery_worktree import assert_delivery_branch
+    assert_delivery_branch(root, state)
     git(root, "merge-base", "--is-ancestor", state["sourceHead"], "HEAD")
     from delivery_git_status import committed_worktree
     if not committed_worktree(root):
@@ -606,7 +623,8 @@ def delivery_verify(run_dir, inputs, *, cleanup=False):
                  commits=git(root, "log", "--format=%h %s", f"{state['sourceHead']}..HEAD").splitlines(),
                  audit=audit, finishedAt=datetime.now(timezone.utc).isoformat())
     core._write_json_atomic(state_file, state)
-    return state
+    from delivery_worktree import release_branch
+    return release_branch(run_dir, state)
 
 
 def main(argv=None):
@@ -627,7 +645,14 @@ def main(argv=None):
                      "current-audit": current_audit, "security-prepare": security_prepare,
                      "security-verify": security_verify, "delivery-prepare": delivery_prepare,
                      "delivery-preflight": delivery_preflight, "delivery-verify": delivery_verify}[args.command]
-        value = operation(run_dir, inputs)
+        from scoped_source_policy import MODE_ENV
+        previous_scope = os.environ.get(MODE_ENV)
+        os.environ[MODE_ENV] = core.load_config(run_dir).get("sourceScope", "repository")
+        try:
+            value = operation(run_dir, inputs)
+        finally:
+            if previous_scope is None: os.environ.pop(MODE_ENV, None)
+            else: os.environ[MODE_ENV] = previous_scope
         # Never print the potentially large source inventory.
         public = {k:v for k,v in value.items() if k not in {"before", "expected", "baseFiles", "files", "textIdentities"}}
         if isinstance(public.get("cleanup"), dict):

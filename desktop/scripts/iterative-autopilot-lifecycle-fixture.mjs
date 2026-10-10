@@ -61,9 +61,9 @@ function fixture(failures = 0, critical = false, infra = false) {
   attempts.startAttempt(runDir,project.name,'none',undefined,0,workspace.id);
   let reads = 0, mutations = 0;
   const options = {
-    setEnabled: (_scope, enabled) => {
+    setEnabled: (_scope, enabled, resume) => {
       const previous = readAutopilotState(runDir);
-      writeAutopilotState(runDir,enabled,enabled && previous?.enabled === false ? undefined : previous?.retry);
+      writeAutopilotState(runDir,enabled,enabled && previous?.enabled === false ? undefined : previous?.retry, resume);
     },
     readRetry: () => readAutopilotState(runDir)?.retry,
     writeRetry: (_scope, retry) => writeAutopilotState(runDir,true,retry),
@@ -94,13 +94,15 @@ for (const failures of [1,3]) {
   const result=await f.drive(undefined,f.scope);
   assert.equal(result.autopilot.stopped,'finished',JSON.stringify(result));
   assert.equal(f.reads(),failures+1); assert.equal(f.mutations(),1);
-  assert.equal(readAutopilotState(f.runDir).enabled,false);
+  assert.equal(readAutopilotState(f.runDir).enabled,true);
+  assert.equal(readAutopilotState(f.runDir).resume,false);
 }
 {
   const f=fixture(10), result=await f.drive(undefined,f.scope);
   assert.match(result.autopilot.error,/AUTOPILOT_RETRY_EXHAUSTED/);
   assert.equal(result.ok,false); assert.equal(f.reads(),4); assert.equal(f.mutations(),0);
-  assert.equal(readAutopilotState(f.runDir).enabled,false);
+  assert.equal(readAutopilotState(f.runDir).enabled,true);
+  assert.equal(readAutopilotState(f.runDir).resume,false);
 }
 {
   const f=fixture(); const read=f.bindings.spawnCapture; let calls=0;
@@ -120,7 +122,8 @@ for (const kind of ['critical','infra']) {
   const f=fixture(kind==='critical'?10:0,kind==='critical',kind==='infra');
   const result=await f.drive(undefined,f.scope);
   assert.equal(result.ok,false); assert.equal(f.reads(),1); assert.equal(f.mutations(),0);
-  assert.equal(readAutopilotState(f.runDir).enabled,false);
+  assert.equal(readAutopilotState(f.runDir).enabled,true);
+  assert.equal(readAutopilotState(f.runDir).resume,false);
 }
 {
   // A crash retains the retry budget, even on its last retry.
@@ -170,7 +173,8 @@ for (const stop of ['pause','cancel']) {
   await new Promise(resolve=>setTimeout(resolve,10));
   if(stop==='pause') auto.setEnabled(f.scope,false); else await cancel(undefined,f.scope);
   assert.equal((await pending).autopilot.stopped,stop==='pause'?'paused':'canceled');
-  assert.equal(calls,0); assert.equal(readAutopilotState(f.runDir).enabled,false);
+  assert.equal(calls,0); assert.equal(readAutopilotState(f.runDir).enabled,stop==='cancel');
+  assert.equal(readAutopilotState(f.runDir).resume,false);
 }
 {
   // Reused request labels on different candidates are real progress, not a loop.
@@ -255,7 +259,8 @@ for (const during of [false,true]) {
   assert.equal(f.mutations(),1);
   assert.equal(attempts.readAttempt(f.runDir).attemptId,attemptId);
   assert.equal(f.auto().hasSession(f.scope),false);
-  assert.equal(readAutopilotState(f.runDir).enabled,false);
+  assert.equal(readAutopilotState(f.runDir).enabled,true);
+  assert.equal(readAutopilotState(f.runDir).resume,false);
 }
 for (const kind of ['failed','canceled','finished','no-run','last-error','cancel-requested']) {
   const f=fixture();

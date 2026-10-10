@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures
+import functools
 import dataclasses
 import hashlib
 import json
@@ -83,9 +84,19 @@ class SourceCaptureError(RuntimeError):
 class SourceInputPolicy:
     excluded_dir_names: tuple[str, ...] = DEFAULT_EXCLUDED_DIR_NAMES
     excluded_file_names: tuple[str, ...] = DEFAULT_EXCLUDED_FILE_NAMES
+    scope_roots: tuple[str, ...] = ()
+    excluded_relative_paths: tuple[str, ...] = ()
+
+    @functools.cached_property
+    def excluded_path_set(self):
+        return frozenset(self.excluded_relative_paths)
 
     @property
     def key(self) -> str:
+        if self.scope_roots:
+            from scoped_source_policy import policy_payload
+            return _canonical_hash({"schema": SOURCE_INPUT_POLICY_SCHEMA, "scope": policy_payload(self),
+                                    "legacyPolicy": SourceInputPolicy(self.excluded_dir_names, self.excluded_file_names).key}, length=64)
         return _canonical_hash({
             "schema": SOURCE_INPUT_POLICY_SCHEMA,
             "excludedDirNames": list(self.excluded_dir_names),
@@ -122,6 +133,7 @@ class SourceSnapshot:
     git_head: str
     git_root: str
     created_at: float
+    input_policy: Optional[SourceInputPolicy] = None
 
 
 _ACTIVE: dict[str, SourceSnapshot] = {}
@@ -683,6 +695,10 @@ def _remove_ephemeral_git_admin_files(root: Path) -> int:
 def _excluded(relative: Path, policy: SourceInputPolicy) -> bool:
     if _is_ephemeral_git_admin_path(relative):
         return True
+    if policy.excluded_relative_paths:
+        names = {relative.as_posix(), *(p.as_posix() for p in relative.parents)}
+        if names.intersection(policy.excluded_path_set):
+            return True
     if any(part in policy.excluded_dir_names for part in relative.parts):
         return True
     return relative.name in policy.excluded_file_names
@@ -1060,6 +1076,9 @@ def _capture_once(
     deadline = (float("inf") if timeout_seconds == 0
                 else started + max(1, int(timeout_seconds)))
     capture_root, project_relative, git_head = _subject_layout(project_dir)
+    if policy == SourceInputPolicy():
+        from scoped_source_policy import policy_for_project
+        policy = policy_for_project(project_dir, capture_root)
     project_path = (capture_root / project_relative).resolve()
     _validate_git_layout(capture_root)
     _submodule_preflight(project_path)
@@ -1099,6 +1118,7 @@ def _capture_once(
                 progress_interval_seconds=progress_interval_seconds,
                 exclude_dir_names=policy.excluded_dir_names,
                 exclude_file_names=policy.excluded_file_names,
+                exclude_relative_paths=policy.excluded_relative_paths,
             )
         except ReparseMaterializationError as exc:
             detail = str(exc)
@@ -1151,6 +1171,7 @@ def _capture_once(
                 "toolBuildId": tool_build_id(),
                 "manifestKey": captured.key,
                 "policyKey": policy.key,
+                "inputPolicy": __import__("scoped_source_policy").policy_payload(policy),
                 "projectRelative": project_relative.as_posix() or ".",
                 "gitHead": git_head,
                 "fileCount": captured.file_count,
@@ -1179,6 +1200,7 @@ def _capture_once(
             git_head=git_head,
             git_root=str(capture_root) if git_head else "",
             created_at=time.time(),
+            input_policy=policy,
         )
     except Exception:
         _force_rmtree(container)
@@ -1269,7 +1291,7 @@ def source_snapshot_live_source_continuity(
 ) -> bool:
     # Git HEAD is provenance only. Ignored/generated files are SourceSnapshot
     # inputs too, so hot reuse requires continuity of all covered live bytes.
-    policy = SourceInputPolicy()
+    policy = snapshot.input_policy or SourceInputPolicy()
     if snapshot.policy_key != policy.key:
         return False
 
@@ -1498,7 +1520,7 @@ def validate_source_snapshot(
     try:
         observed = build_source_tree_manifest(
             snapshot.root,
-            policy=SourceInputPolicy(),
+            policy=snapshot.input_policy or SourceInputPolicy(),
             timeout_seconds=timeout_seconds,
             progress=progress,
             progress_label=progress_label,
@@ -1573,9 +1595,11 @@ def source_snapshot_fingerprint(project_dir: Path) -> str:
     if snapshot is not None:
         return validate_source_snapshot(snapshot).key
     root, relative, _head = _subject_layout(project_dir)
+    from scoped_source_policy import policy_for_project
+    policy = policy_for_project(project_dir, root)
     for attempt in range(1, SOURCE_CAPTURE_RETRIES + 1):
         try:
-            manifest = build_source_tree_manifest(root, timeout_seconds=0)
+            manifest = build_source_tree_manifest(root, policy=policy, timeout_seconds=0)
             break
         except SourceCaptureError as exc:
             if "SOURCE_CAPTURE_UNSTABLE" not in str(exc) or attempt >= SOURCE_CAPTURE_RETRIES:
@@ -1583,7 +1607,7 @@ def source_snapshot_fingerprint(project_dir: Path) -> str:
     return _canonical_hash({
         "schema": SOURCE_SNAPSHOT_SCHEMA,
         "toolBuildId": tool_build_id(),
-        "policyKey": SourceInputPolicy().key,
+        "policyKey": policy.key,
         "manifestKey": manifest.key,
         "projectRelative": relative.as_posix() or ".",
     }, length=32)
@@ -1632,7 +1656,7 @@ def materialize_source_for_verification(
     )
     observed = build_source_tree_manifest(
         target,
-        policy=SourceInputPolicy(),
+        policy=snapshot.input_policy or SourceInputPolicy(),
         timeout_seconds=timeout_seconds,
         progress=progress,
         progress_label=f"{progress_label} post-copy validation",
@@ -1990,7 +2014,8 @@ def open_source_snapshot(
             "SOURCE_SNAPSHOT_KEY_MISMATCH: "
             f"expected={expected_key}; observed={key}"
         )
-    policy = SourceInputPolicy()
+    from scoped_source_policy import policy_from_payload
+    policy = policy_from_payload(raw.get("inputPolicy"))
     if policy_key != policy.key:
         raise SourceCaptureError(
             f"SOURCE_SNAPSHOT_POLICY_UNSUPPORTED: {policy_key}"
@@ -2068,6 +2093,7 @@ def open_source_snapshot(
         git_head=str(raw.get("gitHead") or ""),
         git_root=str(root) if raw.get("gitHead") else "",
         created_at=float(raw.get("createdAt") or manifest_path.stat().st_mtime),
+        input_policy=policy,
     )
 
 
