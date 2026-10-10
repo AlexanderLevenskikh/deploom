@@ -63,7 +63,7 @@ class GitDeliveryTests(unittest.TestCase):
         d.git(self.repo, "config", "user.name", "Delivery Fixture")
         d.git(self.repo, "add", "."); d.git(self.repo, "commit", "-m", "fixture base")
         self.head = d.git(self.repo, "rev-parse", "HEAD")
-        self.source = self.root / "snapshot"
+        self.source = self.root / "sealed" / "tree"
         shutil.copytree(self.repo, self.source)
         (self.source / "source.txt").write_text("upgraded", encoding="utf-8")
         (self.source / "fixtures").mkdir()
@@ -72,7 +72,7 @@ class GitDeliveryTests(unittest.TestCase):
         self.run = {"schemaVersion": core.SCHEMA_VERSION, "runId": "delivery-fixture", "phase": "TERMINAL", "activeCheckpointId": "C1", "activeCandidateId": None}
         self.config = {"schemaVersion": core.SCHEMA_VERSION, "projectDir": str(self.repo), "projectName": "fixture", "runtime": {},
                        "verifyConfig": {"commands": ["node check.cjs"], "projectChecks": "strict"}, "goalMode": "audit-policy", "targets": {}, "auditPolicy": {}}
-        self.checkpoint = {"schemaVersion": core.SCHEMA_VERSION, "checkpointId": "C1", "seq": 1, "status": "VERIFIED", "sourceSnapshotKey": "fixture-key", "sourceHead": self.head, "projectRelative": ".", "fullAssignment": {}, "audit": {"status": "FAIL"}}
+        self.checkpoint = {"schemaVersion": core.SCHEMA_VERSION, "checkpointId": "C1", "seq": 1, "status": "VERIFIED", "sourceSnapshotKey": "fixture-key", "sourceSnapshotContainer": str(self.source.parent), "sourceHead": self.head, "projectRelative": ".", "fullAssignment": {}, "audit": {"status": "FAIL"}}
         core.save_run(self.run_dir, self.run); core.save_config(self.run_dir, self.config)
         core.save_checkpoint(self.run_dir, self.checkpoint)
         (self.run_dir / "reports").mkdir()
@@ -254,6 +254,58 @@ class GitDeliveryTests(unittest.TestCase):
                 d.delivery_verify(self.run_dir,{})
             audit.assert_not_called()
         self.assertEqual(d.read(self.run_dir/'delivery-state.json')['expected'],state['expected'])
+        self.assert_original_preserved()
+
+    def test_legacy_sql_and_utf16_delivery_preflight_is_fast_and_real_checks_still_run(self):
+        from iterative_delivery_preflight import delivery_preflight
+        sql='sql/backend.sql'; unicode='unicode.txt'
+        (self.source/'sql').mkdir()
+        original='-- обновление\r\nALTER TABLE Ref_org ADD DepartmentId int;\r\n'.encode('cp1251')
+        wide=b'\xff\xfe'+'обновление\r\n'.encode('utf-16-le')
+        (self.source/sql).write_bytes(original);(self.source/unicode).write_bytes(wide)
+        state=self.prepare();root=Path(state['workspaceRoot'])
+        state.pop('textIdentities',None)  # compatibility with pre-0.2.210 preparation
+        core._write_json_atomic(self.run_dir/'delivery-state.json',state)
+        actual=original.replace(b'\r\n',b'\n');actual_wide=b'\xff\xfe'+'обновление\n'.encode('utf-16-le')
+        (root/sql).write_bytes(actual);(root/unicode).write_bytes(actual_wide)
+        with patch.object(core,'_open_checkpoint_source',side_effect=AssertionError('must not reverify old checkpoint')),patch.object(core,'verify_assignment') as verify:
+            first=delivery_preflight(self.run_dir,{})
+            verify.assert_not_called()
+        self.assertEqual(first['lineEndingChangeCount'],2)
+        self.assertEqual(first['status'],'ready')
+        self.assertEqual(d.read(self.run_dir/'delivery-state.json')['expected'],state['expected'])
+        d.git(root,'add','-A');d.git(root,'commit','-m','legacy text migration')
+        with patch.object(d,'collect_audit',return_value=report()),patch.object(core,'_finish_locked'),patch.object(core,'_open_checkpoint_source',side_effect=AssertionError('must not reverify old checkpoint')):
+            result=d.delivery_verify(self.run_dir,{})
+        self.assertEqual(result['status'],'done')
+        self.assertEqual((Path(result['verificationWorkspace'])/sql).read_bytes(),actual)
+        self.assertEqual((Path(result['verificationWorkspace'])/unicode).read_bytes(),actual_wide)
+        self.assert_original_preserved()
+
+    def test_preflight_reports_all_content_changes_before_any_project_checks(self):
+        from iterative_delivery_preflight import delivery_preflight
+        state=self.prepare();root=Path(state['workspaceRoot'])
+        (root/'source.txt').write_bytes(b'actual source change')
+        (root/'fixtures/important.txt').write_bytes(b'actual second change')
+        with patch.object(core,'verify_assignment') as verify,patch.object(core,'_open_checkpoint_source',side_effect=AssertionError('must not reverify old checkpoint')):
+            with self.assertRaisesRegex(RuntimeError,'2 blocked files'):
+                delivery_preflight(self.run_dir,{})
+            verify.assert_not_called()
+        evidence=d.read(self.run_dir/'delivery/preflight.json')
+        self.assertEqual({item['path'] for item in evidence['blockedChanges']},{'source.txt','fixtures/important.txt'})
+        self.assertEqual(evidence['status'],'blocked')
+        self.assertEqual(d.read(self.run_dir/'delivery-state.json')['expected'],state['expected'])
+        self.assert_original_preserved()
+
+    def test_non_utf8_binary_payload_does_not_gain_text_eol_tolerance(self):
+        (self.source/'asset.bin').write_bytes(b'\xffbinary\r\n')
+        state=self.prepare();root=Path(state['workspaceRoot'])
+        (root/'asset.bin').write_bytes(b'\xffbinary\n')
+        d.git(root,'add','-A');d.git(root,'commit','-m','unexpected binary edit')
+        with patch.object(core,'verify_assignment') as verify:
+            with self.assertRaisesRegex(RuntimeError,'DELIVERY_SOURCE_CHANGED'):
+                d.delivery_verify(self.run_dir,{})
+            verify.assert_not_called()
         self.assert_original_preserved()
 
     def test_binary_attributes_and_legacy_reference_corruption_reject_eol_changes(self):

@@ -71,17 +71,19 @@ try {
 
   write('run-config.json', { projectName: 'fixture', packagePolicies: { frozen: 'keep-current', required: 'required' }, targets: { required: '2.0.0' }, verifyConfig: { commands: ['node check.cjs'] } })
   rmSync(join(root, 'delivery-state.json'))
-  let paidLaunches = 0, verifyCalls = 0
+  let paidLaunches = 0, verifyCalls = 0, preflightCalls = 0
   const deliveryState = { status: 'ready', runId: 'fixture', checkpointId: 'C4', branch: 'codex/delivery', workspaceRoot: root, sourceHead: 'base' }
   const deps = {
     canceled: () => false, processAlive: () => false, progress: () => {}, provider: 'codex',
     command: async step => {
       if (step === 'security-prepare') return { status: 'not-needed' }
       if (step === 'delivery-prepare') { write('delivery-state.json', deliveryState); return deliveryState }
+      if (step === 'delivery-preflight') { preflightCalls++; return { status: 'ready', checkedFiles: 10, lineEndingChangeCount: 2 } }
       if (step === 'delivery-verify') { verifyCalls++; if (verifyCalls === 1) throw new Error('AUDIT_NETWORK_UNAVAILABLE'); return { status: 'done' } }
       throw new Error(step)
     },
     launch: async context => {
+      assert.ok(preflightCalls > 0, 'check every delivery file before a paid semantic-commit agent')
       paidLaunches++
       context.onSpawn(123); context.onSession('saved-session')
       const durable = JSON.parse(readFileSync(join(root, 'delivery-agent.json'), 'utf8'))
@@ -91,7 +93,7 @@ try {
       assert.ok(context.prompt.includes('@skbkontur/react-icons'))
       assert.ok(context.prompt.includes('Never force-add or copy ignored inputs'))
       assert.ok(context.prompt.includes('checkpoint checks do not prove this new subject'))
-      assert.ok(context.prompt.includes('CR/LF/CRLF differences in UTF-8 text'))
+      assert.ok(context.prompt.includes('ASCII-compatible legacy encodings such as Windows-1251'))
       assert.ok(context.prompt.includes('fresh checks and audit of the exact delivered bytes'))
     },
   }
@@ -99,6 +101,12 @@ try {
   assert.equal((await runDeliveryWorkflow(root, deps)).ok, true)
   assert.equal(paidLaunches, 1, 'restart after verification failure must not replay a finished paid agent')
   assert.equal(verifyCalls, 2)
+  const blockedPreflight = await runDeliveryWorkflow(root, { ...deps,
+    command: async step => { if (step === 'delivery-preflight') throw new Error('DELIVERY_SOURCE_CHANGED: 2 blocked files; full report'); return deps.command(step) },
+  })
+  assert.equal(blockedPreflight.ok, false)
+  assert.equal(paidLaunches, 1, 'complete preflight must reject content drift before launching an agent')
+  assert.equal(verifyCalls, 2, 'preflight rejection must not run the expensive project verifier')
   write('delivery-agent.json', { identity: 'delivery:fixture:C4:0', status: 'needs-agent', sessionId: 'saved-session', provider: 'codex', verificationError: 'DELIVERY_SOURCE_CHANGED: .gitignore line endings' })
   assert.equal((await runDeliveryWorkflow(root, deps)).ok, true)
   assert.equal(paidLaunches, 1, 'retry the exact delivery guard before paying for another agent on EOL-only source rejection')

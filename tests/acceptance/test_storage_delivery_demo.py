@@ -61,6 +61,7 @@ class StorageDeliveryDemoTests(unittest.TestCase):
                 workspace=base/'workspace';run_dir=workspace/'.dependency-roadmap/iterative/demo';run_dir.mkdir(parents=True)
                 (repo/'.gitignore').write_bytes(b'node_modules/\r\n')
                 (repo/'.gitattributes').write_text('*.txt text eol=lf\n')
+                (repo/'backend.sql').write_bytes('-- обновление\r\nSELECT 1;\r\n'.encode('cp1251'))
                 (repo/'.npmrc').write_text(f'registry={registry}\naudit=false\n')
                 def install(version):
                     (repo/'package.json').write_text(json.dumps({'name':'deploom-size-demo','version':'1.0.0','private':True,'dependencies':{'deploom-demo-package':version}}))
@@ -106,7 +107,8 @@ class StorageDeliveryDemoTests(unittest.TestCase):
                 d.git(root,'add','docs');d.git(root,'commit','-m','docs: developer guide and migration report')
                 # The agent/Git may normalize a prepared config after grouping.
                 (root/'.gitignore').write_bytes(b'node_modules/\n')
-                d.git(root,'add','.gitignore');d.git(root,'commit','--allow-empty','-m','chore: commit normalized config')
+                (root/'backend.sql').write_bytes('-- обновление\nSELECT 1;\n'.encode('cp1251'))
+                d.git(root,'add','.gitignore','backend.sql');d.git(root,'commit','--allow-empty','-m','chore: commit normalized config')
                 with contextlib.redirect_stdout(io.StringIO()):
                     delivered=d.delivery_verify(run_dir,{})
                     plan=storage.inspect(None,[str(workspace)]);cleaned=storage.clean(None,[str(workspace)],plan)

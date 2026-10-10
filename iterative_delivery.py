@@ -537,31 +537,8 @@ def delivery_verify(run_dir, inputs, *, cleanup=False):
     expected = dict(notes["expected"] if cleanup else state["expected"])
     if cleanup:
         git(root, "merge-base", "--is-ancestor", notes["baseHead"], "HEAD")
-    from delivery_source_identity import PreparedTextGuard, text_identity
-    def original_source():
-        if cleaned:
-            # Cleanup targets are controller-derived, not the original checkpoint.
-            raise RuntimeError("DELIVERY_CLEANUP_TEXT_IDENTITY_MISSING")
-        return core._open_checkpoint_source(run_dir, checkpoint, config, run_id=run["runId"]).root
-    guard = PreparedTextGuard(root, (notes if cleanup else state).get("textIdentities", {}), original_source)
-    for name, digest in expected.items():
-        path = root / name
-        if not contained(root, path) or path.is_symlink():
-            raise RuntimeError(f"DELIVERY_INVALID_PATH: {name}")
-        data = path.read_bytes() if path.is_file() else None
-        current = hashlib.sha256(data).hexdigest() if data is not None else None
-        if name in documentation:
-            if not path.is_file() or path.is_symlink() or not path.read_text(encoding="utf-8-sig").strip():
-                raise RuntimeError(f"DELIVERY_DOCUMENTATION_MISSING: {name}")
-            expected[name] = current
-            identity = text_identity(data)
-            if identity is not None:
-                guard.identities[name] = identity
-        elif current != digest:
-            if not guard.admit(name, digest, data):
-                raise RuntimeError(f"DELIVERY_SOURCE_CHANGED: commit grouping must preserve verified content ({name})")
-            # Admission grants no proof: verify these exact delivered bytes below.
-            expected[name] = current
+    from iterative_delivery_preflight import inspect_delivery
+    expected, guard, _ = inspect_delivery(run_dir, state, checkpoint, cleanup=cleanup)
     from iterative_delivery_submodules import validate_gitlinks
     validate_gitlinks(root, state.get('gitlinks', {}))
     actual = set(git(root, "ls-files", "-z").split("\0")) - {""}
@@ -637,7 +614,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--input-file", required=True)
-    parser.add_argument("command", choices=("current-audit", "security-prepare", "security-verify", "delivery-prepare", "delivery-verify", "cleanup-prepare", "cleanup-verify"))
+    parser.add_argument("command", choices=("current-audit", "security-prepare", "security-verify", "delivery-prepare", "delivery-preflight", "delivery-verify", "cleanup-prepare", "cleanup-verify"))
     args = parser.parse_args(argv)
     run_dir = Path(args.run_dir).resolve(); run_dir.mkdir(parents=True, exist_ok=True)
     inputs = read(args.input_file)
@@ -645,10 +622,11 @@ def main(argv=None):
     lock.acquire()
     try:
         from iterative_delivery_notes import cleanup_prepare, cleanup_verify
+        from iterative_delivery_preflight import delivery_preflight
         operation = {"cleanup-prepare": cleanup_prepare, "cleanup-verify": cleanup_verify,
                      "current-audit": current_audit, "security-prepare": security_prepare,
                      "security-verify": security_verify, "delivery-prepare": delivery_prepare,
-                     "delivery-verify": delivery_verify}[args.command]
+                     "delivery-preflight": delivery_preflight, "delivery-verify": delivery_verify}[args.command]
         value = operation(run_dir, inputs)
         # Never print the potentially large source inventory.
         public = {k:v for k,v in value.items() if k not in {"before", "expected", "baseFiles", "files", "textIdentities"}}
