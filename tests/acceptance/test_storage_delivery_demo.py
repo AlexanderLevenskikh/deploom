@@ -59,7 +59,7 @@ class StorageDeliveryDemoTests(unittest.TestCase):
             with self.subTest(size=label), tempfile.TemporaryDirectory(prefix='deploom-size-demo-') as temp:
                 base=Path(temp);repo=base/'original';repo.mkdir()
                 workspace=base/'workspace';run_dir=workspace/'.dependency-roadmap/iterative/demo';run_dir.mkdir(parents=True)
-                (repo/'.gitignore').write_text('node_modules/\n')
+                (repo/'.gitignore').write_bytes(b'node_modules/\r\n')
                 (repo/'.gitattributes').write_text('*.txt text eol=lf\n')
                 (repo/'.npmrc').write_text(f'registry={registry}\naudit=false\n')
                 def install(version):
@@ -104,6 +104,9 @@ class StorageDeliveryDemoTests(unittest.TestCase):
                 d.git(root,'add','package.json','package-lock.json');d.git(root,'commit','-m','deps: upgrade demo package')
                 d.git(root,'add','migration-mode.txt');d.git(root,'commit','-m','refactor: adapt capability contract')
                 d.git(root,'add','docs');d.git(root,'commit','-m','docs: developer guide and migration report')
+                # The agent/Git may normalize a prepared config after grouping.
+                (root/'.gitignore').write_bytes(b'node_modules/\n')
+                d.git(root,'add','.gitignore');d.git(root,'commit','--allow-empty','-m','chore: commit normalized config')
                 with contextlib.redirect_stdout(io.StringIO()):
                     delivered=d.delivery_verify(run_dir,{})
                     plan=storage.inspect(None,[str(workspace)]);cleaned=storage.clean(None,[str(workspace)],plan)

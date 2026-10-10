@@ -500,8 +500,9 @@ def resume_delivery_preparation(run_dir, run, config, checkpoint, state):
         if not target.exists():
             shutil.copy2(run_dir / "reports" / name, target)
         files.add(target.relative_to(root).as_posix())
-    state.update(status="ready", files=sorted(files),
-                 expected={n: hashlib.sha256((root/n).read_bytes()).hexdigest() if (root/n).is_file() else None for n in files})
+    from delivery_source_identity import file_identities
+    expected, identities = file_identities(root, files)
+    state.update(status="ready", files=sorted(files), expected=expected, textIdentities=identities)
     core._write_json_atomic(run_dir / "delivery-state.json", state)
     return state
 
@@ -536,15 +537,31 @@ def delivery_verify(run_dir, inputs, *, cleanup=False):
     expected = dict(notes["expected"] if cleanup else state["expected"])
     if cleanup:
         git(root, "merge-base", "--is-ancestor", notes["baseHead"], "HEAD")
+    from delivery_source_identity import PreparedTextGuard, text_identity
+    def original_source():
+        if cleaned:
+            # Cleanup targets are controller-derived, not the original checkpoint.
+            raise RuntimeError("DELIVERY_CLEANUP_TEXT_IDENTITY_MISSING")
+        return core._open_checkpoint_source(run_dir, checkpoint, config, run_id=run["runId"]).root
+    guard = PreparedTextGuard(root, (notes if cleanup else state).get("textIdentities", {}), original_source)
     for name, digest in expected.items():
         path = root / name
-        current = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+        if not contained(root, path) or path.is_symlink():
+            raise RuntimeError(f"DELIVERY_INVALID_PATH: {name}")
+        data = path.read_bytes() if path.is_file() else None
+        current = hashlib.sha256(data).hexdigest() if data is not None else None
         if name in documentation:
             if not path.is_file() or path.is_symlink() or not path.read_text(encoding="utf-8-sig").strip():
                 raise RuntimeError(f"DELIVERY_DOCUMENTATION_MISSING: {name}")
             expected[name] = current
+            identity = text_identity(data)
+            if identity is not None:
+                guard.identities[name] = identity
         elif current != digest:
-            raise RuntimeError(f"DELIVERY_SOURCE_CHANGED: commit grouping must preserve verified bytes ({name})")
+            if not guard.admit(name, digest, data):
+                raise RuntimeError(f"DELIVERY_SOURCE_CHANGED: commit grouping must preserve verified content ({name})")
+            # Admission grants no proof: verify these exact delivered bytes below.
+            expected[name] = current
     from iterative_delivery_submodules import validate_gitlinks
     validate_gitlinks(root, state.get('gitlinks', {}))
     actual = set(git(root, "ls-files", "-z").split("\0")) - {""}
@@ -602,8 +619,11 @@ def delivery_verify(run_dir, inputs, *, cleanup=False):
     refreshed_run.pop("terminalOutcome", None)
     core._finish_locked(run_dir, refreshed_run, config)
     if cleanup:
-        state["cleanup"] = {**notes, "status": "done", "head": delivered_head}
-    state.update(status="done", head=delivered_head, expected=expected, verificationWorkspace=str(verification),
+        state["cleanup"] = {**notes, "status": "done", "head": delivered_head,
+                            "expected": expected, "textIdentities": guard.identities}
+    state.update(status="done", head=delivered_head, expected=expected,
+                 textIdentities=guard.identities, lineEndingChanges=guard.changes,
+                 verificationWorkspace=str(verification),
                  documentationHashes={name: expected[name] for name in sorted(documentation)},
                  proofRefs={"resolvedStateKey": result.resolved_state_key, "preparationProofKey": result.preparation_proof_key},
                  commits=git(root, "log", "--format=%h %s", f"{state['sourceHead']}..HEAD").splitlines(),
@@ -631,9 +651,9 @@ def main(argv=None):
                      "delivery-verify": delivery_verify}[args.command]
         value = operation(run_dir, inputs)
         # Never print the potentially large source inventory.
-        public = {k:v for k,v in value.items() if k not in {"before", "expected", "baseFiles", "files"}}
+        public = {k:v for k,v in value.items() if k not in {"before", "expected", "baseFiles", "files", "textIdentities"}}
         if isinstance(public.get("cleanup"), dict):
-            public["cleanup"] = {k:v for k,v in public["cleanup"].items() if k not in {"before", "expected"}}
+            public["cleanup"] = {k:v for k,v in public["cleanup"].items() if k not in {"before", "expected", "textIdentities"}}
         print("ITERATIVE_DELIVERY_V1 " + json.dumps(public, ensure_ascii=False))
         return 0
     finally:

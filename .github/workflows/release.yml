@@ -115,6 +115,8 @@ jobs:
           python -m unittest tests.test_prepared_workspace_fastpath
           python -m unittest tests.test_sigma_process_supervision
           python -m unittest discover -s tests/regression -p test_storage_cleanup_inventory.py -v
+          python -m unittest discover -s tests/regression -p test_iterative_delivery.py -v
+          python -m unittest discover -s tests/regression -p test_delivery_source_identity.py -v
           python run_tool_tests.py --suite acceptance
 
   package-windows:

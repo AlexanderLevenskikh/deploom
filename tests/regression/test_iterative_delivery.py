@@ -217,6 +217,83 @@ class GitDeliveryTests(unittest.TestCase):
         d.git(root,'add','source.txt')
         self.assertFalse(committed_worktree(root))
 
+    def test_prepared_and_legacy_delivery_accept_only_eol_changes_with_real_checks(self):
+        import hashlib
+        (self.source/'.gitignore').write_bytes(b'node_modules/\r\n.dependency-roadmap/\r\n')
+        state = self.prepare(); root = Path(state['workspaceRoot'])
+        # Reproduce an already prepared pre-fix delivery, then resume repeatedly.
+        state.pop('textIdentities', None)
+        core._write_json_atomic(self.run_dir/'delivery-state.json', state)
+        for ending in (b'\n', b'\r', b'\r\n'):
+            with self.subTest(ending=ending):
+                data = ending.join((b'node_modules/', b'.dependency-roadmap/', b''))
+                (root/'.gitignore').write_bytes(data)
+                d.git(root,'add','-A'); d.git(root,'commit','--allow-empty','-m','semantic migration')
+                with patch.object(d,'collect_audit',return_value=report()) as audit, patch.object(core,'_finish_locked'):
+                    result = d.delivery_verify(self.run_dir,{})
+                    audit.assert_called_once()
+                self.assertEqual(result['status'],'done')
+                self.assertEqual((Path(result['verificationWorkspace'])/'.gitignore').read_bytes(), data)
+                self.assertEqual(result['expected']['.gitignore'],hashlib.sha256(data).hexdigest())
+        (root/'.gitignore').write_bytes(b'node_modules/\n.dependency-roadmap/\nsecret/\n')
+        d.git(root,'add','.gitignore'); d.git(root,'commit','-m','unexpected rule')
+        with patch.object(core,'verify_assignment') as verify:
+            with self.assertRaisesRegex(RuntimeError,'DELIVERY_SOURCE_CHANGED'):
+                d.delivery_verify(self.run_dir,{})
+            verify.assert_not_called()
+        self.assert_original_preserved()
+
+    def test_eol_admission_never_bypasses_failing_project_check(self):
+        (self.source/'.gitignore').write_bytes(b'node_modules/\r\n.dependency-roadmap/\r\n')
+        (self.source/'check.cjs').write_bytes(b'process.exit(17)')
+        state=self.prepare(); root=Path(state['workspaceRoot'])
+        (root/'.gitignore').write_bytes(b'node_modules/\n.dependency-roadmap/\n')
+        d.git(root,'add','-A'); d.git(root,'commit','-m','migration with failed check')
+        with patch.object(d,'collect_audit') as audit:
+            with self.assertRaisesRegex(RuntimeError,'DELIVERY_VERIFICATION_FAILED'):
+                d.delivery_verify(self.run_dir,{})
+            audit.assert_not_called()
+        self.assertEqual(d.read(self.run_dir/'delivery-state.json')['expected'],state['expected'])
+        self.assert_original_preserved()
+
+    def test_binary_attributes_and_legacy_reference_corruption_reject_eol_changes(self):
+        (self.source/'.gitattributes').write_bytes(b'asset.bin -text\n')
+        (self.source/'asset.bin').write_bytes(b'first\r\nsecond\r\n')
+        (self.source/'.gitignore').write_bytes(b'node_modules/\r\n.dependency-roadmap/\r\n')
+        state=self.prepare(); root=Path(state['workspaceRoot'])
+        (root/'asset.bin').write_bytes(b'first\nsecond\n')
+        d.git(root,'add','-A');d.git(root,'commit','-m','unexpected binary normalization')
+        with patch.object(core,'verify_assignment') as verify:
+            with self.assertRaisesRegex(RuntimeError,'DELIVERY_SOURCE_CHANGED'):
+                d.delivery_verify(self.run_dir,{})
+            verify.assert_not_called()
+        (root/'asset.bin').write_bytes(b'first\r\nsecond\r\n')
+        (root/'.gitignore').write_bytes(b'node_modules/\n.dependency-roadmap/\n')
+        (self.source/'.gitignore').write_bytes(b'corrupted reference\n')
+        state.pop('textIdentities',None)
+        core._write_json_atomic(self.run_dir/'delivery-state.json',state)
+        d.git(root,'add','-A');d.git(root,'commit','--allow-empty','-m','legacy delivery')
+        with patch.object(core,'verify_assignment') as verify:
+            with self.assertRaisesRegex(RuntimeError,'DELIVERY_SOURCE_CHANGED'):
+                d.delivery_verify(self.run_dir,{})
+            verify.assert_not_called()
+        self.assert_original_preserved()
+
+    def test_delivered_eol_bytes_cannot_change_during_fresh_audit(self):
+        (self.source/'.gitignore').write_bytes(b'node_modules/\r\n.dependency-roadmap/\r\n')
+        state=self.prepare();root=Path(state['workspaceRoot'])
+        (root/'.gitignore').write_bytes(b'node_modules/\n.dependency-roadmap/\n')
+        d.git(root,'add','-A');d.git(root,'commit','-m','semantic migration')
+        def mutate_during_audit(*args):
+            (root/'.gitignore').write_bytes(b'node_modules/\r\n.dependency-roadmap/\r\n')
+            return report()
+        with patch.object(d,'collect_audit',side_effect=mutate_during_audit), patch.object(core,'_finish_locked') as finish:
+            with self.assertRaisesRegex(RuntimeError,'DELIVERY_(BYTES_)?CHANGED_DURING_VERIFICATION'):
+                d.delivery_verify(self.run_dir,{})
+            finish.assert_not_called()
+        self.assertEqual(d.read(self.run_dir/'delivery-state.json')['expected'],state['expected'])
+        self.assert_original_preserved()
+
     def test_git_stat_cache_eol_noise_does_not_block_exact_delivery_checks(self):
         from delivery_git_status import committed_worktree
         # Git normalizes these files to LF, while the source snapshot is CRLF.
@@ -636,6 +713,22 @@ class GitDeliveryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "ARCHIVE_CHANGED"):
                 notes.cleanup_verify(self.run_dir, {})
             verify.assert_not_called()
+        self.assert_original_preserved()
+
+    @unittest.skipUnless(shutil.which("node") and (shutil.which("npm") or shutil.which("npm.cmd")), "Node/npm required")
+    def test_notes_cleanup_eol_conversion_resumes_and_reverifies(self):
+        notes, root, _ = self.notes_fixture()
+        prepared = notes.cleanup_prepare(self.run_dir,{})
+        self.apply_notes_cleanup(notes,root,prepared)
+        path=root/'note.cjs';data=path.read_bytes().replace(b'\r\n',b'\n')
+        path.write_bytes(data)
+        d.git(root,'add','-A');d.git(root,'commit','--allow-empty','-m','cleanup notes with normalized text')
+        self.assertEqual(notes.cleanup_prepare(self.run_dir,{}),prepared)
+        with patch.object(d,'collect_audit',return_value=report()),patch.object(core,'_finish_locked'):
+            result=notes.cleanup_verify(self.run_dir,{})
+        self.assertEqual(result['cleanup']['status'],'done')
+        self.assertEqual((Path(result['verificationWorkspace'])/'note.cjs').read_bytes(),data)
+        self.assertEqual(notes.cleanup_prepare(self.run_dir,{})['cleanup']['status'],'done')
         self.assert_original_preserved()
 
     @unittest.skipUnless(shutil.which("node") and (shutil.which("npm") or shutil.which("npm.cmd")), "Node/npm required")

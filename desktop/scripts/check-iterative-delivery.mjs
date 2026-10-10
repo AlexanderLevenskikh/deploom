@@ -91,12 +91,23 @@ try {
       assert.ok(context.prompt.includes('@skbkontur/react-icons'))
       assert.ok(context.prompt.includes('Never force-add or copy ignored inputs'))
       assert.ok(context.prompt.includes('checkpoint checks do not prove this new subject'))
+      assert.ok(context.prompt.includes('CR/LF/CRLF differences in UTF-8 text'))
+      assert.ok(context.prompt.includes('fresh checks and audit of the exact delivered bytes'))
     },
   }
   assert.equal((await runDeliveryWorkflow(root, deps)).ok, false)
   assert.equal((await runDeliveryWorkflow(root, deps)).ok, true)
   assert.equal(paidLaunches, 1, 'restart after verification failure must not replay a finished paid agent')
   assert.equal(verifyCalls, 2)
+  write('delivery-agent.json', { identity: 'delivery:fixture:C4:0', status: 'needs-agent', sessionId: 'saved-session', provider: 'codex', verificationError: 'DELIVERY_SOURCE_CHANGED: .gitignore line endings' })
+  assert.equal((await runDeliveryWorkflow(root, deps)).ok, true)
+  assert.equal(paidLaunches, 1, 'retry the exact delivery guard before paying for another agent on EOL-only source rejection')
+  write('delivery-agent.json', { identity: 'delivery:fixture:C4:0', status: 'needs-agent', sessionId: 'saved-session', provider: 'codex', verificationError: 'DELIVERY_SOURCE_CHANGED' })
+  const changedContent = await runDeliveryWorkflow(root, { ...deps,
+    command: async step => { if (step === 'delivery-verify') throw new Error('DELIVERY_SOURCE_CHANGED: actual content changed'); return deps.command(step) },
+  })
+  assert.equal(changedContent.ok, false)
+  assert.equal(paidLaunches, 1, 'actual content drift must remain a controller rejection')
 
   write('delivery-agent.json', { identity: 'delivery:fixture:C4:0', status: 'needs-agent', sessionId: 'saved-session', provider: 'codex', verificationError: 'DELIVERY_UNCOMMITTED_CHANGES: stale EOL status' })
   assert.equal((await runDeliveryWorkflow(root, deps)).ok, true)

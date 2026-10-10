@@ -135,6 +135,10 @@ def cleanup_prepare(run_dir, inputs):
             raise RuntimeError("DELIVERY_CLEANUP_BRANCH_CHANGED: preserve user edits")
         # Resume only the original or exactly prepared bytes, preserving user edits.
         delivery.git(root, "merge-base", "--is-ancestor", previous["baseHead"], "HEAD")
+        from delivery_source_identity import PreparedTextGuard
+        def missing_cleanup_identity():
+            raise RuntimeError("DELIVERY_CLEANUP_TEXT_IDENTITY_MISSING")
+        text_guard = PreparedTextGuard(root, previous.get("textIdentities", {}), missing_cleanup_identity)
         for name, digest in previous["expected"].items():
             target = root / name
             if not delivery.contained(root, target) or target.is_symlink():
@@ -143,10 +147,12 @@ def cleanup_prepare(run_dir, inputs):
             actual = hashlib.sha256(data).hexdigest() if data is not None else None
             allowed = {digest} if previous.get("status") == "done" else {previous["before"].get(name), digest}
             if actual not in allowed:
+                if text_guard.admit(name, digest, data):
+                    continue
                 comment_change = any(change["path"] == name and change["kind"] == "comments" for change in previous["changes"])
                 if previous.get("status") == "ready" and comment_change and data is not None:
                     stripped, _count = without_migration_notes(data, name, state["runId"])
-                    if hashlib.sha256(stripped).hexdigest() == digest:
+                    if hashlib.sha256(stripped).hexdigest() == digest or text_guard.admit(name, digest, stripped):
                         assert_comment_only_removal(data, stripped, name, config, state)
                         continue
                 raise RuntimeError(f"DELIVERY_CLEANUP_BYTES_CHANGED: {name}")
@@ -162,6 +168,8 @@ def cleanup_prepare(run_dir, inputs):
     archive = run_dir / "delivery" / "notes-archive"
     documents = {f"docs/dependency-migration/{state['runId']}/{name}" for name in DOCUMENT_NAMES}
     changes = []
+    from delivery_source_identity import text_identity
+    identities = {}
     for name, digest in expected.items():
         target = root / name
         if not delivery.contained(root, target) or target.is_symlink():
@@ -199,8 +207,13 @@ def cleanup_prepare(run_dir, inputs):
                 assert_comment_only_removal(data, stripped, name, config, state)
                 expected[name] = hashlib.sha256(stripped).hexdigest()
                 changes.append({"path": name, "kind": "comments", "count": count})
+                data = stripped
+        if expected[name] is not None and data is not None:
+            identity = text_identity(data)
+            if identity is not None:
+                identities[name] = identity
     state["cleanup"] = {"status": "ready", "baseHead": state["head"], "expected": expected, "before": before,
-                        "changes": changes, "archiveRoot": str(archive),
+                        "changes": changes, "archiveRoot": str(archive), "textIdentities": identities,
                         "commentCount": sum(change.get("count", 0) for change in changes)}
     core._write_json_atomic(path, state)
     return state
