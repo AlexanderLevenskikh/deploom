@@ -129,7 +129,10 @@ class StorageDeliveryDemoTests(unittest.TestCase):
                 if cleaned['removed'] < 1:
                     import materialization_retention as retention
                     evidence = {'cleanup':cleaned, 'sourceValidation':[]}
-                    trial_scans = [(records, digest) for path, records, digest in scan_records if Path(path) == trial]
+                    failed_path = next((r['path'] for r in cleaned['results'] if r.get('reason') == 'changed-after-preview'), str(trial))
+                    evidence['scanPaths'] = [path for path, _, _ in scan_records]
+                    evidence['trialPath'] = str(trial)
+                    trial_scans = [(records, digest) for path, records, digest in scan_records if path == failed_path]
                     evidence['scanSignatures'] = [digest for _, digest in trial_scans]
                     if len(trial_scans) >= 2:
                         before, after = trial_scans[0][0], trial_scans[-1][0]
