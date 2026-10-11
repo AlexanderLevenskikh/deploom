@@ -24,6 +24,7 @@ import { buildGroupVerificationRepairPrompt } from './group-repair.js'
 import { batchRoadmapDocument, replaceRoadmapPath } from './roadmap-dossier.js'
 import { latestAgentCheckpoint } from './agent-checkpoint.js'
 import { applyBranchBase, projectBranchNames, preferNewestProjectLevels, projectLevelsFromHistorySnapshots, projectLevelsFromRoadmap, type ProjectLevel } from './project-settings.js'
+import { PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH, PROJECT_MANIFEST_DISCOVERY_DEEP_SCAN_DEPTH, deepScanSuggestion, discoverProjectDirectories, resolveProjectPackageSelection, serializeDiscoveryReport, type SerializedDiscoveryReport } from './project-discovery.js'
 import { releaseBranchForAction } from './publication.js'
 import { releaseGateCommands, releasePolicyForProject } from './release-policy.js'
 import { buildMergeRecoveryPrompt } from './merge-recovery.js'
@@ -1029,50 +1030,24 @@ function resolveSettingsPath(workspace: WorkspaceRecord): string {
 }
 
 // BLOCK_W_P0_P1_TYPES_NESTED_FIX_V1
-const PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH = 5
-const PROJECT_MANIFEST_DISCOVERY_IGNORED_DIRS = new Set([
-  '.git', 'node_modules', '.dependency-roadmap', '.dependency-update-history',
-  '.next', 'dist', 'build', 'coverage', '.turbo', '.cache',
-])
-
-function discoverProjectPackageDirectories(root: string): string[] {
-  const found: string[] = []
-  const walk = (directory: string, depth: number): void => {
-    if (depth > PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH) return
-    if (directory !== root && existsSync(join(directory, 'package.json'))) {
-      found.push(resolve(directory))
-      return
-    }
-    let entries: Dirent[]
-    try {
-      entries = readdirSync(directory, { withFileTypes: true })
-    } catch {
-      return
-    }
-    for (const entry of entries) {
-      if (!entry.isDirectory() || entry.isSymbolicLink() || PROJECT_MANIFEST_DISCOVERY_IGNORED_DIRS.has(entry.name)) continue
-      walk(join(directory, entry.name), depth + 1)
-    }
-  }
-  walk(resolve(root), 0)
-  return [...new Set(found)].sort((left, right) => left.localeCompare(right))
-}
+// The bounded, recognized-dirs walk lives in the single-rule module
+// `project-discovery.ts` (Python `project_topology` stays the canonical owner);
+// the constants below are re-exported from there so no divergent copy exists.
 
 function resolveProjectPackageDirectory(inputPath: string, strict = false): string {
-  const selected = resolve(inputPath)
-  if (!existsSync(selected) || !statSync(selected).isDirectory()) {
-    if (strict) throw new Error(`Папка проекта не найдена: ${selected}`)
-    return selected
+  const selection = resolveProjectPackageSelection(inputPath, PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH)
+  if (selection.status === 'explicit' || selection.status === 'single') return selection.path
+  if (!strict) return selection.path
+  const candidates = selection.status === 'ambiguous' ? selection.report.candidates : []
+  const preview = candidates.slice(0, 8).map((candidate) => candidate.relative || '.').join(', ')
+  const detail = candidates.length > 8 ? `, ... (+${candidates.length - 8})` : ''
+  if (deepScanSuggestion(selection.report)) {
+    throw new Error(`package.json глубже лимита сканирования (глубина ${selection.report.maxDepth} из ${selection.report.deepestSeen}). Расширьте сканирование.`)
   }
-  if (existsSync(join(selected, 'package.json'))) return selected
-  const candidates = discoverProjectPackageDirectories(selected)
-  if (candidates.length === 1) return candidates[0]
-  if (!strict) return selected
-  if (!candidates.length) {
-    throw new Error(`В выбранной папке ${selected} package.json не найден. Выберите Git-репозиторий с одним npm-проектом или папку конкретного npm-проекта.`)
+  if (selection.status === 'missing') {
+    throw new Error(`В выбранной папке ${selection.path} package.json не найден. Выберите Git-репозиторий с одним npm-проектом или папку конкретного npm-проекта.`)
   }
-  const preview = candidates.slice(0, 8).map((candidate) => relative(selected, candidate) || '.').join(', ')
-  throw new Error(`Найдено несколько package.json (${preview}${candidates.length > 8 ? `, ... (+${candidates.length - 8})` : ''}). Выберите папку конкретного npm-проекта, чтобы DepLoom не угадывал workspace.`)
+  throw new Error(`Найдено несколько package.json (${preview}${detail}). Выберите папку конкретного npm-проекта, чтобы DepLoom не угадывал workspace.`)
 }
 
 async function resolveProjectGitLayout(project: ProjectSpec): Promise<{ gitRoot: string; packageRelativePath: string }> {
@@ -7099,11 +7074,22 @@ function setupIpc(): void {
     return { state, details: await workspaceDetails(workspace) }
   })
 
-  ipcMain.handle('flow:add-project', async (_event, raw: { workspaceId?: string; name: string; path: string; repositoryPath?: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }) => {
+  ipcMain.handle('flow:discover-project', async (_event, raw: { path?: string; deep?: boolean }) => {
+    const inputPath = String(raw?.path ?? '').trim()
+    if (!inputPath) throw new Error('Укажите папку для сканирования.')
+    const maxDepth = raw?.deep ? PROJECT_MANIFEST_DISCOVERY_DEEP_SCAN_DEPTH : PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH
+    const selection = resolveProjectPackageSelection(inputPath, maxDepth)
+    const report: SerializedDiscoveryReport = selection.status === 'explicit'
+      ? serializeDiscoveryReport({ root: resolve(inputPath), maxDepth, candidates: [], truncated: false, deeperManifests: 0, deepestSeen: 0 })
+      : serializeDiscoveryReport(selection.report)
+    return { status: selection.status, path: selection.path, report, deep: raw?.deep === true }
+  })
+
+  ipcMain.handle('flow:add-project', async (_event, raw: { workspaceId?: string; name: string; path: string; packagePath?: string; repositoryPath?: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }) => {
     const state = loadState()
     const workspace = findWorkspace(state, raw.workspaceId)
     const selectedPath = resolve(raw.path)
-    const projectPath = selectedPath
+    const projectPath = raw.packagePath?.trim() ? resolve(raw.packagePath.trim()) : selectedPath
     if (!existsSync(join(projectPath, 'package.json'))) throw new Error('Выберите рабочую директорию с package.json. Подпроекты автоматически не выбираются.')
     const gitProbe = await spawnCapture('git', ['-C', projectPath, 'rev-parse', '--is-inside-work-tree'], projectPath, 15_000)
     if (gitProbe.timedOut || gitProbe.code !== 0 || gitProbe.stdout.trim().toLowerCase() !== 'true') {

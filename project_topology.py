@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import fnmatch
 import hashlib
 import json
 import os
@@ -21,6 +20,11 @@ from package_manager_profile import (
     PackageManagerProfile,
     PackageManagerProfileError,
     resolve_package_manager_profile,
+)
+from workspace_glob import (
+    expand_braces,
+    match_workspace_pattern,
+    unsupported_workspace_pattern,
 )
 
 # BLOCK_Z_PROJECT_TOPOLOGY_V1
@@ -271,23 +275,25 @@ def _workspace_patterns(manifest: Mapping[str, object], root: Path) -> tuple[str
         value = item[1:] if excluded else item
         while value.startswith("./"):
             value = value[2:]
-        if value:
-            normalized.append(("!" if excluded else "") + value)
+        if not value:
+            continue
+        pattern = ("!" if excluded else "") + value
+        reason = unsupported_workspace_pattern(pattern)
+        if reason:
+            raise ProjectTopologyError(
+                "WORKSPACE_PATTERN_UNSUPPORTED",
+                f"workspaces pattern {pattern!r}: {reason}",
+            )
+        normalized.append(pattern)
     return tuple(sorted(set(normalized)))
 
 
 def _glob_match(relative: str, pattern: str) -> bool:
-    relative = relative.strip("/").replace("\\", "/")
-    pattern = pattern.strip("/").replace("\\", "/")
-    if not relative or not pattern or pattern.startswith("!"):
-        return False
-    if fnmatch.fnmatchcase(relative, pattern):
-        return True
-    # pathlib-style "packages/*" should own a direct member directory.
-    if pattern.endswith("/*"):
-        prefix = pattern[:-2].rstrip("/")
-        return relative.startswith(prefix + "/") and "/" not in relative[len(prefix) + 1:]
-    return False
+    # Segment-aware workspace matching (B3/B4): '*' stays inside one path
+    # segment, '**' crosses segments, '{a,b}' expands to alternatives. Python's
+    # fnmatch would let 'packages/*' own 'packages/group/deep'; this matcher
+    # does not.
+    return match_workspace_pattern(relative, pattern)
 
 
 def _workspace_owns(
@@ -402,16 +408,17 @@ def _workspace_member_manifests(
         for pattern in patterns:
             if pattern.startswith("!"):
                 continue
-            for name in glob.glob(str(manager_root / pattern / "package.json")):
-                manifest = Path(name).resolve()
-                try:
-                    relative = manifest.relative_to(manager_root.resolve())
-                except ValueError:
-                    continue
-                if any(part in PROJECT_MANIFEST_DISCOVERY_IGNORED_DIRS for part in relative.parts[:-1]):
-                    continue
-                if _workspace_owns(manager_root, manifest.parent, patterns):
-                    result.add(manifest)
+            for expanded in expand_braces(pattern):
+                for name in glob.glob(str(manager_root / expanded / "package.json")):
+                    manifest = Path(name).resolve()
+                    try:
+                        relative = manifest.relative_to(manager_root.resolve())
+                    except ValueError:
+                        continue
+                    if any(part in PROJECT_MANIFEST_DISCOVERY_IGNORED_DIRS for part in relative.parts[:-1]):
+                        continue
+                    if _workspace_owns(manager_root, manifest.parent, patterns):
+                        result.add(manifest)
         return tuple(sorted(result, key=lambda item: str(item).lower()))
 
     # Bound discovery to package manifests and prune dependency/build payloads.

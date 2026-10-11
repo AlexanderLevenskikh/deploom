@@ -59,12 +59,14 @@ def policy_for_project(project, root):
         # Installation consumes declared member manifests and local workspaces.
         # Expand workspace patterns directly: never walk unrelated backend builds.
         import glob
+        from workspace_glob import expand_braces
         for pattern in patterns:
             if pattern.startswith("!"): continue
-            for name in glob.glob(str(manager / pattern / "package.json"), recursive=True):
-                directory = Path(name).resolve().parent
-                if _workspace_owns(manager, directory, patterns):
-                    roots.add(directory.relative_to(root).as_posix())
+            for expanded in expand_braces(pattern):
+                for name in glob.glob(str(manager / expanded / "package.json"), recursive=True):
+                    directory = Path(name).resolve().parent
+                    if _workspace_owns(manager, directory, patterns):
+                        roots.add(directory.relative_to(root).as_posix())
     except ProjectTopologyError as exc:
         raise SourceCaptureError(f"SOURCE_SCOPE_TOPOLOGY_UNAVAILABLE: {exc}") from exc
     # Direct file:/link:/portal: inputs remain in scope, including transitive ones.

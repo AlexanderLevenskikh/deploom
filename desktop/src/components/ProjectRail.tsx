@@ -1,4 +1,5 @@
 import { ChevronRight, FolderPlus, RefreshCw, Search, Trash2 } from 'lucide-react'
+import { useState } from 'react'
 import { useLanguage } from '../i18n'
 import type { ProjectSpec, WorkspaceDetails } from '../types'
 
@@ -16,17 +17,27 @@ type Props = {
 
 export function ProjectRail({ details, selected, active, onSelectProject, onRefreshAll, onAddProject, onAddWorkspace, onRemoveWorkspace, onRemoveProject }: Props) {
   const { t } = useLanguage()
+  const [query, setQuery] = useState('')
 
   const requestRemove = (project: ProjectSpec) => {
     if (!window.confirm(t('projectRail.remove.confirm', { name: project.name }))) return
     onRemoveProject(project.name)
   }
 
+  const needle = query.trim().toLowerCase()
+  const visible = needle.length === 0
+    ? details.projects
+    : details.projects.filter((project) => {
+        const haystack = `${project.name} ${project.git?.baseBranch || ''} ${project.git?.sourceBranch || ''}`.toLowerCase()
+        return haystack.includes(needle)
+      })
+
   return (
     <aside className="project-rail">
-      <div className="rail-title"><strong>{t('projectRail.projects')}</strong><Search size={17} /></div>
+      <div className="rail-title"><strong>{t('projectRail.projects')}</strong><span className="rail-count">{details.projects.length}</span></div>
+      <label className="rail-search"><Search size={13} /><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t('projectRail.searchPlaceholder')} aria-label={t('projectRail.searchPlaceholder')} autoComplete="off" /></label>
       <div className="project-list">
-        {details.projects.map((project) => {
+        {visible.map((project) => {
           const level = details.projectLevels[project.name]
           const tone = level?.status === 'red' ? 'danger' : level?.status === 'yellow' ? 'warning' : level?.status === 'green' ? 'success' : 'muted'
           const levelLabel = level?.status === 'red' ? t('levels.red') : level?.status === 'yellow' ? t('levels.yellow') : level?.status === 'green' ? t('levels.green') : t('levels.unknown')
@@ -48,6 +59,7 @@ export function ProjectRail({ details, selected, active, onSelectProject, onRefr
           </div>
         })}
         {details.projects.length === 0 ? <p className="empty-copy">{t('projectRail.empty', { path: details.workspace.settingsPath })}</p> : null}
+        {details.projects.length > 0 && visible.length === 0 ? <p className="empty-copy">{t('projectRail.noMatches')}</p> : null}
       </div>
       <div className="rail-actions">
         <button className="button secondary wide rail-refresh" disabled={active || details.projects.length === 0} onClick={onRefreshAll}><RefreshCw className={active ? 'spin' : ''} size={16} /> {t('projectRail.refreshAll')}</button>

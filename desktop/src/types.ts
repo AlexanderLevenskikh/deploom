@@ -555,6 +555,29 @@ export type IterativeBeginOutcome = {
   attempt?: IterativeAttemptView
   error?: string
 }
+export type ProjectDiscoveryCandidate = {
+  path: string
+  relative: string
+  depth: number
+  packageName?: string
+  lockfileKind: string
+  lockfileName: string | null
+  lockfilePath?: string
+}
+export type ProjectDiscoveryReport = {
+  root: string
+  maxDepth: number
+  candidates: ProjectDiscoveryCandidate[]
+  truncated: boolean
+  deeperManifests: number
+  deepestSeen: number
+}
+export type ProjectDiscoveryResponse = {
+  status: 'explicit' | 'single' | 'missing' | 'ambiguous'
+  path: string
+  deep: boolean
+  report: ProjectDiscoveryReport
+}
 export type DependencyFlowApi = {
   bootstrap: () => Promise<BootstrapPayload>
   pickDirectory: () => Promise<string | undefined>
@@ -563,7 +586,8 @@ export type DependencyFlowApi = {
   listAgentModels: (agentProvider: AgentProvider, cwd?: string) => Promise<string[]>
   registerWorkspace: (input: { path: string; name?: string; agent?: AgentProvider }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   cloneWorkspace: (input: { parentPath: string; folderName: string; teamRemote?: string; templateRemote?: string; agent?: AgentProvider }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
-  addProject: (input: { workspaceId?: string; name: string; path: string; repositoryPath?: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
+  addProject: (input: { workspaceId?: string; name: string; path: string; packagePath?: string; repositoryPath?: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
+  discoverProject: (input: { path: string; deep?: boolean }) => Promise<ProjectDiscoveryResponse>
   removeWorkspace: (workspaceId: string) => Promise<{ state: DesktopState; details?: WorkspaceDetails }>
   removeProject: (input: { workspaceId?: string; projectName: string }) => Promise<{ state: DesktopState; details: WorkspaceDetails }>
   selectWorkspace: (workspaceId: string) => Promise<{ state: DesktopState; details: WorkspaceDetails }>

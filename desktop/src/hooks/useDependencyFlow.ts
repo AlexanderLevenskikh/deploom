@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntentPlan, BootstrapPayload, DependencyGraphSnapshot, DownloadSaved, FlowAction, HardwareSnapshot, IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobFinished, JobOutput, ProjectSpec, TargetLevel, ThemePreference, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
+import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntentPlan, BootstrapPayload, DependencyGraphSnapshot, DownloadSaved, FlowAction, HardwareSnapshot, IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobFinished, JobOutput, ProjectDiscoveryCandidate, ProjectDiscoveryResponse, ProjectSpec, TargetLevel, ThemePreference, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
 import { parseBaselineDecision } from '../data/baselineIntent'
 import { goalSeekingStopReason, nextAutopilotAction, type AutopilotPolicyState } from '../autopilot-policy'
 
@@ -59,6 +59,7 @@ const DEMO: BootstrapPayload = {
 }
 
 const DEMO_MODE = new URLSearchParams(window.location.search).get('demo') === '1'
+const PROJECT_DEMO_MAX_DEPTH = 5
 
 type AutopilotState = AutopilotPolicyState & {
   workspaceId: string
@@ -448,10 +449,39 @@ export function useDependencyFlow() {
     applyWorkspaceResult(await api.cloneWorkspace(input))
   }, [api, applyWorkspaceResult])
 
-  const addProject = useCallback(async (input: { workspaceId?: string; name: string; path: string; repositoryPath?: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }) => {
+  const addProject = useCallback(async (input: { workspaceId?: string; name: string; path: string; packagePath?: string; repositoryPath?: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }) => {
     if (!api) throw new Error('Добавление проекта доступно в desktop-приложении.')
     applyWorkspaceResult(await api.addProject(input))
   }, [api, applyWorkspaceResult])
+
+  const discoverProject = useCallback(async (input: { path: string; deep?: boolean }): Promise<ProjectDiscoveryResponse> => {
+    if (!api) {
+      // Demo mode mirrors the Electron discovery contract so the add-project
+      // dialog (chooser, depth-limit + scan extension) stays testable without
+      // a real migration; the folder name selects the scripted outcome.
+      if (!DEMO_MODE) throw new Error('Сканирование доступно в desktop-приложении.')
+      const candidate = (relative: string, depth: number, packageName?: string): ProjectDiscoveryCandidate => ({
+        path: `${input.path.replace(/[\\/]+$/, '')}\\${relative}`,
+        relative,
+        depth,
+        packageName,
+        lockfileKind: 'npm',
+        lockfileName: 'package-lock.json',
+      })
+      const lower = input.path.toLowerCase()
+      if (lower.includes('peers')) {
+        return { status: 'ambiguous', path: input.path, deep: Boolean(input.deep), report: { root: input.path, maxDepth: PROJECT_DEMO_MAX_DEPTH, candidates: [candidate('packages/app', 2, 'demo-app'), candidate('packages/lib', 2, 'demo-lib')], truncated: false, deeperManifests: 0, deepestSeen: 2 } }
+      }
+      if (lower.includes('deep') && !input.deep) {
+        return { status: 'missing', path: input.path, deep: false, report: { root: input.path, maxDepth: PROJECT_DEMO_MAX_DEPTH, candidates: [], truncated: true, deeperManifests: 1, deepestSeen: PROJECT_DEMO_MAX_DEPTH + 1 } }
+      }
+      if (lower.includes('deep') && input.deep) {
+        return { status: 'single', path: `${input.path}\\nested` , deep: true, report: { root: input.path, maxDepth: PROJECT_DEMO_MAX_DEPTH, candidates: [candidate('nested', PROJECT_DEMO_MAX_DEPTH + 1, 'nested-app')], truncated: false, deeperManifests: 0, deepestSeen: PROJECT_DEMO_MAX_DEPTH + 1 } }
+      }
+      return { status: 'explicit', path: input.path, deep: Boolean(input.deep), report: { root: input.path, maxDepth: PROJECT_DEMO_MAX_DEPTH, candidates: [], truncated: false, deeperManifests: 0, deepestSeen: 0 } }
+    }
+    return api.discoverProject(input)
+  }, [api])
 
   const removeWorkspace = useCallback(async () => {
     if (!api || !payload?.details) return
@@ -752,7 +782,7 @@ export function useDependencyFlow() {
 
   return {
     payload, loading, error, baselineDecision, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch, acknowledgeDraftRun,
-    load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, removeWorkspace, removeProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches, updateProjectNode, listNodeVersions,
+    load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, discoverProject, removeWorkspace, removeProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches, updateProjectNode, listNodeVersions,
     runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult,     getDependencyGraphSnapshot, getIterativeTask, exportIterativeTask, exportLegacyIterativeTask, copyIterativeTask, saveIterativeTask, iterativeStatus, iterativeDrive, iterativeBegin, iterativeAgent, iterativeAttemptRead, iterativeCancel, iterativeAttempt, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }
 }

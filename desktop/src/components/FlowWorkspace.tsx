@@ -609,7 +609,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
 
       <AuditGoalSummary audit={iterativeView?.audit} initial={iterativeView?.initialAudit} onOpenPath={onOpenPath} />
 
-      <section className="roadmap-card migration-launch-settings"><header className="roadmap-card-header"><div><strong>{text('Настройки запуска', 'Run settings')}</strong><span>{text('Агент и модель используются для исправлений. Выберите их до запуска; работа агента может расходовать токены.', 'Agent and model are used for repairs. Choose them before starting; agent work may consume tokens.')}</span></div></header>
+      <section className="roadmap-card migration-launch-settings"><details className="migration-launch-settings-collapse" open={false}><summary className="roadmap-card-header"><div><strong>{text('Настройки запуска', 'Run settings')}</strong><span>{text('Агент и модель используются для исправлений. Выберите их до запуска; работа агента может расходовать токены.', 'Agent and model are used for repairs. Choose them before starting; agent work may consume tokens.')}</span></div></summary>
       <fieldset className="project-facts" disabled={active || scenarioSignal?.running}>
         <div><span>{t('flow.projectPath')}</span><strong title={project.path}>{project.path}</strong></div>
         <div><span>{t('common.branch')}</span><div className="git-plan-control"><ModelPicker ariaLabel={t('flow.updateBranch')} value={branchBase} options={branchSuggestions} onChange={setBranchBase} onCommit={value => persistGitSettings(value).catch(error => window.alert(String(error)))} placeholder="libs" /><label className="push-toggle" title={t('flow.pushTitle')}><input type="checkbox" checked={pushEnabled} onChange={(event) => void persistGitSettings(branchBase, event.target.checked).catch(error => window.alert(String(error)))} />Push</label></div></div>
@@ -621,6 +621,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
           {project.nodeHints?.length ? <span className="node-hints" title={text('Закрепления Node в репозитории (engines.node / .nvmrc / .node-version). Подсказка: выбирать отсюда не обязательно — пустое значение означает среду хоста.', 'Node pins in this repository (engines.node / .nvmrc / .node-version). Suggestion only — leaving it empty keeps the host runtime.')}>{text('В репо закреплён Node', 'Repo pins Node')}: {project.nodeHints.join(', ')}</span> : null}
         </div>
       </fieldset>
+      </details>
       </section>
 
       <IterativeTaskPanel

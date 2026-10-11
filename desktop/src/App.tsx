@@ -1,4 +1,4 @@
-import { Bell, Boxes, Download, ExternalLink, GitFork, Network, Pause, Play, Settings, Trash2, Workflow } from 'lucide-react'
+import { Bell, Boxes, Download, GitFork, Network, Pause, Play, Settings, Trash2, Workflow } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import './App.css'
 import { AddProjectDialog } from './components/AddProjectDialog'
@@ -82,7 +82,6 @@ function App() {
           </div>
           <label className="notification-toggle" title={t('app.notificationsTitle')}><input type="checkbox" checked={payload.notificationsEnabled} onChange={(event) => void flow.setNotificationsEnabled(event.target.checked)} /><Bell size={15} /><span>{t('app.notifications')}</span></label>
           <button className={`icon-button update-download-button${updateReady ? ' ready' : ''}${updateDownloading ? ' downloading' : ''}`} disabled={!updateReady} aria-busy={updateDownloading} aria-label={updateTitle} title={updateTitle} onClick={() => void flow.installUpdate()}><Download size={17} /></button>
-          <button className="button secondary" disabled={!details.dashboardExists} onClick={openDashboard}><ExternalLink size={16} /> Dashboard</button>
           {flow.activeJobId ? <button className="button secondary" onClick={() => void flow.cancelJob()}><Pause size={16} /> {t('app.stop')}</button> : <button className="button secondary" disabled={!project} onClick={() => project && void flow.runAction({ action: 'preflight', workspaceId: details.workspace.id, projectName: project.name })}><Play size={16} /> {t('app.check')}</button>}
           <button className="icon-button" title={t('app.storageCleanup')} aria-label={t('app.storageCleanup')} onClick={() => setShowStorage(true)}><Trash2 size={18} /></button>
           <button className="icon-button" title={t('app.settingsTitle')} onClick={() => void flow.openPath(`${details.workspace.path}/${details.workspace.settingsPath}`)}><Settings size={18} /></button>
@@ -108,7 +107,7 @@ function App() {
 
       </div>
 
-      {showAddProject ? <AddProjectDialog workspaceId={details.workspace.id} onClose={() => setShowAddProject(false)} onPickDirectory={flow.pickDirectory} onSubmit={flow.addProject} /> : null}
+      {showAddProject ? <AddProjectDialog workspaceId={details.workspace.id} onClose={() => setShowAddProject(false)} onPickDirectory={flow.pickDirectory} onDiscoverProject={flow.discoverProject} onSubmit={flow.addProject} /> : null}
 
       {showStorage ? <StorageMaintenanceDialog status={storageStatus} onClose={() => setShowStorage(false)} onMaintenance={(action, operationId) => window.dependencyFlow!.storageMaintenance(action, operationId)} onProgress={window.dependencyFlow!.onStorageProgress} /> : null}
       {showWorkspaceDialog ? <WorkspaceDialog onClose={() => setShowWorkspaceDialog(false)} onPickDirectory={flow.pickDirectory} onConnectExisting={(path, agent) => flow.registerExisting(path, agent)} onCreate={flow.cloneWorkspace} /> : null}

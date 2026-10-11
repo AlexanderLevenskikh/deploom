@@ -29,6 +29,7 @@ competing store of truth.
 from __future__ import annotations
 
 import argparse
+import contextvars
 import dataclasses
 import hashlib
 import json
@@ -77,6 +78,7 @@ from package_manager_profile import (
     resolve_package_manager_profile,
 )
 from project_topology import ProjectTopologyError, resolve_project_topology
+from resolution_inventory import ResolutionInventory, npm_lock_resolved_version
 from storage_capacity import StorageCapacityError
 from source_snapshot import (
     SourceCaptureError,
@@ -620,7 +622,17 @@ def manifest_and_lock_hashes(project_dir: Path) -> Tuple[str, str, Optional[str]
 
 
 def find_lockfile(project_dir: Path) -> Optional[Path]:
-    for name in ("package-lock.json", "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json"):
+    """The local lockfile recorded in a project directory, if any.
+
+    Ordered shrinkwrap-first within the npm family and npm-family-first over
+    yarn/pnpm (B2), matching ``project_topology._select_owned_lockfile`` so
+    hashing/identity and planning agree on the canonical record when several
+    lockfile names sit in one directory. This is a strictly local look (the
+    caller's directory) — the workspace-shared root lockfile of a member
+    package is a topology concern resolved where it matters (discovery,
+    ``ResolutionInventory``).
+    """
+    for name in ("npm-shrinkwrap.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"):
         candidate = project_dir / name
         if candidate.exists():
             return candidate
@@ -2721,6 +2733,19 @@ def _dependency_diagnostics(project_dir: Any) -> Dict[str, Any]:
 # set for the duration of the probe phase only and restored in ``finally``.
 _ACTIVE_DISCOVERY_DEADLINE: float = 0.0
 
+# The parsed-lockfile inventory of the CURRENT discovery phase (C1). Set once
+# per `_discover_targets` so every `_installed_version` probe reads the
+# canonical lockfile from memory instead of re-reading and re-parsing it per
+# package — a 10k-record lockfile is parsed once, not once per direct
+# dependency. A contextvar (not a plain global) propagates into the probe
+# workers of the parallel branch: ThreadPoolExecutor copies the enclosing
+# context into each thread, so every worker sees the same read-only inventory.
+# It is restored in ``finally``; `_installed_version` falls back to building
+# the inventory on demand when none is active.
+_ACTIVE_INVENTORY: "contextvars.ContextVar[Optional[ResolutionInventory]]" = contextvars.ContextVar(
+    "iterative_active_resolution_inventory", default=None
+)
+
 
 def _probe_budget_timeout(default_seconds: int = 60) -> Optional[int]:
     """Subprocess timeout for ONE registry probe under the active discovery
@@ -2967,25 +2992,25 @@ def _installed_version(project_dir: Path, package_name: str, declared_spec: Opti
     package. The lockfile is the reliable source of what is installed. For
     yarn.lock the DECLARED spec of the direct dependency is needed to select
     the direct resolution among several selectors of the same package name
-    (see ``_yarn_lock_installed_version``). ``None`` means the installed
-    version cannot be proven reliably (no canonical lockfile, unreadable file,
-    ambiguous resolution) — the caller MUST abstain for the package instead of
-    choosing against a guess.
+    (see ``_yarn_lock_installed_version``). For a workspace member the
+    canonical lockfile is the SHARED root lockfile of the manager package, and
+    the member-local record is what proves the member's own resolution (see
+    ``ResolutionInventory``). ``None`` means the installed version cannot be
+    proven reliably (no canonical lockfile, unreadable file, ambiguous
+    resolution) — the caller MUST abstain for the package instead of choosing
+    against a guess.
+
+    The active discovery-phase inventory (C1) is consulted first so the
+    lockfile is parsed once per phase, not once per package; outside an active
+    phase (direct helper/tests) the inventory is built on demand.
     """
-    lock = find_lockfile(project_dir)
-    if lock is None or not lock.is_file():
-        return None
     name = str(package_name)
-    try:
-        if lock.name in ("package-lock.json", "npm-shrinkwrap.json"):
-            return _npm_lock_installed_version(lock, name)
-        if lock.name == "yarn.lock":
-            return _yarn_lock_installed_version(lock, name, declared_spec)
-        if lock.name == "pnpm-lock.yaml":
-            return _pnpm_lock_installed_version(lock, name)
-    except Exception:  # noqa: BLE001 - a lockfile read failure is abstention
+    inventory = _ACTIVE_INVENTORY.get()
+    if inventory is None or not inventory.belongs_to(project_dir):
+        inventory = ResolutionInventory.for_project(project_dir)
+    if inventory is None:
         return None
-    return None
+    return inventory.installed_version(name, declared_spec)
 
 
 def _yarn_direct_selectors(package_name: str, declared_spec: Optional[str]) -> List[str]:
@@ -3005,28 +3030,25 @@ def _yarn_direct_selectors(package_name: str, declared_spec: Optional[str]) -> L
 
 
 def _npm_lock_installed_version(lock_path: Path, package_name: str) -> Optional[str]:
-    """package-lock.json / npm-shrinkwrap.json exact direct resolution."""
+    """package-lock.json / npm-shrinkwrap.json exact direct resolution.
+
+    Root-only (no workspace member context): for a workspace member use
+    ``ResolutionInventory``, which reads the SHARED root lockfile with the
+    member-local record (A1). The lookup itself is shared with the inventory
+    (``npm_lock_resolved_version``).
+    """
     try:
         data = json.loads(lock_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict):
         return None
-    packages = data.get("packages")
-    if isinstance(packages, dict):
-        entry = packages.get(f"node_modules/{package_name}")
-        if isinstance(entry, dict):
-            version = entry.get("version")
-            if isinstance(version, str) and version:
-                return version
-    dependencies = data.get("dependencies")
-    if isinstance(dependencies, dict):
-        entry = dependencies.get(package_name)
-        if isinstance(entry, dict):
-            version = entry.get("version")
-            if isinstance(version, str) and version:
-                return version
-    return None
+    return npm_lock_resolved_version(
+        data.get("packages") if isinstance(data.get("packages"), dict) else None,
+        data.get("dependencies") if isinstance(data.get("dependencies"), dict) else None,
+        package_name,
+        "",
+    )
 
 
 def _split_yarn_selectors(value: str) -> List[str]:
@@ -3464,6 +3486,18 @@ def _discover_targets(
     previous_discovery_deadline = _ACTIVE_DISCOVERY_DEADLINE
     if deadline is not None:
         _ACTIVE_DISCOVERY_DEADLINE = deadline
+    # C1: parse the canonical lockfile ONCE for the whole phase and expose it
+    # through the contextvar, so every sequential probe and every parallel
+    # worker (`_ACTIVE_INVENTORY` is a contextvar and ThreadPoolExecutor copies
+    # the enclosing context into each thread) reads the same read-only
+    # inventory instead of re-reading the lockfile per package. An outer phase
+    # (adaptive waves) already holds a fresh inventory for the SAME project and
+    # is reused; anything else is rebuilt for this project_dir. The token
+    # restores the previous value in ``finally``.
+    phase_inventory = _ACTIVE_INVENTORY.get()
+    if phase_inventory is None or not phase_inventory.belongs_to(project_dir):
+        phase_inventory = ResolutionInventory.for_project(project_dir)
+    inventory_token = _ACTIVE_INVENTORY.set(phase_inventory) if phase_inventory is not None else None
     try:
         if parallelism <= 1:
             for name, declared in names:
@@ -3528,6 +3562,8 @@ def _discover_targets(
         _order_discovery(targets, evidence)
         return targets, evidence
     finally:
+        if inventory_token is not None:
+            _ACTIVE_INVENTORY.reset(inventory_token)
         _ACTIVE_DISCOVERY_DEADLINE = previous_discovery_deadline
 
 
@@ -3830,44 +3866,56 @@ def _handle_materialize_failure(
 
     if classification == "resolver":
         # ETARGET defers only the exact package target in this scope; the
-        # remaining packages stay actionable through plan-next.
-        record_unavailable_targets(ledger, run, config, candidate, output)
-        _append_deferral(ledger, candidate, f"resolver {code}: target version unavailable")
-        candidate = dict(candidate)
-        candidate["stage"] = "REJECTED"
-        candidate["conclusion"] = {
-            "kind": "resolver-target-unavailable",
-            "code": code,
-            "reason": f"resolver {code} during exact materialization",
-            "exactTargetDeferred": True,
-        }
-        candidate["attemptResult"] = _build_attempt_result(
-            candidate, base_id, classification=classification, code=code,
-            exit_code=exit_code, retry_count=0, max_retries=max_retries,
-            retryable=False, terminal_failure=True, output_tail=output,
-        )
-        candidate["updatedAt"] = _now_iso()
-        save_candidate(run_dir, candidate)
-        run = dict(run)
-        run["activeCandidateId"] = None
-        run["phase"] = "READY"
-        run["updatedAt"] = _now_iso()
-        save_run(run_dir, run)
-        save_ledger(run_dir, ledger)
-        _emit_status(
-            {
-                "event": "materialize.failed",
-                "runId": run["runId"],
-                "candidateId": candidate_id,
-                "kind": classification,
+        # remaining packages stay actionable through plan-next. The
+        # availability deferral is EVIDENCE-gated: it records a target only
+        # when the failure output proves ``No matching version found for
+        # <name>@<version>`` for a changed/target package. When that evidence is
+        # missing (an ETARGET without an extractable per-target fingerprint)
+        # there is nothing real to defer — fabricating the deferral re-proposed
+        # the same fingerprint forever (B5). Reclassify to an honest unknown and
+        # fall through to the terminal path below: the candidate is concluded
+        # and the identity is blocked for the current scope, so an identical
+        # gate stops with evidence instead of replaying.
+        if not record_unavailable_targets(ledger, run, config, candidate, output):
+            classification = "unknown"
+            code = "RESOLVER_NO_EVIDENCE"
+        else:
+            _append_deferral(ledger, candidate, f"resolver {code}: target version unavailable")
+            candidate = dict(candidate)
+            candidate["stage"] = "REJECTED"
+            candidate["conclusion"] = {
+                "kind": "resolver-target-unavailable",
                 "code": code,
-                "exitCode": exit_code,
-                "outputTail": output[-2000:],
-                "concluded": True,
+                "reason": f"resolver {code} during exact materialization",
                 "exactTargetDeferred": True,
             }
-        )
-        return 0
+            candidate["attemptResult"] = _build_attempt_result(
+                candidate, base_id, classification=classification, code=code,
+                exit_code=exit_code, retry_count=0, max_retries=max_retries,
+                retryable=False, terminal_failure=True, output_tail=output,
+            )
+            candidate["updatedAt"] = _now_iso()
+            save_candidate(run_dir, candidate)
+            run = dict(run)
+            run["activeCandidateId"] = None
+            run["phase"] = "READY"
+            run["updatedAt"] = _now_iso()
+            save_run(run_dir, run)
+            save_ledger(run_dir, ledger)
+            _emit_status(
+                {
+                    "event": "materialize.failed",
+                    "runId": run["runId"],
+                    "candidateId": candidate_id,
+                    "kind": classification,
+                    "code": code,
+                    "exitCode": exit_code,
+                    "outputTail": output[-2000:],
+                    "concluded": True,
+                    "exactTargetDeferred": True,
+                }
+            )
+            return 0
 
     # infrastructure / unknown from here on.
     previous = candidate.get("attemptResult") or {}
@@ -4016,8 +4064,9 @@ def _materialize_trial_tree(
 # Materialize failure classification. Recoverable infrastructure causes
 # (registry auth/rate-limit/server/offline/cache/network/filesystem) bound the
 # infra retry budget and NEVER become compatibility evidence; a resolver
-# ETARGET defers only the exact target; anything else is an honest unknown that
-# stops with evidence instead of looping.
+# ETARGET (with extractable per-target evidence) defers only the exact target;
+# a 404 without that evidence and anything else untagged is an honest unknown
+# that stops with evidence instead of looping (B5).
 _MATERIALIZE_INFRA_MARKERS = (
     ("RATE_LIMIT", ("429", "e429", "rate limit exceeded", "too many requests")),
     ("UNAUTHORIZED", ("401", "e401", "unauthorized", "authentication failed")),
@@ -4033,9 +4082,13 @@ def _materialization_failure(output: str) -> Tuple[str, str]:
     """Return (classification, code) for a failed exact install.
 
     classification: ``infrastructure`` | ``resolver`` | ``unknown``.
-    code: a stable short code (ETARGET, ENOTCACHED, RATE_LIMIT, ...). The
-    classification is scheduling input only; nothing here grants verification
-    proof or asserts incompatibility.
+    code: a stable short code (ETARGET, NOT_FOUND, TARBALL_UNAVAILABLE,
+    RATE_LIMIT, ...). The classification is scheduling input only; nothing here
+    grants verification proof or asserts incompatibility. A 404 is never a
+    ``resolver`` ETARGET on its own: a bare 404 (NOT_FOUND) or a missing tarball
+    (TARBALL_UNAVAILABLE) is an unknown with no per-target evidence, and the
+    resolver branch reclassifies an evidence-less ETARGET to
+    RESOLVER_NO_EVIDENCE rather than fabricating a deferral.
     """
     lowered = (output or "").lower()
     if re.search(r"\b5\d\d\b", output or ""):
@@ -4044,11 +4097,22 @@ def _materialization_failure(output: str) -> Tuple[str, str]:
         for marker in markers:
             if marker in lowered:
                 return "infrastructure", code
+    # A straight 404 is NOT resolver evidence: without an extractable
+    # ``No matching version for <name>@<version>`` fingerprint there is no
+    # per-target availability fact to defer, and treating it as an ETARGET
+    # deferral fabricated a ledger entry that re-proposed the same fingerprint
+    # forever (B5). A missing TARBALL (``.tgz``/``.tar.gz``) and any other 404
+    # are honest unknowns that stop with evidence instead of looping. The check
+    # sits BEFORE the resolver markers so a literal ``e404`` can never be
+    # swallowed by the broader resolver keywords.
+    if "e404" in lowered or "404 not found" in lowered:
+        if re.search(r"\.tgz\b|\.tar\.gz\b", output or ""):
+            return "unknown", "TARBALL_UNAVAILABLE"
+        return "unknown", "NOT_FOUND"
     for marker, code in (
         ("etarget", "ETARGET"),
         ("enotarget", "NOTARGET"),
         ("no matching version", "ETARGET"),
-        ("e404", "ETARGET"),
         ("unable to resolve", "RESOLVER"),
         ("unresolved", "RESOLVER"),
     ):

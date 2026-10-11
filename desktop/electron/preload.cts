@@ -10,6 +10,7 @@ const api = {
   cloneWorkspace: (input: unknown) => ipcRenderer.invoke('flow:clone-workspace', input),
   removeWorkspace: (workspaceId: string) => ipcRenderer.invoke('flow:remove-workspace', workspaceId),
   addProject: (input: unknown) => ipcRenderer.invoke('flow:add-project', input),
+  discoverProject: (input: { path: string; deep?: boolean }) => ipcRenderer.invoke('flow:discover-project', input),
   removeProject: (input: unknown) => ipcRenderer.invoke('flow:remove-project', input),
   selectWorkspace: (workspaceId: string) => ipcRenderer.invoke('flow:select-workspace', workspaceId),
   updateWorkspace: (input: unknown) => ipcRenderer.invoke('flow:update-workspace', input),

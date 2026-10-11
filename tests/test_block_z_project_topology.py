@@ -158,6 +158,43 @@ class BlockZProjectTopologyTests(unittest.TestCase):
             with self.assertRaisesRegex(ProjectTopologyError, "PROJECT_CANONICAL_LOCKFILE_MISSING"):
                 resolve_project_topology(excluded, require_supported=True)
 
+    def test_brace_workspace_patterns_discover_both_members(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            apps = root / "apps"
+            web = apps / "web"
+            _write_json(root / "package.json", {
+                "name": "root",
+                "private": True,
+                "packageManager": "npm@11.0.0",
+                "workspaces": ["{apps,packages}/*"],
+            })
+            _write_json(web / "package.json", {"name": "web", "version": "1.0.0"})
+            _write_json(root / "packages" / "lib" / "package.json", {"name": "lib", "version": "1.0.0"})
+            _npm_workspace_lock(root)
+            _init_git(root)
+            topology = resolve_project_topology(web, require_supported=True)
+            self.assertEqual(root.resolve(), topology.package_manager_root)
+            self.assertIn((web / "package.json").resolve(), topology.workspace_member_manifests)
+            self.assertIn((root / "packages" / "lib" / "package.json").resolve(), topology.workspace_member_manifests)
+
+    def test_extglob_workspace_pattern_fails_closed_with_typed_error(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            _write_json(root / "package.json", {
+                "name": "root",
+                "private": True,
+                "packageManager": "npm@11.0.0",
+                "workspaces": ["packages/@(a|b)"],
+            })
+            _write_json(root / "packages" / "a" / "package.json", {"name": "a", "version": "1.0.0"})
+            _npm_workspace_lock(root)
+            _init_git(root)
+            # Unsupported glob grammar must be a typed topology error, NEVER a
+            # misleading missing-lockfile outcome.
+            with self.assertRaisesRegex(ProjectTopologyError, "WORKSPACE_PATTERN_UNSUPPORTED"):
+                resolve_project_topology(root / "packages" / "a", require_supported=True)
+
     def test_yarn_classic_workspace_is_supported(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

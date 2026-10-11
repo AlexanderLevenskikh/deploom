@@ -169,6 +169,7 @@ jobs:
           npm run check:publication
           npm run check:target-closure
           npm run check:project-settings
+          npm run check:project-discovery
           npm run check:log-presentation
           npm run check:i18n
           npm run check:run-monitor

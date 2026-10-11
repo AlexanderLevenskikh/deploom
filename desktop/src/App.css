@@ -30,6 +30,10 @@
 .app-grid { min-height: 0; display: grid; grid-template-columns: 236px minmax(620px, 1fr) 370px; }
 .project-rail { min-height: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: #fbfcfd; padding: 14px 8px 10px; }
 .rail-title { display: flex; justify-content: space-between; align-items: center; padding: 0 8px 12px; font-size: 12px; }
+.rail-count { color: var(--muted); font-variant-numeric: tabular-nums; }
+.rail-search { display: flex; align-items: center; gap: 6px; padding: 0 8px 10px; color: var(--muted); }
+.rail-search input { min-width: 0; flex: 1; height: 24px; padding: 0 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-raised); color: var(--text); font: inherit; font-size: 12px; }
+.rail-search input:focus { border-color: var(--accent); outline: none; }
 .project-list { overflow: auto; display: flex; flex-direction: column; gap: 5px; }
 .project-row { width: 100%; min-height: 58px; display: grid; grid-template-columns: 10px minmax(0, 1fr) 16px; align-items: center; gap: 8px; text-align: left; padding: 8px 10px; border: 1px solid var(--border); border-radius: 5px; background: #fff; cursor: pointer; }
 .project-row:hover { border-color: #aeb8c5; }
@@ -439,9 +443,10 @@ textarea::placeholder {
 .quick-select-trigger:hover, .quick-select-trigger.open { border-color: var(--accent); background: var(--surface-hover); }
 .quick-select-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .quick-select-menu { z-index: 240; overflow: auto; padding: 4px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-raised); color: var(--text); box-shadow: 0 12px 36px rgb(0 0 0 / 28%); }
-.quick-select-menu > button { width: 100%; min-height: 30px; padding: 5px 8px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 0; border-radius: 4px; background: transparent; color: inherit; cursor: pointer; font-size: 12px; text-align: left; }
-.quick-select-menu > button:hover, .quick-select-menu > button.selected { background: var(--accent-soft); }
-.quick-select-menu > button:disabled { opacity: .5; cursor: not-allowed; }
+.quick-select-menu > button, .quick-select-menu [role="option"] { width: 100%; min-height: 30px; padding: 5px 8px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 0; border-radius: 4px; background: transparent; color: inherit; cursor: pointer; font-size: 12px; text-align: left; outline: none; }
+.quick-select-menu > button:hover, .quick-select-menu > button.selected, .quick-select-menu [role="option"]:hover, .quick-select-menu [role="option"].selected { background: var(--accent-soft); }
+.quick-select-menu [role="option"].active, .quick-select-menu [role="option"]:focus-visible { box-shadow: inset 0 0 0 1px var(--accent); }
+.quick-select-menu > button:disabled, .quick-select-menu [role="option"][aria-disabled="true"] { opacity: .5; cursor: not-allowed; }
 .workspace-select .quick-select { min-width: 220px; }
 .workspace-select .quick-select-trigger { border: 0; font-size: 13px; font-weight: 600; }
 .project-facts .quick-select { width: 100%; }
@@ -933,6 +938,10 @@ textarea::placeholder {
 .roadmap-card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 12px; }
 .roadmap-card-header > div { display: flex; flex-direction: column; gap: 3px; }
 .roadmap-card-header strong { font-size: 14px; }
+.migration-launch-settings-collapse > summary { cursor: pointer; user-select: none; }
+.migration-launch-settings-collapse > summary::-webkit-details-marker { display: none; }
+.migration-launch-settings-collapse > summary { list-style: none; }
+.migration-launch-settings-collapse[open] > summary { margin-bottom: 12px; }
 .roadmap-card-header span { color: var(--text-muted); font-size: 10px; line-height: 1.45; }
 .roadmap-summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
 .roadmap-summary-grid > div { min-width: 0; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
