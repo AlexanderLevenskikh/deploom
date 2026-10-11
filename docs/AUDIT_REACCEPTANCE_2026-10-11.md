@@ -69,7 +69,7 @@ npm registry на loopback с fixture tarball, настоящий npm install и
 | Root | 2 | 0 | 4.14 s | 2.05 s |
 | Monorepo, 2 members | 4 | 2 | 5.14 s | 5.11 s |
 
-Гейт проверяет сокращение install calls и isolation; wall time не является
+Гейт проверяет сокращение install calls на Windows и isolation на всех платформах. На Linux prepared fast path не поддерживается: cold и warm обязаны выполнить одинаковое число installs. Отдельный сценарий отключает guarded lower и проверяет безопасные private copies. Wall time не является
 условием успешности. Оставшиеся installs в monorepo выполняются и не объявлены
 пропущенными. Измерения не доказывают ускорение произвольного пользовательского
 проекта. Install/verifier/source/proof guards не ослаблялись.
@@ -97,7 +97,7 @@ path остаются разными координатами; исходный 
 - Targeted Python: 18 тестов кеша, resolved-state и physical install — OK.
 - Desktop: lint 0 ошибок / 18 предупреждений; build — OK.
 - `python run_tool_tests.py --suite production-fast`: 64 теста — OK.
-- python run_tool_tests.py --suite all: 1983 теста за 1554.985 s — OK (skipped=4).
+- python run_tool_tests.py --suite all: 1983 теста за 1554.985 s — OK (skipped=4), Windows implementation до уточнения платформенных assertions физического install-теста. После уточнения добавлен второй fallback-сценарий; оба прошли отдельным локальным прогоном (2 tests, 48.964 s, OK), полный финальный suite выполняется GitHub CI на release SHA.
 - python run_tool_tests.py --suite storage-delivery: 1 физический тест за 368.946 s — OK; small/medium/large завершены с audit PASS.
 - Desktop inventory: 71/71 contract checks — OK; после последних исправлений повторно прошли проверки Git cache, log batching и interaction contracts. Релизный helper повторяет полный inventory на точном release commit.
 - Browser QA: 8 комбинаций RU/EN × light/dark × 1080×700/1440×940 — PASS. Дополнительно проверены 1000 многострочных логов, первый переход на lazy-экраны, modal focus/Escape и picker с запоздавшим ответом discovery; ошибок React нет.
@@ -105,3 +105,5 @@ path остаются разными координатами; исходный 
 Реальная миграция пользовательского проекта не запускалась. Фикстуры полностью
 создаются во временных директориях. Статус GitHub CI и сборки installers после
 публикации следует проверять отдельно от локальных гейтов.
+
+Первый тег v0.2.219 не создал GitHub Release: Linux CI обнаружил Windows-only ожидание сокращения install calls в новом тесте. Assertion исправлен по реальному контракту платформ; теги не переносятся. Следующая patch-версия проходит штатную публикацию и полный CI заново.

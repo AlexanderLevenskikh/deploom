@@ -21,6 +21,12 @@ import block_v_prepared_artifact as artifact_store
 @unittest.skipUnless(shutil.which('npm') and shutil.which('git') and shutil.which('node'), 'npm/git/node required')
 class PreparedInstallMeasurements(unittest.TestCase):
     def test_cold_warm_install_and_shared_lockfile_isolation(self):
+        self._measure(force_fallback=False)
+
+    def test_disabled_guarded_lower_preserves_isolated_install_fallback(self):
+        self._measure(force_fallback=True)
+
+    def _measure(self, *, force_fallback):
         archive = io.BytesIO()
         with tarfile.open(fileobj=archive, mode='w:gz') as tar:
             for name, data in {'package/package.json': b'{"name":"deploom-install-fixture","version":"1.0.0"}', 'package/index.js': b'module.exports="1.0.0"'}.items():
@@ -54,7 +60,7 @@ class PreparedInstallMeasurements(unittest.TestCase):
                     finally:
                         if install:
                             with guard: active.remove(key)
-                with patch.dict(os.environ, {'DEPLOOM_VERIFICATION_ROOT': str(temporary / 'substrate'), 'DEPLOOM_SOURCE_SCOPE_MODE': 'project-gitignore'}), patch.object(verifier, '_PREPARED_SNAPSHOT_ROOT', None), patch.object(artifact_store, '_CONFIGURED_ROOT', None), patch.object(verifier, '_run', measured_run):
+                with patch.dict(os.environ, {'DEPLOOM_VERIFICATION_ROOT': str(temporary / 'substrate'), 'DEPLOOM_SOURCE_SCOPE_MODE': 'project-gitignore', 'DEPLOOM_DISABLE_GUARDED_LOWER': '1' if force_fallback else '0'}), patch.object(verifier, '_PREPARED_SNAPSHOT_ROOT', None), patch.object(artifact_store, '_CONFIGURED_ROOT', None), patch.object(verifier, '_run', measured_run):
                     # An owned fixture only: no user workspace is migrated.
                     for topology in ('root', 'monorepo'):
                         root = temporary / topology; root.mkdir()
@@ -90,10 +96,16 @@ class PreparedInstallMeasurements(unittest.TestCase):
                         if topology == 'monorepo': self.assertGreaterEqual(len(cold_roots), 2, 'members must install into distinct isolated clones')
                         before = len(calls); started = time.perf_counter(); warm = batch(); warm_ms = (time.perf_counter() - started) * 1000; warm_calls = len(calls) - before
                         for result in warm: self.assertTrue(result.ok, result.summary + '\n' + result.output)
-                        self.assertLess(warm_calls, cold_calls, 'exact verified reuse must reduce repeated install calls')
+                        if os.name == 'nt':
+                            self.assertLess(warm_calls, cold_calls, 'Windows prepared reuse must reduce repeated install calls')
+                        else:
+                            self.assertEqual(cold_calls, warm_calls, 'unsupported preparation backend must preserve fresh installs')
+                        warm_roots = set(calls[before:])
+                        self.assertNotIn(os.path.normcase(str(root)), warm_roots)
+                        if topology == 'monorepo': self.assertGreaterEqual(len(warm_roots), 2)
                         self.assertEqual(original_lock, (root / 'package-lock.json').read_bytes())
                         self.assertEqual(original_manifests, [p.joinpath('package.json').read_bytes() for p in projects])
-                        measurements[topology] = {'coldMs': round(cold_ms, 1), 'warmMs': round(warm_ms, 1), 'coldInstalls': cold_calls, 'warmInstalls': warm_calls, 'isolatedRoots': len(cold_roots), 'sourceLockUnchanged': True}
+                        measurements[topology] = {'coldMs': round(cold_ms, 1), 'warmMs': round(warm_ms, 1), 'coldInstalls': cold_calls, 'warmInstalls': warm_calls, 'isolatedRoots': len(cold_roots), 'sourceLockUnchanged': True, 'preparedReuseExpected': os.name == 'nt', 'guardedLowerEnabled': not force_fallback}
                 print('[C4-install-measurement] ' + json.dumps(measurements, sort_keys=True), flush=True)
         finally:
             server.shutdown(); server.server_close(); thread.join(timeout=5)
