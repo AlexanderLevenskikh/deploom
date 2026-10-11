@@ -1,6 +1,7 @@
 import { FolderGit2, GitFork, X } from 'lucide-react'
-import { useState, type FormEvent } from 'react'
+import { useRef, useState, type FormEvent } from 'react'
 import { useLanguage } from '../i18n'
+import { useDialogFocus } from '../hooks/useDialogFocus'
 import type { AgentProvider } from '../types'
 import { QuickSelect } from './QuickSelect'
 
@@ -13,12 +14,14 @@ type Props = {
 
 export function WorkspaceDialog({ onClose, onPickDirectory, onConnectExisting, onCreate }: Props) {
   const { t } = useLanguage()
+  const rootRef = useRef<HTMLElement>(null)
   const [parentPath, setParentPath] = useState('')
   const [folderName, setFolderName] = useState('deploom-workspace')
   const [teamRemote, setTeamRemote] = useState('')
   const [agent, setAgent] = useState<AgentProvider | ''>('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
+  useDialogFocus(rootRef, { onClose: () => { if (!busy) onClose() } })
 
   const chooseParent = async () => {
     setError(undefined)
@@ -68,7 +71,7 @@ export function WorkspaceDialog({ onClose, onPickDirectory, onConnectExisting, o
 
   return (
     <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose() }}>
-      <section className="dialog workspace-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-dialog-title">
+      <section ref={rootRef} className="dialog workspace-dialog" role="dialog" aria-modal="true" aria-labelledby="workspace-dialog-title">
         <div className="dialog-title">
           <div>
             <h2 id="workspace-dialog-title">{t('workspaceDialog.title')}</h2>

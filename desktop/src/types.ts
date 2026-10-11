@@ -571,6 +571,8 @@ export type ProjectDiscoveryReport = {
   truncated: boolean
   deeperManifests: number
   deepestSeen: number
+  /** Why the bounded scan stopped early (depth limit, entry budget or time budget). */
+  budgetHit?: 'depth' | 'entries' | 'time'
 }
 export type ProjectDiscoveryResponse = {
   status: 'explicit' | 'single' | 'missing' | 'ambiguous'

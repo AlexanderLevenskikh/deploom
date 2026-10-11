@@ -3,6 +3,17 @@ import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntentPlan, 
 import { parseBaselineDecision } from '../data/baselineIntent'
 import { goalSeekingStopReason, nextAutopilotAction, type AutopilotPolicyState } from '../autopilot-policy'
 
+// C3: the in-memory journal window must stay bounded. The old batching paired
+// two 999-line windows (a suffix of the current buffer combined with a suffix
+// of the fresh batch), so a full flush during a busy job grew the list to 1998
+// records instead of the 1000 cap, and the unbounded `[...current, item]`
+// helpers could grow it without limit. Every append goes through
+// appendLogEntry, which keeps at most MAX_LOG_ENTRIES.
+export const MAX_LOG_ENTRIES = 1000
+export function appendLogEntry(current: JobOutput[], entry: JobOutput): JobOutput[] {
+  return [...current, entry].slice(-MAX_LOG_ENTRIES)
+}
+
 const DEMO_WORKSPACE: WorkspaceRecord = {
   id: 'demo',
   name: 'Командный workspace',
@@ -135,7 +146,12 @@ export function useDependencyFlow() {
   }, [])
   const viewEpochRef = useRef(0)
   const selectedWorkspaceId = payload?.details?.workspace.id
-  const selectedProjectName = payload?.details?.workspace.selectedProject ?? payload?.details?.projects[0]?.name
+  // Explicitly deselected (selectedProject === '') means "show the workspace
+  // overview" and must NOT fall back to the first project; an unset selection
+  // on a fresh workspace still picks the first project as before.
+  const selectedProjectName = payload?.details?.workspace.selectedProject === ''
+    ? undefined
+    : payload?.details?.workspace.selectedProject ?? payload?.details?.projects[0]?.name
   const selectedContextRef = useRef<{ workspaceId?: string; projectName?: string }>({})
   selectedContextRef.current = { workspaceId: selectedWorkspaceId, projectName: selectedProjectName }
   useEffect(() => { setBaselineDecision(undefined) }, [selectedProjectName, selectedWorkspaceId])
@@ -188,6 +204,12 @@ export function useDependencyFlow() {
   // snapshot overwriting a newer one is what made stage markers flicker.
   const refreshInFlight = useRef<Promise<void> | undefined>(undefined)
   const refreshQueued = useRef(false)
+  // C3: a refresh can transiently fail (the poll fires while a worker holds the
+  // checkout, or git is busy). The failure must be handled — the last good
+  // snapshot stays on screen, the next poll retries, and the poll timer never
+  // observes an unhandled promise rejection. refreshError surfaces the transient
+  // state to the UI instead of silently freezing on a stale payload.
+  const [refreshError, setRefreshError] = useState<string | undefined>()
   const refresh = useCallback(async () => {
     if (!api) return
     refreshQueued.current = true
@@ -196,9 +218,14 @@ export function useDependencyFlow() {
       do {
         refreshQueued.current = false
         const epoch = viewEpochRef.current
-        const result = await api.refreshWorkspace()
-        if (viewEpochRef.current === epoch) {
-          setPayload((current) => current ? { ...current, state: result.state, details: result.details } : current)
+        try {
+          const result = await api.refreshWorkspace()
+          setRefreshError(undefined)
+          if (viewEpochRef.current === epoch) {
+            setPayload((current) => current ? { ...current, state: result.state, details: result.details } : current)
+          }
+        } catch (error) {
+          setRefreshError(error instanceof Error ? error.message : String(error))
         }
       } while (refreshQueued.current)
     })().finally(() => { refreshInFlight.current = undefined })
@@ -220,24 +247,44 @@ export function useDependencyFlow() {
 
   useEffect(() => {
     if (!api) return
-    const removeOutput = api.onJobOutput((event) => {
-      setLogs((current) => [...current.slice(-999), { ...event, receivedAt: Date.now() }])
-      // Live Draft progress is carried as a dedicated JSON line on stdout:
-      // [draft-progress] {"runId": "...", "step": "...", ...}. It is matched by
-      // runId (when present) so a later progress event of the same run updates
-      // the strip regardless of which job context forwarded it.
-      const match = /^\[draft-progress\]\s+(\{.*\})$/s.exec(event.line)
-      if (match) {
-        try {
-          const parsed = JSON.parse(match[1]) as Partial<DraftProgressPayload>
-          if (parsed && typeof parsed === 'object') {
-            const key = typeof parsed.runId === 'string' && parsed.runId ? parsed.runId : event.jobId
-            setDraftProgress((current) => ({ ...current, [key]: { ...parsed, at: Date.now() } }))
+    // Output arrives as a rapid IPC stream while a worker runs; each line used
+    // to re-render the whole log pane. Events are buffered and flushed in a
+    // bounded batch so a busy job settles into a few renders instead of one per
+    // line, while event order, the full durable window and the live Draft
+    // progress strip are all preserved.
+    let pendingOutput: JobOutput[] = []
+    let flushTimer: number | undefined
+    const consumeOutput = () => {
+      flushTimer = undefined
+      if (pendingOutput.length === 0) return
+      const batch = pendingOutput
+      pendingOutput = []
+      setLogs((current) => [...current, ...batch].slice(-MAX_LOG_ENTRIES))
+      for (const event of batch) {
+        // Live Draft progress is carried as a dedicated JSON line on stdout:
+        // [draft-progress] {"runId": "...", "step": "...", ...}. It is matched by
+        // runId (when present) so a later progress event of the same run updates
+        // the strip regardless of which job context forwarded it.
+        const match = /^\[draft-progress\]\s+(\{.*\})$/s.exec(event.line)
+        if (match) {
+          try {
+            const parsed = JSON.parse(match[1]) as Partial<DraftProgressPayload>
+            if (parsed && typeof parsed === 'object') {
+              const key = typeof parsed.runId === 'string' && parsed.runId ? parsed.runId : event.jobId
+              setDraftProgress((current) => ({ ...current, [key]: { ...parsed, at: Date.now() } }))
+            }
+          } catch {
+            // malformed progress lines stay diagnostic-only
           }
-        } catch {
-          // malformed progress lines stay diagnostic-only
         }
       }
+    }
+    const scheduleOutputFlush = () => {
+      if (flushTimer === undefined) flushTimer = window.setTimeout(consumeOutput, 32)
+    }
+    const removeOutput = api.onJobOutput((event) => {
+      pendingOutput.push({ ...event, receivedAt: Date.now() })
+      scheduleOutputFlush()
     })
     const removeMigrationProgress = api.onMigrationProgressChanged((event) => {
       if (event.workspaceId === selectedWorkspaceId && event.projectName === selectedProjectName) void refresh()
@@ -245,11 +292,21 @@ export function useDependencyFlow() {
     const removeFinished = api.onJobFinished((event: JobFinished) => {
       void (async () => {
         const epoch = viewEpochRef.current
-        const result = await api.refreshWorkspace()
-        if (viewEpochRef.current === epoch) {
+        let result: Awaited<ReturnType<NonNullable<typeof api.refreshWorkspace>>> | undefined
+        try {
+          result = await api.refreshWorkspace()
+          setRefreshError(undefined)
+        } catch (error) {
+          // C3: a rejected finish-refresh must not become an unhandled rejection
+          // inside the event handler; the job is still finished, so its active
+          // slot is released and the next poll retries with the last good state.
+          setRefreshError(error instanceof Error ? error.message : String(error))
+        }
+        if (result && viewEpochRef.current === epoch) {
           setPayload((current) => current ? { ...current, state: result.state, details: result.details } : current)
         }
         forgetActiveJob(event.jobId)
+        if (!result) return
         const eventVisible = contextIsVisible(event.workspaceId, event.projectName)
         const autopilot = autopilotRef.current
         const decision = parseBaselineDecision(event.error)
@@ -276,7 +333,7 @@ export function useDependencyFlow() {
             if (infrastructureCount <= MAX_AUTOPILOT_INFRA_RETRIES) {
               const retryAction = (recovery.action && recovery.action !== 'recover' ? recovery.action : event.action === 'recover' ? 'agent' : event.action) as FlowAction
               setContextError(autopilot.workspaceId, autopilot.projectName, undefined)
-              setLogs((current) => [...current.slice(-999), { jobId: 'autopilot', stream: 'system', workspaceId: autopilot.workspaceId, projectName: autopilot.projectName, line: `Автопилот: инфраструктурная ошибка ${recovery.code}, автоматический retry ${infrastructureCount}/${MAX_AUTOPILOT_INFRA_RETRIES} этапа ${retryAction}. Пользовательское вмешательство пока не требуется.` }])
+              setLogs((current) => appendLogEntry(current, { jobId: 'autopilot', stream: 'system', workspaceId: autopilot.workspaceId, projectName: autopilot.projectName, line: `Автопилот: инфраструктурная ошибка ${recovery.code}, автоматический retry ${infrastructureCount}/${MAX_AUTOPILOT_INFRA_RETRIES} этапа ${retryAction}. Пользовательское вмешательство пока не требуется.` }))
               await new Promise((resolve) => window.setTimeout(resolve, Math.min(4000, 750 * infrastructureCount)))
               try {
                 const started = await api.runAction(autopilotActionInput(result.details, autopilot, retryAction))
@@ -316,10 +373,10 @@ export function useDependencyFlow() {
                 ? `одинаковый recovery ${recovery.code} уже выполнялся и не устранил исходную причину`
                 : `исчерпан общий budget ${MAX_AUTOPILOT_RECOVERY_CYCLES} recovery-циклов`
               setContextError(autopilot.workspaceId, autopilot.projectName, undefined)
-              setLogs((current) => [...current.slice(-999), { jobId: 'autopilot', stream: 'system', workspaceId: autopilot.workspaceId, projectName: autopilot.projectName, line: `Автопилот завершил автономные попытки без красного аварийного статуса: ${reason}. Лучшее Git/state сохранено для handoff. ${recovery.message}` }])
+              setLogs((current) => appendLogEntry(current, { jobId: 'autopilot', stream: 'system', workspaceId: autopilot.workspaceId, projectName: autopilot.projectName, line: `Автопилот завершил автономные попытки без красного аварийного статуса: ${reason}. Лучшее Git/state сохранено для handoff. ${recovery.message}` }))
               return
             }
-            setLogs((current) => [...current.slice(-999), { jobId: 'autopilot', stream: 'system', workspaceId: autopilot.workspaceId, projectName: autopilot.projectName, line: `Автопилот перехватил ${recovery.code}: запускаю встроенный recovery-agent без ручного баннера.` }])
+            setLogs((current) => appendLogEntry(current, { jobId: 'autopilot', stream: 'system', workspaceId: autopilot.workspaceId, projectName: autopilot.projectName, line: `Автопилот перехватил ${recovery.code}: запускаю встроенный recovery-agent без ручного баннера.` }))
             try {
               const recovered = await api.recoverWithAgent({
                 workspaceId: autopilot.workspaceId,
@@ -349,7 +406,7 @@ export function useDependencyFlow() {
           autopilotRef.current = undefined
           setAutopilotActive(false)
           setContextError(autopilot.workspaceId, autopilot.projectName, undefined)
-          setLogs((current) => [...current.slice(-999), { jobId: 'autopilot', stream: 'system', workspaceId: autopilot.workspaceId, projectName: autopilot.projectName, line: `Автопилот исчерпал повторяющийся путь без аварии: ${goalStop}. Лучшее Git/state сохранено; повторять тот же цикл автоматически не буду.` }])
+          setLogs((current) => appendLogEntry(current, { jobId: 'autopilot', stream: 'system', workspaceId: autopilot.workspaceId, projectName: autopilot.projectName, line: `Автопилот исчерпал повторяющийся путь без аварии: ${goalStop}. Лучшее Git/state сохранено; повторять тот же цикл автоматически не буду.` }))
           return
         }
         const next = nextAutopilotAction(result.details, autopilot)
@@ -357,13 +414,13 @@ export function useDependencyFlow() {
           autopilotRef.current = undefined
           setAutopilotActive(false)
           setContextError(autopilot.workspaceId, autopilot.projectName, undefined)
-          setLogs((current) => [...current.slice(-999), { jobId: 'autopilot', stream: 'system', workspaceId: autopilot.workspaceId, projectName: autopilot.projectName, line: `Автопилот завершил доступный FLOW для ${autopilot.projectName}${autopilot.publish ? ' включая публикацию' : '; публикация отключена настройкой git.push'}.` }])
+          setLogs((current) => appendLogEntry(current, { jobId: 'autopilot', stream: 'system', workspaceId: autopilot.workspaceId, projectName: autopilot.projectName, line: `Автопилот завершил доступный FLOW для ${autopilot.projectName}${autopilot.publish ? ' включая публикацию' : '; публикация отключена настройкой git.push'}.` }))
           await api.notifyAutopilotComplete({ projectName: autopilot.projectName, published: autopilot.publish })
           return
         }
         try {
           const input = autopilotActionInput(result.details, autopilot, next)
-          setLogs((current) => [...current.slice(-999), { jobId: 'autopilot', stream: 'system', workspaceId: autopilot.workspaceId, projectName: autopilot.projectName, line: `Автопилот → ${next}` }])
+          setLogs((current) => appendLogEntry(current, { jobId: 'autopilot', stream: 'system', workspaceId: autopilot.workspaceId, projectName: autopilot.projectName, line: `Автопилот → ${next}` }))
           const started = await api.runAction(input)
           rememberActiveRun({ jobId: started.jobId, action: next, workspaceId: autopilot.workspaceId, projectName: autopilot.projectName })
         } catch (nextError) {
@@ -385,7 +442,7 @@ export function useDependencyFlow() {
     })
     const removeDownload = api.onDownloadSaved((event) => {
       setLastDownload(event)
-      setLogs((current) => [...current.slice(-999), { jobId: 'download', stream: 'system', workspaceId: event.workspaceId, projectName: event.projectName, line: `Сохранено: ${event.path}` }])
+      setLogs((current) => appendLogEntry(current, { jobId: 'download', stream: 'system', workspaceId: event.workspaceId, projectName: event.projectName, line: `Сохранено: ${event.path}` }))
       // The dashboard covers every project at once, so the edited project is
       // not necessarily the selected one; main.ts reports which ones actually
       // changed and each is recalculated in turn.
@@ -397,11 +454,15 @@ export function useDependencyFlow() {
           const missing = projects.filter((project) => !queued.some((entry) => entry.workspaceId === workspaceId && entry.projectName === project))
           return [...queued, ...missing.map((projectName) => ({ workspaceId, projectName }))]
         })
-        setLogs((current) => [...current.slice(-999), { jobId: 'system', stream: 'system', workspaceId: event.workspaceId, projectName: event.projectName, line: `Scope изменён (${projects.join(', ')}): roadmap и targets будут пересчитаны автоматически.` }])
+        setLogs((current) => appendLogEntry(current, { jobId: 'system', stream: 'system', workspaceId: event.workspaceId, projectName: event.projectName, line: `Scope изменён (${projects.join(', ')}): roadmap и targets будут пересчитаны автоматически.` }))
       }
       void refresh()
     })
-    return () => { removeOutput(); removeMigrationProgress(); removeFinished(); removeDownload(); removeUpdateStatus(); removeIterativeAttempt() }
+    return () => {
+      if (flushTimer !== undefined) window.clearTimeout(flushTimer)
+      consumeOutput()
+      removeOutput(); removeMigrationProgress(); removeFinished(); removeDownload(); removeUpdateStatus(); removeIterativeAttempt()
+    }
   }, [api, refresh, selectedProjectName, selectedWorkspaceId])
 
 
@@ -528,6 +589,33 @@ export function useDependencyFlow() {
     applyWorkspaceResult(result, epoch)
   }, [api, applyWorkspaceResult, payload?.details])
 
+  // #5: explicit way back to the workspace overview. Deselecting persists
+  // selectedProject === '' (the backend keeps it as a string), which the
+  // selectedProject/selectedProjectName derivations treat as "no project
+  // selected", so WorkspaceOverview can render instead of auto-falling back to
+  // the first project.
+  const selectOverview = useCallback(async () => {
+    if (!payload?.details) return
+    const workspaceId = payload.details.workspace.id
+    setError(undefined)
+    const epoch = ++viewEpochRef.current
+    setPayload((current) => current?.details && current.details.workspace.id === workspaceId ? {
+      ...current,
+      details: {
+        ...current.details,
+        workspace: { ...current.details.workspace, selectedProject: '' },
+        dashboardExists: false,
+        projectPromptPath: undefined,
+        promptStale: false,
+        targetClosure: undefined,
+        migrationProgress: undefined,
+      },
+    } : current)
+    if (!api) return
+    const result = await api.updateWorkspace({ id: workspaceId, selectedProject: '' })
+    applyWorkspaceResult(result, epoch)
+  }, [api, applyWorkspaceResult, payload?.details])
+
   const updateWorkspace = useCallback(async (patch: Partial<WorkspaceRecord> & { id: string }) => {
     if (!api) {
       setPayload((current) => current?.details ? { ...current, details: { ...current.details, workspace: { ...current.details.workspace, ...patch } } } : current)
@@ -573,12 +661,12 @@ export function useDependencyFlow() {
   const runAction = useCallback(async (input: ActionInput): Promise<{ jobId: string; runId?: string } | undefined> => {
     setContextError(input.workspaceId, input.projectName, undefined)
     const logContext = { workspaceId: input.workspaceId, projectName: input.projectName }
-    setLogs((current) => [...current, { jobId: 'system', stream: 'system', ...logContext, line: `Запуск: ${input.action}` }])
+    setLogs((current) => appendLogEntry(current, { jobId: 'system', stream: 'system', ...logContext, line: `Запуск: ${input.action}` }))
     if (!api) {
       const demoId = `demo-${Date.now()}`
       rememberActiveRun({ jobId: demoId, action: input.action, workspaceId: input.workspaceId, projectName: input.projectName })
       window.setTimeout(() => {
-        setLogs((current) => [...current, { jobId: demoId, stream: 'stdout', workspaceId: input.workspaceId, projectName: input.projectName, line: 'Демонстрационный режим: команда успешно завершена.' }])
+        setLogs((current) => appendLogEntry(current, { jobId: demoId, stream: 'stdout', workspaceId: input.workspaceId, projectName: input.projectName, line: 'Демонстрационный режим: команда успешно завершена.' }))
         forgetActiveJob(demoId)
       }, 700)
       return undefined
@@ -589,7 +677,7 @@ export function useDependencyFlow() {
       return { jobId: result.jobId, runId: result.runId }
     } catch (runError) {
       const message = runError instanceof Error ? runError.message : String(runError)
-      setLogs((current) => [...current.slice(-999), { jobId: 'system', stream: 'stderr', ...logContext, line: message }])
+      setLogs((current) => appendLogEntry(current, { jobId: 'system', stream: 'stderr', ...logContext, line: message }))
       setContextError(input.workspaceId, input.projectName, message)
       return undefined
     }
@@ -624,7 +712,7 @@ export function useDependencyFlow() {
         return
       }
       const actionInput = autopilotActionInput(refreshed.details, state, firstAction)
-      setLogs((current) => [...current.slice(-999), { jobId: 'autopilot', stream: 'system', workspaceId: input.workspaceId, projectName: input.projectName, line: 'Автопилот запущен для ' + input.projectName + ': цель ' + input.target + ', первый этап ' + firstAction + '.' }])
+      setLogs((current) => appendLogEntry(current, { jobId: 'autopilot', stream: 'system', workspaceId: input.workspaceId, projectName: input.projectName, line: 'Автопилот запущен для ' + input.projectName + ': цель ' + input.target + ', первый этап ' + firstAction + '.' }))
       const started = await api.runAction(actionInput)
       rememberActiveRun({ jobId: started.jobId, action: firstAction, workspaceId: input.workspaceId, projectName: input.projectName })
     } catch (startError) {
@@ -632,7 +720,7 @@ export function useDependencyFlow() {
       autopilotRef.current = undefined
       setAutopilotActive(false)
       setContextError(input.workspaceId, input.projectName, message)
-      setLogs((current) => [...current.slice(-999), { jobId: 'autopilot', stream: 'stderr', workspaceId: input.workspaceId, projectName: input.projectName, line: 'Автопилот не смог запуститься' + (firstAction ? ' на этапе ' + firstAction : '') + ': ' + message }])
+      setLogs((current) => appendLogEntry(current, { jobId: 'autopilot', stream: 'stderr', workspaceId: input.workspaceId, projectName: input.projectName, line: 'Автопилот не смог запуститься' + (firstAction ? ' на этапе ' + firstAction : '') + ': ' + message }))
     }
   }, [anyActiveJob, api])
   const stopAutopilot = useCallback(async () => {
@@ -770,6 +858,9 @@ export function useDependencyFlow() {
   const selectedProject = useMemo<ProjectSpec | undefined>(() => {
     const details = payload?.details
     if (!details) return undefined
+    // An explicit empty selection is the workspace-overview state; it must not
+    // fall back to the first project, otherwise the overview is unreachable.
+    if (details.workspace.selectedProject === '') return undefined
     return details.projects.find((project) => project.name === details.workspace.selectedProject) ?? details.projects[0]
   }, [payload?.details])
   const activeDraftProgress: DraftProgressPayload | undefined =
@@ -781,8 +872,8 @@ export function useDependencyFlow() {
   ), [logs, selectedProject?.name, selectedWorkspaceId])
 
   return {
-    payload, loading, error, baselineDecision, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch, acknowledgeDraftRun,
-    load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, discoverProject, removeWorkspace, removeProject, selectWorkspace, selectProject, updateWorkspace, updateProjectBranches, updateProjectNode, listNodeVersions,
+    payload, loading, error, refreshError, baselineDecision, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch, acknowledgeDraftRun,
+    load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, discoverProject, removeWorkspace, removeProject, selectWorkspace, selectProject, selectOverview, updateWorkspace, updateProjectBranches, updateProjectNode, listNodeVersions,
     runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult,     getDependencyGraphSnapshot, getIterativeTask, exportIterativeTask, exportLegacyIterativeTask, copyIterativeTask, saveIterativeTask, iterativeStatus, iterativeDrive, iterativeBegin, iterativeAgent, iterativeAttemptRead, iterativeCancel, iterativeAttempt, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }
 }

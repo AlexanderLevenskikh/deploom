@@ -1,4 +1,4 @@
-import { adoptEmptyContinuationBranches, adoptHistoricalContinuationBranches, adoptPreferredScopeBranches, buildMigrationProgress, continuationMigrationPlan, countTrackedDirtyChanges, integratedBranchTargets, leftoverConflictMarkerLines, liveGitWorktreeRecords, mergeInProgressNote, mergePackageJsonThreeWay, migrationCompletionIssues, migrationBatchScopeDriftIssues, migrationGroupScopeDriftIssues, migrationPlanFromPrompt, migrationStateSummary, missingGitignorePatterns, nextIncompleteMigrationBranch, recoverContinuationScopeBranches, rebindMigrationPromptBranchIdentity, replaceMigrationPlanInPrompt, rollbackIncompleteMigrationActions, relevantGitStatus, relevantGitStatusLines, proofEnvelopeContentKey, satisfiedScopePackagesFromPrompt, strayUntrackedPaths, threeWayMergeDependencyMaps, validateScopeProofEnvelope } from "../dist-electron/migration-progress.js";
+import { adoptEmptyContinuationBranches, adoptHistoricalContinuationBranches, adoptPreferredScopeBranches, buildMigrationProgress, continuationMigrationPlan, countTrackedDirtyChanges, integratedBranchTargets, leftoverConflictMarkerLines, liveGitWorktreeRecords, mergeInProgressNote, mergePackageJsonThreeWay, migrationCompletionIssues, migrationBatchScopeDriftIssues, migrationFactsFingerprint, migrationGroupScopeDriftIssues, migrationPlanFromPrompt, migrationStateSummary, missingGitignorePatterns, nextIncompleteMigrationBranch, recoverContinuationScopeBranches, rebindMigrationPromptBranchIdentity, replaceMigrationPlanInPrompt, rollbackIncompleteMigrationActions, relevantGitStatus, relevantGitStatusLines, proofEnvelopeContentKey, satisfiedScopePackagesFromPrompt, strayUntrackedPaths, threeWayMergeDependencyMaps, validateScopeProofEnvelope } from "../dist-electron/migration-progress.js";
 
 const worktrees = liveGitWorktreeRecords(`worktree C:/repo\nHEAD abc\nbranch refs/heads/main\n\nworktree C:/missing\nHEAD def\nbranch refs/heads/stale\nprunable gitdir file points to non-existent location\n`);
 if (worktrees.length !== 1 || worktrees[0].branch !== "main") throw new Error(`Prunable worktree leaked into live Git state: ${JSON.stringify(worktrees)}`);
@@ -441,6 +441,35 @@ if (leftoverConflictMarkerLines("docs.md:1: trailing whitespace.\n+line one  ").
 if (leftoverConflictMarkerLines("").length !== 0) throw new Error("Clean diff --check output must report no markers");
 
 console.log("Migration branch progress OK");
+// C3: unchanged cheap Git state reuses computed migration facts during polling.
+// Any change to a cheap input must change the cache key, or an idle poll could
+// serve a stale answer instead of a fresh read.
+const factsKeyBase = { projectPath: "C:/repo", head: "abc1234", branch: "master", refs: ["master", "libs-merged"], statusLines: [], worktrees: "worktree C:/repo\nHEAD abc1234\nbranch refs/heads/master\n", promptMtimeMs: 123, promptSize: 456 };
+const factsKeySame = migrationFactsFingerprint({ ...factsKeyBase, refs: [...factsKeyBase.refs] });
+if (factsKeySame !== migrationFactsFingerprint(factsKeyBase)) throw new Error("Identical Git facts must produce one cache key");
+const factsKeyMutations = [
+  ["HEAD", (input) => ({ ...input, head: "abc1235" })],
+  ["branch", (input) => ({ ...input, branch: "deps" })],
+  ["refs", (input) => ({ ...input, refs: [...input.refs, "origin/extra"] })],
+  ["status", (input) => ({ ...input, statusLines: [" M package.json"] })],
+  ["worktrees", (input) => ({ ...input, worktrees: input.worktrees + "\n\nworktree C:/repo-w2\nHEAD def\nbranch refs/heads/libs-group-1\n" })],
+  ["prompt mtime", (input) => ({ ...input, promptMtimeMs: 124 })],
+  ["prompt size", (input) => ({ ...input, promptSize: 457 })],
+  ["project path", (input) => ({ ...input, projectPath: "C:/other" })],
+];
+for (const [label, mutate] of factsKeyMutations) {
+  if (migrationFactsFingerprint(mutate(factsKeyBase)) === factsKeySame) throw new Error(`Migration facts cache key must change when ${label} changes`);
+}
+// A moved ref target — same name, new object id (a fresh commit or a
+// force-push) — must invalidate the cache too, or a stale containment grid
+// would ride out the TTL window (C3).
+const factsKeyWithOids = { ...factsKeyBase, refOids: ["aaa", "bbb"] };
+const factsKeyOidsSame = migrationFactsFingerprint({ ...factsKeyWithOids, refs: [...factsKeyWithOids.refs] });
+if (factsKeyOidsSame !== migrationFactsFingerprint(factsKeyWithOids)) throw new Error("Identical Git facts with ref OIDs must produce one cache key");
+if (migrationFactsFingerprint({ ...factsKeyWithOids, refOids: ["aaa", "ccc"] }) === factsKeyOidsSame) throw new Error("Migration facts cache key must change when a ref OID changes with the same ref name");
+// Passing no OIDs must stay stable on its own (older callers without OID data).
+if (migrationFactsFingerprint(factsKeyBase) === factsKeyOidsSame) throw new Error("Ref OIDs must participate in the fingerprint, not be ignored");
+
 // The prompt must carry the exact Baseline ProofEnvelope across the
 // Python -> Dashboard -> Electron boundary. A local scope is only a subset.
 const proofEnvelopePayload = {

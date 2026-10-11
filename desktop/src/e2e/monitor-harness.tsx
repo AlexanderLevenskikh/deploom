@@ -112,12 +112,11 @@ function Harness() {
     <FlowWorkspace details={{ ...details, workspace: { ...details.workspace, agent: qaProvider } }} project={project} appVersion="QA" liveIterativeAttempt={attempt}
       onMarkDraftLaunched={() => {}} onResetDraftLaunch={() => {}} onAcknowledgeDraftRun={() => {}}
       onClearBaselineDecision={() => {}} onGetBaselineIntentPlan={getIntent} onGetCurrentDraftResult={async () => undefined}
-      onRun={async () => undefined} onSendAgentNote={async () => false} onStartAutopilot={noop} onStopAutopilot={noop} onRecoverWithAgent={noop}
+      onRun={async () => undefined} onStartAutopilot={noop} onStopAutopilot={noop} onRecoverWithAgent={noop}
       onOpenDashboard={() => {}} onOpenPath={openQaPath} onChoosePrompt={noop} onUpdateWorkspace={async patch => { if (patch.agent) setQaProvider(patch.agent) }} onUpdateProjectBranches={async input => { document.documentElement.dataset.branchSettings = JSON.stringify(input) }} onUpdateProjectNode={noop}
       onListNodeVersions={models} onListAgentModels={models} onGetIterativeTask={getTask} onExportIterativeTask={outcome} onExportLegacyIterativeTask={outcome} onCopyIterativeTask={outcome} onSaveIterativeTask={outcome}
       onIterativeStatus={name => api.current.status(null, { projectName: name })} onIterativeAttempt={api.current.attempt} onIterativeCancel={name => api.current.cancel(null, { projectName: name })}
-      onIterativeBegin={(name, input) => api.current.begin(null, { projectName: name, ...input })} onIterativeDrive={(name, autopilot) => api.current.drive(null, { projectName: name, autopilot })} onIterativeAgent={async () => ({ ok: false })}
-      logs={[{ jobId: 'old', stream: 'stderr', line: 'SAVED_OLD_FLOW_ONLY: historical error' }]} />
+      onIterativeBegin={(name, input) => api.current.begin(null, { projectName: name, ...input })} onIterativeDrive={(name, autopilot) => api.current.drive(null, { projectName: name, autopilot })} onIterativeAgent={async () => ({ ok: false })} />
     <footer className="status-bar" style={{ position: 'fixed', bottom: 0, left: 0, right: 0 }}><StorageBackgroundStatus status={storageStatus} onOpen={() => setShowStorage(true)} /></footer>
     {showStorage ? <StorageMaintenanceDialog status={storageStatus} onClose={() => setShowStorage(false)} onProgress={handler => { storageProgress.current = handler; return () => { storageProgress.current = undefined } }} onMaintenance={async (action, operationId) => {
       const eligible = storageCleaned.current ? 0 : 2

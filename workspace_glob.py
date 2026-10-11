@@ -153,10 +153,54 @@ def _translate_segment(segment: str) -> str:
 
 @lru_cache(maxsize=4096)
 def _compiled_pattern(pattern: str) -> Pattern[str]:
-    parts = [_translate_segment(segment) for segment in pattern.split("/") if segment]
-    if not parts:
+    segments = [segment for segment in pattern.split("/") if segment]
+    if not segments:
         return re.compile(r"^$")
-    return re.compile("^" + "/".join(parts) + "$")
+    if "**" not in segments:
+        parts = [_translate_segment(segment) for segment in segments]
+        return re.compile("^" + "/".join(parts) + "$")
+    return re.compile(_globstar_regex(segments))
+
+
+def _globstar_regex(segments: List[str]) -> str:
+    """Regex for a pattern containing whole-segment ``**`` globstars.
+
+    ``**`` (a whole segment) matches ZERO OR MORE path segments, so
+    ``packages/**/app`` matches ``packages/app`` (zero intermediate folders), a
+    single level (``packages/a/app``) and deep nesting. The slash separators
+    around a globstar are absorbed into its token:
+    * leading  ``**/x/y``  -> ``(?:[^/]+/)* x/y``
+    * middle   ``a/**/z``  -> ``a (?:/[^/]+)*/ z``
+    * trailing ``a/**``    -> ``a (?:/[^/]+)*``
+    * lone     ``**``      -> ``.*``
+    """
+    runs: List[Optional[List[str]]] = []
+    current: List[str] = []
+    for segment in segments:
+        if segment == "**":
+            if current:
+                runs.append(current)
+                current = []
+            if not runs or runs[-1] is not None:
+                runs.append(None)
+        else:
+            current.append(segment)
+    if current:
+        runs.append(current)
+    if all(run is None for run in runs):
+        return r"^.*$"
+    out = ""
+    first = runs[0]
+    if first is None:
+        out = r"(?:[^/]+/)*"
+        runs = runs[1:]
+    for index, item in enumerate(runs):
+        if item is None:
+            sep = r"(?:/[^/]+)*/" if index < len(runs) - 1 else r"(?:/[^/]+)*"
+            out += sep
+            continue
+        out += "/".join(_translate_segment(segment) for segment in item)
+    return "^" + out + "$"
 
 
 def match_workspace_pattern(relative: str, pattern: str) -> bool:

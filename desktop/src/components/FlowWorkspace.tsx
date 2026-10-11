@@ -1,4 +1,4 @@
-import { FileText, LoaderCircle, Play, RotateCcw, ShieldCheck } from 'lucide-react'
+import { FileText, LoaderCircle, Play, Rocket, RotateCcw, ShieldCheck, Wrench, X } from 'lucide-react'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ACTION_ORDER, FLOW_STAGES } from '../data/flow'
@@ -7,7 +7,6 @@ import { BranchFailureModal } from './BranchFailureModal'
 import { QuickSelect } from './QuickSelect'
 import { ModelPicker } from './ModelPicker'
 import { BaselineIntentDialog } from './BaselineIntentDialog'
-import { LogPanel } from './LogPanel'
 import { PromptPreviewDialog } from './PromptPreviewDialog'
 import { IterativeTaskPanel } from './IterativeTaskPanel'
 import { AuditGoalSummary } from './AuditGoalSummary'
@@ -15,7 +14,7 @@ import { IterativeRunDiagnostics } from './IterativeRunDiagnostics'
 import { normalizeBaselineIntentPlan } from '../data/baselineIntent'
 import type { ScenarioSignal } from '../../electron/iterative-scenario'
 import type { DraftProgressPayload } from '../hooks/useDependencyFlow'
-import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, DraftResultSnapshot, EnvironmentInfo, FlowAction, IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobOutput, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
+import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, DraftResultSnapshot, FlowAction, IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
 
 
 type Props = {
@@ -36,7 +35,6 @@ type Props = {
   onGetBaselineIntentPlan: (projectName: string) => Promise<BaselineIntentPlan>
   onGetCurrentDraftResult: (input: { workspaceId?: string; projectName: string; runId?: string }) => Promise<{ result: DraftResultSnapshot; prompt?: ProjectPromptPreview; plan?: string } | undefined>
   onRun: (input: ActionInput) => Promise<{ jobId: string; runId?: string } | undefined>
-  onSendAgentNote: (note: string, branch?: string) => Promise<boolean>
   onStartAutopilot: (input: { workspaceId: string; projectName: string; target: TargetLevel; releaseBranch?: string }) => Promise<void>
   onStopAutopilot: () => Promise<void>
   onRecoverWithAgent: (input: { workspaceId?: string; projectName: string; note: string }) => Promise<void>
@@ -60,14 +58,9 @@ type Props = {
   onIterativeAttempt: (projectName: string, includeRunLog?: boolean) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; runLog?: string; error?: string }>
   onIterativeCancel: (projectName: string) => Promise<{ ok: boolean }>
   liveIterativeAttempt?: IterativeAttemptView
-  // Live log window (activity bubbles) for the current run, rendered below all
-  // the flow content so failures can be inspected in place.
-  logs?: JobOutput[]
-  onCancelJob?: () => Promise<void>
-  onClearLogs?: () => void
 }
 
-export function FlowWorkspace({ details, project, appVersion, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onSendAgentNote, onOpenDashboard, onOpenPath, onUpdateWorkspace, onUpdateProjectBranches, onUpdateProjectNode, onListNodeVersions, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onExportLegacyIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeDrive, onIterativeBegin, onIterativeAgent, onIterativeAttempt, onIterativeCancel, liveIterativeAttempt, logs, onCancelJob, onClearLogs }: Props) {
+export function FlowWorkspace({ details, project, appVersion, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onOpenDashboard, onOpenPath, onUpdateWorkspace, onUpdateProjectBranches, onUpdateProjectNode, onListNodeVersions, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onExportLegacyIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeDrive, onIterativeBegin, onIterativeAgent, onIterativeAttempt, onIterativeCancel, liveIterativeAttempt }: Props) {
   const { language, text, t } = useLanguage()
   // The persisted goal drives stage actions and autopilot: a green target set
   // in the Baseline dialog must survive into generate/release instead of
@@ -478,6 +471,15 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
             improvements) without duplicating the primary action or the metrics. */}
         {scenarioSignal ? (
           <div className="human-flow-utility">
+            {/* D: the panel owns the ONE main action; the hero mirrors the SAME
+                control (label/enabled/act come out of onScenario) at the top so
+                the primary action is visible without scrolling at 1080×700. */}
+            <button type="button" className="button primary" data-testid="hero-main-action"
+              disabled={!scenarioSignal.enabled}
+              onClick={() => scenarioSignal.act()}>
+              {scenarioSignal.running ? <X size={16} /> : scenarioSignal.state === 'agent' || scenarioSignal.state === 'repair-current' ? <Wrench size={16} /> : scenarioSignal.state === 'result' || scenarioSignal.state === 'partial' || scenarioSignal.state === 'budget-stop' || scenarioSignal.state === 'blocked' || scenarioSignal.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}
+              {scenarioSignal.label}
+            </button>
             <button className="button secondary" disabled={active || scenarioSignal.running} onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button>
             {draftResult ? <button className="button secondary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Последний Draft', 'Last Draft')}</button> : null}
             <button className="button secondary" disabled={!iterativeView?.artifactsDirectory && !run && !activeAction && !scenarioSignal?.attempt} onClick={() => void onOpenPath(iterativeView?.artifactsDirectory || artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
@@ -669,10 +671,6 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
       <details className="flow-technical-details flow-logs-details">
         <summary>{text('Логи запуска', 'Run logs')}</summary>
         {currentScenario ? <IterativeRunDiagnostics signal={currentScenario} logs onReadLog={() => onIterativeAttempt(project.name, true)} onOpenLog={() => onOpenPath(`${currentScenario.runDir}/run.log`)} /> : null}
-        {logs?.length || active ? <details className="flow-legacy-history" open={active ? true : undefined}>
-          <summary>{active ? text('Журнал текущего FLOW / Draft', 'Current FLOW / Draft log') : text('Журнал прежнего FLOW / Draft (отдельный запуск)', 'Previous FLOW / Draft log (separate run)')}</summary>
-          <LogPanel logs={logs ?? []} environment={{} as EnvironmentInfo} showEnvironment={false} showRunMonitor={active} active={active} activeJobId={activeRunId} activeAction={activeAction} runStartedAt={activeRunStartedAt} migrationProgress={details.migrationProgress} onSendAgentNote={onSendAgentNote} onCancel={onCancelJob ?? (async () => {})} onClear={onClearLogs ?? (() => {})} />
-        </details> : null}
       </details>
       {selectedBranchFailure?.runtime?.phase === 'failed' ? <BranchFailureModal branch={selectedBranchFailure} onClose={() => setSelectedBranchFailure(null)} /> : null}
       {baselineIntentDialog ? <BaselineIntentDialog mode={baselineIntentDialog.mode} resume={baselineIntentDialog.resume} plan={baselineIntentDialog.plan} decision={baselineIntentDialog.decision} onCancel={() => { setBaselineIntentDialog(undefined); if (baselineIntentDialog.mode === 'decision') setBaselineDecisionDismissed(true) }} onSubmit={runBaselineIntent} /> : null}

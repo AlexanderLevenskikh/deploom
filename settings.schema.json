@@ -12,6 +12,15 @@
     "registry": {
       "type": "string"
     },
+    "registryMetadataCache": {
+      "type": "string",
+      "description": "Directory of the durable planning packument cache. Planning-only: install, verification and the vulnerability audit inventory never read it. A TTL bounds freshness; omit or set registryMetadataTtl=0 to disable."
+    },
+    "registryMetadataTtl": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Freshness bound (seconds) for the planning packument cache; 0 disables it."
+    },
     "useSystemProxy": {
       "type": "boolean"
     },

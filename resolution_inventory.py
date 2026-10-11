@@ -1,11 +1,12 @@
 """Immutable, hash-bound resolution inventory for one migration phase.
 
-Parses the canonical lockfile exactly ONCE per discovery/materialize phase and
-serves ``installed_version`` lookups from memory instead of re-reading and
-re-parsing the lockfile for every dependency probe (C1). The inventory is
-read-only and bound to the exact bytes it was built from: ``lock_hash`` is the
-SHA-256 of the lockfile text and any lockfile change invalidates the phase —
-a changed input can never be served stale resolutions.
+    Parser and index the canonical lockfile exactly ONCE per discovery/materialize phase and
+    serves ``installed_version`` lookups from memory instead of re-reading and
+    re-parsing the lockfile for every dependency probe (C1). The inventory is
+    read-only and bound to the exact bytes it was built from: ``lock_hash`` is the
+    SHA-256 of the raw lockfile BYTES (a UTF-8 BOM included) and any lockfile
+    change invalidates the phase — a changed input can never be served stale
+    resolutions.
 
 Workspace-aware npm resolution (A1): a member package of an npm-workspaces
 lockfile (lockfileVersion 3) records its direct dependencies under
@@ -89,6 +90,20 @@ def _canonical_for_project(project_dir: Path) -> Tuple[Optional[Path], str]:
     if lock is None:
         return None, ""
     return lock, ""
+
+
+def canonical_lockfile_path(project_dir: object) -> Optional[Path]:
+    """The canonical lockfile path governing a project, or ``None``.
+
+    Single source of the canonical (workspace-root when bound) lockfile for
+    hashing/identity (A1/B1): a workspace MEMBER's identity must react to the
+    shared root lockfile, never to a strictly-local look that returns nothing.
+    """
+    resolved = _normalize_path(project_dir)
+    if resolved is None:
+        return None
+    lock, _relative = _canonical_for_project(resolved)
+    return lock
 
 
 def _shared_root_lockfile(
@@ -181,6 +196,20 @@ def _scan_yarn_v1_blocks(lines: Sequence[str]) -> List[Tuple[List[str], str]]:
     return blocks
 
 
+def _member_ancestor_prefixes(package_relative: str) -> List[str]:
+    """All npm-lock package key prefixes that can carry a resolution for a
+    member: the member itself, every intermediate directory, and the root.
+
+    npm hoists a dependency into the nearest ancestor ``node_modules``, so for
+    ``packages/team/app`` a package can resolve from
+    ``packages/team/app/node_modules/<name>``, ``packages/team/node_modules/<name>``,
+    ``packages/node_modules/<name>`` or the root ``node_modules/<name>``. The
+    innermost (nearest) present resolution wins.
+    """
+    parts = [part for part in (package_relative or "").replace("\\", "/").strip("/").split("/") if part]
+    return ["/".join(parts[:index]) for index in range(len(parts), 0, -1)] + [""]
+
+
 def npm_lock_resolved_version(
     packages: Optional[Dict[str, Any]],
     dependencies: Optional[Dict[str, Any]],
@@ -189,32 +218,41 @@ def npm_lock_resolved_version(
 ) -> Optional[str]:
     """Exact direct resolution for a package-lock.json / npm-shrinkwrap.json.
 
-    Workspace-aware (A1): when ``package_relative`` is non-empty the member-local
-    ``<member>/node_modules/<name>`` key is consulted before the root
-    ``node_modules/<name>``, and a ``link:``/``file:`` portal entry resolves
-    through the linked package's own record. Under a legacy ``dependencies`` map
-    a workspace member cannot prove its own resolution from the root map and
-    abstains (None). For the root (empty ``package_relative``) the legacy map is
-    the fallback after the ``packages`` snapshot.
+    Workspace-aware (A1): when ``package_relative`` is non-empty the resolution
+    is looked up INNERMOST-FIRST over every ancestor prefix of the member — the
+    member-local ``<member>/node_modules/<name>`` key, then each intermediate
+    ``node_modules`` (hoisted copies), then the root ``node_modules/<name>``.
+    At each prefix a ``link:``/``file:`` portal entry decides the resolution
+    through the linked package's own record and never falls through to a root
+    version that could shadow the member's linked local package. Under a legacy
+    ``dependencies`` map (no ``packages``) a workspace member cannot prove its
+    own resolution from the root map and abstains (None). For the root (empty
+    ``package_relative``) the legacy map is the fallback after the ``packages``
+    snapshot.
     """
     name = str(package_name)
     rel = (package_relative or "").replace("\\", "/").strip("/")
-    candidate_keys = ([f"{rel}/node_modules/{name}"] if rel else []) + [f"node_modules/{name}"]
     if isinstance(packages, dict) and packages:
-        for key in candidate_keys:
+        for prefix in _member_ancestor_prefixes(rel):
+            key = f"{prefix}/node_modules/{name}" if prefix else f"node_modules/{name}"
             entry = packages.get(key)
-            if isinstance(entry, dict):
-                version = entry.get("version")
-                if isinstance(version, str) and version:
-                    return version
-        for key in candidate_keys:
-            entry = packages.get(key)
-            if isinstance(entry, dict) and entry.get("link") and isinstance(entry.get("resolved"), str):
+            if not isinstance(entry, dict):
+                continue
+            # A portal at the NEAREST prefix decides the member's resolution;
+            # a hoisted root copy of the same name must not override the
+            # locally linked package.
+            if entry.get("link") and isinstance(entry.get("resolved"), str):
                 linked = packages.get(entry["resolved"].replace("\\", "/").strip("/"))
                 if isinstance(linked, dict):
                     version = linked.get("version")
                     if isinstance(version, str) and version:
                         return version
+                # A link whose target record has no provable version: abstain
+                # rather than guess a hoisted root copy.
+                return None
+            version = entry.get("version")
+            if isinstance(version, str) and version:
+                return version
         return None
     if rel:
         return None
@@ -253,14 +291,18 @@ class ResolutionInventory:
         self._lock_path = lock_path
         raw_relative = str(package_relative or "").replace("\\", "/").strip("/")
         self._package_relative = "" if raw_relative in ("", ".") else raw_relative
-        family, data, lines, text = _read_and_classify(lock_path)
+        family, data, lines, text, raw = _read_and_classify(lock_path)
         self._family = family
         self._packages = None
         self._dependencies = None
         self._berry_mapping = {}
         self._yarn_blocks = []
         self._pnpm_lines = lines if family == "pnpm" else None
-        self._lock_hash = _sha256(text)
+        # Hash the EXACT raw bytes (a UTF-8 BOM included), so the phase identity
+        # matches what Modern Yarn / the verifier hash from disk: a file that was
+        # re-encoded with a different BOM is a different input, never the same
+        # phase with a stale parsed version.
+        self._lock_hash = hashlib.sha256(raw).hexdigest()
         try:
             self._parse(family, data, lines)
         except Exception:  # noqa: BLE001 - unreadable/ambiguous lockfile abstains
@@ -390,34 +432,31 @@ class ResolutionInventory:
             self._yarn_blocks = _scan_yarn_v1_blocks(list(lines or []))
 
 
-def _read_and_classify(lock_path: Path) -> Tuple[str, Optional[Any], Optional[List[str]], str]:
-    """Read the lockfile text once, classify it, and pre-parse structured data.
+def _read_and_classify(lock_path: Path) -> Tuple[str, Optional[Any], Optional[List[str]], str, bytes]:
+    """Read the lockfile bytes once, classify it, and pre-parse structured data.
 
-    Returns ``(family, data-or-text, lines, text)`` where ``lines`` is the
-    split text for the textual families (yarn v1 / pnpm) and ``data`` is the
-    parsed JSON for npm. Family is ``unparsable`` when the classification or
-    structure is unusable.
+    Returns ``(family, data-or-text, lines, text, raw)`` where ``lines`` is the
+    split text for the textual families (yarn v1 / pnpm), ``data`` is the
+    parsed JSON for npm, and ``raw`` the exact original bytes (BOM preserved,
+    used for the phase lock_hash). Family is ``unparsable`` when the
+    classification or structure is unusable.
     """
     try:
         raw = lock_path.read_bytes()
     except OSError:
-        return ("unparsable", None, None, "")
+        return ("unparsable", None, None, "", b"")
     text = raw.decode("utf-8-sig", errors="replace")
     name = lock_path.name
     if name in ("package-lock.json", "npm-shrinkwrap.json"):
         try:
             data = json.loads(text)
         except ValueError:
-            return ("unparsable", None, None, text)
-        return ("npm", data, None, text)
+            return ("unparsable", None, None, text, raw)
+        return ("npm", data, None, text, raw)
     if name == "yarn.lock":
         if _looks_like_berry_lock(text):
-            return ("berry", text, None, text)
-        return ("yarn", None, text.splitlines(), text)
+            return ("berry", text, None, text, raw)
+        return ("yarn", None, text.splitlines(), text, raw)
     if name == "pnpm-lock.yaml":
-        return ("pnpm", None, text.splitlines(), text)
-    return ("unparsable", None, None, text)
-
-
-def _sha256(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+        return ("pnpm", None, text.splitlines(), text, raw)
+    return ("unparsable", None, None, text, raw)

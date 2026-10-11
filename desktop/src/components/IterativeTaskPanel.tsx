@@ -727,6 +727,10 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     }
   }
   const busyLocked = Boolean(validationError) || stepBusy || busy !== undefined || disabledExternal === true || state.phase === 'loading' || (runner === undefined && !runnerError)
+  // One source of truth for the main action's availability, shared by the
+  // panel button and the hero mirror (via onScenario): Stop stays reachable
+  // while running, everything else needs the busy lock AND a valid profile.
+  const mainActionEnabled = mainAction.state === 'running' ? true : !busyLocked && !validationError
 
   // P1#1: the panel is the SINGLE owner of the scenario main action. Mirror it
   // outward so the enclosing workspace hero renders exactly the same control
@@ -749,11 +753,68 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       attempt,
       attemptLog: currentAttemptLog,
       runDir: snapshot?.runDir,
-      enabled: mainAction.state === 'running' ? true : !busyLocked,
+      enabled: mainActionEnabled,
       act: () => runMainActionRef.current(),
     })
-  }, [onScenario, projectName, workspaceId, mainAction.state, mainLabel, mainDescription, busyLocked, repairMutationBlocked, childAlive, activity.title, activity.detail, activity.percent, elapsedMs, attempt, currentAttemptLog, snapshot?.runDir])
+  }, [onScenario, projectName, workspaceId, mainAction.state, mainLabel, mainDescription, busyLocked, mainActionEnabled, repairMutationBlocked, childAlive, activity.title, activity.detail, activity.percent, elapsedMs, attempt, currentAttemptLog, snapshot?.runDir])
   useEffect(() => () => onScenario?.(undefined), [onScenario])
+
+  // D: the single main action is the hero of the panel — rendered right under
+  // the pipeline so it stays above the fold at 1080×700, before the secondary
+  // controls (validation profile, audit, storage) that used to push it down.
+  const mainActionArea = (
+    <div className="resume-notice">
+      <span>{mainDescription}</span>
+      <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.cohortReviewEnabled !== false} disabled={childAlive || stepBusy || disabledExternal === true} onChange={event => { void window.dependencyFlow?.reviewIterativeCohort({ workspaceId, projectName, enabled: event.target.checked }).then(result => { if (!result.ok) setNote(result.error); return refreshRunner() }).catch(error => setNote(String(error))) }} />{text('Согласовывать группы зависимостей перед обновлением', 'Review dependency cohorts before updating')}</label>
+      <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.autopilotEnabled || runner?.autopilotActive || autopilot} disabled={disabledExternal === true} onChange={event => { const enabled = event.target.checked; setAutopilot(enabled); void window.dependencyFlow?.setIterativeAutopilot({ workspaceId, projectName, enabled }).then(() => refreshRunner()).catch(error => { setAutopilot(!enabled); setNote(String(error)) }) }} />{text('Автопилот: продолжать автоматически, включая исправления агентом', 'Autopilot: continue automatically, including agent repairs')}</label>
+      <small>{runner?.phase === 'TERMINAL'
+        ? runner.canResumeTerminal
+          ? text('Включите автопилот для автоматического продолжения или продолжите вручную кнопкой ниже.', 'Enable autopilot to continue automatically, or use the button below to continue manually.')
+          : text('Прогон завершён. Для продолжения нужен новый вариант обновления; проверенный результат сохранён.', 'The run has ended. Continuing requires a new update proposal; the verified result is preserved.')
+        : text('Можно включить во время работы. Автопилот продолжит после текущего шага; выключение остановит автоматические переходы.', 'Enable while running to continue after the current step; disabling stops automatic transitions.')}</small>
+      <footer className="baseline-intent-actions">
+        <button
+          type="button"
+          className={`button ${runner?.phase === 'TERMINAL' && (runner.progressSummary?.accepted ?? 0) > 0 && mainAction.state !== 'result' ? 'secondary' : 'primary'}`}
+          data-testid="iterative-main-action"
+          // P1#2: Stop must stay AVAILABLE while work is running — the
+          // busy lock disables everything EXCEPT the in-flight Stop.
+          disabled={!mainActionEnabled}
+          onClick={() => void runMainAction()}
+        >
+          {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' || mainAction.state === 'repair-current' ? <Wrench size={16} /> : mainAction.state === 'result' || mainAction.state === 'partial' || mainAction.state === 'budget-stop' || mainAction.state === 'blocked' || mainAction.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}
+          {mainLabel}
+        </button>
+        {runner?.phase === 'TERMINAL' && runner.canResumeTerminal === true && ['blocked', 'partial', 'budget-stop', 'no-upgrade'].includes(mainAction.state) ? (
+          <button type="button" className="button primary" data-testid="iterative-resume-action"
+            disabled={busyLocked || childAlive} onClick={() => { void driveNow(false, true) }}>
+            <Rocket size={16} />{text('Продолжить с сохранённого результата', 'Continue from saved result')}
+          </button>
+        ) : null}
+        {(attempt || runner?.present) && mainAction.state !== 'running' ? (
+          <button type="button" className="button secondary" data-testid="iterative-restart"
+            disabled={busyLocked}
+            title={text('Прежний прогон, снимки и результаты сохранятся в истории. Проверим текущие файлы проекта заново.', 'The previous run, snapshots and results stay in history. Re-check the current project files.')}
+            onClick={() => void beginNow({ mode: 'none', checkOnly: true, restart: true })}>
+            <RefreshCw size={16} />{text('Начать заново', 'Start over')}
+          </button>
+        ) : null}
+        {mainAction.state === 'no-targets' ? (
+          <button type="button" className="button secondary" disabled={busyLocked} onClick={() => onConfigureScope?.()}>
+            <Wrench size={16} />{text('Настроить обновление', 'Configure the update')}
+          </button>
+        ) : null}
+        {!busyLocked && !runner?.present && !noTargetsStep && runner?.legacyPlanPresent ? (
+          <>
+            <button type="button" className="button secondary" title={text('Использует последний сохранённый план Baseline. Обновления не применяются; проверки нужно выполнить заново.', 'Uses the last saved Baseline plan. No updates are applied; checks must run again.')} onClick={() => void exportLegacyNow()}>
+              <FileText size={16} />{text('Создать ТЗ из прежнего плана', 'Create an assignment from an earlier plan')}
+            </button>
+          </>
+        ) : null}
+      </footer>
+      {runtimeLine(runner) ? <span className="attempt-meta">{runtimeLine(runner)}</span> : null}
+    </div>
+  )
 
   return (
     <section className="roadmap-card" data-testid="iterative-task-panel">
@@ -805,6 +866,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
           </div>
         )
       })()}
+
+      {state.phase === 'ready' ? mainActionArea : null}
 
       {runner?.phase === 'TERMINAL' && runner.canResumeTerminal === true && ['blocked', 'partial', 'budget-stop', 'no-upgrade'].includes(mainAction.state) ? (
         <div className="resume-notice" data-testid="iterative-resume-result">
@@ -947,59 +1010,6 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         </div>
       ) : (
         <>
-          {/* THE single main action for the current scenario state. */}
-          <div className="resume-notice">
-            <span>{mainDescription}</span>
-            <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.cohortReviewEnabled !== false} disabled={childAlive || stepBusy || disabledExternal === true} onChange={event => { void window.dependencyFlow?.reviewIterativeCohort({ workspaceId, projectName, enabled: event.target.checked }).then(result => { if (!result.ok) setNote(result.error); return refreshRunner() }).catch(error => setNote(String(error))) }} />{text('Согласовывать группы зависимостей перед обновлением', 'Review dependency cohorts before updating')}</label>
-            <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.autopilotEnabled || runner?.autopilotActive || autopilot} disabled={disabledExternal === true} onChange={event => { const enabled = event.target.checked; setAutopilot(enabled); void window.dependencyFlow?.setIterativeAutopilot({ workspaceId, projectName, enabled }).then(() => refreshRunner()).catch(error => { setAutopilot(!enabled); setNote(String(error)) }) }} />{text('Автопилот: продолжать автоматически, включая исправления агентом', 'Autopilot: continue automatically, including agent repairs')}</label>
-            <small>{runner?.phase === 'TERMINAL'
-              ? runner.canResumeTerminal
-                ? text('Включите автопилот для автоматического продолжения или продолжите вручную кнопкой ниже.', 'Enable autopilot to continue automatically, or use the button below to continue manually.')
-                : text('Прогон завершён. Для продолжения нужен новый вариант обновления; проверенный результат сохранён.', 'The run has ended. Continuing requires a new update proposal; the verified result is preserved.')
-              : text('Можно включить во время работы. Автопилот продолжит после текущего шага; выключение остановит автоматические переходы.', 'Enable while running to continue after the current step; disabling stops automatic transitions.')}</small>
-            <footer className="baseline-intent-actions">
-              <button
-                type="button"
-                className={`button ${runner?.phase === 'TERMINAL' && (runner.progressSummary?.accepted ?? 0) > 0 && mainAction.state !== 'result' ? 'secondary' : 'primary'}`}
-                data-testid="iterative-main-action"
-                // P1#2: Stop must stay AVAILABLE while work is running — the
-                // busy lock disables everything EXCEPT the in-flight Stop.
-                disabled={mainAction.state === 'running' ? false : busyLocked || Boolean(validationError)}
-                onClick={() => void runMainAction()}
-              >
-                {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' || mainAction.state === 'repair-current' ? <Wrench size={16} /> : mainAction.state === 'result' || mainAction.state === 'partial' || mainAction.state === 'budget-stop' || mainAction.state === 'blocked' || mainAction.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}
-                {mainLabel}
-              </button>
-              {runner?.phase === 'TERMINAL' && runner.canResumeTerminal === true && ['blocked', 'partial', 'budget-stop', 'no-upgrade'].includes(mainAction.state) ? (
-                <button type="button" className="button primary" data-testid="iterative-resume-action"
-                  disabled={busyLocked || childAlive} onClick={() => { void driveNow(false, true) }}>
-                  <Rocket size={16} />{text('Продолжить с сохранённого результата', 'Continue from saved result')}
-                </button>
-              ) : null}
-              {(attempt || runner?.present) && mainAction.state !== 'running' ? (
-                <button type="button" className="button secondary" data-testid="iterative-restart"
-                  disabled={busyLocked}
-                  title={text('Прежний прогон, снимки и результаты сохранятся в истории. Проверим текущие файлы проекта заново.', 'The previous run, snapshots and results stay in history. Re-check the current project files.')}
-                  onClick={() => void beginNow({ mode: 'none', checkOnly: true, restart: true })}>
-                  <RefreshCw size={16} />{text('Начать заново', 'Start over')}
-                </button>
-              ) : null}
-              {mainAction.state === 'no-targets' ? (
-                <button type="button" className="button secondary" disabled={busyLocked} onClick={() => onConfigureScope?.()}>
-                  <Wrench size={16} />{text('Настроить обновление', 'Configure the update')}
-                </button>
-              ) : null}
-              {!busyLocked && !runner?.present && !noTargetsStep && runner?.legacyPlanPresent ? (
-                <>
-                  <button type="button" className="button secondary" title={text('Использует последний сохранённый план Baseline. Обновления не применяются; проверки нужно выполнить заново.', 'Uses the last saved Baseline plan. No updates are applied; checks must run again.')} onClick={() => void exportLegacyNow()}>
-                    <FileText size={16} />{text('Создать ТЗ из прежнего плана', 'Create an assignment from an earlier plan')}
-                  </button>
-                </>
-              ) : null}
-            </footer>
-            {runtimeLine(runner) ? <span className="attempt-meta">{runtimeLine(runner)}</span> : null}
-          </div>
-
           {!runner?.present ? (
             <div className="resume-notice">
               <strong>{text('Перед запуском', 'Before you start')}</strong>

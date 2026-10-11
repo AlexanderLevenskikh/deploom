@@ -1,14 +1,19 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import './CohortReviewDialog.css'
 import { useLanguage } from '../i18n'
+import { useDialogFocus } from '../hooks/useDialogFocus'
 import type { IterativeStatusOutcome } from '../types'
 
 type Cohort = NonNullable<IterativeStatusOutcome['cohortReview']>
 export function CohortReviewDialog({ cohort, onSubmit, onClose }: { cohort: Cohort; onSubmit: (selected: string[]) => Promise<void>; onClose: () => void }) {
   const { text } = useLanguage()
+  const rootRef = useRef<HTMLDivElement>(null)
   const [selected, setSelected] = useState(() => new Set(cohort.packages.map(p => p.name)))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
+  // Escape closing lives on the backdrop (it skips while busy); the hook adds
+  // focus management and the Tab trap without duplicating the close path.
+  useDialogFocus(rootRef, { onClose, closeOnEscape: false })
   const submit = async (names: string[]) => {
     setBusy(true); setError(undefined)
     try { await onSubmit(names) } catch (e) { setError(String(e)); setBusy(false) }
@@ -19,7 +24,7 @@ export function CohortReviewDialog({ cohort, onSubmit, onClose }: { cohort: Coho
     while (changed) { changed = false; for (const group of cohort.atomicGroups ?? []) if (group.some(n => names.has(n))) for (const n of group) if (!names.has(n)) { names.add(n); changed = true } }
     setSelected(previous => { const next = new Set(previous); for (const n of names) if (cohort.packages.some(p => p.name === n)) { if (checked) next.add(n); else next.delete(n) }; return next })
   }
-  return <div className="dialog-backdrop" onKeyDown={event => { if (event.key === 'Escape' && !busy) { event.stopPropagation(); onClose() } }}><section className="dialog cohort-review-dialog" role="dialog" aria-modal="true" aria-labelledby="cohort-review-title" data-testid="cohort-review-dialog">
+  return <div ref={rootRef} className="dialog-backdrop" onKeyDown={event => { if (event.key === 'Escape' && !busy) { event.stopPropagation(); onClose() } }}><section className="dialog cohort-review-dialog" role="dialog" aria-modal="true" aria-labelledby="cohort-review-title" data-testid="cohort-review-dialog">
     <header><h2 id="cohort-review-title">{text('Согласовать группу зависимостей', 'Review dependency cohort')}</h2></header>
     <p>{text('Подбор объединяет пакеты по связям peer-зависимостей и ограничениям совместимости. Связанные атомарные группы выбираются целиком. Изменения ещё не применены.', 'Planning groups packages by peer dependencies and compatibility constraints. Atomic groups are selected together. Changes have not been applied yet.')}</p>
     <p>{text('После исключения пакетов пересчитаем состав от проверенного результата. Отложенные цели останутся видны; новый состав снова потребует согласования.', 'Exclusions trigger re-planning from the verified checkpoint. Deferred goals remain visible; the new proposal needs another approval.')}</p>

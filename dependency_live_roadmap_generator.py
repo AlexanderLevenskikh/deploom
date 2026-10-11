@@ -143,6 +143,12 @@ from constraint_cache import (
     dependency_failure_navigation_signature,
     matching_dependency_failure_signature,
 )
+from registry_metadata_cache import (
+    DEFAULT_METADATA_CACHE_TTL_SECONDS,
+    load_packument,
+    store_packument,
+)
+from substrate_identity import tool_build_id
 from peer_solver_model import ForbiddenCombination, PackageVariable, PeerOptimizationModel, RequiresAny, forbidden
 from peer_solver_z3 import solve_z3_exact
 from peer_solver_transition import refine_transition_safe_groups
@@ -2367,7 +2373,17 @@ def _draft_progress(client: Any, **kwargs: Any) -> None:
 
 
 class LiveDataClient:
-    def __init__(self, registry: str, timeout: int, batch_size: int, sleep_sec: float, use_system_proxy: bool = False):
+    def __init__(
+        self,
+        registry: str,
+        timeout: int,
+        batch_size: int,
+        sleep_sec: float,
+        use_system_proxy: bool = False,
+        metadata_cache_dir: Optional[Path] = None,
+        metadata_cache_ttl: float = 0.0,
+        metadata_cache_tool_version: str = "",
+    ):
         self.registry = registry.rstrip("/")
         self.timeout = timeout
         self.batch_size = batch_size
@@ -2397,6 +2413,14 @@ class LiveDataClient:
         self.registry_types_cache = {}
         self.registry_runtime_entrypoint_cache = {}
         self.registry_self_types_cache = {}
+        # Optional durable planning packument cache (C2): metadata read here is
+        # merged across CLI invocations. Planning-only -- install, verification
+        # and the vulnerability audit inventory never consult this cache.
+        self.metadata_cache_dir: Optional[Path] = Path(metadata_cache_dir) if metadata_cache_dir else None
+        self.metadata_cache_ttl: float = float(metadata_cache_ttl or 0.0)
+        self.metadata_cache_tool_version: str = metadata_cache_tool_version or ""
+        self._metadata_cache_disk_hits = 0
+        self._metadata_cache_disk_misses = 0
         # Optional run deadline (Draft). When set, every request is bounded by
         # the remaining budget and the budget is checked before each attempt.
         self.deadline: Optional["DeadlineClock"] = None
@@ -2429,6 +2453,10 @@ class LiveDataClient:
         the honest OSV-unavailable behavior are preserved.
         """
         return bool(getattr(self, "draft", False))
+
+    def metadata_cache_stats(self) -> Tuple[int, int]:
+        """(disk hits, disk misses) of the durable planning packument cache."""
+        return (self._metadata_cache_disk_hits, self._metadata_cache_disk_misses)
 
     def _supervised(self, fn: Any) -> Any:
         """Run one network header phase under the absolute run deadline.
@@ -2887,6 +2915,18 @@ class LiveDataClient:
     def fetch_npm_metadata(self, pkg: str):
         if pkg in self.npm_cache:
             return self.npm_cache[pkg]
+        if self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
+            # C2: planning packument cache -- merge latest/version/engines/
+            # history metadata queries across CLI invocations. Only a fresh
+            # entry is used; install/verifier/audit are untouched.
+            cached = load_packument(
+                self.metadata_cache_dir, self.registry, pkg, self.metadata_cache_ttl
+            )
+            if cached is not None:
+                self.npm_cache[pkg] = cached
+                self._metadata_cache_disk_hits += 1
+                return cached
+            self._metadata_cache_disk_misses += 1
         self.progress(operation="registry metadata", package=pkg, step="scan")
         encoded = pkg.replace("/", "%2F")
         url = f"{self.registry}/{encoded}"
@@ -2909,6 +2949,12 @@ class LiveDataClient:
                 if not isinstance(data, dict):
                     raise ValueError("registry metadata response is not a JSON object")
                 self.npm_cache[pkg] = data
+                if self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
+                    # Best-effort; a cache write failure never aborts the run.
+                    store_packument(
+                        self.metadata_cache_dir, self.registry, pkg, data,
+                        self.metadata_cache_tool_version,
+                    )
                 self._bounded_sleep(self.sleep_sec)
                 return data
             except DraftBudgetExceeded:
@@ -4443,6 +4489,25 @@ def _prefetch_registry_metadata(
     })
     if not names:
         return
+    cache_dir = getattr(client, "metadata_cache_dir", None)
+    cache_ttl = getattr(client, "metadata_cache_ttl", 0.0) or 0.0
+    if cache_dir is not None and cache_ttl > 0:
+        # C2: serve fresh packuments from the durable planning cache and
+        # prefetch only the packages it does not cover yet.
+        missing: List[str] = []
+        for name in names:
+            cached = load_packument(cache_dir, client.registry, name, cache_ttl)
+            if cached is not None:
+                client.npm_cache[name] = cached
+            else:
+                missing.append(name)
+        names = missing
+        if not names:
+            eprint(
+                f"[info] {progress_label}: registry metadata served entirely "
+                "from the planning cache"
+            )
+            return
     if getattr(client, "deadline", None) is not None:
         # Draft: per-package metadata is fetched by the deadline-aware row loop
         # below; a parallel pool would swallow the per-future DraftBudgetExceeded
@@ -26212,6 +26277,8 @@ def main() -> None:
     ap.add_argument("--include-prerelease", action="store_true", help="Consider prerelease versions. Overrides false default only when passed.")
     ap.add_argument("--max-candidates", type=int, help="Limit candidate versions after current; 0 = all. Overrides settings.max-candidates/maxCandidates.")
     ap.add_argument("--timeout", type=int, help="HTTP timeout seconds. Overrides settings.timeout.")
+    ap.add_argument("--registry-metadata-cache", default="", help="Directory for the durable planning packument cache. Empty disables it. Overrides settings.registry-metadata-cache/registryMetadataCache.")
+    ap.add_argument("--registry-metadata-ttl", type=float, help="Freshness bound (seconds) for the planning packument cache; 0 disables it. Overrides settings.registry-metadata-ttl/registryMetadataTtl.")
     ap.add_argument("--skip-release-intel", action="store_true", help="Do not fetch GitHub changelog/release notes.")
     ap.add_argument("--release-intel-max-packages", type=int, help="Maximum action packages to enrich with release notes; 0 = unlimited.")
     ap.add_argument("--no-history-snapshot", action="store_true", help="Do not store an automatic full dashboard snapshot in history/snapshots.")
@@ -26417,6 +26484,22 @@ def main() -> None:
 
     registry = args.registry or settings_get(settings, "registry", default=NPM_REGISTRY)
     timeout = args.timeout if args.timeout is not None else as_int(settings_get(settings, "timeout"), REQUEST_TIMEOUT)
+    # Durable planning packument cache (C2): disabled unless a cache directory
+    # is configured. When enabled it merges latest/version/engines/history
+    # metadata queries across CLI invocations; planning metadata must never be
+    # mistaken for install/verifier/audit authority, so only the metadata path
+    # reads it and a TTL bounds freshness (0 disables the cache entirely).
+    registry_metadata_cache_value = args.registry_metadata_cache or settings_get(settings, "registry-metadata-cache", "registryMetadataCache")
+    metadata_cache_dir = resolve_config_path(str(registry_metadata_cache_value), settings_base, None) if registry_metadata_cache_value else None
+    if metadata_cache_dir is not None:
+        ttl_setting = as_float_optional(settings_get(settings, "registry-metadata-ttl", "registryMetadataTtl"))
+        metadata_cache_ttl = (
+            float(args.registry_metadata_ttl)
+            if args.registry_metadata_ttl is not None
+            else (ttl_setting if ttl_setting is not None else DEFAULT_METADATA_CACHE_TTL_SECONDS)
+        )
+    else:
+        metadata_cache_ttl = 0.0
     configured_candidates = args.max_candidates if args.max_candidates is not None else as_int(settings_get(settings, "max-candidates", "maxCandidates"), 0)
     if args.draft_baseline:
         # Draft keeps the candidate space narrow so a warm-path result is
@@ -26715,7 +26798,13 @@ def main() -> None:
         load_dashboard_state(dashboard_state_path),
         cli_exclusions,
     )
-    client = LiveDataClient(str(registry), timeout, OSV_BATCH_SIZE, RATE_SLEEP_SEC, use_system_proxy=use_system_proxy)
+    client = LiveDataClient(
+        str(registry), timeout, OSV_BATCH_SIZE, RATE_SLEEP_SEC,
+        use_system_proxy=use_system_proxy,
+        metadata_cache_dir=metadata_cache_dir,
+        metadata_cache_ttl=metadata_cache_ttl,
+        metadata_cache_tool_version=tool_build_id(),
+    )
     if args.draft_baseline:
         # Draft: every registry/OSV request is bounded by the remaining run
         # budget (per-request timeout = min(timeout, remaining)) and the budget
@@ -26739,6 +26828,14 @@ def main() -> None:
     eprint(f"[info] dashboard state: {dashboard_state_path}")
     eprint(f"[info] release intelligence: {'enabled' if release_intel_enabled else 'disabled'}")
     eprint(f"[info] system proxy: {'enabled' if use_system_proxy else 'disabled'}")
+    eprint(
+        f"[info] registry metadata cache: {'enabled' if metadata_cache_dir is not None and metadata_cache_ttl > 0 else 'disabled'}"
+        + (
+            f" (dir={metadata_cache_dir}; ttl={metadata_cache_ttl:.0f}s; planning-only)"
+            if metadata_cache_dir is not None and metadata_cache_ttl > 0
+            else ""
+        )
+    )
     if args.draft_baseline:
         eprint("[info] analysis mode: Draft Baseline from source branch; physical verification disabled")
     elif args.capture_baseline:

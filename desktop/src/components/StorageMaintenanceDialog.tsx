@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
 import { X, FolderOpen } from 'lucide-react'
 import { useLanguage } from '../i18n'
+import { useDialogFocus } from '../hooks/useDialogFocus'
 import type { DependencyFlowApi, StorageProgress, StorageResult, StorageStatus } from '../types'
 
 export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress, status }: { status?: StorageStatus; onClose: () => void; onMaintenance: DependencyFlowApi['storageMaintenance']; onProgress: DependencyFlowApi['onStorageProgress'] }) {
   const { language } = useLanguage()
   const text = (ru: string, en: string) => language === 'ru' ? ru : en
+  const rootRef = useRef<HTMLDivElement>(null)
+  useDialogFocus(rootRef, { onClose })
   const [result, setResult] = useState<StorageResult>()
   const [busy, setBusy] = useState(false)
   const [action, setAction] = useState<'inspect' | 'clean'>('inspect')
@@ -92,7 +95,7 @@ export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress, s
   const completed = Boolean(result?.results)
   const canClean = !busy && result && !completed && result.eligible > 0
   const stage = progress?.stage === 'clean' ? text('Удаляем подтверждённый мусор', 'Removing confirmed garbage') : progress?.stage === 'validate' ? text('Повторно проверяем папки перед удалением', 'Rechecking folders before deletion') : text('Измеряем папки и проверяем принадлежность', 'Measuring folders and verifying ownership')
-  return <div className="dialog-backdrop">
+  return <div ref={rootRef} className="dialog-backdrop">
     <section className="dialog workspace-dialog storage-dialog" role="dialog" aria-modal="true" aria-labelledby="storage-title">
       <div className="dialog-title"><h2 id="storage-title">{text('Хранилище и безопасная очистка', 'Storage and safe cleanup')}</h2><button className="icon-button" aria-label={text('Закрыть', 'Close')} onClick={onClose}><X size={17} /></button></div>
       <p>{text('Очистка работает в фоне, диалог можно закрыть. Удаляем подтверждённый мусор; старые снимки уплотняем без потери файлов, одинаковое содержимое храним один раз. Последний результат, отчёты, настройки и рабочие ветки сохраняются.', 'Cleanup runs in the background; you can close this dialog. Remove confirmed garbage; compact historical snapshots losslessly, storing identical contents once. Preserve the latest result, reports, settings and result worktrees.')}</p>
@@ -114,7 +117,7 @@ export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress, s
         {completed ? <p role="status">{text('Очистка завершена', 'Cleanup finished')}: {text('удалено каталогов', 'folders removed')}: {result.removed}; {text('уплотнено снимков', 'snapshots compacted')}: {result.compacted || 0}; {gib(result.reclaimedBytes)} {text('освобождено по объёму файлов', 'reclaimed by file volume')}. {text('Пропущено', 'Skipped')}: {result.protected}; {text('ошибок', 'errors')}: {result.failed}. {text('Свободное место на томах обновлено.', 'Volume free space refreshed.')}</p> : null}
       </> : null}
       {error ? <p role="alert">{error}</p> : null}
-      <div className="dialog-actions"><button className="button secondary" disabled={busy} onClick={() => void run('inspect')}>{text('Диагностика всех хранилищ', 'Inspect all storage')}</button><button className="button primary" disabled={!canClean} onClick={() => void run('clean')}>{text('Очистить весь подтверждённый мусор', 'Clean all confirmed garbage')}</button></div>
+      <div className="dialog-actions"><button className="button secondary" data-autofocus disabled={busy} onClick={() => void run('inspect')}>{text('Диагностика всех хранилищ', 'Inspect all storage')}</button><button className="button primary" disabled={!canClean} onClick={() => void run('clean')}>{text('Очистить весь подтверждённый мусор', 'Clean all confirmed garbage')}</button></div>
     </section>
   </div>
 }

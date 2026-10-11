@@ -1,7 +1,8 @@
 import { Check, Clipboard, ExternalLink, FileText, X } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useRef, useState } from 'react'
 
 import { useLanguage } from '../i18n'
+import { useDialogFocus } from '../hooks/useDialogFocus'
 import type { ProjectPromptPreview } from '../types'
 import { copyTextToClipboard } from '../clipboard'
 
@@ -13,15 +14,9 @@ type Props = {
 
 export function PromptPreviewDialog({ preview, onClose, onOpenPath }: Props) {
   const { text } = useLanguage()
+  const rootRef = useRef<HTMLElement>(null)
   const [copied, setCopied] = useState(false)
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [onClose])
+  useDialogFocus(rootRef, { onClose })
 
   const copyPrompt = async () => {
     const ok = await copyTextToClipboard(preview.content)
@@ -35,7 +30,7 @@ export function PromptPreviewDialog({ preview, onClose, onOpenPath }: Props) {
 
   return (
     <div className="baseline-intent-backdrop" role="presentation">
-      <section className="baseline-intent-dialog" role="dialog" aria-modal="true" aria-labelledby="draft-prompt-title">
+      <section ref={rootRef} className="baseline-intent-dialog" role="dialog" aria-modal="true" aria-labelledby="draft-prompt-title">
         <header className="baseline-intent-header">
           <div>
             <FileText size={18} />
@@ -61,7 +56,7 @@ export function PromptPreviewDialog({ preview, onClose, onOpenPath }: Props) {
         <footer className="baseline-intent-actions">
           <span className="baseline-intent-apply-hint" title={preview.path}>{preview.path}</span>
           <button type="button" className="button secondary" onClick={() => void onOpenPath(preview.path)}><ExternalLink size={16} />{text('Открыть файл', 'Open file')}</button>
-          <button type="button" className="button primary" onClick={() => void copyPrompt()}>{copied ? <Check size={16} /> : <Clipboard size={16} />}{copied ? text('Скопировано', 'Copied') : text('Скопировать промпт', 'Copy prompt')}</button>
+          <button type="button" className="button primary" data-autofocus onClick={() => void copyPrompt()}>{copied ? <Check size={16} /> : <Clipboard size={16} />}{copied ? text('Скопировано', 'Copied') : text('Скопировать промпт', 'Copy prompt')}</button>
         </footer>
       </section>
     </div>

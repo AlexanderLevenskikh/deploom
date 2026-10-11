@@ -211,6 +211,8 @@ jobs:
           npm run check:storage-maintenance
           npm run check:task-clipboard
           npm run check:electron-clipboard
+          npm run check:git-facts-cache
+          npm run check:log-batching
       - name: Version consistency
         working-directory: desktop
         run: test "$(node -p "require('./package.json').version")" = "$(cat ../VERSION)"

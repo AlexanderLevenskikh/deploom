@@ -87,6 +87,9 @@ try {
       try { return { code: 0, stdout: execFileSync(command, args, { cwd, encoding: 'utf8', stdio: 'pipe' }), stderr: '' } }
       catch(error) { return { code: error.status || 1, stdout: '', stderr: String(error.stderr) } }
     },
+    // The production handler detects the repo's default branch (never a
+    // hardcoded 'master'); the fixture pins the branch to prove the wiring.
+    detectDefaultBranch: async () => 'main',
   }
   const layoutStart = mainSource.indexOf('async function resolveProjectGitLayout(')
   const layoutEnd = mainSource.indexOf('function projectPathInWorktree(', layoutStart)
@@ -97,6 +100,7 @@ try {
   let saved = JSON.parse(readFileSync(settingsPath, 'utf8')).projects
   assert.equal(saved[0].path, working)
   assert.equal(saved[0].repositoryPath.toLowerCase(), fs.realpathSync.native(repository).toLowerCase())
+  assert.equal(saved[0].git.sourceBranch, 'main', 'add-project must store the detected default branch, not a hardcoded master')
   await assert.rejects(add(null, { workspaceId: 'ws', name: 'wrong', path: working, repositoryPath: fixture }), /Git/)
   await assert.rejects(add(null, { workspaceId: 'ws', name: 'missing', path: fixture }), /package.json/)
   await add(null, { workspaceId: 'ws', name: 'root-only', path: repository })

@@ -1,4 +1,4 @@
-import { ChevronRight, FolderPlus, RefreshCw, Search, Trash2 } from 'lucide-react'
+import { ChevronRight, FolderPlus, LayoutGrid, RefreshCw, Search, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { useLanguage } from '../i18n'
 import type { ProjectSpec, WorkspaceDetails } from '../types'
@@ -13,9 +13,10 @@ type Props = {
   onAddWorkspace: () => void
   onRemoveWorkspace: () => void
   onRemoveProject: (name: string) => void
+  onOverview: () => void
 }
 
-export function ProjectRail({ details, selected, active, onSelectProject, onRefreshAll, onAddProject, onAddWorkspace, onRemoveWorkspace, onRemoveProject }: Props) {
+export function ProjectRail({ details, selected, active, onSelectProject, onRefreshAll, onAddProject, onAddWorkspace, onRemoveWorkspace, onRemoveProject, onOverview }: Props) {
   const { t } = useLanguage()
   const [query, setQuery] = useState('')
 
@@ -62,6 +63,10 @@ export function ProjectRail({ details, selected, active, onSelectProject, onRefr
         {details.projects.length > 0 && visible.length === 0 ? <p className="empty-copy">{t('projectRail.noMatches')}</p> : null}
       </div>
       <div className="rail-actions">
+        {/* #5: explicit way back to the workspace overview; only shown while a
+            project is selected (in the overview itself there is nothing to
+            leave). */}
+        {selected ? <button className="button secondary wide" disabled={active} onClick={onOverview}><LayoutGrid size={16} /> {t('projectRail.overview')}</button> : null}
         <button className="button secondary wide rail-refresh" disabled={active || details.projects.length === 0} onClick={onRefreshAll}><RefreshCw className={active ? 'spin' : ''} size={16} /> {t('projectRail.refreshAll')}</button>
         <button className="button secondary wide" disabled={active} onClick={onAddProject}><FolderPlus size={17} /> {t('projectRail.addProject')}</button>
         <button className="add-workspace subtle" onClick={onAddWorkspace}><FolderPlus size={16} /> {t('projectRail.workspaceAction')}</button>

@@ -1,6 +1,7 @@
 import { AlertTriangle, Search, ShieldCheck, X } from 'lucide-react'
-import { useDeferredValue, useEffect, useMemo, useState } from 'react'
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { useLanguage } from '../i18n'
+import { useDialogFocus } from '../hooks/useDialogFocus'
 import { attemptsForMinutes, handleDialogBudget, recommendedBudgetMinutes } from '../../electron/baseline-intent'
 import type { BaselineControlMode, BaselineDecision, BaselineIntent, BaselineIntentPlan, BaselinePackagePolicy, BaselineProofMode, BaselineSearchMode } from '../types'
 import { QuickSelect } from './QuickSelect'
@@ -62,6 +63,7 @@ function reconcileDeferredCohorts(cohorts: DeferredCohort[], policies: Record<st
 
 export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, onSubmit }: Props) {
   const { text } = useLanguage()
+  const rootRef = useRef<HTMLElement>(null)
   const [query, setQuery] = useState('')
   const [kind, setKind] = useState<'all' | 'runtime' | 'dev' | 'peer'>('all')
   const [policies, setPolicies] = useState<Record<string, BaselinePackagePolicy>>({ ...plan.intent.policies })
@@ -223,6 +225,9 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
     ))) return
     onCancel()
   }
+  const requestCancelRef = useRef(requestCancel)
+  requestCancelRef.current = requestCancel
+  useDialogFocus(rootRef, { onClose: () => requestCancelRef.current() })
 
   const setPolicy = (name: string, policy: BaselinePackagePolicy) => {
     setPolicies((current) => ({ ...current, [name]: policy }))
@@ -342,7 +347,7 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
 
   return (
     <div className="baseline-intent-backdrop" role="presentation">
-      <section className="baseline-intent-dialog" role="dialog" aria-modal="true" aria-labelledby="baseline-intent-title">
+      <section ref={rootRef} className="baseline-intent-dialog" role="dialog" aria-modal="true" aria-labelledby="baseline-intent-title">
         <header className="baseline-intent-header">
           <div>
             {mode === 'decision' ? <AlertTriangle size={18} /> : <ShieldCheck size={18} />}

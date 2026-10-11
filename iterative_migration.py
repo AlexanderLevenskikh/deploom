@@ -78,7 +78,7 @@ from package_manager_profile import (
     resolve_package_manager_profile,
 )
 from project_topology import ProjectTopologyError, resolve_project_topology
-from resolution_inventory import ResolutionInventory, npm_lock_resolved_version
+from resolution_inventory import ResolutionInventory, canonical_lockfile_path, npm_lock_resolved_version
 from storage_capacity import StorageCapacityError
 from source_snapshot import (
     SourceCaptureError,
@@ -616,9 +616,14 @@ def manifest_and_lock_hashes(project_dir: Path) -> Tuple[str, str, Optional[str]
     if not manifest.exists():
         raise InvalidInputError(f"PROJECT_PACKAGE_JSON_MISSING: {manifest}")
     manifest_hash = _sha256_file(manifest)
-    lock = find_lockfile(project_dir)
-    lock_hash = _sha256_file(lock) if lock else ""
-    return manifest_hash, lock_hash, (str(lock) if lock else None)
+    # A1/B1: the lockfile that governs the project is the CANONICAL one (the
+    # workspace-shared root lockfile for a member), identical to what the
+    # inventory, topology and install use — never a strictly-local look that
+    # returns nothing for a bare member directory. Changing the root lockfile
+    # must change the identity/migration and delivery guards.
+    lock = canonical_lockfile_path(project_dir)
+    lock_hash = _sha256_file(lock) if lock is not None else ""
+    return manifest_hash, lock_hash, (str(lock) if lock is not None else None)
 
 
 def find_lockfile(project_dir: Path) -> Optional[Path]:
@@ -2737,11 +2742,12 @@ _ACTIVE_DISCOVERY_DEADLINE: float = 0.0
 # per `_discover_targets` so every `_installed_version` probe reads the
 # canonical lockfile from memory instead of re-reading and re-parsing it per
 # package — a 10k-record lockfile is parsed once, not once per direct
-# dependency. A contextvar (not a plain global) propagates into the probe
-# workers of the parallel branch: ThreadPoolExecutor copies the enclosing
-# context into each thread, so every worker sees the same read-only inventory.
-# It is restored in ``finally``; `_installed_version` falls back to building
-# the inventory on demand when none is active.
+# dependency. A contextvar (not a plain global) lets sequential probes read it
+# directly. It is restored in ``finally``; `_installed_version` falls back to
+# building the inventory on demand when none is active. Python 3.14 no longer
+# copies contextvars into ThreadPoolExecutor workers, so the parallel branch
+# hands the same read-only instance to every worker explicitly (each worker
+# sets the contextvar for the duration of its probe).
 _ACTIVE_INVENTORY: "contextvars.ContextVar[Optional[ResolutionInventory]]" = contextvars.ContextVar(
     "iterative_active_resolution_inventory", default=None
 )
@@ -3487,13 +3493,13 @@ def _discover_targets(
     if deadline is not None:
         _ACTIVE_DISCOVERY_DEADLINE = deadline
     # C1: parse the canonical lockfile ONCE for the whole phase and expose it
-    # through the contextvar, so every sequential probe and every parallel
-    # worker (`_ACTIVE_INVENTORY` is a contextvar and ThreadPoolExecutor copies
-    # the enclosing context into each thread) reads the same read-only
-    # inventory instead of re-reading the lockfile per package. An outer phase
-    # (adaptive waves) already holds a fresh inventory for the SAME project and
-    # is reused; anything else is rebuilt for this project_dir. The token
-    # restores the previous value in ``finally``.
+    # through the contextvar, so every sequential probe reads the same
+    # read-only inventory instead of re-reading the lockfile per package. An
+    # outer phase (adaptive waves) already holds a fresh inventory for the
+    # SAME project and is reused; anything else is rebuilt for this project_dir.
+    # Python 3.14 does not copy contextvars into ThreadPoolExecutor workers, so
+    # the parallel branch passes this same instance explicitly to every probe.
+    # The token restores the previous value in ``finally``.
     phase_inventory = _ACTIVE_INVENTORY.get()
     if phase_inventory is None or not phase_inventory.belongs_to(project_dir):
         phase_inventory = ResolutionInventory.for_project(project_dir)
@@ -3523,23 +3529,33 @@ def _discover_targets(
 
         lock = threading.Lock()
 
-        def probe(item: Tuple[str, str]) -> Tuple[Optional[str], str, Dict[str, Any]]:
-            name, declared = item
-            if deadline is not None and _after_deadline(deadline):
-                return None, name, {
-                    "package": name, "declared": declared,
-                    "status": "discovery-budget-skipped",
-                    "reason": _budget_skip_reason(name, "wall-clock budget exhausted"),
-                }
+        def probe(item: Tuple[str, str], inventory: Optional[ResolutionInventory] = phase_inventory) -> Tuple[Optional[str], str, Dict[str, Any]]:
+            # Python 3.14 does not propagate contextvars into ThreadPoolExecutor
+            # workers, so the same read-only instance is handed in explicitly;
+            # it is immutable after construction, safe to share across threads.
+            # Each worker sets the contextvar for `_installed_version` to see
+            # during its own probe and restores it before returning.
+            token = _ACTIVE_INVENTORY.set(inventory) if inventory is not None else None
             try:
-                target, row = _discover_one_target(project_dir, name, declared, runtime_env, node_version)
-                return target, name, row
-            except Exception:  # noqa: BLE001 - a probe failure is an abstention, never a constraint
-                return None, name, {
-                    "package": name, "declared": declared,
-                    "status": "discovery-budget-skipped",
-                    "reason": _budget_skip_reason(name, "probe failed unexpectedly"),
-                }
+                name, declared = item
+                if deadline is not None and _after_deadline(deadline):
+                    return None, name, {
+                        "package": name, "declared": declared,
+                        "status": "discovery-budget-skipped",
+                        "reason": _budget_skip_reason(name, "wall-clock budget exhausted"),
+                    }
+                try:
+                    target, row = _discover_one_target(project_dir, name, declared, runtime_env, node_version)
+                    return target, name, row
+                except Exception:  # noqa: BLE001 - a probe failure is an abstention, never a constraint
+                    return None, name, {
+                        "package": name, "declared": declared,
+                        "status": "discovery-budget-skipped",
+                        "reason": _budget_skip_reason(name, "probe failed unexpectedly"),
+                    }
+            finally:
+                if token is not None:
+                    _ACTIVE_INVENTORY.reset(token)
 
         with ThreadPoolExecutor(max_workers=parallelism) as pool:
             futures = {pool.submit(probe, item): item for item in names}

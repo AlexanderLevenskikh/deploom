@@ -1,6 +1,7 @@
 import { AlertTriangle, Check, Copy, X } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { useLanguage } from '../i18n'
+import { useDialogFocus } from '../hooks/useDialogFocus'
 import type { LagBlocker, TargetClosure } from '../types'
 import { copyTextToClipboard } from '../clipboard'
 
@@ -16,7 +17,9 @@ function blockerRows(blockers: LagBlocker[]): LagBlocker[] {
 
 export function GoalDetailsModal({ closure, projectName, onClose }: Props) {
   const { t, text } = useLanguage()
+  const rootRef = useRef<HTMLDivElement>(null)
   const [copied, setCopied] = useState(false)
+  useDialogFocus(rootRef, { onClose })
   const fixable = useMemo(() => blockerRows(closure.lagBlockers.filter((blocker) => Boolean(blocker.plannedTarget))), [closure.lagBlockers])
   const stuck = useMemo(() => blockerRows(closure.lagBlockers.filter((blocker) => !blocker.plannedTarget)), [closure.lagBlockers])
   const targetLabel = closure.target === 'yellow' ? t('levels.yellow') : t('levels.green')
@@ -53,7 +56,7 @@ export function GoalDetailsModal({ closure, projectName, onClose }: Props) {
   }
 
   return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label={t('goal.title', { target: targetLabel })} onClick={onClose}>
+    <div ref={rootRef} className="modal-backdrop" role="dialog" aria-modal="true" aria-label={t('goal.title', { target: targetLabel })} onClick={onClose}>
       <div className="modal-card" onClick={(event) => event.stopPropagation()}>
         <div className="modal-head">
           <div><AlertTriangle size={18} className="warning-text" /><strong>{t('goal.title', { target: targetLabel })}</strong></div>
@@ -101,7 +104,7 @@ export function GoalDetailsModal({ closure, projectName, onClose }: Props) {
 
         <div className="modal-actions">
           <button className="button secondary" onClick={() => void copy()}>{copied ? <Check size={16} /> : <Copy size={16} />} {copied ? t('common.copied') : t('goal.copyDetails')}</button>
-          <button className="button primary" onClick={onClose}>{t('common.understood')}</button>
+          <button className="button primary" data-autofocus onClick={onClose}>{t('common.understood')}</button>
         </div>
       </div>
     </div>

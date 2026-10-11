@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
 from pathlib import Path
 from typing import Mapping, Optional
 from project_topology import ProjectTopologyError, resolve_project_topology
@@ -166,6 +167,32 @@ def threading_get_ident() -> int:
     return threading.get_ident()
 
 
+# Restore of a SHARED lockfile needs mutual exclusion, not just identity.
+# The resolved-state key binds *content identity*: it proves exactly which
+# bytes belong to a state, but it cannot by itself stop two verification
+# attempts from concurrently restoring the same lockfile pathname (for example
+# one root lockfile shared by several monorepo packages). os.replace already
+# prevents a torn byte stream. The hash assertion detects observed drift, but
+# does not grant cross-process exclusion or lock the following install. Actual
+# verifier installs run in isolated clones, each with its own root lockfile.
+# The per-path lock below makes
+# write+verify one atomic critical section per pathname within this process, so
+# concurrent restores of the same shared lockfile are serialized instead of
+# interleaving their critical sections.
+_RESTORE_TARGET_LOCKS: dict[str, threading.Lock] = {}
+_RESTORE_TARGET_LOCKS_GUARD = threading.Lock()
+
+
+def _restore_target_lock(target: Path) -> threading.Lock:
+    key = os.path.normcase(str(Path(target).resolve()))
+    with _RESTORE_TARGET_LOCKS_GUARD:
+        lock = _RESTORE_TARGET_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _RESTORE_TARGET_LOCKS[key] = lock
+        return lock
+
+
 def resolved_state_metadata(state: ResolvedDependencyState) -> dict[str, str]:
     return {
         "resolvedStateKey": state.key,
@@ -253,11 +280,12 @@ def restore_resolved_dependency_state(
     project_dir: Path, state: ResolvedDependencyState
 ) -> Path:
     target = resolved_lockfile_path(project_dir, state)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f"{target.name}.deploom-resolved-{os.getpid()}.tmp")
-    temporary.write_bytes(state.lockfile_bytes)
-    os.replace(temporary, target)
-    assert_resolved_dependency_state(project_dir, state)
+    with _restore_target_lock(target):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f"{target.name}.deploom-resolved-{os.getpid()}.tmp")
+        temporary.write_bytes(state.lockfile_bytes)
+        os.replace(temporary, target)
+        assert_resolved_dependency_state(project_dir, state)
     return target
 
 

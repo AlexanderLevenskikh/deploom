@@ -12,7 +12,7 @@ import { buildClaudeAgentArgs, buildClaudeResumeArgs, buildCodexAgentArgs, build
 import { AGENT_LAUNCH_RETRY_BUDGET, agentRepairActivity, agentLaunchProviderError, agentLaunchRetryDelayMs, canRetryAgentLaunch, classifyAgentLaunchFailure, redactAgentDiagnostics, type AgentLaunchDiagnostics } from './agent-launch-errors.js'
 import { agentBatchCompletionFingerprint, agentScopeFingerprint, extractAgentSessionId, resumableAgentSessionId } from './agent-session.js'
 import { restoreVerifiedAgentCompletion, updateFlowProgress, type FlowAction } from './flow-state.js'
-import { adoptEmptyContinuationBranches, adoptHistoricalContinuationBranches, adoptPreferredScopeBranches, buildMigrationProgress, continuationMigrationPlan, integratedBranchTargets, leftoverConflictMarkerLines, liveGitWorktreeRecords, mergeInProgressNote, mergePackageJsonThreeWay, migrationBranchStateText, migrationCompletionIssues, migrationBatchScopeDriftIssues, migrationGroupScopeDriftIssues, migrationPlanFromPrompt, migrationScopeManifestFromPrompt, migrationStateSummary, nextIncompleteMigrationBranch, recoverContinuationScopeBranches, rebindMigrationPromptBranchIdentity, replaceMigrationPlanInPrompt, relevantGitStatus, relevantGitStatusLines, workspaceNoiseGitExcludePathspecs, rollbackIncompleteMigrationActions, satisfiedScopePackagesFromPrompt, scopeActionsFromPrompt, scopeTargetsFromPrompt, validateScopeProofEnvelope, type MigrationBranchProgress, type MigrationBranchRuntime, type MigrationBranchRuntimePhase, type MigrationPlan, type MigrationProgress } from './migration-progress.js'
+import { adoptEmptyContinuationBranches, adoptHistoricalContinuationBranches, adoptPreferredScopeBranches, buildMigrationProgress, continuationMigrationPlan, integratedBranchTargets, GIT_FACTS_CACHE_TTL_MS, leftoverConflictMarkerLines, liveGitWorktreeRecords, mergeInProgressNote, mergePackageJsonThreeWay, migrationBranchStateText, migrationCompletionIssues, migrationBatchScopeDriftIssues, migrationFactsFingerprint, migrationGroupScopeDriftIssues, migrationPlanFromPrompt, migrationScopeManifestFromPrompt, migrationStateSummary, nextIncompleteMigrationBranch, recoverContinuationScopeBranches, rebindMigrationPromptBranchIdentity, replaceMigrationPlanInPrompt, relevantGitStatus, relevantGitStatusLines, workspaceNoiseGitExcludePathspecs, rollbackIncompleteMigrationActions, satisfiedScopePackagesFromPrompt, scopeActionsFromPrompt, scopeTargetsFromPrompt, validateScopeProofEnvelope, type MigrationBranchProgress, type MigrationBranchRuntime, type MigrationBranchRuntimePhase, type MigrationPlan, type MigrationProgress } from './migration-progress.js'
 import { buildGroupScopedPrompt, buildProjectPrompt } from './prompt-harness.js'
 import { rebindOperationalProjectPath } from './prompt-paths.js'
 import { buildAgentExecutionBatches } from './agent-batching.js'
@@ -24,7 +24,7 @@ import { buildGroupVerificationRepairPrompt } from './group-repair.js'
 import { batchRoadmapDocument, replaceRoadmapPath } from './roadmap-dossier.js'
 import { latestAgentCheckpoint } from './agent-checkpoint.js'
 import { applyBranchBase, projectBranchNames, preferNewestProjectLevels, projectLevelsFromHistorySnapshots, projectLevelsFromRoadmap, type ProjectLevel } from './project-settings.js'
-import { PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH, PROJECT_MANIFEST_DISCOVERY_DEEP_SCAN_DEPTH, deepScanSuggestion, discoverProjectDirectories, resolveProjectPackageSelection, serializeDiscoveryReport, type SerializedDiscoveryReport } from './project-discovery.js'
+import { PROJECT_MANIFEST_DISCOVERY_DEFAULT_MAX_ENTRIES, PROJECT_MANIFEST_DISCOVERY_DEFAULT_TIME_BUDGET_MS, PROJECT_MANIFEST_DISCOVERY_DEEP_SCAN_DEPTH, PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH, deepScanSuggestion, discoverProjectDirectoriesBounded, resolveProjectPackageSelection, selectionFromReport, serializeDiscoveryReport, type SerializedDiscoveryReport } from './project-discovery.js'
 import { releaseBranchForAction } from './publication.js'
 import { releaseGateCommands, releasePolicyForProject } from './release-policy.js'
 import { buildMergeRecoveryPrompt } from './merge-recovery.js'
@@ -1068,6 +1068,31 @@ function projectPathInWorktree(worktreeRoot: string, packageRelativePath: string
   return packageRelativePath ? join(worktreeRoot, ...packageRelativePath.split('/')) : worktreeRoot
 }
 
+function cleanGitBranch(stdout: string): string | undefined {
+  const branch = stdout.trim().split(/\s+/)[0]
+  return branch && branch.length <= 256 ? branch : undefined
+}
+
+/**
+ * Detect the repository's default branch for a newly added project: the remote
+ * HEAD (``refs/remotes/origin/HEAD``) when the remote advertises one, otherwise
+ * the currently checked-out branch. Never fabricates ``master`` — a project on
+ * ``main`` would otherwise be registered against a branch that does not exist.
+ */
+async function detectDefaultBranch(gitRoot: string): Promise<string> {
+  const viaRemote = await spawnCapture('git', ['-C', gitRoot, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], gitRoot, 15_000)
+  if (!viaRemote.timedOut && viaRemote.code === 0) {
+    const branch = cleanGitBranch(viaRemote.stdout)
+    if (branch) return branch.replace(/^origin\//, '')
+  }
+  const viaHead = await spawnCapture('git', ['-C', gitRoot, 'symbolic-ref', '--short', 'HEAD'], gitRoot, 15_000)
+  if (!viaHead.timedOut && viaHead.code === 0) {
+    const branch = cleanGitBranch(viaHead.stdout)
+    if (branch) return branch
+  }
+  throw new Error('Не удалось определить ветку по умолчанию Git-репозитория; укажите sourceBranch вручную.')
+}
+
 function projectTreePath(packageRelativePath: string, fileName: string): string {
   return packageRelativePath ? `${packageRelativePath}/${fileName}` : fileName
 }
@@ -1705,39 +1730,90 @@ const AGENT_EXECUTION_BATCH_MAX_PACKAGES = 6
 const MAX_AUTONOMOUS_STAGE_RECOVERY_CYCLES = 8
 const PLANNER_ATTEMPT_TIMEOUT_MS = 6 * 60_000
 
-async function readMigrationProgress(workspace: WorkspaceRecord, project: ProjectSpec): Promise<MigrationProgress | undefined> {
+// C3: an idle poll must not re-run the ref-containment and per-branch
+// package-facts grid. The cheap reads (HEAD, branch, porcelain status, worktree
+// list, prompt file, ref OIDs) gate the expensive grid through a fingerprint
+// (migrationFactsFingerprint) that changes whenever a ref's object id moves, so
+// a dirty state or an external Git action is picked up within one poll interval
+// instead of being cached away. The TTL constant (GIT_FACTS_CACHE_TTL_MS) lives
+// in migration-progress.ts so contract checks can assert it covers the poll
+// intervals.
+type ImmutableMigrationFacts = {
+  emptyBranches: string[]
+  containment: Array<readonly [string, Set<string>]>
+  mergedPackageJson: unknown | undefined
+  branchPackages: Array<readonly [string, unknown]>
+}
+type MigrationFactsCacheEntry = { fingerprint: string; takenAt: number; facts: ImmutableMigrationFacts }
+const migrationFactsCache = new Map<string, MigrationFactsCacheEntry>()
+
+
+async function readMigrationProgress(workspace: WorkspaceRecord, project: ProjectSpec, options: { cacheImmutableFacts?: boolean } = {}): Promise<MigrationProgress | undefined> {
   const promptPath = promptPathForProject(workspace, project.name)
   if (!promptPath || !existsSync(promptPath)) return undefined
   const promptMarkdown = readFileSync(promptPath, 'utf8')
   const plan = migrationPlanFromPrompt(promptMarkdown, project.name)
   if (!plan) return undefined
   const git = (args: string[]) => spawnCapture('git', ['-C', project.path, ...args], project.path, GIT_QUERY_TIMEOUT_MS)
-  const [refsResult, branchResult, statusResult, worktreeResult] = await Promise.all([
-    git(['for-each-ref', '--format=%(refname:short)', 'refs/heads', 'refs/remotes/origin']),
+  const [refsResult, branchResult, statusResult, worktreeResult, headResult] = await Promise.all([
+    git(['for-each-ref', '--format=%(refname:short)%09%(objectname)', 'refs/heads', 'refs/remotes/origin']),
     git(['branch', '--show-current']),
     git(['status', '--porcelain']),
     git(['worktree', 'list', '--porcelain']),
+    git(['rev-parse', 'HEAD']),
   ])
   if (refsResult.code !== 0) return undefined
-  let trustworthy = ![refsResult, branchResult, statusResult, worktreeResult].some((result) => result.timedOut || result.code !== 0)
+  let trustworthy = ![refsResult, branchResult, statusResult, worktreeResult, headResult].some((result) => result.timedOut || result.code !== 0)
   const worktreePaths = new Map<string, string>()
   if (worktreeResult.code === 0) {
     for (const record of liveGitWorktreeRecords(worktreeResult.stdout)) {
       if (record.branch && existsSync(record.path)) worktreePaths.set(record.branch, record.path)
     }
   }
-  const refs = refsResult.stdout.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
+  // Name + object id per ref: the name feeds the containment logic, the OID
+  // feeds the cache fingerprint so a moved ref target invalidates instead of
+  // letting a stale grid ride out the TTL window.
+  const refRows = refsResult.stdout.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
+  const refs = refRows.map((row) => row.split('\t')[0])
+  const refOids = refRows.map((row) => row.split('\t')[1] ?? '')
+  const refObjectIds = new Map(refs.map((ref, index) => [ref, refOids[index]]))
   const refSet = new Set(refs)
+  // Unchanged cheap state means unchanged facts: skip the containment grid, the
+  // merged-branch package reads and the per-worktree probes entirely.
+  let promptMtimeMs = 0
+  let promptSize = 0
+  try {
+    const promptStat = statSync(promptPath)
+    promptMtimeMs = promptStat.mtimeMs
+    promptSize = promptStat.size
+  } catch { /* statting is best-effort; a missing prompt is a cache miss by 0 */ }
+  const fingerprint = migrationFactsFingerprint({
+    projectPath: project.path,
+    head: headResult.stdout.trim(),
+    branch: branchResult.stdout.trim(),
+    refs,
+    refOids,
+    statusLines: relevantGitStatusLines(statusResult.stdout),
+    worktrees: worktreeResult.stdout,
+    promptMtimeMs,
+    promptSize,
+    promptContentHash: createHash('sha256').update(promptMarkdown).digest('hex'),
+  })
+  // Only the UI poll may reuse committed facts. Execution/integration guards
+  // take the default fresh path, and a failed cheap read can never hit a cache.
+  const cachedFacts = options.cacheImmutableFacts && trustworthy ? migrationFactsCache.get(project.path) : undefined
+  const reusableFacts = cachedFacts && cachedFacts.fingerprint === fingerprint && Date.now() - cachedFacts.takenAt < GIT_FACTS_CACHE_TTL_MS
+    ? cachedFacts.facts : undefined
   const selectRef = (branch: string) => refSet.has(branch) ? branch : refSet.has(`origin/${branch}`) ? `origin/${branch}` : undefined
   const localName = (ref: string) => ref.startsWith('origin/') ? ref.slice('origin/'.length) : ref
   const mergedRef = selectRef(plan.mergedBranch)
-  const emptyBranchResult = mergedRef
+  const emptyBranchResult = !reusableFacts && mergedRef
     ? await git(['for-each-ref', '--points-at=' + mergedRef, '--format=%(refname:short)', 'refs/heads', 'refs/remotes/origin'])
     : undefined
   if (emptyBranchResult && (emptyBranchResult.timedOut || emptyBranchResult.code !== 0)) trustworthy = false
-  const emptyBranches = emptyBranchResult?.code === 0
+  const emptyBranches = reusableFacts?.emptyBranches ?? (emptyBranchResult?.code === 0
     ? emptyBranchResult.stdout.split(/\r?\n/).map((item) => localName(item.trim())).filter(Boolean)
-    : []
+    : [])
   const plannedRefs = new Map(plan.branches.flatMap(({ branch }) => {
     const ref = selectRef(branch)
     return ref ? [[branch, ref] as const] : []
@@ -1745,7 +1821,7 @@ async function readMigrationProgress(workspace: WorkspaceRecord, project: Projec
   // One `--contains` query per work branch answers both "is it in merged" and
   // "did it land somewhere else instead", replacing the previous N x N grid of
   // `merge-base` processes that was re-spawned on every refresh.
-  const containment = await Promise.all([...plannedRefs].map(async ([branch, branchRef]) => {
+  const containment = reusableFacts?.containment ?? await Promise.all([...plannedRefs].map(async ([branch, branchRef]) => {
     const result = await git(['for-each-ref', `--contains=${branchRef}`, '--format=%(refname:short)', 'refs/heads', 'refs/remotes/origin'])
     if (result.timedOut || result.code !== 0) trustworthy = false
     const containers = new Set(result.stdout.split(/\r?\n/).map((item) => localName(item.trim())).filter(Boolean))
@@ -1758,7 +1834,7 @@ async function readMigrationProgress(workspace: WorkspaceRecord, project: Projec
   const { packageRelativePath } = await resolveProjectGitLayout(project)
   const packageJsonTreePath = projectTreePath(packageRelativePath, 'package.json')
   const packageJsonAtRef = async (ref: string): Promise<unknown | undefined> => {
-    const result = await git(['show', `${ref}:${packageJsonTreePath}`])
+    const result = await git(['show', `${refObjectIds.get(ref) || ref}:${packageJsonTreePath}`])
     if (result.timedOut || result.code !== 0) return undefined
     try {
       return JSON.parse(result.stdout) as unknown
@@ -1772,7 +1848,7 @@ async function readMigrationProgress(workspace: WorkspaceRecord, project: Projec
   // The gate asks whether the *merged* branch reached the agreed targets. Only
   // when that branch does not exist yet is the working tree a meaningful
   // stand-in, and then the answer is labelled as such.
-  const mergedPackageJson = mergedRef ? await packageJsonAtRef(mergedRef) : undefined
+  const mergedPackageJson = reusableFacts ? reusableFacts.mergedPackageJson : mergedRef ? await packageJsonAtRef(mergedRef) : undefined
   if (mergedRef && mergedPackageJson === undefined) trustworthy = false
   let satisfiedPackages = scopeAt(mergedPackageJson)
   let factsRef = mergedRef ? plan.mergedBranch : ''
@@ -1782,10 +1858,15 @@ async function readMigrationProgress(workspace: WorkspaceRecord, project: Projec
       satisfiedPackages = satisfiedScopePackagesFromPrompt(promptMarkdown, project.name, JSON.parse(readFileSync(join(project.path, 'package.json'), 'utf8')))
     } catch { /* the canonical validator reports malformed project/scope data */ }
   }
-  const branchScopes = await Promise.all([...plannedRefs].map(async ([branch, branchRef]) => {
-    const satisfied = scopeAt(await packageJsonAtRef(branchRef))
-    return satisfied ? [[branch, satisfied] as const] : []
+  const branchPackages = reusableFacts?.branchPackages ?? await Promise.all([...plannedRefs].map(async ([branch, branchRef]) => {
+    const packageJson = await packageJsonAtRef(branchRef)
+    if (packageJson === undefined) trustworthy = false
+    return [branch, packageJson] as const
   }))
+  const branchScopes = branchPackages.flatMap(([branch, packageJson]) => {
+    const satisfied = scopeAt(packageJson)
+    return satisfied ? [[branch, satisfied] as const] : []
+  })
   // Branch refs intentionally remain the completion gate, but an interrupted
   // parallel worker can have valuable uncommitted progress in its own
   // worktree. Read that live package.json for display and resume decisions so
@@ -1819,7 +1900,15 @@ async function readMigrationProgress(workspace: WorkspaceRecord, project: Projec
   const executionCompletedBranches = runState?.executionContractVersion === 2
     ? new Set(runState.completedMigrationBranches ?? [])
     : undefined
-  return buildMigrationProgress({
+  // A ref can move while the grid/worktree probes run. Do not bind mixed
+  // observations to the earlier fingerprint or give them guard authority.
+  if (!reusableFacts) {
+    const confirmedRefs = await git(['for-each-ref', '--format=%(refname:short)%09%(objectname)', 'refs/heads', 'refs/remotes/origin'])
+    const confirmedRows = confirmedRefs.stdout.split(/\r?\n/).map((row) => row.trim()).filter(Boolean)
+    if (confirmedRefs.timedOut || confirmedRefs.code !== 0 || confirmedRows.join('\n') !== refRows.join('\n')) trustworthy = false
+    if (trustworthy) migrationFactsCache.set(project.path, { fingerprint, takenAt: Date.now(), facts: { emptyBranches, containment, mergedPackageJson, branchPackages } })
+  }
+  const progress = buildMigrationProgress({
     plan,
     refs,
     currentBranch: branchResult.stdout.trim(),
@@ -1827,7 +1916,7 @@ async function readMigrationProgress(workspace: WorkspaceRecord, project: Projec
     dirtyChanges,
     integratedBranches,
     satisfiedPackages,
-    branchSatisfiedPackages: Object.fromEntries(branchScopes.flat()),
+    branchSatisfiedPackages: Object.fromEntries(branchScopes),
     branchWorktreeSatisfiedPackages: Object.fromEntries(liveWorktrees.flatMap((item) => item.satisfied ? [[item.branch, item.satisfied] as const] : [])),
     branchWorktreeDirtyChanges: Object.fromEntries(liveWorktrees.map((item) => [item.branch, item.dirtyChanges])),
     branchWorktreePaths: Object.fromEntries(liveWorktrees.map((item) => [item.branch, item.worktreePath])),
@@ -1838,6 +1927,7 @@ async function readMigrationProgress(workspace: WorkspaceRecord, project: Projec
     ...(factsCommit ? { factsCommit } : {}),
     trustworthy,
   })
+  return progress
 }
 
 async function mergeInProgress(projectPath: string): Promise<boolean> {
@@ -2453,7 +2543,7 @@ async function workspaceDetails(workspace: WorkspaceRecord): Promise<WorkspaceDe
   const project = projects.find((item) => item.name === workspace.selectedProject) ?? projects[0]
   const dashboardPath = project ? projectDashboardPath(workspace, project.name) : undefined
   const projectDashboardExists = Boolean(project && dashboardPath && existsSync(dashboardPath) && dashboardHasProject(workspace, project.name))
-  const migrationProgress = project ? await readMigrationProgress(workspace, project) : undefined
+  const migrationProgress = project ? await readMigrationProgress(workspace, project, { cacheImmutableFacts: true }) : undefined
   let teamState = reconcileTeamState(workspace, project, migrationProgress)
   // Upgrade legacy/on-disk states in memory so the UI can offer recovery even
   // when the failure happened before recovery metadata existed (the concrete
@@ -7078,11 +7168,18 @@ function setupIpc(): void {
     const inputPath = String(raw?.path ?? '').trim()
     if (!inputPath) throw new Error('Укажите папку для сканирования.')
     const maxDepth = raw?.deep ? PROJECT_MANIFEST_DISCOVERY_DEEP_SCAN_DEPTH : PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH
-    const selection = resolveProjectPackageSelection(inputPath, maxDepth)
-    const report: SerializedDiscoveryReport = selection.status === 'explicit'
+    // Bounded, async: the scan shares one entry/time budget across the whole
+    // traversal and yields to the event loop, so a huge tree never blocks the
+    // main thread and never returns an unbounded page.
+    const report = await discoverProjectDirectoriesBounded(inputPath, maxDepth, {
+      maxEntries: PROJECT_MANIFEST_DISCOVERY_DEFAULT_MAX_ENTRIES,
+      timeBudgetMs: PROJECT_MANIFEST_DISCOVERY_DEFAULT_TIME_BUDGET_MS,
+    })
+    const selection = selectionFromReport(inputPath, report)
+    const serialized: SerializedDiscoveryReport = selection.status === 'explicit'
       ? serializeDiscoveryReport({ root: resolve(inputPath), maxDepth, candidates: [], truncated: false, deeperManifests: 0, deepestSeen: 0 })
       : serializeDiscoveryReport(selection.report)
-    return { status: selection.status, path: selection.path, report, deep: raw?.deep === true }
+    return { status: selection.status, path: selection.path, report: serialized, deep: raw?.deep === true }
   })
 
   ipcMain.handle('flow:add-project', async (_event, raw: { workspaceId?: string; name: string; path: string; packagePath?: string; repositoryPath?: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }) => {
@@ -7090,7 +7187,9 @@ function setupIpc(): void {
     const workspace = findWorkspace(state, raw.workspaceId)
     const selectedPath = resolve(raw.path)
     const projectPath = raw.packagePath?.trim() ? resolve(raw.packagePath.trim()) : selectedPath
-    if (!existsSync(join(projectPath, 'package.json'))) throw new Error('Выберите рабочую директорию с package.json. Подпроекты автоматически не выбираются.')
+    let manifestIsFile = false
+    try { manifestIsFile = statSync(join(projectPath, 'package.json')).isFile() } catch { manifestIsFile = false }
+    if (!manifestIsFile) throw new Error('Выберите рабочую директорию с package.json. Подпроекты автоматически не выбираются.')
     const gitProbe = await spawnCapture('git', ['-C', projectPath, 'rev-parse', '--is-inside-work-tree'], projectPath, 15_000)
     if (gitProbe.timedOut || gitProbe.code !== 0 || gitProbe.stdout.trim().toLowerCase() !== 'true') {
       throw new Error('Папка проекта не находится внутри Git-репозитория.')
@@ -7099,6 +7198,10 @@ function setupIpc(): void {
     if (raw.repositoryPath?.trim() && relative(realpathSync.native(resolve(raw.repositoryPath.trim())), layout.gitRoot) !== '') {
       throw new Error(`Git-репозиторий рабочей директории: ${layout.gitRoot}. Укажите его корень.`)
     }
+    // A bare `master` default would break repos whose default branch is `main`
+    // or `develop`; detect the repo's actual default branch (origin/HEAD, then
+    // the current branch) when the user did not pin one.
+    const sourceBranch = raw.sourceBranch?.trim() ? raw.sourceBranch.trim() : await detectDefaultBranch(layout.gitRoot)
     const settingsPath = resolveSettingsPath(workspace)
     const settings = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, 'utf8')) as Record<string, unknown> : { schemaVersion: 1 }
     const projects = Array.isArray(settings.projects) ? settings.projects as ProjectSpec[] : []
@@ -7106,7 +7209,7 @@ function setupIpc(): void {
     projects.push({
       name: raw.name.trim(), path: projectPath, repositoryPath: layout.gitRoot,
       git: {
-        sourceBranch: raw.sourceBranch?.trim() || 'master',
+        sourceBranch,
         baseBranch: raw.baseBranch?.trim() || 'libs',
         branchPrefix: raw.baseBranch?.trim() || 'libs',
         mergedBranch: raw.mergedBranch?.trim() || `${raw.baseBranch?.trim() || 'libs'}-merged`,

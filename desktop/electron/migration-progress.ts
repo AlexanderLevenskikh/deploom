@@ -136,6 +136,49 @@ export function relevantGitStatus(porcelainOutput: string): string {
   return relevantGitStatusLines(porcelainOutput).join('\n')
 }
 
+// C3: the git-facts cache TTL must cover both poll intervals (3s while an
+// agent run is active, 10s when idle), otherwise every idle poll would re-run
+// the expensive ref-containment and package-facts grid and the cache would be
+// useless. A longer TTL is safe because migrationFactsFingerprint includes each
+// ref's object id: any real Git change shifts the fingerprint and re-runs the
+// grid on that exact poll instead of being cached away.
+export const GIT_FACTS_CACHE_TTL_MS = 15_000
+
+// Polling reads migration facts several times a second while an agent builds.
+// The fingerprint binds the immutable containment/committed-manifest grid.
+// Mutable runtime, completion state and other worktree contents are read on
+// every poll; they cannot be replaced by a cached MigrationProgress.
+// refOids carry each ref's current object id, so a moved ref target (a fresh
+// commit, a force-push) invalidates the fingerprint even though the ref NAME
+// stayed the same — name-only fingerprints would let a stale containment grid
+// ride out a TTL window.
+export function migrationFactsFingerprint(input: {
+  projectPath: string
+  head: string
+  branch: string
+  refs: string[]
+  refOids?: string[]
+  promptContentHash?: string
+  statusLines: string[]
+  worktrees: string
+  promptMtimeMs: number
+  promptSize: number
+}): string {
+  const digest = createHash('sha256')
+  const write = (part: string) => { digest.update(part); digest.update('\u0000') }
+  write(input.projectPath)
+  write(input.head)
+  write(input.branch)
+  write(input.refs.join('\u0001'))
+  write((input.refOids ?? []).join('\u0001'))
+  write(input.promptContentHash ?? '')
+  write(input.statusLines.join('\u0001'))
+  write(input.worktrees)
+  write(String(input.promptMtimeMs))
+  write(String(input.promptSize))
+  return digest.digest('hex')
+}
+
 // `??` (untracked) porcelain entries can't reflect an unmerged branch — a stray, ungitignored
 // file unrelated to the migration shouldn't block completion or burn auto-resume attempts.
 export function countTrackedDirtyChanges(porcelainOutput: string): number {

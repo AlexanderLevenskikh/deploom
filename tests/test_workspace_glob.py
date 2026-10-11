@@ -50,6 +50,19 @@ class MatchSemanticsTests(unittest.TestCase):
         self.assertTrue(match_workspace_pattern("packages/app", "packages/**"))
         self.assertTrue(match_workspace_pattern("packages/group/deep/app", "packages/**"))
 
+    def test_middle_globstar_allows_zero_intermediate_folders(self) -> None:
+        self.assertTrue(match_workspace_pattern("packages/app", "packages/**/app"))
+        self.assertTrue(match_workspace_pattern("packages/team/app", "packages/**/app"))
+        self.assertTrue(match_workspace_pattern("packages/team/group/app", "packages/**/app"))
+        self.assertFalse(match_workspace_pattern("packages/app/x", "packages/**/app"))
+        self.assertFalse(match_workspace_pattern("vendor/app", "packages/**/app"))
+
+    def test_leading_globstar_allows_zero_intermediate_folders(self) -> None:
+        self.assertTrue(match_workspace_pattern("packages/app", "**/packages/app"))
+        self.assertTrue(match_workspace_pattern("packages/app", "**/app"))
+        self.assertTrue(match_workspace_pattern("app", "**/app"))
+        self.assertFalse(match_workspace_pattern("vendor/app", "**/packages/app"))
+
     def test_brace_patterns_match_both_alternatives(self) -> None:
         self.assertTrue(match_workspace_pattern("apps/web", "{apps,packages}/*"))
         self.assertTrue(match_workspace_pattern("packages/app", "{apps,packages}/*"))

@@ -111,6 +111,13 @@ export function QuickSelect({ value, options, onChange, ariaLabel, className = '
       if (option && !option.disabled) choose(option.value)
     } else if (event.key === 'Escape') {
       event.preventDefault(); choose(value)
+    } else if (event.key === 'Tab') {
+      // APG listbox popup: Tab commits the active option and closes the popup.
+      // Without this, focus jumps out of the portal while a dangling menu stays
+      // open, which breaks keyboard navigation.
+      event.preventDefault()
+      const option = options[activeIndex]
+      choose(option && !option.disabled ? option.value : value)
     } else if (event.key.length === 1) {
       // Type-ahead: accumulate a short prefix and jump to the first match.
       typeAheadQuery.current = (typeAheadQuery.current + event.key.toLowerCase()).slice(-24)

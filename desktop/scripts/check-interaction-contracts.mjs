@@ -55,4 +55,24 @@ for (const sentinel of [
   if (!css.includes(sentinel)) throw new Error(`Modal layout contract missing: ${sentinel}`)
 }
 
+const hook = readFileSync(new URL('../src/hooks/useDialogFocus.ts', import.meta.url), 'utf8')
+// Focus trap must not cache first/last at open: a control that becomes enabled
+// or visible while the dialog stays open (discovery finishing, a section
+// expanding) must be reachable by Tab. Guard that the Tab handler re-evaluates
+// the visible focusable set and that the selector excludes disabled controls.
+for (const sentinel of [
+  'button:not([disabled])',
+  'visibleFocusable',
+  'visibleFocusable(ref.current)',
+]) {
+  if (!hook.includes(sentinel)) throw new Error(`Dialog focus-trapping contract missing: ${sentinel}`)
+}
+
+// Picker updates path before discovery: its callback still closes over the
+// preceding render, so stale-response rejection must use the request epoch.
+const addProject = read('AddProjectDialog.tsx')
+if (addProject.includes('path.trim() !== trimmed')) throw new Error('Folder picker scan cannot compare the stale render path')
+for (const marker of ['onPathChange(value)', 'requestId !== discoveryRequestRef.current', '!discovering && name.trim()', 'setDiscovering(false)']) {
+  if (!addProject.includes(marker)) throw new Error(`Project picker contract missing: ${marker}`)
+}
 console.log('Desktop interaction contracts OK: explicit modal actions + non-native selects + visible Baseline footer')

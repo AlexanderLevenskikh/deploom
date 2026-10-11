@@ -19,7 +19,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from iterative_migration import _ACTIVE_INVENTORY, _discover_targets, _installed_version
+from iterative_migration import _ACTIVE_INVENTORY, _discover_targets, _installed_version, manifest_and_lock_hashes
 from resolution_inventory import ResolutionInventory
 
 
@@ -277,6 +277,171 @@ class ResolutionInventoryTest(unittest.TestCase):
         self.assertTrue(all(seen), "every probe must see the phase inventory")
         self.assertEqual(rows[0]["status"], "installed-version-unknown")
         self.assertIsNone(_ACTIVE_INVENTORY.get(), "the phase inventory must be restored after discovery")
+
+    def test_parallel_discovery_parses_lockfile_once(self) -> None:
+        from unittest.mock import patch
+
+        # C1 parse-once must hold in the PARALLEL branch too: Python 3.14 no
+        # longer copies contextvars into ThreadPoolExecutor workers, so the
+        # phase inventory is handed to every probe explicitly. Ten packages
+        # must build the inventory exactly ONCE.
+        project = self._tmp / "parallel-once"
+        project.mkdir(parents=True, exist_ok=True)
+        names = {f"dep{i}": "^1.0.0" for i in range(10)}
+        (project / "package.json").write_text(
+            json.dumps({"name": "x", "version": "1.0.0", "dependencies": names}), encoding="utf-8"
+        )
+        (project / "package-lock.json").write_text(
+            json.dumps(
+                {
+                    "name": "x", "version": "1.0.0", "lockfileVersion": 3,
+                    "packages": {
+                        "": {"name": "x", "version": "1.0.0", "dependencies": names},
+                        **{f"node_modules/dep{i}": {"version": "1.0.0"} for i in range(10)},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        original = ResolutionInventory.for_project
+        with patch.object(ResolutionInventory, "for_project", autospec=original) as built:
+            built.side_effect = original
+            targets, rows = _discover_targets(project, names, None, parallelism=4)
+        self.assertEqual(built.call_count, 1, "ten parallel probes must parse the lockfile exactly once")
+        self.assertEqual(len(rows), 10)
+
+    def test_intermediate_ancestor_node_modules_wins_over_root(self) -> None:
+        # A1: for packages/team/app the nearest hoisted copy is
+        # packages/team/node_modules/demo@2.0.0 — the root copy 1.0.0 must NOT
+        # win, and neither must a guess from nothing.
+        root = self._tmp / "team-ws"
+        (root / "packages" / "team" / "app").mkdir(parents=True, exist_ok=True)
+        (root / "package.json").write_text(
+            json.dumps({"name": "root", "version": "1.0.0", "private": True, "workspaces": ["packages/**"]}),
+            encoding="utf-8",
+        )
+        (root / "packages" / "team" / "app" / "package.json").write_text(
+            json.dumps({"name": "app", "version": "1.0.0", "dependencies": {"demo": "^2.0.0"}}), encoding="utf-8"
+        )
+        (root / "packages" / "team" / "package.json").write_text(
+            json.dumps({"name": "team", "version": "1.0.0", "dependencies": {"demo": "^2.0.0"}}), encoding="utf-8"
+        )
+        (root / "package-lock.json").write_text(
+            json.dumps(
+                {
+                    "name": "root", "version": "1.0.0", "lockfileVersion": 3,
+                    "packages": {
+                        "": {"name": "root", "version": "1.0.0"},
+                        "node_modules/demo": {"version": "1.0.0"},
+                        "packages/team": {"name": "team", "version": "1.0.0", "dependencies": {"demo": "^2.0.0"}},
+                        "packages/team/node_modules/demo": {"version": "2.0.0"},
+                        "packages/team/app": {"name": "app", "version": "1.0.0", "dependencies": {"demo": "^2.0.0"}},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(_installed_version(root / "packages" / "team" / "app", "demo"), "2.0.0")
+
+    def test_member_local_link_is_not_shadowed_by_root_version(self) -> None:
+        # A1: a member-local `link:` portal must resolve through the linked
+        # record even when the ROOT carries a real hoisted version of the same
+        # name (the root copy is a different instance).
+        root = self._tmp / "link-ws"
+        (root / "packages" / "app").mkdir(parents=True, exist_ok=True)
+        (root / "packages" / "lib").mkdir(parents=True, exist_ok=True)
+        (root / "package.json").write_text(
+            json.dumps({"name": "root", "version": "1.0.0", "private": True, "workspaces": ["packages/*"]}),
+            encoding="utf-8",
+        )
+        (root / "packages" / "app" / "package.json").write_text(
+            json.dumps({"name": "app", "version": "1.0.0", "dependencies": {"lib": "^1.0.0"}}), encoding="utf-8"
+        )
+        (root / "packages" / "lib" / "package.json").write_text(
+            json.dumps({"name": "lib", "version": "1.0.0"}), encoding="utf-8"
+        )
+        (root / "package-lock.json").write_text(
+            json.dumps(
+                {
+                    "name": "root", "version": "1.0.0", "lockfileVersion": 3,
+                    "packages": {
+                        "": {"name": "root", "version": "1.0.0"},
+                        "node_modules/lib": {"version": "9.9.9"},
+                        "packages/app": {"name": "app", "version": "1.0.0", "dependencies": {"lib": "^1.0.0"}},
+                        "packages/app/node_modules/lib": {"link": True, "resolved": "packages/lib"},
+                        "packages/lib": {"name": "lib", "version": "1.7.0"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(_installed_version(root / "packages" / "app", "lib"), "1.7.0")
+
+    def test_member_identity_reacts_to_root_lockfile_change(self) -> None:
+        # B1: a workspace MEMBER's migration/delivery identity must bind the
+        # SHARED root lockfile — editing the root lockfile changes the hashes
+        # returned by `manifest_and_lock_hashes`, never a local-only look.
+        root = self._tmp / "member-id"
+        (root / "packages" / "app").mkdir(parents=True, exist_ok=True)
+        (root / "package.json").write_text(
+            json.dumps({"name": "root", "version": "1.0.0", "private": True, "workspaces": ["packages/*"]}),
+            encoding="utf-8",
+        )
+        (root / "packages" / "app" / "package.json").write_text(
+            json.dumps({"name": "app", "version": "1.0.0", "dependencies": {"demo": "^1.0.0"}}), encoding="utf-8"
+        )
+        lockfile = root / "package-lock.json"
+        lockfile.write_text(
+            json.dumps({"name": "root", "version": "1.0.0", "lockfileVersion": 3,
+                        "packages": {"": {"name": "root", "version": "1.0.0"},
+                                     "packages/app": {"name": "app", "version": "1.0.0"},
+                                     "node_modules/demo": {"version": "1.0.0"}}}),
+            encoding="utf-8",
+        )
+        app = root / "packages" / "app"
+        manifest_hash, lock_hash_before, lock_path = manifest_and_lock_hashes(app)
+        self.assertIsNotNone(lock_path)
+        self.assertTrue(str(lock_path).endswith("package-lock.json"))
+        lockfile.write_text(
+            json.dumps({"name": "root", "version": "1.0.0", "lockfileVersion": 3,
+                        "packages": {"": {"name": "root", "version": "1.0.0"},
+                                     "packages/app": {"name": "app", "version": "1.0.0"},
+                                     "node_modules/demo": {"version": "1.2.0"}}}),
+            encoding="utf-8",
+        )
+        _, lock_hash_after, _ = manifest_and_lock_hashes(app)
+        self.assertEqual(manifest_hash, manifest_and_lock_hashes(app)[0])
+        self.assertNotEqual(lock_hash_before, lock_hash_after, "root lockfile change must alter member identity")
+
+    def test_lock_hash_covers_raw_bytes_with_bom(self) -> None:
+        import hashlib
+
+        # The phase lock_hash must hash the EXACT raw bytes: a UTF-8 BOM
+        # stripped from the parsed text must NOT silently change the identity,
+        # and a BOM addition must change it even when the decoded text matches.
+        project = self._tmp / "bom-hash"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "package.json").write_text(
+            json.dumps({"name": "x", "version": "1.0.0", "dependencies": {"sample": "^8.0.0"}}), encoding="utf-8"
+        )
+        lock_path = project / "yarn.lock"
+        content = (
+            "__metadata:\n  version: 6\n  cacheKey: 8\n\n"
+            '"sample@npm:^8.0.0":\n  version: 8.5.0\n  resolution: "sample@npm:8.5.0"\n  dependencies: {}\n'
+        )
+        lock_path.write_bytes(b"\xef\xbb\xbf" + content.encode("utf-8"))
+        inventory = ResolutionInventory.for_project(project)
+        self.assertIsNotNone(inventory)
+        assert inventory is not None
+        self.assertEqual(inventory.installed_version("sample", "^8.0.0"), "8.5.0")
+        self.assertEqual(inventory.lock_hash, hashlib.sha256(b"\xef\xbb\xbf" + content.encode("utf-8")).hexdigest())
+        # Removing the BOM changes the identity although the decoded text is
+        # byte-identical.
+        lock_path.write_bytes(content.encode("utf-8"))
+        without_bom = ResolutionInventory.for_project(project)
+        self.assertIsNotNone(without_bom)
+        assert without_bom is not None
+        self.assertNotEqual(without_bom.lock_hash, inventory.lock_hash)
 
 
 if __name__ == "__main__":

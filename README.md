@@ -234,6 +234,27 @@ python dependency_live_roadmap_generator.py --use-system-proxy
 { "useSystemProxy": true }
 ```
 
+## Планировочный кеш метаданных registry
+
+Повторные запуски одного workspace (повтор, resume, пере-планирование) запрашивают одни и те же метаданные latest/version/engines/history из registry. Опциональный **планировочный кеш** packument-метаданных объединяет и дедуплицирует эти запросы между вызовами CLI. Кеш строго planning-only: установка, физическая верификация и инвентаризация аудита уязвимостей (`manual_dependency_audit.py`, Modern Yarn audit bridge) никогда его не читают и всегда работают со свежими данными.
+
+Кеш выключен, пока не задан путь:
+
+```json
+{
+  "registryMetadataCache": ".dependency-roadmap/state/registry-metadata-cache",
+  "registryMetadataTtl": 600
+}
+```
+
+Или CLI:
+
+```bash
+python dependency_live_roadmap_generator.py --registry-metadata-cache .dependency-roadmap/state/registry-metadata-cache --registry-metadata-ttl 600
+```
+
+Свойства: ключ = (registry, package), поэтому изолирован по registry (auth/proxy не влияют на содержимое); свежесть ограничена TTL (0 выключает кеш); UNKNOWN/404 никогда не кешируются; локальное атомарное I/O не блокирует deadline и уважает отмену; каждая запись хранит время и tool build id (provenance).
+
 ## Группы работ
 
 Группы отражают очередь и стратегию работы, а не только тип пакета или semver:

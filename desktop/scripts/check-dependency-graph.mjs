@@ -41,7 +41,7 @@ const projection = readFileSync(new URL("../src/data/dependencyGraphProjection.t
 const preload = readFileSync(new URL("../electron/preload.cts", import.meta.url), "utf8")
 const main = readFileSync(new URL("../electron/main.ts", import.meta.url), "utf8")
 
-for (const required of ["WorkspaceTab = 'flow' | 'graph' | 'dashboard'", "DependencyGraphWorkspace", ">Graph<"]) {
+for (const required of ["WorkspaceTab = 'overview' | 'dependencies' | 'report' | 'journal'", "DependencyGraphWorkspace", "t('app.tab.dependencies')"]) {
   if (!app.includes(required)) throw new Error(`Graph tab contract missing: ${required}`)
 }
 for (const required of ["Packages", "Groups", "Verified Scope", "Current blockage", "DIAGNOSTIC_HINT", "OBSERVED_LOCAL_MANIFEST"]) {

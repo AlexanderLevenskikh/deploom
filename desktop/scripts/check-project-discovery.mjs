@@ -19,6 +19,7 @@ import {
   PROJECT_MANIFEST_DISCOVERY_IGNORED_DIRS,
   canonicalLockfileForDir,
   discoverProjectDirectories,
+  discoverProjectDirectoriesBounded,
   resolveProjectPackageSelection,
 } from '../dist-electron/project-discovery.js'
 
@@ -147,7 +148,33 @@ try {
     console.log(`${label}: candidates ${JSON.stringify(ours)} match Python`)
   }
 
-  console.log(`Discovery contract OK (depth ${PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH}, shared rule module validated against project_topology)`)
+  // 8. The bounded ASYNC driver must reproduce the sync candidate set when the
+  //     budgets are not hit (single-rule traversal: the renderer and the sync
+  //     consumers can never diverge).
+  for (const [label, rootPath, maxDepth] of cases) {
+    const bounded = await discoverProjectDirectoriesBounded(rootPath, maxDepth)
+    const sync = discoverProjectDirectories(rootPath, maxDepth)
+    const ours = JSON.stringify(bounded.candidates.map((candidate) => candidate.relative))
+    const theirs = JSON.stringify(sync.candidates.map((candidate) => candidate.relative))
+    expect(ours === theirs && bounded.truncated === sync.truncated && bounded.deeperManifests === sync.deeperManifests, `${label}: bounded async driver diverges from sync walk`)
+  }
+
+  // 9. The shared entry budget must stop the scan early and report it honestly
+  //     (truncated + budgetHit='entries'), never silently returning a partial
+  //     page as if it were complete.
+  const budgeted = fixture('budget')
+  mkdirSync(join(budgeted, 'tree'), { recursive: true })
+  for (let index = 0; index < 300; index += 1) {
+    mkdirSync(join(budgeted, 'tree', `d${index}`), { recursive: true })
+    writeFileSync(join(budgeted, 'tree', `d${index}`, 'package.json'), JSON.stringify({ name: `d${index}` }))
+  }
+  const tightBudget = await discoverProjectDirectoriesBounded(budgeted, PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH, { maxEntries: 40 })
+  expect(tightBudget.truncated === true && tightBudget.budgetHit === 'entries', 'entry budget hit must be marked truncated with budgetHit=entries')
+  expect(tightBudget.candidates.length < 300, 'entry-budget cut must not return the full candidate set')
+  const fullBudget = await discoverProjectDirectoriesBounded(budgeted, PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH, { maxEntries: 100_000 })
+  expect(fullBudget.budgetHit === undefined && fullBudget.candidates.length === 300, 'ample budget must scan everything without a budget flag')
+
+  console.log(`Discovery contract OK (depth ${PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH}, shared rule module validated against project_topology and bounded-async parity)`)
 } finally {
   for (const root of roots) { try { rmSync(root, { recursive: true, force: true }) } catch { /* best effort */ } }
 }

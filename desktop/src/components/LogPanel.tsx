@@ -5,6 +5,7 @@ import { useLanguage, type Language, type TranslationKey } from '../i18n'
 import type { EnvironmentInfo, FlowAction, JobOutput, JobOutputSource, MigrationProgress } from '../types'
 import { copyTextToClipboard } from '../clipboard'
 import { RunMonitor } from './RunMonitor'
+import { rawLogOffsets, rawLogWindow } from '../data/rawLogWindow'
 import { QuickSelect } from './QuickSelect'
 
 type Props = {
@@ -16,6 +17,7 @@ type Props = {
   activeAction?: FlowAction
   runStartedAt?: number
   migrationProgress?: MigrationProgress
+  refreshError?: string
   onSendAgentNote: (note: string, branch?: string) => Promise<boolean>
   onCancel: () => void
   onClear: () => void
@@ -29,6 +31,14 @@ function sourceKey(source?: JobOutputSource): string { return source ? `${source
 function isMachineTelemetry(entry: JobOutput): boolean {
   return entry.line.includes('DEPLOOM_PROGRESS_V2 ')
 }
+
+// C3: the raw journal view can hold up to MAX_LOG_ENTRIES lines; mounting every
+// line on every buffer flush turns a busy job into a full repaint of a
+// thousand `<pre>` nodes. The terminal is rendered through a window around the
+// scroll position (measured row heights + overscan + leading/trailing spacers),
+// so the DOM stays bounded while the full buffer stays intact for Copy.
+const RAW_ROW_HEIGHT = 16
+const RAW_OVERSCAN = 40
 
 function formatTokens(value: number, language: Language): string {
   return new Intl.NumberFormat(language === 'ru' ? 'ru-RU' : 'en-US', {
@@ -64,7 +74,7 @@ const GENERATED_TITLES: Record<string, TranslationKey> = {
   'Записываю файл': 'log.tool.write',
 }
 
-export function LogPanel({ logs, knownSources = [], environment, active, activeJobId, activeAction, runStartedAt, migrationProgress, onSendAgentNote, onCancel, onClear, showRunMonitor = true, showEnvironment = true }: Props) {
+export function LogPanel({ logs, knownSources = [], environment, active, activeJobId, activeAction, runStartedAt, migrationProgress, refreshError, onSendAgentNote, onCancel, onClear, showRunMonitor = true, showEnvironment = true }: Props) {
   const { language, t } = useLanguage()
   const [view, setView] = useState<LogView>('activity')
   const [selectedSource, setSelectedSource] = useState('all')
@@ -74,6 +84,10 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
   const activityRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<HTMLDivElement>(null)
   const followLogRef = useRef(true)
+  const [rawScrollTop, setRawScrollTop] = useState(0)
+  const [rawViewport, setRawViewport] = useState(0)
+  const [rawHeights, setRawHeights] = useState<Map<JobOutput, number>>(() => new Map())
+  const rawWidthRef = useRef(0)
 
   const sourceLabel = (source?: JobOutputSource): string => !source
     ? t('log.source.system')
@@ -133,6 +147,60 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
     followLogRef.current = element.scrollHeight - element.scrollTop - element.clientHeight <= 48
   }
 
+  const onTerminalScroll = (event: UIEvent<HTMLDivElement>) => {
+    rememberLogPosition(event)
+    setRawScrollTop(event.currentTarget.scrollTop)
+  }
+
+  useEffect(() => {
+    const element = view === 'raw' ? terminalRef.current : undefined
+    if (!element) return
+    setRawViewport(element.clientHeight)
+    const observer = new ResizeObserver(() => {
+      setRawViewport(element.clientHeight)
+      if (rawWidthRef.current !== element.clientWidth) {
+        rawWidthRef.current = element.clientWidth
+        setRawHeights(new Map())
+      }
+    })
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [view])
+
+  // Window of the raw journal currently mounted as DOM nodes. The viewport
+  // height comes from a ResizeObserver so the window catches up when the panel
+  // is resized, and the overscan keeps a fast-scrolling user from flashing
+  // empty space.
+  const rawOffsets = useMemo(() => rawLogOffsets(filteredLogs.map((entry) => rawHeights.get(entry) ?? RAW_ROW_HEIGHT)), [filteredLogs, rawHeights])
+  const { start: rawStart, end: rawEnd } = rawLogWindow(rawOffsets, rawScrollTop, rawViewport || 480, RAW_OVERSCAN)
+
+  useEffect(() => {
+    const root = terminalRef.current
+    if (view !== 'raw' || !root) return
+    const rows = Array.from(root.querySelectorAll<HTMLElement>('[data-row-index]'))
+    const measure = () => setRawHeights((current) => {
+      const next = new Map<JobOutput, number>()
+      for (const entry of filteredLogs) {
+        const height = current.get(entry)
+        if (height !== undefined) next.set(entry, height)
+      }
+      for (const row of rows) {
+        const entry = filteredLogs[Number(row.dataset.rowIndex)]
+        if (entry) next.set(entry, Math.max(1, row.getBoundingClientRect().height))
+      }
+      return next.size === current.size && [...next].every(([entry, height]) => current.get(entry) === height) ? current : next
+    })
+    let frame: number | undefined
+    const schedule = () => {
+      if (frame === undefined) frame = window.requestAnimationFrame(() => { frame = undefined; measure() })
+    }
+    schedule()
+    const observer = new ResizeObserver(schedule)
+    rows.forEach((row) => observer.observe(row))
+    return () => { observer.disconnect(); if (frame !== undefined) window.cancelAnimationFrame(frame) }
+  }, [view, filteredLogs, rawStart, rawEnd])
+  const rawWindowed = rawStart > 0 || rawEnd < filteredLogs.length
+
   useEffect(() => {
     followLogRef.current = true
     const frame = window.requestAnimationFrame(() => {
@@ -149,7 +217,7 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
       if (element) element.scrollTop = element.scrollHeight
     })
     return () => window.cancelAnimationFrame(frame)
-  }, [activity, filteredLogs, view])
+  }, [activity, filteredLogs, view, rawHeights])
 
   return (
     <aside className="log-panel">
@@ -164,6 +232,8 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
       </div>
 
       {showRunMonitor ? <RunMonitor logs={logs} active={active} jobId={activeJobId} action={activeAction} runStartedAt={runStartedAt} migrationProgress={migrationProgress} /> : null}
+
+      {refreshError ? <div className="refresh-error-hint" role="status"><AlertTriangle size={14} />{t('log.refreshFailed')}: {refreshError}</div> : null}
 
       <div className="log-controls"><div className="log-tabs" role="tablist" aria-label={t('log.viewAria')}>
         <button role="tab" aria-selected={view === 'activity'} className={view === 'activity' ? 'active' : ''} onClick={() => setView('activity')}>{t('log.activity')}</button>
@@ -187,8 +257,16 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
           ))}
         </div>
       ) : (
-        <div ref={terminalRef} className="terminal" aria-live="polite" onScroll={rememberLogPosition}>
-          {filteredLogs.length === 0 ? <span className="terminal-muted">{t('log.rawEmpty')}</span> : filteredLogs.map((entry, index) => <div className="raw-log-entry" key={`${entry.jobId}-${index}`}><span className="log-source-badge">{sourceLabel(entry.source)}</span><pre className={entry.stream}>{entry.line}</pre></div>)}
+        <div ref={terminalRef} className="terminal" aria-live="polite" onScroll={onTerminalScroll}>
+          {filteredLogs.length === 0 ? <span className="terminal-muted">{t('log.rawEmpty')}</span> : <>
+            {rawStart > 0 ? <div style={{ height: rawOffsets[rawStart] }} aria-hidden="true" data-window-spacer /> : null}
+            {filteredLogs.slice(rawStart, rawEnd).map((entry, index) => {
+              const i = rawStart + index
+              return <div className="raw-log-entry" data-row-index={i} key={`${entry.jobId}-${i}`}><span className="log-source-badge">{sourceLabel(entry.source)}</span><pre className={entry.stream}>{entry.line}</pre></div>
+            })}
+            {rawEnd < filteredLogs.length ? <div style={{ height: rawOffsets[filteredLogs.length] - rawOffsets[rawEnd] }} aria-hidden="true" data-window-spacer /> : null}
+            {rawWindowed ? <span className="terminal-muted" data-window-note>{t('log.windowed', { shown: rawEnd - rawStart, total: filteredLogs.length })}</span> : null}
+          </>}
         </div>
       )}
 

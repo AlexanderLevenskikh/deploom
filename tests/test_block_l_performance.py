@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import time
@@ -13,11 +14,36 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import baseline_constraint_verifier as verifier
+import block_v_prepared_artifact as artifact_store
 import block_vex_storage
 import dependency_live_roadmap_generator as roadmap
 
 
 class BlockLPerformanceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Durable prepared-artifact storage MUST be configured before the first
+        # publish in this process: _prepared_snapshot_root() caches the durable
+        # root on first use, and _lookup_prepared_workspace_snapshot forces the
+        # durable loader. Without this, the tests silently depend on ambient
+        # environment or on which earlier test happened to configure the store.
+        cls._artifact_tmp = tempfile.TemporaryDirectory()
+        cls._artifact_root = Path(cls._artifact_tmp.name)
+        cls._artifact_env_backup = os.environ.get("DEPLOOM_VERIFICATION_ROOT")
+        os.environ["DEPLOOM_VERIFICATION_ROOT"] = str(cls._artifact_root / "substrate")
+        artifact_store.configure_prepared_artifact_store(cls._artifact_root / "proofs")
+        assert artifact_store.prepared_snapshot_storage_root() is not None
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._artifact_env_backup is None:
+            os.environ.pop("DEPLOOM_VERIFICATION_ROOT", None)
+        else:
+            os.environ["DEPLOOM_VERIFICATION_ROOT"] = cls._artifact_env_backup
+        with verifier._PREPARED_SNAPSHOT_LOCK:
+            verifier._PREPARED_SNAPSHOT_ROOT = None
+        cls._artifact_tmp.cleanup()
+
     def test_prepared_snapshot_consumers_are_fresh_and_sealed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -38,6 +64,9 @@ class BlockLPerformanceTests(unittest.TestCase):
             self.assertEqual("sealed\n", (snapshot.workspace_root / snapshot.project_relative / "state.txt").read_text(encoding="utf-8"))
 
     def test_snapshot_cache_is_scoped_by_source_checkout(self) -> None:
+        # The durable prepared-artifact store is configured once in setUpClass
+        # (see there), so _lookup_prepared_workspace_snapshot's forced durable
+        # loader is reproducible regardless of order within the process.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             first_source = root / "source-a"
@@ -45,7 +74,7 @@ class BlockLPerformanceTests(unittest.TestCase):
             for source in (first_source, second_source):
                 source.mkdir()
                 (source / "package.json").write_text('{"name":"same"}\n', encoding="utf-8")
-            snapshot = verifier._publish_prepared_workspace_snapshot(
+            verifier._publish_prepared_workspace_snapshot(
                 first_source, first_source, key="c" * 32,
                 observed_versions={}, observed_hash="d" * 64,
                 source_project=first_source,
