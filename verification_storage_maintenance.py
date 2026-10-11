@@ -47,7 +47,7 @@ def retire_trial(path):
 
 def dead_trial_owner(path):
     try:
-        raw = json.loads((path / '.deploom-trial-owner.json').read_text(encoding='utf-8'))
+        raw = json.loads((path / '.deploom-trial-owner.json').read_text(encoding='utf-8-sig'))
         pid = raw.get('pid')
         return isinstance(pid,int) and not isinstance(pid,bool) and 0 < pid < 2**31 and not owner_alive(pid)
     except (OSError,ValueError,TypeError): return False

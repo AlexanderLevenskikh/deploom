@@ -81,7 +81,7 @@ def _command_identity(project_dir: Path, command: str) -> Dict[str, str]:
 
 def _package_manager_name(project_dir: Path) -> str:
     try:
-        manifest = json.loads((project_dir / "package.json").read_text(encoding="utf-8"))
+        manifest = json.loads((project_dir / "package.json").read_text(encoding="utf-8-sig"))
         raw = str(manifest.get("packageManager") or "") if isinstance(manifest, dict) else ""
         if raw:
             return raw.split("@", 1)[0].strip().lower()
@@ -582,7 +582,7 @@ def _read_cache(path: Optional[Path]) -> Dict[str, object]:
     if path is None or not path.is_file():
         return _empty_cache()
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return _empty_cache()
     # Legacy schema v1 is intentionally NOT migrated into authority. It had a

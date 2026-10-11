@@ -138,7 +138,7 @@ def validate_baseline_reference(mapping):
     reference = mapping.get("testBaseline")
     if reference:
         try:
-            baseline = json.loads(Path(reference["path"]).read_text(encoding="utf-8"))
+            baseline = json.loads(Path(reference["path"]).read_text(encoding="utf-8-sig"))
             if digest(baseline) != reference["hash"]:
                 raise EvidenceError("TEST_BASELINE_HASH_MISMATCH")
         except (OSError, KeyError, ValueError) as exc:
@@ -163,7 +163,7 @@ def verify_initial_control(project, assignment, *, run_config, run_dir, verify_c
     if not result.ok and (result.kind != "project" or not result.project_failures or any(f.command != capture_command for f in result.project_failures)):
         return result
     try:
-        baseline = json.loads(observation.read_text(encoding="utf-8"))
+        baseline = json.loads(observation.read_text(encoding="utf-8-sig"))
         counts = compare(baseline, baseline)
     except (OSError, ValueError, KeyError) as exc:
         # Missing/invalid observation cannot turn a collection or launch error
@@ -197,14 +197,14 @@ def main():
     report = project / (".deploom-vitest-" + uuid.uuid4().hex + ".json")
     try:
         if args.baseline:
-            before = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
+            before = json.loads(Path(args.baseline).read_text(encoding="utf-8-sig"))
             if digest(before) != args.baseline_hash:
                 raise EvidenceError("TEST_BASELINE_HASH_MISMATCH")
         from baseline_constraint_verifier import project_check_command_argv
         command = args.command + " --reporter=json --outputFile=" + command_line([report.name])
         # The outer authoritative supervisor owns this child and descendants.
         result = subprocess.run(project_check_command_argv(command), env={**os.environ, "CI": "1"}, check=False)
-        raw = json.loads(report.read_text(encoding="utf-8"))
+        raw = json.loads(report.read_text(encoding="utf-8-sig"))
         after = normalize_vitest(raw, project)
         failed = any(c["status"] == "failed" for c in after["cases"].values())
         if result.returncode not in (0, 1) or bool(result.returncode) != failed:

@@ -440,7 +440,7 @@ class BaselineRunRecoveryStore:
         if path is None or not path.is_file():
             return dict(empty)
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError, TypeError):
             self._preserve_corrupt(path)
             return dict(empty)

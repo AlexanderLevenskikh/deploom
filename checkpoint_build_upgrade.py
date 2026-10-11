@@ -63,7 +63,7 @@ def reopen_checkpoint_source(run_dir, checkpoint, config, *, verify, progress, r
     record_path = directory / (key + ".json")
     # The context binds actual Node/manager versions, user config and environment.
     if record_path.exists():
-        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record = json.loads(record_path.read_text(encoding="utf-8-sig"))
         if record.get("identity") != identity or record.get("verification", {}).get("status") != "passed":
             raise CheckpointBuildUpgradeError("CHECKPOINT_BUILD_UPGRADE_RECORD_INVALID")
         # Explicit maintenance may evict this reproducible copy. Missing bytes

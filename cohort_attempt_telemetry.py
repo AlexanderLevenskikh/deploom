@@ -48,7 +48,7 @@ def verification_stages(path, offset, fingerprint):
 def agent_measurement(run_dir, candidate):
     # Desktop owns this lease; agent prose supplies no timing or authority.
     try:
-        lease=json.loads((Path(run_dir)/"trial"/"agent-lease.json").read_text(encoding="utf-8"))
+        lease=json.loads((Path(run_dir)/"trial"/"agent-lease.json").read_text(encoding="utf-8-sig"))
         if not isinstance(lease,dict):return None
         if any(str(lease.get(k))!=str(candidate.get(k)) for k in ("runId","candidateId","attemptId")):return None
         started=datetime.fromisoformat(lease["startedAt"].replace("Z","+00:00"))

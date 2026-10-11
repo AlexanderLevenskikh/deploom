@@ -921,7 +921,7 @@ def _current_pointer(task_root: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
         return value if isinstance(value, dict) else None
     except (ValueError, OSError):
         return None
@@ -932,7 +932,7 @@ def _read_manifest(task_root: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
         return value if isinstance(value, dict) else None
     except (ValueError, OSError):
         return None
@@ -952,14 +952,14 @@ def export_task_artifact(
     stale entries and, on insufficient input, raises TaskExportError with the
     exact list of missing fields (no Baseline is started).
     """
-    run = json.loads((Path(run_dir) / "run.json").read_text(encoding="utf-8"))
-    config = json.loads((Path(run_dir) / "run-config.json").read_text(encoding="utf-8"))
+    run = json.loads((Path(run_dir) / "run.json").read_text(encoding="utf-8-sig"))
+    config = json.loads((Path(run_dir) / "run-config.json").read_text(encoding="utf-8-sig"))
     checkpoints: List[Mapping[str, Any]] = []
     checkpoint_dir = Path(run_dir) / "checkpoints"
     if checkpoint_dir.exists():
         for path in sorted(checkpoint_dir.glob("C*.json")):
             try:
-                item = json.loads(path.read_text(encoding="utf-8"))
+                item = json.loads(path.read_text(encoding="utf-8-sig"))
                 if isinstance(item, dict):
                     checkpoints.append(item)
             except (ValueError, OSError):
@@ -968,7 +968,7 @@ def export_task_artifact(
     ledger_path = Path(run_dir) / "ledger.json"
     if ledger_path.exists():
         try:
-            value = json.loads(ledger_path.read_text(encoding="utf-8"))
+            value = json.loads(ledger_path.read_text(encoding="utf-8-sig"))
             if isinstance(value, dict):
                 ledger = value
         except (ValueError, OSError):
@@ -1038,7 +1038,7 @@ def export_task_artifact(
     history_path = root / HISTORY_FILENAME
     if history_path.exists():
         try:
-            value = json.loads(history_path.read_text(encoding="utf-8"))
+            value = json.loads(history_path.read_text(encoding="utf-8-sig"))
             if isinstance(value, list):
                 history = value
         except (ValueError, OSError):
@@ -1279,7 +1279,7 @@ def export_legacy_task_artifact(
     history_path = root / HISTORY_FILENAME
     if history_path.exists():
         try:
-            value = json.loads(history_path.read_text(encoding="utf-8"))
+            value = json.loads(history_path.read_text(encoding="utf-8-sig"))
             if isinstance(value, list):
                 history = value
         except (ValueError, OSError):
@@ -1344,8 +1344,8 @@ def task_staleness(run_dir: Path) -> Dict[str, Any]:
     """
     run_dir = Path(run_dir)
     try:
-        run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-        config = json.loads((run_dir / "run-config.json").read_text(encoding="utf-8"))
+        run = json.loads((run_dir / "run.json").read_text(encoding="utf-8-sig"))
+        config = json.loads((run_dir / "run-config.json").read_text(encoding="utf-8-sig"))
     except (ValueError, OSError) as exc:
         return {"stale": True, "reason": f"run state unreadable: {exc}", "currentTask": None}
     manifest = current_task(run_dir)
@@ -1378,7 +1378,7 @@ def load_task_manifest(run_dir: Path, artifact_id: str) -> Dict[str, Any]:
         if not path.exists():
             continue
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
+            value = json.loads(path.read_text(encoding="utf-8-sig"))
             if isinstance(value, dict) and str(value.get("artifactId")) == artifact_id:
                 return value
         except (ValueError, OSError):
@@ -1391,8 +1391,8 @@ def load_task_manifest(run_dir: Path, artifact_id: str) -> Dict[str, Any]:
 def verify_task_input_errors(run_dir: Path) -> List[str]:
     """The diagnose-only entry: missing fields for export, no side effects."""
     try:
-        run = json.loads((Path(run_dir) / "run.json").read_text(encoding="utf-8"))
-        config = json.loads((Path(run_dir) / "run-config.json").read_text(encoding="utf-8"))
+        run = json.loads((Path(run_dir) / "run.json").read_text(encoding="utf-8-sig"))
+        config = json.loads((Path(run_dir) / "run-config.json").read_text(encoding="utf-8-sig"))
     except (ValueError, OSError) as exc:
         return [f"run state unreadable: {exc}"]
     checkpoints: List[Mapping[str, Any]] = []
@@ -1400,7 +1400,7 @@ def verify_task_input_errors(run_dir: Path) -> List[str]:
     if checkpoint_dir.exists():
         for path in sorted(checkpoint_dir.glob("C*.json")):
             try:
-                item = json.loads(path.read_text(encoding="utf-8"))
+                item = json.loads(path.read_text(encoding="utf-8-sig"))
                 if isinstance(item, dict):
                     checkpoints.append(item)
             except (ValueError, OSError):

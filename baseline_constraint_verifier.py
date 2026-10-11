@@ -590,7 +590,7 @@ def discover_baseline_project_checks(project_dir: Path) -> Tuple[str, ...]:
     failures into solver authority. Explicit commands still take precedence.
     """
     try:
-        manifest = json.loads((project_dir / "package.json").read_text(encoding="utf-8"))
+        manifest = json.loads((project_dir / "package.json").read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError):
         return ()
     scripts = manifest.get("scripts")
@@ -713,7 +713,7 @@ def detect_package_manager(project_dir: Path) -> str:
     if package_json.exists():
         try:
             package_manager = str(
-                json.loads(package_json.read_text(encoding="utf-8")).get("packageManager") or ""
+                json.loads(package_json.read_text(encoding="utf-8-sig")).get("packageManager") or ""
             )
             if package_manager:
                 return package_manager.split("@", 1)[0].strip().lower()
@@ -1460,7 +1460,7 @@ def _workspace_package_targets(workspace_project: Path) -> Dict[str, Path]:
         if member_root == topology.package_manager_root.resolve():
             continue
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError, TypeError) as exc:
             raise RuntimeError(
                 f"WORKSPACE_JUNCTION_MANIFEST_UNREADABLE: {manifest_path}: {exc}"
@@ -2209,7 +2209,7 @@ def _validate_assignment_materialization(
     remove_packages: Iterable[str] = (),
 ) -> Dict[str, object]:
     package_json = project_dir / "package.json"
-    manifest = json.loads(package_json.read_text(encoding="utf-8"))
+    manifest = json.loads(package_json.read_text(encoding="utf-8-sig"))
     if not isinstance(manifest, dict):
         raise ValueError(
             f"ASSIGNMENT_MANIFEST_INVALID: {package_json}: root must be an object"
@@ -2404,7 +2404,7 @@ def observed_resolved_assignment(
 ) -> Dict[str, str]:
     """Observe the installed assignment; control selectors resolve to exact versions."""
     try:
-        manifest = json.loads((project_dir / "package.json").read_text(encoding="utf-8"))
+        manifest = json.loads((project_dir / "package.json").read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError) as exc:
         raise ObservedResolutionError(
             f"OBSERVED_RESOLVED_ASSIGNMENT_MANIFEST_INVALID: {exc}"
@@ -2453,7 +2453,7 @@ def observed_resolved_assignment(
             )
 
         try:
-            package = json.loads(package_json.read_text(encoding="utf-8"))
+            package = json.loads(package_json.read_text(encoding="utf-8-sig"))
             version = str(package.get("version") or "").strip()
         except (OSError, ValueError, TypeError) as exc:
             raise ObservedResolutionError(
@@ -3232,7 +3232,7 @@ def verify_assignment(
             return fixed_identity_result
 
         try:
-            materialized_manifest = json.loads((workspace_project / "package.json").read_text(encoding="utf-8"))
+            materialized_manifest = json.loads((workspace_project / "package.json").read_text(encoding="utf-8-sig"))
         except (OSError, ValueError, TypeError) as exc:
             return BaselineVerifyResult(False, "unknown", f"ASSIGNMENT_MANIFEST_UNREADABLE: {exc}")
         removal_names = set(remove_packages)

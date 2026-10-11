@@ -324,7 +324,7 @@ def _read_json(path: Path, *, required: bool = True) -> Optional[Dict[str, Any]]
             raise InvalidInputError(f"STATE_FILE_MISSING: {path}")
         return None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
         raise InvalidInputError(f"STATE_FILE_INVALID: {path}: {exc}") from exc
     if not isinstance(value, dict):
@@ -408,7 +408,7 @@ class _RunLock:
 
     def _stale(self) -> bool:
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            payload = json.loads(self.path.read_text(encoding="utf-8-sig"))
             owner = str(payload.get("owner") or "")
             pid = int(payload.get("pid") or 0)
             if pid > 0:
@@ -586,7 +586,7 @@ def touch_heartbeat(run_dir: Path, run: Mapping[str, Any]) -> Dict[str, Any]:
 
 def direct_dependency_assignment(project_dir: Path) -> Dict[str, str]:
     """Current declared versions of managed direct dependencies (exact spec)."""
-    manifest = json.loads((project_dir / "package.json").read_text(encoding="utf-8"))
+    manifest = json.loads((project_dir / "package.json").read_text(encoding="utf-8-sig"))
     if not isinstance(manifest, dict):
         raise InvalidInputError("PROJECT_MANIFEST_INVALID")
     assignment: Dict[str, str] = {}
@@ -1049,7 +1049,7 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
 
     verify_raw: Dict[str, Any] = {}
     if args.verify_config:
-        verify_raw = json.loads(Path(args.verify_config).read_text(encoding="utf-8"))
+        verify_raw = json.loads(Path(args.verify_config).read_text(encoding="utf-8-sig"))
         if not isinstance(verify_raw, dict):
             raise InvalidInputError("VERIFY_CONFIG_INVALID")
 
@@ -1064,7 +1064,7 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
 
     targets: Dict[str, str] = {}
     if args.targets_file:
-        raw_targets = json.loads(Path(args.targets_file).read_text(encoding="utf-8"))
+        raw_targets = json.loads(Path(args.targets_file).read_text(encoding="utf-8-sig"))
         if not isinstance(raw_targets, dict):
             raise InvalidInputError("TARGETS_FILE_INVALID")
         for name, version in raw_targets.items():
@@ -1815,7 +1815,7 @@ def _verify_repair_archive(run_dir: Path, archive_root: Path, c0: Mapping[str, A
     if not manifest_path.exists():
         raise InvalidInputError("REPAIR_ARCHIVE_SOURCE_SNAPSHOT_MISSING")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
         raise InvalidInputError(f"REPAIR_ARCHIVE_SOURCE_MANIFEST_INVALID: {exc}") from exc
     observed_key = str(manifest.get("sourceSnapshotKey") or "")
@@ -2660,7 +2660,7 @@ def _dependency_diagnostics(project_dir: Any) -> Dict[str, Any]:
     }
     manifest_path = Path(str(project_dir)) / "package.json"
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     except Exception as exc:  # noqa: BLE001 - diagnostics must never fail planning
         result["manifestReadError"] = f"{exc}"
         return result
@@ -3007,7 +3007,7 @@ def _yarn_direct_selectors(package_name: str, declared_spec: Optional[str]) -> L
 def _npm_lock_installed_version(lock_path: Path, package_name: str) -> Optional[str]:
     """package-lock.json / npm-shrinkwrap.json exact direct resolution."""
     try:
-        data = json.loads(lock_path.read_text(encoding="utf-8"))
+        data = json.loads(lock_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict):
@@ -4746,7 +4746,7 @@ def cmd_apply_feedback(args: argparse.Namespace) -> int:
 def _read_feedback(feedback_file: str) -> Dict[str, Any]:
     path = Path(feedback_file).resolve()
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
         raise InvalidInputError(f"FEEDBACK_FILE_INVALID: {exc}") from exc
     if not isinstance(value, dict):
@@ -5262,7 +5262,7 @@ def _build_migration_report(
     ledger_path = run_dir / "ledger.json"
     if ledger_path.exists():
         try:
-            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8-sig"))
             if not isinstance(ledger, dict):
                 ledger = {}
         except (ValueError, OSError):
@@ -5398,7 +5398,7 @@ def _build_developer_upgrade_guide(
     ledger_path = run_dir / "ledger.json"
     if ledger_path.exists():
         try:
-            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8-sig"))
             if not isinstance(ledger, dict):
                 ledger = {}
         except (ValueError, OSError):
@@ -5670,7 +5670,7 @@ def cmd_export_task(args: argparse.Namespace) -> int:
         _emit_status(
             {
                 "event": "export-task.check",
-                "runId": str(json.loads((run_dir / "run.json").read_text(encoding="utf-8")).get("runId") or ""),
+                "runId": str(json.loads((run_dir / "run.json").read_text(encoding="utf-8-sig")).get("runId") or ""),
                 "sufficient": True,
             }
         )

@@ -21,7 +21,7 @@ def _peer_edges(names, project_dir):
     for name in names:
         if not re.fullmatch(r"(?:@[a-zA-Z0-9_.-]+/)?[a-zA-Z0-9_.-]+", name): continue
         try:
-            raw = json.loads((Path(project_dir) / "node_modules" / name / "package.json").read_text(encoding="utf-8"))
+            raw = json.loads((Path(project_dir) / "node_modules" / name / "package.json").read_text(encoding="utf-8-sig"))
             for other in {**(raw.get("peerDependencies") or {}), **(raw.get("dependencies") or {})}:
                 if other in names and other != name: edges.add(tuple(sorted((name, other))))
         except (OSError, ValueError, TypeError): pass

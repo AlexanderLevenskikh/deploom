@@ -563,7 +563,7 @@ def _submodule_input_roots(project_dir: Path, capture_root: Path) -> set[Path]:
         if not manifest_path.is_file():
             continue
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError, TypeError) as exc:
             raise SourceCaptureError(f"SOURCE_PACKAGE_JSON_UNREADABLE: {manifest_path}: {exc}") from exc
         for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
@@ -627,7 +627,7 @@ def _local_dependency_preflight(project_path: Path, capture_root: Path) -> None:
     if not manifest_path.is_file():
         return
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError) as exc:
         raise SourceCaptureError(f"SOURCE_PACKAGE_JSON_UNREADABLE: {manifest_path}: {exc}") from exc
     for section in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
@@ -1985,7 +1985,7 @@ def open_source_snapshot(
     manifest_path = container / "manifest.json"
     root = container / "tree"
     try:
-        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        raw = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError) as exc:
         raise SourceCaptureError(
             f"SOURCE_SNAPSHOT_MANIFEST_INVALID: {manifest_path}: {exc}"

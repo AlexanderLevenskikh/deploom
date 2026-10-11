@@ -114,7 +114,7 @@ class ProjectTopology:
 
 def _read_json(path: Path) -> dict[str, object]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError) as exc:
         raise ProjectTopologyError(
             "PROJECT_PACKAGE_JSON_INVALID",

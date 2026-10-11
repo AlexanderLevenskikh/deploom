@@ -447,7 +447,7 @@ def _npm_lock_fixed_record(
     if lock.name not in {"npm-shrinkwrap.json", "package-lock.json"}:
         return {}
     try:
-        payload = json.loads(lock.read_text(encoding="utf-8"))
+        payload = json.loads(lock.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError) as exc:
         raise SourceIdentityUnavailable(
             f"FIXED_SOURCE_LOCKFILE_UNREADABLE: {lock}: {exc}"
@@ -595,7 +595,7 @@ def remote_fixed_resolver_input_fingerprint(
     project_dir = project_dir.resolve()
     manifest_path = project_dir / "package.json"
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError) as exc:
         raise SourceIdentityUnavailable(
             f"SOURCE_IDENTITY_MANIFEST_UNAVAILABLE: {manifest_path}: {exc}"
@@ -685,7 +685,7 @@ def fixed_resolver_input_fingerprint(
     project_dir = project_dir.resolve()
     manifest_path = project_dir / "package.json"
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError) as exc:
         raise SourceIdentityUnavailable(
             f"SOURCE_IDENTITY_MANIFEST_UNAVAILABLE: {manifest_path}: {exc}"
@@ -1350,7 +1350,7 @@ class VerificationProofStore:
         if path is None or not path.is_file():
             return None
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError, TypeError):
             return None
         if not isinstance(payload, dict):

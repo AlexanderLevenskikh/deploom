@@ -148,7 +148,7 @@ def load_hint_snapshot(path: str | Path | None) -> tuple[DiagnosticHint, ...]:
     if not source.is_file():
         return ()
     try:
-        payload = json.loads(source.read_text(encoding="utf-8"))
+        payload = json.loads(source.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError):
         return ()
     if not isinstance(payload, dict) or payload.get("schemaVersion") != PREDICATE_SEARCH_SCHEMA:

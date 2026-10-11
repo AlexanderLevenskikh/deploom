@@ -1301,7 +1301,7 @@ def is_prerelease(v: str) -> bool:
 
 
 def read_json(path: Path) -> Dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def load_dependency_knowledge(path: Optional[Path]) -> List[Dict[str, Any]]:
@@ -2622,7 +2622,7 @@ class LiveDataClient:
             raise
 
     def _bounded_json(self, response) -> Any:
-        return json.loads(self._deadline_bounded_read(response).decode("utf-8", errors="replace"))
+        return json.loads(self._deadline_bounded_read(response).decode("utf-8-sig", errors="replace"))
 
     def _bounded_text(self, response) -> str:
         return self._deadline_bounded_read(response).decode("utf-8", errors="replace")
@@ -3299,7 +3299,7 @@ def _registry_tarball_manifest(data: bytes) -> Optional[Tuple[Dict[str, Any], Se
             extracted = archive.extractfile(manifest_member)
             if extracted is None:
                 return None
-            package_json = json.loads(extracted.read().decode("utf-8", errors="replace"))
+            package_json = json.loads(extracted.read().decode("utf-8-sig", errors="replace"))
             if not isinstance(package_json, dict):
                 return None
             prefix = manifest_member.name.rsplit("/", 1)[0] if "/" in manifest_member.name else ""
@@ -7057,7 +7057,7 @@ def _package_version_metadata(
         return None
     try:
         manifest_path = Path(row.package_dir) / "node_modules" / Path(*row.name.split("/")) / "package.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
         if isinstance(manifest, dict) and str(manifest.get("version") or "") == version:
             return manifest
     except (OSError, ValueError, TypeError):
@@ -7171,7 +7171,7 @@ def _project_node_versions(project_dir: str, override: str = "") -> List[Tuple[s
         if exact:
             found.append((exact, "settings.nodeVersion"))
     try:
-        package_json = json.loads((root / "package.json").read_text(encoding="utf-8"))
+        package_json = json.loads((root / "package.json").read_text(encoding="utf-8-sig"))
         volta = package_json.get("volta") if isinstance(package_json, dict) else None
         if isinstance(volta, dict):
             version = _normalized_node_version(volta.get("node"))
@@ -10377,7 +10377,7 @@ def _load_repair_requests(progress_path: Optional[Path]) -> Tuple[Dict[str, Any]
         return ()
     target = progress_path.parent / "repair-requests.json"
     try:
-        payload = json.loads(target.read_text(encoding="utf-8"))
+        payload = json.loads(target.read_text(encoding="utf-8-sig"))
     except Exception:
         return ()
     requests = payload.get("requests") if isinstance(payload, dict) else None
@@ -11533,7 +11533,7 @@ class BaselineProgressReporter:
         try:
             if not self.path.is_file():
                 return
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            payload = json.loads(self.path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError, TypeError):
             return
         if not isinstance(payload, dict):
@@ -11655,7 +11655,7 @@ class BaselineLocalizationCheckpointStore:
         if self.path is None or not self.path.exists():
             return {"schemaVersion": 1, "entries": {}}
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            payload = json.loads(self.path.read_text(encoding="utf-8-sig"))
         except json.JSONDecodeError as exc:
             # Atomic writes mean malformed JSON should be rare. Preserve the
             # evidence instead of silently erasing a potentially multi-hour run.
@@ -24533,7 +24533,7 @@ def append_migration_progress(
     payload: Dict[str, Any] = {"schemaVersion": MIGRATION_PROGRESS_SCHEMA, "points": []}
     if payload_path.is_file():
         try:
-            existing = json.loads(payload_path.read_text(encoding="utf-8"))
+            existing = json.loads(payload_path.read_text(encoding="utf-8-sig"))
             if isinstance(existing, dict) and isinstance(existing.get("points"), list):
                 payload = existing
         except (OSError, ValueError):
@@ -26340,7 +26340,7 @@ def main() -> None:
     if args.residual_stability_file:
         residual_path = Path(args.residual_stability_file).expanduser()
         try:
-            payload = json.loads(residual_path.read_text(encoding="utf-8"))
+            payload = json.loads(residual_path.read_text(encoding="utf-8-sig"))
             projects_payload = payload.get("projects", {}) if isinstance(payload, dict) else {}
             if isinstance(projects_payload, dict):
                 for project_name, project_payload in projects_payload.items():

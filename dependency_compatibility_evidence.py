@@ -76,7 +76,7 @@ def external_evidence_identity_matches(
 
 def load_compatibility_evidence(path: Path) -> CompatibilityEvidence:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError) as exc:
         raise CompatibilityEvidenceError(f"invalid compatibility evidence file: {exc}") from exc
     if not isinstance(raw, dict) or int(raw.get("schemaVersion", 0) or 0) != 2:

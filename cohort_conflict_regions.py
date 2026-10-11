@@ -88,7 +88,7 @@ def region_source_key(checkpoint):
     try:
         if not checkpoint.get("sourceSnapshotContainer"):return None
         container=Path(checkpoint["sourceSnapshotContainer"])
-        manifest=json.loads((container/"manifest.json").read_text(encoding="utf-8"))
+        manifest=json.loads((container/"manifest.json").read_text(encoding="utf-8-sig"))
         if manifest.get("sourceSnapshotKey")!=checkpoint.get("sourceSnapshotKey"):return None
         entries=manifest.get("entries")
         if not isinstance(entries,list):return None

@@ -151,7 +151,7 @@ def yarn1_integrity_path(package_manager_root: Path) -> Path:
 def _yarn1_integrity_payload(package_manager_root: Path) -> dict[str, object]:
     path = yarn1_integrity_path(package_manager_root)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError as exc:
         raise ResolverSeedError(
             f"YARN1_RESOLVER_SEED_INTEGRITY_MISSING: {path}"

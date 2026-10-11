@@ -73,7 +73,7 @@ class PredicateSearchStateStore:
         if self.path is None or not self.path.is_file():
             return self._empty()
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            payload = json.loads(self.path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError, TypeError):
             # Fail open. Diagnostic state loss cannot change correctness.
             return self._empty()

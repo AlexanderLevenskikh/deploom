@@ -21,7 +21,7 @@ def recover_restart_archive(run_dir, write_json):
     journal_path = run_dir / TRANSACTION
     if not journal_path.exists():
         return
-    journal = json.loads(journal_path.read_text(encoding='utf-8'))
+    journal = json.loads(journal_path.read_text(encoding='utf-8-sig'))
     history = _history(run_dir)
     archive_name = journal.get('archiveName', '')
     if not archive_name or Path(archive_name).name != archive_name or archive_name in ('.', '..'):

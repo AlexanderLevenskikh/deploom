@@ -23,7 +23,7 @@ class IndexRecoveryInput:
 
 def inspect_checkpoint_index_drift(container, expected_key, *, progress):
     container = Path(container).resolve()
-    raw = json.loads((container / "manifest.json").read_text(encoding="utf-8"))
+    raw = json.loads((container / "manifest.json").read_text(encoding="utf-8-sig"))
     from scoped_source_policy import policy_from_payload
     policy = policy_from_payload(raw.get("inputPolicy"))
     entries = raw.get("entries")

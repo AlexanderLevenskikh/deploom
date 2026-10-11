@@ -38,7 +38,7 @@ SEVERITIES = ("critical", "high", "moderate", "low", "unknown")
 
 
 def read_json(path: Path) -> Dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 DEPENDENCY_INPUT_FILES = ("package.json", "yarn.lock", "pnpm-lock.yaml", "package-lock.json", "npm-shrinkwrap.json")
 
@@ -521,7 +521,7 @@ def _audit_input_state(project: Path, registry: str) -> Dict[str, str]:
 
 def _read_optional_json(path: Path) -> Dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}

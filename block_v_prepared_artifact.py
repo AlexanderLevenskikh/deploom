@@ -884,7 +884,7 @@ def invalidate_prepared_artifact_record(key: str, *, remove_tree: bool = False) 
     workspace: Optional[Path] = None
     if remove_tree and path.is_file():
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
             if isinstance(payload, dict) and isinstance(payload.get("workspaceRoot"), str):
                 candidate = Path(str(payload["workspaceRoot"]))
                 if is_durable_prepared_path(candidate):

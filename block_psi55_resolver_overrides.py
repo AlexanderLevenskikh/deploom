@@ -212,7 +212,7 @@ def apply_resolver_overrides(
 
     package_json = Path(project_dir) / "package.json"
     try:
-        manifest = json.loads(package_json.read_text(encoding="utf-8"))
+        manifest = json.loads(package_json.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError) as exc:
         raise ResolverOverrideMaterializationError(
             f"RESOLVER_OVERRIDE_MANIFEST_UNREADABLE: {package_json}: {exc}"

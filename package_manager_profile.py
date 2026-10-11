@@ -153,7 +153,7 @@ def _major(version: str) -> int | None:
 def _yarn_lock_is_berry(lockfile: Path) -> bool:
     try:
         lines = lockfile.read_text(
-            encoding="utf-8", errors="replace"
+            encoding="utf-8-sig", errors="replace"
         ).splitlines()[:80]
     except OSError:
         return False
@@ -169,7 +169,7 @@ def _berry_node_linker(root: Path) -> str:
     if not config.is_file():
         return default
     try:
-        text = config.read_text(encoding="utf-8", errors="replace")
+        text = config.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return default
     match = re.search(

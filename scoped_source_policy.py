@@ -75,7 +75,7 @@ def policy_for_project(project, root):
         seen.add(name)
         manifest = root / name / "package.json"
         if not manifest.is_file(): continue
-        raw = json.loads(manifest.read_text(encoding="utf-8"))
+        raw = json.loads(manifest.read_text(encoding="utf-8-sig"))
         for section in ("dependencies", "devDependencies", "optionalDependencies"):
             for value in (raw.get(section) or {}).values():
                 if isinstance(value, str) and value.startswith(("file:", "link:", "portal:")):
@@ -95,7 +95,7 @@ def policy_for_project(project, root):
         config = directory / ".yarnrc.yml"
         if config.is_file():
             import re
-            match = re.search(r"(?m)^\s*yarnPath:\s*['\"]?([^'\"\r\n]+)", config.read_text(encoding="utf-8"))
+            match = re.search(r"(?m)^\s*yarnPath:\s*['\"]?([^'\"\r\n]+)", config.read_text(encoding="utf-8-sig"))
             if match:
                 target = (directory / match.group(1).strip()).resolve()
                 try: files.add(target.relative_to(root).as_posix())

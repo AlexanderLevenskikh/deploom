@@ -112,7 +112,7 @@ def eprint(*args: Any) -> None:
 
 
 def read_json(path: Path) -> Dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def direct_dependencies(package_json: Dict[str, Any]) -> Dict[Tuple[str, str], str]:

@@ -124,7 +124,7 @@ def sha256_file(path: Path) -> str:
 
 def read_json(path: Path) -> Dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         raise LockfileConsistencyError("PACKAGE_JSON_INVALID", f"{path}: {exc}") from exc
     if not isinstance(value, dict):
@@ -300,7 +300,7 @@ def _yarn_lock_resolved_urls(lockfile: Path) -> List[str]:
 
 def _package_lock_resolved_urls(lockfile: Path) -> List[str]:
     try:
-        data = json.loads(lockfile.read_text(encoding="utf-8"))
+        data = json.loads(lockfile.read_text(encoding="utf-8-sig"))
     except Exception:
         return []
     result: List[str] = []
@@ -429,7 +429,7 @@ def _package_lock_version(data: Dict[str, Any], name: str) -> str:
 
 def validate_package_lock(project: Path, package_json: Dict[str, Any], lockfile: Path) -> List[LockfileIssue]:
     try:
-        data = json.loads(lockfile.read_text(encoding="utf-8"))
+        data = json.loads(lockfile.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         return [LockfileIssue("PACKAGE_LOCK_INVALID", detail=str(exc))]
     if not isinstance(data, dict):
@@ -741,7 +741,7 @@ def exact_package_lock_version(lockfile: Path, package_name: str) -> Optional[st
     dashboard source.
     """
     try:
-        data = json.loads(lockfile.read_text(encoding="utf-8"))
+        data = json.loads(lockfile.read_text(encoding="utf-8-sig"))
     except Exception:
         return None
     if not isinstance(data, dict):
@@ -931,7 +931,7 @@ def _block_z_validate_package_lock(
     package_relative: str,
 ) -> List[LockfileIssue]:
     try:
-        data = json.loads(lockfile.read_text(encoding="utf-8"))
+        data = json.loads(lockfile.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         return [LockfileIssue("PACKAGE_LOCK_INVALID", detail=str(exc))]
     if not isinstance(data, dict):
@@ -1196,7 +1196,7 @@ def exact_package_lock_version(
             lockfile, package_name
         )
     try:
-        data = json.loads(lockfile.read_text(encoding="utf-8"))
+        data = json.loads(lockfile.read_text(encoding="utf-8-sig"))
     except Exception:
         return None
     if not isinstance(data, dict):
