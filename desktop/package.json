@@ -21,6 +21,8 @@
     "check:target-closure": "node scripts/check-target-closure.mjs",
     "check:h5-budget-priority": "node scripts/check-h5-budget-priority.mjs",
     "check:project-settings": "node scripts/check-project-settings.mjs",
+    "precheck:project-discovery": "tsc -p tsconfig.electron.json",
+    "check:project-discovery": "node scripts/check-project-discovery.mjs",
     "check:workspace-bootstrap": "node scripts/check-workspace-bootstrap.mjs",
     "check:log-presentation": "node scripts/check-log-presentation.mjs",
     "check:i18n": "node scripts/check-i18n.mjs",
