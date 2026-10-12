@@ -127,23 +127,20 @@ class BlockLPerformanceTests(unittest.TestCase):
                 self.assertNotIn("prefer-offline", rendered)
 
     def test_registry_prefetch_reduces_in_sorted_order(self) -> None:
-        main = SimpleNamespace(
-            registry="https://registry.example.test/npm", timeout=1,
-            batch_size=10, sleep_sec=0, use_system_proxy=False, npm_cache={},
+        main = roadmap.LiveDataClient(
+            "https://registry.example.test/npm", timeout=1,
+            batch_size=10, sleep_sec=0, use_system_proxy=False,
         )
-        class Worker:
-            def __init__(self, *_args, **_kwargs):
-                pass
-            def fetch_npm_metadata(self, name: str):
-                if name == "a":
-                    time.sleep(0.03)
-                return {"name": name, "versions": {}}
+        def fetch_metadata(_client, name: str):
+            if name == "a":
+                time.sleep(0.03)
+            return {"name": name, "versions": {}}
         dependencies = [
             ("b", "dev", "^1.0.0"),
             ("local", "dev", "workspace:*"),
             ("a", "runtime", "^1.0.0"),
         ]
-        with mock.patch.object(roadmap, "LiveDataClient", Worker):
+        with mock.patch.object(roadmap.LiveDataClient, "fetch_npm_metadata", fetch_metadata):
             roadmap._prefetch_registry_metadata(main, dependencies, max_workers=2)
         self.assertEqual(["a", "b"], list(main.npm_cache))
         self.assertNotIn("local", main.npm_cache)

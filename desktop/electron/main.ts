@@ -1,5 +1,6 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
 import updaterPackage from 'electron-updater'
+import { readProjectManifest } from './project-manifest.js'
 import { isDeterministicToolFailure, isDeterministicSourcePreflightFailure, formatSourceCheckoutDirtyFailure } from './baseline-retry.js'
 import { StorageCleanupController } from './storage-cleanup.js'
 import { baselineFailureMessage } from './baseline-failure.js'
@@ -7176,9 +7177,7 @@ function setupIpc(): void {
       timeBudgetMs: PROJECT_MANIFEST_DISCOVERY_DEFAULT_TIME_BUDGET_MS,
     })
     const selection = selectionFromReport(inputPath, report)
-    const serialized: SerializedDiscoveryReport = selection.status === 'explicit'
-      ? serializeDiscoveryReport({ root: resolve(inputPath), maxDepth, candidates: [], truncated: false, deeperManifests: 0, deepestSeen: 0 })
-      : serializeDiscoveryReport(selection.report)
+    const serialized: SerializedDiscoveryReport = serializeDiscoveryReport(report)
     return { status: selection.status, path: selection.path, report: serialized, deep: raw?.deep === true }
   })
 
@@ -7190,6 +7189,7 @@ function setupIpc(): void {
     let manifestIsFile = false
     try { manifestIsFile = statSync(join(projectPath, 'package.json')).isFile() } catch { manifestIsFile = false }
     if (!manifestIsFile) throw new Error('Выберите рабочую директорию с package.json. Подпроекты автоматически не выбираются.')
+    readProjectManifest(projectPath)
     const gitProbe = await spawnCapture('git', ['-C', projectPath, 'rev-parse', '--is-inside-work-tree'], projectPath, 15_000)
     if (gitProbe.timedOut || gitProbe.code !== 0 || gitProbe.stdout.trim().toLowerCase() !== 'true') {
       throw new Error('Папка проекта не находится внутри Git-репозитория.')

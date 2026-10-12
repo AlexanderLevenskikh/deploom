@@ -151,6 +151,7 @@ try {
   }
   if (counts.total === totalAfterFirst) throw new Error('Cheap reads must still run on a cached poll to build the fingerprint');
   const expensiveAfterSecond = counts.expensive;
+  const totalAfterSecond = counts.total;
 
   // Phase 3: advance a ref target (same NAME, new OID) -> fingerprint changes,
   // the very next poll re-runs the grid even inside the TTL window.
@@ -254,7 +255,7 @@ try {
   console.log('Production Git reader: fresh completion/runtime/worktree/failure evidence, authoritative cache bypass and ref-race guard OK');
 
   console.log(`Git facts cache OK: TTL=${GIT_FACTS_CACHE_TTL_MS}ms; cold=${expensiveAfterFirst} expensive calls, ` +
-    `unchanged poll added ${counts.total - totalAfterFirst} cheap calls and 0 expensive, ` +
+    `unchanged poll added ${totalAfterSecond - totalAfterFirst} cheap calls and 0 expensive, ` +
     `ref OID move re-ran ${counts.expensive - expensiveAfterSecond} expensive, expiry recomputed ${shortCounts.expensive}.`);
 } finally {
   if (repo.startsWith(tmpdir())) rmSync(repo, { recursive: true, force: true });

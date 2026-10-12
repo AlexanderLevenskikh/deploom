@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url'
 const root = process.cwd()
 const compiled = join(root, 'dist-electron', 'workspace-bootstrap.js')
 const { initializeWorkspaceRepository, WORKSPACE_SETTINGS_PATH } = await import(pathToFileURL(compiled).href)
+const { readProjectManifest } = await import(pathToFileURL(join(root, 'dist-electron/project-manifest.js')).href)
 
 const calls = []
 const fakeGit = async (command, args, cwd) => {
@@ -75,7 +76,7 @@ try {
   const state = { workspaces: [workspace, other], selectedWorkspaceId: 'ws' }
   const settingsPath = join(workspaceRoot, 'settings.json'), jobs = new Map()
   const bindings = {
-    ...fs, ...paths, jobs,
+    ...fs, ...paths, jobs, readProjectManifest,
     loadState: () => state, saveState: () => {},
     findWorkspace: (current, id) => { const value = current.workspaces.find(w => w.id === id); if (!value) throw Error('missing workspace'); return value },
     selectedWorkspace: current => current.workspaces.find(w => w.id === current.selectedWorkspaceId),
@@ -107,6 +108,11 @@ try {
   saved = JSON.parse(readFileSync(settingsPath, 'utf8')).projects
   assert.equal(saved.length, 2, 'root selection must not add discovered subprojects')
   assert.equal(saved[1].path, repository)
+  const malformed = join(repository, 'malformed'); mkdirSync(malformed)
+  writeFileSync(join(malformed, 'package.json'), '{not-json')
+  const beforeMalformed = readFileSync(settingsPath, 'utf8')
+  await assert.rejects(add(null, { workspaceId: 'ws', name: 'malformed', path: malformed }), /PROJECT_PACKAGE_JSON_INVALID/)
+  assert.equal(readFileSync(settingsPath, 'utf8'), beforeMalformed, 'invalid manifest registration must preserve settings')
   const remove = ipcHandler('flow:remove-workspace', bindings)
   jobs.set('busy', { workspace }); await assert.rejects(remove(null, 'ws'), /активные/); jobs.clear()
   bindings.iterativeAutopilot.hasSession = () => true

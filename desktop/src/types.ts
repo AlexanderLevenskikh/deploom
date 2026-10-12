@@ -568,6 +568,7 @@ export type ProjectDiscoveryReport = {
   root: string
   maxDepth: number
   candidates: ProjectDiscoveryCandidate[]
+  issues?: { path: string; code: string; detail: string }[]
   truncated: boolean
   deeperManifests: number
   deepestSeen: number

@@ -29,7 +29,7 @@ export function ProjectRail({ details, selected, active, onSelectProject, onRefr
   const visible = needle.length === 0
     ? details.projects
     : details.projects.filter((project) => {
-        const haystack = `${project.name} ${project.git?.baseBranch || ''} ${project.git?.sourceBranch || ''}`.toLowerCase()
+        const haystack = `${project.name} ${project.path} ${project.repositoryPath || ''} ${project.git?.baseBranch || ''} ${project.git?.sourceBranch || ''}`.toLowerCase()
         return haystack.includes(needle)
       })
 
@@ -45,7 +45,7 @@ export function ProjectRail({ details, selected, active, onSelectProject, onRefr
           return <div key={project.name} className={`project-row-shell ${selected?.name === project.name ? 'selected' : ''}`}>
             <button className="project-row-main" onClick={() => onSelectProject(project.name)}>
               <span className={`status-dot ${tone}`} title={t('projectRail.currentLevel', { level: levelLabel })} />
-              <span className="project-copy"><strong>{project.name}</strong><small>{project.git?.baseBranch || project.git?.sourceBranch || t('projectRail.notConfigured')}</small></span>
+              <span className="project-copy"><strong>{project.name}</strong><small title={project.path}>{project.path}</small><small>{project.git?.baseBranch || project.git?.sourceBranch || t('projectRail.notConfigured')}</small></span>
               <ChevronRight size={16} />
             </button>
             <button

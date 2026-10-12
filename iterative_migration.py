@@ -72,6 +72,7 @@ from iterative_progress import MigrationProgress
 from migration_validation import digest as validation_digest, validate_profile, verify_initial_control, validate_baseline_reference
 from verification_proof import is_fixed_manifest_spec
 from iterative_target_deferrals import record_unavailable_targets, unavailable_targets
+from iterative_registry_metadata import NpmDiscoveryMetadata
 from iterative_restart import TRANSACTION as RESTART_TRANSACTION, RestartArchiveError, archive_for_restart, recover_restart_archive
 from package_manager_profile import (
     install_args_for_profile,
@@ -2773,6 +2774,25 @@ def _probe_budget_timeout(default_seconds: int = 60) -> Optional[int]:
     return int(max(1, min(default_seconds, remaining)))
 
 
+_ACTIVE_REGISTRY_METADATA: "contextvars.ContextVar[Optional[NpmDiscoveryMetadata]]" = contextvars.ContextVar(
+    "iterative_registry_metadata", default=None
+)
+
+
+def _query_discovery_metadata(project_dir: Path, args: List[str], runtime_env: Optional[Dict[str, str]]) -> Any:
+    manager = resolve_executable("npm")
+    timeout = _probe_budget_timeout()
+    if not manager or timeout is None:
+        return None, False
+    try:
+        result = _run([manager, *args], project_dir, timeout_seconds=timeout,
+                      env=runtime_env or {}, base_env=os.environ,
+                      progress_label=f"registry metadata {args[1]}")
+        return (json.loads(result.stdout) if result.returncode == 0 else None), True
+    except Exception:  # unavailable metadata is UNKNOWN, never a learned constraint
+        return None, True
+
+
 def _normalize_effective_node_version(value: Any) -> str:
     """x.y.z from an effective Node version string (v-prefix/build tolerated)."""
     text = str(value or "").strip().lstrip("vV").split("+", 1)[0]
@@ -2795,6 +2815,9 @@ def _npm_engines_node(
     COMPATIBLE, never as a false incompatibility constraint. Only an actual
     engines.node range from the registry may defer a target.
     """
+    metadata = _ACTIVE_REGISTRY_METADATA.get()
+    if metadata is not None and metadata.name == name:
+        return metadata.engines(version)
     manager = resolve_executable("npm")
     if not manager:
         return ""
@@ -2832,6 +2855,9 @@ def _npm_latest_version(
     runtime_env: Optional[Dict[str, str]],
 ) -> str:
     """Exact registry ``dist-tags.latest`` of a package ('' = no evidence)."""
+    metadata = _ACTIVE_REGISTRY_METADATA.get()
+    if metadata is not None and metadata.name == name:
+        return metadata.latest()
     manager = resolve_executable("npm")
     if not manager:
         return ""
@@ -2875,6 +2901,9 @@ def _npm_versions(
     list — abstention, never a constraint. The bound keeps engine-affinity
     discovery cheap even for packages with thousands of published versions.
     """
+    metadata = _ACTIVE_REGISTRY_METADATA.get()
+    if metadata is not None and metadata.name == name:
+        return metadata.versions(top, _version_sort_key)
     manager = resolve_executable("npm")
     if not manager:
         return []
@@ -3261,6 +3290,24 @@ def _newer_than_installed(candidate: str, installed: str) -> bool:
 
 
 def _discover_one_target(
+    project_dir: Path,
+    name: str,
+    declared: str,
+    runtime_env: Optional[Dict[str, str]],
+    node_version: Optional[str],
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    metadata = NpmDiscoveryMetadata(name, lambda args: _query_discovery_metadata(project_dir, args, runtime_env))
+    token = _ACTIVE_REGISTRY_METADATA.set(metadata)
+    try:
+        target, evidence = _discover_one_target_impl(project_dir, name, declared, runtime_env, node_version)
+        if metadata.queries:
+            evidence["registryMetadata"] = {"source": "npm-cli", "queries": metadata.queries, "scope": "planning-only"}
+        return target, evidence
+    finally:
+        _ACTIVE_REGISTRY_METADATA.reset(token)
+
+
+def _discover_one_target_impl(
     project_dir: Path,
     name: str,
     declared: str,

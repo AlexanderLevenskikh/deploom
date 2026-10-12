@@ -802,9 +802,22 @@ def _run(
     """Run a verifier child with bounded output and full-stream infra detection."""
     infra_seen = False
     rolling = ""
+    latest_output = ""
+    reported_output = ""
+
+    def report_progress(message: str) -> None:
+        nonlocal reported_output
+        if progress is None:
+            return
+        progress(message)
+        # Bounded, throttled by the supervisor heartbeat on its main thread.
+        if latest_output and latest_output != reported_output:
+            progress(f"{progress_label}: output:\n{latest_output}")
+            reported_output = latest_output
 
     def observe_output(chunk: str) -> None:
-        nonlocal infra_seen, rolling
+        nonlocal infra_seen, rolling, latest_output
+        latest_output = (latest_output + str(chunk))[-2000:]
         if infra_seen:
             return
         # Pattern boundaries may cross reader chunks. A small rolling prefix is
@@ -821,13 +834,20 @@ def _run(
         timeout_seconds=timeout_seconds,
         env=env,
         base_env=base_env,
-        progress=progress,
+        progress=report_progress if progress is not None else None,
         progress_label=progress_label,
         progress_interval_seconds=progress_interval_seconds,
         output_observer=observe_output,
     )
     setattr(completed, "deploom_infra_detected", bool(infra_seen))
     return completed
+
+
+def _process_failure_output(error: BaseException) -> str:
+    output = getattr(error, "output", "") or ""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    return str(output)[-16000:]
 
 
 def _durable_proof_publication_allowed(
@@ -3184,7 +3204,7 @@ def verify_assignment(
                         f"BASELINE_BUDGET_EXHAUSTED: resolver-install: the wall-clock budget was reached while the package manager was still running: {exc}",
                         command=" ".join(argv),
                     )
-                return BaselineVerifyResult(False, "infrastructure", f"package-manager verification timed out: {exc}", command=" ".join(argv))
+                return BaselineVerifyResult(False, "infrastructure", f"package-manager verification timed out: {exc}", command=" ".join(argv), output=_process_failure_output(exc), workspace=str(workspace_project))
             except OSError as exc:
                 return BaselineVerifyResult(False, "infrastructure", f"package-manager launch failed: {exc}", command=" ".join(argv))
 
@@ -3745,7 +3765,7 @@ def verify_assignment(
                             f"BASELINE_BUDGET_EXHAUSTED: lifecycle-install: the wall-clock budget was reached while installing: {exc}",
                             command=" ".join(full_argv),
                         )
-                    return BaselineVerifyResult(False, "infrastructure", f"project-preflight install failed: {exc}", command=" ".join(full_argv))
+                    return BaselineVerifyResult(False, "infrastructure", f"project-preflight install failed: {exc}", command=" ".join(full_argv), output=_process_failure_output(exc), workspace=str(workspace_project))
                 preparation_publication_allowed = _durable_proof_publication_allowed(full_result)
                 preparation_classified = (
                     "passed"

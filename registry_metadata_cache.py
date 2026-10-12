@@ -16,8 +16,9 @@ Contract and safety boundaries:
   cache: ``manual_dependency_audit.py`` and the Modern Yarn audit bridge always
   query fresh registry/lockfile evidence.
 * Registry isolation. The registry URL is part of the durable key, so one
-  configured registry can never read another registry's packument (auth/proxy
-  only affect reachability, never the content already keyed by registry).
+  configured registry can never read another registry's packument. A separate
+  request-context fingerprint isolates transport/config views; authenticated
+  clients do not use durable entries.
 * Freshness is bounded by an explicit TTL; 0/None disables the cache. A stale
   entry is returned as a miss, never as data.
 * Honest UNKNOWN. A transient infrastructure failure or a 404 is never
@@ -34,6 +35,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -61,13 +63,13 @@ def _registry_subdir(cache_dir: Path, registry: str) -> Path:
     return cache_dir / _sha256(registry)[:16]
 
 
-def _entry_path(cache_dir: Path, registry: str, name: str) -> Path:
+def _entry_path(cache_dir: Path, registry: str, name: str, context: str = "") -> Path:
     # A package name may be scoped ("@scope/name") and contain '/', '@', '.'.
     # It is stored by hash and validated against the JSON entry on load.
-    return _registry_subdir(cache_dir, registry) / (_sha256(name) + ".json")
+    return _registry_subdir(cache_dir, registry) / (_sha256(context + "\0" + name if context else name) + ".json")
 
 
-def _entry_is_fresh(entry: Dict[str, Any], registry: str, name: str, ttl_seconds: float, now: float) -> bool:
+def _entry_is_fresh(entry: Dict[str, Any], registry: str, name: str, ttl_seconds: float, now: float, context: str = "") -> bool:
     if entry.get("schema") != CACHE_SCHEMA_VERSION:
         return False
     if entry.get("entrySchema") != CACHE_ENTRY_SCHEMA:
@@ -76,13 +78,16 @@ def _entry_is_fresh(entry: Dict[str, Any], registry: str, name: str, ttl_seconds
         return False
     if entry.get("name") != name:
         return False
+    if entry.get("context", "") != context:
+        return False
     data = entry.get("data")
     if not isinstance(data, dict):
         return False
     fetched_at_unix = entry.get("fetchedAtUnix")
-    if not isinstance(fetched_at_unix, (int, float)):
+    if isinstance(fetched_at_unix, bool) or not isinstance(fetched_at_unix, (int, float)):
         return False
-    return (now - float(fetched_at_unix)) <= ttl_seconds
+    age = now - float(fetched_at_unix)
+    return math.isfinite(now) and math.isfinite(float(fetched_at_unix)) and math.isfinite(ttl_seconds) and 0 <= age <= ttl_seconds
 
 
 def load_packument(
@@ -92,6 +97,7 @@ def load_packument(
     ttl_seconds: float,
     *,
     now: Optional[float] = None,
+    context: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Return a fresh cached packument for (registry, name), or None.
 
@@ -101,14 +107,14 @@ def load_packument(
     if cache_dir is None or ttl_seconds <= 0:
         return None
     try:
-        raw = _entry_path(cache_dir, registry, name).read_text(encoding="utf-8")
+        raw = _entry_path(cache_dir, registry, name, context).read_text(encoding="utf-8")
         entry = json.loads(raw)
     except (OSError, ValueError, TypeError):
         return None
     if not isinstance(entry, dict):
         return None
     current = time.time() if now is None else float(now)
-    if not _entry_is_fresh(entry, registry, name, ttl_seconds, current):
+    if not _entry_is_fresh(entry, registry, name, ttl_seconds, current, context):
         return None
     return entry["data"]
 
@@ -121,6 +127,7 @@ def store_packument(
     tool_version: str = "",
     *,
     now: Optional[float] = None,
+    context: str = "",
 ) -> None:
     """Best-effort atomic persistence of one packument entry. Never raises.
 
@@ -130,7 +137,7 @@ def store_packument(
     """
     if cache_dir is None or not isinstance(data, dict):
         return
-    target = _entry_path(cache_dir, registry, name)
+    target = _entry_path(cache_dir, registry, name, context)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -139,7 +146,10 @@ def store_packument(
         # failure: skip persistence instead of failing the fetch.
         return
     current = time.time() if now is None else float(now)
+    if not math.isfinite(current):
+        return
     entry = {
+        "context": context,
         "schema": CACHE_SCHEMA_VERSION,
         "entrySchema": CACHE_ENTRY_SCHEMA,
         "registry": registry,

@@ -14,8 +14,9 @@
 // Electron main thread for a single uncuttable slice. Any budget stop reports
 // `truncated=true` with an explicit `budgetHit` reason, so the renderer can
 // offer the scan-extension action and never pretend a partial view is complete.
-import { statSync, readFileSync, readdirSync, type Dirent } from 'node:fs'
+import { statSync, readdirSync, existsSync, type Dirent } from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
+import { readProjectManifest } from './project-manifest.js'
 
 export const PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH = 5
 export const PROJECT_MANIFEST_DISCOVERY_DEEP_SCAN_DEPTH = 8
@@ -46,11 +47,13 @@ export type DiscoveryCandidate = {
 }
 
 export type DiscoveryBudgetHit = 'depth' | 'entries' | 'time'
+export type DiscoveryIssue = { path: string; code: string; detail: string }
 
 export type DiscoveryReport = {
   root: string
   maxDepth: number
   candidates: DiscoveryCandidate[]
+  issues?: DiscoveryIssue[]
   /** The scan stopped early — because of the depth limit, the entry budget or the time budget. */
   truncated: boolean
   /** Manifests that exist strictly below maxDepth and were therefore not picked up. */
@@ -123,7 +126,8 @@ function translateGlobSegment(segment: string): string {
       if (segment[close] === ']') close += 1
       while (close < segment.length && segment[close] !== ']') close += 1
       if (close < segment.length) {
-        const content = segment.slice(index + 1, close)
+        const raw = segment.slice(index + 1, close)
+        const content = raw.startsWith('!') ? '^' + raw.slice(1) : raw
         out += `[${content.replace(/\\/g, '\\\\')}]`
         index = close
       } else {
@@ -171,6 +175,8 @@ function globstarRegex(segments: string[]): string {
  * character, `[...]` is a class, and `{a,b}` expands to alternatives.
  */
 export function workspacePatternMatches(pattern: string, relPath: string): boolean {
+  pattern = pattern.trim().replace(/\\/g, '/').replace(/^(?:\.\/)+/, '').replace(/^\/+|\/+$/g, '')
+  if (!pattern || /[?*+@!]\(/.test(pattern)) return false
   const segments = relPath.replace(/^\/+|\/+$/g, '').split('/')
   if (!pattern.includes('{')) {
     return matchSegments(pattern.split('/'), segments)
@@ -200,24 +206,21 @@ function matchSegments(patternSegments: string[], relSegments: string[]): boolea
 function workspacePatternsOf(managerDir: string): string[] | undefined {
   const manifestPath = join(managerDir, MANIFEST_FILE)
   if (!fileExists(manifestPath)) return undefined
-  try {
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { workspaces?: unknown }
-    const value = manifest.workspaces
-    if (typeof value === 'string' && value.trim()) return [value.trim()]
-    if (Array.isArray(value)) {
-      const patterns = value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim())
-      return patterns.length ? patterns : undefined
-    }
-    // Yarn classic nests { packages: [...] } — read the flat list only; the
-    // rest is handled by Python for an actual migration.
-    if (value && typeof value === 'object' && Array.isArray((value as { packages?: unknown }).packages)) {
-      const patterns = ((value as { packages: unknown[] }).packages).filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim())
-      return patterns.length ? patterns : undefined
-    }
-    return undefined
-  } catch {
-    return undefined
+  const manifest = readProjectManifest(managerDir) as { workspaces?: unknown }
+  const value = manifest.workspaces
+  if (typeof value === 'string' && value.trim()) return [value.trim()]
+  if (Array.isArray(value)) {
+    const patterns = value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim())
+    return patterns.length ? patterns : undefined
   }
+  // Yarn classic nests { packages: [...] } — read the flat list only; the
+  // rest is handled by Python for an actual migration.
+  if (value && typeof value === 'object' && Array.isArray((value as { packages?: unknown }).packages)) {
+    const patterns = ((value as { packages: unknown[] }).packages).filter((item): item is string => typeof item === 'string' && item.trim().length > 0).map((item) => item.trim())
+    return patterns.length ? patterns : undefined
+  }
+  return undefined
+
 }
 
 /**
@@ -237,6 +240,7 @@ function managerOwnsDir(managerDir: string, dir: string): boolean {
     const negate = pattern.startsWith('!')
     const body = negate ? pattern.slice(1) : pattern
     if (!body.trim()) continue
+    if (/[?*+@!]\(/.test(body) || /\{[^}]*\|/.test(body)) throw new Error(`PROJECT_WORKSPACE_PATTERN_UNSUPPORTED: ${body}`)
     if (workspacePatternMatches(body.trim(), relPath)) {
       if (negate) return false
       owned = true
@@ -254,15 +258,26 @@ function managerOwnsDir(managerDir: string, dir: string): boolean {
  * some unrelated monorepo root above a bare subfolder) is never attributed to
  * the subproject — Python rejects exactly that attribution.
  */
+function discoverySourceBoundary(start: string, fallback: string): string {
+  let current = resolve(start)
+  for (let guard = 0; guard < 64; guard += 1) {
+    if (existsSync(join(current, '.git'))) return current
+    const parent = dirname(current)
+    if (parent === current) break
+    current = parent
+  }
+  return resolve(fallback)
+}
+
 export function canonicalLockfileForDir(startDir: string, boundaryRoot: string): DiscoveryLockfile {
-  const resolvedBoundary = resolve(boundaryRoot)
+  const resolvedBoundary = discoverySourceBoundary(startDir, boundaryRoot)
   let current = resolve(startDir)
   let guard = 0
   while (guard++ < 32) {
     const isSelf = current === resolve(startDir)
     if (!isSelf && !managerOwnsDir(current, startDir)) {
       const parent = dirname(current)
-      if (current === resolvedBoundary || parent === current) break
+      if (current === resolvedBoundary || existsSync(join(current, '.git')) || parent === current) break
       current = parent
       continue
     }
@@ -270,7 +285,7 @@ export function canonicalLockfileForDir(startDir: string, boundaryRoot: string):
       const candidatePath = join(current, entry.name)
       if (fileExists(candidatePath)) return { kind: entry.kind, name: entry.name, path: candidatePath }
     }
-    if (current === resolvedBoundary) break
+    if (current === resolvedBoundary || existsSync(join(current, '.git'))) break
     const parent = dirname(current)
     if (parent === current) break
     current = parent
@@ -279,15 +294,13 @@ export function canonicalLockfileForDir(startDir: string, boundaryRoot: string):
 }
 
 function packageNameFor(directory: string): string | undefined {
-  try {
-    const manifest = JSON.parse(readFileSync(join(directory, MANIFEST_FILE), 'utf8')) as { name?: unknown }
-    return typeof manifest.name === 'string' && manifest.name.trim() ? manifest.name.trim() : undefined
-  } catch {
-    return undefined
-  }
+  const manifest = readProjectManifest(directory)
+  return typeof manifest.name === 'string' && manifest.name.trim() ? manifest.name.trim() : undefined
+
 }
 
 type TraversalStep =
+  | { kind: 'issue'; directory: string; depth: number; issue: DiscoveryIssue }
   | { kind: 'manifest'; directory: string; depth: number; packageName?: string; lockfile?: DiscoveryLockfile }
   | { kind: 'children'; directory: string; depth: number; children: Array<{ directory: string; depth: number }> }
 
@@ -307,8 +320,27 @@ function* walkSteps(root: string): Generator<TraversalStep, void, void> {
   while (stack.length) {
     const { directory, depth } = stack.pop() as { directory: string; depth: number }
     const isRoot = directory === resolvedRoot
-    const hasManifest = !isRoot && fileExists(join(directory, MANIFEST_FILE))
-    if (hasManifest) {
+    let hasManifest = false
+    try {
+      hasManifest = statSync(join(directory, MANIFEST_FILE)).isFile()
+      if (!hasManifest) {
+        yield { kind: 'issue', directory, depth, issue: { path: directory, code: 'PROJECT_MANIFEST_NOT_FILE', detail: 'package.json must be a file' } }
+        continue
+      }
+    } catch (error) {
+      if (!['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) {
+        yield { kind: 'issue', directory, depth, issue: { path: directory, code: 'PROJECT_MANIFEST_UNREADABLE', detail: String(error) } }
+        continue
+      }
+    }
+    if (isRoot && hasManifest) {
+      try { readProjectManifest(directory) } catch (error) {
+        yield { kind: 'issue', directory, depth, issue: { path: directory, code: 'PROJECT_PACKAGE_JSON_INVALID', detail: String(error) } }
+        continue
+      }
+    }
+    if (hasManifest && !isRoot) {
+      try {
       const packageName = packageNameFor(directory)
       const manifestStep: Extract<TraversalStep, { kind: 'manifest' }> = {
         kind: 'manifest',
@@ -318,12 +350,16 @@ function* walkSteps(root: string): Generator<TraversalStep, void, void> {
         lockfile: canonicalLockfileForDir(directory, resolvedRoot),
       }
       yield manifestStep
+      } catch (error) {
+        yield { kind: 'issue', directory, depth, issue: { path: directory, code: String(error).includes('WORKSPACE_PATTERN_UNSUPPORTED') ? 'PROJECT_WORKSPACE_PATTERN_UNSUPPORTED' : 'PROJECT_PACKAGE_JSON_INVALID', detail: String(error) } }
+      }
       continue
     }
     let entries: Dirent[] = []
     try {
       entries = readdirSync(directory, { withFileTypes: true })
-    } catch {
+    } catch (error) {
+      yield { kind: 'issue', directory, depth, issue: { path: directory, code: 'PROJECT_DIRECTORY_UNREADABLE', detail: String(error) } }
       continue
     }
     const children: Array<{ directory: string; depth: number }> = []
@@ -360,6 +396,7 @@ function runBoundedSync(root: string, maxDepth: number, options: BoundedWalkOpti
   const resolvedRoot = resolve(root)
   const limit = Math.max(0, Math.min(64, Number.isFinite(maxDepth) ? maxDepth : PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH))
   const found: DiscoveryCandidate[] = []
+  const issues: DiscoveryIssue[] = []
   const ctx = { truncated: false, deeperManifests: 0, deepestSeen: 0 }
   let budgetHit: DiscoveryBudgetHit | undefined
   let visited = 0
@@ -378,6 +415,11 @@ function runBoundedSync(root: string, maxDepth: number, options: BoundedWalkOpti
       budgetHit = 'time'
       break
     }
+    if (step.kind === 'issue') {
+      issues.push(step.issue)
+      ctx.truncated = true
+      continue
+    }
     if (step.depth > limit) {
       ctx.truncated = true
       if (budgetHit === undefined) budgetHit = 'depth'
@@ -395,6 +437,7 @@ function runBoundedSync(root: string, maxDepth: number, options: BoundedWalkOpti
     root: resolvedRoot,
     maxDepth: limit,
     candidates: found,
+    ...(issues.length ? { issues } : {}),
     truncated: ctx.truncated,
     deeperManifests: ctx.deeperManifests,
     deepestSeen: ctx.deepestSeen,
@@ -416,6 +459,7 @@ export async function discoverProjectDirectoriesBounded(
   const resolvedRoot = resolve(root)
   const limit = Math.max(0, Math.min(64, Number.isFinite(maxDepth) ? maxDepth : PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH))
   const found: DiscoveryCandidate[] = []
+  const issues: DiscoveryIssue[] = []
   const ctx = { truncated: false, deeperManifests: 0, deepestSeen: 0 }
   let budgetHit: DiscoveryBudgetHit | undefined
   let visited = 0
@@ -425,6 +469,7 @@ export async function discoverProjectDirectoriesBounded(
 
   for (const step of walkSteps(resolvedRoot)) {
     visited += 1
+    if (visited % yieldEvery === 0) await new Promise<void>((resolveYield) => setImmediate(resolveYield))
     if (visited > maxEntries) {
       ctx.truncated = true
       budgetHit = 'entries'
@@ -434,6 +479,11 @@ export async function discoverProjectDirectoriesBounded(
       ctx.truncated = true
       budgetHit = 'time'
       break
+    }
+    if (step.kind === 'issue') {
+      issues.push(step.issue)
+      ctx.truncated = true
+      continue
     }
     if (step.depth > limit) {
       ctx.truncated = true
@@ -446,13 +496,13 @@ export async function discoverProjectDirectoriesBounded(
     } else {
       for (const child of step.children) ctx.deepestSeen = Math.max(ctx.deepestSeen, child.depth)
     }
-    if (visited % yieldEvery === 0) await new Promise<void>((resolveYield) => setImmediate(resolveYield))
   }
   found.sort((left, right) => left.relative.localeCompare(right.relative) || left.path.localeCompare(right.path))
   return {
     root: resolvedRoot,
     maxDepth: limit,
     candidates: found,
+    ...(issues.length ? { issues } : {}),
     truncated: ctx.truncated,
     deeperManifests: ctx.deeperManifests,
     deepestSeen: ctx.deepestSeen,
@@ -471,24 +521,24 @@ export function resolveProjectPackageSelection(
   maxDepth: number = PROJECT_MANIFEST_DISCOVERY_MAX_DEPTH,
 ): PackageSelection {
   const selected = resolve(inputPath)
-  if (fileExists(join(selected, MANIFEST_FILE))) return { status: 'explicit', path: selected }
+  if (fileExists(join(selected, MANIFEST_FILE))) { readProjectManifest(selected); return { status: 'explicit', path: selected } }
   const report = discoverProjectDirectories(selected, maxDepth)
   if (report.candidates.length === 0) return { status: 'missing', path: selected, report }
-  if (report.candidates.length === 1) return { status: 'single', path: report.candidates[0].path, report }
+  if (report.candidates.length === 1 && !report.truncated) return { status: 'single', path: report.candidates[0].path, report }
   return { status: 'ambiguous', path: selected, report }
 }
 
 /** Build a selection from an already-computed (possibly bounded) report. */
 export function selectionFromReport(inputPath: string, report: DiscoveryReport): PackageSelection {
   const selected = resolve(inputPath)
-  if (fileExists(join(selected, MANIFEST_FILE))) return { status: 'explicit', path: selected }
+  if (fileExists(join(selected, MANIFEST_FILE))) { readProjectManifest(selected); return { status: 'explicit', path: selected } }
   if (report.candidates.length === 0) return { status: 'missing', path: selected, report }
-  if (report.candidates.length === 1) return { status: 'single', path: report.candidates[0].path, report }
+  if (report.candidates.length === 1 && !report.truncated) return { status: 'single', path: report.candidates[0].path, report }
   return { status: 'ambiguous', path: selected, report }
 }
 
 export function deepScanSuggestion(report: DiscoveryReport): boolean {
-  return report.truncated && report.deeperManifests > 0
+  return report.truncated
 }
 
 export type SerializedDiscoveryCandidate = {
@@ -505,6 +555,7 @@ export type SerializedDiscoveryReport = {
   root: string
   maxDepth: number
   candidates: SerializedDiscoveryCandidate[]
+  issues?: DiscoveryIssue[]
   truncated: boolean
   deeperManifests: number
   deepestSeen: number
@@ -524,6 +575,7 @@ export function serializeDiscoveryReport(report: DiscoveryReport): SerializedDis
       lockfileName: candidate.lockfile.name,
       ...(candidate.lockfile.path ? { lockfilePath: candidate.lockfile.path } : {}),
     })),
+    ...(report.issues?.length ? { issues: report.issues } : {}),
     truncated: report.truncated,
     deeperManifests: report.deeperManifests,
     deepestSeen: report.deepestSeen,

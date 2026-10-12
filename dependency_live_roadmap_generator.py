@@ -143,6 +143,8 @@ from constraint_cache import (
     dependency_failure_navigation_signature,
     matching_dependency_failure_signature,
 )
+from copy import copy as shallow_copy
+from registry_request_context import request_context
 from registry_metadata_cache import (
     DEFAULT_METADATA_CACHE_TTL_SECONDS,
     load_packument,
@@ -2419,6 +2421,7 @@ class LiveDataClient:
         self.metadata_cache_dir: Optional[Path] = Path(metadata_cache_dir) if metadata_cache_dir else None
         self.metadata_cache_ttl: float = float(metadata_cache_ttl or 0.0)
         self.metadata_cache_tool_version: str = metadata_cache_tool_version or ""
+        self._metadata_request_context = request_context(self.session, self.registry, self.metadata_cache_tool_version)[0]
         self._metadata_cache_disk_hits = 0
         self._metadata_cache_disk_misses = 0
         # Optional run deadline (Draft). When set, every request is bounded by
@@ -2913,14 +2916,18 @@ class LiveDataClient:
         return value
 
     def fetch_npm_metadata(self, pkg: str):
+        context, durable = request_context(self.session, self.registry, self.metadata_cache_tool_version)
+        if context is None or context != self._metadata_request_context:
+            self.npm_cache.clear()
+            self._metadata_request_context = context
         if pkg in self.npm_cache:
             return self.npm_cache[pkg]
-        if self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
+        if durable and self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
             # C2: planning packument cache -- merge latest/version/engines/
             # history metadata queries across CLI invocations. Only a fresh
             # entry is used; install/verifier/audit are untouched.
             cached = load_packument(
-                self.metadata_cache_dir, self.registry, pkg, self.metadata_cache_ttl
+                self.metadata_cache_dir, self.registry, pkg, self.metadata_cache_ttl, context=context or ""
             )
             if cached is not None:
                 self.npm_cache[pkg] = cached
@@ -2949,11 +2956,11 @@ class LiveDataClient:
                 if not isinstance(data, dict):
                     raise ValueError("registry metadata response is not a JSON object")
                 self.npm_cache[pkg] = data
-                if self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
+                if durable and self.metadata_cache_dir is not None and self.metadata_cache_ttl > 0:
                     # Best-effort; a cache write failure never aborts the run.
                     store_packument(
                         self.metadata_cache_dir, self.registry, pkg, data,
-                        self.metadata_cache_tool_version,
+                        self.metadata_cache_tool_version, context=context or "",
                     )
                 self._bounded_sleep(self.sleep_sec)
                 return data
@@ -4482,21 +4489,26 @@ def _prefetch_registry_metadata(
     run: the package is marked metadata-unavailable and the canonical loop
     records current/requested without inventing a target version.
     """
-    names = sorted({
-        str(name)
-        for name, _kind, spec in dependencies
-        if not is_non_registry_spec(spec) and str(name) not in client.npm_cache
-    })
+    registry_names = {str(name) for name, _kind, spec in dependencies if not is_non_registry_spec(spec)}
+    if not registry_names:
+        return
+    context, durable = None, False
+    if isinstance(client, LiveDataClient):
+        context, durable = request_context(client.session, client.registry, client.metadata_cache_tool_version)
+        if context is None or context != client._metadata_request_context:
+            client.npm_cache.clear()
+            client._metadata_request_context = context
+    names = sorted(name for name in registry_names if name not in client.npm_cache)
     if not names:
         return
     cache_dir = getattr(client, "metadata_cache_dir", None)
     cache_ttl = getattr(client, "metadata_cache_ttl", 0.0) or 0.0
-    if cache_dir is not None and cache_ttl > 0:
+    if durable and cache_dir is not None and cache_ttl > 0:
         # C2: serve fresh packuments from the durable planning cache and
         # prefetch only the packages it does not cover yet.
         missing: List[str] = []
         for name in names:
-            cached = load_packument(cache_dir, client.registry, name, cache_ttl)
+            cached = load_packument(cache_dir, client.registry, name, cache_ttl, context=context or "")
             if cached is not None:
                 client.npm_cache[name] = cached
             else:
@@ -4513,7 +4525,7 @@ def _prefetch_registry_metadata(
         # below; a parallel pool would swallow the per-future DraftBudgetExceeded
         # signal and hide the run deadline from publication.
         return
-    workers = max(1, min(int(max_workers), 16, len(names)))
+    workers = 1 if context is None else max(1, min(int(max_workers), 16, len(names)))
     if workers <= 1:
         for name in names:
             try:
@@ -4538,7 +4550,19 @@ def _prefetch_registry_metadata(
                 client.registry, timeout=client.timeout,
                 batch_size=client.batch_size, sleep_sec=client.sleep_sec,
                 use_system_proxy=client.use_system_proxy,
+                metadata_cache_dir=client.metadata_cache_dir,
+                metadata_cache_ttl=client.metadata_cache_ttl,
+                metadata_cache_tool_version=client.metadata_cache_tool_version,
             )
+            worker.session.trust_env = client.session.trust_env
+            worker.session.max_redirects = client.session.max_redirects
+            worker.session.params = shallow_copy(client.session.params)
+            worker.session.headers.update(client.session.headers)
+            worker.session.auth = client.session.auth
+            worker.session.proxies.update(client.session.proxies)
+            worker.session.cookies.update(client.session.cookies)
+            worker.session.verify = client.session.verify
+            worker.session.cert = client.session.cert
             local.client = worker
         return worker.fetch_npm_metadata(name)
 

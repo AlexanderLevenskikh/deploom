@@ -1072,3 +1072,11 @@ textarea::placeholder {
 .overview-project-row.selected { border-color: var(--blue); }
 
 .main-workspace-suspense { height: 100%; display: grid; place-items: center; color: var(--muted); font-size: 12px; }
+
+/* Keep expanded discovery and partial registration within the modal viewport. */
+.add-project-dialog { max-height: calc(100vh - 48px); min-height: 0; display: flex; flex-direction: column; font-size: 12px; }
+.add-project-dialog > .dialog-title, .add-project-dialog > .dialog-actions { flex: 0 0 auto; }
+.add-project-dialog > .dialog-actions { position: static; }
+.add-project-scroll { min-height: 0; overflow-y: auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 13px; padding-right: 2px; }
+.add-project-scroll > label { display: flex; flex-direction: column; gap: 5px; font-size: 11px; font-weight: 600; }
+.add-project-scroll input[type="checkbox"] { height: auto; margin-top: 2px; flex: none; }

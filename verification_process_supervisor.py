@@ -8,6 +8,7 @@ filesystem leases only after the owned process tree is quiescent.
 from __future__ import annotations
 
 import ctypes
+import codecs
 import dataclasses
 import os
 import signal
@@ -559,10 +560,17 @@ def run_supervised(
         if stream is None:
             return
         try:
+            # TextIO.read(size) can wait for size characters or EOF, hiding
+            # small progress messages while a package manager is still running.
+            buffer = getattr(stream, "buffer", None)
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             while True:
-                chunk = stream.read(64 * 1024)
-                if not chunk:
+                raw = buffer.read1(64 * 1024) if buffer is not None else stream.read(64 * 1024)
+                if not raw:
+                    if buffer is not None:
+                        capture.feed(decoder.decode(b"", final=True))
                     break
+                chunk = decoder.decode(raw) if isinstance(raw, bytes) else raw
                 capture.feed(chunk)
         except (OSError, ValueError):
             pass

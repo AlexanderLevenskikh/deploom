@@ -87,6 +87,35 @@ class SigmaProcessSupervisionTests(unittest.TestCase):
             )
             self.assertEqual(9, result.returncode, result.stdout)
 
+    def test_small_output_reaches_observer_before_child_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "observed"
+            script = (
+                "import sys,time; from pathlib import Path; "
+                "sys.stdout.buffer.write('фаза fetch\\n'.encode('utf-8')); sys.stdout.flush(); "
+                f"p=Path({str(marker)!r}); "
+                "deadline=time.monotonic()+4; "
+                "exec('while not p.exists() and time.monotonic()<deadline: time.sleep(0.05)'); "
+                "sys.exit(0 if p.exists() else 9)"
+            )
+            def observe(chunk):
+                if "фаза fetch" in chunk:
+                    marker.write_text("seen", encoding="utf-8")
+            result = run_supervised([sys.executable, "-c", script], Path.cwd(),
+                                   timeout_seconds=8, output_observer=observe)
+            self.assertEqual(0, result.returncode, result.stdout)
+            self.assertIn("фаза fetch", result.stdout)
+
+    def test_timeout_retains_output_and_reports_live_phase(self) -> None:
+        messages = []
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            verifier._run([sys.executable, "-c", "import time; print('fetch-phase-fixture',flush=True); time.sleep(10)"],
+                          Path.cwd(), timeout_seconds=2, progress=messages.append,
+                          progress_interval_seconds=1)
+        self.assertIn("fetch-phase-fixture", caught.exception.output)
+        self.assertTrue(any("output:" in m and "fetch-phase-fixture" in m for m in messages))
+        self.assertEqual(0, caught.exception.supervision.descendants_remaining)
+
     def test_output_is_bounded_but_full_stream_infra_match_survives(self) -> None:
         script = (
             "import sys; "

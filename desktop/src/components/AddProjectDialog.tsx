@@ -2,6 +2,7 @@ import { FolderGit2, RefreshCw, Search, X } from 'lucide-react'
 import { useRef, useState, type FormEvent } from 'react'
 import { useLanguage } from '../i18n'
 import { useDialogFocus } from '../hooks/useDialogFocus'
+import { registerProjectBatch } from './project-registration-batch'
 import type { ProjectDiscoveryCandidate, ProjectDiscoveryResponse } from '../types'
 
 type ProjectInput = { workspaceId?: string; name: string; path: string; packagePath?: string; repositoryPath?: string; sourceBranch?: string; baseBranch?: string; mergedBranch?: string }
@@ -30,6 +31,9 @@ export function AddProjectDialog({ workspaceId, onClose, onPickDirectory, onDisc
   const [discoveryError, setDiscoveryError] = useState<string>()
   const [filter, setFilter] = useState('')
   const [selectedPaths, setSelectedPaths] = useState<string[]>([])
+  const [chooseMembers, setChooseMembers] = useState(false)
+  const completedRef = useRef(new Set<string>())
+  const [completed, setCompleted] = useState<string[]>([])
   useDialogFocus(rootRef, { onClose: () => { if (!busy) onClose() } })
   // Guards against stale discovery responses: a response that arrives after the
   // path was changed again (or a newer scan started) is discarded, so the
@@ -50,7 +54,7 @@ export function AddProjectDialog({ workspaceId, onClose, onPickDirectory, onDisc
       setDiscovery(response)
       setScanDeep(deep)
       setSelectedPaths((current) => {
-        const valid = response.status === 'explicit' || response.status === 'single'
+        const valid = !chooseMembers && (response.status === 'explicit' || (response.status === 'single' && !response.report.truncated))
           ? [response.path]
           : current.filter((selected) => response.report.candidates.some((candidate) => candidate.path === selected))
         return valid
@@ -74,8 +78,8 @@ export function AddProjectDialog({ workspaceId, onClose, onPickDirectory, onDisc
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (busy || !path.trim()) return
-    const explicitOrSingle = discovery?.status === 'explicit' || discovery?.status === 'single'
-    const selected = discovery?.status === 'ambiguous' ? selectedPaths : []
+    const explicitOrSingle = !chooseMembers && (discovery?.status === 'explicit' || (discovery?.status === 'single' && !discovery.report.truncated))
+    const selected = ambiguous ? selectedPaths : []
     if (!explicitOrSingle && selected.length === 0) return
     setBusy(true)
     setSubmitError(undefined)
@@ -95,7 +99,7 @@ export function AddProjectDialog({ workspaceId, onClose, onPickDirectory, onDisc
             mergedBranch: mergedBranch.trim(),
           }
         })
-      for (const entry of entries) await onSubmit(entry)
+      await registerProjectBatch(entries, onSubmit, completedRef.current, setCompleted)
       onClose()
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : String(error))
@@ -123,6 +127,7 @@ export function AddProjectDialog({ workspaceId, onClose, onPickDirectory, onDisc
 
   const onPathChange = (value: string) => {
     setPath(value)
+    setChooseMembers(false)
     setSelectedPaths([])
     discoveryRequestRef.current += 1
     setDiscovering(false)
@@ -133,8 +138,8 @@ export function AddProjectDialog({ workspaceId, onClose, onPickDirectory, onDisc
 
   const requestClose = () => { if (!busy) onClose() }
 
-  const showExpand = Boolean(discovery?.report && discovery.report.truncated && discovery.report.deeperManifests > 0 && !scanDeep)
-  const ambiguous = discovery?.status === 'ambiguous'
+  const showExpand = Boolean(discovery?.report.truncated)
+  const ambiguous = chooseMembers || discovery?.status === 'ambiguous' || (discovery?.status === 'single' && discovery.report.truncated)
   const groupKey = (candidate: ProjectDiscoveryCandidate) => candidate.lockfilePath || candidate.lockfileName || 'none'
   const normalized = filter.trim().toLowerCase()
   const visible = ambiguous && discovery
@@ -144,33 +149,35 @@ export function AddProjectDialog({ workspaceId, onClose, onPickDirectory, onDisc
     }).filter((candidate) => !normalized || candidate.relative.toLowerCase().includes(normalized) || candidate.packageName?.toLowerCase().includes(normalized))
     : []
 
-  const canAdd = Boolean(!discovering && name.trim() && path.trim() && (discovery?.status === 'explicit' || discovery?.status === 'single' || (discovery?.status === 'ambiguous' && selectedPaths.length > 0)))
+  const canAdd = Boolean(!discovering && name.trim() && path.trim() && (ambiguous ? selectedPaths.some((selected) => !completed.includes(selected)) : discovery?.status === 'explicit' || (discovery?.status === 'single' && !discovery.report.truncated)))
 
   return <div ref={rootRef} className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) requestClose() }}>
-    <form className="dialog" role="dialog" aria-modal="true" aria-labelledby="add-project-dialog-title" onSubmit={(event) => void submit(event)}>
+    <form className="dialog add-project-dialog" role="dialog" aria-modal="true" aria-labelledby="add-project-dialog-title" onSubmit={(event) => void submit(event)}>
       <div className="dialog-title"><div><h2 id="add-project-dialog-title">{t('addProject.title')}</h2><p>{t('addProject.description')}</p></div><button type="button" className="icon-button" title={t('common.close')} aria-label={t('common.close')} disabled={busy} onClick={requestClose}><X size={17} /></button></div>
-      <label>{t('addProject.name')}<input value={name} onChange={(event) => setName(event.target.value)} placeholder="Demo.App" autoFocus /></label>
+      <div className="add-project-scroll">
+      <label>{t('addProject.name')}<input value={name} onChange={(event) => setName(event.target.value)} placeholder="Demo.App" autoFocus data-autofocus /></label>
       <label>{t('addProject.gitFolder')}<div className="input-action"><input value={repositoryPath} onChange={event => setRepositoryPath(event.target.value)} placeholder={t('addProject.autoGit')} /><button type="button" className="icon-button" title={t('setup.chooseFolder')} aria-label={t('setup.chooseFolder')} disabled={busy} onClick={() => void pickDirectory(true)}><FolderGit2 size={17} /></button></div></label>
       <label>{t('addProject.localFolder')}<div className="input-action"><input value={path} onChange={(event) => onPathChange(event.target.value)} onBlur={onPathBlur} /><button type="button" className="icon-button" title={t('setup.chooseFolder')} aria-label={t('setup.chooseFolder')} disabled={busy} onClick={() => void pickDirectory()}><FolderGit2 size={17} /></button></div></label>
       <p className="setup-note">{t('addProject.scopeHint')}</p>
       {discovering ? <p className="setup-note" role="status">{t('addProject.scanning')}</p> : null}
       {discoveryError ? <div className="dialog-error" role="alert">{discoveryError}</div> : null}
-      {showExpand && !ambiguous && discovery ? (
-        <div className="project-candidates" role="group" aria-label={t('addProject.deeperAria')}>
-          <p className="setup-note">{t('addProject.deeperText', { maxDepth: discovery.report.maxDepth })}</p>
-          <div className="dialog-actions"><button type="button" className="button secondary" disabled={busy} onClick={() => void runDiscovery(path, true)}><RefreshCw size={14} /> {t('addProject.expandScan')}</button></div>
-        </div>
-      ) : null}
+      {showExpand && discovery ? <div className="project-candidates" role="status">
+        <p className="setup-note">{discovery.report.budgetHit === 'depth' ? t('addProject.depthLimitedText', { maxDepth: discovery.report.maxDepth }) : t('addProject.partialText')} {t('addProject.partialChoice')}</p>
+        <button type="button" className="button secondary" disabled={busy || discovering} onClick={() => void runDiscovery(path, true)}><RefreshCw size={14} /> {scanDeep ? t('addProject.retryScan') : t('addProject.expandScan')}</button>
+      </div> : null}
+      {discovery?.report.issues?.length ? <div className="dialog-error" role="alert">{t('addProject.scanIssues', { count: discovery.report.issues.length })}<ul>{discovery.report.issues.slice(0, 10).map((issue, index) => <li key={`${issue.path}-${index}`}>{issue.code}: {issue.path}<small>{issue.detail}</small></li>)}</ul></div> : null}
+      {discovery?.status === 'explicit' && !chooseMembers && discovery.report.candidates.length > 0 ? <button type="button" className="button secondary" disabled={busy} onClick={() => { setChooseMembers(true); setSelectedPaths([]) }}>{t('addProject.chooseMembers')}</button> : null}
+      {completed.length > 0 ? <p role="status" className="setup-note">{t('addProject.completedCount', { count: completed.length })}</p> : null}
       {ambiguous && discovery ? (
         <div className="project-candidates" role="group" aria-label={t('addProject.ambiguousAria')}>
           <label>{t('addProject.chooseCandidate')}</label>
-          {showExpand ? <p className="setup-note">{t('addProject.depthLimitedText', { maxDepth: discovery.report.maxDepth })} <button type="button" className="link-button" disabled={busy} onClick={() => void runDiscovery(path, true)}>{t('addProject.expandScan')}</button></p> : null}
           <div className="project-candidate-search"><Search size={14} /><input value={filter} onChange={(event) => setFilter(event.target.value)} placeholder={t('addProject.filterByPath')} aria-label={t('addProject.filterAria')} /></div>
           <ul className="project-candidate-list">
-            {visible.map((candidate) => (
+            {visible.map((candidate, index) => (
               <li key={candidate.path}>
+                {index === 0 || groupKey(visible[index - 1]) !== groupKey(candidate) ? <p className="setup-note" style={{ overflowWrap: 'anywhere' }}>{candidate.lockfilePath || candidate.lockfileName || t('addProject.noLockfile')}</p> : null}
                 <label className={selectedPaths.includes(candidate.path) ? 'selected' : ''}>
-                  <input type="checkbox" name="project-candidate" checked={selectedPaths.includes(candidate.path)} disabled={busy} onChange={() => toggleCandidate(candidate)} />
+                  <input type="checkbox" name="project-candidate" checked={selectedPaths.includes(candidate.path)} disabled={busy || completed.includes(candidate.path)} onChange={() => toggleCandidate(candidate)} />
                   <span className="project-candidate-row">
                     <span className="project-candidate-path">{candidate.relative || '.'}{candidate.packageName ? <small> · {candidate.packageName}</small> : null}</span>
                     <span className="project-candidate-lock">{candidate.lockfileName ? `${candidate.lockfileName} ${t('addProject.depthSuffix', { depth: candidate.depth })}` : t('addProject.noLockfile')}</span>
@@ -182,14 +189,15 @@ export function AddProjectDialog({ workspaceId, onClose, onPickDirectory, onDisc
           </ul>
         </div>
       ) : null}
-      {discovery?.status === 'missing' && discovery.report.candidates.length === 0 && discovery.report.deeperManifests === 0 && !discovering ? (
+      {discovery?.status === 'missing' && discovery.report.candidates.length === 0 && discovery.report.deeperManifests === 0 && !discovery.report.truncated && !discovering ? (
         <p className="setup-note">{t('addProject.missingText')}</p>
       ) : null}
-      {discovery?.status === 'explicit' && discovery.path ? <p className="setup-note">{t('addProject.explicitText')}</p> : null}
-      {discovery?.status === 'single' && discovery.path ? <p className="setup-note">{t('addProject.singleText', { path: discovery.path })}</p> : null}
+      {discovery?.status === 'explicit' && !chooseMembers && discovery.path ? <p className="setup-note">{t('addProject.explicitText')}</p> : null}
+      {discovery?.status === 'single' && !ambiguous && discovery.path ? <p className="setup-note">{t('addProject.singleText', { path: discovery.path })}</p> : null}
       <div className="dialog-grid"><label>{t('addProject.sourceBranch')}<input value={sourceBranch} onChange={(event) => setSourceBranch(event.target.value)} placeholder={t('addProject.sourceBranchAuto')} /></label><label>{t('addProject.targetBranch')}<input value={baseBranch} onChange={(event) => { setBaseBranch(event.target.value); setMergedBranch(`${event.target.value}-merged`) }} /></label></div>
       <details><summary>{t('addProject.advanced')}</summary><div className="dialog-grid"><label>{t('addProject.mergedBranch')}<input value={mergedBranch} onChange={(event) => setMergedBranch(event.target.value)} /></label></div></details>
       {submitError ? <div className="dialog-error" role="alert">{submitError}</div> : null}
+      </div>
       <div className="dialog-actions"><button type="button" className="button secondary" disabled={busy} onClick={requestClose}>{t('common.cancel')}</button><button type="submit" className="button primary" disabled={busy || !canAdd}>{busy ? t('addProject.adding') : t('addProject.add')}</button></div>
     </form>
   </div>

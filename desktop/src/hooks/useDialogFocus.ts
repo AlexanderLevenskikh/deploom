@@ -27,7 +27,8 @@ type Options = {
  */
 export function useDialogFocus<T extends HTMLElement>(ref: RefObject<T | null>, options: Options = {}): void {
   const { onClose, trap = true, closeOnEscape = true } = options
-  const restoreRef = useRef<HTMLElement | null>(null)
+  // Capture before commit: React autoFocus runs before effects.
+  const restoreRef = useRef<HTMLElement | null>(typeof document !== 'undefined' && document.activeElement instanceof HTMLElement ? document.activeElement : null)
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
   const closeOnEscapeRef = useRef(closeOnEscape)
@@ -35,17 +36,20 @@ export function useDialogFocus<T extends HTMLElement>(ref: RefObject<T | null>, 
 
   useEffect(() => {
     if (typeof document === 'undefined') return
-    restoreRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
     const root = ref.current
+    const restoreTarget = restoreRef.current
     if (!root) return
     // Prefer an explicitly marked non-destructive action (e.g. the primary
     // confirmation) over the first tabbable element, which is often the
     // top-right close button.
     const focusable = visibleFocusable(root)
-    const preferred = focusable.find((item) => item.hasAttribute('data-autofocus')) ?? focusable[0]
+    const active = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const preferred = focusable.find((item) => item.hasAttribute('data-autofocus')) ?? (active && focusable.includes(active) ? active : focusable[0])
     preferred?.focus()
 
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      // A listbox/inner control handles its own Escape first.
+      if (event.defaultPrevented) return
       if (event.key === 'Escape') {
         if (closeOnEscapeRef.current && onCloseRef.current) {
           event.preventDefault()
@@ -65,10 +69,10 @@ export function useDialogFocus<T extends HTMLElement>(ref: RefObject<T | null>, 
         event.preventDefault(); first.focus()
       }
     }
-    document.addEventListener('keydown', onKeyDown, true)
+    document.addEventListener('keydown', onKeyDown)
     return () => {
-      document.removeEventListener('keydown', onKeyDown, true)
-      restoreRef.current?.focus()
+      document.removeEventListener('keydown', onKeyDown)
+      if (restoreTarget?.isConnected) restoreTarget.focus()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])

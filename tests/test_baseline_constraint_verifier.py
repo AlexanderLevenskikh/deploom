@@ -428,6 +428,22 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
             self.assertEqual("project", result.kind)
             self.assertEqual(list(commands), [item.command for item in result.project_failures])
 
+    def test_install_timeouts_keep_diagnostic_output_without_passing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(json.dumps({"packageManager": "npm@11.0.0", "dependencies": {"demo": "1.0.0"}}), encoding="utf-8")
+            (root / "package-lock.json").write_text(json.dumps({"lockfileVersion": 3, "packages": {}}), encoding="utf-8")
+            for phase in ("resolver", "lifecycle"):
+                with self.subTest(phase=phase):
+                    timeout = subprocess.TimeoutExpired('npm install', 1, output=b'fetch-phase-diagnostic')
+                    runs = [timeout] if phase == "resolver" else [CompletedProcess(['npm','install'],0,stdout='ok'), timeout]
+                    with patch("baseline_constraint_verifier.resolve_executable", return_value="npm"), patch("baseline_constraint_verifier._run", side_effect=runs):
+                        result = verify_assignment(root, {"demo":"2.0.0"}, config=BaselineVerifyConfig(commands=("npm run check",)), run_project_checks=True)
+                    self.assertFalse(result.ok)
+                    self.assertEqual("infrastructure", result.kind)
+                    self.assertEqual("fetch-phase-diagnostic", result.output)
+                    self.assertTrue(result.workspace)
+
     def test_project_launch_oserror_is_typed_without_secondary_unboundlocal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
