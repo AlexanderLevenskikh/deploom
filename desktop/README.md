@@ -147,6 +147,8 @@ Desktop автоматически передаёт в release все `release.f
 
 Renderer работает с `nodeIntegration: false`, `contextIsolation: true` и sandboxed CommonJS preload. Команды запускаются без shell. Доступ к dashboard ограничен выбранным workspace через custom protocol. Git push, baseline и release остаются явными действиями пользователя.
 
+Standalone project checks with proof caching pin one sealed source snapshot before building proof identity. Cache lookup, execution and internal retries consume that same snapshot; edits in the original checkout after capture do not invalidate the running check. Changes during capture still require a stable recapture. Each request releases its temporary snapshot after success or failure, and the next request captures current bytes. Caller-owned migration epochs remain owned by the migration. This removes the separate live-tree fingerprint pass; materialized-copy integrity checks remain mandatory.
+
 ### Storage inspection and safe cleanup
 
 The storage dialog discovers the configured verification root and every registered workspace; it does not assume a particular drive letter. Inspection is read-only and lists file volume, free space by volume, cleanup eligibility, and protection reasons. Shared ReFS blocks and compression mean file volume is an estimate rather than guaranteed reclaimed disk space.

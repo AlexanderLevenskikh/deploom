@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures
+import contextlib
+import contextvars
 import functools
 import dataclasses
 import hashlib
@@ -152,6 +154,16 @@ _LIVE_SOURCE_WATCHERS: dict[
     ],
 ] = {}
 _LOCK = threading.RLock()
+_REQUEST_SNAPSHOTS: contextvars.ContextVar[dict[str, SourceSnapshot]] = contextvars.ContextVar(
+    "verification_source_snapshots", default={}
+)
+
+
+def _snapshot_watcher_key(snapshot: SourceSnapshot) -> str:
+    key = _active_key(snapshot.original_project_path)
+    if _REQUEST_SNAPSHOTS.get().get(key) is snapshot:
+        return f"{key}:{snapshot.container}"
+    return key
 
 
 def _tree_object_identity(path: Path) -> Optional[tuple[int, int]]:
@@ -262,7 +274,7 @@ def _watcher_is_clean(watcher: _DirectoryWatcher) -> bool:
 
 
 def _retire_snapshot_watcher(snapshot: SourceSnapshot) -> None:
-    key = _active_key(snapshot.original_project_path)
+    key = _snapshot_watcher_key(snapshot)
     with _LOCK:
         entry = _ACTIVE_WATCHERS.get(key)
         watcher = None
@@ -1271,8 +1283,46 @@ def activate_source_snapshot_epoch(
 
 
 def active_source_snapshot(project_dir: Path) -> Optional[SourceSnapshot]:
+    key = _active_key(project_dir)
+    scoped = _REQUEST_SNAPSHOTS.get().get(key)
+    if scoped is not None:
+        return scoped
     with _LOCK:
-        return _ACTIVE.get(_active_key(project_dir))
+        return _ACTIVE.get(key)
+
+
+@contextlib.contextmanager
+def verification_source_snapshot_scope(
+    project_dir: Path,
+    *,
+    timeout_seconds: int = 1800,
+    progress: Optional[ProgressCallback] = None,
+    progress_interval_seconds: int = 15,
+):
+    """Pin one source subject for identity, cache lookup and all attempt retries.
+
+    Reuse caller-owned epochs; standalone requests own and retire their copy.
+    Context-local registration prevents concurrent requests or later cohorts
+    from consuming a stale epoch belonging to another verification.
+    """
+    existing = active_source_snapshot(project_dir)
+    if existing is not None:
+        yield existing
+        return
+    snapshot = capture_source_snapshot(
+        project_dir, timeout_seconds=timeout_seconds, progress=progress,
+        progress_interval_seconds=progress_interval_seconds,
+    )
+    token = _REQUEST_SNAPSHOTS.set({
+        **_REQUEST_SNAPSHOTS.get(), _active_key(project_dir): snapshot,
+    })
+    try:
+        yield snapshot
+    finally:
+        _retire_snapshot_watcher(snapshot)
+        _REQUEST_SNAPSHOTS.reset(token)
+        _force_rmtree(snapshot.container)
+        _ALL_CONTAINERS.discard(snapshot.container)
 
 
 def _retire_live_source_watcher(snapshot: SourceSnapshot) -> None:
@@ -1439,7 +1489,7 @@ def validate_source_snapshot(
 ) -> SourceSnapshot:
     """Prove snapshot bytes once, then keep that proof live with a watcher."""
     started = time.monotonic()
-    active_key = _active_key(snapshot.original_project_path)
+    active_key = _snapshot_watcher_key(snapshot)
     with _LOCK:
         watcher_entry = _ACTIVE_WATCHERS.get(active_key)
         usable_entry = (
@@ -1447,7 +1497,7 @@ def validate_source_snapshot(
         )
         watcher = watcher_entry[1] if usable_entry else None
         sealed_identity = watcher_entry[2] if usable_entry else None
-        is_active = _ACTIVE.get(active_key) is snapshot
+        is_active = active_source_snapshot(snapshot.original_project_path) is snapshot
     # Drain BEFORE reading events: a mutation that completed just before this
     # boundary may still be in flight, and silence would otherwise be misread
     # as proof of an unchanged tree.
@@ -1566,7 +1616,7 @@ def validate_source_snapshot(
         )
     if candidate_watcher is not None:
         with _LOCK:
-            if _ACTIVE.get(active_key) is snapshot:
+            if active_source_snapshot(snapshot.original_project_path) is snapshot:
                 _ACTIVE_WATCHERS[active_key] = (
                     snapshot,
                     candidate_watcher,

@@ -77,6 +77,8 @@ from source_snapshot import (
     SourceCaptureError,
     SourceSnapshot,
     materialize_source_for_verification,
+    active_source_snapshot,
+    verification_source_snapshot_scope,
 )
 from package_manager_profile import (
     PackageManagerProfileError,
@@ -2658,6 +2660,8 @@ def verify_assignment(
 ) -> BaselineVerifyResult:
     """Materialize one exact assignment over the sealed SourceSnapshot subject."""
     project_dir = project_dir.resolve()
+    snapshot = active_source_snapshot(project_dir)
+    preflight_project = snapshot.project_path if snapshot is not None else project_dir
     attempt_started = time.monotonic()
     attempt_deadline = (float("inf") if config.unbounded_preparation
                         else attempt_started + config.attempt_timeout_seconds)
@@ -2674,7 +2678,7 @@ def verify_assignment(
 
     try:
         _validate_assignment_materialization(
-            project_dir,
+            preflight_project,
             assignment,
             remove_packages=remove_packages,
         )
@@ -2685,7 +2689,7 @@ def verify_assignment(
     # tree. Authority is recomputed again from the sealed/materialized subject.
     try:
         live_topology = resolve_project_topology(
-            project_dir,
+            preflight_project,
             allow_discovery=False,
             require_supported=True,
         )
@@ -5014,9 +5018,13 @@ def verify_assignment(
 ) -> BaselineVerifyResult:
     """Cache-aware proof entry point with ResolvedState-bound project proofs."""
     project_dir = project_dir.resolve()
+    # These are readiness reads; identity construction and materialization
+    # validate the sealed bytes before admitting any verification evidence.
+    snapshot = active_source_snapshot(project_dir)
+    preflight_project = snapshot.project_path if snapshot is not None else project_dir
     try:
         _validate_assignment_materialization(
-            project_dir,
+            preflight_project,
             assignment,
             remove_packages=remove_packages,
         )
@@ -5025,7 +5033,7 @@ def verify_assignment(
 
     try:
         live_topology = resolve_project_topology(
-            project_dir,
+            preflight_project,
             allow_discovery=False,
             require_supported=True,
         )
@@ -5252,6 +5260,27 @@ def verify_assignment(
 _verify_assignment_cache_aware_impl = verify_assignment
 
 
+def _verify_assignment_with_pinned_source(
+    project_dir: Path, assignment: Mapping[str, str], *, config: BaselineVerifyConfig,
+    **kwargs,
+) -> BaselineVerifyResult:
+    # Cache identity and execution must consume the same sealed bytes. Without
+    # a caller epoch, hashing live source before a separate capture races edits
+    # and performs an unnecessary full-tree content pass.
+    try:
+        if not config.proof_cache_dir:
+            return _verify_assignment_cache_aware_impl(project_dir, assignment, config=config, **kwargs)
+        with verification_source_snapshot_scope(
+            project_dir,
+            timeout_seconds=0 if config.unbounded_preparation else config.snapshot_copy_timeout_seconds,
+            progress=kwargs.get("progress"),
+            progress_interval_seconds=config.progress_interval_seconds,
+        ):
+            return _verify_assignment_cache_aware_impl(project_dir, assignment, config=config, **kwargs)
+    except SourceCaptureError as exc:
+        return BaselineVerifyResult(False, "infrastructure", f"source snapshot preparation failed: {exc}")
+
+
 def verify_assignment(
     project_dir: Path,
     assignment: Mapping[str, str],
@@ -5301,7 +5330,7 @@ def verify_assignment(
                             identity=assignment_hash,
                             consumer=progress_label,
                         )
-                    result = _verify_assignment_cache_aware_impl(
+                    result = _verify_assignment_with_pinned_source(
                         project_dir,
                         assignment,
                         config=config,
@@ -5312,7 +5341,7 @@ def verify_assignment(
                         runtime_env=runtime_env,
                     )
             else:
-                result = _verify_assignment_cache_aware_impl(
+                result = _verify_assignment_with_pinned_source(
                     project_dir,
                     assignment,
                     config=config,

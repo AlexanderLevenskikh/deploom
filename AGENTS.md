@@ -1,6 +1,6 @@
 # Working on DepLoom
 
-These instructions apply to this repository. Follow the user's task scope and preserve unrelated work. A review or documentation task does not implicitly authorize publishing a release. When publication is already authorized, use the release workflow below without repeatedly asking for permission.
+These instructions apply to this repository. Follow the user's task scope and preserve unrelated work. The user has given standing authorization to publish a normal patch release after completing requested DepLoom changes and passing all required validation. Finish that release as part of the task without asking again, unless the user explicitly requests otherwise. Read-only reviews do not create a release. Use the release workflow below; this authorization concerns DepLoom itself, not releases of projects being migrated.
 
 ## Start here
 
