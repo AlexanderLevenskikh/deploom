@@ -619,7 +619,34 @@ def discover_baseline_project_checks(project_dir: Path) -> Tuple[str, ...]:
             for name in names
         )
     )
-    if plain_lint_text and not plain_lint_is_exact_duplicate:
+    # Preserve the original shell order of a composite lint command. If it
+    # contains exactly the selected focused lint scripts (each once, without
+    # flags, substitutions or extra stages), run the composite *instead* of
+    # its constituents. This retains command semantics while avoiding duplicate
+    # typecheck/ESLint work and double-reporting the same baseline failure.
+    composite_parts = tuple(
+        part.strip() for part in plain_lint_text.split("&&")
+    ) if plain_lint_text else ()
+    def _plain_script_call(part: str) -> str:
+        prefixes = ("yarn run ", "yarn ") if manager == "yarn" else (
+            f"{manager} run ",
+        )
+        for prefix in prefixes:
+            if part.startswith(prefix):
+                return part[len(prefix):]
+        return ""
+    composite_scripts = tuple(_plain_script_call(part) for part in composite_parts)
+    redundant_composite = bool(
+        len(composite_scripts) > 1
+        and all(composite_scripts)
+        and len(composite_scripts) == len(set(composite_scripts))
+        and set(composite_scripts) == set(names)
+        and all(script in scripts for script in composite_scripts)
+    )
+    if redundant_composite:
+        names = [name for name in names if name not in set(composite_scripts)]
+        names.append("lint")
+    elif plain_lint_text and not plain_lint_is_exact_duplicate:
         names.append("lint")
     for name in ("build", "test:unit", "test"):
         if isinstance(scripts.get(name), str) and scripts.get(name, "").strip():
