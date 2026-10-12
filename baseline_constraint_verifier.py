@@ -1477,11 +1477,11 @@ def _workspace_package_targets(workspace_project: Path) -> Dict[str, Path]:
             f"WORKSPACE_JUNCTION_TOPOLOGY_UNAVAILABLE: {exc}"
         ) from exc
 
+    manager_root = topology.package_manager_root.resolve()
     targets: Dict[str, Path] = {}
+    manifests: list[tuple[Path, dict]] = []
     for manifest_path in topology.workspace_member_manifests:
         member_root = manifest_path.parent.resolve()
-        if member_root == topology.package_manager_root.resolve():
-            continue
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError, TypeError) as exc:
@@ -1492,9 +1492,64 @@ def _workspace_package_targets(workspace_project: Path) -> Dict[str, Path]:
             raise RuntimeError(
                 f"WORKSPACE_JUNCTION_MANIFEST_INVALID: {manifest_path}"
             )
+        manifests.append((member_root, manifest))
         package_name = str(manifest.get("name") or "").strip()
         if package_name:
+            previous = targets.get(package_name)
+            if previous is not None and previous != member_root:
+                raise RuntimeError(
+                    f"WORKSPACE_JUNCTION_DUPLICATE_PACKAGE_NAME: {package_name}: "
+                    f"{previous} and {member_root}"
+                )
             targets[package_name] = member_root
+
+    # Yarn node-modules can link local packages outside workspace globs.
+    # Their authority must come from an explicit manifest dependency and an
+    # exact internal target, not merely from their node_modules location.
+    for member_root, manifest in manifests:
+        for section in ("dependencies", "devDependencies", "optionalDependencies"):
+            declarations = manifest.get(section)
+            if not isinstance(declarations, dict):
+                continue
+            for dependency_name, raw_spec in declarations.items():
+                if not isinstance(dependency_name, str) or not isinstance(raw_spec, str):
+                    continue
+                protocol, sep, remainder = raw_spec.partition(":")
+                if not sep or protocol not in ("portal", "link", "file"):
+                    continue
+                relative_spec = remainder.split("#", 1)[0].split("?", 1)[0]
+                if not relative_spec or "%" in relative_spec or "\x00" in relative_spec:
+                    continue
+                if not relative_spec.startswith(("./", "../")):
+                    continue
+                candidate = (member_root / relative_spec).resolve()
+                try:
+                    candidate.relative_to(manager_root)
+                except ValueError:
+                    continue
+                package_manifest_path = candidate / "package.json"
+                if not package_manifest_path.is_file():
+                    continue
+                try:
+                    package_manifest = json.loads(
+                        package_manifest_path.read_text(encoding="utf-8-sig")
+                    )
+                except (OSError, ValueError, TypeError) as exc:
+                    raise RuntimeError(
+                        f"WORKSPACE_LOCAL_LINK_MANIFEST_UNREADABLE: "
+                        f"{package_manifest_path}: {exc}"
+                    ) from exc
+                if not isinstance(package_manifest, dict):
+                    continue
+                if package_manifest.get("name") != dependency_name:
+                    continue
+                previous = targets.get(dependency_name)
+                if previous is not None and previous != candidate:
+                    raise RuntimeError(
+                        f"WORKSPACE_LOCAL_LINK_AMBIGUOUS_TARGET: {dependency_name}: "
+                        f"{previous} and {candidate}"
+                    )
+                targets[dependency_name] = candidate
     return targets
 
 
