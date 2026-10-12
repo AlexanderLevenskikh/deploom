@@ -777,6 +777,10 @@ def verify_config_from(mapping: Mapping[str, Any], run_dir: Path) -> BaselineVer
         validate_baseline_reference(resolved)
     except ValueError as exc:
         raise ProjectUnreadyError("TEST_BASELINE_UNAVAILABLE", str(exc)) from exc
+    # Large workspace installs (especially Yarn node-modules linking on Windows)
+    # can exceed the legacy ten-minute phase cap. Keep explicit caller limits.
+    if "timeoutSeconds" not in resolved and "timeout_seconds" not in resolved:
+        resolved["timeoutSeconds"] = 3600
     config = BaselineVerifyConfig.from_mapping(resolved)
     proof_cache_dir = str(
         (
