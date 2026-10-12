@@ -161,6 +161,9 @@ _REQUEST_SNAPSHOTS: contextvars.ContextVar[dict[str, SourceSnapshot]] = contextv
 
 def _snapshot_watcher_key(snapshot: SourceSnapshot) -> str:
     key = _active_key(snapshot.original_project_path)
+    with _LOCK:
+        if _ACTIVE.get(key) is snapshot:
+            return key
     if _REQUEST_SNAPSHOTS.get().get(key) is snapshot:
         return f"{key}:{snapshot.container}"
     return key
@@ -1288,7 +1291,33 @@ def active_source_snapshot(project_dir: Path) -> Optional[SourceSnapshot]:
     if scoped is not None:
         return scoped
     with _LOCK:
-        return _ACTIVE.get(key)
+        direct = _ACTIVE.get(key)
+        if direct is not None:
+            return direct
+        # Resolver context builders rebind the logical path to this sealed
+        # project path. It is the SAME selected subject, with the SAME frozen
+        # policy, not a fresh filesystem tree to inventory again.
+        return next((snapshot for snapshot in _ACTIVE.values()
+                     if _active_key(snapshot.project_path) == key), None)
+
+
+@contextlib.contextmanager
+def bind_source_snapshot(snapshot: SourceSnapshot):
+    """Bind logical and sealed paths for one consumer without owning its tree."""
+    existing = active_source_snapshot(snapshot.original_project_path)
+    token = _REQUEST_SNAPSHOTS.set({
+        **_REQUEST_SNAPSHOTS.get(),
+        _active_key(snapshot.original_project_path): snapshot,
+        _active_key(snapshot.project_path): snapshot,
+    })
+    try:
+        yield snapshot
+    finally:
+        # A standalone uncached consumer owns the validation memo it armed;
+        # caller-owned epochs and outer request scopes retain their watcher.
+        if existing is not snapshot:
+            _retire_snapshot_watcher(snapshot)
+        _REQUEST_SNAPSHOTS.reset(token)
 
 
 @contextlib.contextmanager
@@ -1313,14 +1342,10 @@ def verification_source_snapshot_scope(
         project_dir, timeout_seconds=timeout_seconds, progress=progress,
         progress_interval_seconds=progress_interval_seconds,
     )
-    token = _REQUEST_SNAPSHOTS.set({
-        **_REQUEST_SNAPSHOTS.get(), _active_key(project_dir): snapshot,
-    })
     try:
-        yield snapshot
+        with bind_source_snapshot(snapshot):
+            yield snapshot
     finally:
-        _retire_snapshot_watcher(snapshot)
-        _REQUEST_SNAPSHOTS.reset(token)
         _force_rmtree(snapshot.container)
         _ALL_CONTAINERS.discard(snapshot.container)
 

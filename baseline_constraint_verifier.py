@@ -78,6 +78,7 @@ from source_snapshot import (
     SourceSnapshot,
     materialize_source_for_verification,
     active_source_snapshot,
+    bind_source_snapshot,
     verification_source_snapshot_scope,
 )
 from package_manager_profile import (
@@ -2760,6 +2761,7 @@ def verify_assignment(
     ))
     from verification_storage_maintenance import register_trial_owner, retire_trial
     register_trial_owner(temp_root)
+    source_binding = contextlib.ExitStack()
     try:
         workspace_root = temp_root / "repo"
         workspace_started = time.monotonic()
@@ -2773,6 +2775,9 @@ def verify_assignment(
                 progress_label="sealed source snapshot materialization",
                 progress_interval_seconds=config.progress_interval_seconds,
             )
+            # Every fixed/workspace identity probe, including uncached attempts
+            # and internal retries, must consume this exact validated subject.
+            source_binding.enter_context(bind_source_snapshot(source_snapshot))
             changed = _apply_assignment(
                 workspace_project,
                 assignment,
@@ -4634,6 +4639,7 @@ def verify_assignment(
             resolved_state_artifact=resolved_state.artifact_relative_path if resolved_state is not None else "",
         )
     finally:
+        source_binding.close()
         shutil.rmtree(temp_root, ignore_errors=True)
         if temp_root.exists():
             retire_trial(temp_root)
