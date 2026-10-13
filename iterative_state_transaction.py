@@ -92,11 +92,14 @@ def recover_transition(root, run, config, *, write_json, validate_source):
     context = record.get('context') or {}
     from iterative_stage_checkpoint import operation_environment
     environment = operation_environment(config)
-    if (checksum != digest(record) or record.get('schema') != 1
-        or context.get('runId') != run['runId'] or context.get('configHash') != digest(config)
-        or context.get('toolBuildId') != tool_build_id() or context.get('environmentHash') != digest(environment)
-        or context.get('runtimeClosure') != command_tool_closure('node', Path(config['projectDir']), environment)):
-        raise ValueError('ITERATION_TRANSITION_IDENTITY_MISMATCH')
+    if checksum != digest(record) or record.get('schema') != 1:
+        raise ValueError('ITERATION_TRANSITION_IDENTITY_MISMATCH: journal integrity')
+    expected = {'runId': run['runId'], 'configHash': digest(config), 'toolBuildId': tool_build_id(),
+                'environmentHash': digest(environment),
+                'runtimeClosure': command_tool_closure('node', Path(config['projectDir']), environment)}
+    changed = [key for key, value in expected.items() if context.get(key) != value]
+    if changed:
+        raise ValueError('ITERATION_TRANSITION_IDENTITY_MISMATCH: ' + ', '.join(changed))
     from iterative_stage_checkpoint import trial_key
     trial = Path(context.get('trialRoot', '')).resolve()
     if trial != (root / 'trial' / 'workspace').resolve():

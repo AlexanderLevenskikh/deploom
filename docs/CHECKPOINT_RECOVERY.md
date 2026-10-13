@@ -17,6 +17,11 @@ to accept an unverified assignment. Interrupted work remains RUNNING/UNKNOWN.
 
 The verifier checks physical prepared artifacts before reusing any command.
 Only supervised completion with source/dependency guards can publish PASS.
+Windows Job Objects currently provide the required complete process-tree
+ownership. Existing POSIX process groups/token scanning are best-effort; on
+those platforms commands are repeated and durable resolver/lifecycle/command
+PASS reuse remains disabled. Source and controller publication recovery still
+apply. A successful check never upgrades incomplete process supervision.
 Unknown external command closures execute again. The same rules cover lint
 scripts, type checks and any supported command in the selected validation profile.
 A command receipt does not change which checks the user selected.

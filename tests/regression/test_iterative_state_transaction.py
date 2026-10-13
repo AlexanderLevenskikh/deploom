@@ -46,7 +46,7 @@ class IterationTransactionTests(unittest.TestCase):
         self.assertTrue((root / TRANSACTION).exists())
 
     def cli(self, root):
-        return subprocess.run([sys.executable,str(ROOT/'iterative_migration.py'),'--run-dir',str(root),'resume'], cwd=ROOT, capture_output=True,text=True,encoding='utf-8')
+        return subprocess.run([sys.executable,str(ROOT/'iterative_migration.py'),'--run-dir',str(root),'resume'], cwd=ROOT, env=dict(os.environ), capture_output=True,text=True,encoding='utf-8')
 
     def test_real_resume_finishes_metadata_once_and_preserves_incumbent_and_spent_budget(self):
         with tempfile.TemporaryDirectory() as tmp:

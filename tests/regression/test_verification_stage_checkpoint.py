@@ -59,6 +59,20 @@ class StageCheckpointTests(unittest.TestCase):
             env = {**os.environ, 'PYTHONUTF8': '1', 'DEPLOOM_FIXTURE_TRACE': str(trace),
                 'TMP': str(isolated_temp), 'TEMP': str(isolated_temp), 'TMPDIR': str(isolated_temp),
                 'DEPLOOM_VERIFICATION_ROOT': str(root / 'verification-storage')}
+            if os.name != 'nt':
+                # Existing POSIX process groups are best-effort: descendants may
+                # detach/scrub the ownership token. Durable PASS remains denied.
+                for _ in range(2):
+                    outcome = subprocess.run(args, cwd=ROOT, env=env, capture_output=True,
+                        text=True, encoding='utf-8', timeout=90)
+                    self.assertEqual(outcome.returncode, 0, outcome.stdout + outcome.stderr)
+                    self.assertEqual(json.loads(outcome.stdout.splitlines()[-1])['receipts'], [])
+                for script in ('lint', 'lint-types', 'build', 'test-start'):
+                    self.assertEqual(trace.read_text(encoding='utf-8').splitlines().count(script), 2)
+                self.assertFalse(any(json.loads(path.read_text(encoding='utf-8')).get('stage') == 'project-command'
+                    and json.loads(path.read_text(encoding='utf-8')).get('status') == 'PASS'
+                    for path in receipts.glob('*.json')))
+                return
             worker_log = root / 'worker.log'
             output = worker_log.open('w', encoding='utf-8')
             self.addCleanup(output.close)
