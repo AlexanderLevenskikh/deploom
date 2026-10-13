@@ -140,6 +140,7 @@ class SourceSnapshot:
     git_root: str
     created_at: float
     input_policy: Optional[SourceInputPolicy] = None
+    durable_recovery: bool = False
 
 
 _ACTIVE: dict[str, SourceSnapshot] = {}
@@ -1398,6 +1399,7 @@ def verification_source_snapshot_scope(
     progress: Optional[ProgressCallback] = None,
     progress_interval_seconds: int = 15,
     reuse_completed: bool = False,
+    recovery_directory: Optional[Path] = None,
 ):
     """Pin one source subject for identity, cache lookup and all attempt retries.
 
@@ -1427,11 +1429,16 @@ def verification_source_snapshot_scope(
             if snapshot is None:
                 _retire_completed_request(candidate)
     if snapshot is None:
-        snapshot = capture_source_snapshot(
-            project_dir, timeout_seconds=timeout_seconds, progress=progress,
-            progress_interval_seconds=progress_interval_seconds,
-        )
-        reused = False
+        if recovery_directory is not None:
+            from verification_stage_checkpoint import capture_recovery_source
+            snapshot, reused = capture_recovery_source(
+                project_dir, recovery_directory, timeout_seconds=timeout_seconds, progress=progress)
+        else:
+            snapshot = capture_source_snapshot(
+                project_dir, timeout_seconds=timeout_seconds, progress=progress,
+                progress_interval_seconds=progress_interval_seconds,
+            )
+            reused = False
     else:
         reused = True
     emit_observability_event("source.request.reuse", reused=reused,
@@ -1465,7 +1472,8 @@ def verification_source_snapshot_scope(
 def _retire_completed_request(snapshot):
     _retire_snapshot_watcher(snapshot)
     _retire_live_source_watcher(snapshot)
-    _force_rmtree(snapshot.container)
+    if not snapshot.durable_recovery:
+        _force_rmtree(snapshot.container)
     _ALL_CONTAINERS.discard(snapshot.container)
 
 

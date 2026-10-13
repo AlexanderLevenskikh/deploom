@@ -53,6 +53,9 @@ _COMPONENT_FILES: Mapping[str, tuple[str, ...]] = {
         "artifact_integrity.py",
     ),
     "project": (
+        "verification_stage_checkpoint.py",
+        "iterative_stage_checkpoint.py",
+        "iterative_state_transaction.py",
         "migration_validation.py",
         "baseline_constraint_verifier.py",
         "verification_process_supervisor.py",

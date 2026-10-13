@@ -23,14 +23,21 @@ class NpmDiscoveryMetadata:
         self.name = name
         self.query = query
         self.queries = 0
+        self.source = "npm-cli"
+        self.failure_class = ""
         self._loaded = False
         self._data: dict = {}
         self._engines: dict[str, str] = {}
         self._alternatives_loaded = False
 
     def _ask(self, args: list[str]) -> Any:
-        data, executed = self.query(args)
+        result = self.query(args)
+        data, executed = result[:2]
         self.queries += int(executed)
+        if len(result) >= 3 and result[2]:
+            self.failure_class = str(result[2])[:64]
+        if len(result) >= 4 and result[3]:
+            self.source = str(result[3])[:64]
         return data
 
     def _load(self) -> None:
@@ -50,6 +57,11 @@ class NpmDiscoveryMetadata:
         self._data = data
         self._engines[latest] = _engine(data)
         self._engines[version] = _engine(data)
+        by_version = data.get('enginesByVersion')
+        if isinstance(by_version, dict):
+            for item, node_range in by_version.items():
+                if isinstance(item, str) and isinstance(node_range, str) and _EXACT.fullmatch(item):
+                    self._engines[item] = node_range[:256]
 
     def latest(self) -> str:
         self._load()

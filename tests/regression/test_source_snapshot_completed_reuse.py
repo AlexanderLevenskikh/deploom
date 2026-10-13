@@ -28,14 +28,27 @@ class CompletedSourceReuseTests(unittest.TestCase):
         source.clear_source_snapshot_epochs();self.assertFalse(first.container.exists())
 
     @unittest.skipUnless(os.name=="nt","proven Windows notification continuity")
-    def test_quiet_completed_reuse_does_not_add_a_full_manifest_pass(self):
+    def test_quiet_completed_reuse_defers_live_manifest_without_rehashing_sealed_bytes(self):
+        # v0.2.233 postpones the ORIGINAL-tree continuity pass until the next
+        # consumer. The sealed-tree watcher can still validate by notification,
+        # but an unarmed live-tree watcher requires one authoritative hash pass.
         real=source.build_source_tree_manifest
         with patch.object(source,"build_source_tree_manifest",wraps=real) as manifest:
-            with self.scope() as first:source.validate_source_snapshot(first)
+            with self.scope() as first:
+                source.validate_source_snapshot(first)
+                after_sealed_validation=manifest.call_count
             before=manifest.call_count
+            self.assertEqual(after_sealed_validation, before,
+                             "completed scope must not eagerly hash the live tree")
             with self.scope() as second:
                 self.assertIs(first,second);source.validate_source_snapshot(second)
-            self.assertEqual(before,manifest.call_count,"context loss forced an unnecessary strong source pass")
+            deferred_calls=manifest.call_args_list[before:]
+            self.assertEqual(1,len(deferred_calls),
+                             "quiet reuse should need only the deferred live-source pass")
+            self.assertEqual("hot SourceSnapshot live-source continuity",
+                             deferred_calls[0].kwargs.get("progress_label"),
+                             "unexpected extra sealed-source hashing during reuse")
+            self.assertEqual(self.root.resolve(),Path(deferred_calls[0].args[0]).resolve())
         source.clear_source_snapshot_epochs()
         self.assertFalse(any(entry[0] is first for entry in source._ACTIVE_WATCHERS.values()))
 

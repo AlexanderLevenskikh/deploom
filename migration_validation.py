@@ -156,7 +156,9 @@ def verify_initial_control(project, assignment, *, run_config, run_dir, verify_c
     unit = profile["unitCommand"]
     evidence_dir = run_dir / "validation-evidence"
     evidence_dir.mkdir(parents=True, exist_ok=True)
-    observation = evidence_dir / (uuid.uuid4().hex + ".json")
+    # The run lock serializes controls. A stable locator lets an interrupted
+    # control reuse its hash-bound command receipt and saved collection evidence.
+    observation = evidence_dir / "initial-control-observation.json"
     capture_command = evidence_command(unit, observation=observation)
     capture_config = dataclasses.replace(verify_config, commands=tuple(capture_command if c == unit else c for c in verify_config.commands))
     result = verifier(project, assignment, config=capture_config, **kwargs)

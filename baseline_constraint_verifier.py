@@ -180,6 +180,8 @@ class BaselineVerifyConfig:
     telemetry_path: str = ""
     proof_cache_dir: str = ""
     reuse_resolver_proof_key: str = ""
+    recovery_checkpoints: bool = False
+    recovery_journal_dir: str = ""
     # Ψ.5.5: candidate-only package-manager controls. These are part of
     # resolver/proof identity and are materialized only in private verification.
     resolver_overrides: Mapping[str, str] = dataclasses.field(default_factory=dict)
@@ -255,6 +257,7 @@ class BaselineVerifyConfig:
             ),
             project_checks=mode,
             commands=commands,
+            recovery_checkpoints=_as_bool(raw.get("recoveryCheckpoints"), True),
             resolver_overrides=resolver_overrides,
             budget_phase_deadline=(
                 float(raw.get("budgetPhaseDeadline", raw.get("budget_phase_deadline")))
@@ -289,6 +292,8 @@ def _durable_prepared_publication_policy(
 ) -> Tuple[bool, str]:
     """Choose durable publication by artifact role, never search depth."""
     purpose = _verification_purpose(config)
+    if config.recovery_checkpoints:
+        return bool(config.publish_durable_prepared_artifact), "durable-stage-recovery"
     if purpose in _PSI4_INTERMEDIATE_PURPOSES:
         return False, "intermediate-role-private"
     if purpose == "baseline-control":
@@ -359,6 +364,7 @@ class BaselineVerifyResult:
     resolved_lockfile_hash: str = ""
     resolved_state_artifact: str = ""
     preparation_proof_key: str = ""
+    command_checkpoint_refs: Tuple[str, ...] = ()
 
     @property
     def hard_failure(self) -> bool:
@@ -3099,6 +3105,16 @@ def verify_assignment(
             Path(config.proof_cache_dir) if config.proof_cache_dir else None
         )
 
+        stage_journal = None
+        if config.recovery_checkpoints and proof_store.root is not None:
+            from verification_stage_checkpoint import StageJournal, digest as checkpoint_digest
+            stage_journal = StageJournal(
+                config.recovery_journal_dir or (proof_store.root / "stage-checkpoints"),
+                {"toolBuildId": proof_identity.tool_build_id, "sourceSnapshotKey": source_snapshot.key,
+                 "resolverInputKey": proof_identity.resolver_input_key, "assignmentKey": proof_identity.assignment_key,
+                 "environmentHash": checkpoint_digest(base_env)})
+            stage_journal.write("source-sealed", "PASS", {"container": str(source_snapshot.container), "key": source_snapshot.key})
+
         resolved_state: Optional[ResolvedDependencyState] = None
 
         # BLOCK_PSI57_YARN1_RESOLVER_SEED_V1
@@ -3189,7 +3205,7 @@ def verify_assignment(
         ).strip().lower() in {"1", "true", "yes", "on"}
         resolver_reuse_key = (
             config.reuse_resolver_proof_key
-            or (proof_identity.resolver_input_key if recovery_reuse else "")
+            or (proof_identity.resolver_input_key if recovery_reuse or config.recovery_checkpoints else "")
         )
         resolver_reuse_cache_operation_id = ""
         if resolver_reuse_key:
@@ -3324,6 +3340,8 @@ def verify_assignment(
                         f"{seed_capability_reason}",
                     )
         else:
+            if stage_journal:
+                stage_journal.write("resolver-install", "RUNNING")
             resolver_started = time.monotonic()
             resolver_operation_id = new_observability_id("resolver-process")
             event(
@@ -3508,6 +3526,8 @@ def verify_assignment(
                     cacheKey=proof_identity.resolver_input_key,
                     reason="process-tree-supervision-not-guaranteed",
                 )
+            if stage_journal and resolver_publication_allowed:
+                stage_journal.write("resolver-install", "PASS", resolved_state_metadata(resolved_state))
             event(
                 "verify.resolved-state.captured",
                 resolvedStateKey=resolved_state.key,
@@ -3647,6 +3667,7 @@ def verify_assignment(
                 durable_lookup_allowed = True
                 if (
                     _verification_purpose(config) == "baseline-control"
+                    and not config.recovery_checkpoints
                     and not _persistent_control_cross_run_enabled()
                 ):
                     durable_lookup_allowed = False
@@ -3883,6 +3904,8 @@ def verify_assignment(
                 lifecycle_env.update(_package_manager_cache_environment(config, manager))
                 if workspace_topology.profile.family == "yarn-berry" and config.registry:
                     lifecycle_env["YARN_NPM_REGISTRY_SERVER"] = config.registry
+                if stage_journal:
+                    stage_journal.write("lifecycle-install", "RUNNING")
                 preparation_started = time.monotonic()
                 lifecycle_operation_id = new_observability_id("lifecycle-install")
                 event(
@@ -4037,6 +4060,8 @@ def verify_assignment(
                         observed_hash,
                         extra_metadata=resolved_state_metadata(resolved_state),
                     )
+                    if stage_journal:
+                        stage_journal.write("lifecycle-install", "PASS", {"preparationProofKey": proof_identity.preparation_proof_key, "resolvedStateKey": resolved_state.key})
                 else:
                     event(
                         "proof.cache.publish-skipped",
@@ -4059,6 +4084,8 @@ def verify_assignment(
                     progress,
                     f"{progress_label}: snapshot publish started; hardTimeout={snapshot_timeout}s",
                 )
+                if stage_journal:
+                    stage_journal.write("prepared-publication", "RUNNING", {"preparationProofKey": proof_identity.preparation_proof_key})
                 publication_operation_id = new_observability_id(
                     "prepared-publication"
                 )
@@ -4073,6 +4100,7 @@ def verify_assignment(
                 if (
                     durable_snapshot_requested
                     and purpose == "baseline-control"
+                    and not config.recovery_checkpoints
                     and not _persistent_control_cross_run_enabled()
                 ):
                     durable_snapshot_requested = False
@@ -4202,6 +4230,8 @@ def verify_assignment(
                     pin_prepared_artifact_record(
                         proof_identity.preparation_proof_key
                     )
+                    if stage_journal:
+                        stage_journal.write("prepared-publication", "PASS", {"preparationProofKey": proof_identity.preparation_proof_key, "workspaceRoot": str(snapshot.workspace_root)})
                 elif not durable_snapshot_requested:
                     _register_same_run_private_prepared_snapshot(
                         snapshot, producer=progress_label
@@ -4219,7 +4249,25 @@ def verify_assignment(
             if len(source_entries_by_path) != len(snapshot.source_closure_entries):
                 source_entries_by_path = {}  # Ambiguous Windows names: no delta authority.
 
+            command_checkpoints = None
+            command_checkpoint_refs = []
+            if config.recovery_checkpoints and proof_store.root is not None:
+                from verification_stage_checkpoint import CommandCheckpoint
+                checkpoint_artifact = load_prepared_artifact_record(
+                    proof_identity.preparation_proof_key, project_dir, progress=progress)
+                command_checkpoints = CommandCheckpoint(
+                    config.recovery_journal_dir or (proof_store.root / "stage-checkpoints"),
+                    proof_identity, checkpoint_artifact, config.commands, base_env)
+
             for command_index, command in enumerate(config.commands, start=1):
+                receipt = command_checkpoints.lookup(command_index, command) if command_checkpoints else None
+                if receipt:
+                    command_checkpoint_refs.append(receipt)
+                    event("verify.project-check.checkpoint-hit", command=command, check=command_index, receipt=receipt)
+                    _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} checkpoint PASS: {command}")
+                    continue
+                if command_checkpoints:
+                    command_checkpoints.begin(command_index, command)
                 reusing_private_trial = bool(
                     reusable_private_root is not None
                     and reusable_private_project is not None
@@ -4369,6 +4417,7 @@ def verify_assignment(
                 workspace_guard_started = False
                 check_result: Optional[subprocess.CompletedProcess[str]] = None
                 lower_check_clean = False
+                command_pass_verified = False
                 try:
                     removed_caches = clean_ephemeral_verification_caches(command_root, snapshot.dependency_roots)
                     if removed_caches:
@@ -4688,6 +4737,7 @@ def verify_assignment(
                         quiescenceMs=int(getattr(getattr(check_result, "supervision", None), "quiescence_ms", 0) or 0),
                     )
                     if check_result.returncode == 0:
+                        command_pass_verified = True
                         _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} PASS: {command_label}")
                         continue
                     tail = "\n".join((check_result.stdout or "").splitlines()[-80:])
@@ -4728,6 +4778,17 @@ def verify_assignment(
                         from verification_source_closure import reset_observed_trial_outputs
                         source_reset_for_reuse = reset_observed_trial_outputs(
                             command_root, source_entries_by_path, workspace_changes.changes, progress=progress)
+
+                    if command_checkpoints and check_result is not None:
+                        # Command guards above retain their authority. A receipt
+                        # also requires guaranteed process-tree quiescence.
+                        receipt = command_checkpoints.complete(
+                            command_index, command, check_result,
+                            safe=command_pass_verified and lower_check_clean
+                                and _durable_proof_publication_allowed(check_result))
+                        if receipt:
+                            command_checkpoint_refs.append(receipt)
+                            event("verify.project-check.checkpoint-published", command=command, check=command_index, receipt=receipt)
 
                     if (
                         workspace_guard_started
@@ -4826,6 +4887,8 @@ def verify_assignment(
             resolved_lockfile_path=resolved_state.lockfile_path if resolved_state is not None else "",
             resolved_lockfile_hash=resolved_state.lockfile_hash if resolved_state is not None else "",
             resolved_state_artifact=resolved_state.artifact_relative_path if resolved_state is not None else "",
+            preparation_proof_key=proof_identity.preparation_proof_key if run_project_checks and config.commands else "",
+            command_checkpoint_refs=tuple(command_checkpoint_refs) if run_project_checks and config.commands else (),
         )
     finally:
         # Early return may retain a trial provisionally. Release every owned
@@ -5478,6 +5541,8 @@ def _verify_assignment_with_pinned_source(
             progress=kwargs.get("progress"),
             progress_interval_seconds=config.progress_interval_seconds,
             reuse_completed=True,
+            recovery_directory=(Path(config.recovery_journal_dir or config.proof_cache_dir) / "source-checkpoints"
+                                if config.recovery_checkpoints else None),
         ):
             return _verify_assignment_cache_aware_impl(project_dir, assignment, config=config, **kwargs)
     except SourceCaptureError as exc:

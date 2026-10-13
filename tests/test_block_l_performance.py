@@ -153,13 +153,14 @@ class BlockLPerformanceTests(unittest.TestCase):
         self.assertIn("_publish_prepared_workspace_snapshot(", source)
         self.assertIn("verify.preparation.snapshot-hit", source)
 
-        # Project checks reuse one fully-private trial only when a whole-workspace
-        # watcher proves that the previous command produced no filesystem events.
-        # Any event or watcher uncertainty discards the trial before the next check.
+        # A private trial is reusable only when watcher evidence proves that
+        # source/dependency bytes remain sealed. New build outputs may be reset
+        # after delta validation; guarded-lower reuse retains its isolation mode.
         self.assertIn("_fresh_project_check_root(", source)
         self.assertIn('stem = f"project-check-{int(command_index):03d}"', source)
         self.assertIn("for command_index, command in enumerate(config.commands, start=1):", source)
-        self.assertIn('clone_isolation = "reused-private-trial"', source)
+        self.assertIn('"reused-private-trial"', source)
+        self.assertIn('"ntfs-junction-guarded"', source)
         self.assertIn("WorkspaceChangeGuard(command_root)", source)
         self.assertIn("verify.project-check.trial-reuse-ready", source)
         self.assertIn("verify.project-check.trial-reuse-rejected", source)
