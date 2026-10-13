@@ -9,6 +9,15 @@ These instructions apply to this repository. Follow the user's task scope and pr
 - Distinguish this DepLoom source repository, a user workspace with `.dependency-roadmap/`, and the projects being migrated. Never run a real migration or release against an arbitrary project just to test a helper.
 - Prefer small changes at the owning layer. Avoid extending the large entrypoints when a focused existing module owns the behavior.
 
+## README and documentation policy
+
+- Keep the root `README.md` as the public product overview and documentation entry point. Preserve the product description, supported platforms, setup/run information and links to `USERGUIDE.md`, `HOW_IT_WORKS.md`, `desktop/README.md`, `docs/INDEX.md` and the relevant current contracts.
+- Never replace or repurpose `README.md` with patch installation instructions, a task summary, a changelog fragment, audit/acceptance logs, agent notes or documentation for a project being migrated. Put focused technical material in the owning document under `docs/`; keep dated reports clearly historical.
+- For routine fixes, edit only the relevant README paragraph or documentation link. A complete README rewrite requires an explicit user request to rewrite or restore it; a request to fix, package or release code does not authorize one.
+- Before running a patch installer, generator, archive extraction or release helper, inspect whether it writes `README.md`. Do not allow bundled replacement READMEs or generated task notes to overwrite the project README. Apply the intended code changes without that replacement.
+- Read and preserve local/staged README changes before editing. When restoring from history, identify the last full product README, inspect the diff and preserve unrelated current documentation additions. Do not use destructive checkout/reset commands.
+- Check every added local documentation link and inspect the final README diff. A root README reduced to instructions for one patch is a regression, even if the code tests pass.
+
 ## Repository map
 
 | Area | Responsibility |
