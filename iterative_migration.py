@@ -2486,7 +2486,8 @@ def _plan_next_locked(
 
     ledger = load_ledger(run_dir)
     from iterative_stage_checkpoint import negative_evidence_scope
-    negative_scope = negative_evidence_scope(run_dir, config, checkpoint_id)
+    negative_scope = (negative_evidence_scope(run_dir, config, checkpoint_id, checkpoint=checkpoint)
+                      if any(entry.get("evidenceScope") for entry in ledger.get("blocks", [])) else None)
     blocks = [
         entry
         for entry in ledger.get("blocks", [])

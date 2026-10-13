@@ -32,10 +32,13 @@ def operation_journal(run_dir, run, config, candidate, operation):
     return StageJournal(Path(run_dir) / 'operation-checkpoints', context)
 
 
-def negative_evidence_scope(run_dir, config, checkpoint_id):
+def negative_evidence_scope(run_dir, config, checkpoint_id, *, checkpoint=None):
     """Compatibility history is reusable only under the same proof inputs."""
     import json
-    base = json.loads((Path(run_dir) / 'checkpoints' / (checkpoint_id + '.json')).read_text(encoding='utf-8-sig'))
+    base = checkpoint if checkpoint is not None else json.loads(
+        (Path(run_dir) / 'checkpoints' / (checkpoint_id + '.json')).read_text(encoding='utf-8-sig'))
+    if not base.get('sourceSnapshotKey') or not config.get('projectDir'):
+        return None
     environment = operation_environment(config)
     closure = command_tool_closure('node', Path(config['projectDir']), environment)
     if not closure or not base.get('sourceSnapshotKey'):
