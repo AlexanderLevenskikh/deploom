@@ -26,6 +26,10 @@ class InitialC0ReusePhysicalTests(unittest.TestCase):
             self.assertEqual(0, result.returncode, result.stderr[-2000:] + result.stdout[-2000:])
             checkpoint = json.loads((Path(raw) / 'run/checkpoints/C0.json').read_text(encoding='utf8'))
             self.assertEqual('VERIFIED', checkpoint['status'])
+            container = Path(checkpoint['sourceSnapshotContainer'])
+            manifest = json.loads((container / 'manifest.json').read_text(encoding='utf8'))
+            actual = {p.relative_to(container / 'tree').as_posix() for p in (container / 'tree').rglob('*')}
+            self.assertEqual({entry['path'] for entry in manifest['entries']}, actual)
             events = [json.loads(line.split(' ',1)[1]) for line in result.stdout.splitlines() if line.startswith('ITERATIVE_MIGRATION_STATUS_V1 ')]
             attempts = [e for e in events if 'SourceSnapshot capture attempt' in e.get('message','') and not e.get('heartbeat')]
             self.assertEqual(1, len(attempts))

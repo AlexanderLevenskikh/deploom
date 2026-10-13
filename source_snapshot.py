@@ -250,10 +250,18 @@ def _drain_watcher(
     marker_directory = root / _DRAIN_MARKER_DIR
     token = f".drain-{uuid.uuid4().hex}"
     marker = marker_directory / token
+    created_directory = False
     try:
-        marker_directory.mkdir(parents=True, exist_ok=True)
+        try:
+            marker_directory.mkdir(parents=True, exist_ok=False)
+            created_directory = True
+        except FileExistsError:
+            pass
         marker.write_text("drain", encoding="utf-8")
     except OSError:
+        if created_directory:
+            with contextlib.suppress(OSError):
+                marker_directory.rmdir()
         return False
     deadline = time.monotonic() + max(0.05, float(timeout_seconds))
     delivered = False
@@ -270,6 +278,11 @@ def _drain_watcher(
             marker.unlink()
         except OSError:
             pass
+        if created_directory:
+            # Only remove our own empty directory; preserve pre-existing state
+            # and concurrent files. Sealed C0 must retain exact membership.
+            with contextlib.suppress(OSError):
+                marker_directory.rmdir()
     return delivered
 
 

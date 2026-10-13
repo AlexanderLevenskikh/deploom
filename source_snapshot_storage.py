@@ -74,6 +74,8 @@ def new_snapshot_container(capture_root: Path, *, prefix: str) -> Path:
         if _contained(container, live_root):
             # Defence in depth against unusual aliasing / reparse races.
             container.rmdir()
-            continue
+            from source_snapshot import SourceCaptureError
+            raise SourceCaptureError("SOURCE_SNAPSHOT_TEMP_INSIDE_SUBJECT: allocated storage aliases the source root")
         return container
-    raise OSError("SOURCE_SNAPSHOT_TEMP_UNAVAILABLE: no writable storage outside the source root")
+    from source_snapshot import SourceCaptureError
+    raise SourceCaptureError("SOURCE_SNAPSHOT_TEMP_UNAVAILABLE: no writable storage outside the source root")
