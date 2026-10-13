@@ -49,6 +49,15 @@ jobs:
         run: npx tsc -p tsconfig.electron.json
       - name: Install pinned modern Yarn acceptance runtimes
         run: node scripts/prepare-yarn-test-runtimes.mjs
+      - name: Check durable migration recovery boundaries
+        run: >-
+          python -m unittest
+          tests.regression.test_iterative_yarn_registry_discovery
+          tests.regression.test_iterative_discovery_checkpoint
+          tests.regression.test_iterative_checkpoint_publication
+          tests.regression.test_iterative_state_transaction
+          tests.regression.test_verification_stage_checkpoint
+          -v
       - name: Run production-fast regressions
         run: python run_tool_tests.py --suite production-fast
       - name: Run all tool tests
@@ -85,6 +94,15 @@ jobs:
         run: npm ci
       - name: Install pinned modern Yarn acceptance runtimes
         run: node scripts/prepare-yarn-test-runtimes.mjs
+      - name: Check durable migration recovery boundaries
+        run: >-
+          python -m unittest
+          tests.regression.test_iterative_yarn_registry_discovery
+          tests.regression.test_iterative_discovery_checkpoint
+          tests.regression.test_iterative_checkpoint_publication
+          tests.regression.test_iterative_state_transaction
+          tests.regression.test_verification_stage_checkpoint
+          -v
       - name: Run Windows verification substrate gate
         run: |
           python -m unittest tests.test_prepared_workspace_fastpath

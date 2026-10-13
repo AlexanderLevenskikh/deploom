@@ -66,7 +66,7 @@ import { liveRunWriterPid, readAutopilotState, writeAutopilotState } from './ite
 import { IterativeDecision, decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
 import { iterativeCheckoutView, type IterativeCheckoutView } from './iterative-checkout-view.js'
 import { migrationProfilePath, readMigrationProfile, readMigrationScope, saveMigrationProfile } from './migration-validation.js'
-import { hasSavedProjectPlan, iterativeBeginInvocation, iterativeCheckTimeoutFailure, targetsFromDashboardState } from './iterative-begin.js'
+import { extractIterativeFailureEnvelope, hasSavedProjectPlan, iterativeBeginInvocation, iterativeCheckTimeoutFailure, targetsFromDashboardState } from './iterative-begin.js'
 import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
 import { type IterativeAttemptRecord, beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, readRunLogTail, recordAttemptLog, recordAttemptProgress, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
@@ -7567,27 +7567,6 @@ function setupIpc(): void {
     return undefined
   }
 
-  // P1#4 / user report: the check CLI prints ITERATIVE_MIGRATION_FAILURE_V1 on
-  // STDOUT — dependency noise on stderr must never hide it. Recover the machine
-  // envelope from a combined stream so the scenario can parse it (a red control
-  // must map to the repair agent, not a dead-end re-check).
-  function extractIterativeFailureEnvelope(text: string): string | undefined {
-    const marker = 'ITERATIVE_MIGRATION_FAILURE_V1 '
-    const at = text.indexOf(marker)
-    if (at < 0) return undefined
-    const chunk = text.slice(at + marker.length).split(/\r?\n/, 1)[0]
-    const open = chunk.indexOf('{')
-    const close = chunk.lastIndexOf('}')
-    if (open < 0 || close <= open) return undefined
-    try {
-      const parsed = JSON.parse(chunk.slice(open, close + 1)) as { code?: unknown }
-      if (parsed && typeof parsed.code === 'string') return marker + chunk.slice(open, close + 1)
-    } catch {
-      // not a valid envelope — fall through
-    }
-    return undefined
-  }
-
   // P1#4 / user report: build the machine failure envelope from the DURABLE
   // verdict so the scenario offers the RIGHT next step — a failed control is
   // the red current state (repair agent), an inconclusive result is a retry.
@@ -8483,7 +8462,8 @@ function setupIpc(): void {
         // the panel gets an honest reason instead of a generic stderr splice.
         const raw = result.timedOut
           ? (readAttempt(runDir)?.cancelRequested === true ? 'CANCELED: begin terminated by user cancel' : 'BEGIN_TIMEOUT: begin exceeded its 20-minute budget; no run was created')
-          : (result.stderr.trim() || result.stdout.trim() || `BEGIN_EXIT_${result.code}`)
+          : (extractIterativeFailureEnvelope(`${result.stderr || ""}\n${result.stdout || ""}`)
+            || result.stderr.trim() || result.stdout.trim() || `BEGIN_EXIT_${result.code}`)
         const canceledByUser = readAttempt(runDir)?.cancelRequested === true
         if (canceledByUser) clearCancelRequest(runDir)
         updateAttempt(runDir, {

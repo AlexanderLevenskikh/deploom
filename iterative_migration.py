@@ -73,6 +73,7 @@ from migration_validation import digest as validation_digest, validate_profile, 
 from verification_proof import is_fixed_manifest_spec
 from iterative_target_deferrals import record_unavailable_targets, unavailable_targets
 from iterative_registry_metadata import NpmDiscoveryMetadata
+from iterative_registry_yarn import modern_yarn_root, normalize_yarn_packument, normalize_yarn_alternative
 from iterative_restart import TRANSACTION as RESTART_TRANSACTION, RestartArchiveError, archive_for_restart, recover_restart_archive
 from package_manager_profile import (
     install_args_for_profile,
@@ -304,10 +305,16 @@ def _checkpoint_path(run_dir: Path, checkpoint_id: str) -> Path:
 
 
 def _write_json_atomic(path: Path, value: Any) -> None:
+    from iterative_state_transaction import stage_write
+    if stage_write(path, value):
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + f".tmp-{os.getpid()}-{uuid.uuid4().hex}")
     try:
-        tmp.write_text(_stable_json(value) + "\n", encoding="utf-8")
+        with tmp.open('w', encoding='utf-8', newline='\n') as stream:
+            stream.write(_stable_json(value) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
         for attempt in range(10):
             try:
                 os.replace(tmp, path)
@@ -323,6 +330,10 @@ def _write_json_atomic(path: Path, value: Any) -> None:
 
 
 def _read_json(path: Path, *, required: bool = True) -> Optional[Dict[str, Any]]:
+    from iterative_state_transaction import staged_read
+    staged, value = staged_read(path)
+    if staged:
+        return value
     if not path.exists():
         if required:
             raise InvalidInputError(f"STATE_FILE_MISSING: {path}")
@@ -803,8 +814,9 @@ def verify_config_from(mapping: Mapping[str, Any], run_dir: Path) -> BaselineVer
         telemetry_path=telemetry_path,
         proof_cache_dir=proof_cache_dir,
         publish_durable_prepared_artifact=bool(
-            resolved.get("publishDurablePreparedArtifact", False)
+            resolved.get("publishDurablePreparedArtifact", True)
         ),
+        recovery_journal_dir=str((run_dir / "v").resolve()),
     )
 
 
@@ -884,11 +896,10 @@ def cmd_begin(args: argparse.Namespace) -> int:
     if getattr(args, "check_only", False):
         return _cmd_begin_check_only(run_dir, args, owner)
 
-    config = build_run_config(run_dir, args)
-
     lock = _RunLock(run_dir, owner)
     lock.acquire()
     try:
+        config = build_run_config(run_dir, args)
         return _begin_locked(run_dir, config, args, adopt=adopt)
     finally:
         lock.release()
@@ -1177,10 +1188,18 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
                 }
             )
 
+        from iterative_discovery_checkpoint import DiscoveryCheckpoint, discovery_identity
+
+        current = {n: v for n, v in direct_dependency_assignment(project_dir).items()
+                   if package_policies.get(n) != "keep-current"}
+        checkpoint = DiscoveryCheckpoint(
+            run_dir / "preparation-discovery.json",
+            discovery_identity(project_dir, {"current": current, "runtime": runtime,
+                "environment": discovery_env, "intent": intent, "toolBuildId": args.tool_build_id}),
+        )
         targets, target_discovery = _discover_targets(
             project_dir,
-            {n: v for n, v in direct_dependency_assignment(project_dir).items()
-             if package_policies.get(n) != "keep-current"},
+            current,
             discovery_env,
             runtime.get("effectiveVersion"),
             parallelism=discovery_parallelism,
@@ -1188,6 +1207,7 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
             max_packages=discovery_max_packages,
             progress=_discovery_progress,
             adaptive=bool(getattr(args, "adaptive_discovery", False)),
+            checkpoint=checkpoint,
         )
 
     commands = tuple(str(item) for item in (verify_raw.get("commands") or []))
@@ -1335,6 +1355,11 @@ def _begin_locked(
         if entry.get("status") in ("latest-incompatible-no-alternative", "no-newer-compatible")
     ]
     budget_skipped = [entry for entry in discovery if entry.get("status") == "discovery-budget-skipped"]
+    from collections import Counter
+    registry_diagnostics = dict(sorted(Counter(
+        str((entry.get("registryMetadata") or {}).get("errorClass") or "unspecified")
+        for entry in unavailable
+    ).items()))
     if discovered or unavailable or incompatible_no_alt or budget_skipped:
         _emit_status(
             {
@@ -1343,6 +1368,7 @@ def _begin_locked(
                 "source": "registry dist-tags.latest (engine-aware)",
                 "discoveredTargets": sorted(str(entry.get("package") or "") for entry in discovered),
                 "registryUnavailable": sorted(str(entry.get("package") or "") for entry in unavailable),
+                "registryDiagnostics": registry_diagnostics,
                 "noCompatibleAlternative": sorted(str(entry.get("package") or "") for entry in incompatible_no_alt),
                 "budgetSkipped": sorted(str(entry.get("package") or "") for entry in budget_skipped),
             }
@@ -1358,7 +1384,10 @@ def _begin_locked(
         raise ProjectUnreadyError(
             "DISCOVERY_UNSETTLED",
             "Не удалось установить доступные обновления: данные registry недоступны или бюджет поиска исчерпан. "
-            "Результат не засчитывается как завершённая миграция. Повторите поиск или настройте состав обновления.",
+            "Результат не засчитывается как завершённая миграция. "
+            f"Диагностика registry: {json.dumps(registry_diagnostics, ensure_ascii=False, sort_keys=True)}. "
+            "Проверьте registry/auth/proxy для выбранного package manager и повторите поиск; "
+            "прошедшая ранее проверка проекта остаётся отдельным результатом.",
             command="",
         )
 
@@ -1389,9 +1418,10 @@ def _begin_locked(
     snapshot_container = run_dir / SOURCE_DIR / "C0"
     with MigrationProgress(_emit_status, operation="source-capture", run_id=run_id,
                            message="iterative migration source capture: preparing sealed C0") as progress:
-        snapshot = capture_durable_source_snapshot(
-            project_dir, snapshot_container, timeout_seconds=1800, progress=progress
-        )
+        from verification_stage_checkpoint import capture_recovery_source
+        snapshot, _reused = capture_recovery_source(
+            project_dir, (run_dir / "preparation-source" if config.get("repairOnly") else run_dir / "v" / "sc"), preferred_destination=snapshot_container,
+            timeout_seconds=1800, progress=progress)
     project_relative = resolve_project_relative(project_dir, snapshot)
 
     verify_config = verify_config_from(config["verifyConfig"], run_dir)
@@ -1456,6 +1486,7 @@ def _begin_locked(
         "proofRefs": {
             "resolvedStateKey": result.resolved_state_key or "",
             "preparationProofKey": result.preparation_proof_key or "",
+            "commandCheckpoints": list(getattr(result, "command_checkpoint_refs", ())),
         },
         "runtimeContractHash": _runtime_contract_hash(config),
         "audit": {"status": "UNKNOWN", "evidenceRef": ""},
@@ -1615,6 +1646,7 @@ def _begin_adopted_locked(
         "proofRefs": {
             "resolvedStateKey": result.resolved_state_key or "",
             "preparationProofKey": result.preparation_proof_key or "",
+            "commandCheckpoints": list(getattr(result, "command_checkpoint_refs", ())),
         },
         "runtimeContractHash": _runtime_contract_hash(config),
         "audit": {
@@ -2244,6 +2276,12 @@ def cmd_resume(args: argparse.Namespace) -> int:
     lock.acquire()
     try:
         run, config = load_run(run_dir), load_config(run_dir)
+        _assert_runtime_unchanged(config)
+        if _recover_iteration_transition(run_dir, run, config):
+            return 0
+        recovered_publication = _recover_checkpoint_publication(run_dir, run, config)
+        if recovered_publication is not None:
+            return 0
         if not run_budget_ok(config, run):
             raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
         _assert_runtime_unchanged(config)
@@ -2447,11 +2485,14 @@ def _plan_next_locked(
         return 0
 
     ledger = load_ledger(run_dir)
+    from iterative_stage_checkpoint import negative_evidence_scope
+    negative_scope = negative_evidence_scope(run_dir, config, checkpoint_id)
     blocks = [
         entry
         for entry in ledger.get("blocks", [])
         if entry.get("kind") in {"NEGATIVE_VERIFY", "NOT_ACTIONABLE"}
         and entry.get("baseCheckpointId") == checkpoint_id
+        and negative_scope is not None and entry.get("evidenceScope") == negative_scope
     ]
     blocked_fingerprints = {
         str(entry.get("assignmentFingerprint"))
@@ -2473,6 +2514,7 @@ def _plan_next_locked(
         and isinstance(entry.get("nogood"), dict)
         and entry.get("nogood")
         and entry.get("scope") == "deterministic"
+        and negative_scope is not None and entry.get("evidenceScope") == negative_scope
     ]
     # Recoverable, registry-scoped infra blocks: an identical install must not
     # be silently re-proposed for the same configuration. They are scheduling
@@ -2791,20 +2833,100 @@ def _probe_budget_timeout(default_seconds: int = 60) -> Optional[int]:
 _ACTIVE_REGISTRY_METADATA: "contextvars.ContextVar[Optional[NpmDiscoveryMetadata]]" = contextvars.ContextVar(
     "iterative_registry_metadata", default=None
 )
+_UNSET_YARN_DISCOVERY_ROOT = object()
+_ACTIVE_DISCOVERY_YARN_ROOT: "contextvars.ContextVar[object]" = contextvars.ContextVar(
+    "iterative_discovery_yarn_root", default=_UNSET_YARN_DISCOVERY_ROOT
+)
+
+
+def _registry_failure_class(output: str, *, timed_out: bool = False) -> str:
+    """Return a fixed diagnostic category. NEVER emit raw URLs/tokens/stderr."""
+    if timed_out:
+        return "timeout"
+    text = str(output or "").lower()
+    if any(word in text for word in ("e401", "e403", "yn0041", "yn0044", "unauthorized", "forbidden", "authentication", "invalid authentication")):
+        return "authentication"
+    if any(word in text for word in ("e404", "not found", "yn0035")):
+        return "not-found"
+    if any(word in text for word in ("enotfound", "eai_again", "econnreset", "econnrefused", "etimedout", "esockettimedout", "self_signed_cert", "certificate", "unable to verify")):
+        return "network-or-tls"
+    return "command-failed"
 
 
 def _query_discovery_metadata(project_dir: Path, args: List[str], runtime_env: Optional[Dict[str, str]]) -> Any:
-    manager = resolve_executable("npm")
+    """Query a package's *actual* registry in a read-only planning subprocess.
+
+    Modern Yarn may use npmScopes/npmRegistries credentials in .yarnrc.yml
+    that npm view cannot read. Therefore prefer `yarn npm info` from the
+    authoritative package-manager root for Yarn Berry. Other managers retain
+    npm view. Unknown/unavailable responses never produce invented targets.
+    """
     timeout = _probe_budget_timeout()
-    if not manager or timeout is None:
-        return None, False
+    if timeout is None:
+        return None, False, "budget-exhausted", ""
+    yarn_root = _ACTIVE_DISCOVERY_YARN_ROOT.get()
+    if yarn_root is _UNSET_YARN_DISCOVERY_ROOT:
+        yarn_root = modern_yarn_root(project_dir)
+    if yarn_root is not None:
+        yarn = resolve_executable("yarn")
+        if not yarn:
+            return None, False, "yarn-cli-unavailable", "yarn-native"
+        name = str(args[1])
+        versioned_name, _, alternative_range = name.rpartition("@")
+        is_alternative = args[2:4] == ["version", "engines.node"] and bool(versioned_name)
+        versions = alternative_range.split(" || ") if is_alternative else []
+        package = versioned_name if versions else name
+        commands = (
+            [[yarn, "npm", "info", f"{package}@{version}", "--fields", "version,engines", "--json"] for version in versions]
+            if versions else [[yarn, "npm", "info", package, "--fields", "version,dist-tags,versions,engines", "--json"]]
+        )
+        rows: list[dict[str, Any]] = []
+        for query_index, command in enumerate(commands):
+            remaining = _probe_budget_timeout()
+            if remaining is None:
+                return None, bool(rows), "budget-exhausted", "yarn-native"
+            try:
+                result = _run(command, yarn_root, timeout_seconds=remaining,
+                              env=runtime_env or {}, base_env=os.environ,
+                              progress_label=f"yarn registry metadata {package}")
+            except subprocess.TimeoutExpired:
+                return None, True, "timeout", "yarn-native"
+            except Exception:
+                return None, True, "command-failed", "yarn-native"
+            if result.returncode != 0:
+                return None, True, _registry_failure_class((result.stdout or "") + (getattr(result, "stderr", "") or "")), "yarn-native"
+            if versions:
+                row = normalize_yarn_alternative(result.stdout or "", versions[query_index])
+                if row is not None:
+                    rows.append(row)
+            else:
+                parsed = normalize_yarn_packument(result.stdout or "", package)
+                return parsed, True, "" if parsed is not None else "metadata-invalid", "yarn-native"
+        return rows, len(commands), "", "yarn-native"
+
+    manager = resolve_executable("npm")
+    if not manager:
+        return None, False, "npm-cli-unavailable", "npm-cli"
+    # Run from the canonical manager directory: a selected nested workspace
+    # package might otherwise hide the root .npmrc registry configuration.
+    inventory = _ACTIVE_INVENTORY.get()
+    lockfile = (inventory.lock_path if inventory is not None and inventory.belongs_to(project_dir)
+                else canonical_lockfile_path(project_dir))
+    query_root = lockfile.parent if lockfile is not None else project_dir
     try:
-        result = _run([manager, *args], project_dir, timeout_seconds=timeout,
+        result = _run([manager, *args], query_root, timeout_seconds=timeout,
                       env=runtime_env or {}, base_env=os.environ,
                       progress_label=f"registry metadata {args[1]}")
-        return (json.loads(result.stdout) if result.returncode == 0 else None), True
-    except Exception:  # unavailable metadata is UNKNOWN, never a learned constraint
-        return None, True
+    except subprocess.TimeoutExpired:
+        return None, True, "timeout", "npm-cli"
+    except Exception:
+        return None, True, "command-failed", "npm-cli"
+    if result.returncode != 0:
+        return None, True, _registry_failure_class((result.stdout or "") + (getattr(result, "stderr", "") or "")), "npm-cli"
+    try:
+        return json.loads(result.stdout), True, "", "npm-cli"
+    except (ValueError, TypeError):
+        return None, True, "metadata-invalid", "npm-cli"
 
 
 def _normalize_effective_node_version(value: Any) -> str:
@@ -3314,8 +3436,11 @@ def _discover_one_target(
     token = _ACTIVE_REGISTRY_METADATA.set(metadata)
     try:
         target, evidence = _discover_one_target_impl(project_dir, name, declared, runtime_env, node_version)
-        if metadata.queries:
-            evidence["registryMetadata"] = {"source": "npm-cli", "queries": metadata.queries, "scope": "planning-only"}
+        if metadata.queries or (metadata.failure_class and metadata.failure_class != "budget-exhausted"):
+            evidence["registryMetadata"] = {
+                "source": metadata.source, "queries": metadata.queries, "scope": "planning-only",
+                **({"errorClass": metadata.failure_class} if metadata.failure_class else {}),
+            }
         return target, evidence
     finally:
         _ACTIVE_REGISTRY_METADATA.reset(token)
@@ -3461,6 +3586,7 @@ def _discover_targets(
     max_packages: int = 0,
     progress: Optional[Callable[[int, int], None]] = None,
     adaptive: bool = False,
+    checkpoint: Any = None,
 ) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
     """#2/P1.2 bounded target discovery for begin when no roadmap targets exist.
 
@@ -3505,7 +3631,7 @@ def _discover_targets(
         return discover_in_waves(
             discover=lambda batch, seconds, on_progress: _discover_targets(
                 project_dir, batch, runtime_env, node_version, parallelism=parallelism,
-                wall_budget_s=seconds, progress=on_progress),
+                wall_budget_s=seconds, progress=on_progress, checkpoint=checkpoint),
             current=current, initial_packages=max_packages, wall_budget_s=wall_budget_s,
             progress=progress, emit=_emit_status, clock=time.monotonic)
     global _ACTIVE_DISCOVERY_DEADLINE
@@ -3539,9 +3665,24 @@ def _discover_targets(
         if target_version is not None:
             targets[name] = target_version
         evidence.append(row)
+        if checkpoint is not None:
+            checkpoint.record(name, target_version, row)
         processed += 1
         if progress is not None:
             progress(processed, total)
+
+    if checkpoint is not None:
+        pending = []
+        for name, declared in names:
+            saved = checkpoint.lookup(name, declared)
+            if saved is None:
+                pending.append((name, declared))
+            else:
+                target, row = saved
+                record(target, name, row)
+        names = pending
+        if processed:
+            _emit_status({"event": "begin.discovery-resumed", "reused": processed, "total": total})
 
     # The wall budget is passed INTO every registry probe for the whole phase:
     # each request bounds its own subprocess to the time remaining until the
@@ -3565,6 +3706,8 @@ def _discover_targets(
     if phase_inventory is None or not phase_inventory.belongs_to(project_dir):
         phase_inventory = ResolutionInventory.for_project(project_dir)
     inventory_token = _ACTIVE_INVENTORY.set(phase_inventory) if phase_inventory is not None else None
+    discovery_yarn_root = modern_yarn_root(project_dir)
+    yarn_root_token = _ACTIVE_DISCOVERY_YARN_ROOT.set(discovery_yarn_root)
     try:
         if parallelism <= 1:
             for name, declared in names:
@@ -3597,6 +3740,7 @@ def _discover_targets(
             # Each worker sets the contextvar for `_installed_version` to see
             # during its own probe and restores it before returning.
             token = _ACTIVE_INVENTORY.set(inventory) if inventory is not None else None
+            yarn_token = _ACTIVE_DISCOVERY_YARN_ROOT.set(discovery_yarn_root)
             try:
                 name, declared = item
                 if deadline is not None and _after_deadline(deadline):
@@ -3615,6 +3759,7 @@ def _discover_targets(
                         "reason": _budget_skip_reason(name, "probe failed unexpectedly"),
                     }
             finally:
+                _ACTIVE_DISCOVERY_YARN_ROOT.reset(yarn_token)
                 if token is not None:
                     _ACTIVE_INVENTORY.reset(token)
 
@@ -3639,6 +3784,7 @@ def _discover_targets(
         _order_discovery(targets, evidence)
         return targets, evidence
     finally:
+        _ACTIVE_DISCOVERY_YARN_ROOT.reset(yarn_root_token)
         if inventory_token is not None:
             _ACTIVE_INVENTORY.reset(inventory_token)
         _ACTIVE_DISCOVERY_DEADLINE = previous_discovery_deadline
@@ -3798,10 +3944,31 @@ def _materialize_locked(
     candidate = load_candidate(run_dir)
     if candidate is None:
         raise InvalidInputError("NO_ACTIVE_CANDIDATE")
+    from iterative_stage_checkpoint import operation_journal, completed_materialization
+    materialization_journal = operation_journal(run_dir, run, config, candidate, "materialize")
+    refs = (candidate.get("materializationRefs") or {})
+    workspace_root = trial_workspace_root(run_dir)
+    base = load_checkpoint(run_dir, str(candidate["baseCheckpointId"]))
+    if base.get("status") != "VERIFIED":
+        raise InvalidInputError("BASE_CHECKPOINT_NOT_VERIFIED")
+    if candidate.get("stage") not in {"PLANNED", "MATERIALIZED"}:
+        raise InvalidInputError(f"CANDIDATE_STAGE_NOT_PLANNED: {candidate.get("stage")}")
+    project_relative = Path(str(base.get("projectRelative") or "."))
+    project_path = workspace_root / project_relative
+    recovered = completed_materialization(materialization_journal, workspace_root, candidate["fullAssignment"],
+        lambda: observed_resolved_assignment(project_path, candidate["fullAssignment"]))
+    if recovered is not None:
+        _open_checkpoint_source(run_dir, base, config, run_id=str(run["runId"]))
+        save_candidate(run_dir, recovered)
+        resumed = {**run, "phase": "MATERIALIZING", "updatedAt": _now_iso()}
+        save_run(run_dir, resumed)
+        _emit_status({"event": "materialize.checkpoint-resumed", "runId": run["runId"], "candidateId": candidate["candidateId"]})
+        return 0
     if candidate.get("stage") != "PLANNED":
         raise InvalidInputError(
             f"CANDIDATE_STAGE_NOT_PLANNED: {candidate.get('stage')}"
         )
+    materialization_journal.write("materialize", "RUNNING")
     base_checkpoint = load_checkpoint(run_dir, str(candidate["baseCheckpointId"]))
     if base_checkpoint.get("status") != "VERIFIED":
         raise InvalidInputError("BASE_CHECKPOINT_NOT_VERIFIED")
@@ -3877,6 +4044,11 @@ def _materialize_locked(
         "installExitCode": install_result.returncode,
     }
     candidate["updatedAt"] = _now_iso()
+    from iterative_stage_checkpoint import trial_key
+    from baseline_constraint_verifier import _durable_proof_publication_allowed
+    materialization_journal.write("materialize", "PASS" if _durable_proof_publication_allowed(install_result) else "UNKNOWN", {
+        "workspaceRoot": str(workspace_root.resolve()), "artifactKey": trial_key(workspace_root),
+        "observed": observed, "candidate": candidate})
     save_candidate(run_dir, candidate)
     run = dict(run)
     run["phase"] = "MATERIALIZING"
@@ -4315,7 +4487,17 @@ def _precheck_locked(
     base_env: Dict[str, str] = os.environ
     if runtime_env:
         base_env = {**base_env, **runtime_env}
-    for command in commands:
+    from iterative_stage_checkpoint import operation_journal, DiagnosticCommandSequence
+    precheck_journal = operation_journal(run_dir, run, config, candidate, "precheck")
+    sequence = DiagnosticCommandSequence(precheck_journal, workspace_root, project_path, commands, base_env)
+    completed_prefix = sequence.resume_prefix()
+    if completed_prefix:
+        _emit_status({"event": "precheck.checkpoint-resumed", "runId": run["runId"],
+                      "candidateId": candidate["candidateId"], "completedCommands": completed_prefix})
+    for command_index, command in enumerate(commands, 1):
+        if command_index <= completed_prefix:
+            continue
+        before_key = sequence.begin(command_index, command)
         env: Dict[str, str] = {
             "CI": "1",
             "npm_config_ignore_scripts": "true",
@@ -4331,6 +4513,7 @@ def _precheck_locked(
                 progress=progress,
                 progress_label=f"iterative migration precheck {command}",
             )
+        sequence.complete(command_index, command, before_key, result)
         failed = result.returncode != 0
         measurement_outcome = "UNKNOWN" if result.returncode < 0 or result.returncode in {124, 137} else "FAIL" if failed else "PASS"
         measurements.append(stage_measurement(command_stage(command), time.monotonic()-command_started, measurement_outcome, command))
@@ -4461,9 +4644,13 @@ def cmd_verify_exact(args: argparse.Namespace) -> int:
 def _verify_exact_locked(
     run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any], args: argparse.Namespace
 ) -> int:
+    _assert_runtime_unchanged(config)
+    if _recover_iteration_transition(run_dir, run, config):
+        return 0
+    if _recover_checkpoint_publication(run_dir, run, config) is not None:
+        return 0
     if not run_budget_ok(config, run):
         raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
-    _assert_runtime_unchanged(config)
     candidate = load_candidate(run_dir)
     if candidate is None:
         raise InvalidInputError("NO_ACTIVE_CANDIDATE")
@@ -4524,15 +4711,27 @@ def _verify_exact_locked(
     offset = event_offset(verify_config.telemetry_path)
     scheduler_started = time.monotonic()
     with MigrationProgress(_emit_status, operation="verify-exact", message="iterative migration verify-exact: preparing verification", run_id=run["runId"], candidate_id=candidate["candidateId"]) as progress:
-        result = verify_assignment(
-            project_path,
-            candidate["fullAssignment"],
-            config=verify_config,
-            run_project_checks=True,
-            progress=progress,
-            progress_label="iterative migration verify-exact",
-            runtime_env=_runtime_env(config),
-        )
+        from iterative_stage_checkpoint import operation_journal, VerificationResultCheckpoint
+        result_journal = operation_journal(run_dir, run, config, candidate, "verify-result")
+        result_environment = {**os.environ, **(_runtime_env(config) or {}), "CI": "1"}
+        result_checkpoint = VerificationResultCheckpoint(
+            result_journal, workspace_root, project_path, config["verifyConfig"], result_environment)
+        result = result_checkpoint.lookup(verify_config.proof_cache_dir, progress)
+        if result is not None:
+            _emit_status({"event": "verify-exact.checkpoint-resumed", "runId": run["runId"],
+                          "candidateId": candidate["candidateId"], "kind": result.kind})
+        else:
+            before_key = result_checkpoint.begin(progress)
+            result = verify_assignment(
+                project_path,
+                candidate["fullAssignment"],
+                config=verify_config,
+                run_project_checks=True,
+                progress=progress,
+                progress_label="iterative migration verify-exact",
+                runtime_env=_runtime_env(config),
+            )
+            result_checkpoint.complete(before_key, result, progress)
     _emit_status(
         {
             "event": "verify-exact.result",
@@ -4565,50 +4764,103 @@ def _verify_exact_locked(
         return _accept_checkpoint(
             run_dir, run, config, candidate, base_checkpoint, result
         )
-    from cohort_action_cost import append_observation, observation_scope
-    scheduler_ledger = load_ledger(run_dir)
-    append_observation(scheduler_ledger, scope=observation_scope(run, config), candidate=candidate,
-                       seconds=candidate["schedulerSeconds"],
-                       outcome="rejected" if result.kind in {"dependency", "preparation"} else "inconclusive",
-                       source_key=str(base_checkpoint.get("sourceSnapshotKey") or ""))
-    save_ledger(run_dir, scheduler_ledger)
+    from iterative_state_transaction import StateTransaction, state_context
+    with StateTransaction(run_dir, state_context(run_dir, run, config, candidate), _write_json_atomic):
+        from cohort_action_cost import append_observation, observation_scope
+        scheduler_ledger = load_ledger(run_dir)
+        append_observation(scheduler_ledger, scope=observation_scope(run, config), candidate=candidate,
+                           seconds=candidate["schedulerSeconds"],
+                           outcome="rejected" if result.kind in {"dependency", "preparation"} else "inconclusive",
+                           source_key=str(base_checkpoint.get("sourceSnapshotKey") or ""))
+        save_ledger(run_dir, scheduler_ledger)
 
-    if result.kind == "project":
-        failing = [
-            {"command": f.command, "exitCode": f.exit_code, "tail": f.output}
-            for f in result.project_failures
-        ]
-        candidate = load_candidate(run_dir)
-        candidate = dict(candidate)
-        ledger = load_ledger(run_dir)
-        counters = dict(ledger.get("counters", {}))
-        max_attempts = int(config["budget"]["maxRepairAttemptsPerRevision"])
-        # B2: the repair budget belongs to THIS candidate incarnation
-        # (candidate.attemptId), so a NEW candidate never inherits a spent
-        # per-revision count and restarting the SAME attempt never resets it.
-        # The ledger keeps the per-revision total only as observable telemetry
-        # with a single owner (the locked controller).
-        used = int(candidate.get("attemptId", 0)) + 1
-        revision_key = _attempt_revision_key(
-            str(candidate["baseCheckpointId"]),
-            assignment_fingerprint(candidate["fullAssignment"]),
-        )
-        by_revision = dict(counters.get("repairAttemptsByRevision") or {})
-        by_revision[revision_key] = used
-        counters["repairAttemptsByRevision"] = by_revision
-        counters["repairAttemptsForRevision"] = used  # latest-revision telemetry
-        ledger = dict(ledger)
-        ledger["counters"] = counters
-        if used >= max_attempts:
+        if result.kind == "project":
+            failing = [
+                {"command": f.command, "exitCode": f.exit_code, "tail": f.output}
+                for f in result.project_failures
+            ]
+            candidate = load_candidate(run_dir)
+            candidate = dict(candidate)
+            ledger = load_ledger(run_dir)
+            counters = dict(ledger.get("counters", {}))
+            max_attempts = int(config["budget"]["maxRepairAttemptsPerRevision"])
+            # B2: the repair budget belongs to THIS candidate incarnation
+            # (candidate.attemptId), so a NEW candidate never inherits a spent
+            # per-revision count and restarting the SAME attempt never resets it.
+            # The ledger keeps the per-revision total only as observable telemetry
+            # with a single owner (the locked controller).
+            used = int(candidate.get("attemptId", 0)) + 1
+            revision_key = _attempt_revision_key(
+                str(candidate["baseCheckpointId"]),
+                assignment_fingerprint(candidate["fullAssignment"]),
+            )
+            by_revision = dict(counters.get("repairAttemptsByRevision") or {})
+            by_revision[revision_key] = used
+            counters["repairAttemptsByRevision"] = by_revision
+            counters["repairAttemptsForRevision"] = used  # latest-revision telemetry
+            ledger = dict(ledger)
+            ledger["counters"] = counters
+            if used >= max_attempts:
+                _record_block(
+                    ledger,
+                    run_dir,
+                    candidateId=str(candidate["candidateId"]),
+                    baseCheckpointId=str(candidate["baseCheckpointId"]),
+                    kind="NOT_ACTIONABLE",
+                    reason=f"REPAIR_ATTEMPTS_EXHAUSTED completed={used} max={max_attempts}",
+                    assignmentFingerprint=assignment_fingerprint(candidate["fullAssignment"]),
+                )
+                candidate["stage"] = "REJECTED"
+                candidate["updatedAt"] = _now_iso()
+                save_candidate(run_dir, candidate)
+                run = dict(run)
+                run["activeCandidateId"] = None
+                run["phase"] = "READY"
+                run["updatedAt"] = _now_iso()
+                save_run(run_dir, run)
+                _emit_status(
+                    {
+                        "event": "verify-exact.rejected",
+                        "runId": run["runId"],
+                        "candidateId": candidate["candidateId"],
+                        "reason": "REPAIR_ATTEMPTS_EXHAUSTED",
+                    }
+                )
+                return 0
+            candidate["attemptId"] = used
+            candidate["stage"] = "REPAIRING"
+            candidate["updatedAt"] = _now_iso()
+            save_candidate(run_dir, candidate)
+            _write_candidate_repair_requests(
+                run_dir,
+                run,
+                candidate,
+                config,
+                failing_commands=failing,
+                reason="project-source-config-repair",
+            )
+            save_ledger(run_dir, ledger)
+            run = dict(run)
+            run["phase"] = "REPAIRING"
+            run["updatedAt"] = _now_iso()
+            save_run(run_dir, run)
+            return 0
+
+        if result.kind in {"dependency", "preparation"}:
+            # A deterministic dependency/preparation failure of the EXACT candidate
+            # becomes a deterministic scoped block for the same base checkpoint.
+            ledger = load_ledger(run_dir)
             _record_block(
                 ledger,
                 run_dir,
                 candidateId=str(candidate["candidateId"]),
                 baseCheckpointId=str(candidate["baseCheckpointId"]),
-                kind="NOT_ACTIONABLE",
-                reason=f"REPAIR_ATTEMPTS_EXHAUSTED completed={used} max={max_attempts}",
+                kind="NEGATIVE_VERIFY",
+                reason=f"kind={result.kind}: {result.summary}",
                 assignmentFingerprint=assignment_fingerprint(candidate["fullAssignment"]),
             )
+            candidate = load_candidate(run_dir)
+            candidate = dict(candidate)
             candidate["stage"] = "REJECTED"
             candidate["updatedAt"] = _now_iso()
             save_candidate(run_dir, candidate)
@@ -4622,85 +4874,34 @@ def _verify_exact_locked(
                     "event": "verify-exact.rejected",
                     "runId": run["runId"],
                     "candidateId": candidate["candidateId"],
-                    "reason": "REPAIR_ATTEMPTS_EXHAUSTED",
+                    "reason": f"DETERMINISTIC_{result.kind.upper()}",
                 }
             )
             return 0
-        candidate["attemptId"] = used
-        candidate["stage"] = "REPAIRING"
-        candidate["updatedAt"] = _now_iso()
-        save_candidate(run_dir, candidate)
-        _write_candidate_repair_requests(
-            run_dir,
-            run,
-            candidate,
-            config,
-            failing_commands=failing,
-            reason="project-source-config-repair",
-        )
-        save_ledger(run_dir, ledger)
-        run = dict(run)
-        run["phase"] = "REPAIRING"
-        run["updatedAt"] = _now_iso()
-        save_run(run_dir, run)
-        return 0
 
-    if result.kind in {"dependency", "preparation"}:
-        # A deterministic dependency/preparation failure of the EXACT candidate
-        # becomes a deterministic scoped block for the same base checkpoint.
-        ledger = load_ledger(run_dir)
-        _record_block(
-            ledger,
-            run_dir,
-            candidateId=str(candidate["candidateId"]),
-            baseCheckpointId=str(candidate["baseCheckpointId"]),
-            kind="NEGATIVE_VERIFY",
-            reason=f"kind={result.kind}: {result.summary}",
-            assignmentFingerprint=assignment_fingerprint(candidate["fullAssignment"]),
-        )
-        candidate = load_candidate(run_dir)
-        candidate = dict(candidate)
-        candidate["stage"] = "REJECTED"
-        candidate["updatedAt"] = _now_iso()
+        # UNKNOWN/infrastructure evidence never rejects the assignment. Bound the
+        # same candidate's re-verification; retain repaired bytes for explicit retry.
+        failures = int(candidate.get("verifyInfraFailures") or 0) + 1
+        limit = int(config["budget"]["maxInfraRetries"])
+        candidate["verifyInfraFailures"] = failures
+        candidate["verificationFailure"] = {"kind": result.kind, "summary": result.summary}
         save_candidate(run_dir, candidate)
         run = dict(run)
-        run["activeCandidateId"] = None
-        run["phase"] = "READY"
-        run["updatedAt"] = _now_iso()
-        save_run(run_dir, run)
-        _emit_status(
-            {
-                "event": "verify-exact.rejected",
-                "runId": run["runId"],
-                "candidateId": candidate["candidateId"],
-                "reason": f"DETERMINISTIC_{result.kind.upper()}",
+        exhausted = failures > limit
+        run["phase"] = "READY" if exhausted else "VERIFYING"
+        if exhausted:
+            run["infraBlocked"] = {
+                "operation": "verify-exact", "candidateId": candidate["candidateId"],
+                "baseCheckpointId": candidate["baseCheckpointId"],
+                "classification": result.kind, "reason": result.summary,
+                "failures": failures, "maxRetries": limit, "blockedAt": _now_iso(),
             }
-        )
+        run["updatedAt"] = _now_iso()
+        save_run(run_dir, run)
+        _emit_status({"event": "verify-exact.inconclusive", "runId": run["runId"],
+                      "candidateId": candidate["candidateId"], "retryable": not exhausted,
+                      "failures": failures, "summary": result.summary})
         return 0
-
-    # UNKNOWN/infrastructure evidence never rejects the assignment. Bound the
-    # same candidate's re-verification; retain repaired bytes for explicit retry.
-    failures = int(candidate.get("verifyInfraFailures") or 0) + 1
-    limit = int(config["budget"]["maxInfraRetries"])
-    candidate["verifyInfraFailures"] = failures
-    candidate["verificationFailure"] = {"kind": result.kind, "summary": result.summary}
-    save_candidate(run_dir, candidate)
-    run = dict(run)
-    exhausted = failures > limit
-    run["phase"] = "READY" if exhausted else "VERIFYING"
-    if exhausted:
-        run["infraBlocked"] = {
-            "operation": "verify-exact", "candidateId": candidate["candidateId"],
-            "baseCheckpointId": candidate["baseCheckpointId"],
-            "classification": result.kind, "reason": result.summary,
-            "failures": failures, "maxRetries": limit, "blockedAt": _now_iso(),
-        }
-    run["updatedAt"] = _now_iso()
-    save_run(run_dir, run)
-    _emit_status({"event": "verify-exact.inconclusive", "runId": run["runId"],
-                  "candidateId": candidate["candidateId"], "retryable": not exhausted,
-                  "failures": failures, "summary": result.summary})
-    return 0
 
 
 def _record_block(
@@ -4716,6 +4917,8 @@ def _record_block(
         "createdAt": _now_iso(),
     }
     ledger = dict(ledger)
+    from iterative_stage_checkpoint import negative_evidence_scope
+    entry["evidenceScope"] = negative_evidence_scope(run_dir, load_config(run_dir), baseCheckpointId)
     blocks = list(ledger.get("blocks", []))
     blocks.append(entry)
     ledger["blocks"] = blocks
@@ -4729,6 +4932,7 @@ def _accept_checkpoint(
     candidate: Mapping[str, Any],
     base_checkpoint: Mapping[str, Any],
     result: BaselineVerifyResult,
+    *, supersede_publication: bool = False,
 ) -> int:
     for name, policy in (config.get("packagePolicies") or {}).items():
         if policy == "keep-current" and (candidate.get("fullAssignment") or {}).get(name) != (base_checkpoint.get("fullAssignment") or {}).get(name):
@@ -4754,10 +4958,10 @@ def _accept_checkpoint(
         }
     )
     with MigrationProgress(_emit_status, operation="checkpoint", message="Saving verified source snapshot", run_id=run["runId"], candidate_id=candidate_id) as progress:
-        snapshot = capture_durable_source_snapshot(
-            project_path, run_dir / SOURCE_DIR / checkpoint_id, timeout_seconds=0,
-            progress=progress,
-        )
+        from verification_stage_checkpoint import capture_recovery_source
+        snapshot, _reused = capture_recovery_source(
+            project_path, run_dir / "v" / "sc",
+            preferred_destination=run_dir / SOURCE_DIR / checkpoint_id, timeout_seconds=0, progress=progress)
     project_relative = resolve_project_relative(project_path, snapshot)
 
     observed = dict(result.observed_resolved_versions or {})
@@ -4782,6 +4986,11 @@ def _accept_checkpoint(
         "fullAssignment": new_assignment,
         "acceptedDelta": accepted_delta,
         "cohortId": candidate.get("cohortId") or None,
+        "iteration": {"candidateId": candidate_id, "attemptId": candidate.get("attemptId", 0),
+                      "assignmentFingerprint": assignment_fingerprint(new_assignment),
+                      "schedulerSeconds": candidate.get("schedulerSeconds"),
+                      "stageMeasurements": candidate.get("stageMeasurements") or [],
+                      "cohortSelection": candidate.get("cohortSelection") or {}},
         "verification": {
             "status": "passed",
             "kind": result.kind,
@@ -4792,24 +5001,30 @@ def _accept_checkpoint(
         "proofRefs": {
             "resolvedStateKey": result.resolved_state_key or "",
             "preparationProofKey": result.preparation_proof_key or "",
+            "commandCheckpoints": list(getattr(result, "command_checkpoint_refs", ())),
         },
         "runtimeContractHash": _runtime_contract_hash(config),
         "audit": {"status": "UNKNOWN", "evidenceRef": ""},
         "createdAt": _now_iso(),
         "toolBuildId": config.get("toolBuildId") or "",
     }
-    save_checkpoint(run_dir, checkpoint)
-
-    # Atomic pointer switch: the new checkpoint is durable before the pointer moves.
+    # Write-ahead publication binds the physically verified snapshot and the
+    # next pointer before either state file changes. Recovery revalidates bytes.
+    previous_run = dict(run)
     run = dict(run)
     run["activeCheckpointId"] = checkpoint_id
     run["activeCandidateId"] = None
     run["generation"] = int(run.get("generation", 1)) + 1
     run["phase"] = "READY"
     run["updatedAt"] = _now_iso()
+    from iterative_checkpoint_publication import prepare_publication, TRANSACTION
+    prepare_publication(run_dir, previous_run, config, checkpoint, run, candidate_id, _write_json_atomic,
+                        supersede_verified=supersede_publication)
+    save_checkpoint(run_dir, checkpoint)
     save_run(run_dir, run)
     clear_candidate(run_dir)
     write_repair_requests(run_dir, [])
+    (run_dir / TRANSACTION).unlink()
 
     # The accepted pointer is durable first. Lossless cold storage failure
     # cannot revoke it or erase the previous snapshot; expose the failure.
@@ -4847,6 +5062,42 @@ def _accept_checkpoint(
         }
     )
     return 0
+
+
+def _recover_iteration_transition(run_dir, run, config):
+    from iterative_state_transaction import recover_transition
+    def validate_base(cid, source_key):
+        checkpoint = load_checkpoint(run_dir, cid)
+        if checkpoint.get("status") != "VERIFIED" or checkpoint.get("sourceSnapshotKey") != source_key:
+            raise ValueError("ITERATION_TRANSITION_BASE_DRIFT")
+        _open_checkpoint_source(run_dir, checkpoint, config, run_id=str(run["runId"]))
+    try:
+        recovered = recover_transition(run_dir, run, config, write_json=_write_json_atomic, validate_source=validate_base)
+    except (ValueError, OSError) as exc:
+        raise InvalidInputError(f"ITERATION_TRANSITION_RECOVERY_FAILED: {exc}") from exc
+    if recovered:
+        _emit_status({"event": "iteration.transition-recovered", "runId": run["runId"]})
+    return recovered
+
+
+def _recover_checkpoint_publication(run_dir, run, config):
+    from iterative_checkpoint_publication import recover_publication
+    try:
+        recovered = recover_publication(
+            run_dir, run, config,
+            read_checkpoint=lambda cid: load_checkpoint(run_dir, cid) if _checkpoint_path(run_dir, cid).exists() else None,
+            save_checkpoint=lambda cp: save_checkpoint(run_dir, cp),
+            validate_source=lambda cp: _open_checkpoint_source(run_dir, cp, config, run_id=str(run["runId"])),
+            save_run=lambda value: save_run(run_dir, value),
+            clear_candidate=lambda: clear_candidate(run_dir),
+            clear_repairs=lambda: write_repair_requests(run_dir, []),
+        )
+    except (ValueError, OSError) as exc:
+        raise InvalidInputError(f"CHECKPOINT_PUBLICATION_RECOVERY_FAILED: {exc}") from exc
+    if recovered is not None:
+        _emit_status({"event": "checkpoint.publication-recovered", "runId": run["runId"],
+                      "checkpointId": recovered["activeCheckpointId"]})
+    return recovered
 
 
 def _accepted_delta(
@@ -5141,6 +5392,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         "progressSummary": progress_summary,
         "goalSatisfied": _policy_satisfied(config, checkpoint),
         "terminalRepairResumable": terminal_repair_resumable(run_dir, run, checkpoint, candidate, ledger, config),
+        "checkpointPublicationPending": (run_dir / "checkpoint-publication.json").exists(),
+        "iterationPublicationPending": (run_dir / "iteration-transition.json").exists(),
         "candidate": candidate,
         "ledgerSummary": {
             "blocks": len(ledger.get("blocks", [])),

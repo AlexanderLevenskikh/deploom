@@ -99,8 +99,17 @@ class VerificationSourceScopeTests(unittest.TestCase):
         self.assertTrue(result.ok, f'{result.kind}: {result.summary}\n{result.output}')
         self.assertEqual(1, capture.call_count)
         self.assertEqual('live edit', (self.project / 'input.txt').read_text())
-        self.assertFalse(snapshots[0].container.exists())
+        # A completed verification retains a *candidate* for the next request.
+        # The live edit must not be consumed as sealed proof: the next request
+        # revalidates continuity, retires the stale copy and captures new bytes.
+        self.assertTrue(snapshots[0].container.exists())
         self.assertIsNone(source.active_source_snapshot(self.project))
+        with patch.object(source, 'capture_source_snapshot', wraps=source.capture_source_snapshot) as recapture:
+            with source.verification_source_snapshot_scope(self.project, reuse_completed=True) as refreshed:
+                self.assertNotEqual(snapshots[0].key, refreshed.key)
+                self.assertEqual('live edit', (refreshed.project_path / 'input.txt').read_text())
+            self.assertEqual(1, recapture.call_count)
+        self.assertFalse(snapshots[0].container.exists())
 
 
 if __name__ == '__main__':

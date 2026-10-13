@@ -13,6 +13,28 @@
 // already accepted — never a Desktop-invented version.
 import { existsSync, readFileSync } from 'node:fs'
 
+// P1#4 / user report: the check CLI prints ITERATIVE_MIGRATION_FAILURE_V1 on
+// STDOUT — dependency noise on stderr must never hide it. Recover the machine
+// envelope from a combined stream so the scenario can parse it (a red control
+// must map to the repair agent, not a dead-end re-check).
+export function extractIterativeFailureEnvelope(text: string): string | undefined {
+  const marker = 'ITERATIVE_MIGRATION_FAILURE_V1 '
+  const at = text.indexOf(marker)
+  if (at < 0) return undefined
+  const chunk = text.slice(at + marker.length).split(/\r?\n/, 1)[0]
+  const open = chunk.indexOf('{')
+  const close = chunk.lastIndexOf('}')
+  if (open < 0 || close <= open) return undefined
+  try {
+    const parsed = JSON.parse(chunk.slice(open, close + 1)) as { code?: unknown }
+    if (parsed && typeof parsed.code === 'string') return marker + chunk.slice(open, close + 1)
+  } catch {
+    // not a valid envelope — fall through
+  }
+  return undefined
+}
+
+
 export type IterativeBeginOptions = {
   projectDir: string
   projectName: string

@@ -49,6 +49,15 @@ def preserved_checkpoints(history):
         cp=read(record);identity=cp.get('checkpointId','')
         if not isinstance(identity,str) or not re.fullmatch(r'C\d+',identity): continue
         source=history/'sources'/identity
+        raw_source = cp.get('sourceSnapshotContainer')
+        if raw_source:
+            reference = Path(raw_source).resolve()
+            if reference.is_relative_to(history.resolve()):
+                source = reference
+            elif history.parent.name == 'run-archive':
+                current_run = history.parent.parent.resolve()
+                if reference.is_relative_to(current_run):
+                    source = history / reference.relative_to(current_run)
         from snapshot_compaction import has_packed_source
         if not _plain_directory(source/'tree') and not has_packed_source(source): continue
         manifest=read(source/'manifest.json');key=cp.get('sourceSnapshotKey')

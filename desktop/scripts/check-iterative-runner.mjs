@@ -37,6 +37,14 @@ function expectDecision(run, extra, expectedStep, expectedReasonPart) {
   return decision;
 }
 
+for (const phase of ['VERIFYING', 'READY']) {
+  expectDecision({ phase, activeCandidateId: 'candidate-1' },
+    { checkpointPublicationPending: true }, 'resume', 'verified checkpoint publication');
+}
+
+expectDecision({ phase: "VERIFYING", activeCandidateId: "candidate-1" },
+  { iterationPublicationPending: true }, "resume", "interrupted iteration state publication");
+
 // 1. No durable state -> begin.
 const empty = decideNextStep(runDir, {});
 if (empty.step !== "begin" || !empty.reason.includes("NO_RUN")) throw new Error("Run-less dir must decide begin");

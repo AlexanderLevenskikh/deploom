@@ -185,6 +185,9 @@ export function decideNextStep(
     })
     .filter((item): item is { requestId: string; summary: string } => Boolean(item))
 
+  if (payload.iterationPublicationPending === true) return { step: "resume", phase, reason: "finish the interrupted iteration state publication; previous verified checkpoint preserved" }
+  if (payload.checkpointPublicationPending === true) return { step: "resume", phase, reason: "recover the durable verified checkpoint publication before further work" }
+
   // A proposal planned by an older controller must not start an unnecessary
   // installation after the exact active checkpoint already meets the goals.
   // Materialized/repairing trials remain subject to their normal closure.

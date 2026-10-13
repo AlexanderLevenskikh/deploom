@@ -316,7 +316,7 @@ def security_verify(run_dir, inputs):
     state.update(status="accepting", pendingCheckpointId=f"C{int(checkpoint.get('seq', 0)) + 1}",
                  pendingAssignment=assignment, pendingAudit=audited)
     core._write_json_atomic(state_file, state)
-    core._accept_checkpoint(run_dir, run, config, candidate, checkpoint, result)
+    core._accept_checkpoint(run_dir, run, config, candidate, checkpoint, result, supersede_publication=True)
     updated = core.load_run(run_dir)
     accepted = core.load_checkpoint(run_dir, updated["activeCheckpointId"])
     accepted["audit"] = {**audited, "checkpointId": accepted["checkpointId"]}

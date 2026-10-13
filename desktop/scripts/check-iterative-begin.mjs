@@ -2,6 +2,7 @@ import { mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  extractIterativeFailureEnvelope,
   iterativeBeginInvocation,
   iterativeCheckTimeoutFailure,
   hasSavedProjectPlan,
@@ -11,6 +12,12 @@ import {
 
 import { readMigrationProfile, saveMigrationProfile, validateMigrationProfile, migrationProfilePath } from '../dist-electron/migration-validation.js';
 import assert from 'node:assert/strict';
+
+const discoveryFailure = 'ITERATIVE_MIGRATION_FAILURE_V1 ' + JSON.stringify({ code: 'DISCOVERY_UNSETTLED', summary: 'registry unavailable', command: '', fixable: true });
+const noisyBegin = 'ITERATIVE_MIGRATION_STATUS_V1 {"event":"begin.discovery-progress"}\n'.repeat(100) + discoveryFailure;
+assert.equal(extractIterativeFailureEnvelope('stderr noise\n' + noisyBegin)?.slice(0, 4000), discoveryFailure, 'progress must not hide the actionable discovery failure');
+assert.equal(extractIterativeFailureEnvelope('stderr noise\n' + discoveryFailure), discoveryFailure);
+assert.equal(extractIterativeFailureEnvelope('ITERATIVE_MIGRATION_FAILURE_V1 invalid'), undefined);
 
 const profileRoot = mkdtempSync(join(tmpdir(), 'deploom-validation-profile-'));
 const profileRun = join(profileRoot, 'run');
