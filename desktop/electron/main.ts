@@ -54,7 +54,7 @@ import { baselineBudgetOverride } from './baseline-budget.js'
 import { acceptanceVerdictFromManualAudit, dependencyInputIdentity, mergeTargetPolicy, normalizeAcceptancePolicy, type AcceptancePolicy, type AcceptanceVerdict } from './acceptance-policy.js'
 import { normalizeBudgetField } from './baseline-intent.js'
 import { summarizeUpdaterError } from './updater-error.js'
-import { flowNotificationContent, type FlowNotificationEvent } from './notifications.js'
+import { createFlowNotificationSender, createIterativeNotificationObserver, type FlowNotificationEvent } from './notifications.js'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
@@ -69,7 +69,7 @@ import { migrationProfilePath, readMigrationProfile, readMigrationScope, saveMig
 import { hasSavedProjectPlan, iterativeBeginInvocation, iterativeCheckTimeoutFailure, targetsFromDashboardState } from './iterative-begin.js'
 import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
-import { beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, readRunLogTail, recordAttemptLog, recordAttemptProgress, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
+import { type IterativeAttemptRecord, beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, readRunLogTail, recordAttemptLog, recordAttemptProgress, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
 import { spawnIterativeStreamed, type CaptureResult, type StreamAttemptIo, type StreamPlatform } from './iterative-stream.js'
 import { extendRepairBudget, repairProgressFingerprint, agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, agentProviderFailure, openCodeRuntimeManifestPaths, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, recordAgentDispatchTiming, trialBaselineFile, trialProjectPath, withAgentDispatchLock, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
@@ -1018,10 +1018,20 @@ function notificationsEnabled(state = loadState()): boolean {
   return state.notificationsEnabled !== false
 }
 
+const sendFlowNotification = createFlowNotificationSender({
+  enabled: notificationsEnabled,
+  supported: () => Notification.isSupported(),
+  create: content => new Notification(content),
+  onFailure: () => console.warn('FLOW_NOTIFICATION_FAILED: native notification delivery failed'),
+  onClick: () => { mainWindow?.show(); mainWindow?.focus() },
+})
 function showFlowNotification(event: FlowNotificationEvent): void {
-  if (!notificationsEnabled() || !Notification.isSupported()) return
-  const content = flowNotificationContent(event)
-  new Notification(content).show()
+  sendFlowNotification(event)
+}
+const observeIterativeNotifications = createIterativeNotificationObserver()
+function broadcastIterativeAttempt(attempt: IterativeAttemptRecord): void {
+  send('flow:iterative:attempt', attempt)
+  for (const event of observeIterativeNotifications(attempt)) showFlowNotification(event)
 }
 function selectedWorkspace(state = loadState()): WorkspaceRecord | undefined {
   return state.workspaces.find((item) => item.id === state.selectedWorkspaceId) ?? state.workspaces[0]
@@ -1706,7 +1716,7 @@ const iterativeStreamIo = (_runDir: string): StreamAttemptIo => ({
   cancelRequested: (dir: string) => readAttempt(dir)?.cancelRequested === true,
   recordLine: (dir: string, text: string) => {
     const attempt = recordAttemptProgress(dir, text)
-    if (attempt) send('flow:iterative:attempt', attempt)
+    if (attempt) broadcastIterativeAttempt(attempt)
   },
   trimLog: (dir: string) => trimAttemptLog(dir),
 })
@@ -7084,7 +7094,13 @@ async function executeJob(job: JobRecord, commands: CommandSpec[]): Promise<void
     // generate/audit/agent residual cycle. Only manual single-stage runs get a
     // stage-complete OS notification; Autopilot emits one final notification
     // when the whole FLOW really has no next action.
-    if (exitCode === 0 && !job.autopilot) showFlowNotification({ kind: 'stage-complete', projectName: job.projectName || job.workspace.name, action: job.action })
+    if (!job.cancelled) {
+      if (exitCode === 0 && !job.autopilot) showFlowNotification({ kind: 'stage-complete', projectName: job.projectName || job.workspace.name, action: job.action })
+      else if (exitCode !== 0) showFlowNotification({
+        kind: errorMessage.includes(BASELINE_DECISION_MARKER) ? 'stage-attention' : 'stage-failed',
+        projectName: job.projectName || job.workspace.name, stage: job.action,
+      })
+    }
   }
 }
 
@@ -7672,9 +7688,13 @@ function setupIpc(): void {
     readRetry: input => readAutopilotState(autopilotRunDir(input))?.retry,
     waitForWriter: input => liveRunWriterPid(autopilotRunDir(input), isPidAlive) ? Date.now() + 1_000 : undefined,
     onStopped: (input, summary) => {
-      if (!summary.error) return
+      if (!summary.error) {
+        if (summary.stopped === 'finished') showFlowNotification({ kind: 'iterative-run-complete', projectName: input.projectName })
+        return
+      }
       const runDir = autopilotRunDir(input)
       updateAttempt(runDir, { status: 'failed', lastError: summary.error.slice(0, 4000), waitUntil: undefined })
+      if (!readAttempt(runDir)) showFlowNotification({ kind: 'stage-failed', projectName: input.projectName, stage: 'Автоматический прогон' })
       recordAttemptLog(runDir, `Autopilot stopped (${summary.stopped}): ${summary.error.slice(0, 4000)}\n`)
       publishIterativeAttempt(runDir)
     },
@@ -7906,7 +7926,7 @@ function setupIpc(): void {
   // attempt stopped (the record and log live in the run dir, not in memory).
   function publishIterativeAttempt(runDir: string): void {
     const attempt = readAttempt(runDir)
-    if (attempt) send('flow:iterative:attempt', attempt)
+    if (attempt) broadcastIterativeAttempt(attempt)
   }
 
   ipcMain.handle('flow:iterative:attempt', async (_event, input: { workspaceId?: string; projectName: string; includeRunLog?: boolean }) => {
