@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import os
 import shutil
 import sys
@@ -97,6 +98,48 @@ def workspace_backend_summary(root: Optional[Path] = None) -> str:
     return "portable-private-copy"
 
 
+# Linux FICLONE creates a private CoW file; unlike a hardlink, modifying the
+# destination cannot modify the sealed source file object. This is a cheap
+# optimization for filtered source captures where whole-tree cp --reflink=always
+# is unsafe because it would copy excluded source/dependency directories.
+_LINUX_FICLONE = 0x40049409
+_LINUX_REFLINK_UNSUPPORTED = frozenset({
+    errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOTTY, errno.EXDEV, errno.EINVAL,
+})
+
+
+def _filtered_reflink_copy_function(stats: dict[str, int]):
+    """Copytree file callback, reflink-first with a safe byte-copy fallback."""
+    def copy_file(src: str, dst: str) -> str:
+        if not sys.platform.startswith("linux") or stats.get("unsupported"):
+            stats["fallback"] = stats.get("fallback", 0) + 1
+            return shutil.copy2(src, dst)
+        import fcntl
+        created = False
+        try:
+            # 'xb' refuses to follow a previously-created destination link.
+            with open(src, "rb") as reader, open(dst, "xb") as writer:
+                created = True
+                fcntl.ioctl(writer.fileno(), _LINUX_FICLONE, reader.fileno())
+            shutil.copystat(src, dst)
+            stats["reflink"] = stats.get("reflink", 0) + 1
+            return dst
+        except OSError as exc:
+            # E.g. overlayfs / ext4 / different devices: use a normal private
+            # copy, never a writable hardlink to the proof-bearing source.
+            if created:
+                try:
+                    os.unlink(dst)
+                except FileNotFoundError:
+                    pass
+            if exc.errno not in _LINUX_REFLINK_UNSUPPORTED:
+                raise
+            stats["unsupported"] = 1
+            stats["fallback"] = stats.get("fallback", 0) + 1
+            return shutil.copy2(src, dst)
+    return copy_file
+
+
 def _materialize_private_tree_impl(
     source: Path,
     target: Path,
@@ -137,9 +180,11 @@ def _materialize_private_tree_impl(
         def ignore(directory, entries):
             relative = Path(directory).relative_to(source)
             return [name for name in entries if name in names or (relative / name).as_posix() in excluded]
-        shutil.copytree(source, target, symlinks=True, ignore=ignore)
+        stats: dict[str, int] = {}
+        shutil.copytree(source, target, symlinks=True, ignore=ignore,
+                        copy_function=_filtered_reflink_copy_function(stats))
         recreate_reparse_plan(source, target, canonical_plan)
-        return "portable-scoped-private-copy"
+        return "linux-scoped-file-reflink" if stats.get("reflink") else "portable-scoped-private-copy"
 
     if os.name == "nt":
         source_fs = windows_filesystem(source)
@@ -235,8 +280,12 @@ def _materialize_private_tree_impl(
 
     ignored = tuple(sorted(set(exclude_dir_names) | set(exclude_file_names)))
     ignore = shutil.ignore_patterns(*ignored) if ignored else None
-    shutil.copytree(source, target, symlinks=True, ignore=ignore)
+    stats: dict[str, int] = {}
+    shutil.copytree(source, target, symlinks=True, ignore=ignore,
+                    copy_function=_filtered_reflink_copy_function(stats))
     recreate_reparse_plan(source, target, canonical_plan)
+    if stats.get("reflink"):
+        return "linux-filtered-file-reflink"
     return "portable-filtered-deep-copy" if ignored else "portable-deep-copy"
 
 # BLOCK_VG_ZERO_CONFIG_TRANSACTIONAL_UI_V1

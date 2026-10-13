@@ -25,7 +25,7 @@ def require_complete_source_policy(policy):
             "confidence": "complete-under-source-policy", "policyKey": policy.key,
             "frontendBuildOutputExclusions": list(policy.frontend_build_output_paths),
             "frontendProfile": policy.frontend_profile, "cacheExclusions": list(policy.excluded_relative_paths),
-            "agentStateExclusions": list(AGENT_STATE_DIRS) if policy.frontend_profile else []}
+            "agentStateExclusions": [name for name in AGENT_STATE_DIRS if name in policy.excluded_dir_names]}
 
 def execution_scope(snapshot, *, project, package_manager_root, commands, materialization):
     from source_snapshot import SourceInputPolicy
@@ -43,7 +43,9 @@ def excluded_source_failure_evidence(snapshot, output, *, execution_root, execut
     import re
     from source_snapshot import _excluded, SourceInputPolicy
     policy = snapshot.input_policy or SourceInputPolicy()
-    if not policy.frontend_profile:
+    if not policy.frontend_profile and not any(
+        name in policy.excluded_dir_names for name in (".claude", ".codex")
+    ):
         return []
     text = str(output)[-131072:]
     if not re.search(r"cannot find|can't find|enoent|no such file|module not found", text, re.I):

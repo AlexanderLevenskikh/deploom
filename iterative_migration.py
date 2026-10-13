@@ -84,6 +84,7 @@ from storage_capacity import StorageCapacityError
 from source_snapshot import (
     SourceCaptureError,
     SourceSnapshot,
+    bind_source_snapshot,
     capture_durable_source_snapshot,
     capture_source_snapshot,
     incomplete_submodules,
@@ -1386,9 +1387,11 @@ def _begin_locked(
             _write_json_atomic(run_dir / REPAIR_HANDOFF_FILENAME, handoff)
 
     snapshot_container = run_dir / SOURCE_DIR / "C0"
-    snapshot = capture_durable_source_snapshot(
-        project_dir, snapshot_container, timeout_seconds=0
-    )
+    with MigrationProgress(_emit_status, operation="source-capture", run_id=run_id,
+                           message="iterative migration source capture: preparing sealed C0") as progress:
+        snapshot = capture_durable_source_snapshot(
+            project_dir, snapshot_container, timeout_seconds=1800, progress=progress
+        )
     project_relative = resolve_project_relative(project_dir, snapshot)
 
     verify_config = verify_config_from(config["verifyConfig"], run_dir)
@@ -1396,7 +1399,14 @@ def _begin_locked(
         verify_config, verification_purpose="baseline-control"
     )
     _emit_status({"event": "begin.c0-verify", "runId": run_id})
-    with MigrationProgress(_emit_status, operation="control", message="iterative migration C0 control verification: preparing verification") as progress:
+    # Reuse the sealed C0 bytes while retaining the original live-source guard.
+    original_root = project_dir.resolve()
+    for _part in project_relative.parts:
+        original_root = original_root.parent
+    control_source = dataclasses.replace(snapshot, original_project_path=project_dir.resolve(),
+                                         capture_root=original_root,
+                                         git_root=str(original_root) if snapshot.git_root else "")
+    with bind_source_snapshot(control_source), MigrationProgress(_emit_status, operation="control", message="iterative migration C0 control verification: preparing verification") as progress:
         result = verify_initial_control(
             project_dir, initial_assignment, run_config=config, run_dir=run_dir,
             verify_config=verify_config, verifier=verify_assignment,

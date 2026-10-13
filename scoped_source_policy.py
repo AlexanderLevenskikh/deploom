@@ -43,7 +43,7 @@ def policy_from_payload(raw):
         if not isinstance(caches, list) or any(name not in KNOWN_FRONTEND_CACHE_PATHS for name in caches):
             raise SourceCaptureError("SOURCE_FRONTEND_CACHE_POLICY_INVALID")
         from source_snapshot import DEFAULT_EXCLUDED_DIR_NAMES
-        return SourceInputPolicy(excluded_dir_names=(*DEFAULT_EXCLUDED_DIR_NAMES, *AGENT_STATE_DIRS),
+        return SourceInputPolicy(excluded_dir_names=tuple(dict.fromkeys((*DEFAULT_EXCLUDED_DIR_NAMES, *AGENT_STATE_DIRS))),
             excluded_relative_paths=tuple(caches), frontend_build_output_paths=tuple(paths), frontend_profile=True)
     if isinstance(raw, dict) and raw.get("mode") == "frontend-msbuild-outputs-v1":
         paths = raw.get("excludedBuildOutputPaths")
@@ -80,6 +80,6 @@ def policy_for_project(project, root):
         from frontend_source_policy import discover_backend_build_outputs, AGENT_STATE_DIRS, KNOWN_FRONTEND_CACHE_PATHS
         from source_snapshot import DEFAULT_EXCLUDED_DIR_NAMES
         caches = KNOWN_FRONTEND_CACHE_PATHS if (root / "nx.json").is_file() else ()
-        return SourceInputPolicy(excluded_dir_names=(*DEFAULT_EXCLUDED_DIR_NAMES, *AGENT_STATE_DIRS),
+        return SourceInputPolicy(excluded_dir_names=tuple(dict.fromkeys((*DEFAULT_EXCLUDED_DIR_NAMES, *AGENT_STATE_DIRS))),
             excluded_relative_paths=caches, frontend_build_output_paths=discover_backend_build_outputs(root), frontend_profile=True)
     return SourceInputPolicy()

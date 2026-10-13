@@ -4683,7 +4683,8 @@ def verify_assignment(
                     if excluded_inputs:
                         return BaselineVerifyResult(False, "infrastructure",
                             "VERIFICATION_SOURCE_SCOPE_REQUIRED_INPUT_EXCLUDED: "
-                            + json.dumps({"paths": excluded_inputs, "sourceScope": "frontend", "action": "use repository source scope"}, sort_keys=True),
+                            + json.dumps({"paths": excluded_inputs, "sourceScope": "frontend" if source_snapshot.input_policy.frontend_profile else "repository",
+                                          "action": "move required source inputs out of excluded tool/build state directories"}, sort_keys=True),
                             command=command, output=tail, workspace=str(command_project))
                     # Only our direct, trusted adapter reserves exit 2 for
                     # unavailable evidence. Arbitrary project output cannot

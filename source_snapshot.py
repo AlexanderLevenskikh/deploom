@@ -68,6 +68,8 @@ DEFAULT_EXCLUDED_DIR_NAMES = (
     ".vs",
     ".vscode",
     ".fleet",
+    ".claude",
+    ".codex",
 )
 DEFAULT_EXCLUDED_FILE_NAMES = (
     ".DS_Store",
@@ -1151,9 +1153,8 @@ def _capture_once(
             _local_dependency_preflight(manifest_path.parent, capture_root, policy)
 
     _reap_once()
-    container = Path(
-        tempfile.mkdtemp(prefix=SOURCE_SNAPSHOT_CONTAINER_PREFIX)
-    )
+    from source_snapshot_storage import new_snapshot_container
+    container = new_snapshot_container(capture_root, prefix=SOURCE_SNAPSHOT_CONTAINER_PREFIX)
     if _within(container, capture_root):
         _force_rmtree(container)
         raise SourceCaptureError(
@@ -1281,6 +1282,7 @@ def _capture_source_snapshot_impl(
     progress: Optional[ProgressCallback] = None,
     progress_interval_seconds: int = 15,
 ) -> SourceSnapshot:
+    deadline = float("inf") if timeout_seconds == 0 else time.monotonic() + max(1, timeout_seconds)
     last: Optional[BaseException] = None
     for attempt in range(1, SOURCE_CAPTURE_RETRIES + 1):
         try:
@@ -1289,7 +1291,7 @@ def _capture_source_snapshot_impl(
             return _capture_once(
                 project_dir,
                 policy=policy,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=_remaining(deadline),
                 progress=progress,
                 progress_interval_seconds=progress_interval_seconds,
             )
@@ -1912,15 +1914,18 @@ def reap_orphaned_source_snapshots(
     """
     from verification_storage_maintenance import dead_trial_owner, _plain_directory, _has_links
     reaped = skipped = failed = 0
-    base = Path(tempfile.gettempdir())
+    from source_snapshot_storage import candidate_snapshot_parents
     now = time.time()
     with _LOCK:
         owned = {os.path.normcase(str(item)) for item in _ALL_CONTAINERS}
-    try:
-        candidates = sorted(base.glob(SOURCE_SNAPSHOT_CONTAINER_PREFIX + "*"))
-    except OSError:
-        candidates = []
-    for container in candidates:
+    candidates: list[Path] = []
+    for base in candidate_snapshot_parents():
+        try:
+            candidates.extend(base.glob(SOURCE_SNAPSHOT_CONTAINER_PREFIX + "*"))
+        except OSError:
+            continue
+    for container in sorted(set(candidates)):
+
         if reaped >= max_containers:
             break
         if os.path.normcase(str(container)) in owned or not container.is_dir():
@@ -1930,14 +1935,14 @@ def reap_orphaned_source_snapshots(
             if not all(_plain_directory(p) for p in [container, *container.parents]) or not dead_trial_owner(container):
                 skipped += 1
                 continue
-            if _has_links(container):
-                skipped += 1
-                continue
             age = now - container.stat().st_mtime
         except OSError:
             skipped += 1
             continue
         if age < max_age_seconds:
+            skipped += 1
+            continue
+        if _has_links(container):
             skipped += 1
             continue
         trash = container.with_name(f"{container.name}.reap-{os.getpid()}")
@@ -2300,7 +2305,8 @@ def persist_source_snapshot(
     progress: Optional[ProgressCallback] = None,
 ) -> SourceSnapshot:
     """Atomically publish an active snapshot as durable evidence."""
-    validate_source_snapshot(snapshot, timeout_seconds=timeout_seconds, progress=progress)
+    deadline = float("inf") if timeout_seconds == 0 else time.monotonic() + max(1, timeout_seconds)
+    validate_source_snapshot(snapshot, timeout_seconds=_remaining(deadline), progress=progress)
     destination = destination.expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
@@ -2318,11 +2324,13 @@ def persist_source_snapshot(
         last_report = time.monotonic()
         def copy_with_progress(source, target):
             nonlocal copied_files, copied_bytes, last_report
+            _remaining(deadline)
             result = shutil.copy2(source, target)
+            _remaining(deadline)
             copied_files += 1
             copied_bytes += os.stat(source).st_size
             now = time.monotonic()
-            if now - last_report >= 15:
+            if progress is not None and now - last_report >= 15:
                 progress(f"durable source snapshot copy: files={copied_files}, bytes={copied_bytes}")
                 last_report = now
             return result
@@ -2333,21 +2341,21 @@ def persist_source_snapshot(
             stage,
             dirs_exist_ok=True,
             symlinks=True,
-            copy_function=copy_with_progress if progress else shutil.copy2,
+            copy_function=copy_with_progress,
         )
         if progress:
             progress(f"durable source snapshot copy: ready; files={copied_files}, bytes={copied_bytes}")
         open_source_snapshot(
             stage,
             expected_key=snapshot.key,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=_remaining(deadline),
             progress=progress,
         )
         os.replace(stage, destination)
         return open_source_snapshot(
             destination,
             expected_key=snapshot.key,
-            timeout_seconds=timeout_seconds,
+            timeout_seconds=_remaining(deadline),
             progress=progress,
         )
     except Exception:
@@ -2362,14 +2370,15 @@ def capture_durable_source_snapshot(
     timeout_seconds: int = 1800,
     progress: Optional[ProgressCallback] = None,
 ) -> SourceSnapshot:
+    deadline = float("inf") if timeout_seconds == 0 else time.monotonic() + max(1, timeout_seconds)
     snapshot = capture_source_snapshot(
         project_dir,
-        timeout_seconds=timeout_seconds,
+        timeout_seconds=_remaining(deadline),
         progress=progress,
     )
     try:
         return persist_source_snapshot(
-            snapshot, destination, timeout_seconds=timeout_seconds, progress=progress,
+            snapshot, destination, timeout_seconds=_remaining(deadline), progress=progress,
         )
     finally:
         # This capture is private to this call. The published durable copy has
