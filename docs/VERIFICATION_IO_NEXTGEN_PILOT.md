@@ -42,3 +42,15 @@ A Windows synthetic capture A/B on identical input (1,000 source files at 4 KiB 
 A separate Windows private-copy fixture (1,000 files at 64 KiB) measured 0.581 / 0.567 / 0.628 seconds using robocopy. It excludes install/check/mount costs and cannot be compared directly with the VHDX PoC. The supplied Linux measurement used the portable fallback, so it provides no measured reflink improvement. Real-project acceptance and equivalent VHDX/private-clone A/B remain outstanding.
 
 The first remote validation also exercised two previously uncovered boundaries: Windows watcher drain barriers left a newly created empty `.dependency-roadmap` directory in sealed C0 (preventing exact-membership cold compaction), and forbidden snapshot allocation propagated the wrong exception type. The barrier now removes only its own empty directory, retaining pre-existing/concurrent files; unsafe allocation raises `SourceCaptureError` immediately. Cold compaction remains strict. Regression coverage includes exact C0 membership, barrier cleanup and preservation, and the original injected-alias rejection.
+
+## Private trial delta reuse follow-up (unvalidated local changes)
+
+At the user's request, this follow-up has not run tests, builds, physical acceptance or release validation. It is not a verified release claim.
+
+The first fresh private trial still receives full source-closure validation. After a guaranteed-quiescent command, the Windows watcher is drained before stopping. Only observed source paths are rehashed. Newly generated ordinary files/directories absent from the initial source seal can be removed from the private trial to restore its initial state; existing source modifications, dependency changes, aliases, missing evidence and large deltas refuse reuse. Cleanup is bounded to 10,000 paths and a cooperative five-second metadata budget; it never recursively follows links or edits the original project. The next command may then skip clone and full source hashing.
+
+NTFS guarded trials retain their existing lower watcher and exclusive lease across reused commands. Intermediate lower observations are provisional; the last command performs the existing final lower check, and early returns release all owned guards. Lower integrity checks and assignment prechecks remain enabled.
+
+Completed source snapshots are retained only as untrusted cache candidates. The costly end-of-request live-tree rehash is deferred: the next consumer must still validate both the sealed snapshot and live-source continuity before use. A never-reused candidate grants no new proof authority. No snapshot cache hit may bypass those guards.
+
+Limits: existing captured build outputs that change, writes under node_modules, watcher failures/overflow, and unsupported watchers still take the conservative fresh-clone path. No new timing improvement has been measured for this follow-up.

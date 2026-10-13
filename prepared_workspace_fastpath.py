@@ -70,12 +70,22 @@ class WorkspaceChangeGuard:
         if watcher is None:
             self._stopped = WorkspaceChangeResult(errors=("workspace watcher unavailable",))
             return self._stopped
+        barrier_paths: set[str] = set()
         if self._started:
-            watcher.stop()
+            # Drain notifications before cancellation; quiescent process trees
+            # alone do not prove that queued filesystem events were delivered.
+            from source_snapshot import _drain_watcher
+            try:
+                if not _drain_watcher(watcher, self.root, barrier_paths=barrier_paths):
+                    watcher.errors.append("private trial event barrier unavailable")
+            except Exception as exc:
+                watcher.errors.append(f"private trial event barrier failed: {exc}")
+            finally:
+                watcher.stop()
         changes = tuple(sorted({
             f"{action}:{name.replace(chr(92), '/')}"
             for action, name in watcher.events
-            if name
+            if name and name.replace(chr(92), "/") not in barrier_paths
         }))
         self._stopped = WorkspaceChangeResult(
             changes=changes,
@@ -1354,6 +1364,27 @@ def guarded_clone_authorized_roots(target: Path) -> tuple[Path, ...]:
     if state is None:
         return ()
     return tuple(state.authorized_lower_roots)
+
+
+def peek_guarded_clone(target: Path) -> GuardResult:
+    """Keep the lower watcher and exclusive lease alive BETWEEN commands.
+
+    This is provisional evidence only. The final command must stop the guard
+    and validate its complete accumulated stream before publishing any proof.
+    """
+    with _ACTIVE_LOCK:
+        state = _ACTIVE.get(_key(target))
+    if state is None or state.stopped is not None:
+        return GuardResult(errors=("guarded lower continuity unavailable",))
+    errors = []
+    notifications = []
+    for watcher in state.guard.watchers:
+        if watcher._thread is None or not watcher._thread.is_alive():
+            errors.append(f"guarded lower watcher stopped: {watcher.root}")
+        errors.extend(watcher.errors)
+        notifications.extend(f"{watcher.root}:{action}:{name}" for action, name in list(watcher.events)
+                             if not _is_ephemeral_change(name))
+    return GuardResult(errors=tuple(errors), notification_only=tuple(sorted(set(notifications))))
 
 
 def stop_guarded_clone(target: Path) -> GuardResult:

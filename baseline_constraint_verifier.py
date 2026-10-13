@@ -2884,6 +2884,7 @@ def verify_assignment(
     from verification_storage_maintenance import register_trial_owner, retire_trial
     register_trial_owner(temp_root)
     source_binding = contextlib.ExitStack()
+    guarded_trial_roots: set[Path] = set()
     try:
         workspace_root = temp_root / "repo"
         workspace_started = time.monotonic()
@@ -4213,6 +4214,10 @@ def verify_assignment(
             project_publication_allowed = True
             reusable_private_root: Optional[Path] = None
             reusable_private_project: Optional[Path] = None
+            source_entries_by_path = {os.path.normcase(str(item["path"])).replace("\\", "/"): item
+                                      for item in snapshot.source_closure_entries}
+            if len(source_entries_by_path) != len(snapshot.source_closure_entries):
+                source_entries_by_path = {}  # Ambiguous Windows names: no delta authority.
 
             for command_index, command in enumerate(config.commands, start=1):
                 reusing_private_trial = bool(
@@ -4243,7 +4248,8 @@ def verify_assignment(
                 if reusing_private_trial:
                     assert reusable_private_project is not None
                     command_project = reusable_private_project
-                    clone_isolation = "reused-private-trial"
+                    clone_isolation = ("ntfs-junction-guarded" if guarded_clone_is_active(command_root)
+                                       else "reused-private-trial")
                     _emit_progress(
                         progress,
                         f"{progress_label}: project check {command_index}/{len(config.commands)} "
@@ -4286,6 +4292,8 @@ def verify_assignment(
                             timeout_seconds=clone_timeout,
                             progress_interval_seconds=config.progress_interval_seconds,
                         )
+                        if guarded_clone_is_active(command_root):
+                            guarded_trial_roots.add(command_root)
                         from verification_source_closure import validate_materialized_source_closure
                         validate_materialized_source_closure(snapshot, command_root, progress=progress,
                             progress_interval_seconds=config.progress_interval_seconds)
@@ -4360,12 +4368,13 @@ def verify_assignment(
                 workspace_guard: Optional[WorkspaceChangeGuard] = None
                 workspace_guard_started = False
                 check_result: Optional[subprocess.CompletedProcess[str]] = None
+                lower_check_clean = False
                 try:
                     removed_caches = clean_ephemeral_verification_caches(command_root, snapshot.dependency_roots)
                     if removed_caches:
                         _emit_progress(progress, f"{progress_label}: normalized transient caches before {command}: {', '.join(removed_caches)}")
 
-                    if clone_isolation in {"fresh-prepared-snapshot-clone", "reused-private-trial"}:
+                    if clone_isolation in {"fresh-prepared-snapshot-clone", "reused-private-trial", "ntfs-junction-guarded"}:
                         workspace_guard = WorkspaceChangeGuard(command_root)
                         workspace_guard_started = workspace_guard.start()
                         if not workspace_guard_started:
@@ -4540,7 +4549,12 @@ def verify_assignment(
                             )
                         return BaselineVerifyResult(False, "infrastructure", f"project check launch failed: {exc}", command=command)
 
-                    guard_result = stop_guarded_clone(command_root)
+                    if clone_isolation == "ntfs-junction-guarded" and command_index < len(config.commands):
+                        from prepared_workspace_fastpath import peek_guarded_clone
+                        guard_result = peek_guarded_clone(command_root)
+                    else:
+                        guard_result = stop_guarded_clone(command_root)
+                    lower_check_clean = not (guard_result.errors or guard_result.mutations or guard_result.notification_only)
                     if (
                         guard_result.errors
                         or guard_result.mutations
@@ -4705,19 +4719,26 @@ def verify_assignment(
                     _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} RED exit={check_result.returncode}: {command_label}")
                 finally:
                     workspace_changes = workspace_guard.stop() if workspace_guard is not None else None
+                    source_reset_for_reuse = False
+                    if (workspace_guard_started and workspace_changes is not None
+                            and not workspace_changes.errors and workspace_changes.changes
+                            and clone_isolation in {"fresh-prepared-snapshot-clone", "reused-private-trial", "ntfs-junction-guarded"}
+                            and check_result is not None
+                            and getattr(getattr(check_result, "supervision", None), "quality", "") == "guaranteed-tree"):
+                        from verification_source_closure import reset_observed_trial_outputs
+                        source_reset_for_reuse = reset_observed_trial_outputs(
+                            command_root, source_entries_by_path, workspace_changes.changes, progress=progress)
 
-                    if clone_isolation == "ntfs-junction-guarded":
-                        cleanup_guarded_clone(command_root)
-                        _cleanup_trial_root(command_root, event=event, command=command)
-                        reusable_private_root = None
-                        reusable_private_project = None
-                    elif (
+                    if (
                         workspace_guard_started
                         and workspace_changes is not None
                         and not workspace_changes.errors
-                        and not workspace_changes.changes
+                        and (not workspace_changes.changes or source_reset_for_reuse)
                         and command_root.is_dir()
                         and command_project.is_dir()
+                        and (clone_isolation != "ntfs-junction-guarded"
+                             or (lower_check_clean and guarded_clone_is_active(command_root)
+                                 and command_index < len(config.commands)))
                         and check_result is not None
                         and (
                             getattr(check_result, "supervision", None) is None
@@ -4736,7 +4757,7 @@ def verify_assignment(
                         _emit_progress(
                             progress,
                             f"{progress_label}: private verification trial remained unchanged; "
-                            "next project check may reuse it without cloning",
+                            "next project check may reuse it without cloning or full source hashing",
                         )
                     else:
                         if workspace_changes is not None:
@@ -4758,6 +4779,8 @@ def verify_assignment(
                             )
                         reusable_private_root = None
                         reusable_private_project = None
+                        if clone_isolation == "ntfs-junction-guarded":
+                            cleanup_guarded_clone(command_root)
                         _cleanup_trial_root(command_root, event=event, command=command)
 
             if project_failures:
@@ -4805,6 +4828,13 @@ def verify_assignment(
             resolved_state_artifact=resolved_state.artifact_relative_path if resolved_state is not None else "",
         )
     finally:
+        # Early return may retain a trial provisionally. Release every owned
+        # lower lease/guard even when a later check or evidence adapter aborts.
+        for guarded_root in guarded_trial_roots:
+            try:
+                cleanup_guarded_clone(guarded_root)
+            except Exception as exc:
+                event("verify.project-check.guard-cleanup-failed", detail=str(exc), workspace=str(guarded_root))
         source_binding.close()
         shutil.rmtree(temp_root, ignore_errors=True)
         if temp_root.exists():

@@ -92,3 +92,123 @@ def validate_materialized_source_closure(snapshot, target, *, progress=None, pro
     raise ArtifactIntegrityError("VERIFICATION_SOURCE_CLOSURE_MATERIALIZED_MISMATCH: " +
         json.dumps({"expected": expected_key, "observed": observed.source_content_key,
                     "changedPaths": changes[:20], "changedPathCount": len(changes)}, sort_keys=True))
+
+
+def reset_observed_trial_outputs(root, expected, changes, *, progress=None):
+    """Reset only new private outputs after a complete, quiescent event stream.
+
+    Existing source files must still match the original source seal. Dependency
+    writes, aliases, unknown event types or oversized deltas reject reuse. No
+    directory-name allowlist grants authority; every removed path was absent
+    from the fully validated initial source tree.
+    """
+    import os
+    import stat
+    import time
+    from artifact_integrity import _hash_file
+    root = Path(root).resolve()
+    deadline = time.monotonic() + 5
+    limit = 10000
+    removed = checked = 0
+    touched = {}
+    new_paths = set()
+    deletion_plan = {}
+
+    def plain(relative):
+        if time.monotonic() >= deadline:
+            raise ValueError("private trial delta budget exhausted")
+        path = root
+        for part in relative.parts:
+            path = path / part
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                return None
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise ValueError("private trial delta contains reparse entry")
+        if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+            raise ValueError("private trial delta contains shared file")
+        if os.path.normcase(str(path.resolve(strict=True))) != os.path.normcase(str(path.absolute())):
+            raise ValueError("private trial delta contains a filesystem path alias")
+        return info
+
+    try:
+        if not expected or len(changes) > limit:
+            return False
+        for change in changes:
+            action, name = change.split(":", 1)
+            relative = Path(name.replace("\\", "/"))
+            if (int(action) not in (1, 2, 3, 4, 5) or not relative.parts
+                    or relative.is_absolute() or relative.drive
+                    or any(part.casefold() in ("..", "node_modules") or ":" in part
+                           or part.endswith((".", " ")) for part in relative.parts)):
+                return False
+            key = relative.as_posix()
+            touched.setdefault(key, set()).add(int(action))
+        for name, actions in touched.items():
+            relative = Path(name)
+            info = plain(relative)
+            entry = expected.get(os.path.normcase(name).replace("\\", "/"))
+            if entry is not None and entry["path"] != name:
+                return False  # Case-only renames/Windows aliases cannot become new outputs.
+            if entry is None:
+                new_paths.add(relative)
+                continue
+            if info is None:
+                return False
+            if entry["kind"] == "directory":
+                if not stat.S_ISDIR(info.st_mode) or actions != {3}:
+                    return False
+            elif entry["kind"] == "file":
+                if not stat.S_ISREG(info.st_mode):
+                    return False
+                digest, size, executable = _hash_file(root / relative)
+                checked += 1
+                if (digest, size, executable) != (entry["sha256"], entry["size"], entry["executable"]):
+                    return False
+            else:
+                return False
+        # Validate the complete deletion plan BEFORE removing anything. A new
+        # output directory may not conceal baseline files or dependency roots.
+        pending = list(new_paths)
+        while pending:
+            relative = pending.pop()
+            if relative in deletion_plan:
+                continue
+            if (os.path.normcase(relative.as_posix()).replace("\\", "/") in expected
+                    or any(part.casefold() == "node_modules" for part in relative.parts)):
+                return False
+            info = plain(relative)
+            if info is None:
+                continue
+            if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+                return False
+            deletion_plan[relative] = (info.st_dev, info.st_ino, stat.S_ISDIR(info.st_mode))
+            if len(deletion_plan) > limit:
+                return False
+            if stat.S_ISDIR(info.st_mode):
+                with os.scandir(root / relative) as children:
+                    for item in children:
+                        if len(pending) + len(deletion_plan) >= limit:
+                            return False
+                        pending.append(relative / item.name)
+        for relative in sorted(deletion_plan, key=lambda path: len(path.parts), reverse=True):
+            info = plain(relative)
+            if info is None:
+                return False
+            identity = (info.st_dev, info.st_ino, stat.S_ISDIR(info.st_mode))
+            if identity != deletion_plan[relative]:
+                return False
+            path = root / relative
+            if identity[2]:
+                path.rmdir()  # Nonrecursive: concurrent/unregistered children reject reuse.
+            else:
+                path.unlink()
+            removed += 1
+        if progress:
+            progress(f"private trial delta validation: sourceFilesRehashed={checked}, newOutputPathsRemoved={removed}; full source hashing skipped")
+        return True
+    except Exception as exc:
+        if progress:
+            progress(f"private trial delta reuse rejected: {type(exc).__name__}: {exc}")
+        return False

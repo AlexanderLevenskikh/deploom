@@ -232,6 +232,7 @@ def _drain_watcher(
     root: Path,
     *,
     timeout_seconds: float = 2.0,
+    barrier_paths: Optional[set[str]] = None,
 ) -> bool:
     """Prove every change that completed before this boundary was delivered.
 
@@ -258,6 +259,10 @@ def _drain_watcher(
         except FileExistsError:
             pass
         marker.write_text("drain", encoding="utf-8")
+        if barrier_paths is not None:
+            barrier_paths.add(marker.relative_to(root).as_posix())
+            if created_directory:
+                barrier_paths.add(_DRAIN_MARKER_DIR)
     except OSError:
         if created_directory:
             with contextlib.suppress(OSError):
@@ -1437,14 +1442,11 @@ def verification_source_snapshot_scope(
             yield snapshot
         completed = True
     finally:
-        retained = False
-        if completed and reuse_completed:
-            try:
-                with bind_source_snapshot(snapshot, retain_watchers=True):
-                    validate_source_snapshot(snapshot, timeout_seconds=timeout_seconds, progress=progress)
-                    retained = source_snapshot_live_source_continuity(snapshot, timeout_seconds=timeout_seconds, progress=progress)
-            except (SourceCaptureError, OSError):
-                retained = False
+        # This cache contains candidates, not verification authority. The next
+        # consumer always validates BOTH sealed bytes and live continuity above.
+        # Do not hash the original tree merely to decide whether to keep a
+        # candidate that may never be consumed again.
+        retained = completed and reuse_completed
         if retained:
             retired = []
             with _LOCK:
