@@ -46,7 +46,7 @@ class DiscoveryCheckpoint:
         self.identity = identity
         self.entries: dict[str, Any] = {}
         try:
-            saved = json.loads(path.read_text(encoding="utf-8"))
+            saved = json.loads(path.read_text(encoding="utf-8-sig"))
             if saved.get("schema") == 1 and saved.get("identity") == identity and isinstance(saved.get("entries"), dict):
                 self.entries = saved["entries"]
         except (OSError, ValueError, AttributeError):

@@ -30,6 +30,26 @@ class IterationTransactionTests(unittest.TestCase):
         im.save_ledger(run_dir, {'schemaVersion':1, 'blocks':[], 'counters':{'spent':17}})
         return run_dir, run, config, candidate, trial
 
+    def test_negative_history_scope_requires_current_source_config_tool_and_environment(self):
+        from unittest.mock import patch
+        from iterative_stage_checkpoint import negative_evidence_scope
+        with tempfile.TemporaryDirectory() as tmp:
+            root, run, config, candidate, _ = self.fixture(Path(tmp).resolve())
+            with patch('iterative_stage_checkpoint.command_tool_closure', return_value='runtime-one'):
+                original = negative_evidence_scope(root, config, 'C0')
+                self.assertEqual(original, negative_evidence_scope(root, config, 'C0'))
+                self.assertNotEqual(original, negative_evidence_scope(root, {**config, 'policyHash': 'changed'}, 'C0'))
+                with patch.dict(os.environ, {'DEPLOOM_FIXTURE_INPUT': 'changed'}):
+                    self.assertNotEqual(original, negative_evidence_scope(root, config, 'C0'))
+                checkpoint = im.load_checkpoint(root, 'C0')
+                im.save_checkpoint(root, {**checkpoint, 'sourceSnapshotKey': 'different-source'})
+                self.assertNotEqual(original, negative_evidence_scope(root, config, 'C0'))
+                im.save_checkpoint(root, checkpoint)
+            with patch('iterative_stage_checkpoint.command_tool_closure', return_value='runtime-two'):
+                self.assertNotEqual(original, negative_evidence_scope(root, config, 'C0'))
+            with patch('iterative_stage_checkpoint.command_tool_closure', return_value=None):
+                self.assertIsNone(negative_evidence_scope(root, config, 'C0'))
+
     def interrupt(self, root, run, config, candidate):
         calls = 0
         def interrupted(path, value):

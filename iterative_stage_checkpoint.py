@@ -32,6 +32,19 @@ def operation_journal(run_dir, run, config, candidate, operation):
     return StageJournal(Path(run_dir) / 'operation-checkpoints', context)
 
 
+def negative_evidence_scope(run_dir, config, checkpoint_id):
+    """Compatibility history is reusable only under the same proof inputs."""
+    import json
+    base = json.loads((Path(run_dir) / 'checkpoints' / (checkpoint_id + '.json')).read_text(encoding='utf-8-sig'))
+    environment = operation_environment(config)
+    closure = command_tool_closure('node', Path(config['projectDir']), environment)
+    if not closure or not base.get('sourceSnapshotKey'):
+        return None
+    return digest({'baseCheckpointId': checkpoint_id, 'sourceSnapshotKey': base['sourceSnapshotKey'],
+        'configHash': digest(config), 'toolBuildId': tool_build_id(),
+        'environmentHash': digest(environment), 'runtimeClosure': closure})
+
+
 def trial_key(root, progress=None):
     return build_artifact_tree_integrity(Path(root), progress=progress,
         progress_label='migration trial checkpoint integrity').key
@@ -120,6 +133,11 @@ class VerificationResultCheckpoint:
 
     def complete(self, before, result, progress=None):
         import dataclasses
+        from baseline_constraint_verifier import BaselineVerifyResult
+        if not isinstance(result, BaselineVerifyResult):
+            # Test doubles/non-authoritative adapters cannot publish recovery evidence.
+            self.journal.write('verification-result', 'UNKNOWN')
+            return
         self.journal.write('verification-result', 'COMPLETED', {
             'inputKey': before, 'afterKey': trial_key(self.root, progress),
             'closures': self.closures(), 'result': dataclasses.asdict(result)})
@@ -164,7 +182,7 @@ class VerificationResultCheckpoint:
                 from verification_stage_checkpoint import adapter_artifacts
                 import json
                 for command, reference in zip(self.config.get('commands') or [], refs):
-                    receipt = json.loads(Path(reference).read_text(encoding='utf-8'))
+                    receipt = json.loads(Path(reference).read_text(encoding='utf-8-sig'))
                     checksum = receipt.pop('digest', None)
                     if checksum != digest(receipt) or receipt.get('status') != 'PASS':
                         return None

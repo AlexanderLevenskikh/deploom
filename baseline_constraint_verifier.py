@@ -5541,7 +5541,7 @@ def _verify_assignment_with_pinned_source(
             progress=kwargs.get("progress"),
             progress_interval_seconds=config.progress_interval_seconds,
             reuse_completed=True,
-            recovery_directory=(Path(config.recovery_journal_dir or config.proof_cache_dir) / "source-checkpoints"
+            recovery_directory=(Path(config.recovery_journal_dir or config.proof_cache_dir) / "sc"
                                 if config.recovery_checkpoints else None),
         ):
             return _verify_assignment_cache_aware_impl(project_dir, assignment, config=config, **kwargs)

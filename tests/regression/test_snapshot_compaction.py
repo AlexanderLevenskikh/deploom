@@ -31,6 +31,23 @@ class SnapshotCompactionTests(unittest.TestCase):
     def compact(self, snapshot):
         with contextlib.redirect_stdout(io.StringIO()): return c.compact(snapshot.container)
 
+    def test_recovery_source_references_compact_old_bytes_and_protect_shared_hot_source(self):
+        old = capture_durable_source_snapshot(self.source, self.run / 'v' / 'sc' / 's' / 'old', timeout_seconds=0)
+        hot = capture_durable_source_snapshot(self.source, self.run / 'v' / 'sc' / 's' / 'hot', timeout_seconds=0)
+        records = self.run / 'checkpoints'; records.mkdir()
+        for identity, snapshot in [('C0', old), ('C1', hot), ('C2', hot)]:
+            (records / (identity + '.json')).write_text(json.dumps({
+                'checkpointId': identity, 'sourceSnapshotContainer': str(snapshot.container),
+                'sourceSnapshotKey': snapshot.key}), encoding='utf-8')
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = c.compact_superseded(self.run)
+        self.assertEqual(result['compacted'], 1, result)
+        self.assertFalse(old.root.exists())
+        self.assertTrue(hot.root.exists())
+        self.assertEqual(open_source_snapshot(old.container, expected_key=old.key).key, old.key)
+        from materialization_retention import preserved_checkpoints
+        self.assertEqual({cp['checkpointId'] for cp, _, _ in preserved_checkpoints(self.run)}, {'C0', 'C1', 'C2'})
+
     def test_lossless_reopen_preserves_exact_identity_and_private_files(self):
         snapshot = self.capture("C0"); original = (snapshot.root / "payload.bin").read_bytes()
         reclaimed = self.compact(snapshot)

@@ -60,7 +60,7 @@ class StageJournal:
 
     def read(self, stage):
         try:
-            row = json.loads(self.path(stage).read_text(encoding='utf-8'))
+            row = json.loads(self.path(stage).read_text(encoding='utf-8-sig'))
             checksum = row.pop('digest')
             if checksum == digest(row) and row.get('schema') == 1 and row.get('identity') == self.identity and row.get('stage') == stage:
                 return row
@@ -301,16 +301,34 @@ def capture_recovery_source(project, directory, *, preferred_destination=None, t
                 if live_key == evidence.get('key'):
                     snapshot = bind_live(open_source_snapshot(container, expected_key=live_key, timeout_seconds=timeout_seconds, progress=progress))
                     if source_snapshot_live_source_continuity(snapshot, timeout_seconds=timeout_seconds, progress=progress):
-                        if progress:
-                            progress('SourceSnapshot checkpoint HIT; sealed source copy reused')
-                        return snapshot, True
+                        target = Path(preferred_destination).resolve() if preferred_destination else container
+                        if target != container and not target.exists() and container.is_relative_to(directory):
+                            # Promote the already sealed tree by rename, preserving
+                            # every previously referenced incumbent. No per-stage copy.
+                            checkpoint_dir = target.parent.parent / 'checkpoints'
+                            referenced = any(Path(str(json.loads(record.read_text(encoding='utf-8-sig')).get('sourceSnapshotContainer') or '.')).resolve() == container
+                                for record in checkpoint_dir.glob('*.json'))
+                            if not referenced:
+                                from source_snapshot import _retire_snapshot_watcher, _retire_live_source_watcher
+                                _retire_snapshot_watcher(snapshot)
+                                _retire_live_source_watcher(snapshot)
+                                target.parent.mkdir(parents=True, exist_ok=True)
+                                os.replace(container, target)
+                                snapshot = bind_live(open_source_snapshot(target, expected_key=live_key,
+                                    timeout_seconds=timeout_seconds, progress=progress))
+                                journal.write('source-sealed', 'PASS', {'container': str(target), 'key': snapshot.key})
+                                container = target
+                        if target == container:
+                            if progress:
+                                progress('SourceSnapshot checkpoint HIT; sealed source copy reused')
+                            return snapshot, True
             except (SourceCaptureError, OSError):
                 pass
     journal.write('source-sealed', 'RUNNING')
-    destination = Path(preferred_destination).resolve() if preferred_destination else directory / 'sources' / uuid.uuid4().hex
+    destination = Path(preferred_destination).resolve() if preferred_destination else directory / 's' / uuid.uuid4().hex
     if destination.exists():
         # Keep historical evidence and incomplete captures; never overwrite them.
-        destination = directory / 'sources' / uuid.uuid4().hex
+        destination = directory / 's' / uuid.uuid4().hex
     snapshot = bind_live(capture_durable_source_snapshot(project, destination, timeout_seconds=timeout_seconds, progress=progress))
     if not source_snapshot_live_source_continuity(snapshot, timeout_seconds=timeout_seconds, progress=progress):
         raise SourceCaptureError('SOURCE_CAPTURE_UNSTABLE: live inputs changed during durable publication')

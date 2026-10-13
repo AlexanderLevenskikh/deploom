@@ -12,9 +12,27 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
 
 
-def prepare_publication(run_dir, run, config, checkpoint, next_run, candidate_id, write_json):
-    if (run_dir / TRANSACTION).exists():
-        raise ValueError("CHECKPOINT_PUBLICATION_PENDING")
+def prepare_publication(run_dir, run, config, checkpoint, next_run, candidate_id, write_json, *, supersede_verified=False):
+    pending = run_dir / TRANSACTION
+    if pending.exists():
+        if not supersede_verified:
+            raise ValueError("CHECKPOINT_PUBLICATION_PENDING")
+        previous = json.loads(pending.read_text(encoding='utf-8-sig'))
+        checksum = previous.pop('digest', None)
+        old = previous.get('checkpoint') or {}
+        if (checksum != digest(previous) or previous.get('schema') != 1
+            or previous.get('runId') != run['runId'] or previous.get('candidateId') != candidate_id
+            or previous.get('baseCheckpointId') != run['activeCheckpointId']
+            or previous.get('generation') != run.get('generation', 1)
+            or previous.get('configHash') != digest(config)
+            or old.get('checkpointId') != checkpoint['checkpointId']
+            or old.get('parentCheckpointId') != checkpoint['parentCheckpointId']
+            or old.get('fullAssignment') != checkpoint['fullAssignment']):
+            raise ValueError('CHECKPOINT_PUBLICATION_SUPERSESSION_IDENTITY_MISMATCH')
+        # Security's owner has preserved the orphan and physically reverified
+        # the SAME attempt. Keep the abandoned journal as diagnostic evidence.
+        from uuid import uuid4
+        pending.rename(run_dir / ('checkpoint-publication.superseded-' + uuid4().hex + '.json'))
     record = {"schema": 1, "runId": run["runId"], "candidateId": candidate_id,
               "baseCheckpointId": run["activeCheckpointId"], "generation": run.get("generation", 1),
               "configHash": digest(config), "checkpoint": checkpoint, "nextRun": next_run}

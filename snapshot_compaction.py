@@ -206,10 +206,17 @@ def locations(run, archive=None):
         agent = history/'delivery-agent.json'
         if agent.exists() and json.loads(agent.read_text(encoding='utf-8-sig')).get('status') == 'running': return
         hot = str(state.get("activeCheckpointId") or "")
-        containers = [(p, 'checkpoint') for p in sorted((history / "sources").glob("C*"))]
+        from materialization_retention import preserved_checkpoints
+        referenced = list(preserved_checkpoints(history))
+        ids = {str(source): cp['checkpointId'] for cp, source, _ in referenced}
+        hot_sources = {str(source) for cp, source, _ in referenced if cp['checkpointId'] == hot}
+        candidates = set((history / "sources").glob("C*")) | {source for _, source, _ in referenced}
+        containers = [(p, 'checkpoint') for p in sorted(candidates)]
         containers += [(p, 'upgrade') for p in sorted((history / "checkpoint-build-upgrades").glob("*-source"))]
         for container, kind in containers:
-            if kind == 'checkpoint' and (not re.fullmatch(r"C\d+", container.name) or (archive is None and container.name == hot)): continue
+            identity = ids.get(str(container), container.name)
+            if kind == 'checkpoint' and (not re.fullmatch(r"C\d+", identity) or
+                (archive is None and (identity == hot or str(container) in hot_sources))): continue
             if kind == 'upgrade' and not re.fullmatch(r"[a-f0-9]{64}-source", container.name): continue
             if not (container / "tree").is_dir(): continue
             try:
@@ -225,7 +232,7 @@ def compact_superseded(run, progress=lambda path: None):
     result = {'compacted': 0, 'reclaimedBytes': 0, 'errors': []}
     for container, *unused in locations(Path(run)):
         # Verifier upgrades have their own proof/receipt lifecycle.
-        if container.parent.name != 'sources': continue
+        if container.parent.name not in {'sources', 's'}: continue
         try:
             result['reclaimedBytes'] += compact(container, progress=progress)
             result['compacted'] += 1

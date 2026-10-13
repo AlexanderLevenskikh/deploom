@@ -816,7 +816,7 @@ def verify_config_from(mapping: Mapping[str, Any], run_dir: Path) -> BaselineVer
         publish_durable_prepared_artifact=bool(
             resolved.get("publishDurablePreparedArtifact", True)
         ),
-        recovery_journal_dir=str((run_dir / "verification-checkpoints").resolve()),
+        recovery_journal_dir=str((run_dir / "v").resolve()),
     )
 
 
@@ -1420,7 +1420,7 @@ def _begin_locked(
                            message="iterative migration source capture: preparing sealed C0") as progress:
         from verification_stage_checkpoint import capture_recovery_source
         snapshot, _reused = capture_recovery_source(
-            project_dir, (run_dir / "preparation-source" if config.get("repairOnly") else run_dir / "verification-checkpoints" / "source-checkpoints"), preferred_destination=snapshot_container,
+            project_dir, (run_dir / "preparation-source" if config.get("repairOnly") else run_dir / "v" / "sc"), preferred_destination=snapshot_container,
             timeout_seconds=1800, progress=progress)
     project_relative = resolve_project_relative(project_dir, snapshot)
 
@@ -2485,11 +2485,14 @@ def _plan_next_locked(
         return 0
 
     ledger = load_ledger(run_dir)
+    from iterative_stage_checkpoint import negative_evidence_scope
+    negative_scope = negative_evidence_scope(run_dir, config, checkpoint_id)
     blocks = [
         entry
         for entry in ledger.get("blocks", [])
         if entry.get("kind") in {"NEGATIVE_VERIFY", "NOT_ACTIONABLE"}
         and entry.get("baseCheckpointId") == checkpoint_id
+        and negative_scope is not None and entry.get("evidenceScope") == negative_scope
     ]
     blocked_fingerprints = {
         str(entry.get("assignmentFingerprint"))
@@ -2511,6 +2514,7 @@ def _plan_next_locked(
         and isinstance(entry.get("nogood"), dict)
         and entry.get("nogood")
         and entry.get("scope") == "deterministic"
+        and negative_scope is not None and entry.get("evidenceScope") == negative_scope
     ]
     # Recoverable, registry-scoped infra blocks: an identical install must not
     # be silently re-proposed for the same configuration. They are scheduling
@@ -4913,6 +4917,8 @@ def _record_block(
         "createdAt": _now_iso(),
     }
     ledger = dict(ledger)
+    from iterative_stage_checkpoint import negative_evidence_scope
+    entry["evidenceScope"] = negative_evidence_scope(run_dir, load_config(run_dir), baseCheckpointId)
     blocks = list(ledger.get("blocks", []))
     blocks.append(entry)
     ledger["blocks"] = blocks
@@ -4926,6 +4932,7 @@ def _accept_checkpoint(
     candidate: Mapping[str, Any],
     base_checkpoint: Mapping[str, Any],
     result: BaselineVerifyResult,
+    *, supersede_publication: bool = False,
 ) -> int:
     for name, policy in (config.get("packagePolicies") or {}).items():
         if policy == "keep-current" and (candidate.get("fullAssignment") or {}).get(name) != (base_checkpoint.get("fullAssignment") or {}).get(name):
@@ -4953,7 +4960,7 @@ def _accept_checkpoint(
     with MigrationProgress(_emit_status, operation="checkpoint", message="Saving verified source snapshot", run_id=run["runId"], candidate_id=candidate_id) as progress:
         from verification_stage_checkpoint import capture_recovery_source
         snapshot, _reused = capture_recovery_source(
-            project_path, run_dir / "verification-checkpoints" / "source-checkpoints",
+            project_path, run_dir / "v" / "sc",
             preferred_destination=run_dir / SOURCE_DIR / checkpoint_id, timeout_seconds=0, progress=progress)
     project_relative = resolve_project_relative(project_path, snapshot)
 
@@ -5011,7 +5018,8 @@ def _accept_checkpoint(
     run["phase"] = "READY"
     run["updatedAt"] = _now_iso()
     from iterative_checkpoint_publication import prepare_publication, TRANSACTION
-    prepare_publication(run_dir, previous_run, config, checkpoint, run, candidate_id, _write_json_atomic)
+    prepare_publication(run_dir, previous_run, config, checkpoint, run, candidate_id, _write_json_atomic,
+                        supersede_verified=supersede_publication)
     save_checkpoint(run_dir, checkpoint)
     save_run(run_dir, run)
     clear_candidate(run_dir)

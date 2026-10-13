@@ -39,6 +39,20 @@ class StageCheckpointTests(unittest.TestCase):
             self.assertIsNone(journal.pass_record('build'))
             self.assertIsNone(StageJournal(tmp, {'source': 'changed'}).pass_record('build'))
 
+    def test_tool_drift_during_command_does_not_publish_pass_under_new_identity(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            proof = SimpleNamespace(event_fields=lambda: {'sourceSnapshotKey': 'sealed'})
+            prepared = {'workspaceRoot': str(root), 'projectRelative': '.', 'artifactContentKey': 'prepared'}
+            checkpoint = CommandCheckpoint(root / 'records', proof, prepared, ['node check.cjs'], {})
+            outcome = SimpleNamespace(returncode=0, stdout='', supervision=SimpleNamespace(quality='guaranteed-tree'))
+            with patch('verification_stage_checkpoint.command_tool_closure', side_effect=['old-tool', 'new-tool']):
+                receipt = checkpoint.begin(1, 'node check.cjs')
+                self.assertEqual(checkpoint.complete(1, 'node check.cjs', outcome, True), '')
+            self.assertEqual(json.loads(Path(receipt).read_text(encoding='utf-8-sig'))['status'], 'UNKNOWN')
+
     @unittest.skipUnless(shutil.which('node') and shutil.which('npm'), 'Node/npm required')
     def test_real_kill_after_build_resumes_tests_without_repeating_build_or_installs(self):
         with tempfile.TemporaryDirectory() as tmp:
