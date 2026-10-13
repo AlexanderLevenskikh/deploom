@@ -57,7 +57,14 @@ class UniversalNodeSourceClosurePhysical(unittest.TestCase):
                 self.assertTrue(result.ok,result.summary+"\n"+result.output)
                 self.assertEqual("passed",result.kind);self.assertEqual(list(config.commands),checks)
             print("NODE_CLOSURE_INSTALL_STAGE_COUNTS "+json.dumps({"stages":counts,"seconds":measurements}),flush=True)
-            self.assertEqual(2,counts[0],counts);self.assertEqual(0,counts[1],counts)
+            self.assertEqual(2,counts[0],counts)
+            # Exact warm reuse exists only under guaranteed process-tree supervision
+            # (Windows). Best-effort POSIX supervision keeps fresh isolated installs
+            # on every run while still executing the real toolchain checks.
+            if os.name == 'nt':
+                self.assertEqual(0,counts[1],counts)
+            else:
+                self.assertEqual(counts[0],counts[1],counts)
             self.assertFalse((root/"dist").exists(),"real source tree must not be built")
             print("NODE_CLOSURE_PHYSICAL_MEASUREMENTS "+json.dumps({"coldSeconds":measurements[0],"warmSeconds":measurements[1],"installStages":counts}))
             source.clear_source_snapshot_epochs()

@@ -178,7 +178,14 @@ for(const item of %s)if(!fs.existsSync(path.join(root,item)))throw new Error('MI
             self.assertTrue(result.ok,result.summary+"\n"+result.output)
             counts.append(stages)
         self.assertEqual(2,len(counts[0]),counts)
-        self.assertEqual([],counts[1],counts)
+        # Durable reuse requires guaranteed process-tree supervision (Windows Job
+        # Objects). Best-effort POSIX supervision never publishes reusable proofs,
+        # so a warm run must prepare fresh; the protected property is that cache
+        # writes never invalidate reuse where reuse is available.
+        if os.name == 'nt':
+            self.assertEqual([],counts[1],counts)
+        else:
+            self.assertEqual(counts[0],counts[1],counts)
         self.assertFalse((self.repo/"node_modules/.cache/fixture").exists(),"project checks must leave original sources untouched")
 
     def test_single_package_source_root_stays_local(self):

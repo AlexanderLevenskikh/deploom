@@ -102,7 +102,13 @@ class PreparedInstallMeasurements(unittest.TestCase):
                             self.assertEqual(cold_calls, warm_calls, 'unsupported preparation backend must preserve fresh installs')
                         warm_roots = set(calls[before:])
                         self.assertNotIn(os.path.normcase(str(root)), warm_roots)
-                        self.assertEqual(warm_calls, len(warm_roots), 'every needed install must use its own isolated root; exact reuse may need none')
+                        if os.name == 'nt':
+                            self.assertEqual(warm_calls, len(warm_roots), 'every needed install must use its own isolated root; exact reuse may need none')
+                        else:
+                            # Best-effort POSIX supervision never publishes durable
+                            # proofs, so warm repeats fresh resolver+lifecycle
+                            # installs into the same per-project isolated clone.
+                            self.assertEqual(len(cold_roots), len(warm_roots), 'fresh warm installs must keep one isolated root per project clone')
                         self.assertEqual(original_lock, (root / 'package-lock.json').read_bytes())
                         self.assertEqual(original_manifests, [p.joinpath('package.json').read_bytes() for p in projects])
                         measurements[topology] = {'coldMs': round(cold_ms, 1), 'warmMs': round(warm_ms, 1), 'coldInstalls': cold_calls, 'warmInstalls': warm_calls, 'isolatedRoots': len(cold_roots), 'sourceLockUnchanged': True, 'preparedReuseExpected': os.name == 'nt', 'guardedLowerEnabled': not force_fallback}
