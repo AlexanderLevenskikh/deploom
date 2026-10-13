@@ -77,6 +77,9 @@ jobs:
         working-directory: desktop
         run: node scripts/run-all-contract-checks.mjs
 
+      - name: Install pinned modern Yarn acceptance runtimes
+        run: node scripts/prepare-yarn-test-runtimes.mjs
+
       - name: Install and test Python tool
         run: |
           python -m pip install -r requirements.txt

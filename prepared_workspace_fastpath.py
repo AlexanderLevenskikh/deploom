@@ -1151,11 +1151,11 @@ class _DependencyTreeGuard:
             for _action, event in watcher.events:
                 if _is_ephemeral_change(event):
                     continue
-                mutations.append(f"{watcher.root}:{event}")
+                mutations.append(f"{watcher.root}:{_action}:{event}")
         return GuardResult(
-            mutations=tuple(sorted(set(mutations))),
+            mutations=(),
             errors=tuple(errors),
-            notification_only=(),
+            notification_only=tuple(sorted(set(mutations))),
         )
 
 

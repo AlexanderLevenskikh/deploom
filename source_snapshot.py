@@ -88,14 +88,16 @@ class SourceInputPolicy:
     excluded_file_names: tuple[str, ...] = DEFAULT_EXCLUDED_FILE_NAMES
     scope_roots: tuple[str, ...] = ()
     excluded_relative_paths: tuple[str, ...] = ()
+    frontend_build_output_paths: tuple[str, ...] = ()
+    frontend_profile: bool = False
 
     @functools.cached_property
     def excluded_path_set(self):
-        return frozenset(self.excluded_relative_paths)
+        return frozenset((*self.excluded_relative_paths, *self.frontend_build_output_paths))
 
     @property
     def key(self) -> str:
-        if self.scope_roots:
+        if self.scope_roots or self.excluded_relative_paths or self.frontend_build_output_paths or self.frontend_profile:
             from scoped_source_policy import policy_payload
             return _canonical_hash({"schema": SOURCE_INPUT_POLICY_SCHEMA, "scope": policy_payload(self),
                                     "legacyPolicy": SourceInputPolicy(self.excluded_dir_names, self.excluded_file_names).key}, length=64)
@@ -140,6 +142,9 @@ class SourceSnapshot:
 
 _ACTIVE: dict[str, SourceSnapshot] = {}
 _ALL_CONTAINERS: set[Path] = set()
+# Performance-only idle subjects; context leases remove entries while in use.
+_COMPLETED_REQUEST_SNAPSHOTS: dict[str, SourceSnapshot] = {}
+_COMPLETED_REQUEST_LIMIT = 2
 # (snapshot, watcher, sealed directory-object identity at arm time)
 _ACTIVE_WATCHERS: dict[
     str, tuple[SourceSnapshot, _DirectoryWatcher, Optional[object]]
@@ -277,14 +282,12 @@ def _watcher_is_clean(watcher: _DirectoryWatcher) -> bool:
 
 
 def _retire_snapshot_watcher(snapshot: SourceSnapshot) -> None:
-    key = _snapshot_watcher_key(snapshot)
+    # Idle request subjects have no current binding. Retire by object ownership,
+    # not a context-dependent key that could leave their qualified watcher live.
     with _LOCK:
-        entry = _ACTIVE_WATCHERS.get(key)
-        watcher = None
-        if entry is not None and entry[0] is snapshot:
-            _ACTIVE_WATCHERS.pop(key, None)
-            watcher = entry[1]
-    if watcher is not None:
+        keys = [key for key, entry in _ACTIVE_WATCHERS.items() if entry[0] is snapshot]
+        watchers = [_ACTIVE_WATCHERS.pop(key)[1] for key in keys]
+    for watcher in watchers:
         watcher.stop()
 
 
@@ -309,6 +312,29 @@ def _force_rmtree(path: Path) -> None:
     except OSError:
         pass
     shutil.rmtree(path, ignore_errors=True)
+
+
+@functools.lru_cache(maxsize=8)
+def _sealed_manifest_entries(container: str, manifest_key: str, policy_key: str):
+    from types import MappingProxyType
+    record = json.loads((Path(container) / "manifest.json").read_text(encoding="utf-8-sig"))
+    entries = record.get("entries")
+    if not isinstance(entries, list) or any(not isinstance(item, dict) or not isinstance(item.get("path"), str) for item in entries):
+        raise SourceCaptureError("SOURCE_SNAPSHOT_MANIFEST_RECORD_INVALID")
+    observed = _canonical_hash({"schema": SOURCE_SNAPSHOT_SCHEMA,
+        "toolBuildId": record.get("toolBuildId"), "policyKey": record.get("policyKey"), "entries": entries}, length=64)
+    if observed != manifest_key or record.get("policyKey") != policy_key:
+        raise SourceCaptureError("SOURCE_SNAPSHOT_MANIFEST_RECORD_MISMATCH")
+    return tuple(MappingProxyType(item) for item in entries)
+
+
+def sealed_source_manifest_entries(snapshot: SourceSnapshot):
+    """Derive identities from the existing sealed manifest, not mutable re-reads.
+
+    The bounded memo retains verified immutable metadata, not filesystem state.
+    Physical continuity still uses validate_source_snapshot before consumption.
+    """
+    return _sealed_manifest_entries(str(snapshot.container), snapshot.manifest_key, snapshot.policy_key)
 
 
 def _canonical_hash(value: object, *, length: int = 64) -> str:
@@ -637,7 +663,7 @@ def _submodule_preflight(project_dir: Path) -> None:
             )
 
 
-def _local_dependency_preflight(project_path: Path, capture_root: Path) -> None:
+def _local_dependency_preflight(project_path: Path, capture_root: Path, policy: SourceInputPolicy = SourceInputPolicy()) -> None:
     manifest_path = project_path / "package.json"
     if not manifest_path.is_file():
         return
@@ -661,6 +687,8 @@ def _local_dependency_preflight(project_path: Path, capture_root: Path) -> None:
             if not target.is_absolute():
                 target = project_path / target
             target = target.resolve(strict=False)
+            if _within(target, capture_root) and _excluded(target.relative_to(capture_root), policy):
+                raise SourceCaptureError("SOURCE_REQUIRED_INPUT_EXCLUDED: local dependency " + str(name) + " targets an excluded path; use repository source scope")
             if not _within(target, capture_root):
                 raise SourceCaptureError(
                     "SOURCE_EXTERNAL_LOCAL_DEPENDENCY_UNSUPPORTED: "
@@ -710,7 +738,7 @@ def _remove_ephemeral_git_admin_files(root: Path) -> int:
 def _excluded(relative: Path, policy: SourceInputPolicy) -> bool:
     if _is_ephemeral_git_admin_path(relative):
         return True
-    if policy.excluded_relative_paths:
+    if policy.excluded_relative_paths or policy.frontend_build_output_paths:
         names = {relative.as_posix(), *(p.as_posix() for p in relative.parents)}
         if names.intersection(policy.excluded_path_set):
             return True
@@ -1079,6 +1107,18 @@ def _remaining(deadline: float) -> int:
     return max(1, value)
 
 
+def source_copy_budget():
+    """Bound unexpected conservative copies before any file data is copied."""
+    raw = os.environ.get("DEPLOOM_SOURCE_COPY_MAX_BYTES", str(8 * 1024**3))
+    try:
+        value = int(raw)
+        if value < 0:
+            raise ValueError()
+    except ValueError as exc:
+        raise SourceCaptureError("SOURCE_MATERIALIZATION_BUDGET_INVALID: expected nonnegative bytes") from exc
+    return value or None
+
+
 def _capture_once(
     project_dir: Path,
     *,
@@ -1094,8 +1134,10 @@ def _capture_once(
     if policy == SourceInputPolicy():
         from scoped_source_policy import policy_for_project
         policy = policy_for_project(project_dir, capture_root)
+    if _excluded(project_relative / "package.json", policy):
+        raise SourceCaptureError("SOURCE_SELECTED_PROJECT_EXCLUDED: selected package is outside the source input policy; select an authoritative source root containing it")
     project_path = (capture_root / project_relative).resolve()
-    _validate_git_layout(capture_root)
+    _validate_git_layout(capture_root, policy=policy)
     _submodule_preflight(project_path)
     try:
         topology_manifests = semantic_manifest_paths(project_path)
@@ -1106,7 +1148,7 @@ def _capture_once(
         topology_manifests = ((project_path / "package.json").resolve(),)
     for manifest_path in topology_manifests:
         if manifest_path.is_file():
-            _local_dependency_preflight(manifest_path.parent, capture_root)
+            _local_dependency_preflight(manifest_path.parent, capture_root, policy)
 
     _reap_once()
     container = Path(
@@ -1130,13 +1172,18 @@ def _capture_once(
                 timeout_seconds=_remaining(deadline),
                 progress=progress,
                 progress_label="source capture materialization",
+                maximum_copy_bytes=source_copy_budget(),
                 progress_interval_seconds=progress_interval_seconds,
                 exclude_dir_names=policy.excluded_dir_names,
                 exclude_file_names=policy.excluded_file_names,
-                exclude_relative_paths=policy.excluded_relative_paths,
+                exclude_relative_paths=tuple(sorted(policy.excluded_path_set)),
             )
+        except StorageCapacityError as exc:
+            raise SourceCaptureError(str(exc)) from exc
         except ReparseMaterializationError as exc:
             detail = str(exc)
+            if "SOURCE_MATERIALIZATION_BUDGET_EXCEEDED" in detail:
+                raise SourceCaptureError(detail) from exc
             if os.name != "nt" and "REPARSE_EXTERNAL_TARGET_UNSUPPORTED" in detail:
                 raise SourceCaptureError(f"SOURCE_SYMLINK_ESCAPE: {detail}") from exc
             raise SourceCaptureError(f"SOURCE_REPARSE_LAYOUT_UNSUPPORTED: {detail}") from exc
@@ -1166,8 +1213,11 @@ def _capture_once(
             pass_role="live-final",
         )
         if captured.key != post.key:
+            from verification_identity_diagnostics import manifest_entry_change_summary
+            changes = manifest_entry_change_summary(captured.entries, post.entries)
             raise SourceCaptureError(
-                "SOURCE_CAPTURE_UNSTABLE: sealed/live-final content manifests differ"
+                "SOURCE_CAPTURE_UNSTABLE: sealed/live-final content manifests differ; changedInputs="
+                + json.dumps(changes, sort_keys=True)
             )
 
         key = _canonical_hash({
@@ -1302,7 +1352,7 @@ def active_source_snapshot(project_dir: Path) -> Optional[SourceSnapshot]:
 
 
 @contextlib.contextmanager
-def bind_source_snapshot(snapshot: SourceSnapshot):
+def bind_source_snapshot(snapshot: SourceSnapshot, *, retain_watchers: bool = False):
     """Bind logical and sealed paths for one consumer without owning its tree."""
     existing = active_source_snapshot(snapshot.original_project_path)
     token = _REQUEST_SNAPSHOTS.set({
@@ -1315,7 +1365,7 @@ def bind_source_snapshot(snapshot: SourceSnapshot):
     finally:
         # A standalone uncached consumer owns the validation memo it armed;
         # caller-owned epochs and outer request scopes retain their watcher.
-        if existing is not snapshot:
+        if existing is not snapshot and not retain_watchers:
             _retire_snapshot_watcher(snapshot)
         _REQUEST_SNAPSHOTS.reset(token)
 
@@ -1327,10 +1377,12 @@ def verification_source_snapshot_scope(
     timeout_seconds: int = 1800,
     progress: Optional[ProgressCallback] = None,
     progress_interval_seconds: int = 15,
+    reuse_completed: bool = False,
 ):
     """Pin one source subject for identity, cache lookup and all attempt retries.
 
-    Reuse caller-owned epochs; standalone requests own and retire their copy.
+    Reuse caller-owned epochs. Optional completed-request reuse is authorized
+    by existing sealed and live-source continuity guards, never the cache key.
     Context-local registration prevents concurrent requests or later cohorts
     from consuming a stale epoch belonging to another verification.
     """
@@ -1338,22 +1390,76 @@ def verification_source_snapshot_scope(
     if existing is not None:
         yield existing
         return
-    snapshot = capture_source_snapshot(
-        project_dir, timeout_seconds=timeout_seconds, progress=progress,
-        progress_interval_seconds=progress_interval_seconds,
-    )
+    source_mode = "frontend" if os.environ.get("DEPLOOM_SOURCE_SCOPE_MODE") == "frontend" else "repository"
+    cache_key = _active_key(project_dir) + ":" + tool_build_id() + ":" + source_mode
+    snapshot = None
+    if reuse_completed:
+        with _LOCK:
+            candidate = _COMPLETED_REQUEST_SNAPSHOTS.pop(cache_key, None)
+        if candidate is not None:
+            try:
+                with bind_source_snapshot(candidate, retain_watchers=True):
+                    validate_source_snapshot(candidate, timeout_seconds=timeout_seconds, progress=progress)
+                    if source_snapshot_live_source_continuity(candidate, timeout_seconds=timeout_seconds, progress=progress):
+                        snapshot = candidate
+            except (SourceCaptureError, OSError):
+                pass
+            if snapshot is None:
+                _retire_completed_request(candidate)
+    if snapshot is None:
+        snapshot = capture_source_snapshot(
+            project_dir, timeout_seconds=timeout_seconds, progress=progress,
+            progress_interval_seconds=progress_interval_seconds,
+        )
+        reused = False
+    else:
+        reused = True
+    emit_observability_event("source.request.reuse", reused=reused,
+                            snapshotKey=snapshot.key, authority="SOURCE_TRUTH_GUARD")
+    completed = False
     try:
-        with bind_source_snapshot(snapshot):
+        with bind_source_snapshot(snapshot, retain_watchers=reuse_completed):
             yield snapshot
+        completed = True
     finally:
-        _force_rmtree(snapshot.container)
-        _ALL_CONTAINERS.discard(snapshot.container)
+        retained = False
+        if completed and reuse_completed:
+            try:
+                with bind_source_snapshot(snapshot, retain_watchers=True):
+                    validate_source_snapshot(snapshot, timeout_seconds=timeout_seconds, progress=progress)
+                    retained = source_snapshot_live_source_continuity(snapshot, timeout_seconds=timeout_seconds, progress=progress)
+            except (SourceCaptureError, OSError):
+                retained = False
+        if retained:
+            retired = []
+            with _LOCK:
+                previous = _COMPLETED_REQUEST_SNAPSHOTS.pop(cache_key, None)
+                if previous is not None:
+                    retired.append(previous)
+                _COMPLETED_REQUEST_SNAPSHOTS[cache_key] = snapshot
+                while len(_COMPLETED_REQUEST_SNAPSHOTS) > _COMPLETED_REQUEST_LIMIT:
+                    retired.append(_COMPLETED_REQUEST_SNAPSHOTS.pop(next(iter(_COMPLETED_REQUEST_SNAPSHOTS))))
+            for candidate in retired:
+                _retire_completed_request(candidate)
+        else:
+            _retire_completed_request(snapshot)
+
+
+def _retire_completed_request(snapshot):
+    _retire_snapshot_watcher(snapshot)
+    _retire_live_source_watcher(snapshot)
+    _force_rmtree(snapshot.container)
+    _ALL_CONTAINERS.discard(snapshot.container)
 
 
 def _retire_live_source_watcher(snapshot: SourceSnapshot) -> None:
     key = _active_key(snapshot.original_project_path)
     with _LOCK:
-        entry = _LIVE_SOURCE_WATCHERS.pop(key, None)
+        entry = _LIVE_SOURCE_WATCHERS.get(key)
+        if entry is not None and entry[0] is snapshot:
+            _LIVE_SOURCE_WATCHERS.pop(key, None)
+        else:
+            entry = None
     if entry is not None:
         entry[1].stop()
 
@@ -1620,8 +1726,11 @@ def validate_source_snapshot(
         with _LOCK:
             if _ACTIVE.get(active_key) is snapshot:
                 _ACTIVE.pop(active_key, None)
+        from verification_identity_diagnostics import source_manifest_change_summary
+        changed_inputs = source_manifest_change_summary(snapshot, observed)
         emit_observability_event(
             "source.snapshot.validation",
+            changedInputs=changed_inputs,
             snapshotKey=snapshot.key, outcome="content-mismatch",
             generation=str(snapshot.created_at),
             validationMs=max(0, int((time.monotonic() - started) * 1000)),
@@ -1629,7 +1738,8 @@ def validate_source_snapshot(
         )
         raise SourceCaptureError(
             "SOURCE_SNAPSHOT_CONTENT_MISMATCH: "
-            f"expected={snapshot.manifest_key}; observed={observed.key}"
+            f"expected={snapshot.manifest_key}; observed={observed.key}" +
+            "; changedInputs=" + json.dumps(changed_inputs, sort_keys=True)
         )
     if candidate_watcher is not None and not _watcher_is_clean(candidate_watcher):
         candidate_watcher.stop()
@@ -1715,6 +1825,14 @@ def materialize_source_for_verification(
             progress=progress,
             progress_interval_seconds=progress_interval_seconds,
         )
+    from verification_source_closure import require_complete_source_policy
+    require_complete_source_policy(snapshot.input_policy or SourceInputPolicy())
+    budget = source_copy_budget()
+    if budget is not None and snapshot.byte_count > budget:
+        raise SourceCaptureError("SOURCE_MATERIALIZATION_BUDGET_EXCEEDED: "
+            f"observedBytes={snapshot.byte_count}; limitBytes={budget}; no source bytes copied")
+    from storage_capacity import require_capacity
+    require_capacity(target, snapshot.byte_count, "verification source materialization")
     validate_source_snapshot(
         snapshot,
         timeout_seconds=timeout_seconds,
@@ -1756,7 +1874,8 @@ def materialize_source_for_verification(
 
 def clear_source_snapshot_epochs() -> None:
     with _LOCK:
-        snapshots = list(_ACTIVE.values())
+        snapshots = [*list(_ACTIVE.values()), *list(_COMPLETED_REQUEST_SNAPSHOTS.values())]
+        _COMPLETED_REQUEST_SNAPSHOTS.clear()
         watchers = [entry[1] for entry in _ACTIVE_WATCHERS.values()]
         live_watchers = [entry[1] for entry in _LIVE_SOURCE_WATCHERS.values()]
         _ACTIVE.clear()
@@ -1860,6 +1979,7 @@ def _reap_once() -> None:
 def _cleanup_all() -> None:
     with _LOCK:
         _ACTIVE.clear()
+        _COMPLETED_REQUEST_SNAPSHOTS.clear()
         watchers = [entry[1] for entry in _ACTIVE_WATCHERS.values()]
         watchers.extend(entry[1] for entry in _LIVE_SOURCE_WATCHERS.values())
         _ACTIVE_WATCHERS.clear()

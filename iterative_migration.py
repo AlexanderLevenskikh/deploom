@@ -1264,7 +1264,7 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
     return {
         "schemaVersion": SCHEMA_VERSION,
         "projectDir": str(project_dir),
-        "sourceScope": getattr(args, "source_scope", "project-gitignore"),
+        "sourceScope": getattr(args, "source_scope", "repository"),
         "projectName": project_name,
         "workspaceId": (args.workspace_id or "").strip(),
         "projectId": (args.project_id or project_name).strip(),
@@ -5829,8 +5829,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     begin = sub.add_parser("begin", help="Захват C0 (Исходный замер)")
     begin.add_argument("--project-dir", required=True)
-    begin.add_argument("--source-scope", choices=("project-gitignore", "repository"), default="project-gitignore",
-                       help="Copy working project/workspace inputs respecting gitignore, or the legacy whole repository")
+    begin.add_argument("--source-scope", choices=("frontend", "project-gitignore", "repository"), default="repository",
+                       help="repository keeps all authoritative source; frontend explicitly excludes MSBuild-owned backend bin/obj, agent state and declared Nx cache; project-gitignore is a legacy repository alias")
     begin.add_argument("--project-name", default="")
     begin.add_argument("--intent-file", default="")
     begin.add_argument("--max-known-moderate", type=int, default=None)

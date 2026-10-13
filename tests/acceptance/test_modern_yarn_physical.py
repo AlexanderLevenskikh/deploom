@@ -76,7 +76,7 @@ class ModernYarnPhysicalAcceptance(unittest.TestCase):
                 runtime_env = {**os.environ, 'PATH': str(bin_dir)+os.pathsep+os.environ['PATH']}
                 with patch.dict(os.environ, {**runtime_env, 'DEPLOOM_SOURCE_SCOPE_MODE': 'project-gitignore'}):
                     snapshot = capture_source_snapshot(app)
-                    self.assertFalse((snapshot.root/'backend.sql').exists())
+                    self.assertTrue((snapshot.root/'backend.sql').is_file())
                     self.assertTrue((snapshot.root/'.yarn/releases/yarn.cjs').is_file())
                     config = BaselineVerifyConfig(enabled=True, project_checks='strict', commands=('node check.js',), registry=registry, timeout_seconds=120, attempt_timeout_seconds=300, proof_cache_dir=str(Path(tmp)/'proof'))
                     result = verify_assignment(app, {'deploom-yarn-fixture': '2.0.0'}, config=config, run_project_checks=True, runtime_env=runtime_env)

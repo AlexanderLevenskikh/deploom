@@ -22,6 +22,7 @@ from typing import Callable, Mapping, Optional, Sequence
 from artifact_integrity import (
     ArtifactIntegrityError,
     build_artifact_tree_integrity,
+    source_entry_integrity_key,
 )
 from block_vex_storage import verification_root
 from prepared_workspace_fastpath import (
@@ -42,6 +43,7 @@ _LOCK = threading.RLock()
 _CONFIGURED_ROOT: Optional[Path] = None
 _INTEGRITY_VALIDATION_LOCK = threading.RLock()
 _VALIDATED_CONTENT: set[tuple[str, str, str]] = set()
+_VALIDATED_SOURCE_KEYS: dict[tuple[str, str, str], str] = {}
 # slot -> (watcher, sealed directory-object identity at arm time)
 _VALIDATION_WATCHERS: dict[
     tuple[str, str, str], tuple[_DirectoryWatcher, Optional[tuple[int, int]]]
@@ -59,6 +61,7 @@ def _retire_validation_watchers(*, key: Optional[str] = None) -> None:
         watchers = [_VALIDATION_WATCHERS.pop(slot)[0] for slot in slots]
         for slot in slots:
             _VALIDATED_CONTENT.discard(slot)
+            _VALIDATED_SOURCE_KEYS.pop(slot, None)
             _VALIDATION_DRAIN_TOKENS.pop(slot, None)
     for watcher in watchers:
         watcher.stop()
@@ -68,6 +71,7 @@ def _retire_validation_slot(slot: tuple[str, str, str]) -> None:
     with _INTEGRITY_VALIDATION_LOCK:
         entry = _VALIDATION_WATCHERS.pop(slot, None)
         _VALIDATED_CONTENT.discard(slot)
+        _VALIDATED_SOURCE_KEYS.pop(slot, None)
         _VALIDATION_DRAIN_TOKENS.pop(slot, None)
     if entry is not None:
         entry[0].stop()
@@ -554,6 +558,7 @@ def publish_prepared_artifact_record(
     reparse_plan: Optional[Sequence[ReparseLink]] = None,
     progress: Optional[Callable[[str], None]] = None,
     progress_interval_seconds: int = 15,
+    source_closure_receipt: Optional[dict[str, object]] = None,
 ) -> bool:
     """Atomically publish an immutable artifact locator.
 
@@ -594,6 +599,8 @@ def publish_prepared_artifact_record(
         "key": _valid_key(key),
         "toolBuildId": integrity.tool_build_id,
         "artifactContentKey": integrity.key,
+        "sourceClosureContentKey": integrity.source_content_key,
+        "sourceClosureEntries": list(integrity.source_entries),
         "artifactFileCount": integrity.file_count,
         "artifactDirectoryCount": integrity.directory_count,
         "artifactByteCount": integrity.byte_count,
@@ -629,6 +636,7 @@ def publish_prepared_artifact_record(
         )
         with _INTEGRITY_VALIDATION_LOCK:
             _VALIDATED_CONTENT.add(slot)
+            _VALIDATED_SOURCE_KEYS[slot] = integrity.source_content_key
         emit_observability_event(
             "prepared-artifact.integrity",
             outcome="published",
@@ -638,6 +646,8 @@ def publish_prepared_artifact_record(
             byteCount=integrity.byte_count,
             toolBuildId=integrity.tool_build_id,
         )
+        if source_closure_receipt is not None:
+            source_closure_receipt.update(key=integrity.source_content_key, entries=integrity.source_entries)
         return True
     except OSError:
         try:
@@ -667,6 +677,14 @@ def load_prepared_artifact_record(
         return None
     current_build_id = tool_build_id()
     content_key = str(payload.get("artifactContentKey") or "").lower()
+    source_key = str(payload.get("sourceClosureContentKey") or "").lower()
+    source_entries = payload.get("sourceClosureEntries")
+    if (len(source_key) != 64 or any(ch not in "0123456789abcdef" for ch in source_key)
+            or not isinstance(source_entries, list)
+            or any(not isinstance(item, dict) or not isinstance(item.get("path"), str) for item in source_entries)):
+        return None
+    if source_entry_integrity_key(source_entries, current_build_id) != source_key:
+        return None
     if payload.get("toolBuildId") != current_build_id:
         invalidate_prepared_artifact_record(key, remove_tree=False)
         return None
@@ -700,7 +718,11 @@ def load_prepared_artifact_record(
     validation_slot = (os.path.normcase(str(workspace)), _valid_key(key), content_key)
     with _INTEGRITY_VALIDATION_LOCK:
         watcher_entry = _VALIDATION_WATCHERS.get(validation_slot)
-        memory_hit = validation_slot in _VALIDATED_CONTENT
+        memory_hit = (validation_slot in _VALIDATED_CONTENT
+                      and _VALIDATED_SOURCE_KEYS.get(validation_slot) == source_key)
+    if not memory_hit and watcher_entry is not None:
+        _retire_validation_slot(validation_slot)
+        watcher_entry = None
     watcher = watcher_entry[0] if watcher_entry is not None else None
     sealed_identity = watcher_entry[1] if watcher_entry is not None else None
 
@@ -806,6 +828,7 @@ def load_prepared_artifact_record(
             return None
         if (
             observed_integrity.key != content_key
+            or observed_integrity.source_content_key != source_key
             or observed_integrity.tool_build_id != current_build_id
         ):
             if candidate_watcher is not None:
@@ -841,6 +864,7 @@ def load_prepared_artifact_record(
         return None
     with _INTEGRITY_VALIDATION_LOCK:
         _VALIDATED_CONTENT.add(validation_slot)
+        _VALIDATED_SOURCE_KEYS[validation_slot] = source_key
         if candidate_watcher is not None:
             _VALIDATION_WATCHERS[validation_slot] = (
                 candidate_watcher,
@@ -862,6 +886,7 @@ def load_prepared_artifact_record(
         "projectRelative": relative,
         "storageMode": str(payload.get("storageMode") or "durable-prepared-artifact"),
         "toolBuildId": current_build_id, "artifactContentKey": content_key,
+        "sourceClosureContentKey": source_key, "sourceClosureEntries": tuple(source_entries),
         "observedResolvedVersions": dict(sorted(versions.items())),
         "observedResolvedHash": observed_hash,
         "dependencyRoots": tuple(dependency_roots),

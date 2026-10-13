@@ -128,6 +128,7 @@ type ProjectSpec = {
   // means "no CI-compatibility claim" — the child runtime stays the host
   // ambient one and verification makes no requested-runtime commitment.
   nodeVersion?: string
+  sourceScope?: 'repository' | 'frontend'
   // D2.4: display-only Node hints from repo pins (engines.node, .nvmrc,
   // .node-version). The UI may suggest them, never auto-fills the runtime.
   nodeHints?: string[]
@@ -8130,6 +8131,7 @@ function setupIpc(): void {
           projectId: project.name,
           toolBuildId: app.getVersion(),
           requestedNode: project.nodeVersion || undefined,
+          sourceScope: project.sourceScope,
         }
         Object.assign(options, { validationProfileFile: existsSync(migrationProfilePath(runDir)) ? migrationProfilePath(runDir) : undefined })
         const invocation = iterativeBeginInvocation(runDir, options, generator, python)
@@ -8248,6 +8250,7 @@ function setupIpc(): void {
           projectId: project.name,
           toolBuildId: app.getVersion(),
           requestedNode: project.nodeVersion || undefined,
+          sourceScope: project.sourceScope,
         }
         Object.assign(options, { validationProfileFile: existsSync(migrationProfilePath(runDir)) ? migrationProfilePath(runDir) : undefined })
         const invocation = iterativeBeginInvocation(runDir, options, generator, python)
@@ -8395,6 +8398,7 @@ function setupIpc(): void {
         intentFile,
         toolBuildId: app.getVersion(),
         requestedNode: project.nodeVersion || undefined,
+        sourceScope: project.sourceScope,
         // P1 (#1): carry the verified repaired source into the new migration.
         adoptRepairSource: adoptRepairSource || undefined,
         // R8: the run captures the workspace dashboard-state (user package lag

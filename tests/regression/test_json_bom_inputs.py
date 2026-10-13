@@ -64,7 +64,8 @@ class JsonBomInputTests(unittest.TestCase):
             self.assertTrue(any('build' in command for command in baseline.discover_baseline_project_checks(app)))
             with patch.dict(os.environ, {MODE_ENV:'project-gitignore'}):
                 snapshot = capture_durable_source_snapshot(app, base / 'snapshot', timeout_seconds=0)
-            self.assertIn('shared/lib', snapshot.input_policy.scope_roots)
+            self.assertEqual((), snapshot.input_policy.scope_roots)
+            self.assertTrue((snapshot.root / 'shared/lib/package.json').is_file())
             for path in [*manifests, root / 'yarn.lock', root / '.yarnrc.yml', yarn]:
                 self.assertEqual((snapshot.root / path.relative_to(root)).read_bytes(), path.read_bytes())
 

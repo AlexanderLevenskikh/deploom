@@ -110,6 +110,7 @@ def _materialize_private_tree_impl(
     exclude_file_names: tuple[str, ...] = (),
     exclude_relative_paths: tuple[str, ...] = (),
     reparse_plan: Optional[tuple[ReparseLink, ...]] = None,
+    maximum_copy_bytes: Optional[int] = None,
 ) -> str:
     # BLOCK_X_SOURCE_TRUTH_V1
     source = source.resolve()
@@ -125,6 +126,8 @@ def _materialize_private_tree_impl(
             excluded_dir_names=exclude_dir_names,
             excluded_file_names=exclude_file_names,
             excluded_relative_paths=exclude_relative_paths,
+            maximum_copy_bytes=maximum_copy_bytes,
+            capacity_destination=target if maximum_copy_bytes is not None else None,
         )
     )
 
@@ -251,6 +254,7 @@ def materialize_private_tree(
     exclude_file_names: tuple[str, ...] = (),
     exclude_relative_paths: tuple[str, ...] = (),
     reparse_plan: Optional[tuple[ReparseLink, ...]] = None,
+    maximum_copy_bytes: Optional[int] = None,
 ) -> str:
     """Instrumented private materialization without following reparse points."""
     operation_id = new_observability_id("materialize")
@@ -298,6 +302,7 @@ def materialize_private_tree(
                 exclude_file_names=exclude_file_names,
                 exclude_relative_paths=exclude_relative_paths,
                 reparse_plan=reparse_plan,
+                maximum_copy_bytes=maximum_copy_bytes,
             )
     except BaseException as exc:
         after = process_resource_snapshot()

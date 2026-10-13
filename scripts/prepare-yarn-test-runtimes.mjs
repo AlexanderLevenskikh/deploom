@@ -22,5 +22,5 @@ for (const version of ['2.4.3', '3.8.7', '4.0.0']) {
   const result = spawnSync(executable, argv, { stdio: 'inherit' });
   if (result.status !== 0) process.exit(result.status || 1);
 }
-if (process.env.GITHUB_ENV) appendFileSync(process.env.GITHUB_ENV, `DEPLOOM_TEST_YARN_ROOT=${resolve(root)}\n`);
+if (process.env.GITHUB_ENV) appendFileSync(process.env.GITHUB_ENV, `DEPLOOM_TEST_YARN_ROOT=${resolve(root)}\nDEPLOOM_TEST_NODE_SOURCE_CLOSURE=1\n`);
 console.log(`DEPLOOM_TEST_YARN_ROOT=${resolve(root)}`);

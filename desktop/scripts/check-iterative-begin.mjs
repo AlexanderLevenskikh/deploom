@@ -33,6 +33,10 @@ assert.deepEqual(readMigrationProfile(profileRun, profileRoot).commands, selecte
 const profileInvocation = iterativeBeginInvocation(profileRun, { projectDir: profileRoot, projectName: 'demo', targetLevel: 'yellow', validationProfileFile: migrationProfilePath(profileRun) }, 'iterative_migration.py');
 assert.equal(profileInvocation.args[profileInvocation.args.indexOf('--validation-profile') + 1], migrationProfilePath(profileRun));
 
+const frontendInvocation = iterativeBeginInvocation(profileRun, { projectDir: profileRoot, projectName: 'demo', targetLevel: 'yellow', sourceScope: 'frontend' }, 'iterative_migration.py');
+assert.equal(frontendInvocation.args[frontendInvocation.args.indexOf('--source-scope') + 1], 'frontend');
+assert.equal(profileInvocation.args.includes('--source-scope'), false, 'unset scope keeps the strict default');
+assert.throws(() => iterativeBeginInvocation(profileRun, { projectDir: profileRoot, projectName: 'demo', targetLevel: 'yellow', sourceScope: 'unknown' }, 'iterative_migration.py'), /SOURCE_SCOPE_INVALID/);
 const timeoutEnvelope = iterativeCheckTimeoutFailure('source-materialization: hashing files=12000');
 const timeout = JSON.parse(timeoutEnvelope.slice('ITERATIVE_MIGRATION_FAILURE_V1 '.length));
 if (timeout.code !== 'PROJECT_CHECK_TIMEOUT' || !timeout.summary.includes('20 минут') ||

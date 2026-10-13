@@ -306,7 +306,9 @@ class BlockTVerificationDriftGateTests(unittest.TestCase):
         start = source.index("def verify_assignment(")
         section = source[start:]
         self.assertIn("def fixed_source_identity_gate(stage: str)", section)
-        self.assertIn("remote_fixed_resolver_input_fingerprint(", section)
+        self.assertIn("fixed_resolver_input_identity(", section)
+        self.assertIn("manager=manager, remote_only=True", section)
+        self.assertIn("identity_component_diff(expected_remote_identity", section)
         self.assertIn("current_source_fixed_key", section)
         self.assertEqual(1, section.count('fixed_source_identity_gate("resolver")'))
         self.assertEqual(1, section.count('fixed_source_identity_gate("lifecycle")'))

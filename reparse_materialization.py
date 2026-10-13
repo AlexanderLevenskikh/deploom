@@ -81,6 +81,8 @@ def inventory_reparse_plan(
     excluded_file_names: Iterable[str] = (),
     excluded_relative_paths: Iterable[str] = (),
     workspace_package_targets: Optional[Mapping[str, Path]] = None,
+    maximum_copy_bytes: Optional[int] = None,
+    capacity_destination: Optional[Path] = None,
 ) -> tuple[ReparseLink, ...]:
     root = root.resolve()
     excluded_dirs = set(excluded_dir_names)
@@ -91,8 +93,10 @@ def inventory_reparse_plan(
         for name, target in (workspace_package_targets or {}).items()
     }
     links: list[ReparseLink] = []
+    total_bytes = 0
 
     def walk(directory: Path) -> None:
+        nonlocal total_bytes
         try:
             entries = sorted(os.scandir(directory), key=lambda item: item.name.lower())
         except OSError as exc:
@@ -163,15 +167,27 @@ def inventory_reparse_plan(
                 ))
                 continue
             try:
-                mode = item.stat(follow_symlinks=False).st_mode
+                item_stat = item.stat(follow_symlinks=False)
+                mode = item_stat.st_mode
             except OSError as exc:
                 raise ReparseMaterializationError(
                     f"REPARSE_ENTRY_UNREADABLE: {path}: {exc}"
                 ) from exc
+            if stat.S_ISREG(mode):
+                total_bytes += item_stat.st_size
+                if maximum_copy_bytes is not None and total_bytes > maximum_copy_bytes:
+                    raise ReparseMaterializationError(
+                        "SOURCE_MATERIALIZATION_BUDGET_EXCEEDED: "
+                        f"observedBytesAtLeast={total_bytes}; limitBytes={maximum_copy_bytes}; "
+                        "no source bytes copied; configure DEPLOOM_SOURCE_COPY_MAX_BYTES "
+                        "only after checking storage capacity (0 means unlimited)")
             if stat.S_ISDIR(mode):
                 walk(path)
 
     walk(root)
+    if capacity_destination is not None:
+        from storage_capacity import require_capacity
+        require_capacity(capacity_destination, total_bytes, "source materialization")
     return tuple(sorted(links, key=lambda item: item.link_relative.lower()))
 
 

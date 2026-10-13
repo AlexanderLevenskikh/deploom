@@ -352,10 +352,16 @@ def _windows_resources() -> ProcessResources:
     try:
         counters = PROCESS_MEMORY_COUNTERS()
         counters.cb = ctypes.sizeof(counters)
-        handle = ctypes.windll.kernel32.GetCurrentProcess()  # type: ignore[attr-defined]
-        ok = ctypes.windll.psapi.GetProcessMemoryInfo(  # type: ignore[attr-defined]
-            handle, ctypes.byref(counters), counters.cb
-        )
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel.GetCurrentProcess.argtypes = []
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE,
+            ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wintypes.DWORD]
+        handle = kernel.GetCurrentProcess()
+        ok = psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
         if ok:
             rss = int(counters.WorkingSetSize)
             peak = int(counters.PeakWorkingSetSize)

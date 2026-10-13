@@ -22,6 +22,7 @@ from typing import Mapping, Optional
 _PROOF_NEUTRAL_ENV = frozenset({
     "DEPLOOM_VERIFICATION_ROOT",
     "DEPLOOM_WORKSPACE_COPY_WORKERS",
+    "DEPLOOM_SOURCE_COPY_MAX_BYTES",
     "DEPLOOM_NTFS_FASTPATH_MIN_COMMANDS",
     "DEPLOOM_BASELINE_RESUME",
     # Block Psi continuation/search controls are orchestration-only. Keep this

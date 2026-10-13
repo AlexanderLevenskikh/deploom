@@ -58,6 +58,12 @@
                 "type": "string",
                 "description": "Git repository root; path remains the single selected project working directory. Desktop validates both belong to the same repository."
               },
+              "sourceScope": {
+                "type": "string",
+                "enum": ["repository", "frontend"],
+                "default": "repository",
+                "description": "Explicit verification source policy. repository preserves all policy-covered source; frontend excludes backend MSBuild bin/obj, .claude/.codex agent state and .nx state when nx.json exists, preserving Git, Node package bins and dot configuration. Exclusions are part of snapshot/proof identity; local dependency conflicts fail closed."
+              },
               "nodeVersion": {
                 "type": "string",
                 "pattern": "^(v?\\d+(\\.\\d+){0,2})$",

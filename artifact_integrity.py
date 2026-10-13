@@ -38,6 +38,14 @@ class ArtifactTreeIntegrity:
     byte_count: int
     reparse_count: int
     tool_build_id: str
+    source_content_key: str = ""
+    source_entries: tuple[dict[str, object], ...] = ()
+
+
+def source_entry_integrity_key(entries, build_id):
+    """Derived subset of the existing artifact seal; never dependency payload."""
+    return _canonical_hash({"schema": "prepared-artifact-source-v1", "toolBuildId": build_id,
+                            "entries": sorted(entries, key=lambda item: str(item["path"]))})
 
 
 def _canonical_hash(value: object) -> str:
@@ -112,6 +120,7 @@ def build_artifact_tree_integrity(
     progress_interval_seconds: int = 15,
     reparse_plan: Optional[Sequence[ReparseLink]] = None,
     cancelled: Optional[Callable[[], bool]] = None,
+    source_only: bool = False,
 ) -> ArtifactTreeIntegrity:
     """Whole-tree content seal.
 
@@ -150,13 +159,16 @@ def build_artifact_tree_integrity(
         )
     if reparse_plan is None:
         try:
-            canonical_reparse_plan = inventory_reparse_plan(root)
+            canonical_reparse_plan = inventory_reparse_plan(root, excluded_dir_names=("node_modules",) if source_only else ())
         except ReparseMaterializationError as exc:
             raise ArtifactIntegrityError(
                 f"PREPARED_ARTIFACT_REPARSE_INVALID: {exc}"
             ) from exc
     else:
         canonical_reparse_plan = tuple(reparse_plan)
+    if source_only:
+        canonical_reparse_plan = tuple(item for item in canonical_reparse_plan
+            if "node_modules" not in Path(item.link_relative).parts)
     reparse_by_path = {
         item.link_relative: item
         for item in canonical_reparse_plan
@@ -181,6 +193,8 @@ def build_artifact_tree_integrity(
                 f"PREPARED_ARTIFACT_DIRECTORY_UNREADABLE: {directory}: {exc}"
             ) from exc
         for item in scanned:
+            if source_only and item.name == "node_modules":
+                continue
             scanned_entries += 1
             heartbeat("scanning", scanned_entries)
             path = Path(item.path)
@@ -251,7 +265,10 @@ def build_artifact_tree_integrity(
                     "path": relative_text,
                     "kind": planned.link_kind,
                     "target": planned.target_relative,
-                    "authority": planned.authority,
+                    # Caller-specific topology evidence does not change the
+                    # physical tree. Expected target mapping is checked above;
+                    # the content key binds the same internal target on replay.
+                    "authority": "internal",
                     "package": planned.package_name,
                 })
                 continue
@@ -374,8 +391,12 @@ def build_artifact_tree_integrity(
         "toolBuildId": build_id,
         "entries": entries,
     })
+    source_entries = tuple(item for item in entries
+        if "node_modules" not in Path(str(item["path"])).parts)
     return ArtifactTreeIntegrity(
         key=key,
+        source_content_key=source_entry_integrity_key(source_entries, build_id),
+        source_entries=source_entries,
         file_count=len(files),
         directory_count=len(directories),
         byte_count=byte_count,

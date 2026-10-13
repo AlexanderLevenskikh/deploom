@@ -31,6 +31,7 @@ export type IterativeBeginOptions = {
   // D3: explicit Node.js for project/CI (exact or major). Empty = no claim —
   // no --requested-node is passed and the run makes no CI-runtime commitment.
   requestedNode?: string
+  sourceScope?: 'repository' | 'frontend'
   intentFile?: string
   // P1 (v0.2.163 #1): start the migration from the VERIFIED REPAIRED source.
   // Set ONLY when a finished repair (TERMINAL REPAIR_VERIFIED) was just
@@ -113,6 +114,10 @@ export function iterativeBeginInvocation(
 ): { command: string; args: string[] } {
   const args = [scriptPath, '--run-dir', runDir, 'begin', '--project-dir', options.projectDir]
   if (options.projectName) args.push('--project-name', options.projectName)
+  if (options.sourceScope !== undefined) {
+    if (options.sourceScope !== 'repository' && options.sourceScope !== 'frontend') throw new Error('SOURCE_SCOPE_INVALID')
+    args.push('--source-scope', options.sourceScope)
+  }
   args.push('--target-level', options.targetLevel)
   if (options.validationProfileFile) args.push('--validation-profile', options.validationProfileFile)
   if (options.targetsFile) args.push('--targets-file', options.targetsFile)

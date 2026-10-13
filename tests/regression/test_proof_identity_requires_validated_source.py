@@ -54,7 +54,7 @@ class ProofIdentityRequiresValidatedSource(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_identity_build_actually_validates_the_active_snapshot(self) -> None:
-        source_snapshot.activate_source_snapshot_epoch(self.project, replace=True)
+        snapshot = source_snapshot.activate_source_snapshot_epoch(self.project, replace=True)
         real = verification_proof.validate_source_snapshot
         calls: list[str] = []
 
@@ -65,9 +65,10 @@ class ProofIdentityRequiresValidatedSource(unittest.TestCase):
         with patch.object(verification_proof, "validate_source_snapshot", counting):
             _identity(self.project)
 
-        self.assertEqual(
+        self.assertGreaterEqual(
             len(calls), 1, "authority-bearing identity did not validate the snapshot"
         )
+        self.assertEqual({snapshot.key}, set(calls), "identity validated a different subject")
 
     def test_mutation_before_identity_build_is_detected(self) -> None:
         snapshot = source_snapshot.activate_source_snapshot_epoch(

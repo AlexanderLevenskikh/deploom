@@ -28,9 +28,9 @@ class ScopedSourcePolicyTests(unittest.TestCase):
             (front / "ignored-input.txt").write_text("ignored",encoding="utf-8")
             with patch.dict(os.environ,{MODE_ENV:"project-gitignore"}):
                 snapshot = capture_durable_source_snapshot(front,base/"snapshot",timeout_seconds=0)
-            self.assertFalse((snapshot.root / "backend").exists())
-            self.assertFalse((snapshot.project_path / "bin/huge-build.dll").exists())
-            self.assertFalse((snapshot.project_path / "ignored-input.txt").exists())
+            self.assertTrue((snapshot.root / "backend/server.sql").is_file())
+            self.assertTrue((snapshot.project_path / "bin/huge-build.dll").is_file())
+            self.assertTrue((snapshot.project_path / "ignored-input.txt").is_file())
             self.assertEqual((snapshot.project_path / "bin/explicit-source.txt").read_text(),"tracked despite ignore")
             self.assertTrue((snapshot.root / ".gitignore").is_file())
             # Stored scope must survive lossless cold storage and restoration.
@@ -42,14 +42,14 @@ class ScopedSourcePolicyTests(unittest.TestCase):
             cold.compact(packed)
             self.assertFalse((packed / "tree").exists())
             restored = open_source_snapshot(packed, expected_key=snapshot.key, timeout_seconds=0)
-            self.assertFalse((restored.root / "backend").exists())
+            self.assertTrue((restored.root / "backend/server.sql").is_file())
             self.assertEqual(restored.input_policy, snapshot.input_policy)
-            self.assertNotIn("backend/server.sql",delivery.delivery_files(snapshot.root))
+            self.assertIn("backend/server.sql",delivery.delivery_files(snapshot.root))
             reopened = open_source_snapshot(base/"snapshot",expected_key=snapshot.key,timeout_seconds=0)
             with patch.dict(snapshots._ACTIVE, {snapshots._active_key(reopened.project_path): reopened}):
                 materialized, _, _ = materialize_source_for_verification(reopened.project_path,base/"trial",timeout_seconds=0)
             self.assertTrue((materialized / "source.js").is_file())
-            self.assertFalse((base / "trial/backend").exists())
+            self.assertTrue((base / "trial/backend/server.sql").is_file())
 
     def test_workspace_scope_keeps_root_lock_and_local_yarn_without_ignored_cache(self):
         with tempfile.TemporaryDirectory(prefix="deploom-workspace-scope-") as raw:
@@ -65,8 +65,8 @@ class ScopedSourcePolicyTests(unittest.TestCase):
             (root/".yarn/cache/large.zip").write_bytes(b"cache")
             delivery.git(root,"init","-b","fixture")
             with patch.dict(os.environ,{MODE_ENV:"project-gitignore"}): policy=policy_for_project(app,root)
-            self.assertEqual(policy.scope_roots,("packages/app","packages/lib"))
-            self.assertIn(".yarn/cache",policy.excluded_relative_paths)
+            self.assertEqual(policy.scope_roots,())
+            self.assertNotIn(".yarn/cache",policy.excluded_relative_paths)
             self.assertNotIn(".yarn/releases/yarn.cjs",policy.excluded_relative_paths)
             self.assertNotIn("yarn.lock",policy.excluded_relative_paths)
 

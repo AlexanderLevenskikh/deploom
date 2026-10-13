@@ -611,8 +611,11 @@ def discover_baseline_project_checks(project_dir: Path) -> Tuple[str, ...]:
     names = [name for name in focused if isinstance(scripts.get(name), str) and scripts.get(name, "").strip()]
     plain_lint = scripts.get("lint")
     plain_lint_text = plain_lint.strip() if isinstance(plain_lint, str) else ""
+    plain_lint_has_hooks = any(isinstance(scripts.get(hook), str) and scripts[hook].strip()
+                              for hook in ("prelint", "postlint"))
     plain_lint_is_exact_duplicate = bool(
-        plain_lint_text
+        not plain_lint_has_hooks
+        and plain_lint_text
         and any(
             isinstance(scripts.get(name), str)
             and scripts.get(name, "").strip() == plain_lint_text
@@ -670,6 +673,8 @@ def discover_baseline_project_checks(project_dir: Path) -> Tuple[str, ...]:
         and isinstance(test_unit_text, str)
         and isinstance(test_text, str)
         and test_text.strip() == test_unit_text.strip()
+        and not any(isinstance(scripts.get(hook), str) and scripts[hook].strip()
+                    for hook in ("pretest", "posttest"))
     ):
         names = [name for name in names if name != "test"]
     commands: List[str] = []
@@ -830,6 +835,8 @@ def _run(
     progress_interval_seconds: int = 15,
 ) -> subprocess.CompletedProcess[str]:
     """Run a verifier child with bounded output and full-stream infra detection."""
+    from package_manager_telemetry import PackageManagerTelemetry
+    package_telemetry = PackageManagerTelemetry(progress_label)
     infra_seen = False
     rolling = ""
     latest_output = ""
@@ -848,6 +855,7 @@ def _run(
     def observe_output(chunk: str) -> None:
         nonlocal infra_seen, rolling, latest_output
         latest_output = (latest_output + str(chunk))[-2000:]
+        package_telemetry.consume(chunk)
         if infra_seen:
             return
         # Pattern boundaries may cross reader chunks. A small rolling prefix is
@@ -858,18 +866,23 @@ def _run(
             infra_seen = True
         rolling = candidate[-4096:]
 
-    completed = run_supervised(
-        argv,
-        cwd,
-        timeout_seconds=timeout_seconds,
-        env=env,
-        base_env=base_env,
-        progress=report_progress if progress is not None else None,
-        progress_label=progress_label,
-        progress_interval_seconds=progress_interval_seconds,
-        output_observer=observe_output,
-    )
+    try:
+        completed = run_supervised(
+            argv,
+            cwd,
+            timeout_seconds=timeout_seconds,
+            env=env,
+            base_env=base_env,
+            progress=report_progress if progress is not None else None,
+            progress_label=progress_label,
+            progress_interval_seconds=progress_interval_seconds,
+            output_observer=observe_output,
+        )
+    except BaseException:
+        package_telemetry.finish(None)
+        raise
     setattr(completed, "deploom_infra_detected", bool(infra_seen))
+    setattr(completed, "deploom_package_manager_telemetry", package_telemetry.finish(completed.returncode))
     return completed
 
 
@@ -948,6 +961,9 @@ class PreparedWorkspaceSnapshot:
     # Ψ.4.1: exact cost of the strong durable integrity-seal substage only.
     # Performance metadata; never proof/cache identity.
     durable_seal_duration_ms: int = 0
+    # Source subset is derived by the same strong PreparedArtifact seal.
+    source_closure_content_key: str = ""
+    source_closure_entries: tuple[dict[str, object], ...] = ()
 
 
 _PREPARED_SNAPSHOT_LOCK = threading.Lock()
@@ -1366,11 +1382,15 @@ atexit.register(_cleanup_prepared_snapshot_root)
 def _prepared_snapshot_root() -> Path:
     global _PREPARED_SNAPSHOT_ROOT
     with _PREPARED_SNAPSHOT_LOCK:
-        if _PREPARED_SNAPSHOT_ROOT is None:
-            durable = prepared_snapshot_storage_root()
-            _PREPARED_SNAPSHOT_ROOT = durable or Path(
+        # The configured store can change between requests in a long-lived
+        # worker. A stale root must not route a new subject to retired storage.
+        durable = prepared_snapshot_storage_root()
+        if durable is not None:
+            _PREPARED_SNAPSHOT_ROOT = durable.resolve()
+        elif _PREPARED_SNAPSHOT_ROOT is None or not _PREPARED_SNAPSHOT_ROOT.is_dir():
+            _PREPARED_SNAPSHOT_ROOT = Path(
                 tempfile.mkdtemp(prefix="dependency-flow-prepared-snapshots-")
-            )
+            ).resolve()
         return _PREPARED_SNAPSHOT_ROOT
 
 
@@ -1867,6 +1887,8 @@ def _lookup_prepared_workspace_snapshot(
             str(item) for item in (record.get("dependencyRoots") or ())
         ),
         dependency_integrity={},
+        source_closure_content_key=str(record.get("sourceClosureContentKey") or ""),
+        source_closure_entries=tuple(record.get("sourceClosureEntries") or ()),
     )
     with _PREPARED_SNAPSHOT_LOCK:
         _PREPARED_SNAPSHOTS[slot] = snapshot
@@ -2081,6 +2103,11 @@ def _publish_prepared_workspace_snapshot(
                     progress=progress,
                 )
 
+        normalized = clean_ephemeral_verification_caches(stage_workspace, dependency_roots)
+        if normalized:
+            _emit_progress(progress, f"{progress_label}: normalized dependency caches before seal: {', '.join(normalized)}")
+            emit_observability_event("verify.preparation.dependency-cache-normalized", removedCaches=list(normalized))
+
         snapshot = PreparedWorkspaceSnapshot(
             key=str(key),
             workspace_root=stage_workspace,
@@ -2109,6 +2136,7 @@ def _publish_prepared_workspace_snapshot(
             published = snapshot
 
         durable_published = False
+        source_closure_receipt: dict[str, object] = {}
         durable_seal_duration_ms = 0
         if shared_reuse_allowed and is_durable_prepared_path(published.workspace_root):
             # This performs a FULL whole-tree content hash of the durable
@@ -2130,6 +2158,7 @@ def _publish_prepared_workspace_snapshot(
                     observed_resolved_versions=published.observed_resolved_versions,
                     observed_resolved_hash=published.observed_resolved_hash,
                     dependency_roots=published.dependency_roots,
+                    source_closure_receipt=source_closure_receipt,
                     reparse_plan=canonical_reparse_plan,
                     progress=progress,
                     progress_interval_seconds=progress_interval_seconds,
@@ -2142,6 +2171,8 @@ def _publish_prepared_workspace_snapshot(
                 published,
                 durable_publication_confirmed=True,
                 durable_seal_duration_ms=durable_seal_duration_ms,
+                source_closure_content_key=str(source_closure_receipt.get("key") or ""),
+                source_closure_entries=tuple(source_closure_receipt.get("entries") or ()),
             )
             if shared_reuse_allowed:
                 with _PREPARED_SNAPSHOT_LOCK:
@@ -2167,6 +2198,15 @@ def _publish_prepared_workspace_snapshot(
             durablePublished=bool(durable_published),
             totalMs=max(0, int((time.monotonic() - publish_started) * 1000)),
         )
+        if not published.source_closure_content_key:
+            # Private preparation has no durable whole-tree seal; seal its
+            # source subset once before any project clone can consume it.
+            from artifact_integrity import build_artifact_tree_integrity
+            source_integrity = build_artifact_tree_integrity(published.workspace_root, source_only=True,
+                progress=progress, progress_label="prepared source closure integrity",
+                progress_interval_seconds=progress_interval_seconds)
+            published = dataclasses.replace(published, source_closure_content_key=source_integrity.source_content_key,
+                source_closure_entries=source_integrity.source_entries)
         return published
     except Exception:
         shutil.rmtree(stage, ignore_errors=True)
@@ -2840,7 +2880,7 @@ def verify_assignment(
     temp_root = Path(tempfile.mkdtemp(
         prefix="dependency-flow-baseline-verify-",
         dir=str(trial_parent) if trial_parent is not None else None,
-    ))
+    )).resolve()
     from verification_storage_maintenance import register_trial_owner, retire_trial
     register_trial_owner(temp_root)
     source_binding = contextlib.ExitStack()
@@ -2904,6 +2944,13 @@ def verify_assignment(
                 )
             package_manager_relative_to_workspace = package_manager_project.relative_to(workspace_root)
             project_relative_to_workspace = workspace_project.relative_to(workspace_root)
+            from verification_source_closure import execution_scope
+            execution_context = execution_scope(source_snapshot, project=workspace_project,
+                package_manager_root=package_manager_project, commands=config.commands,
+                materialization=source_materialization_method)
+            execution_context["preparationCwd"] = execution_context.pop("executionCwd")
+            event("verify.source-closure.context", **execution_context)
+            _emit_progress(progress, "VERIFICATION_PREPARATION_SCOPE " + json.dumps(execution_context, ensure_ascii=False, sort_keys=True))
             event(
                 "verify.workspace.finish",
                 durationMs=int((time.monotonic() - workspace_started) * 1000),
@@ -2987,30 +3034,34 @@ def verify_assignment(
             )
         event("proof.identity", manager=manager, sourceSnapshotKey=source_snapshot.key)
 
+        from verification_proof import fixed_resolver_input_identity
+        from verification_identity_diagnostics import identity_component_diff, safe_identity_error
+        try:
+            expected_fixed_identity = fixed_resolver_input_identity(source_snapshot.project_path, manager=manager)
+            expected_remote_identity = fixed_resolver_input_identity(source_snapshot.project_path, manager=manager, remote_only=True)
+        except (SourceIdentityUnavailable, OSError, ValueError) as exc:
+            return BaselineVerifyResult(False, "unknown", "FIXED_SOURCE_IDENTITY_UNAVAILABLE_BEFORE_RESOLVER: " + safe_identity_error(exc))
+
         def fixed_source_identity_gate(stage: str) -> Optional[BaselineVerifyResult]:
             try:
                 # The complete identity is rebound to the original checkout.
                 # Local/workspace paths are intentionally not re-identified
                 # from the temporary assignment clone.
-                current_source_fixed_key = fixed_resolver_input_fingerprint(
-                    source_snapshot.project_path, manager=manager
-                )
-                expected_remote_key = remote_fixed_resolver_input_fingerprint(
-                    source_snapshot.project_path, manager=manager
-                )
-                observed_remote_key = remote_fixed_resolver_input_fingerprint(
-                    workspace_project, manager=manager
-                )
+                current_fixed_identity = fixed_resolver_input_identity(source_snapshot.project_path, manager=manager)
+                current_remote_identity = fixed_resolver_input_identity(workspace_project, manager=manager, remote_only=True)
+                current_source_fixed_key = current_fixed_identity["key"]
+                expected_remote_key = expected_remote_identity["key"]
+                observed_remote_key = current_remote_identity["key"]
             except (SourceIdentityUnavailable, OSError, ValueError) as exc:
                 event(
                     "verify.fixed-source.identity-unavailable",
                     stage=stage,
-                    detail=str(exc),
+                    detail=safe_identity_error(exc),
                 )
                 return BaselineVerifyResult(
                     False,
                     "unknown",
-                    f"FIXED_SOURCE_IDENTITY_UNAVAILABLE_DURING_{stage.upper()}: {exc}",
+                    f"FIXED_SOURCE_IDENTITY_UNAVAILABLE_DURING_{stage.upper()}: {safe_identity_error(exc)}",
                     workspace=str(workspace_project),
                 )
             expected_fixed_key = proof_identity.fixed_resolver_inputs_key
@@ -3019,8 +3070,14 @@ def verify_assignment(
                 and observed_remote_key == expected_remote_key
             ):
                 return None
+            identity_changes = {
+                "fixedInputs": identity_component_diff(expected_fixed_identity, current_fixed_identity),
+                "remoteInputs": identity_component_diff(expected_remote_identity, current_remote_identity),
+                "expectedComponentEvidenceMatchesProof": expected_fixed_identity["key"] == expected_fixed_key,
+            }
             event(
                 "verify.fixed-source.identity-drift",
+                identityChanges=identity_changes,
                 stage=stage,
                 expectedFixedResolverInputsKey=expected_fixed_key,
                 observedFixedResolverInputsKey=current_source_fixed_key,
@@ -3032,7 +3089,8 @@ def verify_assignment(
                 "unknown",
                 "FIXED_SOURCE_IDENTITY_DRIFT_DURING_" + stage.upper() + ": "
                 + f"expected={expected_fixed_key} observed={current_source_fixed_key} "
-                + f"remoteExpected={expected_remote_key} remoteObserved={observed_remote_key}",
+                + f"remoteExpected={expected_remote_key} remoteObserved={observed_remote_key}; "
+                + "identityChanges=" + json.dumps(identity_changes, sort_keys=True),
                 workspace=str(workspace_project),
             )
 
@@ -3986,7 +4044,7 @@ def verify_assignment(
                         reason="process-tree-supervision-not-guaranteed",
                     )
 
-                normalized = clean_ephemeral_verification_caches(workspace_project)
+                normalized = clean_ephemeral_verification_caches(package_manager_project)
                 if normalized:
                     event("verify.preparation.snapshot-normalized", removedCaches=list(normalized))
                 snapshot_started = time.monotonic()
@@ -4228,6 +4286,9 @@ def verify_assignment(
                             timeout_seconds=clone_timeout,
                             progress_interval_seconds=config.progress_interval_seconds,
                         )
+                        from verification_source_closure import validate_materialized_source_closure
+                        validate_materialized_source_closure(snapshot, command_root, progress=progress,
+                            progress_interval_seconds=config.progress_interval_seconds)
                     except Exception as exc:
                         clone_failure = f"PREPARED_SNAPSHOT_CLONE_FAILED: {command}: {exc}"
                         emit_observability_event(
@@ -4300,7 +4361,7 @@ def verify_assignment(
                 workspace_guard_started = False
                 check_result: Optional[subprocess.CompletedProcess[str]] = None
                 try:
-                    removed_caches = clean_ephemeral_verification_caches(command_project, snapshot.dependency_roots)
+                    removed_caches = clean_ephemeral_verification_caches(command_root, snapshot.dependency_roots)
                     if removed_caches:
                         _emit_progress(progress, f"{progress_label}: normalized transient caches before {command}: {', '.join(removed_caches)}")
 
@@ -4406,6 +4467,12 @@ def verify_assignment(
 
                     from migration_validation import display_validation_command
                     command_label = display_validation_command(command)
+                    check_context = execution_scope(source_snapshot, project=command_project,
+                        package_manager_root=command_root / package_manager_relative_to_workspace,
+                        commands=(command_label,), materialization=clone_isolation)
+                    check_context["preparedSourceContentKey"] = snapshot.source_closure_content_key
+                    event("verify.source-closure.execution", **check_context)
+                    _emit_progress(progress, "VERIFICATION_EXECUTION_SCOPE " + json.dumps(check_context, ensure_ascii=False, sort_keys=True))
                     _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} started: {command_label}")
                     check_started = time.monotonic()
                     event(
@@ -4499,7 +4566,7 @@ def verify_assignment(
                             else (
                                 "confirmed-content-mutation"
                                 if guard_result.mutations
-                                else "integrity-matched-notification"
+                                else "dependency-write-notification"
                             )
                         )
                         event(
@@ -4518,14 +4585,16 @@ def verify_assignment(
                             progress,
                             f"{progress_label}: NTFS fast clone rejected during {command} "
                             f"({rejection_reason}); rebuilding trusted preparation and "
-                            "retrying with proof-safe full-copy project clones",
+                            "retrying with proof-safe full-copy project clones; changed paths="
+                            + repr(list(guard_result.mutations or guard_result.notification_only)[:10]),
                         )
                         # The failed fast-path check is infrastructure evidence,
                         # never dependency evidence. Re-enter with the same proof
                         # identity; ResolverProof may be reused, while lifecycle
                         # preparation is rebuilt because the shared snapshot was
                         # quarantined.
-                        return _retry_assignment_without_prepared_fastpath(
+                        fallback_started = time.monotonic()
+                        fallback_result = _retry_assignment_without_prepared_fastpath(
                             project_dir,
                             assignment,
                             config=config,
@@ -4536,11 +4605,17 @@ def verify_assignment(
                             proof_identity=proof_identity,
                             runtime_env=runtime_env,
                         )
+                        fallback_ms = max(0, int((time.monotonic() - fallback_started) * 1000))
+                        event("verify.project-check.fastpath-fallback-complete",
+                              command=command, durationMs=fallback_ms,
+                              resolverProofReuseRequested=True, outcome=fallback_result.kind)
+                        _emit_progress(progress, f"{progress_label}: private-copy fallback completed; "
+                                       f"elapsed={fallback_ms / 1000:.3f}s; outcome={fallback_result.kind}")
+                        return fallback_result
 
                     # Allowed root cache writes are cache-only. Remove them
                     # from the sealed dependency base before any later check.
-                    prepared_project = snapshot.workspace_root / snapshot.project_relative
-                    normalized_shared = clean_ephemeral_verification_caches(prepared_project, snapshot.dependency_roots)
+                    normalized_shared = clean_ephemeral_verification_caches(snapshot.workspace_root, snapshot.dependency_roots)
                     if normalized_shared:
                         event(
                             "verify.project-check.shared-cache-normalized",
@@ -4602,6 +4677,14 @@ def verify_assignment(
                         _emit_progress(progress, f"{progress_label}: project check {command_index}/{len(config.commands)} PASS: {command_label}")
                         continue
                     tail = "\n".join((check_result.stdout or "").splitlines()[-80:])
+                    from verification_source_closure import excluded_source_failure_evidence
+                    excluded_inputs = excluded_source_failure_evidence(source_snapshot, check_result.stdout,
+                        execution_root=command_root, execution_cwd=command_project)
+                    if excluded_inputs:
+                        return BaselineVerifyResult(False, "infrastructure",
+                            "VERIFICATION_SOURCE_SCOPE_REQUIRED_INPUT_EXCLUDED: "
+                            + json.dumps({"paths": excluded_inputs, "sourceScope": "frontend", "action": "use repository source scope"}, sort_keys=True),
+                            command=command, output=tail, workspace=str(command_project))
                     # Only our direct, trusted adapter reserves exit 2 for
                     # unavailable evidence. Arbitrary project output cannot
                     # grant infrastructure authority or teach incompatibility.
@@ -5363,6 +5446,7 @@ def _verify_assignment_with_pinned_source(
             timeout_seconds=0 if config.unbounded_preparation else config.snapshot_copy_timeout_seconds,
             progress=kwargs.get("progress"),
             progress_interval_seconds=config.progress_interval_seconds,
+            reuse_completed=True,
         ):
             return _verify_assignment_cache_aware_impl(project_dir, assignment, config=config, **kwargs)
     except SourceCaptureError as exc:

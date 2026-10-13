@@ -1,4 +1,6 @@
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
+import { runClipboardProbe } from "./electron-clipboard-runner.mjs";
+import { verifyClipboardRunnerContract } from "./electron-clipboard-runner-contract.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 
@@ -26,50 +28,30 @@ const marker = [
   "Проверка кириллицы, служебных символов и многострочности.",
 ].join("\n");
 
+await verifyClipboardRunnerContract();
+// Existing headless Linux policy is explicit; arbitrary spawn/sandbox failures
+// on a GUI-capable host cannot silently skip this acceptance check.
+if (process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
+  console.log("check-electron-clipboard: SKIP (Linux has no DISPLAY or WAYLAND_DISPLAY)");
+  process.exit(0);
+}
 let electronBin;
 try {
   const electronImport = await import("electron");
   electronBin = electronImport.default ?? electronImport;
 } catch (error) {
-  console.log(`check-electron-clipboard: SKIP (electron package not resolvable: ${error.message})`);
-  process.exit(0);
-}
-if (typeof electronBin !== "string" || electronBin.length === 0) {
-  console.log("check-electron-clipboard: SKIP (electron binary path not resolvable)");
-  process.exit(0);
-}
-
-let raw;
-try {
-  raw = execFileSync(electronBin, [PROBE, marker], {
-    cwd: DESKTOP,
-    encoding: "utf8",
-    timeout: 90_000,
-    windowsHide: true,
-  });
-} catch (error) {
-  const stderr = String(error?.stderr ?? error?.message ?? error);
-  const guiUnavailable = /DISPLAY|display|sandbox|Gtk|gtk|X11|xcb/i.test(stderr);
-  if (guiUnavailable || error?.code === "ENOENT") {
-    console.log(`check-electron-clipboard: SKIP (Electron GUI unavailable here: ${stderr.split("\n")[0].trim()})`);
-    process.exit(0);
-  }
-  console.log(`check-electron-clipboard: FAIL (spawn error: ${stderr.split("\n").slice(0, 3).join(" | ")})`);
+  console.error(`check-electron-clipboard: FAIL (electron package: ${error.message})`);
   process.exit(1);
 }
-
-const line = raw.split("\n").find((item) => item.startsWith("CLIPBOARD_PROBE "));
-if (!line) {
-  console.log(`check-electron-clipboard: FAIL (no probe result in ${JSON.stringify(raw.slice(0, 200))})`);
+if (typeof electronBin !== "string" || !electronBin) {
+  console.error("check-electron-clipboard: FAIL (electron binary path unavailable)");
   process.exit(1);
 }
-const payload = JSON.parse(line.slice("CLIPBOARD_PROBE ".length));
-if (payload.ok !== true) {
-  console.log(`check-electron-clipboard: FAIL (${JSON.stringify(payload)})`);
+const result = runClipboardProbe(() => spawnSync(electronBin, [PROBE, marker], {
+  cwd: DESKTOP, encoding: "utf8", timeout: 90_000, windowsHide: true,
+}), marker);
+if (!result.ok) {
+  console.error(`check-electron-clipboard: FAIL (${JSON.stringify(result)})`);
   process.exit(1);
 }
-if (typeof payload.markerBytes !== "number" || payload.markerBytes <= 0) {
-  console.log(`check-electron-clipboard: FAIL (missing size ${JSON.stringify(payload)})`);
-  process.exit(1);
-}
-console.log(`check-electron-clipboard: OK (real Electron clipboard round-trip, ${payload.markerBytes} bytes)`);
+console.log(`check-electron-clipboard: OK (real Electron clipboard round-trip, ${result.markerBytes} bytes; attempts=${result.attempts})`);

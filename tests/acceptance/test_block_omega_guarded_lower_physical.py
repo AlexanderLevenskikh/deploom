@@ -216,8 +216,8 @@ class BlockOmegaGuardedLowerPhysicalAcceptance(unittest.TestCase):
             result = stop_guarded_clone(target)
             self.assertFalse(result.errors, result.errors)
             self.assertTrue(
-                result.mutations,
-                "shared dependency mutation must be detected without a baseline hash",
+                result.notification_only,
+                "shared dependency writes must reject the lower without falsely claiming a baseline byte comparison",
             )
             cleanup_guarded_clone(target)
 

@@ -1,8 +1,5 @@
-"""Explicit Git-visible migration inputs, with repository-relative layout retained."""
+"""Source closure policy, with repository-relative layout retained."""
 from pathlib import Path
-import json
-import os
-import subprocess
 
 MODE_ENV = "DEPLOOM_SOURCE_SCOPE_MODE"
 
@@ -23,9 +20,14 @@ def in_scope(name, roots):
 
 
 def policy_payload(policy):
-    if not policy.scope_roots:
+    if policy.frontend_profile:
+        return {"mode": "frontend-source-v1", "excludedBuildOutputPaths": list(policy.frontend_build_output_paths),
+                "excludedCachePaths": list(policy.excluded_relative_paths)}
+    if policy.frontend_build_output_paths:
+        return {"mode": "frontend-msbuild-outputs-v1", "excludedBuildOutputPaths": list(policy.frontend_build_output_paths)}
+    if not policy.scope_roots and not policy.excluded_relative_paths:
         return {}
-    return {"mode": "project-gitignore", "roots": list(policy.scope_roots),
+    return {"mode": "project-gitignore", "roots": list(policy.scope_roots or (".",)),
             "excludedPaths": list(policy.excluded_relative_paths)}
 
 
@@ -33,6 +35,21 @@ def policy_from_payload(raw):
     from source_snapshot import SourceInputPolicy, SourceCaptureError
     if not raw:
         return SourceInputPolicy()
+    if isinstance(raw, dict) and raw.get("mode") == "frontend-source-v1":
+        paths = raw.get("excludedBuildOutputPaths")
+        caches = raw.get("excludedCachePaths")
+        from frontend_source_policy import validate_build_output_paths, AGENT_STATE_DIRS, KNOWN_FRONTEND_CACHE_PATHS
+        validate_build_output_paths(paths)
+        if not isinstance(caches, list) or any(name not in KNOWN_FRONTEND_CACHE_PATHS for name in caches):
+            raise SourceCaptureError("SOURCE_FRONTEND_CACHE_POLICY_INVALID")
+        from source_snapshot import DEFAULT_EXCLUDED_DIR_NAMES
+        return SourceInputPolicy(excluded_dir_names=(*DEFAULT_EXCLUDED_DIR_NAMES, *AGENT_STATE_DIRS),
+            excluded_relative_paths=tuple(caches), frontend_build_output_paths=tuple(paths), frontend_profile=True)
+    if isinstance(raw, dict) and raw.get("mode") == "frontend-msbuild-outputs-v1":
+        paths = raw.get("excludedBuildOutputPaths")
+        from frontend_source_policy import validate_build_output_paths
+        validate_build_output_paths(paths)
+        return SourceInputPolicy(frontend_build_output_paths=tuple(paths))
     if not isinstance(raw, dict) or raw.get("mode") != "project-gitignore":
         raise SourceCaptureError("SOURCE_SCOPE_POLICY_INVALID")
     roots, excluded = raw.get("roots"), raw.get("excludedPaths")
@@ -45,77 +62,24 @@ def policy_from_payload(raw):
 
 
 def policy_for_project(project, root):
+    """Workspace membership/Git visibility cannot prove execution source closure.
+
+    Generic JS/TS tasks can read sibling resources, ignored generated inputs or
+    root-level tools. Without a complete closure certificate, retain the full
+    authoritative root. Dependency payload stays under the existing separate
+    SourceInputPolicy exclusions; this never expands node_modules into source.
+    """
     from source_snapshot import SourceInputPolicy, SourceCaptureError
-    if os.environ.get(MODE_ENV) != "project-gitignore":
-        return SourceInputPolicy()
     project, root = Path(project).resolve(), Path(root).resolve()
-    roots = {project.relative_to(root).as_posix()}
-    if not (root / ".git").exists():
-        # A standalone non-Git directory is already the selected source root.
-        return SourceInputPolicy()
-    from project_topology import _select_owned_lockfile, _workspace_owns, ProjectTopologyError
     try:
-        manager, lockfile, patterns = _select_owned_lockfile(project, source_boundary=root)
-        # Installation consumes declared member manifests and local workspaces.
-        # Expand workspace patterns directly: never walk unrelated backend builds.
-        import glob
-        from workspace_glob import expand_braces
-        for pattern in patterns:
-            if pattern.startswith("!"): continue
-            for expanded in expand_braces(pattern):
-                for name in glob.glob(str(manager / expanded / "package.json"), recursive=True):
-                    directory = Path(name).resolve().parent
-                    if _workspace_owns(manager, directory, patterns):
-                        roots.add(directory.relative_to(root).as_posix())
-    except ProjectTopologyError as exc:
-        raise SourceCaptureError(f"SOURCE_SCOPE_TOPOLOGY_UNAVAILABLE: {exc}") from exc
-    # Direct file:/link:/portal: inputs remain in scope, including transitive ones.
-    pending = list(roots); seen = set()
-    while pending:
-        name = pending.pop()
-        if name in seen: continue
-        seen.add(name)
-        manifest = root / name / "package.json"
-        if not manifest.is_file(): continue
-        raw = json.loads(manifest.read_text(encoding="utf-8-sig"))
-        for section in ("dependencies", "devDependencies", "optionalDependencies"):
-            for value in (raw.get(section) or {}).values():
-                if isinstance(value, str) and value.startswith(("file:", "link:", "portal:")):
-                    target = (manifest.parent / value.split(":", 1)[1]).resolve()
-                    try: relative = target.relative_to(root).as_posix()
-                    except ValueError: raise SourceCaptureError("SOURCE_SCOPE_LOCAL_DEPENDENCY_OUTSIDE_REPOSITORY")
-                    if relative not in roots: roots.add(relative); pending.append(relative)
-    roots = tuple(sorted(roots))
-    result = subprocess.run(["git", "-C", str(root), "ls-files", "--cached", "--others", "--exclude-standard", "--exclude=node_modules/", "--exclude=.dependency-roadmap/", "-z"],
-        capture_output=True, encoding="utf-8", errors="strict", timeout=120, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
-    if result.returncode:
-        raise SourceCaptureError("SOURCE_SCOPE_GIT_INVENTORY_FAILED")
-    files = {name for name in result.stdout.split("\0") if name and in_scope(name, roots)}
-    # Keep the project's explicitly configured local Yarn executable, even when
-    # the Yarn cache/release folder is ignored. Do not include arbitrary ignored data.
-    for directory in [root, *[root / name for name in roots]]:
-        config = directory / ".yarnrc.yml"
-        if config.is_file():
-            import re
-            match = re.search(r"(?m)^\s*yarnPath:\s*['\"]?([^'\"\r\n]+)", config.read_text(encoding="utf-8-sig"))
-            if match:
-                target = (directory / match.group(1).strip()).resolve()
-                try: files.add(target.relative_to(root).as_posix())
-                except ValueError: raise SourceCaptureError("SOURCE_SCOPE_YARN_PATH_OUTSIDE_REPOSITORY")
-    dirs = {"."}
-    for name in files:
-        dirs.update(parent.as_posix() for parent in Path(name).parents)
-    excluded = []
-    stack = [root]
-    while stack:
-        folder = stack.pop()
-        with os.scandir(folder) as entries:
-            for item in entries:
-                path = Path(item.path); relative = path.relative_to(root).as_posix()
-                if relative == ".git": continue
-                if item.is_dir(follow_symlinks=False):
-                    if relative in dirs: stack.append(path)
-                    else: excluded.append(relative)
-                elif relative not in files:
-                    excluded.append(relative)
-    return SourceInputPolicy(scope_roots=roots, excluded_relative_paths=tuple(sorted(excluded)))
+        project.relative_to(root)
+    except ValueError as exc:
+        raise SourceCaptureError("SOURCE_SCOPE_PROJECT_OUTSIDE_ROOT") from exc
+    import os
+    if os.environ.get(MODE_ENV) == "frontend":
+        from frontend_source_policy import discover_backend_build_outputs, AGENT_STATE_DIRS, KNOWN_FRONTEND_CACHE_PATHS
+        from source_snapshot import DEFAULT_EXCLUDED_DIR_NAMES
+        caches = KNOWN_FRONTEND_CACHE_PATHS if (root / "nx.json").is_file() else ()
+        return SourceInputPolicy(excluded_dir_names=(*DEFAULT_EXCLUDED_DIR_NAMES, *AGENT_STATE_DIRS),
+            excluded_relative_paths=caches, frontend_build_output_paths=discover_backend_build_outputs(root), frontend_profile=True)
+    return SourceInputPolicy()

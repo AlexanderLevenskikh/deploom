@@ -51,7 +51,7 @@ _RESOLVER_FILES = (
 )
 
 _EXCLUDED_FALLBACK_DIRS = {
-    ".git", "node_modules", "dist", "build", ".cache", ".dependency-roadmap",
+    ".git", "node_modules", ".dependency-roadmap",
     ".idea", ".vs", ".vscode", ".fleet",
 }
 
@@ -242,11 +242,44 @@ def _local_fixed_target(project_dir: Path, spec: str) -> Path:
 
 
 def _external_fixed_target_identity(project_dir: Path, spec: str) -> Mapping[str, object]:
+    project_dir = proof_subject_project_dir(project_dir)
     target = _local_fixed_target(project_dir, spec)
+    logical_target = target
+    snapshot = active_source_snapshot(project_dir)
+    if snapshot is not None:
+        # Physical temporary paths are not resolver source identity. Read only
+        # captured bytes, but name an internal target in its logical source root.
+        try:
+            relative = target.relative_to(snapshot.root.resolve())
+            logical_target = "source-relative:" + (relative.as_posix() or ".")
+        except ValueError as exc:
+            # A literal absolute original path is not relocated by the resolver.
+            # Never fingerprint captured bytes while installation reads live ones.
+            raise SourceIdentityUnavailable("FIXED_SOURCE_LOCAL_TARGET_OUTSIDE_SOURCE_CLOSURE") from exc
     base = {
-        "path": str(target).replace("\\", "/"),
+        "path": str(logical_target).replace("\\", "/"),
         "spec": spec,
     }
+    if snapshot is not None:
+        from source_snapshot import sealed_source_manifest_entries
+        try:
+            entries = sealed_source_manifest_entries(snapshot)
+        except (SourceCaptureError, OSError, ValueError) as exc:
+            raise SourceIdentityUnavailable(str(exc)) from exc
+        prefix = relative.parts
+        selected = [(Path(str(item["path"])), item) for item in entries
+            if Path(str(item["path"])).parts[:len(prefix)] == prefix]
+        exact = next((item for path, item in selected if path == relative), None)
+        if exact and exact.get("kind") == "file":
+            return {**base, "kind": "file", "sha256": exact["sha256"]}
+        if any(item.get("kind") == "symlink" for _, item in selected):
+            return {**base, "kind": "captured-reparse-source", "sourceSnapshotKey": snapshot.key}
+        if relative == Path(".") or exact and exact.get("kind") == "directory":
+            files = [(path.relative_to(relative).as_posix(), str(item["sha256"]))
+                for path, item in selected if item.get("kind") == "file"
+                and not any(part in _EXCLUDED_FALLBACK_DIRS for part in path.relative_to(relative).parts)]
+            return {**base, "kind": "directory", "contentTree": _canonical_hash({"kind":"content-tree", "files": sorted(files)})}
+        return {**base, "kind": "missing"}
     if not target.exists():
         return {**base, "kind": "missing"}
     if target.is_file():
@@ -580,11 +613,11 @@ def _immutable_remote_fixed_identity(
     )
 
 
-def remote_fixed_resolver_input_fingerprint(
+def _remote_fixed_resolver_input_payload(
     project_dir: Path,
     *,
     manager: str = "",
-) -> str:
+) -> Mapping[str, object]:
     """Hash only remote fixed inputs that can resolve differently during install.
 
     Local file/link/portal and workspace sources remain bound by the ordinary
@@ -664,25 +697,22 @@ def remote_fixed_resolver_input_fingerprint(
                 "identity": dict(_manifest_fixed_control_identity(project_dir, spec)),
             })
 
-    return _canonical_hash(
-        {
-            "schema": PROOF_SCHEMA_VERSION,
-            "toolBuildId": tool_build_id(),
-            "remoteFixedResolverInputs": remote,
-            "remoteFixedResolverControlInputs": controls,
-        },
-        length=64,
-    )
+    return {
+        "schema": PROOF_SCHEMA_VERSION,
+        "toolBuildId": tool_build_id(),
+        "remoteFixedResolverInputs": remote,
+        "remoteFixedResolverControlInputs": controls,
+    }
 
 
-def fixed_resolver_input_fingerprint(
+def _fixed_resolver_input_payload(
     project_dir: Path,
     *,
     manager: str = "",
-) -> str:
+) -> Mapping[str, object]:
     # Root manifest/lock/config files are hashed separately by ResolverInputKey.
     # This key adds the source/content identity that those files cannot capture.
-    project_dir = project_dir.resolve()
+    project_dir = proof_subject_project_dir(project_dir)
     manifest_path = project_dir / "package.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
@@ -757,16 +787,50 @@ def fixed_resolver_input_fingerprint(
                 "identity": dict(_manifest_fixed_control_identity(project_dir, spec)),
             })
 
-    return _canonical_hash(
-        {
-            "schema": PROOF_SCHEMA_VERSION,
-            "toolBuildId": tool_build_id(),
-            "fixedResolverInputs": fixed,
-            "fixedResolverControlInputs": fixed_controls,
-        },
-        length=64,
-    )
+    return {
+        "schema": PROOF_SCHEMA_VERSION,
+        "toolBuildId": tool_build_id(),
+        "fixedResolverInputs": fixed,
+        "fixedResolverControlInputs": fixed_controls,
+    }
 
+
+
+def _safe_component_name(value):
+    text = str(value)
+    return text if re.fullmatch(r"[A-Za-z0-9_@./*+-]{1,200}", text) else "component-" + _canonical_hash(text, length=12)
+
+
+def fixed_resolver_input_identity(project_dir: Path, *, manager: str = "", remote_only: bool = False):
+    try:
+        subject = proof_subject_project_dir(project_dir)
+        snapshot = active_source_snapshot(subject)
+        if snapshot is not None:
+            validate_source_snapshot(snapshot)
+        payload = (_remote_fixed_resolver_input_payload if remote_only else _fixed_resolver_input_payload)(subject, manager=manager)
+        if snapshot is not None:
+            validate_source_snapshot(snapshot)
+    except SourceCaptureError as exc:
+        raise SourceIdentityUnavailable(str(exc)) from exc
+    components = {"schema": _canonical_hash(payload["schema"], length=64),
+                  "toolBuildId": str(payload["toolBuildId"])}
+    for field, entries in payload.items():
+        if not isinstance(entries, list):
+            continue
+        for index, entry in enumerate(entries):
+            label = _safe_component_name(entry.get("name") or ".".join(map(str, entry.get("path") or (index,))))
+            components[field + ":" + str(entry.get("section") or "control") + ":" + label] = _canonical_hash(entry, length=64)
+            if entry.get("workspaceSourceSnapshotKey"):
+                components["workspaceSourceSnapshotKey"] = str(entry["workspaceSourceSnapshotKey"])
+    return {"key": _canonical_hash(payload, length=64), "components": dict(sorted(components.items()))}
+
+
+def fixed_resolver_input_fingerprint(project_dir: Path, *, manager: str = "") -> str:
+    return fixed_resolver_input_identity(project_dir, manager=manager)["key"]
+
+
+def remote_fixed_resolver_input_fingerprint(project_dir: Path, *, manager: str = "") -> str:
+    return fixed_resolver_input_identity(project_dir, manager=manager, remote_only=True)["key"]
 
 
 def source_snapshot_fingerprint(project_dir: Path) -> str:
@@ -968,10 +1032,18 @@ def _resolver_context_payload(
         raise SourceIdentityUnavailable(
             f"PROJECT_TOPOLOGY_UNAVAILABLE: {exc}"
         ) from exc
+    from verification_source_closure import require_complete_source_policy
+    from source_snapshot import SourceInputPolicy
+    snapshot = active_source_snapshot(project_dir)
+    try:
+        closure = require_complete_source_policy(snapshot.input_policy or SourceInputPolicy() if snapshot else SourceInputPolicy())
+    except SourceCaptureError as exc:
+        raise SourceIdentityUnavailable(str(exc)) from exc
     return {
         "schema": PROOF_SCHEMA_VERSION,
         "toolBuildId": tool_build_id(),
         "projectTopology": topology_payload,
+        "verificationSourceClosure": closure,
         "projectResolverFiles": _resolver_ancestor_files(project_dir),
         "userConfigFiles": _user_config_files(environment),
         "effectiveYarnConfig": _effective_yarn_config_identity(
