@@ -63,6 +63,7 @@ export type ScenarioAttemptShape = {
 
 export type ScenarioRunnerShape = {
   present: boolean
+  canResumeTerminal?: boolean
   residualRepair?: { resumable?: boolean }
   progressSummary?: { accepted: number }
   phase?: string
@@ -103,6 +104,8 @@ export type ScenarioMainActionState =
 
 export type ScenarioMainAction = {
   state: ScenarioMainActionState
+  /** Explicitly reopen the saved terminal checkpoint before driving. */
+  resumeTerminal?: boolean
   /** fixable local blocker surfaced once (e.g. an uninitialized submodule). */
   blocker?: IterativeFailureInfo
   /** true when this is the first drive of a freshly captured run. */
@@ -166,6 +169,11 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
       reasonShort:
         attempt?.reason ?? "Провайдер агента временно недоступен — ремонт ждёт повтора запуска и не расходует попытку.",
     }
+  }
+
+  if (runner?.present && runner.phase === 'TERMINAL' && runner.canResumeTerminal === true) {
+    return { state: 'continue-run', resumeTerminal: true, blocker, firstRun: false,
+      reasonShort: 'Продолжим обновление с последнего проверенного состояния. Сохранённая подготовка будет использована после проверки актуальности.' }
   }
 
   if (runner?.present && runner.phase === 'TERMINAL' && runner.residualRepair?.resumable) {

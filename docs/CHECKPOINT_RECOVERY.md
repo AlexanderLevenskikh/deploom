@@ -73,11 +73,13 @@ Explicit continuation archives legacy engine deferrals containing npm warning
 text, preserves real incompatibilities, and replans from the sealed checkpoint
 without resetting budgets or acceptance evidence.
 
-An interrupted security session exposes Resume preparation when its run,
+The primary Continue the update action selects checkpoint recovery when it is
+actionable, otherwise it resumes an interrupted security session when its run,
 checkpoint, private workspace and saved session match. The controller resumes
 the same session and attempt, then independently verifies its result. Existing
-terminal outcomes do not hide that unfinished work. Continue from saved result
-reopens planning separately; neither action repeats begin or grants an old PASS
+terminal outcomes do not hide that unfinished work. A previous agent session
+remains an explicitly explained alternative when checkpoint recovery is selected;
+neither action repeats begin or grants an old PASS
 to changed source, runtime or configuration.
 
 ## Validation

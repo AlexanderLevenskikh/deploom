@@ -45,6 +45,19 @@ const envelope =
 const controlEnvelope =
   'ITERATIVE_MIGRATION_FAILURE_V1 {"code": "PROJECT_CONTROL_FAILED", "summary": "Контроль текущих зависимостей не пройден: npm run test (exit 1).", "command": "", "fixable": true}';
 
+expect("checkpoint recovery is the single recommended continuation", () => {
+  for (const residualRepair of [undefined, {resumable:true}]) {
+    const input = {inFlight:false,checked:true,taskPresent:false,noTargets:false,
+      attempt:attempt({status:'failed'}),
+      runner:runner({phase:'TERMINAL',canResumeTerminal:true,residualRepair,decision:{step:'finish',reason:'NO_VERIFIED_UPGRADE'}})};
+    const action = deriveMainAction(input);
+    assert.equal(action.state,'continue-run');
+    assert.equal(action.resumeTerminal,true);
+    assert.equal(deriveMainAction({...input,inFlight:true}).state,'running');
+    assert.equal(scenarioPipeline(action.state,true,{runner:input.runner}).current,'upgrade');
+  }
+});
+
 expect("interrupted security session overrides old no-upgrade terminal", () => {
   const input = { inFlight:false, checked:true, taskPresent:false, noTargets:false,
     attempt: attempt({status:'failed', stage:'agent', lastError:'DELIVERY_AGENT_IDLE_TIMEOUT'}),

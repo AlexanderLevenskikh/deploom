@@ -66,7 +66,7 @@ const MAIN_LABEL: Record<ScenarioMainActionState, [string, string]> = {
   'continue-run': ['Продолжить обновление', 'Continue the update'],
   running: ['Остановить', 'Stop'],
   'recovered-running': ['Продолжить обновление', 'Continue the update'],
-  'resume-delivery': ['Продолжить подготовку', 'Resume preparation'],
+  'resume-delivery': ['Продолжить обновление', 'Continue the update'],
   agent: ['Исправить агентом', 'Repair with an agent'],
   // Launch-wait: a provider rate limit / temporary outage parked the repair.
   // The only useful user control while waiting is canceling the wait.
@@ -93,7 +93,7 @@ const MAIN_DESCRIPTION: Record<ScenarioMainActionState, [string, string]> = {
   'continue-run': ['Работа приостановлена. Продолжите — применим и проверим следующую группу.', 'The update is paused. Continue — the next group will be applied and verified.'],
   running: ['Идёт работа. Остановить можно в любой момент; проверенный результат сохраняется.', 'Work is running. You can stop at any time; the verified result is kept.'],
   'recovered-running': ['Работа была прервана перезапуском; процесс не запущен. Продолжите, чтобы возобновить её.', 'Work was interrupted by a restart; no process is running. Continue to resume it.'],
-  'resume-delivery': ['Рабочая копия и сессия сохранены. Продолжите прерванную подготовку.', 'The workspace and session are saved. Resume the interrupted preparation.'],
+  'resume-delivery': ['Агент продолжит прерванные исправления в сохранённой рабочей копии. Затем проверим результат.', 'The agent resumes interrupted repairs in the saved workspace. The result will then be verified.'],
   agent: ['Нужны исправления в изолированном окружении. Запустите агента.', 'Repairs are needed in an isolated environment. Run the agent.'],
   // Launch-wait: the durable attempt.reason carries the exact cause + the next
   // attempt time; the static line is the fallback when the journal is absent.
@@ -606,6 +606,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         'Registry-данные не получены или бюджет поиска исчерпан — результат не засчитан. Повторите поиск или настройте состав обновления.',
         'Registry data was not obtained or the search budget was exhausted — not counted. Retry the search or configure the update scope.',
       )
+    : mainAction.resumeTerminal
+    ? text('Продолжим с последнего проверенного состояния. Сохранённая подготовка будет использована после проверки актуальности.', 'Continue from the last verified state. Saved preparation will be reused after checking its validity.')
     : mainAction.state === 'blocked' && (runner?.progressSummary?.accepted ?? 0) > 0
     ? text('Принятые обновления проверены и сохранены. Финальное подтверждение результата заблокировано; откройте результат и данные аудита.', 'Accepted updates are verified and saved. Final confirmation is blocked; open the result and audit evidence.')
     : mainAction.state === 'agent' && attempt?.status === 'done' && attempt.lastStep === 'agent'
@@ -689,7 +691,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       case 'start-run':
       case 'continue-run':
       case 'recovered-running':
-        void driveNow()
+        void driveNow(false, mainAction.resumeTerminal === true)
         break
       case 'running':
         void cancelNow()
@@ -773,8 +775,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.cohortReviewEnabled !== false} disabled={childAlive || stepBusy || disabledExternal === true} onChange={event => { void window.dependencyFlow?.reviewIterativeCohort({ workspaceId, projectName, enabled: event.target.checked }).then(result => { if (!result.ok) setNote(result.error); return refreshRunner() }).catch(error => setNote(String(error))) }} />{text('Согласовывать группы зависимостей перед обновлением', 'Review dependency cohorts before updating')}</label>
       <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.autopilotEnabled || runner?.autopilotActive || autopilot} disabled={disabledExternal === true} onChange={event => { const enabled = event.target.checked; setAutopilot(enabled); void window.dependencyFlow?.setIterativeAutopilot({ workspaceId, projectName, enabled }).then(() => refreshRunner()).catch(error => { setAutopilot(!enabled); setNote(String(error)) }) }} />{text('Автопилот: продолжать автоматически, включая исправления агентом', 'Autopilot: continue automatically, including agent repairs')}</label>
       <small>{runner?.phase === 'TERMINAL'
-        ? runner.canResumeTerminal
-          ? text('Включите автопилот для автоматического продолжения или продолжите вручную кнопкой ниже.', 'Enable autopilot to continue automatically, or use the button below to continue manually.')
+        ? runner.canResumeTerminal || runner.residualRepair?.resumable
+          ? text('Продолжите обновление кнопкой ниже. Автопилот сможет выполнять следующие этапы автоматически.', 'Continue the update using the button below. Autopilot can run subsequent stages automatically.')
           : text('Прогон завершён. Для продолжения нужен новый вариант обновления; проверенный результат сохранён.', 'The run has ended. Continuing requires a new update proposal; the verified result is preserved.')
         : text('Можно включить во время работы. Автопилот продолжит после текущего шага; выключение остановит автоматические переходы.', 'Enable while running to continue after the current step; disabling stops automatic transitions.')}</small>
       <footer className="baseline-intent-actions">
@@ -790,12 +792,6 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
           {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' || mainAction.state === 'repair-current' ? <Wrench size={16} /> : mainAction.state === 'result' || mainAction.state === 'partial' || mainAction.state === 'budget-stop' || mainAction.state === 'blocked' || mainAction.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}
           {mainLabel}
         </button>
-        {runner?.phase === 'TERMINAL' && runner.canResumeTerminal === true && ['blocked', 'partial', 'budget-stop', 'no-upgrade', 'resume-delivery'].includes(mainAction.state) ? (
-          <button type="button" className="button primary" data-testid="iterative-resume-action"
-            disabled={busyLocked || childAlive} onClick={() => { void driveNow(false, true) }}>
-            <Rocket size={16} />{text('Продолжить с сохранённого результата', 'Continue from saved result')}
-          </button>
-        ) : null}
         {(attempt || runner?.present) && mainAction.state !== 'running' ? (
           <button type="button" className="button secondary" data-testid="iterative-restart"
             disabled={busyLocked}
@@ -874,7 +870,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
 
       {state.phase === 'ready' ? mainActionArea : null}
 
-      {runner?.phase === 'TERMINAL' && runner.canResumeTerminal === true && ['blocked', 'partial', 'budget-stop', 'no-upgrade', 'resume-delivery'].includes(mainAction.state) ? (
+      {runner?.phase === 'TERMINAL' && runner.canResumeTerminal === true && ['continue-run', 'blocked', 'partial', 'budget-stop', 'no-upgrade', 'resume-delivery'].includes(mainAction.state) ? (
         <div className="resume-notice" data-testid="iterative-resume-result">
           <span>{runner.stopDetail ? text(`Исправление группы из ${runner.stopDetail.packageCount} пакетов остановлено по таймауту. Новых принятых обновлений нет. Правки сохранены отдельно. ${runner.stopDetail.recoverable ? 'Продолжение возобновит ремонт.' : 'Нужен другой вариант обновления.'} Итоговый аудит: ${runner.stopDetail.auditStatus}.`, `Repair of ${runner.stopDetail.packageCount} packages stopped on timeout. No new updates accepted. Trial edits are preserved. ${runner.stopDetail.recoverable ? 'Continue resumes the repair.' : 'A different update proposal is needed.'} Final audit: ${runner.stopDetail.auditStatus}.`) : text('Проверенное состояние сохранено. Продолжение сохраняет ограничения и бюджет; непринятые изменения требуют проверки.', 'The verified state is saved. Continuing preserves limits and budget; unaccepted changes still need verification.')}</span>
         </div>
@@ -961,7 +957,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         </> : null}
         {runner.delivery?.cleanup?.archiveRoot ? <button className="button secondary" onClick={() => void onOpenPath(runner.delivery!.cleanup!.archiveRoot)}><FileText size={16} />{text('Сохранённые документы', 'Archived documents')}</button> : null}
         {runner.delivery?.workspaceRoot ? <button className="button secondary" onClick={() => void onOpenPath(runner.delivery!.workspaceRoot)}><ExternalLink size={16} />{text('Открыть ветку результата', 'Open the result branch')}</button> : null}
-        {runner.delivery?.status !== 'done' ? <button className="button secondary" disabled={busyLocked || childAlive} onClick={() => void agentNow()}><Rocket size={16} />{runner.delivery ? text('Продолжить подготовку коммитов', 'Resume commit preparation') : text('Устранить остаток и подготовить коммиты', 'Repair remaining goals and prepare commits')}</button> : null}
+        {runner.residualRepair?.resumable && mainAction.resumeTerminal ? <span>{text('Дополнительно можно возобновить прежнюю сессию агента с её непроверенными правками. Результат потребует проверки.', 'Alternatively, resume the previous agent session with its unverified edits. The result will require verification.')}</span> : null}
+        {runner.delivery?.status !== 'done' && mainAction.state !== 'resume-delivery' ? <button className="button secondary" disabled={busyLocked || childAlive} onClick={() => void agentNow()}><Rocket size={16} />{runner.residualRepair?.resumable ? text('Возобновить работу агента', 'Resume the agent') : runner.delivery ? text('Продолжить подготовку коммитов', 'Resume commit preparation') : text('Устранить остаток и подготовить коммиты', 'Repair remaining goals and prepare commits')}</button> : null}
       </div> : null}
 
       {runner?.scopeExpansionIssues?.length ? (
