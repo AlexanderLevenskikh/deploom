@@ -1,0 +1,39 @@
+DEMO small: begin exit=0
+DEMO small: plan-next exit=0
+DEMO small: materialize exit=0
+DEMO small: precheck exit=0
+DEMO small: apply-feedback exit=0
+DEMO small: verify-exact exit=0
+DEMO small: audit exit=0
+DEMO small: finish exit=0
+test_small_to_large_real_delivery_audit_and_lossless_cleanup (dependency_roadmap_test_test_storage_delivery_demo_0.StorageDeliveryDemoTests.test_small_to_large_real_delivery_audit_and_lossless_cleanup) ... [audit] loading publish metadata for 1 packages with 1 workers
+[audit] publish metadata 1/1
+DEMO small: files=10, payloadMiB=1, delivery=done, audit=PASS, terminal=COMPLETE, reclaimedBytes=1086479, seconds=87.4
+DEMO medium: begin exit=0
+DEMO medium: plan-next exit=0
+DEMO medium: materialize exit=0
+DEMO medium: precheck exit=0
+DEMO medium: apply-feedback exit=0
+DEMO medium: verify-exact exit=0
+DEMO medium: audit exit=0
+DEMO medium: finish exit=0
+[audit] loading publish metadata for 1 packages with 1 workers
+[audit] publish metadata 1/1
+DEMO medium: files=200, payloadMiB=8, delivery=done, audit=PASS, terminal=COMPLETE, reclaimedBytes=8493571, seconds=93.4
+DEMO large: begin exit=0
+DEMO large: plan-next exit=0
+DEMO large: materialize exit=0
+DEMO large: precheck exit=0
+DEMO large: apply-feedback exit=0
+DEMO large: verify-exact exit=0
+DEMO large: audit exit=0
+DEMO large: finish exit=0
+[audit] loading publish metadata for 1 packages with 1 workers
+[audit] publish metadata 1/1
+ok
+DEMO large: files=2000, payloadMiB=64, delivery=done, audit=PASS, terminal=COMPLETE, reclaimedBytes=67780963, seconds=312.5
+
+----------------------------------------------------------------------
+Ran 1 test in 523.394s
+
+OK

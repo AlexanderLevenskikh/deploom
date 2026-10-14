@@ -9577,7 +9577,7 @@ function setupIpc(): void {
       { stdin: JSON.stringify(payload), onLine })
     if (result.code !== 0) throw new Error(result.stderr || 'Storage maintenance failed')
     return result.stdout
-  }, () => loadState().workspaces.map(workspace => workspace.path), () => jobs.size > 0 || iterativeStepInFlight.size > 0 || [...initialAuditJobs.values()].some(job => !job.finishedAt), status => {
+  }, () => loadState().workspaces.map(workspace => workspace.path), () => jobs.size > 0 || iterativeStepInFlight.size > 0 || iterativeAutopilot.hasActiveSessions() || [...initialAuditJobs.values()].some(job => !job.finishedAt), status => {
     for (const window of BrowserWindow.getAllWindows()) if (!window.webContents.isDestroyed()) window.webContents.send('flow:storage-status', status)
   })
   ipcMain.handle('flow:storage-status', () => storageCleanup.status())

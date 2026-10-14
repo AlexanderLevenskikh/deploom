@@ -6,6 +6,8 @@ import { resolve, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const { StorageCleanupController } = await import('../dist-electron/storage-cleanup.js');
+const { createIterativeAutopilot } = await import('../dist-electron/iterative-autopilot.js');
+const { readFileSync } = await import('node:fs');
 const fixture = mkdtempSync(join(tmpdir(), 'deploom-storage-check-'));
 const root = join(fixture, 'verification');
 const trials = join(root, 'trials');
@@ -92,6 +94,61 @@ try {
   await new Promise(done => setTimeout(done, 1100)); assert.deepEqual(calls, []);
   automaticActive = false; await new Promise(done => setTimeout(done, 2100));
   assert.deepEqual(calls, ['inspect', 'clean']); assert.equal(automatic.status().phase, 'done');
+  // Reproduce cleanup scheduled by an agent finally while Autopilot still owns
+  // the run: reject the repair, discard its trial, then materialize a new candidate.
+  const scope = { workspaceId: 'test-workspace', projectName: 'demo', autopilot: true };
+  const autopilot = createIterativeAutopilot(input => input.projectName);
+  const betweenSteps = Promise.withResolvers();
+  const resumeDrive = Promise.withResolvers();
+  const maintenanceCalls = [];
+  const sessionCleanup = new StorageCleanupController(async action => {
+    maintenanceCalls.push(action);
+    return 'STORAGE_RESULT_V1 ' + JSON.stringify(action === 'inspect' ? inventory : final);
+  }, () => [], () => autopilot.hasActiveSessions());
+  // Also pin production wiring; per-step locks alone leave the inter-step gap open.
+  assert.ok(readFileSync(join(repo, 'desktop/electron/main.ts'), 'utf8').includes('() => jobs.size > 0 || iterativeStepInFlight.size > 0 || iterativeAutopilot.hasActiveSessions()'));
+  await sessionCleanup.maintenance('inspect', 'session-preview', () => {});
+  maintenanceCalls.length = 0;
+  let drives = 0;
+  const drive = autopilot.register('drive', async (_event, input) => {
+    sessionCleanup.assertMigrationAllowed();
+    if (++drives === 1) return { ok: true, stopped: 'agent-gate' };
+    assert.equal(input.discardCandidate, true);
+    // This await represents a status read before the next Python step lock.
+    betweenSteps.resolve();
+    await resumeDrive.promise;
+    sessionCleanup.assertMigrationAllowed();
+    return { ok: true, stopped: 'finished' };
+  });
+  autopilot.register('status', async () => ({ ok: true, decision: 'repair' }));
+  autopilot.register('agent', async () => {
+    sessionCleanup.scheduleAutomatic();
+    return { ok: false, error: 'FORBIDDEN_MUTATION: modified:tool-config' };
+  });
+  const migration = drive(undefined, scope);
+  await betweenSteps.promise;
+  assert.equal(autopilot.hasActiveSessions(), true);
+  await assert.rejects(sessionCleanup.maintenance('clean', 'during-session', () => {}), /Stop active migrations/);
+  await new Promise(done => setTimeout(done, 1100));
+  assert.deepEqual(maintenanceCalls, [], 'automatic cleanup must wait between steps');
+  resumeDrive.resolve();
+  assert.equal((await migration).autopilot.stopped, 'finished');
+  assert.equal(drives, 2);
+  assert.equal(autopilot.hasActiveSessions(), false);
+  await new Promise(done => setTimeout(done, 2100));
+  assert.deepEqual(maintenanceCalls, ['inspect', 'clean'], 'cleanup resumes after session completion');
+
+  // Pausing disables continuation but the current handler still owns its bytes.
+  const parked = Promise.withResolvers();
+  const releaseParked = Promise.withResolvers();
+  const manual = autopilot.register('begin', async () => { parked.resolve(); await releaseParked.promise; throw new Error('test failure'); });
+  const manualRun = manual(undefined, scope);
+  await parked.promise;
+  autopilot.setEnabled(scope, false);
+  assert.equal(autopilot.hasActiveSessions(), true);
+  releaseParked.resolve();
+  assert.equal((await manualRun).ok, false);
+  assert.equal(autopilot.hasActiveSessions(), false);
   let inspectFails = false;
   const invalidation = new StorageCleanupController(async () => { if (inspectFails) throw new Error('read failed'); return 'STORAGE_RESULT_V1 ' + JSON.stringify(inventory) }, () => [], () => false);
   await invalidation.maintenance('inspect', 'old-preview', () => {}); inspectFails = true;
