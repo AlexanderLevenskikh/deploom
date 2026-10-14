@@ -53,6 +53,17 @@ def trial_key(root, progress=None):
         progress_label='migration trial checkpoint integrity').key
 
 
+def observe_materialized_assignment(project, workspace, assignment, observe):
+    """Resolve hoisted dependencies only within this private trial's owner."""
+    from project_topology import _select_owned_lockfile
+    project, workspace = Path(project).resolve(), Path(workspace).resolve()
+    if not project.is_relative_to(workspace):
+        raise ValueError("MATERIALIZATION_PROJECT_OUTSIDE_TRIAL")
+    manager = (workspace if project == workspace else
+               _select_owned_lockfile(project, source_boundary=workspace)[0])
+    return observe(project, assignment, package_manager_root=manager)
+
+
 def completed_materialization(journal, root, assignment, observed, progress=None):
     row = journal.pass_record('materialize')
     if not row:

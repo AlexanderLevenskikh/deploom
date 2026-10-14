@@ -3931,7 +3931,7 @@ def _materialize_locked(
     candidate = load_candidate(run_dir)
     if candidate is None:
         raise InvalidInputError("NO_ACTIVE_CANDIDATE")
-    from iterative_stage_checkpoint import operation_journal, completed_materialization
+    from iterative_stage_checkpoint import operation_journal, completed_materialization, observe_materialized_assignment
     materialization_journal = operation_journal(run_dir, run, config, candidate, "materialize")
     refs = (candidate.get("materializationRefs") or {})
     workspace_root = trial_workspace_root(run_dir)
@@ -3943,7 +3943,7 @@ def _materialize_locked(
     project_relative = Path(str(base.get("projectRelative") or "."))
     project_path = workspace_root / project_relative
     recovered = completed_materialization(materialization_journal, workspace_root, candidate["fullAssignment"],
-        lambda: observed_resolved_assignment(project_path, candidate["fullAssignment"]))
+        lambda: observe_materialized_assignment(project_path, workspace_root, candidate["fullAssignment"], observed_resolved_assignment))
     if recovered is not None:
         _open_checkpoint_source(run_dir, base, config, run_id=str(run["runId"]))
         save_candidate(run_dir, recovered)
@@ -4007,7 +4007,7 @@ def _materialize_locked(
         )
 
     try:
-        observed = observed_resolved_assignment(project_path, candidate["fullAssignment"])
+        observed = observe_materialized_assignment(project_path, workspace_root, candidate["fullAssignment"], observed_resolved_assignment)
     except Exception as exc:  # drift / undeclared -> materialization not exact
         # Drift is a recoverable infrastructure-class observation (the install
         # did not produce the requested exact assignment). It is bounded by the

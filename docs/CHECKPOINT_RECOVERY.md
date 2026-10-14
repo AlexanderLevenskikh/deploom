@@ -82,6 +82,13 @@ remains an explicitly explained alternative when checkpoint recovery is selected
 neither action repeats begin or grants an old PASS
 to changed source, runtime or configuration.
 
+## Hoisted dependencies in materialized trials
+
+Fresh materialization and resumed materialization receipts observe dependencies
+from the selected package through its owning package-manager root inside the
+private trial. Yarn hoisting does not make an installed package missing. Exact
+versions, nearest-package shadowing and external-path rejection remain enforced.
+
 ## Validation
 
 Cross-process tests kill a real physical verifier after completed lint,

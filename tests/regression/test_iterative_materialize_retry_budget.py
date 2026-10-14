@@ -402,7 +402,7 @@ class PerRevisionRepairBudgetTests(MaterializeRetryBudgetBase):
              mock.patch("iterative_migration._apply_assignment", return_value={}), \
              mock.patch("iterative_migration._run_install", return_value=self.install_success()), \
              mock.patch("iterative_migration._runtime_env", return_value={}), \
-             mock.patch("iterative_migration.observed_resolved_assignment", side_effect=lambda p, assignment: assignment), \
+             mock.patch("iterative_migration.observed_resolved_assignment", side_effect=lambda p, assignment, **kwargs: assignment), \
              mock.patch("iterative_migration.observed_resolved_hash", return_value="h"), \
              mock.patch("iterative_migration.capture_source_snapshot", return_value=SimpleNamespace(key="trial-key")), \
              mock.patch("iterative_migration._emit_status"):
