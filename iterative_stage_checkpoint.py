@@ -44,7 +44,8 @@ def negative_evidence_scope(run_dir, config, checkpoint_id, *, checkpoint=None):
     if not closure or not base.get('sourceSnapshotKey'):
         return None
     return digest({'baseCheckpointId': checkpoint_id, 'sourceSnapshotKey': base['sourceSnapshotKey'],
-        'configHash': digest(config), 'toolBuildId': tool_build_id(),
+        'configHash': digest({key:value for key,value in config.items() if key != 'documentLanguage'}),
+        'toolBuildId': tool_build_id(),
         'environmentHash': digest(environment), 'runtimeClosure': closure})
 
 

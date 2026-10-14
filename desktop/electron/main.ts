@@ -8068,7 +8068,7 @@ function setupIpc(): void {
     }
   }))
 
-  ipcMain.handle('flow:iterative:begin', iterativeAutopilot.register('begin', async (_event, input: { workspaceId?: string; projectName: string; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
+  ipcMain.handle('flow:iterative:begin', iterativeAutopilot.register('begin', async (_event, input: { workspaceId?: string; projectName: string; language?: 'en' | 'ru'; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
     storageCleanup.assertMigrationAllowed()
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
@@ -8129,6 +8129,7 @@ function setupIpc(): void {
           workspaceId: workspace.id,
           projectId: project.name,
           toolBuildId: app.getVersion(),
+          language: input.language,
           requestedNode: project.nodeVersion || undefined,
           sourceScope: project.sourceScope,
         }
@@ -8248,6 +8249,7 @@ function setupIpc(): void {
           workspaceId: workspace.id,
           projectId: project.name,
           toolBuildId: app.getVersion(),
+          language: input.language,
           requestedNode: project.nodeVersion || undefined,
           sourceScope: project.sourceScope,
         }
@@ -8396,6 +8398,7 @@ function setupIpc(): void {
         targetsFile,
         intentFile,
         toolBuildId: app.getVersion(),
+        language: input.language,
         requestedNode: project.nodeVersion || undefined,
         sourceScope: project.sourceScope,
         // P1 (#1): carry the verified repaired source into the new migration.

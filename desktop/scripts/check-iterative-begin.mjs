@@ -39,6 +39,9 @@ saveMigrationProfile(profileRun, { commands: ['npm run typecheck'] });
 assert.deepEqual(readMigrationProfile(profileRun, profileRoot).commands, selectedProfile.commands, 'an active run uses the pinned profile');
 const profileInvocation = iterativeBeginInvocation(profileRun, { projectDir: profileRoot, projectName: 'demo', targetLevel: 'yellow', validationProfileFile: migrationProfilePath(profileRun) }, 'iterative_migration.py');
 assert.equal(profileInvocation.args[profileInvocation.args.indexOf('--validation-profile') + 1], migrationProfilePath(profileRun));
+assert.equal(profileInvocation.args.includes('--lang'),false,'unset language never infers locale');
+const russianDocuments = iterativeBeginInvocation(profileRun, {projectDir:profileRoot,projectName:'demo',targetLevel:'yellow',language:'ru'},'iterative_migration.py');
+assert.equal(russianDocuments.args[russianDocuments.args.indexOf('--lang')+1],'ru');
 
 const frontendInvocation = iterativeBeginInvocation(profileRun, { projectDir: profileRoot, projectName: 'demo', targetLevel: 'yellow', sourceScope: 'frontend' }, 'iterative_migration.py');
 assert.equal(frontendInvocation.args[frontendInvocation.args.indexOf('--source-scope') + 1], 'frontend');

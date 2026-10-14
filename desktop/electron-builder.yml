@@ -20,6 +20,8 @@ extraResources:
       - "requirements-solver.txt"
       - "scripts/**/*"
       - "templates/**/*"
+      - "document_locales/*.json"
+      - "examples/real_world_workspace_demos.py"
   - from: vendor
     to: tool/vendor
 win:

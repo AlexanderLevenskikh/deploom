@@ -605,10 +605,10 @@ class IterativeMigrationFinishAuditTests(unittest.TestCase):
             with patch("iterative_migration._audit_locked", side_effect=audit_now):
                 _finish_locked(root.root, load_run(root.root), load_config(root.root))
             report = (root.root / "reports/MIGRATION_REPORT.md").read_text(encoding="utf-8")
-            self.assertIn("статус `PASS`", report)
-            self.assertIn("lag-ok `100%`", report)
+            self.assertIn('"auditStatus": "PASS"', report)
+            self.assertIn('"lagOkPct": 100', report)
             self.assertIn("fresh-audit-evidence", report)
-            self.assertNotIn("статус `UNKNOWN`", report)
+            self.assertNotIn('"auditStatus": "UNKNOWN"', report)
 
     def test_finish_idempotent_preserves_terminal_outcome(self) -> None:
         from iterative_migration import _finish_locked, load_config, load_run
@@ -679,7 +679,7 @@ class IterativeMigrationReportTests(unittest.TestCase):
             )
             # Neither checkpoint accepted a change, so the guide reports NO
             # accepted upgrades with REAL content, not a placeholder promise.
-            self.assertIn("Проверенных обновлений зависимостей", guide)
+            self.assertIn("No accepted version changes are recorded", guide)
             self.assertNotIn("описываются по мере", guide)
 
     def test_report_orders_by_parent_chain_and_aggregates_coverage(self) -> None:
@@ -738,10 +738,12 @@ class IterativeMigrationReportTests(unittest.TestCase):
                 root.root, load_run(root.root), load_config(root.root), checkpoints, None,
             )
             # Parent-chain order: C0 before C1 before C2 (not filename order).
-            self.assertLess(report.index("| C0 "), report.index("| C1 "))
-            self.assertLess(report.index("| C1 "), report.index("| C2 "))
-            self.assertIn("Итог миграции", report)
-            self.assertIn("остаток: `0`", report)
+            checkpoint_table = report.split("## Checkpoint chain", 1)[1].split("##", 1)[0]
+            self.assertLess(checkpoint_table.index("| C0 "), checkpoint_table.index("| C1 "))
+            self.assertLess(checkpoint_table.index("| C1 "), checkpoint_table.index("| C2 "))
+            self.assertIn("## Outcome", report)
+            self.assertIn('"remaining": 0', report)
+            self.assertIn('"denominator": 2', report)
             self.assertIn("lagOkPct", report)
             self.assertIn("vulnerabilityPackages", report)
             self.assertIn("runtime adapter", report)
@@ -760,6 +762,7 @@ class IterativeMigrationReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = _RunDir(Path(tmp))
             root.write_config(_config_dict(targets={"pkg-a": "1.1.0"}))
+            root.write_run(_run_dict(activeCheckpointId="C1"))
             root.write_checkpoint(
                 _checkpoint_dict(
                     checkpoint_id="C1",
@@ -798,7 +801,8 @@ class IterativeMigrationReportTests(unittest.TestCase):
                 for cid in ("C0", "C1")
             ]
             guide = _build_developer_upgrade_guide(root.root, load_config(root.root), checkpoints)
-            self.assertIn("| `pkg-a` | `0.5.0` | `1.1.0` |", guide)
+            self.assertIn("| pkg-a | 0.5.0 | 1.1.0 | C1 | UNKNOWN |", guide)
+            self.assertIn("Data unavailable: `manifestHash`", guide)
             self.assertIn("dropped legacy API", guide)
             self.assertIn("PEER_RESOLUTION_DEFERRED", guide)
 

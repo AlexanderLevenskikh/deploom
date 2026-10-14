@@ -772,9 +772,9 @@ export function useDependencyFlow() {
     if (!api) return { ok: false, steps: [], stopped: 'error', error: 'NO_DESKTOP_API' }
     return api.iterativeDrive({ workspaceId: selectedWorkspaceId, projectName, autopilot, retryInfra, discardCandidate, resumeTerminal })
   }, [api, selectedWorkspaceId])
-  const iterativeBegin = useCallback(async (projectName: string, discovery?: { autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }): Promise<IterativeBeginOutcome> => {
+  const iterativeBegin = useCallback(async (projectName: string, discovery?: { language?: 'en' | 'ru'; autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }): Promise<IterativeBeginOutcome> => {
     if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
-    return api.iterativeBegin({ workspaceId: selectedWorkspaceId, projectName, autopilot: discovery?.autopilot, discovery, validationProfile: discovery?.validationProfile, checkOnly: discovery?.checkOnly, repair: discovery?.repair, restart: discovery?.restart })
+    return api.iterativeBegin({ workspaceId: selectedWorkspaceId, projectName, language: discovery?.language, autopilot: discovery?.autopilot, discovery, validationProfile: discovery?.validationProfile, checkOnly: discovery?.checkOnly, repair: discovery?.repair, restart: discovery?.restart })
   }, [api, selectedWorkspaceId])
   const iterativeAgent = useCallback(async (projectName: string, autopilot?: boolean, cleanupNotes?: boolean): Promise<IterativeAgentOutcome> => {
     if (!api) return { ok: false, error: 'NO_DESKTOP_API' }

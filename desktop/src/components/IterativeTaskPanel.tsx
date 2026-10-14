@@ -24,7 +24,7 @@ type Props = {
   onSave: (projectName: string, language?: string) => Promise<IterativeTaskActionOutcome>
   onStatus: (projectName: string) => Promise<IterativeStatusOutcome>
   onDrive: (projectName: string, autopilot?: boolean, retryInfra?: boolean, discardCandidate?: boolean, resumeTerminal?: boolean) => Promise<IterativeDriveOutcome>
-  onBegin: (projectName: string, discovery?: { autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
+  onBegin: (projectName: string, discovery?: { language?: 'en' | 'ru'; autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => Promise<IterativeBeginOutcome>
   onAgent: (projectName: string, autopilot?: boolean, cleanupNotes?: boolean) => Promise<IterativeAgentOutcome>
   onAttempt: (projectName: string) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; error?: string }>
   onCancel: (projectName: string) => Promise<{ ok: boolean }>
@@ -418,7 +418,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
     }
   }
 
-  const beginNow = async (discovery?: { autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
+  const beginNow = async (discovery?: { language?: 'en' | 'ru'; autopilot?: boolean; mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
     setStepBusy(true)
     setNote(undefined)
     // P2#5: a fresh attempt supersedes the previous "no targets" explanation.
@@ -427,7 +427,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
       const profile = validationDraft ?? runner?.validationProfile
       const validationProfile = runner?.present && !discovery?.restart ? undefined : profile && { ...profile, commands: profile.commands.map(c => c.trim()).filter(Boolean) }
       await onBeforeStart?.()
-      const outcome = await onBegin(projectName, { mode: discovery?.mode ?? 'none', autopilot: runner?.autopilotEnabled || runner?.autopilotActive || autopilot, ...discovery, validationProfile })
+      const outcome = await onBegin(projectName, { language, mode: discovery?.mode ?? 'none', autopilot: runner?.autopilotEnabled || runner?.autopilotActive || autopilot, ...discovery, validationProfile })
       if (outcome.autopilot) {
         setNote(autopilotNote(outcome.autopilot))
       } else if (outcome.ok) {

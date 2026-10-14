@@ -5,6 +5,7 @@ import hashlib
 import json
 import subprocess
 from pathlib import Path
+from migration_documents import relative_document_names
 
 DOCUMENT_NAMES = ("DEVELOPER_UPGRADE_GUIDE.md", "MIGRATION_REPORT.md")
 LINE_COMMENTS = {ext: "//" for ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".cs", ".java")}
@@ -166,7 +167,7 @@ def cleanup_prepare(run_dir, inputs):
     expected = {**state["expected"], **state.get("documentationHashes", {})}
     before = dict(expected)
     archive = run_dir / "delivery" / "notes-archive"
-    documents = {f"docs/dependency-migration/{state['runId']}/{name}" for name in DOCUMENT_NAMES}
+    documents = {f"docs/dependency-migration/{state['runId']}/{name}" for name in relative_document_names(state.get('documentLanguage') or 'en', primary=True)}
     changes = []
     from delivery_source_identity import text_identity
     identities = {}

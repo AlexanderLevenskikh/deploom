@@ -16,6 +16,8 @@
 | `settings.schema.json` | Схема настроек проекта и Desktop; источник истины для путей/режимов. |
 | `docs/ITERATIVE_MIGRATION_CONTROL_LOOP.md` | Текущий управляющий цикл накопительной миграции, фиксы аудита B1–B7, bounded GC и результаты валидации. |
 | `docs/ITERATIVE_MIGRATION_DEMO.md` | Профильная интеграционная демонстрация через настоящий Node coordinator + Python CLI. |
+| [MIGRATION_DOCUMENTS.md](MIGRATION_DOCUMENTS.md) | Явный язык документов, аудит до/после, недостающие доказательства и реконструкция. |
+| [REAL_WORLD_WORKSPACE_DEMOS.md](REAL_WORLD_WORKSPACE_DEMOS.md) | Изолированные сценарии форматов манифеста, монорепозиториев и реальных установок. |
 | [CHECKPOINT_RECOVERY.md](CHECKPOINT_RECOVERY.md) | Durable preparation, selected check receipts (including lint), migration and incumbent recovery. |
 | `docs/MIGRATION_VALIDATION.md` | Контракт валидации миграции: явные профили, fail-closed, не-пересъёмка baseline, сохранение старых падений. |
 | `docs/ITERATIVE_REPAIR_RECOVERY.md` | Ремонт исходников/конфига в изолированном checkout, typed feedback, ре-верификация на свежих bytes. |

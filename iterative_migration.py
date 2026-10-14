@@ -1310,6 +1310,7 @@ def build_run_config(run_dir: Path, args: argparse.Namespace, discover: bool = T
         "intent": intent,
         "createdAt": _now_iso(),
         "toolBuildId": args.tool_build_id or "",
+        "documentLanguage": getattr(args, "lang", None) or "en",
     }
 
 
@@ -1523,6 +1524,8 @@ def _begin_locked(
         "toolBuildId": config.get("toolBuildId") or "",
     }
     save_run(run_dir, run)
+    from migration_documents import write_pre_fix_report
+    write_pre_fix_report(run_dir, run, config, checkpoint)
 
     if status != "VERIFIED":
         _write_bootstrap_repair_request(run_dir, checkpoint, result)
@@ -1691,6 +1694,8 @@ def _begin_adopted_locked(
         "adoptedAt": _now_iso(),
     }
     save_run(run_dir, run)
+    from migration_documents import write_pre_fix_report
+    write_pre_fix_report(run_dir, run, config, checkpoint)
 
     # Mark the handoff adopted ONLY after the run is durable: a crash in between
     # leaves RUN_ALREADY_EXISTS instead of silently re-capturing the red source.
@@ -5468,6 +5473,12 @@ def cmd_finish(args: argparse.Namespace) -> int:
     lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=600)
     lock.acquire()
     try:
+        if getattr(args, "lang", None):
+            delivery = json.loads((run_dir / "delivery-state.json").read_text(encoding="utf-8-sig")) if (run_dir / "delivery-state.json").exists() else None
+            if delivery and (delivery.get("documentLanguage") or "en") != args.lang:
+                raise InvalidInputError("DOCUMENT_LANGUAGE_LOCKED_FOR_DELIVERY")
+            config = {**config, "documentLanguage": args.lang}
+            save_config(run_dir, config)
         return _finish_locked(run_dir, run, config)
     finally:
         lock.release()
@@ -5546,10 +5557,8 @@ def _finish_locked(run_dir: Path, run: Mapping[str, Any], config: Mapping[str, A
     # finish may have just persisted fresh audit evidence. Render those bytes,
     # not the pre-audit checkpoint list loaded at entry.
     checkpoints = _all_checkpoints(run_dir)
-    report = _build_migration_report(run_dir, run, config, checkpoints, existing_outcome or run.get("terminalOutcome"))
-    guide = _build_developer_upgrade_guide(run_dir, config, checkpoints)
-    (reports_dir / "MIGRATION_REPORT.md").write_text(report, encoding="utf-8")
-    (reports_dir / "DEVELOPER_UPGRADE_GUIDE.md").write_text(guide, encoding="utf-8")
+    from migration_documents import generate_run_documents
+    generate_run_documents(run_dir, run, config, checkpoints)
     _emit_status(
         {
             "event": "finish.done",
@@ -5625,236 +5634,23 @@ def _resolve_active_checkpoint(
 
 
 def _build_migration_report(
-    run_dir: Path,
-    run: Mapping[str, Any],
-    config: Mapping[str, Any],
-    checkpoints: Sequence[Mapping[str, Any]],
-    terminal_outcome: Optional[Mapping[str, Any]] = None,
+    run_dir: Path, run: Mapping[str, Any], config: Mapping[str, Any],
+    checkpoints: Sequence[Mapping[str, Any]], terminal_outcome: Optional[Mapping[str, Any]] = None,
 ) -> str:
-    active = _resolve_active_checkpoint(run, checkpoints)
-    targets = {str(k): str(v) for k, v in (config.get("targets") or {}).items()}
-    assignment = {str(k): str(v) for k, v in (active.get("fullAssignment") or {}).items()}
-    satisfied = all(
-        name in assignment and str(targets[name]) == assignment[name] for name in targets
-    )
-    remaining = sum(1 for name in targets if assignment.get(name) != str(targets[name]))
-    active_audit = active.get("audit") or {}
-    ledger: Dict[str, Any] = {}
-    ledger_path = run_dir / "ledger.json"
-    if ledger_path.exists():
-        try:
-            ledger = json.loads(ledger_path.read_text(encoding="utf-8-sig"))
-            if not isinstance(ledger, dict):
-                ledger = {}
-        except (ValueError, OSError):
-            ledger = {}
-    feedback = [entry for entry in (ledger.get("feedback") or []) if isinstance(entry, dict)]
-
-    lines: List[str] = []
-    lines.append("# MIGRATION_REPORT")
-    lines.append("")
-    lines.append(f"- Run: `{run.get('runId')}`")
-    lines.append(f"- Project: `{config.get('projectName')}`")
-    lines.append(f"- Target level: `{config.get('targetLevel')}`")
-    lines.append(f"- Terminal: `{run.get('terminal') or 'in-progress'}`")
-    lines.append(f"- Active checkpoint: `{active.get('checkpointId')}`")
-    lines.append("")
-    if terminal_outcome:
-        lines.append("## Outcome")
-        lines.append("")
-        lines.append(f"- Verdict: `{terminal_outcome.get('outcome')}`")
-        lines.append(f"- Satisfied policy targets: `{terminal_outcome.get('satisfied')}`")
-        lines.append(f"- Independent audit of the accepted checkpoint: `{terminal_outcome.get('auditStatus')}`")
-        lines.append(f"- Accepted checkpoints: `{terminal_outcome.get('acceptedCheckpoints')}`")
-        lines.append(f"- Finished at: `{terminal_outcome.get('finishedAt')}`")
-        lines.append("")
-    lines.append("## Итог миграции (остаток и покрытие)")
-    lines.append("")
-    lines.append(
-        f"- Целей по политике: `{len(targets)}`; достигнуто на активном checkpoint "
-        f"`{active.get('checkpointId')}`: `{len(targets) - remaining}`; остаток: `{remaining}`; "
-        f"policy satisfied: `{satisfied}`."
-    )
-    lines.append(
-        f"- Независимый аудит активного checkpoint: статус `{active_audit.get('status') or 'UNKNOWN'}`, "
-        f"lag-ok `{active_audit.get('lagOkPct')}%` (`{active_audit.get('lagOk')}` из "
-        f"`{active_audit.get('lagTotal')}`), отстающих `{active_audit.get('lagLagging')}`, "
-        f"неизвестных `{active_audit.get('lagUnknown')}`, пакетов с уязвимостями "
-        f"`{active_audit.get('vulnerabilityPackages')}`; evidence: `{active_audit.get('evidenceRef') or '-'}`."
-    )
-    lines.append("")
-    lines.append("## Проверки и ограничения покрытия")
-    lines.append("")
-    profile = config.get("validationProfile") or {}
-    scope = config.get("validationScope") or {}
-    lines.append(f"- Команды: `{profile.get('commands') or (config.get('verifyConfig') or {}).get('commands', [])}`.")
-    lines.append(f"- Отложенные проверки (не подтверждены): {profile.get('deferredChecks') or 'не указаны'}. ")
-    if scope.get("mode") == "test-nonregression":
-        lines.append(f"- Подтверждено отсутствие новых сбоев Vitest относительно исходного контроля, а не полностью зелёный проект. Исходно падающих тестов: `{scope.get('existingFailures')}`; baseline: `{scope.get('baselinePath')}`; hash: `{scope.get('baselineHash')}`. Актуальные результаты: `validation-evidence/comparison-*.json`.")
-    lines.append("")
-    lines.append("## Checkpoints (по цепочке parent)")
-    lines.append("")
-    lines.append("| Checkpoint | Parent | Status | Changed packages | Audit |")
-    lines.append("| --- | --- | --- | --- | --- |")
-    for checkpoint in checkpoints:
-        delta = checkpoint.get("acceptedDelta") or {}
-        changed = list((delta.get("changed") or {}).items())
-        parent_state = {}
-        for parent in checkpoints:
-            if parent.get("checkpointId") == checkpoint.get("parentCheckpointId"):
-                parent_state = parent.get("fullAssignment") or {}
-                break
-        summary = (
-            ", ".join(
-                f"`{name}` {parent_state.get(name, '<unknown>')}→{new}"
-                for name, new in changed
-            )
-            or "-"
-        )
-        lines.append(
-            f"| {checkpoint.get('checkpointId')} | {checkpoint.get('parentCheckpointId') or '-'} "
-            f"| {checkpoint.get('status')} | {summary} | {checkpoint.get('audit', {}).get('status', 'UNKNOWN')} |"
-        )
-    lines.append("")
-    lines.append("## Accepted dependency state")
-    lines.append("")
-    lines.append("```json")
-    lines.append(_stable_json(assignment))
-    lines.append("```")
-    lines.append("")
-    lines.append("## Evidence")
-    lines.append("")
-    for checkpoint in checkpoints:
-        audit = checkpoint.get("audit") or {}
-        lines.append(
-            f"- {checkpoint.get('checkpointId')}: sourceSnapshotKey=`{checkpoint.get('sourceSnapshotKey')}`, "
-            f"manifestHash=`{checkpoint.get('manifestHash')}`, lockfileHash=`{checkpoint.get('lockfileHash') or '-'}`, "
-            f"resolvedStateKey=`{checkpoint.get('resolvedStateKey') or '-'}`"
-        )
-        if audit.get("status"):
-            lines.append(
-                f"  - audit=`{audit.get('status')}`, evidence=`{audit.get('evidenceRef') or '-'}`, "
-                f"lagOkPct=`{audit.get('lagOkPct')}`, lagOk=`{audit.get('lagOk')}`/"
-                f"{audit.get('lagLagging')}`lagging/`{audit.get('lagUnknown')}`unknown "
-                f"(of `{audit.get('lagTotal')}`), vulnerabilityPackages=`{audit.get('vulnerabilityPackages')}`"
-            )
-    lines.append("")
-    if feedback:
-        lines.append("## Объяснения агента и release-факты (по принятой цепочке)")
-        lines.append("")
-        for entry in feedback:
-            base = entry.get("baseCheckpointId") or "-"
-            kind = entry.get("kind") or "-"
-            candidate = entry.get("candidateId") or "-"
-            reason = str(entry.get("reason") or "").strip()
-            changed = entry.get("changedFiles") or []
-            lines.append(f"- checkpoint `{base}` / candidate `{candidate}` / kind `{kind}`")
-            if reason:
-                lines.append(f"  - reason: {reason}")
-            if changed:
-                lines.append(f"  - изменённые файлы: {', '.join('`' + str(f) + '`' for f in changed)}")
-        lines.append("")
-    return "\n".join(lines)
+    from migration_documents import run_inputs, complete_inputs, migration_document
+    data = run_inputs(run_dir, run, config, checkpoints)
+    if terminal_outcome is not None:
+        data["run"] = {**run, "terminalOutcome": terminal_outcome}
+    return migration_document(complete_inputs(data), config.get("documentLanguage") or "en")
 
 
 def _build_developer_upgrade_guide(
     run_dir: Path, config: Mapping[str, Any], checkpoints: Sequence[Mapping[str, Any]]
 ) -> str:
-    upgraded: Dict[str, Dict[str, str]] = {}
-    adaptations: Dict[str, List[str]] = {}
-    changed_files: Dict[str, List[str]] = {}
-    for checkpoint in checkpoints:
-        delta = checkpoint.get("acceptedDelta") or {}
-        for name, new_version in (delta.get("changed") or {}).items():
-            old = "<unknown>"
-            parent_id = checkpoint.get("parentCheckpointId")
-            if parent_id:
-                parent = next(
-                    (c for c in checkpoints if c.get("checkpointId") == parent_id), None
-                )
-                if parent:
-                    old = str((parent.get("fullAssignment") or {}).get(name, old))
-            upgraded[name] = {"from": old, "to": str(new_version)}
-    ledger: Dict[str, Any] = {}
-    ledger_path = run_dir / "ledger.json"
-    if ledger_path.exists():
-        try:
-            ledger = json.loads(ledger_path.read_text(encoding="utf-8-sig"))
-            if not isinstance(ledger, dict):
-                ledger = {}
-        except (ValueError, OSError):
-            ledger = {}
-    # R10: aggregate the ACTUAL agent explanations/adaptations recorded per
-    # candidate — never the "will describe later" placeholder.
-    for entry in (ledger.get("feedback") or []):
-        if not isinstance(entry, dict):
-            continue
-        reason = str(entry.get("reason") or "")
-        files = [str(f) for f in (entry.get("changedFiles") or []) if isinstance(f, str)]
-        for name in upgraded:
-            if name in reason or any(name in f for f in files):
-                adaptations.setdefault(name, [])
-                if reason and reason not in adaptations[name]:
-                    adaptations[name].append(reason)
-        changed_files.setdefault(str(entry.get("baseCheckpointId") or "-"), []).extend(files)
-    deferrals = [
-        entry for entry in (ledger.get("deferrals") or [])
-        if isinstance(entry, dict) and str(entry.get("reason") or "").strip()
-    ]
-
-    lines: List[str] = []
-    lines.append("# DEVELOPER_UPGRADE_GUIDE")
-    lines.append("")
-    if not upgraded:
-        lines.append(
-            "Проверенных обновлений зависимостей на этой цепочке нет: полный assignment "
-            "активного checkpoint совпадает с исходным (ни один пакет не принят к изменению). "
-            "Это НЕ означает завершения миграции: см. MIGRATION_REPORT (остаток целей)."
-        )
-        lines.append("")
-        lines.append("- Проверено: принятых изменений `fullAssignment` нет; verified checkpoint только фиксирует состояние.")
-        lines.append("- Ограничения и отложенные пакеты:")
-        if deferrals:
-            for entry in deferrals:
-                lines.append(
-                    f"  - `{entry.get('package') or entry.get('candidateId') or '-'}`: {entry.get('reason')}"
-                )
-        else:
-            lines.append("  - явных отложенных пакетов в ledger нет.")
-        lines.append("- Рекомендация: продолжить план-next/новый cohort по остатку целей; при следующем принятом "
-                     "улучшении guide пополняется фактическими возможностями и breaking changes.")
-    else:
-        lines.append("## Accepted upgrades")
-        lines.append("")
-        lines.append("| Package | From | To |")
-        lines.append("| --- | --- | --- |")
-        for name, versions in sorted(upgraded.items()):
-            lines.append(f"| `{name}` | `{versions['from']}` | `{versions['to']}` |")
-        lines.append("")
-        lines.append("## Возможности и адаптации (фактические, по ответам агента)")
-        lines.append("")
-        if adaptations:
-            for name, notes in sorted(adaptations.items()):
-                lines.append(f"- `{name}`:")
-                for note in notes:
-                    lines.append(f"  - {note}")
-        else:
-            lines.append(
-                "Записанных агентских объяснений по этим пакетам в ledger нет; адаптация "
-                "проверялась только через verify-exact на отремонтированных bytes."
-            )
-        lines.append("")
-        lines.append("## Ограничения и отложенные пакеты")
-        lines.append("")
-        if deferrals:
-            for entry in deferrals:
-                lines.append(
-                    f"- `{entry.get('package') or entry.get('candidateId') or '-'}`: {entry.get('reason')}"
-                )
-        else:
-            lines.append("- Явных отложенных пакетов нет; остаток целей см. в MIGRATION_REPORT.")
-    lines.append("")
-    return "\n".join(lines)
+    from migration_documents import run_inputs, complete_inputs, migration_document, optional
+    run = optional(run_dir / "run.json") or {}
+    data = run_inputs(run_dir, run, config, checkpoints)
+    return migration_document(complete_inputs(data), config.get("documentLanguage") or "en", guide=True)
 
 
 def cmd_audit(args: argparse.Namespace) -> int:
@@ -5944,7 +5740,7 @@ def _audit_once_locked(
         _stable_json(report), encoding="utf-8"
     )
     try:
-        evidence_markdown.write_text(markdown(report), encoding="utf-8")
+        evidence_markdown.write_text(markdown(report, config.get("documentLanguage") or "en"), encoding="utf-8")
     except Exception as exc:  # the markdown renderer must never hide a finished audit
         evidence_markdown.write_text(
             f"# Audit report (markdown render failed: {exc})\n\n" + _stable_json(report),
@@ -5985,6 +5781,9 @@ def _audit_once_locked(
         "generatedAt": report.get("generatedAt") or "",
     }
     save_checkpoint(run_dir, checkpoint)
+    if checkpoint.get("checkpointId") == "C0":
+        from migration_documents import write_pre_fix_report
+        write_pre_fix_report(run_dir, run, config, checkpoint)
     _emit_status(
         {
             "event": "audit.done",
@@ -6089,6 +5888,7 @@ def build_parser() -> argparse.ArgumentParser:
     begin.add_argument("--project-id", default="")
     begin.add_argument("--run-id", default="")
     begin.add_argument("--target-level", choices=("yellow", "green"), default="yellow")
+    begin.add_argument("--lang", choices=("en", "ru"), default="en", help="Explicit language of all migration documents")
     begin.add_argument(
         "--check-only",
         action="store_true",
@@ -6193,6 +5993,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="Машинный статус run")
     finish = sub.add_parser("finish", help="Сформировать MIGRATION_REPORT.md / DEVELOPER_UPGRADE_GUIDE.md")
+    finish.add_argument("--lang", choices=("en", "ru"), default=None)
 
     audit = sub.add_parser("audit", help="Независимый аудит активного checkpoint")
     audit.add_argument("--registry", default="")

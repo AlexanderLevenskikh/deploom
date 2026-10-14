@@ -61,6 +61,8 @@ jobs:
           tests.regression.test_iterative_engine_precheck
           tests.regression.test_iterative_resume
           tests.regression.test_iterative_hoisted_materialization
+          tests.regression.test_migration_document_languages
+          tests.regression.test_real_world_workspace_demos
           -v
       - name: Run production-fast regressions
         run: python run_tool_tests.py --suite production-fast
@@ -110,6 +112,8 @@ jobs:
           tests.regression.test_iterative_engine_precheck
           tests.regression.test_iterative_resume
           tests.regression.test_iterative_hoisted_materialization
+          tests.regression.test_migration_document_languages
+          tests.regression.test_real_world_workspace_demos
           -v
       - name: Run Windows verification substrate gate
         run: |

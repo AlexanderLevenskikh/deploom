@@ -84,10 +84,15 @@ class AcceptanceMatrixRows(unittest.TestCase):
         self.assertIn("source snapshot/commit", _source("dependency_live_roadmap_generator.py"))
 
     def test_r8_security_endpoint_unavailable_is_unknown_not_zero(self):
-        audit_source = _source("manual_dependency_audit.py")
-        self.assertIn("did not complete; counts are unknown", audit_source)
-        self.assertIn("totals_available else 'UNKNOWN'", audit_source)
-        self.assertIn('"unknown"', audit_source)
+        from manual_dependency_audit import markdown
+        report = {"audit": {"complete": False, "totals": {"high": 0},
+                            "packageTotals": {"high": 0}, "advisoryTotals": {"high": 0}}, "lag": []}
+        rendered = markdown(report)
+        self.assertIn("did not complete; counts are unknown", rendered)
+        for label in ["Affected dependency nodes", "Vulnerable package records", "Unique advisories"]:
+            self.assertIn(label + ": **UNKNOWN**", rendered)
+        self.assertIn("Data unavailable: `audit.completeEvidence`", rendered)
+        self.assertNotIn("Affected dependency nodes: **0**", rendered)
         audit_tests = _test_names("tests/test_validator_and_manual_audit.py")
         self.assertIn("def test_", audit_tests)
 

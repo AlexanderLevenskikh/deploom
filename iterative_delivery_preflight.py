@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
+from migration_documents import relative_document_names
 import time
 from delivery_source_identity import PreparedTextGuard, text_identity
 
@@ -74,7 +75,7 @@ def inspect_delivery(run_dir, state, checkpoint, *, cleanup=False):
         if not tree.is_dir():
             raise RuntimeError("DELIVERY_REFERENCE_TREE_UNAVAILABLE")
         return tree
-    documentation = set() if cleaned else {f"docs/dependency-migration/{state['runId']}/{name}" for name in ("MIGRATION_REPORT.md", "DEVELOPER_UPGRADE_GUIDE.md")}
+    documentation = set() if cleaned else {f"docs/dependency-migration/{state['runId']}/{name}" for name in relative_document_names(state.get("documentLanguage") or "en", primary=True)}
     expected, guard, report = scan_files(root, expected, (notes if cleanup else state).get("textIdentities", {}), reference_root, documentation)
     report.update(runId=state["runId"], checkpointId=checkpoint["checkpointId"], sourceSnapshotKey=checkpoint["sourceSnapshotKey"])
     report_path = Path(run_dir) / "delivery" / "preflight.json"

@@ -1839,174 +1839,9 @@ def _node_preview(record: Dict[str, Any], limit: int = 5) -> str:
     return preview
 
 
-def markdown(report: Dict[str, Any]) -> str:
-    audit_complete = bool(report.get("auditComplete", report.get("audit", {}).get("complete")))
-    lag_complete = bool(
-        report.get(
-            "lagComplete",
-            all(item.get("status") != "unknown" for item in (report.get("lag") or [])),
-        )
-    )
-    lines = [
-        "# Manual dependency audit",
-        "",
-        f"- Project: `{report['projectDir']}`",
-        f"- Package manager: `{report['packageManager']}`",
-        f"- Registry: `{report['registry'] or 'project/default npm config'}`",
-        f"- Generated: `{report['generatedAt']}`",
-        f"- Completeness: `{'COMPLETE' if report.get('complete') else 'INCOMPLETE'}`",
-        f"- Vulnerability audit: `{'COMPLETE' if audit_complete else 'INCOMPLETE'}`",
-        f"- Lag audit: `{'COMPLETE' if lag_complete else 'INCOMPLETE'}`",
-        "",
-        "## Vulnerabilities",
-        "",
-    ]
-    audit = report["audit"]
-    packages = audit.get("packages") or {}
-    package_details = audit.get("packageDetails") or {}
-    raw_package_details = ((audit.get("rawAuditEvidence") or {}).get("packageDetails") or {})
-    if not audit.get("complete"):
-        if audit.get("rawAuditComplete") and raw_package_details:
-            if audit.get("engine") == "npm-lock-bridge":
-                lines.append(
-                    "- The audit endpoint returned findings, but they are **not trusted** because the generated "
-                    "npm bridge graph diverged from the canonical `yarn.lock`. Counts are withheld."
-                )
-            else:
-                lines.append(
-                    "- The audit endpoint returned findings, but the canonical `yarn.lock` inventory could not "
-                    "be reconstructed completely. Counts are withheld until unresolved lock edges are fixed."
-                )
-        else:
-            lines.append("- Vulnerability audit did not complete; counts are unknown.")
-    elif package_details:
-        for name, record in package_details.items():
-            direct = "direct" if record.get("isDirect") else "transitive"
-            affected_range = str(record.get("range") or "—")
-            fix_text = _fix_available_text(record.get("fixAvailable"))
-            lines.append(
-                f"- `{name}` — **{_severity_label(record.get('severity'))}**, {direct}; "
-                f"affected range `{affected_range}`; fix available: `{fix_text}`"
-            )
-            lines.append(f"  - Affected nodes: {_node_preview(record)}")
-            advisories = record.get("advisories") or []
-            if advisories:
-                advisory_bits = []
-                for advisory in advisories[:4]:
-                    title = str(advisory.get("title") or advisory.get("name") or "advisory").strip()
-                    advisory_range = str(advisory.get("range") or "").strip()
-                    bit = f"{_severity_label(advisory.get('severity'))}: {title}"
-                    if advisory_range:
-                        bit += f" (`{advisory_range}`)"
-                    advisory_bits.append(bit)
-                lines.append("  - Advisories: " + "; ".join(advisory_bits))
-                if len(advisories) > 4:
-                    lines.append(f"  - Additional advisories: {len(advisories) - 4}")
-            transitive_via = record.get("transitiveVia") or []
-            if transitive_via:
-                lines.append("  - Propagated via vulnerable packages: " + ", ".join(f"`{item}`" for item in transitive_via[:8]))
-    elif packages:
-        for name, counts in packages.items():
-            lines.append(f"- `{name}` ({format_counts(counts)})")
-    else:
-        lines.append("- Vulnerable packages were not found in parsed audit output.")
-
-    totals_available = bool(audit.get("complete"))
-    node_totals = audit.get("nodeTotals") or audit.get("totals") or {}
-    package_version_totals = audit.get("packageVersionTotals") or {}
-    package_totals = audit.get("packageTotals") or {}
-    advisory_totals = audit.get("advisoryTotals") or {}
-    lines += ["", "### Totals by unit", ""]
-    if audit.get("engine") == "yarn-inventory":
-        lines += [
-            f"- Vulnerable canonical package@version records: **{format_counts(package_version_totals) if totals_available else 'UNKNOWN'}**",
-            f"- Vulnerable package names: **{format_counts(package_totals) if totals_available else 'UNKNOWN'}**",
-            f"- Unique advisories: **{format_counts(advisory_totals) if totals_available else 'UNKNOWN'}**",
-            "",
-            "The inventory engine audits exact versions reachable from `yarn.lock`; it does not claim synthetic npm paths are real installed dependency nodes.",
-        ]
-    else:
-        lines += [
-            f"- Affected dependency nodes: **{format_counts(node_totals) if totals_available else 'UNKNOWN'}**",
-            f"- Vulnerable package records: **{format_counts(package_totals) if totals_available else 'UNKNOWN'}**",
-            f"- Unique advisories: **{format_counts(advisory_totals) if totals_available else 'UNKNOWN'}**",
-            "",
-            "These totals intentionally use separate units; they must not be compared as if they were the same count.",
-        ]
-    lines += [
-        "",
-        f"Audit engine: `{audit.get('engine') or 'unknown'}`",
-        f"Requested registry: `{audit.get('requestedRegistry') or report['registry'] or 'project/default npm config'}`",
-        f"Effective audit registry: `{audit.get('effectiveRegistry') or 'unknown'}`",
-    ]
-    if audit.get("lockCommand"):
-        lock_mode = "reused" if audit.get("lockReused") else "generated"
-        lines.append(
-            f"Package-lock: `{lock_mode}`; exit={audit.get('lockExitCode')}; "
-            f"duration={audit.get('lockDurationSeconds', 0)}s"
-        )
-        lines.append(f"Lock command: `{' '.join(audit['lockCommand'])}`")
-    lines.append(f"Audit command: `{' '.join(audit.get('command') or [])}`; exit={audit['exitCode']}")
-    if audit.get("auditDurationSeconds") is not None:
-        lines.append(f"Audit duration: `{audit.get('auditDurationSeconds')}s`")
-    reconciliation = audit.get("bridgeReconciliation") or {}
-    if reconciliation:
-        lines += [
-            "",
-            "### Yarn → npm bridge reconciliation",
-            "",
-            f"- Faithful to canonical yarn.lock: `{'yes' if reconciliation.get('faithful') else 'NO'}`",
-            f"- yarn.lock package@version pairs: `{reconciliation.get('sourcePairs', 0)}`",
-            f"- generated package-lock pairs: `{reconciliation.get('generatedPairs', 0)}`",
-        ]
-        extra_pairs = reconciliation.get("extraPairs") or []
-        missing_pairs = reconciliation.get("missingPairs") or []
-        if extra_pairs:
-            lines.append(
-                "- Extra pairs introduced by npm resolver: "
-                + ", ".join(f"`{item}`" for item in extra_pairs[:20])
-                + (f" (+{len(extra_pairs) - 20} more)" if len(extra_pairs) > 20 else "")
-            )
-        if missing_pairs:
-            lines.append(
-                "- yarn.lock pairs absent from generated lock (diagnostic): "
-                + ", ".join(f"`{item}`" for item in missing_pairs[:20])
-                + (f" (+{len(missing_pairs) - 20} more)" if len(missing_pairs) > 20 else "")
-            )
-    canonical_inventory = audit.get("canonicalInventory") or {}
-    if canonical_inventory:
-        lines += [
-            "",
-            "### Canonical Yarn inventory",
-            "",
-            f"- Reconstruction complete: `{'yes' if canonical_inventory.get('complete') else 'NO'}`",
-            f"- Reachable yarn.lock entries: `{canonical_inventory.get('reachableEntries', 0)}`",
-            f"- Audited package@version pairs: `{canonical_inventory.get('packageVersionPairs', 0)}`",
-            f"- Direct package names: `{len(canonical_inventory.get('directPackages') or [])}`",
-        ]
-        unresolved_edges = canonical_inventory.get("unresolvedEdges") or []
-        if unresolved_edges:
-            lines.append(
-                "- Unresolved edges: "
-                + ", ".join(f"`{item}`" for item in unresolved_edges[:20])
-                + (f" (+{len(unresolved_edges) - 20} more)" if len(unresolved_edges) > 20 else "")
-            )
-    if report["audit"]["notes"]:
-        lines += ["", "Notes:"] + [f"- {note}" for note in report["audit"]["notes"]]
-    lines += ["", "## Direct dependencies outside lag policy", "", "| Section | Package | Current | Latest | Policy | Lag days | Current published | Status |", "|---|---|---|---|---:|---:|---|---|"]
-    lagging = [item for item in report["lag"] if item["status"] == "lagging"]
-    unknown = [item for item in report["lag"] if item["status"] == "unknown"]
-    for item in lagging:
-        lines.append(f"| {item['section']} | `{item['name']}` | `{item['current']}` | `{item['latest'] or '—'}` | ≤{item['policyMonths']}m | {item.get('lagDays', '—')} | {item.get('currentPublishedAt') or '—'} | LAGGING |")
-    if not lagging:
-        lines.append("| — | — | — | — | — | — | — | No known violations |")
-    lines += ["", f"Lagging: **{len(lagging)}**; OK: **{sum(1 for item in report['lag'] if item['status'] == 'ok')}**; unknown: **{len(unknown)}**."]
-    if unknown:
-        lines += ["", "### Unknown lag checks"]
-        for item in unknown:
-            lines.append(f"- `{item['section']}:{item['name']}` `{item['current']}` — {item.get('error') or 'unknown'}")
-    lines += ["", "## Reconciliation hint", "", "Compare package names, exact affected node versions, separately labelled severity totals and lagging rows with the dashboard generated from the same checkout and registry. A mismatch is a reason to investigate lockfile graph, registry/auth, dashboard state or stale artifacts; do not silently choose one result.", ""]
-    return "\n".join(lines)
+def markdown(report: Dict[str, Any], language="en") -> str:
+    from migration_documents import audit_document
+    return audit_document(report, language)
 
 
 def build_report(
@@ -2132,6 +1967,7 @@ def main() -> int:
     )
     parser.add_argument("--json-out")
     parser.add_argument("--md-out")
+    parser.add_argument("--lang", choices=("en", "ru"), default="en")
     args = parser.parse_args()
 
     project = Path(args.project_dir).expanduser().resolve()
@@ -2153,7 +1989,7 @@ def main() -> int:
         max_known_moderate=args.max_known_moderate,
         max_known_low=args.max_known_low,
     )
-    md = markdown(report)
+    md = markdown(report, args.lang)
     print(md)
     if args.json_out:
         out = Path(args.json_out).expanduser().resolve(); out.parent.mkdir(parents=True, exist_ok=True)

@@ -42,6 +42,7 @@ export type IterativeBeginOptions = {
   workspaceId?: string
   projectId?: string
   toolBuildId?: string
+  language?: 'en' | 'ru'
   validationProfileFile?: string
   targetsFile?: string
   // R8: the independent audit runs with the user's ACTUAL package lag policy.
@@ -156,6 +157,7 @@ export function iterativeBeginInvocation(
   if (options.workspaceId) args.push('--workspace-id', options.workspaceId)
   if (options.projectId) args.push('--project-id', options.projectId)
   if (options.toolBuildId) args.push('--tool-build-id', options.toolBuildId)
+  if (options.language) args.push('--lang', options.language)
   if (options.requestedNode) args.push('--requested-node', options.requestedNode)
   if (options.adoptRepairSource) args.push('--adopt-repair-source')
   return { command: python, args }

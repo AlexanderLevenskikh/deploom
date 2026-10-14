@@ -14,6 +14,7 @@ import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from migration_documents import relative_document_names, generate_run_documents
 
 
 def read(path):
@@ -435,6 +436,7 @@ def delivery_prepare(run_dir, inputs):
              "requestedBranch": requested_branch, "reuseBranch": reuse_branch, "branchResolution": branch_resolution,
              "workspaceRoot": str(root), "projectRelative": checkpoint.get("projectRelative") or ".",
              "sourceHead": head, "status": "preparing", "files": sorted(files),
+             "documentLanguage": config.get("documentLanguage") or "en",
              "ignoredInputCount": len(ignored), "ignoredInputsEvidenceRef": str(evidence),
              "verificationSubject": "committed-git-tree",
              "auditTool": str(Path(__file__).with_name("manual_dependency_audit.py"))}
@@ -482,8 +484,10 @@ def resume_delivery_preparation(run_dir, run, config, checkpoint, state):
         core._write_json_atomic(run_dir / "delivery-state.json", state)
     expected = dict(state["baseFiles"])
     expected.update({n: hashlib.sha256((source/n).read_bytes()).hexdigest() if (source/n).is_file() else None for n in files})
+    generate_run_documents(run_dir, run, config, preserve_primary=True)
+    document_names = relative_document_names(config.get("documentLanguage") or "en") + ["pre-fix-audit-report.json", "post-fix-audit-report.json"]
     allowed = f"docs/dependency-migration/{run['runId']}/"
-    for name in ("MIGRATION_REPORT.md", "DEVELOPER_UPGRADE_GUIDE.md"):
+    for name in document_names:
         path = allowed + name
         if path not in expected or expected[path] is None:
             expected[path] = hashlib.sha256((run_dir / "reports" / name).read_bytes()).hexdigest()
@@ -506,8 +510,9 @@ def resume_delivery_preparation(run_dir, run, config, checkpoint, state):
             raise RuntimeError(f"DELIVERY_SUBMODULE_REQUIRES_MATERIALIZATION: {name}")
     docs = root / "docs" / "dependency-migration" / run["runId"]
     docs.mkdir(parents=True, exist_ok=True)
-    for name in ("MIGRATION_REPORT.md", "DEVELOPER_UPGRADE_GUIDE.md"):
+    for name in document_names:
         target = docs / name
+        target.parent.mkdir(parents=True, exist_ok=True)
         if not target.exists():
             shutil.copy2(run_dir / "reports" / name, target)
         files.add(target.relative_to(root).as_posix())
@@ -550,7 +555,7 @@ def delivery_verify(run_dir, inputs, *, cleanup=False):
     if cleaned:
         from iterative_delivery_notes import validate_notes_archive
         validate_notes_archive(run_dir, state)
-    documentation = set() if cleaned else {f"docs/dependency-migration/{state['runId']}/{name}" for name in ("MIGRATION_REPORT.md", "DEVELOPER_UPGRADE_GUIDE.md")}
+    documentation = set() if cleaned else {f"docs/dependency-migration/{state['runId']}/{name}" for name in relative_document_names(state.get("documentLanguage") or "en", primary=True)}
     expected = dict(notes["expected"] if cleanup else state["expected"])
     if cleanup:
         git(root, "merge-base", "--is-ancestor", notes["baseHead"], "HEAD")
@@ -623,6 +628,7 @@ def delivery_verify(run_dir, inputs, *, cleanup=False):
                  commits=git(root, "log", "--format=%h %s", f"{state['sourceHead']}..HEAD").splitlines(),
                  audit=audit, finishedAt=datetime.now(timezone.utc).isoformat())
     core._write_json_atomic(state_file, state)
+    generate_run_documents(run_dir, refreshed_run, config)
     from delivery_worktree import release_branch
     return release_branch(run_dir, state)
 

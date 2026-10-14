@@ -81,6 +81,24 @@ class GitDeliveryTests(unittest.TestCase):
         self.snapshot = patch.object(core, "_open_checkpoint_source", return_value=SimpleNamespace(root=self.source))
         self.snapshot.start(); self.addCleanup(self.snapshot.stop)
 
+    def test_russian_delivery_copies_all_documents_and_untranslated_json(self):
+        self.config['documentLanguage']='ru'
+        core.save_config(self.run_dir,self.config)
+        state=self.prepare()
+        root=Path(state['workspaceRoot'])/'docs/dependency-migration'/self.run['runId']
+        from migration_documents import DOCUMENTS
+        for name in DOCUMENTS:
+            self.assertTrue((root/'ru'/name).is_file(),name)
+            self.assertIn('Чего не хватает',(root/'ru'/name).read_text(encoding='utf-8'))
+            self.assertFalse((root/name).exists())
+        self.assertEqual(state['documentLanguage'],'ru')
+        for phase in ['pre','post']:
+            name=phase+'-fix-audit-report.json'
+            self.assertEqual((root/name).read_bytes(),(self.run_dir/'reports'/name).read_bytes())
+        from iterative_delivery_preflight import inspect_delivery
+        expected,_,_=inspect_delivery(self.run_dir,state,self.checkpoint)
+        self.assertIn('docs/dependency-migration/'+self.run['runId']+'/ru/MIGRATION_REPORT.md',expected)
+
     def security_fixture(self):
         root = self.run_dir / "security" / "attempt-1" / "workspace"
         root.parent.mkdir(parents=True)
