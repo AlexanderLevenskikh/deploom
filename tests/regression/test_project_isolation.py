@@ -98,7 +98,10 @@ class ProjectIsolationRegressionTests(unittest.TestCase):
         select_project = hook.split("const selectProject = useCallback", 1)[1].split("const updateWorkspace", 1)[0]
         self.assertIn("setError(undefined)", select_project)
         self.assertIn("workspaceBusy: anyActiveJob", hook)
-        self.assertIn("active={flow.workspaceBusy}", app)
+        # The rail's active state is driven by workspaceBusy and may be widened
+        # by additional conditions (e.g. maintenanceBlocked) without losing the
+        # busy tracking, so match the prop prefix instead of the exact expression.
+        self.assertIn("active={flow.workspaceBusy", app)
 
 
     def test_fresh_baseline_ends_old_execution_epoch_and_forgets_prompt(self) -> None:

@@ -242,6 +242,9 @@ jobs:
           npm run check:iterative-agent
           npm run check:agent-launch-errors
           npm run check:storage-maintenance
+          npm run check:project-audit
+          npm run check:project-journal
+          npm run check:storage-controls
           npm run check:task-clipboard
           npm run check:electron-clipboard
           npm run check:git-facts-cache
