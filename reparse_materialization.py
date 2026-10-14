@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import shutil
 import stat
@@ -74,6 +75,39 @@ def _package_link_name(relative: Path) -> str:
     return parts[index]
 
 
+def _declared_package_self_link(path: Path, relative: Path, target: Path) -> bool:
+    """npm file:. aliases may point at their own private package directory.
+
+    Enumeration/reconstruction record the link without following it. Arbitrary
+    ancestor links remain cycles; the package owner must explicitly declare
+    this exact alias and target in its manifest.
+    """
+    name = _package_link_name(relative)
+    if not name:
+        return False
+    owner = path.parent.parent if name.startswith('@') else path.parent
+    if owner.name != 'node_modules':
+        return False
+    owner = owner.parent
+    if owner.resolve() != target:
+        return False
+    try:
+        manifest = json.loads((owner / 'package.json').read_text(encoding='utf-8-sig'))
+        for section in ('dependencies', 'devDependencies', 'optionalDependencies'):
+            declarations = manifest.get(section) or {}
+            specification = declarations.get(name) if isinstance(declarations, dict) else None
+            if not isinstance(specification, str):
+                continue
+            protocol, separator, value = specification.partition(':')
+            if (separator and protocol in {'file', 'link'} and value
+                and not Path(value).is_absolute() and not Path(value).drive
+                and (owner / value).resolve() == target):
+                return True
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return False
+
+
 def inventory_reparse_plan(
     root: Path,
     *,
@@ -126,7 +160,7 @@ def inventory_reparse_plan(
                     raise ReparseMaterializationError(
                         f"REPARSE_EXTERNAL_TARGET_UNSUPPORTED: {relative.as_posix()} -> {target}"
                     )
-                if target == path or target in path.parents:
+                if (target == path or target in path.parents) and not _declared_package_self_link(path, relative, target):
                     raise ReparseMaterializationError(
                         f"REPARSE_CYCLE_UNSUPPORTED: {relative.as_posix()} -> {target}"
                     )

@@ -1573,7 +1573,7 @@ def _workspace_package_targets(workspace_project: Path) -> Dict[str, Path]:
                 relative_spec = remainder.split("#", 1)[0].split("?", 1)[0]
                 if not relative_spec or "%" in relative_spec or "\x00" in relative_spec:
                     continue
-                if not relative_spec.startswith(("./", "../")):
+                if relative_spec != "." and not relative_spec.startswith(("./", "../")):
                     continue
                 candidate = (member_root / relative_spec).resolve()
                 try:
@@ -1594,7 +1594,7 @@ def _workspace_package_targets(workspace_project: Path) -> Dict[str, Path]:
                     ) from exc
                 if not isinstance(package_manifest, dict):
                     continue
-                if package_manifest.get("name") != dependency_name:
+                if package_manifest.get("name") != dependency_name and candidate != member_root:
                     continue
                 previous = targets.get(dependency_name)
                 if previous is not None and previous != candidate:
