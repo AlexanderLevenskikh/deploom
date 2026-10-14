@@ -1,0 +1,49 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { projectAuditContext } from '../dist-electron/project-audit-context.js';
+import { createProjectAuditController, readProjectAuditStatus } from '../dist-electron/project-audit-lifecycle.js';
+const fixture = mkdtempSync(join(tmpdir(), 'deploom-audit-check-'));
+const write = (path, value) => writeFileSync(path, JSON.stringify(value));
+try {
+  const project = join(fixture, 'project'), home = join(fixture, 'home'), runDir = join(fixture, 'run');
+  mkdirSync(project); mkdirSync(home); mkdirSync(runDir);
+  write(join(project, 'package.json'), { name: 'fixture', dependencies: { alpha: '1.0.0' } });
+  const inputs = { intent: { targetLevel: 'yellow' }, requestedNode: '22', projectName: 'fixture' };
+  const context = () => projectAuditContext(project, inputs, { PATH: 'node-fixture', NODE_AUTH_TOKEN: 'private-secret' }, home);
+  const original = context();
+  assert.ok(!JSON.stringify(original).includes('private-secret'));
+  assert.notEqual(projectAuditContext(project, inputs, { PATH: 'node-fixture', NODE_AUTH_TOKEN: 'changed' }, home).registryHash, original.registryHash);
+  assert.notEqual(projectAuditContext(project, { ...inputs, requestedNode: '24' }, { PATH: 'node-fixture', NODE_AUTH_TOKEN: 'private-secret' }, home).runtimeHash, original.runtimeHash);
+  let calls = 0, release;
+  const controller = createProjectAuditController({ run: async (request, operationId) => {
+    calls++;
+    await new Promise(done => { release = done });
+    write(join(request.runDir, 'current-audit.json'), { operationId, desktopContextHash: request.context.hash, status: 'PASS', auditComplete: true });
+  } });
+  const request = { runDir, projectName: 'fixture', workspaceId: 'workspace', workspacePath: fixture, inputs, context: original, currentContext: context };
+  const before = readdirSync(runDir);
+  for (let n = 0; n < 10; n++) assert.equal(controller.status(request).phase, 'missing');
+  assert.equal(calls, 0); assert.deepEqual(readdirSync(runDir), before, 'status must not write or launch a collector');
+  const first = controller.start(request), duplicate = controller.start(request);
+  assert.equal(first.operationId, duplicate.operationId); assert.equal(calls, 1);
+  assert.throws(() => controller.start({ ...request, runDir: join(fixture, 'sibling') }), /AUDIT_SCOPE_BUSY/);
+  release(); await controller.jobs.get(runDir).promise;
+  assert.equal(controller.status(request).phase, 'done'); assert.equal(controller.status(request).applicability, undefined);
+  const saved = readFileSync(join(runDir, 'current-audit-state.json'), 'utf8');
+  write(join(project, 'package.json'), { name: 'fixture', dependencies: { alpha: '2.0.0' } });
+  assert.equal(controller.status({ ...request, context: context() }).applicability, 'dependencies-changed');
+  assert.equal(readFileSync(join(runDir, 'current-audit-state.json'), 'utf8'), saved, 'reading applicability does not mutate evidence');
+  write(join(runDir, 'current-audit-state.json'), { ...JSON.parse(saved), phase: 'running', ownerPid: 987654321 });
+  assert.equal(readProjectAuditStatus(runDir, context(), undefined, () => false).phase, 'interrupted');
+  const incomplete = createProjectAuditController({ run: async () => {} });
+  incomplete.start({ ...request, context: context() }); await incomplete.jobs.get(runDir).promise;
+  assert.equal(incomplete.status({ ...request, context: context() }).phase, 'error', 'old evidence cannot complete a fresh operation');
+  assert.match(incomplete.status({ ...request, context: context() }).error, /AUDIT_EVIDENCE_MISSING/);
+  console.log('Project audit: read-only status, duplicate joins, shared scope exclusion, context applicability, restart ownership and fresh evidence identity PASS');
+} finally {
+  assert.equal(dirname(fixture), resolve(tmpdir()));
+  assert.ok(fixture.startsWith(join(resolve(tmpdir()), 'deploom-audit-check-')));
+  rmSync(fixture, { recursive: true, force: true });
+}

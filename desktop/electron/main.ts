@@ -3,6 +3,11 @@ import updaterPackage from 'electron-updater'
 import { readProjectManifest } from './project-manifest.js'
 import { isDeterministicToolFailure, isDeterministicSourcePreflightFailure, formatSourceCheckoutDirtyFailure } from './baseline-retry.js'
 import { StorageCleanupController } from './storage-cleanup.js'
+import { withStorageControlFile } from './storage-control-file.js'
+import { flushJournal, queueJournalRecord } from './project-journal.js'
+import { registerProjectJournalHandlers } from './project-journal-ipc.js'
+import { projectAuditContext } from './project-audit-context.js'
+import { auditJson, createProjectAuditController } from './project-audit-lifecycle.js'
 import { baselineFailureMessage } from './baseline-failure.js'
 import { draftArtifactsRoot, draftManifestPath, draftReadFailureText, draftResultStaleness, readDraftResultArtifact, type DraftResultArtifact as ParsedDraftResultArtifact, type DraftReadResult } from './draft-artifact-reader.js'
 import { BASELINE_DECISION_MARKER, extractBaselineDecisionEnvelope } from './migration-baseline-decision.js'
@@ -1714,8 +1719,8 @@ const iterativeStreamPlatform: StreamPlatform = {
 
 const iterativeStreamIo = (_runDir: string): StreamAttemptIo => ({
   cancelRequested: (dir: string) => readAttempt(dir)?.cancelRequested === true,
-  recordLine: (dir: string, text: string) => {
-    const attempt = recordAttemptProgress(dir, text)
+  recordLine: (dir: string, text: string, stream) => {
+    const attempt = recordAttemptProgress(dir, text, stream)
     if (attempt) broadcastIterativeAttempt(attempt)
   },
   trimLog: (dir: string) => trimAttemptLog(dir),
@@ -2640,6 +2645,7 @@ function flushArtifactJobLog(jobId: string): void {
   if (entry.timer) { clearTimeout(entry.timer); entry.timer = undefined }
   try {
     writeFileSync(entry.path, chunk, { encoding: 'utf8', flag: 'a' })
+    flushJournal(dirname(entry.path))
   } catch (error) {
     // Logging is diagnostic-only and must never change FLOW/proof authority.
     console.warn(`DepLoom artifact log write failed for ${jobId}: ${error instanceof Error ? error.message : String(error)}`)
@@ -2677,6 +2683,9 @@ function bufferArtifactJobOutput(payload: Record<string, unknown>): void {
     ? String((payload.source as Record<string, unknown>).label ?? (payload.source as Record<string, unknown>).id ?? '').trim()
     : ''
   const chunk = `[${new Date().toISOString()}] [${stream}]${source ? ` [${source}]` : ''} ${line.replace(/\r?\n$/, '')}\n`
+  if (job.projectName) {
+    try { queueJournalRecord(dirname(entry.path), { workspaceId: job.workspace.id, projectName: job.projectName, runId: jobId, stream: stream === 'stdout' || stream === 'stderr' ? stream : 'system', source: payload.source && typeof payload.source === 'object' ? String((payload.source as Record<string, unknown>).id ?? source) : job.action, sourceLabel: source || job.action, agentGroup: (payload.source as { kind?: string; id?: string } | undefined)?.kind === 'group' ? String((payload.source as { id?: string }).id ?? '') : undefined, text: line, at: Date.now() }) } catch { /* durable raw output remains available */ }
+  }
   entry.chunks.push(chunk)
   entry.bufferedChars += chunk.length
   if (entry.bufferedChars >= ARTIFACT_LOG_MAX_BUFFER_CHARS) {
@@ -2759,10 +2768,12 @@ function checkForLatestUpdate(): ReturnType<typeof autoUpdater.checkForUpdates> 
   return request
 }
 
+let updateRestartBlocked = () => jobs.size > 0
 async function installLatestUpdate(): Promise<void> {
   if (!app.isPackaged || updateInstallInProgress) return
   updateInstallInProgress = true
   try {
+    if (updateRestartBlocked()) throw new Error('UPDATE_BUSY: finish or stop active operations before restarting DepLoom')
     // A package may have been downloaded before a newer release appeared.
     // Refresh the feed and wait for that newest package instead of installing
     // the stale cached one and making the user upgrade again on next launch.
@@ -2775,6 +2786,7 @@ async function installLatestUpdate(): Promise<void> {
     if (downloadedUpdateVersion !== latestVersion) {
       throw new Error(`Update ${latestVersion} did not finish downloading.`)
     }
+    if (updateRestartBlocked()) throw new Error('UPDATE_BUSY: an operation started while downloading; restart is deferred')
     autoUpdater.quitAndInstall(false, true)
   } catch (error) {
     publishUpdaterError(error)
@@ -7596,6 +7608,7 @@ function setupIpc(): void {
   // other state (active run, no run) is left untouched. An archive ERROR is
   // surfaced distinctly so the begin flow never hides a half-done archive.
   async function archiveFinishedRepairRun(runDir: string): Promise<{ archived: boolean; error?: string }> {
+    flushJournal(runDir)
     const runPath = join(runDir, 'run.json')
     const recoveryPending = existsSync(join(runDir, 'repair-archive-transaction.json'))
     if (!existsSync(runPath) && !recoveryPending) return { archived: false }
@@ -7849,40 +7862,66 @@ function setupIpc(): void {
   )
 
   const iterativeStepInFlight = new Set<string>()
-  const initialAuditJobs = new Map<string, { identity: string; promise: Promise<void>; finishedAt?: number; error?: string }>()
-  function ensureInitialAudit(workspace: WorkspaceRecord, project: ProjectSpec, runDir: string, force = false) {
-    if (!force && existsSync(join(runDir, 'run.json'))) return
+  const auditChildren = new Set<ChildProcess>()
+  let auditShuttingDown = false
+  app.on('before-quit', () => { auditShuttingDown = true; for (const child of auditChildren) iterativeStreamPlatform.killProcessTree(child); flushJournal() })
+  const projectAudits = createProjectAuditController({
+    run: async (request, operationId) => {
+      const inputFile = join(request.runDir, 'current-audit-input.json')
+      writeFileSync(inputFile, JSON.stringify({ ...request.inputs, forceRefresh: true, operationId, desktopContextHash: request.context.hash }), 'utf8')
+      const logDir = join(request.runDir, 'audit-logs', operationId)
+      let ownedChild: ChildProcess | undefined
+      try {
+        const result = await spawnIterativeStreamed(request.runDir, resolveExecutable('python'), [join(bundledToolDir(), 'iterative_delivery.py'), '--run-dir', request.runDir, '--input-file', inputFile, 'current-audit'], request.workspacePath, 20 * 60_000, {
+          cancelRequested: () => auditShuttingDown,
+          recordLine: (_dir, text, stream) => queueJournalRecord(logDir, { workspaceId: request.workspaceId, projectName: request.projectName, runId: operationId, source: 'audit', stream: stream ?? 'system', text, at: Date.now() }),
+          trimLog: () => {},
+        }, iterativeStreamPlatform, undefined, { onSpawn: (_pid, child) => { if (child) { ownedChild = child; auditChildren.add(child) } } })
+        if (result.timedOut) throw new Error('AUDIT_TIMEOUT: audit did not complete within its collection budget')
+        if (result.canceled) throw new Error('AUDIT_INTERRUPTED: application closed during the audit')
+        if (result.code !== 0) throw new Error(result.stderr.trim() || 'INITIAL_AUDIT_FAILED')
+      } finally { if (ownedChild) auditChildren.delete(ownedChild); flushJournal(logDir) }
+    },
+    event: (request, text) => {
+      const state = auditJson(join(request.runDir, 'current-audit-state.json'))
+      if (!state?.operationId) return
+      const directory = join(request.runDir, 'audit-logs', state.operationId)
+      mkdirSync(directory, { recursive: true })
+      const metadata = join(directory, 'run.json')
+      if (!existsSync(metadata)) writeFileSync(metadata, JSON.stringify({ workspaceId: request.workspaceId, projectName: request.projectName, jobId: state.operationId, action: 'audit', startedAt: state.startedAt }), 'utf8')
+      queueJournalRecord(directory, { workspaceId: request.workspaceId, projectName: request.projectName, runId: state.operationId, source: 'audit', stream: 'system', text, at: Date.now() })
+    },
+  })
+  const initialAuditJobs = projectAudits.jobs
+  function projectAuditRequest(workspace: WorkspaceRecord, project: ProjectSpec) {
     const intent = loadBaselineIntent(workspace, project.name)
     const inputs = { projectDir: project.path, projectName: project.name, intent,
-      forceRefresh: force, requestedNode: project.nodeVersion, dashboardState: artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json'),
+      requestedNode: project.nodeVersion, dashboardState: artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json'),
       lagOverrides: readDeliveryJson(artifactPath(workspace, 'dashboardState', '.dependency-roadmap/state/dashboard-state.json'))?.packageOverrides?.[project.name] ?? {} }
-    const inputFiles = ['package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', '.npmrc', '.yarnrc', '.yarnrc.yml'].map(name => {
-      const path = join(project.path, name)
-      return existsSync(path) ? [name, createHash('sha256').update(readFileSync(path)).digest('hex')] : [name]
-    })
-    const identity = JSON.stringify([{ ...inputs, forceRefresh: undefined }, inputFiles])
-    const previous = initialAuditJobs.get(runDir)
-    if (previous && (!previous.finishedAt || !force && previous.identity === identity && Date.now() - previous.finishedAt < (previous.error ? 60_000 : 86_400_000))) return
-    if (iterativeStepInFlight.has(stepLockKey(workspace.id, project.name))) return
-    mkdirSync(runDir, { recursive: true })
-    const inputFile = join(runDir, 'current-audit-input.json')
-    writeFileSync(inputFile, JSON.stringify(inputs), 'utf8')
-    const pendingFile = join(runDir, 'current-audit-pending.json')
-    writeFileSync(pendingFile, JSON.stringify({ identity }), 'utf8')
-    const job = { identity, promise: Promise.resolve(), finishedAt: undefined as number | undefined, error: undefined as string | undefined }
-    initialAuditJobs.set(runDir, job)
-    job.promise = (async () => {
-      try {
-        const result = await spawnCapture(resolveExecutable('python'), [join(bundledToolDir(), 'iterative_delivery.py'), '--run-dir', runDir, '--input-file', inputFile, 'current-audit'], workspace.path, 20 * 60_000)
-        if (result.code !== 0 || result.timedOut) throw new Error(result.stderr.trim() || 'INITIAL_AUDIT_FAILED')
-        if (existsSync(pendingFile)) unlinkSync(pendingFile)
-      } catch (error) {
-        job.error = error instanceof Error ? error.message : String(error)
-        writeFileSync(pendingFile, JSON.stringify({ identity, error: job.error }), 'utf8')
-      }
-      finally { job.finishedAt = Date.now() }
-    })()
+    return { runDir: iterativeTaskRunDir(workspace, project), workspaceId: workspace.id, projectName: project.name, workspacePath: workspace.path, inputs, context: projectAuditContext(project.path, inputs), currentContext: () => projectAuditRequest(workspace, findProject(workspace, project.name)).context }
   }
+  function ensureInitialAudit(workspace: WorkspaceRecord, project: ProjectSpec, _runDir: string, _force = false) {
+    if (iterativeStepInFlight.has(stepLockKey(workspace.id, project.name))) throw new Error('AUDIT_SCOPE_BUSY: a migration step owns this project')
+    return projectAudits.start(projectAuditRequest(workspace, project))
+  }
+  function projectAuditView(workspace: WorkspaceRecord, project: ProjectSpec) {
+    const request = projectAuditRequest(workspace, project)
+    const lifecycle = projectAudits.status(request)
+    const audit = readCurrentAuditView(request.runDir)
+    return { lifecycle, audit: audit ? { ...audit, running: lifecycle.phase === 'running', stale: Boolean(audit.stale || lifecycle.applicability), error: lifecycle.error } : undefined, previous: auditJson(join(request.runDir, 'current-audit-previous.json')), blockedReason: jobs.size > 0 || iterativeStepInFlight.size > 0 || iterativeAutopilot.hasActiveSessions() ? 'ACTIVE_MIGRATION' : undefined }
+  }
+  ipcMain.handle('flow:audit:status', (_event, input: { workspaceId?: string; projectName: string }) => {
+    const workspace = findWorkspace(loadState(), input.workspaceId)
+    return projectAuditView(workspace, findProject(workspace, input.projectName))
+  })
+  ipcMain.handle('flow:audit:start', (_event, input: { workspaceId?: string; projectName: string }) => {
+    storageCleanup.assertMigrationAllowed()
+    if (jobs.size > 0 || iterativeStepInFlight.size > 0 || iterativeAutopilot.hasActiveSessions()) throw new Error('AUDIT_SCOPE_BUSY: stop the active migration before auditing current source')
+    const workspace = findWorkspace(loadState(), input.workspaceId)
+    const project = findProject(workspace, input.projectName)
+    ensureInitialAudit(workspace, project, iterativeTaskRunDir(workspace, project), true)
+    return projectAuditView(workspace, project)
+  })
   refreshWorkspaceAudits = async (workspace, projectName) => {
     for (const project of readProjects(workspace).filter(project => !projectName || project.name === projectName)) {
       const runDir = iterativeTaskRunDir(workspace, project)
@@ -7907,6 +7946,20 @@ function setupIpc(): void {
     const attempt = readAttempt(runDir)
     if (attempt) broadcastIterativeAttempt(attempt)
   }
+
+  registerProjectJournalHandlers(ipcMain, {
+    scope: input => {
+      const workspace = findWorkspace(loadState(), input.workspaceId)
+      const project = findProject(workspace, input.projectName)
+      return { workspaceId: workspace.id, projectName: project.name, workspacePath: workspace.path, iterativeDirectory: iterativeTaskRunDir(workspace, project) }
+    },
+    savePath: async (event, filename) => {
+      const owner = BrowserWindow.fromWebContents((event as Electron.IpcMainInvokeEvent).sender) ?? undefined
+      const options = { title: 'DepLoom · ' + filename, defaultPath: filename }
+      const result = owner ? await dialog.showSaveDialog(owner, options) : await dialog.showSaveDialog(options)
+      return result.canceled ? undefined : result.filePath
+    },
+  })
 
   ipcMain.handle('flow:iterative:attempt', async (_event, input: { workspaceId?: string; projectName: string; includeRunLog?: boolean }) => {
     const state = loadState()
@@ -7951,7 +8004,7 @@ function setupIpc(): void {
     const project = findProject(workspace, input.projectName)
     const runDir = iterativeTaskRunDir(workspace, project)
     const present = existsSync(join(runDir, 'run.json'))
-    if (!present) ensureInitialAudit(workspace, project, runDir)
+    // Status only observes durable audit evidence; collection is an explicit command.
     const stale = taskStaleness(runDir).stale
     let phase: string | undefined
     let decision: ReturnType<typeof decideNextStep> | undefined
@@ -8070,6 +8123,7 @@ function setupIpc(): void {
 
   ipcMain.handle('flow:iterative:begin', iterativeAutopilot.register('begin', async (_event, input: { workspaceId?: string; projectName: string; language?: 'en' | 'ru'; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
     storageCleanup.assertMigrationAllowed()
+    if (projectAudits.active()) throw new Error('AUDIT_SCOPE_BUSY: wait for the current-source audit to finish')
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -8077,6 +8131,7 @@ function setupIpc(): void {
     const pendingInitialAudit = initialAuditJobs.get(runDir)
     if (!input.checkOnly && pendingInitialAudit && !pendingInitialAudit.finishedAt) await pendingInitialAudit.promise
     if (input.restart === true || existsSync(join(runDir, 'restart-archive-transaction.json'))) {
+      flushJournal(runDir)
       const key = stepLockKey(workspace.id, project.name)
       if (iterativeStepInFlight.has(key)) return { ok: false, step: 'begin', error: 'STEP_IN_PROGRESS' }
       iterativeStepInFlight.add(key)
@@ -8534,6 +8589,7 @@ function setupIpc(): void {
   // a killed app simply resumes from where the files say the run stands.
   const runIterativeDriveWithAutopilot = iterativeAutopilot.register('drive', async (_event, input: { workspaceId?: string; projectName: string; autopilot?: boolean; retryInfra?: boolean; discardCandidate?: boolean; resumeTerminal?: boolean }) => {
     storageCleanup.assertMigrationAllowed()
+    if (projectAudits.active()) throw new Error('AUDIT_SCOPE_BUSY: wait for the current-source audit to finish')
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -8881,6 +8937,7 @@ function setupIpc(): void {
     error?: string
   }> => {
     storageCleanup.assertMigrationAllowed()
+    if (projectAudits.active()) throw new Error('AUDIT_SCOPE_BUSY: wait for the current-source audit to finish')
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -9481,6 +9538,7 @@ function setupIpc(): void {
 
   ipcMain.handle('flow:run-action', async (_event, input: ActionInput) => {
     storageCleanup.assertMigrationAllowed()
+    if (projectAudits.active()) throw new Error('AUDIT_SCOPE_BUSY: wait for the current-source audit to finish')
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -9570,17 +9628,19 @@ function setupIpc(): void {
     }
   })
 
-  const storageCleanup = new StorageCleanupController(async (action, payload, onLine) => {
+  const storageCleanup = new StorageCleanupController(async (action, payload, onLine, controls) => withStorageControlFile(join(app.getPath('userData'), 'storage-control'), controls, async controlPayload => {
     const toolDir = bundledToolDir()
     const result = await spawnIterativeStreamed(toolDir, 'python', [join(toolDir, 'storage_cleanup_inventory.py'), action], toolDir, 0,
-      { cancelRequested: () => false, recordLine: () => {}, trimLog: () => {} }, iterativeStreamPlatform, undefined,
-      { stdin: JSON.stringify(payload), onLine })
+      { cancelRequested: () => controls.terminate(), recordLine: () => {}, trimLog: () => {} }, iterativeStreamPlatform, undefined,
+      { stdin: JSON.stringify({ ...payload, ...controlPayload }), onLine })
     if (result.code !== 0) throw new Error(result.stderr || 'Storage maintenance failed')
     return result.stdout
-  }, () => loadState().workspaces.map(workspace => workspace.path), () => jobs.size > 0 || iterativeStepInFlight.size > 0 || iterativeAutopilot.hasActiveSessions() || [...initialAuditJobs.values()].some(job => !job.finishedAt), status => {
+  }), () => loadState().workspaces.map(workspace => workspace.path), () => jobs.size > 0 || iterativeStepInFlight.size > 0 || iterativeAutopilot.hasActiveSessions() || [...initialAuditJobs.values()].some(job => !job.finishedAt), status => {
     for (const window of BrowserWindow.getAllWindows()) if (!window.webContents.isDestroyed()) window.webContents.send('flow:storage-status', status)
   })
+  updateRestartBlocked = () => jobs.size > 0 || iterativeStepInFlight.size > 0 || iterativeAutopilot.hasActiveSessions() || projectAudits.active() || ['inspect', 'clean'].includes(storageCleanup.status().phase)
   ipcMain.handle('flow:storage-status', () => storageCleanup.status())
+  ipcMain.handle('flow:storage-control', (_event, input: { operationId: unknown; command: unknown }) => storageCleanup.control(input.command, input.operationId))
   ipcMain.handle('flow:storage-maintenance', async (event, action: unknown, operationId: unknown) =>
     storageCleanup.maintenance(action, operationId, progress => event.sender.send('flow:storage-progress', progress)))
   ipcMain.handle('flow:get-hardware-snapshot', () => hardwareSnapshot())
@@ -9846,6 +9906,7 @@ app.whenReady().then(async () => {
 })
 
 app.on('before-quit', () => {
+  flushJournal()
   stopUpdateChecks?.()
   stopUpdateChecks = undefined
   baselineWorkerPool?.dispose(killProcessTree)

@@ -9,18 +9,24 @@ import { ModelPicker } from './ModelPicker'
 import { BaselineIntentDialog } from './BaselineIntentDialog'
 import { PromptPreviewDialog } from './PromptPreviewDialog'
 import { IterativeTaskPanel } from './IterativeTaskPanel'
+import { useProjectSurface } from './ProjectSurfaces'
 import { AuditGoalSummary } from './AuditGoalSummary'
 import { IterativeRunDiagnostics } from './IterativeRunDiagnostics'
 import { normalizeBaselineIntentPlan } from '../data/baselineIntent'
 import type { ScenarioSignal } from '../../electron/iterative-scenario'
+import { storageBlocksMigration } from '../../electron/storage-status'
 import type { DraftProgressPayload } from '../hooks/useDependencyFlow'
-import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, DraftResultSnapshot, FlowAction, IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, WorkspaceDetails } from '../types'
+import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntent, BaselineIntentPlan, DraftResultSnapshot, FlowAction, IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, MigrationBranchProgress, ProjectPromptPreview, ProjectSpec, TargetLevel, StorageStatus, WorkspaceDetails } from '../types'
 
 
 type Props = {
   details: WorkspaceDetails
   project: ProjectSpec
   appVersion?: string
+  projectAudit?: ReturnType<typeof import('../hooks/useProjectAudit').useProjectAudit>
+  storageStatus?: StorageStatus
+  onOpenStorage?: () => void
+  onScenarioChange?: (signal: ScenarioSignal | undefined) => void
   activeAction?: FlowAction
   activeRunId?: string
   activeRunStartedAt?: number
@@ -60,8 +66,9 @@ type Props = {
   liveIterativeAttempt?: IterativeAttemptView
 }
 
-export function FlowWorkspace({ details, project, appVersion, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onOpenDashboard, onOpenPath, onUpdateWorkspace, onUpdateProjectBranches, onUpdateProjectNode, onListNodeVersions, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onExportLegacyIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeDrive, onIterativeBegin, onIterativeAgent, onIterativeAttempt, onIterativeCancel, liveIterativeAttempt }: Props) {
+export function FlowWorkspace({ details, project, appVersion, projectAudit, storageStatus, onOpenStorage, onScenarioChange, activeAction, activeRunId, activeRunStartedAt, activeDraftProgress, draftLaunch, onMarkDraftLaunched, onResetDraftLaunch, onAcknowledgeDraftRun, baselineDecision, onClearBaselineDecision, onGetBaselineIntentPlan, onGetCurrentDraftResult, onRun, onOpenDashboard, onOpenPath, onUpdateWorkspace, onUpdateProjectBranches, onUpdateProjectNode, onListNodeVersions, onListAgentModels, onGetIterativeTask, onExportIterativeTask, onExportLegacyIterativeTask, onCopyIterativeTask, onSaveIterativeTask, onIterativeStatus, onIterativeDrive, onIterativeBegin, onIterativeAgent, onIterativeAttempt, onIterativeCancel, liveIterativeAttempt }: Props) {
   const { language, text, t } = useLanguage()
+  const surface = useProjectSurface()
   // The persisted goal drives stage actions and autopilot: a green target set
   // in the Baseline dialog must survive into generate/release instead of
   // being reset to a hard-coded yellow on the next step (F1).
@@ -165,12 +172,14 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
   const flowComplete = actionsComplete && acceptanceAccepted
   const activeIndex = currentIndex < 0 ? FLOW_STAGES.length - 1 : currentIndex
   const active = Boolean(activeAction)
+  const maintenanceBlocked = storageBlocksMigration(storageStatus)
   // P1#1: the deterministic iterative scenario owns the ONE main action. The
   // panel mirrors it here; while a signal is present, the hero never renders
   // its own competing legacy FLOW primary.
   const [reportedScenario, setScenarioSignal] = useState<ScenarioSignal | undefined>(undefined)
   const scenarioSignal = reportedScenario?.projectName === project.name && reportedScenario.workspaceId === details.workspace.id ? reportedScenario : undefined
   const scenarioOnScenario = setScenarioSignal
+  useEffect(() => { onScenarioChange?.(scenarioSignal) }, [onScenarioChange, scenarioSignal])
   const acceptanceTone = acceptanceAccepted ? 'success' : acceptanceNeedsRemediation ? 'danger' : 'muted'
   const acceptanceLabel = acceptanceAccepted ? 'ACCEPTED' : acceptanceNeedsRemediation ? 'REMEDIATION_REQUIRED' : 'UNKNOWN'
   const configuredBranch = project.git?.baseBranch || project.git?.branchPrefix || 'libs'
@@ -456,6 +465,7 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
 
   return (
     <section className="flow-workspace">
+      {maintenanceBlocked ? <div className="resume-notice storage-migration-notice" role="status"><strong>{storageStatus?.control === 'paused' ? text('Очистка на паузе', 'Cleanup paused') : text('Выполняется очистка хранилища', 'Storage cleanup is running')}</strong><span>{text('Запуск и повтор обновления временно недоступны. Продолжите или отмените очистку, чтобы начать миграцию.', 'Starting or retrying an update is temporarily unavailable. Resume or cancel cleanup before starting a migration.')}</span>{onOpenStorage ? <button type="button" className="button secondary" onClick={onOpenStorage}>{text('Управлять очисткой', 'Manage cleanup')}</button> : null}</div> : null}
 
       <section className="human-flow-card" aria-label={text('Состояние обновления зависимостей', 'Dependency upgrade status')}>
         <div className="human-flow-hero">
@@ -475,16 +485,18 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
                 control (label/enabled/act come out of onScenario) at the top so
                 the primary action is visible without scrolling at 1080×700. */}
             <button type="button" className="button primary" data-testid="hero-main-action"
-              disabled={!scenarioSignal.enabled}
+              disabled={!scenarioSignal.enabled || maintenanceBlocked && !scenarioSignal.running}
               onClick={() => scenarioSignal.act()}>
               {scenarioSignal.running ? <X size={16} /> : scenarioSignal.state === 'agent' || scenarioSignal.state === 'repair-current' ? <Wrench size={16} /> : scenarioSignal.state === 'result' || scenarioSignal.state === 'partial' || scenarioSignal.state === 'budget-stop' || scenarioSignal.state === 'blocked' || scenarioSignal.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}
               {scenarioSignal.label}
             </button>
-            <button className="button secondary" disabled={active || scenarioSignal.running} onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button>
+            <details className="project-actions-menu"><summary>{text('Действия', 'Actions')} ···</summary><div>
+            <button className="button secondary" disabled={active || scenarioSignal.running || maintenanceBlocked} onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button>
             {draftResult ? <button className="button secondary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Последний Draft', 'Last Draft')}</button> : null}
             <button className="button secondary" disabled={!iterativeView?.artifactsDirectory && !run && !activeAction && !scenarioSignal?.attempt} onClick={() => void onOpenPath(iterativeView?.artifactsDirectory || artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
             {iterativeView?.iterationDirectory ? <button className="button secondary" onClick={() => void onOpenPath(iterativeView.iterationDirectory)}><FileText size={16} />{text('Рабочая директория итерации', 'Iteration working directory')}</button> : null}
-            {flowComplete && acceptanceAccepted ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} />{text('Продолжить улучшение', 'Continue improving')}</button> : null}
+            {flowComplete && acceptanceAccepted ? <button className="button secondary" disabled={active || maintenanceBlocked} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} />{text('Продолжить улучшение', 'Continue improving')}</button> : null}
+            </div></details>
           </div>
         ) : (
           <>
@@ -507,13 +519,13 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
               panel owns the ONE main action. This legacy action row only runs on
               the no-panel path (scenarioSignal absent), where the legacy FLOW
               primary applies. */}
-          {!flowComplete && !active && humanPrimaryStage.action ? <button className="button primary" disabled={humanPrimaryStage.action === 'release' && !acceptanceAccepted} onClick={() => baselineRestartRequired && humanPrimaryStage.action === 'baseline' ? restartBaseline(activeIndex) : void execute(activeIndex, undefined, undefined, humanPrimaryStage.action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}><Play size={16} />{baselineRestartRequired && humanPrimaryStage.action === 'baseline' ? text('Начать новый поиск', 'Start a new search') : humanPrimaryStage.action === 'baseline' && details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Продолжить работу', 'Continue')}</button> : null}
-          {!flowComplete && !active && humanPrimaryStage.action === 'baseline' && (details.baselineRecovery?.available || run?.lastAction === 'baseline') ? <button className="button secondary" onClick={() => restartBaseline(activeIndex)}><RotateCcw size={16} />{text('Начать заново', 'Start over')}</button> : null}
+          {!flowComplete && !active && humanPrimaryStage.action ? <button className="button primary" disabled={maintenanceBlocked || humanPrimaryStage.action === 'release' && !acceptanceAccepted} onClick={() => baselineRestartRequired && humanPrimaryStage.action === 'baseline' ? restartBaseline(activeIndex) : void execute(activeIndex, undefined, undefined, humanPrimaryStage.action === 'baseline' ? (details.baselineRecovery?.available ? 'continue' : 'auto') : undefined)}><Play size={16} />{baselineRestartRequired && humanPrimaryStage.action === 'baseline' ? text('Начать новый поиск', 'Start a new search') : humanPrimaryStage.action === 'baseline' && details.baselineRecovery?.available ? text('Продолжить', 'Continue') : text('Продолжить работу', 'Continue')}</button> : null}
+          {!flowComplete && !active && humanPrimaryStage.action === 'baseline' && (details.baselineRecovery?.available || run?.lastAction === 'baseline') ? <button className="button secondary" disabled={maintenanceBlocked} onClick={() => restartBaseline(activeIndex)}><RotateCcw size={16} />{text('Начать заново', 'Start over')}</button> : null}
           {/* L3: Draft/scope stays reachable right after project selection — on
               Preflight and after a failed C0 — not only when the FLOW stage is
               Baseline. The planner still guards what a Draft may do. */}
-          {!active ? <button className="button secondary" onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button> : null}
-          {flowComplete && acceptanceAccepted ? <button className="button secondary" disabled={active} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} />{text('Продолжить улучшение', 'Continue improving')}</button> : null}
+          {!active ? <button className="button secondary" disabled={maintenanceBlocked} onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button> : null}
+          {flowComplete && acceptanceAccepted ? <button className="button secondary" disabled={active || maintenanceBlocked} onClick={() => void openDeferredImprovementDialog()}><RotateCcw size={16} />{text('Продолжить улучшение', 'Continue improving')}</button> : null}
           {draftResult ? <button className="button secondary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Последний Draft', 'Last Draft')}</button> : null}
           <button className="button secondary" disabled={!run && !activeAction} onClick={() => void onOpenPath(artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
         </div>
@@ -609,23 +621,6 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         )}
       </section>
 
-      <AuditGoalSummary audit={iterativeView?.audit} initial={iterativeView?.initialAudit} onOpenPath={onOpenPath} />
-
-      <section className="roadmap-card migration-launch-settings"><details className="migration-launch-settings-collapse" open={false}><summary className="roadmap-card-header"><div><strong>{text('Настройки запуска', 'Run settings')}</strong><span>{text('Агент и модель используются для исправлений. Выберите их до запуска; работа агента может расходовать токены.', 'Agent and model are used for repairs. Choose them before starting; agent work may consume tokens.')}</span></div></summary>
-      <fieldset className="project-facts" disabled={active || scenarioSignal?.running}>
-        <div><span>{t('flow.projectPath')}</span><strong title={project.path}>{project.path}</strong></div>
-        <div><span>{t('common.branch')}</span><div className="git-plan-control"><ModelPicker ariaLabel={t('flow.updateBranch')} value={branchBase} options={branchSuggestions} onChange={setBranchBase} onCommit={value => persistGitSettings(value).catch(error => window.alert(String(error)))} placeholder="libs" /><label className="push-toggle" title={t('flow.pushTitle')}><input type="checkbox" checked={pushEnabled} onChange={(event) => void persistGitSettings(branchBase, event.target.checked).catch(error => window.alert(String(error)))} />Push</label></div></div>
-        <div><span>{text('Базовая ветка для актуализации / Baseline', 'Source branch for refresh / Baseline')}</span><ModelPicker ariaLabel={text('Базовая ветка', 'Baseline source branch')} value={sourceBranch} options={branchSuggestions} onChange={setSourceBranch} onCommit={value => persistGitSettings(branchBase, pushEnabled, value).catch(error => window.alert(String(error)))} placeholder="master" title={text('Актуализация и проверенный Baseline берут исходное состояние из этой ветки. Непринятые изменения не удаляются; защита Git может остановить переключение.', 'Refresh and verified Baseline use this source branch. Local changes are preserved; the Git guard can block switching.')} />{branchListError ? <span className="error-text" role="alert">{branchListError}</span> : null}</div>
-        <div><span>{t('flow.workspace')}</span><strong className={details.git.dirty ? 'warning-text' : 'success-text'}>{details.git.dirty ? t('flow.workspaceDirty', { count: details.git.summary.length }) : t('flow.workspaceClean')}</strong></div>
-        <div><span>{t('flow.agent')}</span><QuickSelect value={details.workspace.agent} options={[{ value: 'codex', label: 'Codex' }, { value: 'opencode', label: 'OpenCode' }, { value: 'claude', label: 'Claude' }]} onChange={(value) => void onUpdateWorkspace({ id: details.workspace.id, agent: value as AgentProvider })} ariaLabel={t('flow.agent')} /></div>
-        <div><span>{t('flow.model')}</span><ModelPicker value={agentModel} options={modelSuggestions} onChange={setAgentModel} onCommit={value => persistAgentModel(value).catch(error => window.alert(error instanceof Error ? error.message : String(error)))} placeholder={t('flow.modelDefault')} ariaLabel={t('flow.modelAria')} title={t('flow.modelTitle')} />{modelValidationError ? <span className="error-text" role="alert">{modelValidationError}</span> : null}</div>
-        <div><span title={text('Явная версия Node.js проекта/CI. Пусто = среда не зафиксирована (host runtime, без гарантии совместимости с CI). Проверки и верификация будут выполняться установленным Node.', 'Explicit project/CI Node.js version. Empty = no fixed runtime (host ambient Node, no CI-compatibility claim). Verification and checks run on the installed Node.')}>{text('Node.js', 'Node.js')}</span><ModelPicker value={nodeVersionDraft} options={availableNodeVersions} onChange={setNodeVersionDraft} onCommit={value => persistNodeVersion(value).catch(error => window.alert(error instanceof Error ? error.message : String(error)))} placeholder={text('не задано', 'not set')} ariaLabel={text('Node.js для проекта/CI', 'Node.js for project/CI')} title={text('Node.js для проекта/CI', 'Node.js for project/CI')} />
-          {project.nodeHints?.length ? <span className="node-hints" title={text('Закрепления Node в репозитории (engines.node / .nvmrc / .node-version). Подсказка: выбирать отсюда не обязательно — пустое значение означает среду хоста.', 'Node pins in this repository (engines.node / .nvmrc / .node-version). Suggestion only — leaving it empty keeps the host runtime.')}>{text('В репо закреплён Node', 'Repo pins Node')}: {project.nodeHints.join(', ')}</span> : null}
-        </div>
-      </fieldset>
-      </details>
-      </section>
-
       <IterativeTaskPanel
         key={`${details.workspace.id}:${project.name}`}
         workspaceId={details.workspace.id}
@@ -651,9 +646,31 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         // allow a start while a legacy activeAction owns the checkout.
         onScenario={scenarioOnScenario}
         onStatusView={setIterativeView}
-        disabledExternal={active}
+        disabledExternal={active || maintenanceBlocked || projectAudit?.view?.lifecycle.phase === 'running'}
       />
 
+      <AuditGoalSummary audit={iterativeView?.audit?.checkpointId ? iterativeView.audit : projectAudit?.view?.audit ?? iterativeView?.audit} initial={iterativeView?.initialAudit} lifecycle={projectAudit?.view?.lifecycle} onRefresh={projectAudit?.start} refreshDisabled={maintenanceBlocked || active || Boolean(projectAudit?.view?.blockedReason) || projectAudit?.starting} refreshError={projectAudit?.error} onOpenPath={onOpenPath} />
+
+      {surface('dependencies', <>
+      <section className="project-scope-actions"><h2>{text('Состав и настройки обновления', 'Update scope and settings')}</h2><p>{text('Draft предлагает версии; проверенный запуск применяет и проверяет изменения.', 'Draft proposes versions; a verified run applies and checks the changes.')}</p><button className="button secondary" disabled={active || maintenanceBlocked || scenarioSignal?.running} onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button></section>
+      <section className="roadmap-card migration-launch-settings"><details className="migration-launch-settings-collapse" open={false}><summary className="roadmap-card-header"><div><strong>{text('Настройки запуска', 'Run settings')}</strong><span>{text('Агент и модель используются для исправлений. Выберите их до запуска; работа агента может расходовать токены.', 'Agent and model are used for repairs. Choose them before starting; agent work may consume tokens.')}</span></div></summary>
+      <fieldset className="project-facts" disabled={active || scenarioSignal?.running}>
+        <div><span>{t('flow.projectPath')}</span><strong title={project.path}>{project.path}</strong></div>
+        <div><span>{t('common.branch')}</span><div className="git-plan-control"><ModelPicker ariaLabel={t('flow.updateBranch')} value={branchBase} options={branchSuggestions} onChange={setBranchBase} onCommit={value => persistGitSettings(value).catch(error => window.alert(String(error)))} placeholder="libs" /><label className="push-toggle" title={t('flow.pushTitle')}><input type="checkbox" checked={pushEnabled} onChange={(event) => void persistGitSettings(branchBase, event.target.checked).catch(error => window.alert(String(error)))} />Push</label></div></div>
+        <div><span>{text('Базовая ветка для актуализации / Baseline', 'Source branch for refresh / Baseline')}</span><ModelPicker ariaLabel={text('Базовая ветка', 'Baseline source branch')} value={sourceBranch} options={branchSuggestions} onChange={setSourceBranch} onCommit={value => persistGitSettings(branchBase, pushEnabled, value).catch(error => window.alert(String(error)))} placeholder="master" title={text('Актуализация и проверенный Baseline берут исходное состояние из этой ветки. Непринятые изменения не удаляются; защита Git может остановить переключение.', 'Refresh and verified Baseline use this source branch. Local changes are preserved; the Git guard can block switching.')} />{branchListError ? <span className="error-text" role="alert">{branchListError}</span> : null}</div>
+        <div><span>{t('flow.workspace')}</span><strong className={details.git.dirty ? 'warning-text' : 'success-text'}>{details.git.dirty ? t('flow.workspaceDirty', { count: details.git.summary.length }) : t('flow.workspaceClean')}</strong></div>
+        <div><span>{t('flow.agent')}</span><QuickSelect value={details.workspace.agent} options={[{ value: 'codex', label: 'Codex' }, { value: 'opencode', label: 'OpenCode' }, { value: 'claude', label: 'Claude' }]} onChange={(value) => void onUpdateWorkspace({ id: details.workspace.id, agent: value as AgentProvider })} ariaLabel={t('flow.agent')} /></div>
+        <div><span>{t('flow.model')}</span><ModelPicker value={agentModel} options={modelSuggestions} onChange={setAgentModel} onCommit={value => persistAgentModel(value).catch(error => window.alert(error instanceof Error ? error.message : String(error)))} placeholder={t('flow.modelDefault')} ariaLabel={t('flow.modelAria')} title={t('flow.modelTitle')} />{modelValidationError ? <span className="error-text" role="alert">{modelValidationError}</span> : null}</div>
+        <div><span title={text('Явная версия Node.js проекта/CI. Пусто = среда не зафиксирована (host runtime, без гарантии совместимости с CI). Проверки и верификация будут выполняться установленным Node.', 'Explicit project/CI Node.js version. Empty = no fixed runtime (host ambient Node, no CI-compatibility claim). Verification and checks run on the installed Node.')}>{text('Node.js', 'Node.js')}</span><ModelPicker value={nodeVersionDraft} options={availableNodeVersions} onChange={setNodeVersionDraft} onCommit={value => persistNodeVersion(value).catch(error => window.alert(error instanceof Error ? error.message : String(error)))} placeholder={text('не задано', 'not set')} ariaLabel={text('Node.js для проекта/CI', 'Node.js for project/CI')} title={text('Node.js для проекта/CI', 'Node.js for project/CI')} />
+          {project.nodeHints?.length ? <span className="node-hints" title={text('Закрепления Node в репозитории (engines.node / .nvmrc / .node-version). Подсказка: выбирать отсюда не обязательно — пустое значение означает среду хоста.', 'Node pins in this repository (engines.node / .nvmrc / .node-version). Suggestion only — leaving it empty keeps the host runtime.')}>{text('В репо закреплён Node', 'Repo pins Node')}: {project.nodeHints.join(', ')}</span> : null}
+        </div>
+      </fieldset>
+      </details>
+      </section>
+
+      </>)}
+
+      {surface('journal', <>
       <details className="flow-technical-details">
         <summary>{text('Технические детали', 'Technical details')}</summary>
         <div className="flow-technical-details-body">
@@ -672,8 +689,9 @@ export function FlowWorkspace({ details, project, appVersion, activeAction, acti
         <summary>{text('Логи запуска', 'Run logs')}</summary>
         {currentScenario ? <IterativeRunDiagnostics signal={currentScenario} logs onReadLog={() => onIterativeAttempt(project.name, true)} onOpenLog={() => onOpenPath(`${currentScenario.runDir}/run.log`)} /> : null}
       </details>
+      </>)}
       {selectedBranchFailure?.runtime?.phase === 'failed' ? <BranchFailureModal branch={selectedBranchFailure} onClose={() => setSelectedBranchFailure(null)} /> : null}
-      {baselineIntentDialog ? <BaselineIntentDialog mode={baselineIntentDialog.mode} resume={baselineIntentDialog.resume} plan={baselineIntentDialog.plan} decision={baselineIntentDialog.decision} onCancel={() => { setBaselineIntentDialog(undefined); if (baselineIntentDialog.mode === 'decision') setBaselineDecisionDismissed(true) }} onSubmit={runBaselineIntent} /> : null}
+      {baselineIntentDialog ? <BaselineIntentDialog disabledReason={maintenanceBlocked ? text('Выполняется очистка хранилища. Продолжите или отмените её перед запуском.', 'Storage cleanup is running. Resume or cancel it before starting.') : undefined} mode={baselineIntentDialog.mode} resume={baselineIntentDialog.resume} plan={baselineIntentDialog.plan} decision={baselineIntentDialog.decision} onCancel={() => { setBaselineIntentDialog(undefined); if (baselineIntentDialog.mode === 'decision') setBaselineDecisionDismissed(true) }} onSubmit={runBaselineIntent} /> : null}
       {draftPromptPreview ? <PromptPreviewDialog preview={draftPromptPreview} onClose={() => setDraftPromptPreview(undefined)} onOpenPath={onOpenPath} /> : null}
 
     </section>
@@ -779,4 +797,5 @@ function DraftLiveProgress({ startedAt, progress, runId }: { startedAt?: number;
       <small>{stagePct !== undefined && !progress?.status ? text('Проценты относятся только к текущему этапу; 100% завершения — только когда результат опубликован.', 'Percentages refer to the current stage only; 100% completion only when the result is published.') : ''}{text(' Planning-only: install/lifecycle/project checks не выполняются, проект не изменяется.', ' Planning-only: no install/lifecycle/project checks are run, the project is not modified.')}</small>
     </div>
   )
+
 }

@@ -4,6 +4,7 @@ import { latestJobId, mergeLogSources, presentLogs, summarizeTokenUsage, type Pr
 import { useLanguage, type Language, type TranslationKey } from '../i18n'
 import type { EnvironmentInfo, FlowAction, JobOutput, JobOutputSource, MigrationProgress } from '../types'
 import { copyTextToClipboard } from '../clipboard'
+import { useVirtualLogRows } from '../hooks/useVirtualLogRows'
 import { RunMonitor } from './RunMonitor'
 import { rawLogOffsets, rawLogWindow } from '../data/rawLogWindow'
 import { QuickSelect } from './QuickSelect'
@@ -23,6 +24,7 @@ type Props = {
   onClear: () => void
   showRunMonitor?: boolean
   showEnvironment?: boolean
+  emptyMessage?: string
 }
 
 type LogView = 'activity' | 'raw'
@@ -74,8 +76,9 @@ const GENERATED_TITLES: Record<string, TranslationKey> = {
   'Записываю файл': 'log.tool.write',
 }
 
-export function LogPanel({ logs, knownSources = [], environment, active, activeJobId, activeAction, runStartedAt, migrationProgress, refreshError, onSendAgentNote, onCancel, onClear, showRunMonitor = true, showEnvironment = true }: Props) {
-  const { language, t } = useLanguage()
+export function LogPanel({ logs, knownSources = [], environment, active, activeJobId, activeAction, runStartedAt, migrationProgress, refreshError, onSendAgentNote, onCancel, onClear, showRunMonitor = true, showEnvironment = true, emptyMessage }: Props) {
+  const { language, t, text } = useLanguage()
+  const [query, setQuery] = useState('')
   const [view, setView] = useState<LogView>('activity')
   const [selectedSource, setSelectedSource] = useState('all')
   const [note, setNote] = useState('')
@@ -84,6 +87,7 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
   const activityRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<HTMLDivElement>(null)
   const followLogRef = useRef(true)
+  const [following, setFollowing] = useState(true)
   const [rawScrollTop, setRawScrollTop] = useState(0)
   const [rawViewport, setRawViewport] = useState(0)
   const [rawHeights, setRawHeights] = useState<Map<JobOutput, number>>(() => new Map())
@@ -92,7 +96,7 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
   const sourceLabel = (source?: JobOutputSource): string => !source
     ? t('log.source.system')
     : source.kind === 'planner'
-      ? t('log.source.planner')
+      ? source.label || t('log.source.planner')
       : t('log.source.group', { label: source.label })
 
   const localizeActivityTitle = (title: string | undefined, kind: PresentedLog['kind']): string => {
@@ -103,12 +107,13 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
     return tool ? t('log.tool.generic', { name: tool[1] }) : title
   }
 
-  const visibleLogs = useMemo(() => logs.filter((entry) => !isMachineTelemetry(entry)), [logs])
+  const visibleLogs = useMemo(() => logs.filter((entry) => (view === 'raw' || !isMachineTelemetry(entry)) && (!query.trim() || entry.line.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()))), [logs, query, view])
   const sourceOptions = useMemo(() => mergeLogSources(visibleLogs, knownSources), [visibleLogs, knownSources])
   const filteredLogs = useMemo(() => selectedSource === 'all' ? visibleLogs : selectedSource === 'system' ? visibleLogs.filter((entry) => !entry.source) : visibleLogs.filter((entry) => sourceKey(entry.source) === selectedSource), [selectedSource, visibleLogs])
   const selectedSourceInfo = sourceOptions.find(([key]) => key === selectedSource)?.[1]
   const addressedGroup = selectedSourceInfo?.kind === 'group' ? selectedSourceInfo : undefined
   const activity = useMemo(() => presentLogs(filteredLogs), [filteredLogs])
+  const activityWindow = useVirtualLogRows(activity, activityRef, view === 'activity')
   const tokens = useMemo(() => summarizeTokenUsage(filteredLogs.filter((entry) => entry.jobId === latestJobId(filteredLogs))), [filteredLogs])
 
   const numberLocale = language === 'ru' ? 'ru-RU' : 'en-US'
@@ -145,6 +150,7 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
   const rememberLogPosition = (event: UIEvent<HTMLDivElement>) => {
     const element = event.currentTarget
     followLogRef.current = element.scrollHeight - element.scrollTop - element.clientHeight <= 48
+    setFollowing(followLogRef.current)
   }
 
   const onTerminalScroll = (event: UIEvent<HTMLDivElement>) => {
@@ -203,6 +209,7 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
 
   useEffect(() => {
     followLogRef.current = true
+    setFollowing(true)
     const frame = window.requestAnimationFrame(() => {
       const element = view === 'activity' ? activityRef.current : terminalRef.current
       if (element) element.scrollTop = element.scrollHeight
@@ -235,6 +242,8 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
 
       {refreshError ? <div className="refresh-error-hint" role="status"><AlertTriangle size={14} />{t('log.refreshFailed')}: {refreshError}</div> : null}
 
+      <label className="journal-search"><span>{text('Поиск в журнале', 'Search journal')}</span><input type="search" value={query} onChange={event => setQuery(event.target.value)} placeholder={text('Текст сообщения или команды', 'Message or command text')} /></label>
+      <div className="journal-follow-controls"><button type="button" className="button secondary" aria-pressed={following} onClick={() => { const next = !following; followLogRef.current = next; setFollowing(next); if (next) { const element = view === 'activity' ? activityRef.current : terminalRef.current; if (element) element.scrollTop = element.scrollHeight } }}>{following ? text('Следим за новыми событиями', 'Following new events') : text('Следить за новыми событиями', 'Follow new events')}</button></div>
       <div className="log-controls"><div className="log-tabs" role="tablist" aria-label={t('log.viewAria')}>
         <button role="tab" aria-selected={view === 'activity'} className={view === 'activity' ? 'active' : ''} onClick={() => setView('activity')}>{t('log.activity')}</button>
         <button role="tab" aria-selected={view === 'raw'} className={view === 'raw' ? 'active' : ''} onClick={() => setView('raw')}>Raw</button>
@@ -248,17 +257,21 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
       </div>
 
       {view === 'activity' ? (
-        <div ref={activityRef} className="activity-log" aria-live="polite" onScroll={rememberLogPosition}>
-          {activity.length === 0 ? <span className="activity-empty">{t('log.activityEmpty')}</span> : activity.map((entry, index) => (
-            <div className={`activity-entry ${entry.kind}`} key={`${entry.kind}-${index}`}>
+        <div ref={activityRef} className="activity-log" aria-live="off" onScroll={event => { rememberLogPosition(event); activityWindow.onScroll(event) }}>
+          {activity.length === 0 ? <span className="activity-empty">{emptyMessage ?? t('log.activityEmpty')}</span> : <>
+          {activityWindow.before > 0 ? <div style={{height:activityWindow.before}} aria-hidden="true" /> : null}
+          {activity.slice(activityWindow.start, activityWindow.end).map((entry, index) => (
+            <div className={`activity-entry ${entry.kind}`} key={`${entry.kind}-${activityWindow.start + index}`} data-activity-row={activityWindow.start + index}>
               <span className="activity-icon"><ActivityIcon kind={entry.kind} /></span>
               <div><div className="activity-title"><strong>{localizeActivityTitle(entry.title, entry.kind)}</strong><span className="log-source-badge">{sourceLabel(entry.source)}</span></div><p>{entry.body}</p>{entry.detail ? <small>{entry.detail}</small> : null}</div>
             </div>
           ))}
+          {activityWindow.after > 0 ? <div style={{height:activityWindow.after}} aria-hidden="true" /> : null}
+          </>}
         </div>
       ) : (
-        <div ref={terminalRef} className="terminal" aria-live="polite" onScroll={onTerminalScroll}>
-          {filteredLogs.length === 0 ? <span className="terminal-muted">{t('log.rawEmpty')}</span> : <>
+        <div ref={terminalRef} className="terminal" aria-live="off" onScroll={onTerminalScroll}>
+          {filteredLogs.length === 0 ? <span className="terminal-muted">{emptyMessage ?? t('log.rawEmpty')}</span> : <>
             {rawStart > 0 ? <div style={{ height: rawOffsets[rawStart] }} aria-hidden="true" data-window-spacer /> : null}
             {filteredLogs.slice(rawStart, rawEnd).map((entry, index) => {
               const i = rawStart + index

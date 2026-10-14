@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, writeFileSync, renameSync, realpathSync } from 'node:fs'
+import { dependencyInputIdentity } from './acceptance-policy.js'
 import { migrationDocumentationPrompt } from './migration-documentation.js'
 import { join, resolve, relative, isAbsolute, dirname, basename } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -64,7 +65,13 @@ export function readCurrentAuditView(runDir: string): AuditView | undefined {
     const file = join(audit.projectDir!, name)
     try { return (existsSync(file) ? createHash('sha256').update(readFileSync(file)).digest('hex') : null) !== hash } catch { return true }
   })
-  return { ...audit, stale: Boolean(audit.stale || changed || pending), running: Boolean(pending && !pending.error), error: pending?.error }
+  let sharedChanged = false
+  const hash = (audit as AuditView & { dependencyInputHash?: string }).dependencyInputHash
+  if (audit.projectDir && hash) { try { sharedChanged = dependencyInputIdentity(audit.projectDir).hash !== hash } catch { sharedChanged = true } }
+  const lifecycle = readJson(join(runDir, 'current-audit-state.json'))
+  let alive = false
+  if (lifecycle?.phase === 'running' && Number.isSafeInteger(lifecycle.ownerPid) && lifecycle.ownerPid > 0) { try { process.kill(lifecycle.ownerPid, 0); alive = true } catch { /* lost owner */ } }
+  return { ...audit, stale: Boolean(audit.stale || changed || sharedChanged || pending), running: Boolean(pending && !pending.error && alive), error: pending?.error || (pending && !alive ? 'AUDIT_INTERRUPTED' : undefined) }
 }
 export function readAuditView(runDir: string): AuditView | undefined {
   const run = readJson(join(runDir, 'run.json'))
@@ -80,7 +87,7 @@ export function readAuditView(runDir: string): AuditView | undefined {
   if (!audit?.generatedAt) {
     const pending = readJson(join(runDir, 'current-audit-pending.json'))
     const cached = readCurrentAuditView(runDir)
-    const initial = pending ? { ...cached, status: cached?.status ?? 'UNKNOWN', stale: true, running: !pending.error, error: pending.error } : cached
+    const initial = pending ? { ...cached, status: cached?.status ?? 'UNKNOWN', stale: true, running: cached?.running === true, error: cached?.error || pending.error } : cached
     return run ? { ...initial, ...audit, status: audit?.status ?? 'UNKNOWN', checkpointId: run.activeCheckpointId, stale: true } : initial
   }
   // Older runs stored only a package count; read canonical totals from the
@@ -104,7 +111,7 @@ function fresh(value?: AuditView): AuditView | undefined {
     unknownPackages: (report.lag ?? []).filter((item: any) => item.status === 'unknown').map((item: any) => ({ package: item.name, version: item.current, reason: item.error })),
     vulnerablePackages: Object.entries(report.audit?.packages ?? {}).map(([name, raw]) => { const item = raw as any; return { package: name, severity: item.severity ?? ['critical', 'high', 'moderate', 'low'].find(s => item[s] > 0), direct: item.isDirect, nodes: item.nodes } }),
   } : {}
-  return { ...value, ...evidence, stale: !Number.isFinite(age) || age < -300_000 || age > 86_400_000 }
+  return { ...value, ...evidence, stale: Boolean(value.stale) || !Number.isFinite(age) || age < -300_000 || age > 86_400_000 }
 }
 export function auditLevel(audit?: AuditView): { status: 'red' | 'yellow' | 'green'; lagOkPct?: number; measuredAt?: string } | undefined {
   if (!audit || audit.stale || audit.running) return

@@ -439,6 +439,12 @@ export const en = {
   "duration.hourShort": "h",
   "duration.minuteShort": "m",
   "duration.secondShort": "s",
+  "app.shellSettings": "Interface and workspace settings",
+  "app.cleanupBlocked": "Wait for cleanup to finish or cancel it",
+  "app.projectSection": "Project section",
+  "projectRail.audit.aria": "Audit {name}",
+  "projectRail.audit": "Run audit",
+  "projectRail.manageWorkspace": "Manage workspace",
 } as const
 
 export type TranslationKey = keyof typeof en

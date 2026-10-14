@@ -10,6 +10,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -98,6 +99,9 @@ def current_audit(run_dir, inputs):
     import iterative_migration as core
     from manual_dependency_audit import dependency_input_identity
     from project_runtime import resolve_requested_node
+    operation_id = inputs.get("operationId")
+    if operation_id is not None and (not isinstance(operation_id, str) or not re.fullmatch(r"[a-zA-Z0-9-]{1,80}", operation_id)):
+        raise ValueError("Invalid audit operation ID")
     project = Path(inputs["projectDir"]).resolve()
     intent = inputs.get("intent") or {}
     policy = intent.get("acceptancePolicy") or {}
@@ -120,7 +124,7 @@ def current_audit(run_dir, inputs):
                      for name in ("package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", ".npmrc", ".yarnrc", ".yarnrc.yml")}
     registry_inputs = {name: hashlib.sha256((project / name).read_bytes()).hexdigest() if (project / name).is_file() else None
                        for name in (".npmrc", ".yarnrc", ".yarnrc.yml")}
-    identity = hashlib.sha256(json.dumps([dependency_input_identity(project)[0], {k: v for k, v in inputs.items() if k != "forceRefresh"}, config.get("runtime") or {}, registry_inputs], sort_keys=True).encode()).hexdigest()
+    identity = hashlib.sha256(json.dumps([dependency_input_identity(project)[0], {k: v for k, v in inputs.items() if k not in {"forceRefresh", "operationId"}}, config.get("runtime") or {}, registry_inputs], sort_keys=True).encode()).hexdigest()
     cache = run_dir / "current-audit.json"
     if cache.exists():
         try:
@@ -137,7 +141,7 @@ def current_audit(run_dir, inputs):
         if not inputs.get("forceRefresh") and previous.get("inputIdentity") == identity and fresh and previous.get("status") in {"PASS", "FAIL"}:
             return previous
     before = dependency_input_identity(project)[0]
-    evidence = run_dir / "audit" / "initial"
+    evidence = run_dir / "audit" / (f"current-{operation_id}" if operation_id else "initial")
     metadata_cache = evidence / "npm-metadata-cache.json"
     if inputs.get("forceRefresh") and metadata_cache.exists():
         metadata_cache.unlink()
@@ -145,7 +149,9 @@ def current_audit(run_dir, inputs):
     if dependency_input_identity(project)[0] != before or any((hashlib.sha256((project / name).read_bytes()).hexdigest() if (project / name).is_file() else None) != value for name, value in source_hashes.items()):
         raise RuntimeError("AUDIT_INPUT_CHANGED: dependency files or registry configuration changed during the audit")
     result = {**summary(report, evidence), "inputIdentity": identity, "projectDir": str(project),
-              "branch": git(project, "branch", "--show-current"), "sourceFileHashes": source_hashes}
+              "branch": git(project, "branch", "--show-current"), "sourceFileHashes": source_hashes,
+              "dependencyInputHash": before,
+              **({"operationId": operation_id, "desktopContextHash": inputs.get("desktopContextHash")} if operation_id else {})}
     core._write_json_atomic(cache, result)
     return result
 

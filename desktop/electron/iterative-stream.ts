@@ -41,7 +41,7 @@ export type StreamPlatform = {
 
 export type StreamAttemptIo = {
   cancelRequested: (runDir: string) => boolean
-  recordLine: (runDir: string, text: string) => void
+  recordLine: (runDir: string, text: string, stream?: 'stdout' | 'stderr') => void
   trimLog: (runDir: string) => void
 }
 
@@ -75,7 +75,7 @@ export function spawnIterativeStreamed(
   io: StreamAttemptIo,
   platform: StreamPlatform,
   onEvent?: (payload: Record<string, any>) => void,
-  options?: { stdin?: string; onLine?: (line: string) => void; onSpawn?: (pid: number) => void; onDeadline?: () => number },
+  options?: { stdin?: string; onLine?: (line: string) => void; onSpawn?: (pid: number, child?: ChildProcess) => void; onDeadline?: () => number },
 ): Promise<CaptureResult> {
   return new Promise((resolvePromise) => {
     let stdout = ''
@@ -117,7 +117,7 @@ export function spawnIterativeStreamed(
     // Zero disables only the overall watchdog; cancellation remains active.
     child.stdin.on('error', () => { /* EPIPE from an early child exit */ })
     child.stdin.end(options?.stdin)
-    if (child.pid) observe(() => options?.onSpawn?.(child.pid as number))
+    if (child.pid) observe(() => options?.onSpawn?.(child.pid as number, child))
     let timer: ReturnType<typeof setTimeout> | undefined
     const deadline = (): void => {
       if (settled || canceled || observerFailed) return
@@ -140,7 +140,7 @@ export function spawnIterativeStreamed(
       const line = stdoutCarry
       stdoutCarry = ''
       stdout = captureTail(stdout, `${line}\n`)
-      try { io.recordLine(runDir, `${line}\n`) } catch { /* log is best-effort */ }
+      try { io.recordLine(runDir, `${line}\n`, 'stdout') } catch { /* log is best-effort */ }
       maybeTrim()
       parseEventLine(line, onEvent)
       observe(() => options?.onLine?.(line))
@@ -158,7 +158,7 @@ export function spawnIterativeStreamed(
       let plain = ''
       const flushPlain = (): void => {
         if (!plain) return
-        try { io.recordLine(runDir, plain) } catch { /* log is best-effort */ }
+        try { io.recordLine(runDir, plain, 'stdout') } catch { /* log is best-effort */ }
         plain = ''
         maybeTrim()
       }
@@ -166,7 +166,7 @@ export function spawnIterativeStreamed(
         observe(() => options?.onLine?.(line))
         if (line.includes('ITERATIVE_MIGRATION_STATUS_V1 ')) {
           flushPlain()
-          try { io.recordLine(runDir, `${line}\n`) } catch { /* log is best-effort */ }
+          try { io.recordLine(runDir, `${line}\n`, 'stdout') } catch { /* log is best-effort */ }
           maybeTrim()
           parseEventLine(line, onEvent)
         } else {
@@ -178,14 +178,14 @@ export function spawnIterativeStreamed(
       // Journal oversized plain lines verbatim without retaining an unlimited carry.
       if (Buffer.byteLength(stdoutCarry, 'utf8') > MAX_CAPTURE_BYTES) {
         stdout = captureTail(stdout, stdoutCarry)
-        try { io.recordLine(runDir, stdoutCarry) } catch { /* best-effort */ }
+        try { io.recordLine(runDir, stdoutCarry, 'stdout') } catch { /* best-effort */ }
         stdoutCarry = ''
         maybeTrim()
       }
     })
     child.stderr.on('data', (chunk: Buffer) => {
       const text = platform.decodeChunk(chunk)
-      try { io.recordLine(runDir, text) } catch { /* best-effort */ }
+      try { io.recordLine(runDir, text, 'stderr') } catch { /* best-effort */ }
       maybeTrim()
       stderr = captureTail(stderr, text)
     })

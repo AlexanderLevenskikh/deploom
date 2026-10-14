@@ -2,9 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 import { X, FolderOpen } from 'lucide-react'
 import { useLanguage } from '../i18n'
 import { useDialogFocus } from '../hooks/useDialogFocus'
+import './StorageControls.css'
 import type { DependencyFlowApi, StorageProgress, StorageResult, StorageStatus } from '../types'
 
-export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress, status }: { status?: StorageStatus; onClose: () => void; onMaintenance: DependencyFlowApi['storageMaintenance']; onProgress: DependencyFlowApi['onStorageProgress'] }) {
+export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress, onControl, status }: { status?: StorageStatus; onClose: () => void; onMaintenance: DependencyFlowApi['storageMaintenance']; onProgress: DependencyFlowApi['onStorageProgress']; onControl?: DependencyFlowApi['storageControl'] }) {
   const { language } = useLanguage()
   const text = (ru: string, en: string) => language === 'ru' ? ru : en
   const rootRef = useRef<HTMLDivElement>(null)
@@ -36,6 +37,12 @@ export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress, s
       setError(reason instanceof Error ? reason.message : String(reason))
       if (next === 'clean') setResult(undefined)
     } finally { activeOperation.current = undefined; setBusy(false) }
+  }
+  const controlPhase = status?.operationId === activeOperation.current ? status?.control : undefined
+  const paused = controlPhase === 'paused'
+  const requestControl = async (command: 'pause' | 'resume' | 'cancel') => {
+    if (!onControl || !activeOperation.current) return
+    try { setError(undefined); await onControl(activeOperation.current, command) } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
   }
   const gib = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} ${text('ГиБ', 'GiB')}`
   const label = (category: string) => ({
@@ -92,18 +99,19 @@ export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress, s
     groups.set(key, group)
   }
   const outcomes = new Map((result?.results || []).map(item => [item.path, item]))
-  const completed = Boolean(result?.results)
-  const canClean = !busy && result && !completed && result.eligible > 0
+  const completed = Boolean(result?.results) && !result?.canceled
+  const canClean = !busy && result && !result.canceled && !result.partial && !completed && result.eligible > 0
   const stage = progress?.stage === 'clean' ? text('Удаляем подтверждённый мусор', 'Removing confirmed garbage') : progress?.stage === 'validate' ? text('Повторно проверяем папки перед удалением', 'Rechecking folders before deletion') : text('Измеряем папки и проверяем принадлежность', 'Measuring folders and verifying ownership')
   return <div ref={rootRef} className="dialog-backdrop">
     <section className="dialog workspace-dialog storage-dialog" role="dialog" aria-modal="true" aria-labelledby="storage-title">
       <div className="dialog-title"><h2 id="storage-title">{text('Хранилище и безопасная очистка', 'Storage and safe cleanup')}</h2><button className="icon-button" aria-label={text('Закрыть', 'Close')} onClick={onClose}><X size={17} /></button></div>
       <p>{text('Очистка работает в фоне, диалог можно закрыть. Удаляем подтверждённый мусор; старые снимки уплотняем без потери файлов, одинаковое содержимое храним один раз. Последний результат, отчёты, настройки и рабочие ветки сохраняются.', 'Cleanup runs in the background; you can close this dialog. Remove confirmed garbage; compact historical snapshots losslessly, storing identical contents once. Preserve the latest result, reports, settings and result worktrees.')}</p>
       {busy ? <div className="storage-progress" role="status" aria-live="polite">
-        <strong>{stage}{progress?.percent != null && progress.stage === 'clean' ? ` · ${progress.percent}%` : ''}</strong>
-        <progress max={100} value={progress?.stage === 'clean' && progress.percent != null ? progress.percent : undefined} aria-label={stage} />
+        <strong>{paused ? text('Очистка на паузе', 'Cleanup paused') : controlPhase === 'pausing' ? text('Ожидаем безопасной паузы…', 'Waiting for a safe pause…') : controlPhase === 'resuming' ? text('Продолжаем очистку…', 'Resuming cleanup…') : controlPhase === 'canceling' ? text('Останавливаем очистку безопасно…', 'Stopping cleanup safely…') : stage}{progress?.percent != null && progress.stage === 'clean' ? ` · ${progress.percent}%` : ''}</strong>
+        {!paused ? <progress max={100} value={progress?.stage === 'clean' && progress.percent != null ? progress.percent : undefined} aria-label={stage} /> : <p>{text('Пауза подтверждена. Чтобы обновлять зависимости, продолжите или отмените очистку.', 'Pause confirmed. Resume or cancel cleanup before updating dependencies.')}</p>}
         <span>{action === 'clean' && progress?.stage === 'clean' ? `${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()} ${text('файлов обработано', 'files processed')}` : `${(progress?.files || 0).toLocaleString()} ${text('файлов в текущей папке', 'files in current folder')}`}</span>
         <small className="storage-path">{progress?.path}</small>
+        {onControl ? <div className="storage-control-actions"><button type="button" className="button secondary" disabled={controlPhase === 'pausing' || controlPhase === 'resuming' || controlPhase === 'canceling'} onClick={() => void requestControl(paused ? 'resume' : 'pause')}>{paused ? text('Продолжить очистку', 'Resume cleanup') : text('Пауза', 'Pause')}</button><button type="button" className="button secondary" disabled={controlPhase === 'canceling'} onClick={() => void requestControl('cancel')}>{text('Отменить очистку', 'Cancel cleanup')}</button></div> : null}
       </div> : null}
       {result ? <>
         <div className="storage-metrics">
@@ -116,6 +124,7 @@ export function StorageMaintenanceDialog({ onClose, onMaintenance, onProgress, s
         <details><summary>{text('Папки и причины защиты', 'Folders and protection reasons')}</summary><div className="storage-folder-list">{result.items.map(item => <div key={item.path}><button className="icon-button" title={text('Открыть папку', 'Open folder')} aria-label={text('Открыть папку', 'Open folder')} disabled={outcomes.get(item.path)?.status === 'removed'} onClick={() => void window.dependencyFlow?.openPath(item.path)}><FolderOpen size={15} /></button><span className="storage-path">{item.path}<small>{gib(item.bytes)} · {outcomes.get(item.path)?.status === 'removed' ? text('Удалено', 'Removed') : outcomes.get(item.path)?.status === 'compacted' ? text('Сохранено в сжатом виде; восстановится при обращении', 'Compacted; restored on access') : outcomes.get(item.path)?.status === 'failed' ? text('Не удалось удалить; папка сохранена или удалена частично', 'Deletion failed; folder retained or partially removed') : outcomes.get(item.path)?.reason ? reasons[outcomes.get(item.path)!.reason!] || outcomes.get(item.path)!.reason : item.eligible ? text('Можно очистить', 'Can clean') : reasons[item.reason] || item.reason}</small></span></div>)}</div></details>
         {completed ? <p role="status">{text('Очистка завершена', 'Cleanup finished')}: {text('удалено каталогов', 'folders removed')}: {result.removed}; {text('уплотнено снимков', 'snapshots compacted')}: {result.compacted || 0}; {gib(result.reclaimedBytes)} {text('освобождено по объёму файлов', 'reclaimed by file volume')}. {text('Пропущено', 'Skipped')}: {result.protected}; {text('ошибок', 'errors')}: {result.failed}. {text('Свободное место на томах обновлено.', 'Volume free space refreshed.')}</p> : null}
       </> : null}
+      {result?.canceled || status?.phase === 'canceled' ? <p role="status">{text('Очистка отменена. Выполненные удаления не откатываются; сохранённые снимки и защищённые данные остаются на месте. Для новой очистки повторите диагностику.', 'Cleanup canceled. Completed deletions are not undone; saved snapshots and protected data remain. Inspect again before starting another cleanup.')}</p> : null}
       {error ? <p role="alert">{error}</p> : null}
       <div className="dialog-actions"><button className="button secondary" data-autofocus disabled={busy} onClick={() => void run('inspect')}>{text('Диагностика всех хранилищ', 'Inspect all storage')}</button><button className="button primary" disabled={!canClean} onClick={() => void run('clean')}>{text('Очистить весь подтверждённый мусор', 'Clean all confirmed garbage')}</button></div>
     </section>

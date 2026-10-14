@@ -149,6 +149,39 @@ try {
   releaseParked.resolve();
   assert.equal((await manualRun).ok, false);
   assert.equal(autopilot.hasActiveSessions(), false);
+  // Commands stay pending until the child acknowledges them. Neither pause nor
+  // cancel may release the migration guard while the worker still owns files.
+  let controlLine, finishControlled, controlsHandle;
+  const modes = [];
+  const controlled = new StorageCleanupController(async (action, _payload, line, controls) => {
+    if (action === 'inspect') return 'STORAGE_RESULT_V1 ' + JSON.stringify(inventory);
+    controlLine = line; controlsHandle = controls;
+    controls.bind(mode => modes.push(mode));
+    return new Promise(done => { finishControlled = done });
+  }, () => [], () => false);
+  await controlled.maintenance('inspect', 'control-preview', () => {});
+  const controlledRun = controlled.maintenance('clean', 'controlled-clean', () => {});
+  assert.throws(() => controlled.control('pause', 'old-operation'), /no longer active/);
+  assert.equal(controlled.control('pause', 'controlled-clean').control, 'pausing');
+  controlLine('STORAGE_CONTROL_V1 ' + JSON.stringify({ operationId: 'old-operation', state: 'paused' }));
+  assert.equal(controlled.status().control, 'pausing');
+  controlLine('STORAGE_CONTROL_V1 ' + JSON.stringify({ operationId: 'controlled-clean', state: 'paused' }));
+  assert.equal(controlled.status().control, 'paused');
+  assert.throws(() => controlled.assertMigrationAllowed(), /cleanup is running/);
+  assert.equal(controlled.control('resume', 'controlled-clean').control, 'resuming');
+  controlLine('STORAGE_CONTROL_V1 ' + JSON.stringify({ operationId: 'controlled-clean', state: 'running' }));
+  assert.equal(controlled.status().control, undefined);
+  assert.equal(controlled.control('cancel', 'controlled-clean').control, 'canceling');
+  controlled.control('resume', 'controlled-clean');
+  assert.equal(controlsHandle.mode(), 'cancel', 'cancel cannot be undone by a late resume');
+  assert.throws(() => controlled.assertMigrationAllowed(), /cleanup is running/);
+  finishControlled('STORAGE_RESULT_V1 ' + JSON.stringify({ ...final, canceled: true, partial: true }));
+  await controlledRun;
+  assert.equal(controlled.status().phase, 'canceled');
+  assert.doesNotThrow(() => controlled.assertMigrationAllowed());
+  assert.deepEqual(modes, ['run', 'pause', 'run', 'cancel']);
+  assert.throws(() => controlled.control('pause', 'controlled-clean'), /no longer active/);
+  await assert.rejects(controlled.maintenance('clean', 'reuse-canceled', () => {}), /Inspect storage/);
   let inspectFails = false;
   const invalidation = new StorageCleanupController(async () => { if (inspectFails) throw new Error('read failed'); return 'STORAGE_RESULT_V1 ' + JSON.stringify(inventory) }, () => [], () => false);
   await invalidation.maintenance('inspect', 'old-preview', () => {}); inspectFails = true;

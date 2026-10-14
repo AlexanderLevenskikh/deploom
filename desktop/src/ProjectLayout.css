@@ -1,0 +1,86 @@
+/* Production layout follows the supplied DepLoom UX prototype. */
+.app-shell { --canvas:#fff; grid-template-rows:56px minmax(0,1fr) 30px; font-size:14px; background:var(--canvas); }
+html[data-theme='dark'] .app-shell { --canvas:#111827; }
+.app-shell [hidden] { display:none !important; }
+.app-shell .app-header { height:56px; gap:18px; background:var(--canvas); padding:0 20px; }
+.app-shell .app-brand { min-width:178px; }
+.app-shell .app-grid { grid-template-columns:216px minmax(0,1fr); }
+.app-shell .app-grid.graph-hide-project-rail { grid-template-columns:minmax(0,1fr); }
+.app-shell .project-rail { background:var(--surface); padding:22px 12px 14px; gap:12px; }
+.app-shell .rail-title { padding:0 6px; font-size:14px; }
+.app-shell .rail-search { margin:0; background:var(--canvas); }
+.app-shell .project-list { gap:4px; flex:1; }
+.app-shell .project-row-shell { border-radius:6px; border-color:transparent; box-shadow:none; }
+.app-shell .project-row-utilities { display:flex; flex-direction:column; align-items:center; justify-content:center; width:28px; flex:none; }
+.app-shell .project-row-remove, .app-shell .project-row-audit { position:static; display:grid; place-items:center; width:26px; height:26px; border:0; background:transparent; color:var(--muted); cursor:pointer; }
+.app-shell .project-row-audit:hover { color:var(--blue); }
+.app-shell .overview-project-with-actions { display:flex; align-items:center; gap:12px; }
+.app-shell .overview-project-with-actions > .project-row-main { flex:1; }
+.app-shell .project-row-shell.selected { border-color:transparent; background:var(--blue-soft); }
+.app-shell .project-copy strong { font-size:13px; }
+.app-shell .project-copy small { font-size:11px; line-height:1.5; }
+.app-shell .main-workspace { display:flex; flex-direction:column; background:var(--canvas); min-width:0; }
+.app-shell .workspace-titlebar { flex-shrink:0; display:flex; flex-direction:column; align-items:stretch; gap:18px; padding:24px 30px 0; }
+.app-shell .workspace-titlebar > div:first-child { align-items:flex-start; }
+.app-shell .workspace-titlebar h1 { font-size:22px; font-weight:600; line-height:1.25; }
+.project-title-copy { display:flex; flex-direction:column; gap:6px; min-width:0; }
+.project-title-copy > small { font-size:12px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.app-shell .tab-switch { border:0; border-radius:0; gap:24px; overflow:visible; }
+.app-shell .tab-switch > button { display:inline-flex; justify-content:center; align-items:center; gap:6px; min-width:0; padding:0 0 12px; height:38px; border:0; border-bottom:2px solid transparent; background:transparent; color:var(--muted); font-size:13px; }
+.app-shell .tab-switch > button.active { color:var(--blue); border-bottom-color:var(--blue); background:transparent; }
+.app-shell .persistent-project-controller, .app-shell .project-tab-body { min-height:0; flex:1; overflow:auto; }
+.app-shell .flow-workspace { display:flex; flex-direction:column; overflow:visible; padding:24px 30px; max-width:1140px; margin:0 auto; }
+.app-shell .human-flow-card, .app-shell .roadmap-card, .app-shell .audit-goals { border:0; border-radius:0; box-shadow:none; background:transparent; max-width:none; margin:0; padding:0 0 24px; }
+.app-shell .human-flow-card { padding-bottom:20px; }
+.app-shell .human-flow-hero { gap:12px; }
+.app-shell .human-flow-icon { width:36px; height:36px; border-radius:8px; }
+.app-shell .human-flow-hero h2 { font-size:18px; margin:0 0 6px; }
+.app-shell .human-flow-hero p { font-size:13px; line-height:1.6; color:var(--muted); }
+.app-shell .button { font-size:12px; min-height:34px; }
+.app-shell .human-flow-utility { margin-top:16px; gap:10px; }
+.app-shell .audit-goals { order:3; border-top:1px solid var(--border); padding-top:24px; margin-top:8px; }
+.app-shell .audit-goals header strong { font-size:15px; }
+.app-shell .audit-goals header > strong { font-size:12px; font-weight:500; }
+.app-shell .audit-goals-grid { grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); margin:22px 0; gap:24px; }
+.app-shell .audit-goals-grid > div { padding:0; border:0; border-radius:0; background:transparent; }
+.app-shell .audit-goals-grid strong { font-size:22px; font-weight:600; }
+.app-shell .audit-goals footer { padding-top:16px; font-size:11px; }
+.app-shell .roadmap-card[data-testid='iterative-task-panel'] { order:2; border-top:0; padding-top:0; padding-bottom:18px; }
+.app-shell .roadmap-card[data-testid='iterative-task-panel'] > .roadmap-card-header { display:none; }
+.app-shell .scenario-run-options { margin:22px 0; display:grid; gap:10px; font-size:13px; }
+.app-shell .scenario-run-options h3 { margin:0; font-size:15px; }
+.app-shell .scenario-run-options small { color:var(--muted); line-height:1.5; }
+.app-shell .roadmap-card[data-testid='iterative-task-panel'] > .resume-notice:has(> .baseline-intent-actions:empty) { display:none; }
+.app-shell .iterative-pipeline { margin:8px 0 18px; }
+.app-shell .project-tab-body > div:not(.project-journal) { padding:24px 30px; }
+.app-shell .project-tab-body .project-scope-actions { margin-bottom:20px; }
+.app-shell .project-scope-actions h2 { margin:0 0 6px; font-size:17px; font-weight:600; }
+.app-shell .project-scope-actions p { margin:0 0 16px; color:var(--muted); font-size:13px; }
+.app-shell .project-tab-body .migration-launch-settings { border-bottom:1px solid var(--border); padding-bottom:20px; margin-bottom:20px; }
+.app-shell .project-facts { grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); }
+.app-shell .project-facts > div:last-child { display:flex; }
+.app-shell .project-tab-body .dependency-graph-workspace { min-height:550px; }
+.app-shell .status-bar { background:var(--surface); font-size:10px; }
+.app-shell .project-journal { padding:24px 30px; }
+.app-shell .project-journal .activity-log, .app-shell .project-journal .terminal { min-height:240px; max-height:50vh; }
+.app-shell .flow-technical-details { margin:0 0 16px; }
+.app-shell :focus-visible { outline:2px solid var(--blue); outline-offset:3px; }
+.app-shell .notification-toggle > span { display:inline; white-space:normal; }
+.app-settings-menu, .project-actions-menu { position:relative; }
+.app-settings-menu > summary, .project-actions-menu > summary { list-style:none; cursor:pointer; display:flex; align-items:center; justify-content:center; min-height:34px; border-radius:5px; padding:6px 10px; color:var(--muted); font-size:12px; }
+.app-settings-menu > summary:hover, .project-actions-menu > summary:hover { background:var(--surface); color:var(--text); }
+.app-settings-popover, .project-actions-menu > div { position:absolute; z-index:30; width:310px; max-width:calc(100vw - 40px); padding:16px; display:flex; flex-direction:column; gap:12px; border:1px solid var(--border); border-radius:7px; box-shadow:0 8px 30px #0002; background:var(--canvas); }
+.app-settings-popover { right:0; top:38px; }
+.project-actions-menu > div { left:0; top:38px; }
+.project-actions-menu > div .button { width:100%; justify-content:flex-start; white-space:normal; text-align:left; }
+.app-shell .workspace-actions-menu > summary { cursor:pointer; padding:10px 4px; font-size:12px; color:var(--muted); }
+.app-shell .workspace-actions-menu > div { display:flex; flex-direction:column; gap:6px; padding-top:8px; }
+.app-shell .rail-actions .button { white-space:normal; text-align:left; min-height:34px; }
+.app-shell .app-header .workspace-select { display:flex; }
+.app-shell .app-header .workspace-select > span:first-child { display:none; }
+.app-shell .iterative-pipeline + .resume-notice { margin-bottom:0; }
+.app-shell.graph-fullscreen #project-panel-dependencies > div:first-child { display:none; }
+.app-shell.graph-fullscreen #project-panel-dependencies { overflow:hidden; }
+
+@media(max-width:1100px) { .app-shell .app-header { gap:10px; padding:0 14px; } .app-shell .app-brand { min-width:150px; } .app-shell .app-grid { grid-template-columns:198px minmax(0,1fr); } .app-shell .workspace-select { display:flex; } .app-shell .workspace-titlebar { padding:20px 24px 0; } .app-shell .flow-workspace { padding:22px 24px; } .app-shell .human-flow-utility { flex-wrap:wrap; } }
+@media(max-width:760px) { .app-shell .app-grid { grid-template-columns:164px minmax(0,1fr); } .app-shell .workspace-select { display:none; } .app-shell .app-brand { min-width:0; } .app-shell .header-actions { gap:4px; } .app-shell .tab-switch { gap:15px; } .app-shell .tab-switch > button { font-size:12px; } .app-shell .tab-switch svg { display:none; } .app-shell .workspace-titlebar { padding:18px 16px 0; } .app-shell .flow-workspace, .app-shell .project-journal { padding:20px 16px; } .app-shell .project-tab-body > div:not(.project-journal) { padding:20px 16px; } .app-shell .human-flow-hero h2 { font-size:16px; } }

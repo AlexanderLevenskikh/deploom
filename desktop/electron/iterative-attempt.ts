@@ -12,6 +12,8 @@
 // always preserved on retry/resume).
 import { appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
+import { recordJournalAttempt } from './project-journal-history.js'
+import { queueJournalRecord } from './project-journal.js'
 import { dirname, join } from 'node:path'
 
 export type IterativeAttemptStatus = 'starting' | 'running' | 'waiting' | 'done' | 'failed' | 'canceled'
@@ -72,6 +74,9 @@ const MAX_LOG_BYTES = 128 * 1024
 export function writeAttempt(runDir: string, record: IterativeAttemptRecord): IterativeAttemptRecord {
   mkdirSync(runDir, { recursive: true })
   const target = attemptFilePath(runDir)
+  if (readAttempt(runDir)?.attemptId !== record.attemptId) {
+    try { recordJournalAttempt(runDir, record) } catch { /* diagnostic index never owns execution */ }
+  }
   const tmp = join(dirname(target), `.attempt-${randomUUID()}.tmp`)
   writeFileSync(tmp, JSON.stringify(record, null, 2), 'utf8')
   renameSync(tmp, target)
@@ -161,13 +166,21 @@ export function clearCancelRequest(runDir: string): void {
 }
 
 /** Capped append of a child output line into the run diagnostic artifact. */
-export function recordAttemptLog(runDir: string, line: string): void {
+export function recordAttemptLog(runDir: string, line: string, stream: 'stdout' | 'stderr' | 'system' = 'system'): void {
   const target = attemptLogPath(runDir)
   mkdirSync(dirname(target), { recursive: true })
   const cumulative = join(runDir, 'run.log')
   if (!existsSync(cumulative) && existsSync(target)) writeFileSync(cumulative, readFileSync(target))
   appendFileSync(target, line, 'utf8')
   appendFileSync(cumulative, line, 'utf8')
+  try {
+    const attempt = readAttempt(runDir)
+    if (attempt) {
+      let runId = attempt.attemptId
+      try { runId = JSON.parse(readFileSync(join(runDir, 'run.json'), 'utf8')).runId || runId } catch { /* pre-run check has an attempt identity */ }
+      queueJournalRecord(runDir, { workspaceId: attempt.workspaceId ?? '', projectName: attempt.projectName, runId, attemptId: attempt.attemptId, source: attempt.stage, stream, text: line, at: Date.now() })
+    }
+  } catch { /* Diagnostic metadata never changes execution authority. */ }
   trimAttemptLog(runDir)
 }
 
@@ -203,8 +216,8 @@ export function trimAttemptLog(runDir: string): void {
 
 /** Persist the actual phase and heartbeat together before publishing to UI.
  * Progress is display-only: it cannot alter stage, verdict or checkpoint. */
-export function recordAttemptProgress(runDir: string, line: string): IterativeAttemptRecord | undefined {
-  recordAttemptLog(runDir, line)
+export function recordAttemptProgress(runDir: string, line: string, stream: 'stdout' | 'stderr' | 'system' = 'system'): IterativeAttemptRecord | undefined {
+  recordAttemptLog(runDir, line, stream)
   const match = line.match(/^ITERATIVE_MIGRATION_STATUS_V1 (\{.*\})\s*$/)
   if (!match) return undefined
   try {

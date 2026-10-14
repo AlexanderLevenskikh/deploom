@@ -1,4 +1,4 @@
-import { ChevronRight, FolderPlus, LayoutGrid, RefreshCw, Search, Trash2 } from 'lucide-react'
+import { ChevronRight, FolderPlus, LayoutGrid, RefreshCw, Search, ShieldCheck, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { useLanguage } from '../i18n'
 import type { ProjectSpec, WorkspaceDetails } from '../types'
@@ -13,10 +13,11 @@ type Props = {
   onAddWorkspace: () => void
   onRemoveWorkspace: () => void
   onRemoveProject: (name: string) => void
+  onAuditProject?: (name: string) => void
   onOverview: () => void
 }
 
-export function ProjectRail({ details, selected, active, onSelectProject, onRefreshAll, onAddProject, onAddWorkspace, onRemoveWorkspace, onRemoveProject, onOverview }: Props) {
+export function ProjectRail({ details, selected, active, onSelectProject, onRefreshAll, onAddProject, onAddWorkspace, onRemoveWorkspace, onRemoveProject, onAuditProject, onOverview }: Props) {
   const { t } = useLanguage()
   const [query, setQuery] = useState('')
 
@@ -48,7 +49,7 @@ export function ProjectRail({ details, selected, active, onSelectProject, onRefr
               <span className="project-copy"><strong>{project.name}</strong><small title={project.path}>{project.path}</small><small>{project.git?.baseBranch || project.git?.sourceBranch || t('projectRail.notConfigured')}</small></span>
               <ChevronRight size={16} />
             </button>
-            <button
+            <div className="project-row-utilities">{onAuditProject ? <button className="project-row-audit" disabled={active} aria-label={t('projectRail.audit.aria', { name: project.name })} title={t('projectRail.audit')} onClick={() => onAuditProject(project.name)}><ShieldCheck size={14} /></button> : null}<button
               className="project-row-remove"
               disabled={active}
               title={t('projectRail.remove.title')}
@@ -56,7 +57,7 @@ export function ProjectRail({ details, selected, active, onSelectProject, onRefr
               onClick={() => requestRemove(project)}
             >
               <Trash2 size={14} />
-            </button>
+            </button></div>
           </div>
         })}
         {details.projects.length === 0 ? <p className="empty-copy">{t('projectRail.empty', { path: details.workspace.settingsPath })}</p> : null}
@@ -67,10 +68,12 @@ export function ProjectRail({ details, selected, active, onSelectProject, onRefr
             project is selected (in the overview itself there is nothing to
             leave). */}
         {selected ? <button className="button secondary wide" disabled={active} onClick={onOverview}><LayoutGrid size={16} /> {t('projectRail.overview')}</button> : null}
+        <details className="workspace-actions-menu"><summary>{t('projectRail.manageWorkspace')}</summary><div>
         <button className="button secondary wide rail-refresh" disabled={active || details.projects.length === 0} onClick={onRefreshAll}><RefreshCw className={active ? 'spin' : ''} size={16} /> {t('projectRail.refreshAll')}</button>
         <button className="button secondary wide" disabled={active} onClick={onAddProject}><FolderPlus size={17} /> {t('projectRail.addProject')}</button>
         <button className="add-workspace subtle" onClick={onAddWorkspace}><FolderPlus size={16} /> {t('projectRail.workspaceAction')}</button>
         <button className="button secondary wide" disabled={active} onClick={() => { if (window.confirm(t('projectRail.removeWorkspace.confirm', { name: details.workspace.name }))) onRemoveWorkspace() }}><Trash2 size={16} /> {t('projectRail.removeWorkspace')}</button>
+        </div></details>
       </div>
     </aside>
   )

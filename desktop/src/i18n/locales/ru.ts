@@ -441,4 +441,10 @@ export const ru: Record<TranslationKey, string> = {
   "duration.hourShort": "ч",
   "duration.minuteShort": "мин",
   "duration.secondShort": "с",
+  "app.shellSettings": "Настройки интерфейса и workspace",
+  "app.cleanupBlocked": "Дождитесь завершения или отмените очистку",
+  "app.projectSection": "Раздел проекта",
+  "projectRail.audit.aria": "Провести аудит {name}",
+  "projectRail.audit": "Провести аудит",
+  "projectRail.manageWorkspace": "Управление workspace",
 }

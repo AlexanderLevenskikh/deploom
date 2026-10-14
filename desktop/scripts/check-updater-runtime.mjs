@@ -28,11 +28,18 @@ if (refreshIndex < 0 || waitIndex < 0 || installIndex < 0 || !(refreshIndex < wa
   throw new Error("explicit update install must refresh the feed and await the latest package");
 }
 
-const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-const appStyles = readFileSync(new URL("../src/App.css", import.meta.url), "utf8");
-if (!appSource.includes("<Download size={17} />") || !appSource.includes("update-download-button") || !appSource.includes("disabled={!updateReady}")) {
-  throw new Error("update action must be a compact download icon enabled only when ready");
+const appSource = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+const control = readFileSync(new URL('../src/components/AppUpdateControl.tsx', import.meta.url), 'utf8');
+if (!appSource.includes('<AppUpdateControl')) throw new Error('updater status must remain visible in the shell');
+for (const state of ['idle', 'checking', 'available', 'downloading', 'ready', 'error']) {
+  if (!control.includes("status.state === '" + state + "'")) throw new Error('missing updater state: ' + state);
 }
-if (!appStyles.includes(".update-download-button.ready")) throw new Error("ready update icon must have an active visual state");
+if (!control.includes('disabled={blocked}') || !control.includes('onInstall') || !control.includes('onCheck')) throw new Error('explicit restart and retry controls are required');
+if (!control.includes("typeof status.percent === 'number'")) throw new Error('unknown download progress must stay indeterminate');
+const guards = compiledMain.slice(compiledMain.indexOf('async function installLatestUpdate()'), compiledMain.indexOf('function findWorkspace('));
+if ((guards.match(/if \(updateRestartBlocked\(\)\)/g) || []).length !== 2) throw new Error('restart must check activity both before and after the async download');
+for (const owner of ['iterativeStepInFlight.size', 'iterativeAutopilot.hasActiveSessions()', 'projectAudits.active()', 'storageCleanup.status().phase']) {
+  if (!compiledMain.includes(owner)) throw new Error('restart activity owner missing: ' + owner);
+}
 
 console.log("electron-updater runtime and explicit-install policy OK");

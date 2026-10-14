@@ -9,6 +9,8 @@ type Props = {
   selectedName?: string
   onSelectProject: (name: string) => void
   onAddProject: () => void
+  onAuditProject?: (name: string) => void
+  auditBlocked?: boolean
   onOpenStorage: () => void
 }
 
@@ -22,8 +24,8 @@ function OverviewFact({ label, value, ok }: { label: string; value: string; ok?:
   )
 }
 
-export function WorkspaceOverview({ details, environment, storageStatus, selectedName, onSelectProject, onAddProject, onOpenStorage }: Props) {
-  const { t } = useLanguage()
+export function WorkspaceOverview({ details, environment, storageStatus, selectedName, onSelectProject, onAddProject, onOpenStorage, onAuditProject, auditBlocked }: Props) {
+  const { t, text } = useLanguage()
   const agentAvailable = environment[details.workspace.agent]?.available
   const pythonAvailable = environment.python?.available
   const volumes = storageStatus?.result?.volumes ?? []
@@ -57,14 +59,13 @@ export function WorkspaceOverview({ details, environment, storageStatus, selecte
         <div className="overview-projects-title"><strong>{t('app.overview.projects')}</strong><span className="rail-count">{details.projects.length}</span></div>
         <div className="overview-project-list">
           {details.projects.map((project: ProjectSpec) => (
-            <button
-              key={project.name}
+            <div key={project.name} className="overview-project-with-actions"><button
               className={`project-row-main overview-project-row${selectedName === project.name ? ' selected' : ''}`}
               onClick={() => onSelectProject(project.name)}
             >
               <span className="status-dot muted" />
               <span className="project-copy"><strong>{project.name}</strong><small>{project.path}</small></span>
-            </button>
+            </button>{onAuditProject ? <button className="button secondary" disabled={auditBlocked} onClick={() => onAuditProject(project.name)}>{text('Провести аудит', 'Run audit')}</button> : null}</div>
           ))}
           {details.projects.length === 0 ? <p className="empty-copy">{t('app.overview.projectsEmpty')}</p> : null}
         </div>

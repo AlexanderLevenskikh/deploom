@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ActionInput, AgentProvider, BaselineDecision, BaselineIntentPlan, BootstrapPayload, DependencyGraphSnapshot, DownloadSaved, FlowAction, HardwareSnapshot, IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot, JobFinished, JobOutput, ProjectDiscoveryCandidate, ProjectDiscoveryResponse, ProjectSpec, TargetLevel, ThemePreference, UpdateStatus, WorkspaceDetails, WorkspaceRecord } from '../types'
 import { parseBaselineDecision } from '../data/baselineIntent'
+import { useProjectAudit } from './useProjectAudit'
+import { useProjectJournal } from './useProjectJournal'
 import { goalSeekingStopReason, nextAutopilotAction, type AutopilotPolicyState } from '../autopilot-policy'
 
 // C3: the in-memory journal window must stay bounded. The old batching paired
@@ -764,6 +766,10 @@ export function useDependencyFlow() {
     if (!api) return { ok: false, error: 'NO_DESKTOP_API' }
     return api.saveIterativeTask({ workspaceId: selectedWorkspaceId, projectName, language })
   }, [api, selectedWorkspaceId])
+  const auditProject = useCallback(async (projectName: string) => {
+    if (!api) throw new Error('Desktop API is unavailable')
+    return api.projectAuditStart({ workspaceId: selectedWorkspaceId, projectName })
+  }, [api, selectedWorkspaceId])
   const iterativeStatus = useCallback(async (projectName: string): Promise<IterativeStatusOutcome> => {
     if (!api) return { ok: false, present: false, stale: false, error: 'NO_DESKTOP_API' }
     return api.iterativeStatus({ workspaceId: selectedWorkspaceId, projectName })
@@ -867,13 +873,15 @@ export function useDependencyFlow() {
     (selectedActiveRun?.runId ? draftProgress[selectedActiveRun.runId] : undefined)
     ?? (activeJobId ? draftProgress[activeJobId] : undefined)
   const selectedDraftLaunch = selectedProjectName ? draftLaunches[contextKey(selectedWorkspaceId, selectedProjectName)] : undefined
+  const projectAudit = useProjectAudit(api, selectedWorkspaceId, selectedProject?.name)
+  const journal = useProjectJournal(api, selectedWorkspaceId, selectedProject?.name, selectedActiveRun?.jobId)
   const visibleLogs = useMemo(() => logs.filter((entry) =>
     entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name
   ), [logs, selectedProject?.name, selectedWorkspaceId])
 
   return {
-    payload, loading, error, refreshError, baselineDecision, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch, acknowledgeDraftRun,
+    payload, loading, error, refreshError, baselineDecision, journal, projectAudit, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch, acknowledgeDraftRun,
     load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, discoverProject, removeWorkspace, removeProject, selectWorkspace, selectProject, selectOverview, updateWorkspace, updateProjectBranches, updateProjectNode, listNodeVersions,
-    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult,     getDependencyGraphSnapshot, getIterativeTask, exportIterativeTask, exportLegacyIterativeTask, copyIterativeTask, saveIterativeTask, iterativeStatus, iterativeDrive, iterativeBegin, iterativeAgent, iterativeAttemptRead, iterativeCancel, iterativeAttempt, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
+    runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult,     getDependencyGraphSnapshot, getIterativeTask, exportIterativeTask, exportLegacyIterativeTask, copyIterativeTask, saveIterativeTask, auditProject, iterativeStatus, iterativeDrive, iterativeBegin, iterativeAgent, iterativeAttemptRead, iterativeCancel, iterativeAttempt, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }
 }

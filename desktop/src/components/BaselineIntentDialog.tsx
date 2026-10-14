@@ -7,6 +7,7 @@ import type { BaselineControlMode, BaselineDecision, BaselineIntent, BaselineInt
 import { QuickSelect } from './QuickSelect'
 
 type Props = {
+  disabledReason?: string
   mode: 'prepare' | 'decision'
   resume?: 'auto' | 'continue' | 'restart'
   plan: BaselineIntentPlan
@@ -61,7 +62,7 @@ function reconcileDeferredCohorts(cohorts: DeferredCohort[], policies: Record<st
     .filter((cohort) => cohort.packages.length > 0)
 }
 
-export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, onSubmit }: Props) {
+export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, onSubmit, disabledReason }: Props) {
   const { text } = useLanguage()
   const rootRef = useRef<HTMLElement>(null)
   const [query, setQuery] = useState('')
@@ -213,6 +214,7 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
   }
 
   const submit = async (intent: BaselineIntent, autoOpenPrompt?: boolean) => {
+    if (disabledReason) return
     setBusy(true)
     try { await onSubmit(intent, autoOpenPrompt) } finally { setBusy(false) }
   }
@@ -380,8 +382,8 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
             <div className="baseline-run-control">
               <span className="baseline-run-control-label">{text('Режим поиска', 'Search strategy')}</span>
               <div className="baseline-mode-toggle" role="group" aria-label={text('Стратегия поиска Baseline', 'Baseline search strategy')}>
-                <button type="button" className={productMode === 'fast' ? 'active' : ''} aria-pressed={productMode === 'fast'} disabled={busy} onClick={() => setProductMode('fast')}>{text('Fast', 'Fast')}</button>
-                <button type="button" className={productMode === 'deep' ? 'active' : ''} aria-pressed={productMode === 'deep'} disabled={busy} onClick={() => setProductMode('deep')}>{text('Deep', 'Deep')}</button>
+                <button type="button" className={productMode === 'fast' ? 'active' : ''} aria-pressed={productMode === 'fast'} disabled={busy || Boolean(disabledReason)} onClick={() => setProductMode('fast')}>{text('Fast', 'Fast')}</button>
+                <button type="button" className={productMode === 'deep' ? 'active' : ''} aria-pressed={productMode === 'deep'} disabled={busy || Boolean(disabledReason)} onClick={() => setProductMode('deep')}>{text('Deep', 'Deep')}</button>
               </div>
               <small>{productMode === 'fast'
                 ? text('Fast останавливается на первом physically verified кандидате, который реально удовлетворяет Acceptance policy (все известные Critical/High закрыты, lag-цель достигнута). Дедлайн и бюджет строго ограничены.', 'FAST stops on the first physically verified candidate that actually satisfies the acceptance policy (every known Critical/High covered, lag goal met). Deadline and budget are tightly bounded.')
@@ -399,8 +401,8 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
             <div className="baseline-run-control">
               <span className="baseline-run-control-label">{text('Контроль', 'Control')}</span>
               <div className="baseline-mode-toggle" role="group" aria-label={text('Режим контроля Baseline', 'Baseline control mode')}>
-                <button type="button" className={controlMode === 'AUTONOMOUS' ? 'active' : ''} aria-pressed={controlMode === 'AUTONOMOUS'} disabled={busy} onClick={() => setControlMode('AUTONOMOUS')}>{text('Автономно', 'Autonomous')}</button>
-                <button type="button" className={controlMode === 'CONFIRM_SIGNIFICANT' ? 'active' : ''} aria-pressed={controlMode === 'CONFIRM_SIGNIFICANT'} disabled={busy} onClick={() => setControlMode('CONFIRM_SIGNIFICANT')}>{text('Подтверждать существенное', 'Confirm significant')}</button>
+                <button type="button" className={controlMode === 'AUTONOMOUS' ? 'active' : ''} aria-pressed={controlMode === 'AUTONOMOUS'} disabled={busy || Boolean(disabledReason)} onClick={() => setControlMode('AUTONOMOUS')}>{text('Автономно', 'Autonomous')}</button>
+                <button type="button" className={controlMode === 'CONFIRM_SIGNIFICANT' ? 'active' : ''} aria-pressed={controlMode === 'CONFIRM_SIGNIFICANT'} disabled={busy || Boolean(disabledReason)} onClick={() => setControlMode('CONFIRM_SIGNIFICANT')}>{text('Подтверждать существенное', 'Confirm significant')}</button>
               </div>
               <small>{controlMode === 'AUTONOMOUS'
                 ? text('Без обычных continuation-диалогов: только safety/authority stop. Deferred cohorts сохраняются для следующих проходов.', 'No ordinary continuation dialogs: only safety/authority stops. Deferred cohorts remain available for later passes.')
@@ -409,18 +411,18 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
             <div className="baseline-run-control">
               <span className="baseline-run-control-label">{text('Бюджет Baseline / планирования', 'Baseline / planning budget')}</span>
               <label className="baseline-default-budget-toggle">
-                <input type="checkbox" checked={!budgetEdited} disabled={busy} onChange={() => setBudgetEdited((edited) => !edited)} />
+                <input type="checkbox" checked={!budgetEdited} disabled={busy || Boolean(disabledReason)} onChange={() => setBudgetEdited((edited) => !edited)} />
                 {text('Лимиты по умолчанию (без явного бюджета)', 'Default limits (no explicit budget)')}
               </label>
               {budgetEdited ? (
                 <>
-                  <label>{text('Минуты', 'Minutes')}<input type="number" min={5} max={240} step={5} value={budgetMinutes} disabled={busy} onChange={(event) => { setBudgetEdited(true); setBudgetMinutes(boundedInteger(event.target.value, 30, 5, 240)) }} /></label>
+                  <label>{text('Минуты', 'Minutes')}<input type="number" min={5} max={240} step={5} value={budgetMinutes} disabled={busy || Boolean(disabledReason)} onChange={(event) => { setBudgetEdited(true); setBudgetMinutes(boundedInteger(event.target.value, 30, 5, 240)) }} /></label>
                   <small className="baseline-budget-applied">
                     {text(`Применяемый лимит: ${boundedInteger(budgetMinutes, 30, 5, 240)} мин (${boundedInteger(budgetMinutes, 30, 5, 240) * 60} с · ${attemptsForMinutes(budgetMinutes)} дорогих попыток)`, `Applied budget: ${boundedInteger(budgetMinutes, 30, 5, 240)} min (${boundedInteger(budgetMinutes, 30, 5, 240) * 60}s · ${attemptsForMinutes(budgetMinutes)} expensive attempts)`)}
                   </small>
                   <small className="baseline-budget-suggestion">
                     {text(`Рекомендация: ${recommendedBudget} мин для ${plan.candidates.length} пакетов (${productMode})`, `Suggestion: ${recommendedBudget} min for ${plan.candidates.length} packages (${productMode})`)}
-                    <button type="button" className="button secondary" disabled={busy} onClick={() => setBudgetMinutes(recommendedBudget)}>{text('Взять рекомендацию', 'Use suggestion')}</button>
+                    <button type="button" className="button secondary" disabled={busy || Boolean(disabledReason)} onClick={() => setBudgetMinutes(recommendedBudget)}>{text('Взять рекомендацию', 'Use suggestion')}</button>
                   </small>
                 </>
               ) : (
@@ -438,13 +440,13 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
             <div className="baseline-run-control">
               <span className="baseline-run-control-label">{text('Цель запуска', 'Run goal')}</span>
               <div className="baseline-mode-toggle" role="group" aria-label={text('Целевой уровень Result', 'Result target level')}>
-                <button type="button" className={targetLevel === 'yellow' ? 'active' : ''} aria-pressed={targetLevel === 'yellow'} disabled={busy} onClick={() => setTargetLevel('yellow')}>{text('Жёлтый', 'Yellow')}</button>
-                <button type="button" className={targetLevel === 'green' ? 'active' : ''} aria-pressed={targetLevel === 'green'} disabled={busy} onClick={() => { setTargetLevel('green'); setMinLagOkPct(100) }}>{text('Зелёный', 'Green')}</button>
+                <button type="button" className={targetLevel === 'yellow' ? 'active' : ''} aria-pressed={targetLevel === 'yellow'} disabled={busy || Boolean(disabledReason)} onClick={() => setTargetLevel('yellow')}>{text('Жёлтый', 'Yellow')}</button>
+                <button type="button" className={targetLevel === 'green' ? 'active' : ''} aria-pressed={targetLevel === 'green'} disabled={busy || Boolean(disabledReason)} onClick={() => { setTargetLevel('green'); setMinLagOkPct(100) }}>{text('Зелёный', 'Green')}</button>
               </div>
               <label>{text('Минимум актуальности', 'Minimum lag compliance')} <input type="range" min={0} max={100} step={5} value={targetLevel === 'green' ? 100 : minLagOkPct} disabled={busy || targetLevel === 'green'} onChange={(event) => setMinLagOkPct(boundedInteger(event.target.value, 80, 0, 100))} /> <strong>{targetLevel === 'green' ? 100 : minLagOkPct}%</strong></label>
               <div className="baseline-mode-toggle" role="group" aria-label={text('Lag-порог', 'Lag threshold')}>
                 {[3, 6, 9, 12].map((months) => (
-                  <button key={months} type="button" className={lagPolicyMonths === months ? 'active' : ''} aria-pressed={lagPolicyMonths === months} disabled={busy} onClick={() => setLagPolicyMonths(boundedLagMonths(String(months)))}>{months} {text('мес', 'mo')}</button>
+                  <button key={months} type="button" className={lagPolicyMonths === months ? 'active' : ''} aria-pressed={lagPolicyMonths === months} disabled={busy || Boolean(disabledReason)} onClick={() => setLagPolicyMonths(boundedLagMonths(String(months)))}>{months} {text('мес', 'mo')}</button>
                 ))}
               </div>
               <small>{targetLevel === 'green'
@@ -455,8 +457,8 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
           <details className="baseline-advanced-actions">
             <summary>{text('Техническая глубина поиска', 'Technical search depth')}</summary>
             <div className="baseline-mode-toggle" role="group" aria-label={text('Техническая глубина поиска Baseline', 'Technical Baseline search depth')}>
-              <button type="button" className={searchDepth === 'AUTO' ? 'active' : ''} aria-pressed={searchDepth === 'AUTO'} disabled={busy} onClick={() => setSearchDepth('AUTO')}>AUTO</button>
-              <button type="button" className={searchDepth === 'EXHAUSTIVE' ? 'active' : ''} aria-pressed={searchDepth === 'EXHAUSTIVE'} disabled={busy} onClick={() => setSearchDepth('EXHAUSTIVE')}>EXHAUSTIVE</button>
+              <button type="button" className={searchDepth === 'AUTO' ? 'active' : ''} aria-pressed={searchDepth === 'AUTO'} disabled={busy || Boolean(disabledReason)} onClick={() => setSearchDepth('AUTO')}>AUTO</button>
+              <button type="button" className={searchDepth === 'EXHAUSTIVE' ? 'active' : ''} aria-pressed={searchDepth === 'EXHAUSTIVE'} disabled={busy || Boolean(disabledReason)} onClick={() => setSearchDepth('EXHAUSTIVE')}>EXHAUSTIVE</button>
             </div>
             <small>{text('Это диагностическая настройка алгоритма, а не цель результата.', 'This is an algorithm diagnostic setting, not a result goal.')}</small>
           </details>
@@ -472,7 +474,7 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
               <div className="baseline-deferred-cohort" key={cohort.id}>
                 <div><strong>{cohort.label}</strong><small>{cohort.packages.length} package(s)</small></div>
                 <div className="baseline-cohort-packages">{cohort.packages.map((name) => <code key={name}>{name}</code>)}</div>
-                <button type="button" className="button secondary" disabled={busy} onClick={() => reactivateCohort(cohort)}>{text('Вернуться к этой группе', 'Work on this group next')}</button>
+                <button type="button" className="button secondary" disabled={busy || Boolean(disabledReason)} onClick={() => reactivateCohort(cohort)}>{text('Вернуться к этой группе', 'Work on this group next')}</button>
               </div>
             ))}
           </div>
@@ -488,7 +490,7 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
                 {suggestedCohort.blockedPackages.length ? <small>{text(`Не будут отложены автоматически: ${suggestedCohort.blockedPackages.join(', ')} (Required/Critical)`, `Will not be deferred: ${suggestedCohort.blockedPackages.join(', ')} (Required/Critical)`)}</small> : null}
                 {suggestedCohort.warningPackages.length ? <small className="warning">{text(`В группе есть High-priority security: ${suggestedCohort.warningPackages.join(', ')}. Проверьте решение перед deferral.`, `The group contains High-priority security packages: ${suggestedCohort.warningPackages.join(', ')}. Review before deferring.`)}</small> : null}
                 {suggestedCohort.boundaryPackages.length ? <small>{text(`Граница группы: ${suggestedCohort.boundaryPackages.join(', ')}. Если blocker останется после deferral, DepLoom сможет расширить neighborhood уже на следующем подтверждённом кандидате.`, `Group boundary: ${suggestedCohort.boundaryPackages.join(', ')}. If the blocker remains after deferral, DepLoom can expand the neighborhood on the next confirmed candidate.`)}</small> : null}
-                <button type="button" className="button primary" disabled={busy} onClick={deferSuggestedCohort}>{text(`Отложить группу (${suggestedCohort.packages.length}) и продолжить`, `Defer group (${suggestedCohort.packages.length}) and continue`)}</button>
+                <button type="button" className="button primary" disabled={busy || Boolean(disabledReason)} onClick={deferSuggestedCohort}>{text(`Отложить группу (${suggestedCohort.packages.length}) и продолжить`, `Defer group (${suggestedCohort.packages.length}) and continue`)}</button>
                 <details className="baseline-technical-details">
                   <summary>{text('Технические детали', 'Technical details')}</summary>
                   <small>confidence {Math.round(suggestedCohort.confidence * 100)}% · {suggestedCohort.authority}</small>
@@ -530,7 +532,7 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
         <div className="baseline-intent-toolbar">
           <label><Search size={14} /><input autoFocus spellCheck={false} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={text('Найти зависимость', 'Find dependency')} /></label>
           <QuickSelect value={kind} options={kindOptions} onChange={(value) => setKind(value as typeof kind)} ariaLabel={text('Фильтр типа зависимости', 'Dependency type filter')} />
-          <button type="button" className="button secondary" disabled={busy} onClick={() => { setPolicies({}); setDeferredCohorts([]) }}>{text('Все → AUTO', 'All → AUTO')}</button>
+          <button type="button" className="button secondary" disabled={busy || Boolean(disabledReason)} onClick={() => { setPolicies({}); setDeferredCohorts([]) }}>{text('Все → AUTO', 'All → AUTO')}</button>
         </div>
 
         <div className="baseline-intent-stats">
@@ -550,9 +552,9 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
                 <span>{item.kind}</span>
                 <code>{item.currentVersion || '—'}</code>
                 <div className="baseline-policy-toggle" role="group" aria-label={text(`Правило для ${item.name}`, `Policy for ${item.name}`)}>
-                  <button type="button" className={policy === 'auto' ? 'active' : ''} aria-pressed={policy === 'auto'} disabled={busy} onClick={() => setPolicy(item.name, 'auto')}>AUTO</button>
-                  <button type="button" className={policy === 'keep-current' ? 'active' : ''} aria-pressed={policy === 'keep-current'} disabled={busy} onClick={() => setPolicy(item.name, 'keep-current')}>{text('Не обновлять сейчас', 'Do not update now')}</button>
-                  <button type="button" className={policy === 'required' ? 'active required' : ''} aria-pressed={policy === 'required'} disabled={busy} onClick={() => setPolicy(item.name, 'required')}>{text('Обязательно', 'Required')}</button>
+                  <button type="button" className={policy === 'auto' ? 'active' : ''} aria-pressed={policy === 'auto'} disabled={busy || Boolean(disabledReason)} onClick={() => setPolicy(item.name, 'auto')}>AUTO</button>
+                  <button type="button" className={policy === 'keep-current' ? 'active' : ''} aria-pressed={policy === 'keep-current'} disabled={busy || Boolean(disabledReason)} onClick={() => setPolicy(item.name, 'keep-current')}>{text('Не обновлять сейчас', 'Do not update now')}</button>
+                  <button type="button" className={policy === 'required' ? 'active required' : ''} aria-pressed={policy === 'required'} disabled={busy || Boolean(disabledReason)} onClick={() => setPolicy(item.name, 'required')}>{text('Обязательно', 'Required')}</button>
                 </div>
               </div>
             )
@@ -560,19 +562,20 @@ export function BaselineIntentDialog({ mode, resume, plan, decision, onCancel, o
         </div>
         </div>
 
+        {disabledReason ? <p role="status" className="storage-migration-notice">{disabledReason}</p> : null}
         <footer className="baseline-intent-actions">
           <span className="baseline-intent-apply-hint">{dirty ? text('Есть неприменённые изменения', 'There are unapplied changes') : text('Scope готов', 'Scope is ready')}</span>
           <button type="button" className="button secondary" disabled={busy} onClick={requestCancel}>{mode === 'decision' ? text('Оставить на паузе', 'Keep paused') : text('Отмена', 'Cancel')}</button>
-          {mode === 'prepare' ? <button type="button" className="button secondary" disabled={busy} onClick={() => buildDraft(true)} title={text('Без install/lifecycle/project checks. После завершения сразу откроется готовый prompt; Dashboard не требуется.', 'No install/lifecycle/project checks. The ready prompt opens immediately after completion; Dashboard is not required.')}>{text('Создать Draft и показать промпт', 'Create Draft and show prompt')}</button> : null}
-          {mode === 'prepare' ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{resume === 'restart' ? text('Начать заново и запустить', 'Restart and start') : controlMode === 'AUTONOMOUS' ? text('Запустить автономно', 'Start autonomously') : text('Запустить Baseline', 'Start Baseline')}</button> : null}
-          {mode === 'decision' && !suggestedCohort?.packages.length && decision?.package ? <button type="button" className="button primary" disabled={busy} onClick={keepFocusAndContinue}>{text(`Пока оставить ${decision.package} current`, `Keep ${decision.package} current for now`)}</button> : null}
-          {mode === 'decision' && !suggestedCohort?.packages.length && !decision?.package ? <button type="button" className="button primary" disabled={busy} onClick={applyAndContinue}>{text('Применить scope и продолжить', 'Apply scope and continue')}</button> : null}
+          {mode === 'prepare' ? <button type="button" className="button secondary" disabled={busy || Boolean(disabledReason)} onClick={() => buildDraft(true)} title={text('Без install/lifecycle/project checks. После завершения сразу откроется готовый prompt; Dashboard не требуется.', 'No install/lifecycle/project checks. The ready prompt opens immediately after completion; Dashboard is not required.')}>{text('Создать Draft и показать промпт', 'Create Draft and show prompt')}</button> : null}
+          {mode === 'prepare' ? <button type="button" className="button primary" disabled={busy || Boolean(disabledReason)} onClick={applyAndContinue}>{resume === 'restart' ? text('Начать заново и запустить', 'Restart and start') : controlMode === 'AUTONOMOUS' ? text('Запустить автономно', 'Start autonomously') : text('Запустить Baseline', 'Start Baseline')}</button> : null}
+          {mode === 'decision' && !suggestedCohort?.packages.length && decision?.package ? <button type="button" className="button primary" disabled={busy || Boolean(disabledReason)} onClick={keepFocusAndContinue}>{text(`Пока оставить ${decision.package} current`, `Keep ${decision.package} current for now`)}</button> : null}
+          {mode === 'decision' && !suggestedCohort?.packages.length && !decision?.package ? <button type="button" className="button primary" disabled={busy || Boolean(disabledReason)} onClick={applyAndContinue}>{text('Применить scope и продолжить', 'Apply scope and continue')}</button> : null}
           {mode === 'decision' ? (
             <details className="baseline-advanced-actions">
               <summary>{text('Другие варианты', 'Other options')}</summary>
-              <button type="button" className="button secondary" disabled={busy} onClick={applyAndContinue}>{text('Применить ручные изменения', 'Apply manual changes')}</button>
-              <button type="button" className="button secondary" disabled={busy} onClick={() => buildDraft()}>{text('Сформировать Draft для передачи агенту', 'Build Draft for agent handoff')}</button>
-              <button type="button" className="button secondary" disabled={busy} onClick={continueExhaustive}>{text('Технически: продолжить EXHAUSTIVE автономно', 'Technical: continue EXHAUSTIVE autonomously')}</button>
+              <button type="button" className="button secondary" disabled={busy || Boolean(disabledReason)} onClick={applyAndContinue}>{text('Применить ручные изменения', 'Apply manual changes')}</button>
+              <button type="button" className="button secondary" disabled={busy || Boolean(disabledReason)} onClick={() => buildDraft()}>{text('Сформировать Draft для передачи агенту', 'Build Draft for agent handoff')}</button>
+              <button type="button" className="button secondary" disabled={busy || Boolean(disabledReason)} onClick={continueExhaustive}>{text('Технически: продолжить EXHAUSTIVE автономно', 'Technical: continue EXHAUSTIVE autonomously')}</button>
             </details>
           ) : null}
         </footer>

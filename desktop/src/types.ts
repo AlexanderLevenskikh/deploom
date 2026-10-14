@@ -1,7 +1,5 @@
-export type StorageProgress = { operationId: string; stage: 'scan' | 'validate' | 'clean' | 'done'; path: string; processed: number; total: number; percent: number | null; files: number; bytes: number }
-export type StorageItem = { path: string; category: string; reason: string; eligible: boolean; bytes: number; files: number }
-export type StorageStatus = { phase: 'idle' | 'inspect' | 'clean' | 'done' | 'failed'; action?: 'inspect' | 'clean'; automatic?: boolean; operationId?: string; progress?: StorageProgress; result?: StorageResult; error?: string }
-export type StorageResult = { root: string; items: StorageItem[]; volumes: { path: string; freeBytes: number }[]; eligible: number; eligibleBytes: number; protectedBytes: number; removed: number; compacted?: number; failed: number; protected: number; reclaimedBytes: number; results?: { path: string; status: string; reason?: string }[] }
+import type { StorageProgress, StorageStatus, StorageResult } from '../electron/storage-status'
+export type { StorageProgress, StorageItem, StorageStatus, StorageResult, StorageControlCommand } from '../electron/storage-status'
 
 export type AgentProvider = 'codex' | 'opencode' | 'claude'
 export type FlowAction = 'preflight' | 'sync-tool' | 'baseline' | 'generate' | 'generate-all' | 'audit' | 'agent' | 'recover' | 'release' | 'commit-state' | 'push-workspace'
@@ -336,6 +334,9 @@ export type ActionInput = {
   autopilot?: boolean
 }
 
+export type { JournalCursor, JournalEvent, JournalPage } from '../electron/project-journal-types'
+export type ProjectJournalSource = Omit<import('../electron/project-journal-types').JournalSource, 'directory'>
+
 export type JobOutputSource = { kind: 'group' | 'planner'; id: string; label: string }
 export type JobOutput = { jobId: string; stream: 'system' | 'stdout' | 'stderr'; line: string; workspaceId?: string; projectName?: string; source?: JobOutputSource; receivedAt?: number }
 export type JobFinished = { jobId: string; action: FlowAction; workspaceId?: string; projectName?: string; exitCode: number; error?: string; draftResult?: DraftResultSnapshot }
@@ -626,6 +627,9 @@ export type DependencyFlowApi = {
   notifyAutopilotComplete: (input: { projectName: string; published: boolean }) => Promise<void>
   installUpdate: () => Promise<void>
   storageStatus: () => Promise<StorageStatus>
+  projectAuditStatus: (input: { workspaceId?: string; projectName: string }) => Promise<import('../electron/project-audit-types').ProjectAuditView>
+  projectAuditStart: (input: { workspaceId?: string; projectName: string }) => Promise<import('../electron/project-audit-types').ProjectAuditView>
+  storageControl: (operationId: string, command: import('../electron/storage-status').StorageControlCommand) => Promise<StorageStatus>
   onStorageStatus: (handler: (event: StorageStatus) => void) => () => void
   storageMaintenance: (action: 'inspect' | 'clean', operationId: string) => Promise<StorageResult>
   onStorageProgress: (handler: (event: StorageProgress) => void) => () => void
@@ -637,6 +641,9 @@ export type DependencyFlowApi = {
   onMigrationProgressChanged: (handler: (event: { jobId: string; workspaceId?: string; projectName?: string; branch: string; phase?: MigrationBranchRuntimePhase }) => void) => () => void
   onJobFinished: (handler: (event: JobFinished) => void) => () => void
   onDownloadSaved: (handler: (event: DownloadSaved) => void) => () => void
+  journalSources: (input: { workspaceId?: string; projectName: string }) => Promise<{ sources: ProjectJournalSource[] }>
+  journalRead: (input: { workspaceId?: string; projectName: string; sourceId: string; cursor?: import('../electron/project-journal-types').JournalCursor }) => Promise<import('../electron/project-journal-types').JournalPage & { sourceId: string }>
+  journalExport: (input: { workspaceId?: string; projectName: string; sourceId: string }) => Promise<{ canceled: boolean; path?: string }>
   iterativeAttempt: (input: { workspaceId?: string; projectName: string; includeRunLog?: boolean }) => Promise<{ ok: boolean; present: boolean; attempt?: IterativeAttemptView; attemptLog?: string; runLog?: string; error?: string }>
   iterativeCancel: (input: { workspaceId?: string; projectName: string }) => Promise<{ ok: boolean }>
   onIterativeAttempt: (handler: (payload: IterativeAttemptView) => void) => () => void

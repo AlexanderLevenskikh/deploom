@@ -7,10 +7,10 @@ export function StorageBackgroundStatus({ status, onOpen }: { status?: StorageSt
   const text = (ru: string, en: string) => language === 'ru' ? ru : en
   const running = status.phase === 'inspect' || status.phase === 'clean'
   const percent = status.progress?.stage === 'clean' ? status.progress.percent : null
-  const summary = status.phase === 'failed' ? text('ошибка — открыть', 'error — open') : running ? text('в фоне', 'in background') : text('завершено — открыть', 'finished — open')
+  const summary = status.control === 'paused' ? text('на паузе — открыть', 'paused — open') : status.control === 'pausing' ? text('ожидаем паузу', 'pausing') : status.control === 'canceling' ? text('останавливаем', 'stopping') : status.phase === 'canceled' ? text('отменена — открыть', 'canceled — open') : status.phase === 'failed' ? text('ошибка — открыть', 'error — open') : running ? text('в фоне', 'in background') : text('завершено — открыть', 'finished — open')
   return <button className="storage-background-status" onClick={onOpen}>
     {text('Очистка', 'Storage')}: {summary}
-    {running ? <progress max={100} value={percent ?? undefined} aria-label={text('Прогресс очистки', 'Cleanup progress')} /> : null}
+    {running && status.control !== 'paused' ? <progress max={100} value={percent ?? undefined} aria-label={text('Прогресс очистки', 'Cleanup progress')} /> : null}
     {running && percent != null ? ` ${percent}%` : ''}
   </button>
 }

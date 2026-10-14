@@ -4,6 +4,7 @@ import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import { iterativeLogMessages } from '../data/iterativeLogMessages'
 import { useLanguage } from '../i18n'
 import { MigrationChecksPanel } from './MigrationChecksPanel'
+import { useProjectSurface } from './ProjectSurfaces'
 import { AuditGoalSummary } from './AuditGoalSummary'
 import { CohortReviewDialog } from './CohortReviewDialog'
 import { validateMigrationProfile, validationProfilesEqual, type MigrationValidationProfile } from '../../electron/migration-validation-profile'
@@ -130,7 +131,7 @@ const activityText = (attempt?: IterativeAttemptView, text?: (ru: string, en: st
   return t('Работа выполняется', 'Work is in progress')
 }
 
-export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVersion, onGet, onExport, onCopy, onSave, onStatus, onDrive, onBegin, onExportLegacy, onAgent, onAttempt, onCancel, liveAttempt, onConfigureScope, onBeforeStart, onOpenPath, onScenario, disabledExternal, onStatusView }: Props) {
+export function useIterativeController({ workspaceId, projectName, refreshKey, appVersion, onGet, onExport, onCopy, onSave, onStatus, onDrive, onBegin, onExportLegacy, onAgent, onAttempt, onCancel, liveAttempt, onConfigureScope, onBeforeStart, onOpenPath, onScenario, disabledExternal, onStatusView }: Props) {
   const { text, language } = useLanguage()
   const [state, setState] = useState<PanelState>({ phase: 'loading' })
   const [validationDraft, setValidationDraft] = useState<MigrationValidationProfile>()
@@ -769,9 +770,18 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
   // D: the single main action is the hero of the panel — rendered right under
   // the pipeline so it stays above the fold at 1080×700, before the secondary
   // controls (validation profile, audit, storage) that used to push it down.
+  return { workspaceId, projectName, onExport, onCopy, onSave, onConfigureScope, onOpenPath, disabledExternal, onStatusView, text, language, state, validationDraft, setValidationDraft, autopilot, setAutopilot, busy, copied, note, setNote, showDialog, setShowDialog, runner, dismissedCohort, setDismissedCohort, runnerError, stepBusy, attempt, showLog, noTargetsStep, showDiag, setShowDiag, runtimeLine, refreshRunner, load, attemptAlive, childAlive, run, driveNow, beginNow, exportLegacyNow, agentNow, toggleLog, snapshot, task, insufficient, blocker, validationChanged, mainAction, mainLabel, mainDescription, elapsedMs, progress, currentAttemptLog, showLogTail, activity, attemptFailure, decisionText, copyDiagnostics, runMainAction, validationError, busyLocked, mainActionEnabled }
+}
+
+/** Presentation consumes the persistent scenario controller without owning subprocesses. */
+export function IterativeTaskPanel(props: Props) {
+  const surface = useProjectSurface()
+  const { workspaceId, projectName, onExport, onCopy, onSave, onConfigureScope, onOpenPath, disabledExternal, onStatusView, text, language, state, validationDraft, setValidationDraft, autopilot, setAutopilot, busy, copied, note, setNote, showDialog, setShowDialog, runner, dismissedCohort, setDismissedCohort, runnerError, stepBusy, attempt, showLog, noTargetsStep, showDiag, setShowDiag, runtimeLine, refreshRunner, load, attemptAlive, childAlive, run, driveNow, beginNow, exportLegacyNow, agentNow, toggleLog, snapshot, task, insufficient, blocker, validationChanged, mainAction, mainLabel, mainDescription, elapsedMs, progress, currentAttemptLog, showLogTail, activity, attemptFailure, decisionText, copyDiagnostics, runMainAction, validationError, busyLocked, mainActionEnabled } = useIterativeController(props)
+
   const mainActionArea = (
     <div className="resume-notice">
-      <span>{mainDescription}</span>
+      {!props.onScenario ? <span>{mainDescription}</span> : null}
+      {surface('dependencies', <section className="scenario-run-options"><h3>{text('Управление запуском', 'Run controls')}</h3>
       <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.cohortReviewEnabled !== false} disabled={childAlive || stepBusy || disabledExternal === true} onChange={event => { void window.dependencyFlow?.reviewIterativeCohort({ workspaceId, projectName, enabled: event.target.checked }).then(result => { if (!result.ok) setNote(result.error); return refreshRunner() }).catch(error => setNote(String(error))) }} />{text('Согласовывать группы зависимостей перед обновлением', 'Review dependency cohorts before updating')}</label>
       <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.autopilotEnabled || runner?.autopilotActive || autopilot} disabled={disabledExternal === true} onChange={event => { const enabled = event.target.checked; setAutopilot(enabled); void window.dependencyFlow?.setIterativeAutopilot({ workspaceId, projectName, enabled }).then(() => refreshRunner()).catch(error => { setAutopilot(!enabled); setNote(String(error)) }) }} />{text('Автопилот: продолжать автоматически, включая исправления агентом', 'Autopilot: continue automatically, including agent repairs')}</label>
       <small>{runner?.phase === 'TERMINAL'
@@ -779,7 +789,9 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
           ? text('Продолжите обновление кнопкой ниже. Автопилот сможет выполнять следующие этапы автоматически.', 'Continue the update using the button below. Autopilot can run subsequent stages automatically.')
           : text('Прогон завершён. Для продолжения нужен новый вариант обновления; проверенный результат сохранён.', 'The run has ended. Continuing requires a new update proposal; the verified result is preserved.')
         : text('Можно включить во время работы. Автопилот продолжит после текущего шага; выключение остановит автоматические переходы.', 'Enable while running to continue after the current step; disabling stops automatic transitions.')}</small>
+      </section>)}
       <footer className="baseline-intent-actions">
+        {!props.onScenario ? <>
         <button
           type="button"
           className={`button ${runner?.phase === 'TERMINAL' && (runner.progressSummary?.accepted ?? 0) > 0 && mainAction.state !== 'result' ? 'secondary' : 'primary'}`}
@@ -792,6 +804,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
           {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' || mainAction.state === 'repair-current' ? <Wrench size={16} /> : mainAction.state === 'result' || mainAction.state === 'partial' || mainAction.state === 'budget-stop' || mainAction.state === 'blocked' || mainAction.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}
           {mainLabel}
         </button>
+        </> : null}
         {(attempt || runner?.present) && mainAction.state !== 'running' ? (
           <button type="button" className="button secondary" data-testid="iterative-restart"
             disabled={busyLocked}
@@ -876,7 +889,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         </div>
       ) : null}
 
-      <MigrationChecksPanel key={`${workspaceId}:${projectName}`} profile={validationDraft ? { ...runner?.validationProfile, ...validationDraft } : runner?.validationProfile} locked={Boolean(runner?.present || childAlive || stepBusy || disabledExternal)} scope={validationChanged ? undefined : runner?.validationScope ?? runner?.checked?.validationScope} onChange={setValidationDraft} />
+      {surface('dependencies', <MigrationChecksPanel key={`${workspaceId}:${projectName}`} profile={validationDraft ? { ...runner?.validationProfile, ...validationDraft } : runner?.validationProfile} locked={Boolean(runner?.present || childAlive || stepBusy || disabledExternal)} scope={validationChanged ? undefined : runner?.validationScope ?? runner?.checked?.validationScope} onChange={setValidationDraft} />)}
 
       {/* L1: durable attempt strip — visible from the very first click, after a
           restart, and during a long check/discovery/cohort. User-facing wording;
@@ -926,6 +939,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         </div>
       ) : null}
 
+      {surface('report', <>
       {runner?.workingCheckout ? (
         <div className="resume-notice" data-testid="iterative-working-checkout">
           <strong>{runner.workingCheckout.kind === 'trial'
@@ -960,6 +974,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         {runner.residualRepair?.resumable && mainAction.resumeTerminal ? <span>{text('Дополнительно можно возобновить прежнюю сессию агента с её непроверенными правками. Результат потребует проверки.', 'Alternatively, resume the previous agent session with its unverified edits. The result will require verification.')}</span> : null}
         {runner.delivery?.status !== 'done' && mainAction.state !== 'resume-delivery' ? <button className="button secondary" disabled={busyLocked || childAlive} onClick={() => void agentNow()}><Rocket size={16} />{runner.residualRepair?.resumable ? text('Возобновить работу агента', 'Resume the agent') : runner.delivery ? text('Продолжить подготовку коммитов', 'Resume commit preparation') : text('Устранить остаток и подготовить коммиты', 'Repair remaining goals and prepare commits')}</button> : null}
       </div> : null}
+
+      </>)}
 
       {runner?.scopeExpansionIssues?.length ? (
         <div className="resume-notice warning" role="status" data-testid="scope-expansion-issues">
@@ -1003,6 +1019,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         </div>
       ) : null}
 
+      {surface('report', <>
       {state.phase === 'loading' ? (
         <div className="resume-notice"><span>{text('Загружаю…', 'Loading…')}</span></div>
       ) : state.phase === 'error' ? (
@@ -1074,6 +1091,8 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         </>
       )}
 
+      </>)}
+
       {showDialog && task ? (
         <div className="baseline-intent-backdrop" role="presentation" onClick={() => setShowDialog(false)}>
           <section className="baseline-intent-dialog" role="dialog" aria-modal="true" aria-labelledby="iterative-task-title" onClick={(event) => event.stopPropagation()}>
@@ -1089,7 +1108,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
             </header>
             <pre data-testid="iterative-task-preview" style={{ margin: 0, maxHeight: '56vh', overflow: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-word', padding: '16px', borderRadius: '10px', border: '1px solid var(--border, rgba(127, 127, 127, .3))', background: 'var(--panel, rgba(0, 0, 0, .08))', fontSize: '12px', lineHeight: 1.55 }}>{task.content}</pre>
             <footer className="baseline-intent-actions">
-              {snapshot.runDir ? (
+              {snapshot?.runDir ? (
                 <button type="button" className="button secondary" onClick={() => void onOpenPath(snapshot.runDir)}><ExternalLink size={16} />{text('Открыть папку задания', 'Open task folder')}</button>
               ) : null}
               <button type="button" className="button primary" disabled={busy !== undefined} onClick={() => void run('copy', () => onCopy(projectName, language))}>

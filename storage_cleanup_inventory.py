@@ -10,6 +10,7 @@ import stat
 import sys
 import time
 from contextlib import nullcontext
+from storage_maintenance_control import StorageCancelled, checkpoint, maintenance_control
 from verification_storage_maintenance import (
     _plain_directory, _trusted_parent, dead_trial_owner, owner_alive,
     TRASH_NAME, MIN_AGE_SECONDS,
@@ -22,6 +23,7 @@ _last_emit = 0.0
 
 def progress(stage, path='', *, processed=0, total=0, files=0, bytes=0, force=False):
     global _last_emit
+    if stage not in {'done', 'canceled'}: checkpoint()
     now = time.monotonic()
     if not force and now - _last_emit < 0.25:
         return
@@ -50,6 +52,7 @@ def scan(path, stage='scan', *, identify=True):
             signature.update(f'D:{folder.relative_to(path)}:{info.st_dev}:{info.st_ino}:{info.st_mtime_ns}'.encode())
         with os.scandir(folder) as entries:
             for entry in sorted(entries, key=lambda e: e.name):
+                checkpoint()
                 # Windows directory listings can return stale timestamps and
                 # omit object/link identity. Bind the preview to fresh no-follow
                 # metadata, also used when inspecting each directory below.
@@ -259,15 +262,18 @@ def remove_tree(path, advance):
     # Do not chmod until the complete scan has excluded shared files and links.
     for current, dirs, files in os.walk(path, topdown=False, followlinks=False):
         for name in files:
+            checkpoint()
             file = Path(current) / name
             info = file.lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1 or getattr(info, 'st_file_attributes', 0) & 0x400:
                 raise OSError('tree changed during cleanup')
             file.chmod(info.st_mode | stat.S_IWRITE); file.unlink(); advance(info.st_size)
         for name in dirs:
+            checkpoint()
             child = Path(current) / name
             if not _plain_directory(child): raise OSError('tree changed during cleanup')
             child.chmod(child.stat().st_mode | stat.S_IWRITE); child.rmdir()
+    checkpoint()
     path.chmod(path.stat().st_mode | stat.S_IWRITE); path.rmdir()
 
 
@@ -277,8 +283,10 @@ def clean(root, workspaces, plan):
     total = sum(i['files'] - (1 if i['category'] == 'snapshot-compaction' else 0) for i in selected)
     processed = freed = removed = failed = protected = compacted = 0
     results = []
+    canceled = False
     for item in selected:
         path = Path(item['path']); entry = allowed.get(str(path)); reason = 'scope-changed'
+        item_freed_before = freed
         def advance(size):
             nonlocal processed, freed
             processed += 1; freed += size
@@ -333,6 +341,11 @@ def clean(root, workspaces, plan):
                                 remove_tree(path, advance); removed += 1
                                 results.append(dict(path=str(path), status='removed'))
                             continue
+            except StorageCancelled:
+                canceled = True
+                if item['category'] == 'snapshot-compaction': freed = item_freed_before
+                results.append(dict(path=str(path), status='canceled'))
+                break
             except Exception as exc:
                 # A failed compaction may have allocated objects before a
                 # partial removal. Never advertise those bytes as reclaimed.
@@ -341,13 +354,13 @@ def clean(root, workspaces, plan):
                 failed += 1; results.append(dict(path=str(path), status='failed', reason=error_reason))
                 continue
         protected += 1; results.append(dict(path=str(path), status='protected', reason=reason))
-    progress('done', processed=processed, total=total, bytes=freed, force=True)
+    progress('canceled' if canceled else 'done', processed=processed, total=total, bytes=freed, force=True)
     volumes = []
     for old in plan.get('volumes', []):
         try: volumes.append(dict(path=old['path'], freeBytes=shutil.disk_usage(old['path']).free))
         except OSError: pass
     return {**plan, 'removed': removed, 'compacted': compacted, 'failed': failed, 'protected': protected,
-            'reclaimedBytes': freed, 'volumes': volumes, 'results': results}
+            'reclaimedBytes': freed, 'volumes': volumes, 'results': results, 'canceled': canceled, 'partial': canceled}
 
 
 def main():
@@ -356,7 +369,11 @@ def main():
     payload = json.load(sys.stdin)
     root = profile.root.absolute() if profile.root is not None else None
     workspaces = payload.get('workspaces', [])
-    result = inspect(root, workspaces, eligible_only=bool(payload.get('eligibleOnly'))) if sys.argv[1] == 'inspect' else clean(root, workspaces, payload['plan'])
+    try:
+        with maintenance_control(payload):
+            result = inspect(root, workspaces, eligible_only=bool(payload.get('eligibleOnly'))) if sys.argv[1] == 'inspect' else clean(root, workspaces, payload['plan'])
+    except StorageCancelled:
+        result = {**payload.get('plan', {}), 'root': str(root or ''), 'items': payload.get('plan', {}).get('items', []), 'volumes': [], 'eligible': 0, 'eligibleBytes': 0, 'protectedBytes': 0, 'removed': 0, 'failed': 0, 'protected': 0, 'reclaimedBytes': 0, 'canceled': True, 'partial': True}
     print('STORAGE_RESULT_V1 ' + json.dumps(result), flush=True)
 
 if __name__ == '__main__': main()

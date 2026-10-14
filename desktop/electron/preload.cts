@@ -34,6 +34,9 @@ exportLegacyIterativeTask: (input: { workspaceId?: string; projectName: string }
   iterativeDrive: (input: { workspaceId?: string; projectName: string; autopilot?: boolean; retryInfra?: boolean; discardCandidate?: boolean; resumeTerminal?: boolean }) => ipcRenderer.invoke('flow:iterative:drive', input),
   iterativeBegin: (input: { workspaceId?: string; projectName: string; autopilot?: boolean; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => ipcRenderer.invoke('flow:iterative:begin', input),
   iterativeAgent: (input: { workspaceId?: string; projectName: string; autopilot?: boolean; cleanupNotes?: boolean }) => ipcRenderer.invoke('flow:iterative:agent', input),
+  journalSources: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:journal:list', input),
+  journalRead: (input: { workspaceId?: string; projectName: string; sourceId: string; cursor?: { epoch: string; offset: number } }) => ipcRenderer.invoke('flow:journal:read', input),
+  journalExport: (input: { workspaceId?: string; projectName: string; sourceId: string }) => ipcRenderer.invoke('flow:journal:export', input),
   iterativeAttempt: (input: { workspaceId?: string; projectName: string; includeRunLog?: boolean }) => ipcRenderer.invoke('flow:iterative:attempt', input),
   iterativeCancel: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:iterative:cancel', input),
   runAction: (input: unknown) => ipcRenderer.invoke('flow:run-action', input),
@@ -49,6 +52,9 @@ exportLegacyIterativeTask: (input: { workspaceId?: string; projectName: string }
   getHardwareSnapshot: () => ipcRenderer.invoke('flow:get-hardware-snapshot'),
   storageMaintenance: (action: 'inspect' | 'clean', operationId: string) => ipcRenderer.invoke('flow:storage-maintenance', action, operationId),
   storageStatus: () => ipcRenderer.invoke('flow:storage-status'),
+  projectAuditStatus: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:audit:status', input),
+  projectAuditStart: (input: { workspaceId?: string; projectName: string }) => ipcRenderer.invoke('flow:audit:start', input),
+  storageControl: (operationId: string, command: 'pause' | 'resume' | 'cancel') => ipcRenderer.invoke('flow:storage-control', { operationId, command }),
   onStorageStatus: (handler: (event: unknown) => void) => {
     const listener = (_event: unknown, status: unknown) => handler(status)
     ipcRenderer.on('flow:storage-status', listener)
