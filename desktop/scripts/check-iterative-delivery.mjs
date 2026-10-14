@@ -186,3 +186,35 @@ try {
   assert.deepEqual(calls, ['drive', 'agent'])
   console.log('check-iterative-delivery: OK (audit freshness, selected goals, restart/session and final autopilot)')
 } finally { rmSync(root, { recursive: true, force: true }) }
+
+const { securityResumeAvailable } = await import('../dist-electron/iterative-delivery.js');
+const recovery = mkdtempSync(join(tmpdir(), 'security-resume-'));
+try {
+  const workspaceRoot = join(recovery,'security','attempt-1','workspace');
+  mkdirSync(workspaceRoot,{recursive:true});
+  const put = (name,data) => writeFileSync(join(recovery,name),JSON.stringify(data));
+  put('run.json',{runId:'fixture',activeCheckpointId:'C0'});
+  const state = {runId:'fixture',baseCheckpointId:'C0',attempt:1,status:'ready',workspaceRoot};
+  put('security-state.json',state);
+  put('delivery-agent.json',{identity:'security:fixture:C0:1',status:'running',sessionId:'same-session',resumeError:'DELIVERY_AGENT_IDLE_TIMEOUT'});
+  assert.equal(securityResumeAvailable(recovery),true);
+  for (const change of [{runId:'other'},{baseCheckpointId:'C1'},{workspaceRoot:tmpdir()},{status:'accepted'}]) {
+    put('security-state.json',{...state,...change});
+    assert.equal(securityResumeAvailable(recovery),false);
+  }
+  put('security-state.json',state);
+  put('delivery-agent.json',{identity:'security:fixture:C0:1',status:'running'});
+  assert.equal(securityResumeAvailable(recovery),false);
+  put('delivery-agent.json',{identity:'security:fixture:C0:1',status:'running',sessionId:'same-session',provider:'codex'});
+  put('run-config.json',{budget:{maxRepairAttemptsPerRevision:2}});
+  let launches = 0;
+  const outcome = await runDeliveryWorkflow(recovery, {
+    provider:'codex', canceled:()=>false, processAlive:()=>false, progress:()=>{},
+    command:async command => { if (command === 'security-prepare') return state; throw Error('stop-after-security'); },
+    launch:async context => { launches++; assert.equal(context.sessionId,'same-session'); assert.equal(context.cwd,workspaceRoot); },
+  });
+  assert.equal(launches,1);
+  assert.equal(outcome.error,'stop-after-security');
+  assert.equal(JSON.parse(readFileSync(join(recovery,'delivery-agent.json'),'utf8')).sessionId,'same-session');
+  console.log('Security recovery: same run/checkpoint/session/private workspace required; workflow resumes same session');
+} finally { rmSync(recovery,{recursive:true,force:true}) }

@@ -6,7 +6,16 @@ requesting every historical manifest of packages with thousands of versions.
 """
 from __future__ import annotations
 import re
+import json
 from typing import Any, Callable
+
+
+def registry_json(output: str):
+    """Discard npm diagnostic lines; only JSON is registry evidence."""
+    text = "\n".join(line for line in output.splitlines()
+                     if not re.match(r"^npm (?:warn|notice)(?:\s|$)", line, re.I))
+    return json.loads(text)
+
 
 _EXACT = re.compile(r"^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 

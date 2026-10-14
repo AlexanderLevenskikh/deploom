@@ -266,6 +266,31 @@ class IterativeEnginePrecheckTests(unittest.TestCase):
         self.assertEqual({"pkg-b": "1.1.0"}, load_candidate(run_dir)["delta"]["changed"])
         self.assertEqual("C0", load_run(run_dir)["activeCheckpointId"])
 
+    def test_registry_diagnostics_never_become_engine_constraints(self):
+        import subprocess
+        import iterative_migration as migration
+        warning = "npm warn Ignoring workspaces for specified package(s)\n"
+        for body, expected in [("", ""), ('{"version":"2.0.0","engines.node":">=20"}', ">=20"),
+                               ('{"version":"2.0.0","engines.node":">=25"}', ">=25"),
+                               ('{"version":"3.0.0","engines.node":">=25"}', ""), ('not JSON', "")]:
+            with self.subTest(body=body), mock.patch.object(migration, 'modern_yarn_root', return_value=None), \
+                 mock.patch.object(migration, 'resolve_executable', return_value='npm'), \
+                 mock.patch.object(migration, '_run', return_value=subprocess.CompletedProcess([], 0, warning + body, '')):
+                self.assertEqual(migration._npm_engines_node(Path('.'), 'fixture', '2.0.0', {}), expected)
+                effective, deferred = migration._engine_deferred_targets(Path('.'), {}, {'fixture':'2.0.0'}, '24.18.0', {})
+                self.assertEqual(bool(deferred), expected == '>=25')
+                self.assertEqual(bool(effective), expected != '>=25')
+
+    def test_planner_engine_probe_uses_yarn_registry_without_npm_fallback(self):
+        import subprocess
+        import iterative_migration as migration
+        with mock.patch.object(migration, 'modern_yarn_root', return_value=Path('yarn-root')), \
+             mock.patch.object(migration, 'resolve_executable', side_effect=lambda name: 'yarn' if name == 'yarn' else self.fail('npm fallback')), \
+             mock.patch.object(migration, '_run', return_value=subprocess.CompletedProcess([],0,'{"version":"2.0.0","engines":{"node":">=25"}}','')) as command:
+            self.assertEqual(migration._npm_engines_node(Path('nested'), 'fixture', '2.0.0', {}), '>=25')
+            self.assertEqual(command.call_args.args[1], Path('yarn-root'))
+            self.assertIn('fixture@2.0.0', command.call_args.args[0])
+
     def test_normalize_effective_node_version(self) -> None:
         self.assertEqual(_normalize_effective_node_version("20.11.0"), "20.11.0")
         self.assertEqual(_normalize_effective_node_version("v22.18.0"), "22.18.0")

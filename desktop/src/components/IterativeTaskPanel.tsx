@@ -66,6 +66,7 @@ const MAIN_LABEL: Record<ScenarioMainActionState, [string, string]> = {
   'continue-run': ['Продолжить обновление', 'Continue the update'],
   running: ['Остановить', 'Stop'],
   'recovered-running': ['Продолжить обновление', 'Continue the update'],
+  'resume-delivery': ['Продолжить подготовку', 'Resume preparation'],
   agent: ['Исправить агентом', 'Repair with an agent'],
   // Launch-wait: a provider rate limit / temporary outage parked the repair.
   // The only useful user control while waiting is canceling the wait.
@@ -92,6 +93,7 @@ const MAIN_DESCRIPTION: Record<ScenarioMainActionState, [string, string]> = {
   'continue-run': ['Работа приостановлена. Продолжите — применим и проверим следующую группу.', 'The update is paused. Continue — the next group will be applied and verified.'],
   running: ['Идёт работа. Остановить можно в любой момент; проверенный результат сохраняется.', 'Work is running. You can stop at any time; the verified result is kept.'],
   'recovered-running': ['Работа была прервана перезапуском; процесс не запущен. Продолжите, чтобы возобновить её.', 'Work was interrupted by a restart; no process is running. Continue to resume it.'],
+  'resume-delivery': ['Рабочая копия и сессия сохранены. Продолжите прерванную подготовку.', 'The workspace and session are saved. Resume the interrupted preparation.'],
   agent: ['Нужны исправления в изолированном окружении. Запустите агента.', 'Repairs are needed in an isolated environment. Run the agent.'],
   // Launch-wait: the durable attempt.reason carries the exact cause + the next
   // attempt time; the static line is the fallback when the journal is absent.
@@ -698,6 +700,9 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
         // lease — no agent was running; no repair attempt is spent).
         void cancelNow()
         break
+      case 'resume-delivery':
+        void agentNow()
+        break
       case 'agent':
         if (repairMutationBlocked) void driveNow(true)
         else void agentNow()
@@ -785,7 +790,7 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
           {mainAction.state === 'running' ? <X size={16} /> : mainAction.state === 'agent' || mainAction.state === 'repair-current' ? <Wrench size={16} /> : mainAction.state === 'result' || mainAction.state === 'partial' || mainAction.state === 'budget-stop' || mainAction.state === 'blocked' || mainAction.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}
           {mainLabel}
         </button>
-        {runner?.phase === 'TERMINAL' && runner.canResumeTerminal === true && ['blocked', 'partial', 'budget-stop', 'no-upgrade'].includes(mainAction.state) ? (
+        {runner?.phase === 'TERMINAL' && runner.canResumeTerminal === true && ['blocked', 'partial', 'budget-stop', 'no-upgrade', 'resume-delivery'].includes(mainAction.state) ? (
           <button type="button" className="button primary" data-testid="iterative-resume-action"
             disabled={busyLocked || childAlive} onClick={() => { void driveNow(false, true) }}>
             <Rocket size={16} />{text('Продолжить с сохранённого результата', 'Continue from saved result')}
@@ -869,9 +874,9 @@ export function IterativeTaskPanel({ workspaceId, projectName, refreshKey, appVe
 
       {state.phase === 'ready' ? mainActionArea : null}
 
-      {runner?.phase === 'TERMINAL' && runner.canResumeTerminal === true && ['blocked', 'partial', 'budget-stop', 'no-upgrade'].includes(mainAction.state) ? (
+      {runner?.phase === 'TERMINAL' && runner.canResumeTerminal === true && ['blocked', 'partial', 'budget-stop', 'no-upgrade', 'resume-delivery'].includes(mainAction.state) ? (
         <div className="resume-notice" data-testid="iterative-resume-result">
-          <span>{runner.stopDetail ? text(`Исправление группы из ${runner.stopDetail.packageCount} пакетов остановлено по таймауту. Новых принятых обновлений нет. Правки сохранены отдельно. ${runner.stopDetail.recoverable ? 'Продолжение возобновит ремонт.' : 'Нужен другой вариант обновления.'} Итоговый аудит: ${runner.stopDetail.auditStatus}.`, `Repair of ${runner.stopDetail.packageCount} packages stopped on timeout. No new updates accepted. Trial edits are preserved. ${runner.stopDetail.recoverable ? 'Continue resumes the repair.' : 'A different update proposal is needed.'} Final audit: ${runner.stopDetail.auditStatus}.`) : text('Принятые обновления сохранены. Продолжение сохраняет ограничения и бюджет; непринятые изменения требуют проверки.', 'Accepted updates are saved. Continuing preserves limits and budget; unaccepted changes still need verification.')}</span>
+          <span>{runner.stopDetail ? text(`Исправление группы из ${runner.stopDetail.packageCount} пакетов остановлено по таймауту. Новых принятых обновлений нет. Правки сохранены отдельно. ${runner.stopDetail.recoverable ? 'Продолжение возобновит ремонт.' : 'Нужен другой вариант обновления.'} Итоговый аудит: ${runner.stopDetail.auditStatus}.`, `Repair of ${runner.stopDetail.packageCount} packages stopped on timeout. No new updates accepted. Trial edits are preserved. ${runner.stopDetail.recoverable ? 'Continue resumes the repair.' : 'A different update proposal is needed.'} Final audit: ${runner.stopDetail.auditStatus}.`) : text('Проверенное состояние сохранено. Продолжение сохраняет ограничения и бюджет; непринятые изменения требуют проверки.', 'The verified state is saved. Continuing preserves limits and budget; unaccepted changes still need verification.')}</span>
         </div>
       ) : null}
 

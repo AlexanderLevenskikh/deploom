@@ -2303,6 +2303,13 @@ def cmd_resume(args: argparse.Namespace) -> int:
             reopened.update(phase="REPAIRING", activeCandidateId=recovered["candidateId"])
             _emit_status({"event": "resume.repair-restored", "runId": run["runId"], "candidateId": recovered["candidateId"],
                           "message": "Preserved timed-out repair restored; project verification is still required"})
+        from iterative_resume import invalid_engine_deferrals
+        ledger = load_ledger(run_dir)
+        invalid = invalid_engine_deferrals(ledger, checkpoint["checkpointId"])
+        if invalid:
+            ledger["deferrals"] = [entry for entry in ledger.get("deferrals", []) if entry not in invalid]
+            ledger["invalidRegistryDeferrals"] = list(ledger.get("invalidRegistryDeferrals", [])) + invalid
+            save_ledger(run_dir, ledger)
         save_run(run_dir, reopened)
         _emit_status({"event": "resume.done", "runId": run["runId"], "checkpointId": checkpoint["checkpointId"]})
         return 0
@@ -2925,7 +2932,8 @@ def _query_discovery_metadata(project_dir: Path, args: List[str], runtime_env: O
     if result.returncode != 0:
         return None, True, _registry_failure_class((result.stdout or "") + (getattr(result, "stderr", "") or "")), "npm-cli"
     try:
-        return json.loads(result.stdout), True, "", "npm-cli"
+        from iterative_registry_metadata import registry_json
+        return registry_json(result.stdout), True, "", "npm-cli"
     except (ValueError, TypeError):
         return None, True, "metadata-invalid", "npm-cli"
 
@@ -2955,35 +2963,13 @@ def _npm_engines_node(
     metadata = _ACTIVE_REGISTRY_METADATA.get()
     if metadata is not None and metadata.name == name:
         return metadata.engines(version)
-    manager = resolve_executable("npm")
-    if not manager:
-        return ""
-    probe_timeout = _probe_budget_timeout()
-    if probe_timeout is None:
-        return ""
-    try:
-        completed = _run(
-            [manager, "view", f"{name}@{version}", "engines.node", "--json"],
-            project_dir,
-            timeout_seconds=probe_timeout,
-            env=runtime_env or {},
-            base_env=os.environ,
-            progress_label=f"engine metadata probe {name}@{version}",
-        )
-    except Exception:  # noqa: BLE001 - a probe failure is abstention, never a constraint
-        return ""
-    if completed.returncode != 0:
-        return ""
-    text = (completed.stdout or "").strip()
-    if not text or text in ("{}", "null", "undefined"):
-        return ""
-    try:
-        parsed = json.loads(text)
-    except ValueError:
-        parsed = text
-    if isinstance(parsed, dict):
-        parsed = parsed.get("node")
-    return str(parsed or "").strip()[:256]
+    data, *_ = _query_discovery_metadata(project_dir,
+        ["view", f"{name}@{version}", "version", "engines.node", "--json"], runtime_env)
+    from iterative_registry_metadata import _engine
+    for row in data if isinstance(data, list) else [data]:
+        if isinstance(row, dict) and str(row.get("version", "")).lstrip("vV") == version.lstrip("vV"):
+            return _engine(row)
+    return ""
 
 
 def _npm_latest_version(

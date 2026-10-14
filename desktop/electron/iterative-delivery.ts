@@ -29,6 +29,18 @@ function canonicalPath(path: string): string {
 export function deliveryRoot(runDir: string, runId: string): string {
   return join(dirname(canonicalPath(runDir)), 'deliveries', `${basename(runDir)}-${createHash('sha256').update(runId).digest('hex').slice(0, 12)}`, 'workspace')
 }
+export function securityResumeAvailable(runDir: string): boolean {
+  const state = readJson(join(runDir, 'security-state.json'))
+  const run = readJson(join(runDir, 'run.json'))
+  const lease = readJson(join(runDir, 'delivery-agent.json'))
+  if (!state || !run || !lease || !['ready', 'running'].includes(state.status)) return false
+  if (state.runId !== run.runId || state.baseCheckpointId !== run.activeCheckpointId) return false
+  if (lease.identity !== `security:${run.runId}:${run.activeCheckpointId}:${state.attempt}` || !lease.sessionId || lease.status !== 'running') return false
+  const expected = canonicalPath(join(runDir, 'security', `attempt-${state.attempt}`, 'workspace'))
+  const owned = relative(canonicalPath(runDir), expected)
+  if (owned === '..' || owned.startsWith('..\\') || owned.startsWith('../') || isAbsolute(owned)) return false
+  return typeof state.workspaceRoot === 'string' && canonicalPath(state.workspaceRoot) === expected && existsSync(expected)
+}
 export function iterationDirectory(runDir: string): string | undefined {
   for (const name of ['delivery-state.json', 'security-state.json']) {
     const state = readJson(join(runDir, name))

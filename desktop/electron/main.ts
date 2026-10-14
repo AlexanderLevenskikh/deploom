@@ -60,7 +60,7 @@ import { commandEnvironment, decodeProcessOutputChunk, normalizePathForCompariso
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { discoveryProgress } from './iterative-discovery-progress.js'
 import { pendingCohortReview, cohortReviewEnabled, saveCohortReviewEnabled } from './iterative-cohort-review.js'
-import { auditLevel, readCurrentAuditView, readAuditView, readDeliveryView, iterationDirectory, readJson as readDeliveryJson, runDeliveryWorkflow, createDeliveryAgentWatchdog } from './iterative-delivery.js'
+import { auditLevel, readCurrentAuditView, readAuditView, readDeliveryView, securityResumeAvailable, iterationDirectory, readJson as readDeliveryJson, runDeliveryWorkflow, createDeliveryAgentWatchdog } from './iterative-delivery.js'
 import { createIterativeAutopilot } from './iterative-autopilot.js'
 import { liveRunWriterPid, readAutopilotState, writeAutopilotState } from './iterative-autopilot-state.js'
 import { IterativeDecision, decideNextStep, iterativeStatusInvocation, iterativeStepInvocation, parseIterativeStatusPayload, readIterativeStatus } from './iterative-runner.js'
@@ -8054,7 +8054,7 @@ function setupIpc(): void {
       cohortReviewEnabled: cohortReviewEnabled(runDir),
       cohortReview: decision?.step === 'materialize' ? pendingCohortReview(runDir) : undefined,
       initialAudit: readDeliveryJson(join(runDir, 'current-audit.json')),
-      residualRepair: (() => { const value = readDeliveryJson(join(runDir, 'security-state.json')); return value ? { status: value.status, attempt: value.attempt, reason: value.reason } : undefined })(),
+      residualRepair: (() => { const value = readDeliveryJson(join(runDir, 'security-state.json')); return value ? { status: value.status, attempt: value.attempt, reason: value.reason, resumable: securityResumeAvailable(runDir) } : undefined })(),
       delivery: readDeliveryView(runDir),
       runDirectory: runDir,
       artifactsDirectory: existsSync(join(runDir, 'reports')) ? join(runDir, 'reports') : runDir,

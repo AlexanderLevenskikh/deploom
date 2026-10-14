@@ -63,6 +63,7 @@ export type ScenarioAttemptShape = {
 
 export type ScenarioRunnerShape = {
   present: boolean
+  residualRepair?: { resumable?: boolean }
   progressSummary?: { accepted: number }
   phase?: string
   decision?: { step: string | null; satisfied?: boolean; reason?: string } | undefined
@@ -90,6 +91,7 @@ export type ScenarioMainActionState =
   | "continue-run" // работа приостановлена → Продолжить обновление
   | "running" // реальный процесс выполняется → Остановить
   | "recovered-running" // журнал running, но живого процесса нет → Продолжить
+  | "resume-delivery" // сохранённая security-сессия → продолжить подготовку
   | "agent" // требуется ремонт агентом → Исправить агентом
   | "agent-waiting" // прерывание запуска агента (rate limit / временный сбой) → ждать / отменить ожидание
   | "result" // результат ПОЛНОСТЬЮ проверен и принят → Посмотреть результат
@@ -164,6 +166,11 @@ export function deriveMainAction(input: ScenarioInput): ScenarioMainAction {
       reasonShort:
         attempt?.reason ?? "Провайдер агента временно недоступен — ремонт ждёт повтора запуска и не расходует попытку.",
     }
+  }
+
+  if (runner?.present && runner.phase === 'TERMINAL' && runner.residualRepair?.resumable) {
+    return { state: 'resume-delivery', blocker, firstRun: false,
+      reasonShort: 'Подготовка прервана; рабочая копия и сессия агента сохранены. Продолжите с места остановки.' }
   }
 
   // A journal is activity evidence, not proof that begin created a run.
@@ -379,6 +386,7 @@ export function scenarioPipeline(state: ScenarioMainActionState, checked: boolea
       return { current: "plan", completed: checked ? ["check"] : [] }
     case "start-run":
     case "continue-run":
+    case "resume-delivery":
     case "agent":
     case "agent-waiting":
       return { current: context?.runner?.phase === "BOOTSTRAP_REPAIR" ? "check" : "upgrade", completed: context?.runner?.phase === "BOOTSTRAP_REPAIR" ? [] : ["check", "plan"] }

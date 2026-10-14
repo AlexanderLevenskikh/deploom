@@ -65,6 +65,21 @@ one-hour expiry. Registry planning data alone uses a 24-hour freshness limit.
 Upgrading DepLoom may require ordinary fresh checkpoint verification while
 preserving the saved assignment and source evidence.
 
+## Interrupted registry planning and security preparation
+
+Registry diagnostics are not engine constraints. Engine probes use the canonical
+package-manager registry and bind parsed JSON metadata to the requested version.
+Explicit continuation archives legacy engine deferrals containing npm warning
+text, preserves real incompatibilities, and replans from the sealed checkpoint
+without resetting budgets or acceptance evidence.
+
+An interrupted security session exposes Resume preparation when its run,
+checkpoint, private workspace and saved session match. The controller resumes
+the same session and attempt, then independently verifies its result. Existing
+terminal outcomes do not hide that unfinished work. Continue from saved result
+reopens planning separately; neither action repeats begin or grants an old PASS
+to changed source, runtime or configuration.
+
 ## Validation
 
 Cross-process tests kill a real physical verifier after completed lint,

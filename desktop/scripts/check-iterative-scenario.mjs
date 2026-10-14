@@ -45,6 +45,17 @@ const envelope =
 const controlEnvelope =
   'ITERATIVE_MIGRATION_FAILURE_V1 {"code": "PROJECT_CONTROL_FAILED", "summary": "Контроль текущих зависимостей не пройден: npm run test (exit 1).", "command": "", "fixable": true}';
 
+expect("interrupted security session overrides old no-upgrade terminal", () => {
+  const input = { inFlight:false, checked:true, taskPresent:false, noTargets:false,
+    attempt: attempt({status:'failed', stage:'agent', lastError:'DELIVERY_AGENT_IDLE_TIMEOUT'}),
+    runner:runner({phase:'TERMINAL', decision:{step:'finish',reason:'NO_VERIFIED_UPGRADE'}, residualRepair:{resumable:true}}) };
+  if (deriveMainAction(input).state !== 'resume-delivery') throw Error('saved security session must resume');
+  if (deriveMainAction({...input,inFlight:true}).state !== 'running') throw Error('live child must win');
+  if (deriveMainAction({...input,runner:{...input.runner,residualRepair:{resumable:false}}}).state !== 'no-upgrade') throw Error('no unvalidated recovery');
+  const pipeline = scenarioPipeline('resume-delivery',true,{runner:input.runner});
+  if (pipeline.current !== 'upgrade' || pipeline.completed.includes('upgrade')) throw Error('unfinished repair is not a verified update');
+});
+
 // 1. New project, nothing run → explicit «Check project» first step.
 expect("fresh project acts as check (Проверить проект)", () => {
   const a = deriveMainAction({ inFlight: false, runner: undefined, taskPresent: false, noTargets: false, attempt: undefined });

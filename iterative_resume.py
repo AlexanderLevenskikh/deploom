@@ -24,13 +24,22 @@ def reopen_terminal_run(run, checkpoint, candidate):
             "activeCandidateId": None, "continuations": history, "updatedAt": now}
 
 
+def invalid_engine_deferrals(ledger, checkpoint_id):
+    """Legacy npm diagnostics are not compatibility evidence."""
+    return [entry for entry in ledger.get("deferrals", [])
+            if entry.get("baseCheckpointId") == checkpoint_id
+            and entry.get("kind") == "ENGINES_INCOMPATIBLE"
+            and not entry.get("candidateId") and not entry.get("assignmentFingerprint")
+            and " requires node npm warn " in str(entry.get("reason", "")).lower()]
+
+
 def terminal_repair_resumable(run_dir, run, checkpoint, candidate, ledger, config):
     """Expose only a one-time actionable repair; no budget or proof is reset."""
     if run.get("phase") != "TERMINAL":
         return False
     try:
         reopen_terminal_run(run, checkpoint, candidate)
-        return recover_timed_out_candidate(run_dir, run, checkpoint, candidate, ledger, config) is not None
+        return bool(invalid_engine_deferrals(ledger, checkpoint.get("checkpointId"))) or recover_timed_out_candidate(run_dir, run, checkpoint, candidate, ledger, config) is not None
     except (ValueError, OSError):
         return False
 

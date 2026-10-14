@@ -36,6 +36,25 @@ class ResumeTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(REPO / "iterative_migration.py"),
             "--run-dir", str(root), "resume"], cwd=REPO, capture_output=True, text=True, encoding="utf-8")
 
+    def test_cli_replans_legacy_warning_deferrals_without_resetting_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run, _ = self.setup_run(Path(tmp))
+            bad = {"kind":"ENGINES_INCOMPATIBLE", "baseCheckpointId":"C4", "candidateId":"",
+                   "reason":"fixture@2.0.0 requires node npm warn Ignoring workspaces for specified package(s), but the run's chosen Node is 24.18.0"}
+            valid = {**bad, "reason":"fixture@3.0.0 requires node >=25, but the run's chosen Node is 24.18.0"}
+            migration.save_ledger(run.root, {"schemaVersion":1, "deferrals":[bad,valid], "counters":{"attempts":17}})
+            ledger = migration.load_ledger(run.root)
+            self.assertTrue(terminal_repair_resumable(run.root, migration.load_run(run.root), migration.load_checkpoint(run.root,'C4'), None, ledger, migration.load_config(run.root)))
+            checkpoint = (run.root/'checkpoints/C4.json').read_bytes()
+            result = self.cli(run.root)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            saved = migration.load_ledger(run.root)
+            self.assertEqual(saved['deferrals'], [valid])
+            self.assertEqual(saved['invalidRegistryDeferrals'], [bad])
+            self.assertEqual(saved['counters'], {'attempts':17})
+            self.assertEqual(checkpoint, (run.root/'checkpoints/C4.json').read_bytes())
+            self.assertFalse(terminal_repair_resumable(run.root, migration.load_run(run.root), migration.load_checkpoint(run.root,'C4'), None, saved, {}))
+
     def test_real_cli_preserves_checkpoint_constraints_and_spent_budgets(self):
         with tempfile.TemporaryDirectory() as tmp:
             run, snapshot = self.setup_run(Path(tmp))

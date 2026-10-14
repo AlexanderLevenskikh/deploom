@@ -432,7 +432,7 @@ export type IterativeAttemptView = {
 export type IterativeStatusOutcome = {
   audit?: import('../electron/iterative-audit-view').AuditView
   initialAudit?: import('../electron/iterative-audit-view').AuditView
-  residualRepair?: { status?: string; attempt?: number; reason?: string }
+  residualRepair?: { status?: string; attempt?: number; reason?: string; resumable?: boolean }
   delivery?: import('../electron/iterative-audit-view').DeliveryView
   runDirectory?: string
   artifactsDirectory?: string

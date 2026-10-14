@@ -58,6 +58,8 @@ jobs:
           tests.regression.test_iterative_state_transaction
           tests.regression.test_verification_stage_checkpoint
           tests.regression.test_package_self_link
+          tests.regression.test_iterative_engine_precheck
+          tests.regression.test_iterative_resume
           -v
       - name: Run production-fast regressions
         run: python run_tool_tests.py --suite production-fast
@@ -104,6 +106,8 @@ jobs:
           tests.regression.test_iterative_state_transaction
           tests.regression.test_verification_stage_checkpoint
           tests.regression.test_package_self_link
+          tests.regression.test_iterative_engine_precheck
+          tests.regression.test_iterative_resume
           -v
       - name: Run Windows verification substrate gate
         run: |
