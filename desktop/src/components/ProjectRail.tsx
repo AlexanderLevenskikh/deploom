@@ -1,4 +1,4 @@
-import { ChevronRight, FolderPlus, LayoutGrid, RefreshCw, Search, ShieldCheck, Trash2 } from 'lucide-react'
+import { FolderOpen, FolderPlus, LayoutGrid, RefreshCw, Search, ShieldCheck, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { useLanguage } from '../i18n'
 import type { ProjectSpec, WorkspaceDetails } from '../types'
@@ -14,11 +14,12 @@ type Props = {
   onRemoveWorkspace: () => void
   onRemoveProject: (name: string) => void
   onAuditProject?: (name: string) => void
+  onOpenProject: (path: string) => void
   onOverview: () => void
 }
 
-export function ProjectRail({ details, selected, active, onSelectProject, onRefreshAll, onAddProject, onAddWorkspace, onRemoveWorkspace, onRemoveProject, onAuditProject, onOverview }: Props) {
-  const { t } = useLanguage()
+export function ProjectRail({ details, selected, active, onSelectProject, onRefreshAll, onAddProject, onAddWorkspace, onRemoveWorkspace, onRemoveProject, onAuditProject, onOpenProject, onOverview }: Props) {
+  const { t, text } = useLanguage()
   const [query, setQuery] = useState('')
 
   const requestRemove = (project: ProjectSpec) => {
@@ -46,10 +47,9 @@ export function ProjectRail({ details, selected, active, onSelectProject, onRefr
           return <div key={project.name} className={`project-row-shell ${selected?.name === project.name ? 'selected' : ''}`}>
             <button className="project-row-main" onClick={() => onSelectProject(project.name)}>
               <span className={`status-dot ${tone}`} title={t('projectRail.currentLevel', { level: levelLabel })} />
-              <span className="project-copy"><strong>{project.name}</strong><small title={project.path}>{project.path}</small><small>{project.git?.baseBranch || project.git?.sourceBranch || t('projectRail.notConfigured')}</small></span>
-              <ChevronRight size={16} />
+              <span className="project-copy"><strong title={project.name}>{project.name}</strong></span>
             </button>
-            <div className="project-row-utilities">{onAuditProject ? <button className="project-row-audit" disabled={active} aria-label={t('projectRail.audit.aria', { name: project.name })} title={t('projectRail.audit')} onClick={() => onAuditProject(project.name)}><ShieldCheck size={14} /></button> : null}<button
+            <div className="project-row-utilities">{onAuditProject ? <button className="project-row-audit" disabled={active} aria-label={t('projectRail.audit.aria', { name: project.name })} title={t('projectRail.audit')} onClick={() => onAuditProject(project.name)}><ShieldCheck size={14} /></button> : null}<button className="project-row-open" aria-label={text('Открыть папку', 'Open folder') + ': ' + project.name} title={text('Открыть папку', 'Open folder')} onClick={() => onOpenProject(project.path)}><FolderOpen size={14} /></button><button
               className="project-row-remove"
               disabled={active}
               title={t('projectRail.remove.title')}

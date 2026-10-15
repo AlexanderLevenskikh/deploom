@@ -9,10 +9,14 @@ html[data-theme='dark'] .app-shell { --canvas:#111827; }
 .app-shell .project-rail { background:var(--surface); padding:22px 12px 14px; gap:12px; }
 .app-shell .rail-title { padding:0 6px; font-size:14px; }
 .app-shell .rail-search { margin:0; background:var(--canvas); }
-.app-shell .project-list { gap:4px; flex:1; }
+.app-shell .project-list { gap:4px; flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; }
+.app-shell .project-list > .project-row-shell { flex-shrink:0; grid-template-columns:minmax(0,1fr); min-height:0; }
+.app-shell .project-list .project-row-main { grid-template-columns:8px minmax(0,1fr); padding:8px 8px 2px; }
+.app-shell .project-list .project-copy strong { display:block; white-space:nowrap; }
+.app-shell .rail-actions { flex-shrink:0; }
 .app-shell .project-row-shell { border-radius:6px; border-color:transparent; box-shadow:none; }
-.app-shell .project-row-utilities { display:flex; flex-direction:column; align-items:center; justify-content:center; width:28px; flex:none; }
-.app-shell .project-row-remove, .app-shell .project-row-audit { position:static; display:grid; place-items:center; width:26px; height:26px; border:0; background:transparent; color:var(--muted); cursor:pointer; }
+.app-shell .project-row-utilities { display:flex; flex-direction:row; gap:4px; align-items:center; padding:0 6px 4px 20px; }
+.app-shell .project-row-open, .app-shell .project-row-remove, .app-shell .project-row-audit { position:static; display:grid; place-items:center; width:26px; height:26px; border:0; background:transparent; color:var(--muted); cursor:pointer; }
 .app-shell .project-row-audit:hover { color:var(--blue); }
 .app-shell .overview-project-with-actions { display:flex; align-items:center; gap:12px; }
 .app-shell .overview-project-with-actions > .project-row-main { flex:1; }
@@ -73,6 +77,9 @@ html[data-theme='dark'] .app-shell { --canvas:#111827; }
 .project-actions-menu > summary:hover { background:transparent; border-color:var(--blue); }
 .app-settings-popover, .project-actions-menu > div { position:absolute; z-index:30; width:310px; max-width:calc(100vw - 40px); padding:16px; display:flex; flex-direction:column; gap:12px; border:1px solid var(--border); border-radius:7px; box-shadow:0 8px 30px #0002; background:var(--canvas); }
 .app-settings-popover { right:0; top:38px; }
+.app-settings-popover .theme-switch { align-self:center; }
+.app-settings-popover .theme-switch button { display:grid; place-items:center; padding:0; }
+.app-settings-popover > .button { justify-content:flex-start; gap:8px; }
 .project-actions-menu > div { left:0; top:38px; }
 .project-actions-menu > div .button { width:100%; justify-content:flex-start; white-space:normal; text-align:left; }
 .app-shell .workspace-actions-menu > summary { cursor:pointer; padding:10px 4px; font-size:12px; color:var(--muted); }

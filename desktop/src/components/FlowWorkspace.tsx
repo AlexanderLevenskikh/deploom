@@ -1,4 +1,4 @@
-import { FileText, LoaderCircle, MoreHorizontal, Play, Rocket, RotateCcw, ShieldCheck, Wrench, X } from 'lucide-react'
+import { FileText, LoaderCircle, MoreHorizontal, Play, Rocket, RefreshCw, RotateCcw, ShieldCheck, Wrench, X } from 'lucide-react'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ACTION_ORDER, FLOW_STAGES } from '../data/flow'
@@ -491,6 +491,7 @@ export function FlowWorkspace({ details, project, appVersion, projectAudit, stor
               {scenarioSignal.label}
             </button>
             <details className="project-actions-menu"><summary>{text('Действия', 'Actions')}<MoreHorizontal size={20} aria-hidden="true" /></summary><div>
+            <button className="button secondary" disabled={maintenanceBlocked || active || projectAudit?.view?.lifecycle.phase === 'running' || Boolean(projectAudit?.view?.blockedReason) || projectAudit?.starting || !projectAudit} onClick={() => void projectAudit?.start()}><RefreshCw size={16} />{projectAudit?.view?.lifecycle.phase === 'running' ? text('Аудит выполняется…', 'Audit running…') : text('Обновить аудит', 'Refresh audit')}</button>
             <button className="button secondary" disabled={active || scenarioSignal.running || maintenanceBlocked} onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button>
             {draftResult ? <button className="button secondary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Последний Draft', 'Last Draft')}</button> : null}
             <button className="button secondary" disabled={!iterativeView?.artifactsDirectory && !run && !activeAction && !scenarioSignal?.attempt} onClick={() => void onOpenPath(iterativeView?.artifactsDirectory || artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>
@@ -649,7 +650,7 @@ export function FlowWorkspace({ details, project, appVersion, projectAudit, stor
         disabledExternal={active || maintenanceBlocked || projectAudit?.view?.lifecycle.phase === 'running'}
       />
 
-      <AuditGoalSummary audit={iterativeView?.audit?.checkpointId ? iterativeView.audit : projectAudit?.view?.audit ?? iterativeView?.audit} initial={iterativeView?.initialAudit} lifecycle={projectAudit?.view?.lifecycle} onRefresh={projectAudit?.start} refreshDisabled={maintenanceBlocked || active || Boolean(projectAudit?.view?.blockedReason) || projectAudit?.starting} refreshError={projectAudit?.error} onOpenPath={onOpenPath} />
+      <AuditGoalSummary audit={iterativeView?.audit?.checkpointId ? iterativeView.audit : projectAudit?.view?.audit ?? iterativeView?.audit} initial={iterativeView?.initialAudit} lifecycle={projectAudit?.view?.lifecycle} refreshDisabled={maintenanceBlocked || active || Boolean(projectAudit?.view?.blockedReason) || projectAudit?.starting} refreshError={projectAudit?.error} onOpenPath={onOpenPath} />
 
       {surface('dependencies', <>
       <section className="project-scope-actions"><h2>{text('Состав и настройки обновления', 'Update scope and settings')}</h2><p>{text('Draft предлагает версии; проверенный запуск применяет и проверяет изменения.', 'Draft proposes versions; a verified run applies and checks the changes.')}</p><button className="button secondary" disabled={active || maintenanceBlocked || scenarioSignal?.running} onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button></section>

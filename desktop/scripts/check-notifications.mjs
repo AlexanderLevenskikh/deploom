@@ -73,6 +73,17 @@ try {
     "restart must not replay previously completed steps");
 } finally { rmSync(dir, { recursive: true, force: true }); }
 
+// Autopilot is quiet about selection/review, while errors and completed stages remain visible.
+{
+  const observe = createIterativeNotificationObserver();
+  const base = {attemptId:'auto',workspaceId:'w',projectName:'demo',status:'running',stage:'drive',stepsDone:[]};
+  observe(base, {autopilot:true});
+  assert.deepEqual(observe({...base,stepsDone:['plan-next']}, {autopilot:true}), []);
+  const completed = observe({...base,stepsDone:['plan-next','verify']}, {autopilot:true});
+  assert.equal(completed[0].kind, 'iterative-stage-complete');
+  assert.deepEqual(observe({...base,stepsDone:['plan-next','verify'],status:'done',lastStep:'cohort-review'}, {autopilot:true}), []);
+  assert.equal(observe({...base,status:'failed',lastError:'CHECK_FAILED'}, {autopilot:true}).at(-1).kind, 'stage-failed');
+}
 let enabled = true, supported = true, failures = 0, clicks = 0;
 const native = [];
 const sender = createFlowNotificationSender({
@@ -98,7 +109,7 @@ assert.equal(failures, 3);
 const completion = flowNotificationContent({ kind: "iterative-run-complete", projectName: "demo" });
 assert.match(completion.title, /Прогон завершён/);
 assert.ok(!completion.body.includes("опубликованы"), "stopping a run does not prove publication");
-for (const marker of ["broadcastIterativeAttempt(attempt)", "observeIterativeNotifications(attempt)", "summary.stopped === 'finished'", "FLOW_NOTIFICATION_FAILED", "if (!job.cancelled)"]) {
+for (const marker of ["broadcastIterativeAttempt(attempt)", "observeIterativeNotifications(attempt, { autopilot: iterativeNotificationAutopilot(attempt) })", "summary.stopped === 'finished'", "FLOW_NOTIFICATION_FAILED", "if (!job.cancelled)"]) {
   assert.ok(main.includes(marker), "Missing notification boundary: " + marker);
 }
 console.log("Iterative journal, native delivery failures and notification deduplication OK");

@@ -1033,9 +1033,10 @@ function showFlowNotification(event: FlowNotificationEvent): void {
   sendFlowNotification(event)
 }
 const observeIterativeNotifications = createIterativeNotificationObserver()
+let iterativeNotificationAutopilot = (_scope: { workspaceId?: string; projectName: string }) => false
 function broadcastIterativeAttempt(attempt: IterativeAttemptRecord): void {
   send('flow:iterative:attempt', attempt)
-  for (const event of observeIterativeNotifications(attempt)) showFlowNotification(event)
+  for (const event of observeIterativeNotifications(attempt, { autopilot: iterativeNotificationAutopilot(attempt) })) showFlowNotification(event)
 }
 function selectedWorkspace(state = loadState()): WorkspaceRecord | undefined {
   return state.workspaces.find((item) => item.id === state.selectedWorkspaceId) ?? state.workspaces[0]
@@ -7704,6 +7705,8 @@ function setupIpc(): void {
     },
   })
 
+  iterativeNotificationAutopilot = scope => iterativeAutopilot.isEnabled(scope) === true
+
   ipcMain.handle('flow:iterative:autopilot', async (_event, input: { workspaceId?: string; projectName: string; enabled: boolean }) => {
     const workspace = autopilotWorkspace(input)
     const project = findProject(workspace, input.projectName)
@@ -8107,7 +8110,7 @@ function setupIpc(): void {
       scopeExpansionIssues,
       audit: { ...readAuditView(runDir), ...(initialAuditJobs.get(runDir)?.error ? { error: initialAuditJobs.get(runDir)?.error } : {}), running: !present && Boolean(initialAuditJobs.get(runDir) && !initialAuditJobs.get(runDir)?.finishedAt) },
       cohortReviewEnabled: cohortReviewEnabled(runDir),
-      cohortReview: decision?.step === 'materialize' ? pendingCohortReview(runDir) : undefined,
+      cohortReview: decision?.step === 'materialize' && iterativeAutopilot.isEnabled({ workspaceId: workspace.id, projectName: input.projectName }) !== true ? pendingCohortReview(runDir) : undefined,
       initialAudit: readDeliveryJson(join(runDir, 'current-audit.json')),
       residualRepair: (() => { const value = readDeliveryJson(join(runDir, 'security-state.json')); return value ? { status: value.status, attempt: value.attempt, reason: value.reason, resumable: securityResumeAvailable(runDir) } : undefined })(),
       delivery: readDeliveryView(runDir),
@@ -8705,7 +8708,7 @@ function setupIpc(): void {
         publish()
         // Return the exact repair gate; the Electron coordinator dispatches
         // the agent only while the user has enabled autopilot.
-        if (decision.step === 'materialize' && pendingCohortReview(runDir, payload)) {
+        if (decision.step === 'materialize' && iterativeAutopilot.isEnabled({ workspaceId: workspace.id, projectName: input.projectName }) !== true && pendingCohortReview(runDir, payload)) {
           updateAttempt(runDir, { status: 'done', stage: 'drive', lastStep: 'cohort-review', reason: 'Группа зависимостей ожидает согласования' })
           publish()
           return { ok: true, steps, stopped: 'cohort-review', reason: 'Группа зависимостей ожидает согласования', attempt: readAttempt(runDir) }

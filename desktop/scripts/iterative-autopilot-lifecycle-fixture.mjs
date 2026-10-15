@@ -379,4 +379,22 @@ for (const repeated of [false,true]) {
   assert.match(attempts.readAttempt(f.runDir).lastError,/Prepared artifact file disappeared/);
   assert.ok(!result.error.startsWith('ITERATIVE_MIGRATION_STATUS_V1'));
 }
-console.log('autopilot lifecycle: production toggle/drive, durable restart, identity, bounded reads, cancel, critical and exhausted verification boundaries OK');
+// The real drive handler must stop for manual review, but an enabled session
+// must reach materialization without changing the persisted review preference.
+for (const enabled of [false, true]) {
+  const f = fixture();
+  f.payload.run.phase = 'PLANNING'; delete f.payload.run.terminal;
+  f.payload.candidate = {candidateId:'review-candidate',stage:'PLANNED'};
+  let reviews = 0, materialized = 0;
+  f.bindings.pendingCohortReview = () => { reviews++; return {candidateId:'review-candidate'}; };
+  f.bindings.spawnIterativeStreamed = async () => {
+    materialized++;
+    return child('process.stdout.write(' + JSON.stringify('ITERATIVE_MIGRATION_FAILURE_V1 ' + JSON.stringify({code:'FIXTURE_STOP',summary:'after review gate',command:'',fixable:false})) + ');process.exit(1)');
+  };
+  const result = await f.drive(undefined, {...f.scope,autopilot:enabled});
+  assert.equal(materialized, enabled ? 1 : 0);
+  assert.equal(reviews, enabled ? 0 : 1);
+  if (!enabled) assert.equal(result.stopped, 'cohort-review');
+  else assert.match(result.error, /FIXTURE_STOP.*after review gate/);
+}
+console.log('autopilot lifecycle: production review bypass/manual gate, durable restart, identity, bounded reads and cancellation OK');

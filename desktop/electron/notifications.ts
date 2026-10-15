@@ -67,7 +67,7 @@ const ITERATIVE_STAGE_LABELS: Record<IterativeAttemptRecord['stage'], string> = 
 /** Observe journal transitions, never poll results or interpret process output as success. */
 export function createIterativeNotificationObserver() {
   const seen = new Map<string, { attemptId: string; terminal?: string; steps: string[] }>()
-  return (attempt: IterativeAttemptRecord): FlowNotificationEvent[] => {
+  return (attempt: IterativeAttemptRecord, options: { autopilot?: boolean } = {}): FlowNotificationEvent[] => {
     const scope = JSON.stringify([attempt.workspaceId, attempt.projectName])
     const steps = Array.isArray(attempt.stepsDone) ? attempt.stepsDone.filter(step => typeof step === 'string') : []
     let previous = seen.get(scope)
@@ -87,7 +87,7 @@ export function createIterativeNotificationObserver() {
     if (attempt.status === 'starting' || attempt.status === 'running') previous.terminal = undefined
     const prefix = previous.steps.every((step, index) => steps[index] === step)
     for (const step of steps.slice(prefix ? previous.steps.length : 0)) {
-      if (ITERATIVE_STEP_LABELS[step]) events.push({ kind: 'iterative-stage-complete',
+      if (ITERATIVE_STEP_LABELS[step] && !(options.autopilot && step === 'plan-next')) events.push({ kind: 'iterative-stage-complete',
         projectName: attempt.projectName, stage: ITERATIVE_STEP_LABELS[step] })
     }
     previous.steps = [...steps]
@@ -98,7 +98,7 @@ export function createIterativeNotificationObserver() {
     if (attempt.status === 'failed') {
       events.push({ kind: attempt.lastError ? 'stage-failed' : 'stage-attention', projectName: attempt.projectName, stage })
     } else if (attempt.lastStep === 'cohort-review') {
-      events.push({ kind: 'stage-attention', projectName: attempt.projectName, stage: 'Согласование группы зависимостей' })
+      if (!options.autopilot) events.push({ kind: 'stage-attention', projectName: attempt.projectName, stage: 'Согласование группы зависимостей' })
     } else if (attempt.stage !== 'drive') {
       events.push({ kind: 'iterative-stage-complete', projectName: attempt.projectName,
         stage: ITERATIVE_STEP_LABELS[attempt.lastStep || ''] || stage })

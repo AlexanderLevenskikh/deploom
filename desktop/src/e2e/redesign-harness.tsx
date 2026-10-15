@@ -8,7 +8,7 @@ import '../index.css'
 const query = new URLSearchParams(location.search)
 const scenario = query.get('case') || 'ready'
 const workspace = { id:'qa', name:'QA workspace · synthetic IPC', path:'C:/qa/workspace', templateRemote:'', toolRemote:'', settingsPath:'.dependency-roadmap/settings.json', agent:'codex' as const, selectedProject:'Demo.Web' }
-const projects = ['Demo.Web','Demo.Api','Demo.Tools'].map(name => ({name,path:'C:/qa/'+name,nodeVersion:'22',git:{sourceBranch:'master',baseBranch:'libs'}}))
+const projects = (query.get('projects') === 'many' ? ['Demo.Web','Demo.Api','Demo.Tools', ...Array.from({length:21}, (_,i) => 'Demo.VeryLongProjectNameForEllipsis.' + (i + 1))] : ['Demo.Web','Demo.Api','Demo.Tools']).map(name => ({name,path:'C:/qa/'+name,nodeVersion:'22',git:{sourceBranch:'master',baseBranch:'libs'}}))
 const details = { workspace, projects, settingsExists:true, dashboardExists:false, promptStale:false, git:{branch:'master',dirty:false,summary:[]}, projectLevels:{}, teamState:{schemaVersion:1 as const,updatedAt:'',projects:{}} }
 const payload: BootstrapPayload = { appVersion:'0.3.7 · QA', state:{schemaVersion:1,workspaces:[workspace],selectedWorkspaceId:'qa'},details,environment:{git:{available:true,version:'Git · fixture'},python:{available:true,version:'Python · fixture'},codex:{available:true,version:'Codex · fixture'},opencode:{available:true,version:'OpenCode · fixture'}},defaults:{templateRemote:'',toolRemote:''},notificationsEnabled:false,themePreference:query.get('theme')==='dark'?'dark':'light',updateStatus:{state:query.get('update')==='error'?'error':'downloading',percent:47,version:'QA-next'} }
 let audit: ProjectAuditView = { lifecycle:{phase:scenario==='audit-error'?'error':'missing',error:scenario==='audit-error'?'REGISTRY_UNAVAILABLE: synthetic fixture':undefined,previousPresent:false} }
@@ -32,10 +32,10 @@ const bridge = {
  journalExport:async()=>{observed('exported',true);return {canceled:false,path:'C:/qa/export.ndjson'}},
  openPath:async(path:string)=>{observed('openedPath',path)},
  getBaselineIntentPlan:async()=>({candidates:[],intent:{schemaVersion:2,policies:{},controlMode:'AUTONOMOUS',targetLevel:'yellow'}}),
- getDependencyGraphSnapshot:async()=>{throw Error('QA: no graph evidence in this scenario')},
+ getDependencyGraphSnapshot:async(projectName:string)=>({schemaVersion:1,project:projectName,capturedAt:new Date().toISOString(),packages:[{name:'react',kind:'runtime',requestedSpec:'^18.0.0',currentVersion:'18.3.1',installedVersion:'18.3.1',policy:'auto',manifestObserved:true}],edges:[],intent:{policies:{},deferredCohorts:[]},manifestCoverage:{observed:1,total:1,missing:[]},authorityBoundary:{packageList:'PROJECT_MANIFEST',relations:'OBSERVED_LOCAL_MANIFEST',cohorts:'DIAGNOSTIC_HINT_OR_USER_POLICY',proofAuthority:false}}),
  checkForUpdates:async()=>({currentVersion:payload.appVersion,development:true}),installUpdate:async()=>{observed('installed',true)},
  iterativeBegin:async(input:unknown)=>{observed('begin',input);return {ok:true,checked:{ok:true}}},iterativeDrive:async(input:unknown)=>{observed('drive',input);return {ok:true,steps:[],stopped:'finished'}},iterativeCancel:async()=>({ok:true}),
- updateWorkspace:async()=>({state:payload.state,details}),updateProjectBranches:async()=>({state:payload.state,details}),updateProjectNode:async()=>({state:payload.state,details}),
+ updateWorkspace:async(input:{selectedProject?:string})=>{if(input.selectedProject !== undefined)workspace.selectedProject=input.selectedProject; const next=structuredClone({state:payload.state,details}); if(query.get('switchDelay'))await new Promise(resolve=>setTimeout(resolve,Number(query.get('switchDelay')))); if(query.get('switchError') && input.selectedProject === 'Demo.Api')throw Error('QA: project state unavailable'); return next},updateProjectBranches:async()=>({state:payload.state,details}),updateProjectNode:async()=>({state:payload.state,details}),
 }
 window.dependencyFlow = bridge as unknown as DependencyFlowApi
 const root = createRoot(document.getElementById('root')!)

@@ -782,7 +782,7 @@ export function IterativeTaskPanel(props: Props) {
     <div className="resume-notice">
       {!props.onScenario ? <span>{mainDescription}</span> : null}
       {surface('dependencies', <section className="scenario-run-options"><h3>{text('Управление запуском', 'Run controls')}</h3>
-      <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.cohortReviewEnabled !== false} disabled={childAlive || stepBusy || disabledExternal === true} onChange={event => { void window.dependencyFlow?.reviewIterativeCohort({ workspaceId, projectName, enabled: event.target.checked }).then(result => { if (!result.ok) setNote(result.error); return refreshRunner() }).catch(error => setNote(String(error))) }} />{text('Согласовывать группы зависимостей перед обновлением', 'Review dependency cohorts before updating')}</label>
+      <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.cohortReviewEnabled !== false} disabled={autopilot || runner?.autopilotEnabled || runner?.autopilotActive || childAlive || stepBusy || disabledExternal === true} onChange={event => { void window.dependencyFlow?.reviewIterativeCohort({ workspaceId, projectName, enabled: event.target.checked }).then(result => { if (!result.ok) setNote(result.error); return refreshRunner() }).catch(error => setNote(String(error))) }} />{text('Согласовывать группы в ручном режиме', 'Review dependency cohorts in manual mode')}</label>
       <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.autopilotEnabled || runner?.autopilotActive || autopilot} disabled={disabledExternal === true} onChange={event => { const enabled = event.target.checked; setAutopilot(enabled); void window.dependencyFlow?.setIterativeAutopilot({ workspaceId, projectName, enabled }).then(() => refreshRunner()).catch(error => { setAutopilot(!enabled); setNote(String(error)) }) }} />{text('Автопилот: продолжать автоматически, включая исправления агентом', 'Autopilot: continue automatically, including agent repairs')}</label>
       <small>{runner?.phase === 'TERMINAL'
         ? runner.canResumeTerminal || runner.residualRepair?.resumable
@@ -832,14 +832,14 @@ export function IterativeTaskPanel(props: Props) {
 
   return (
     <section className="roadmap-card" data-testid="iterative-task-panel">
-      {runner?.cohortReview && runner.cohortReview.candidateId !== dismissedCohort && !childAlive && !stepBusy && disabledExternal !== true ? <CohortReviewDialog key={runner.cohortReview.candidateId} cohort={runner.cohortReview} onClose={() => setDismissedCohort(runner.cohortReview?.candidateId)} onSubmit={async selected => {
+      {!autopilot && !runner?.autopilotEnabled && !runner?.autopilotActive && runner?.cohortReview && runner.cohortReview.candidateId !== dismissedCohort && !childAlive && !stepBusy && disabledExternal !== true ? <CohortReviewDialog key={runner.cohortReview.candidateId} cohort={runner.cohortReview} onClose={() => setDismissedCohort(runner.cohortReview?.candidateId)} onSubmit={async selected => {
         if (!window.dependencyFlow) throw new Error('DESKTOP_API_UNAVAILABLE')
         const result = await window.dependencyFlow.reviewIterativeCohort({ workspaceId, projectName, candidateId: runner.cohortReview?.candidateId, selected })
         if (!result.ok) throw new Error(result.error)
         await refreshRunner()
         await driveNow()
       }} /> : null}
-      {runner?.cohortReview && runner.cohortReview.candidateId === dismissedCohort ? <button className="button primary" onClick={() => setDismissedCohort(undefined)}>{text('Согласовать ожидающую группу', 'Review pending cohort')}</button> : null}
+      {!autopilot && !runner?.autopilotEnabled && !runner?.autopilotActive && runner?.cohortReview && runner.cohortReview.candidateId === dismissedCohort ? <button className="button primary" onClick={() => setDismissedCohort(undefined)}>{text('Согласовать ожидающую группу', 'Review pending cohort')}</button> : null}
       <header className="roadmap-card-header">
         <div>
           <strong>{text('Обновление проекта', 'Project update')}</strong>

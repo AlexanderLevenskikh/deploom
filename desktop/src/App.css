@@ -777,7 +777,7 @@ textarea::placeholder {
 }
 
 /* BLOCK_DEPENDENCY_GRAPH_V1 */
-.dependency-graph-workspace { --graph-verified:#16794f; --graph-deferred:#7b6a3d; --graph-active:#b5473c; --graph-required:#315a9b; --graph-critical:#9d2f2f; height:100%; min-height:0; display:grid; grid-template-rows:auto auto auto minmax(0,1fr); gap:10px; padding:12px; background:var(--panel,#fff); overflow:hidden; }
+.dependency-graph-workspace { --graph-verified:#16794f; --graph-deferred:#7b6a3d; --graph-active:#b5473c; --graph-required:#315a9b; --graph-critical:#9d2f2f; height:100%; min-height:0; display:grid; grid-template-rows:auto auto auto minmax(0,1fr); gap:10px; padding:12px; background:var(--surface); overflow:hidden; }
 .dependency-graph-summary { display:grid; grid-template-columns:repeat(6,minmax(105px,1fr)); gap:8px; }
 .dependency-graph-summary>div { min-width:0; padding:9px 11px; border:1px solid var(--border); border-radius:8px; background:var(--surface,#fff); }
 .dependency-graph-summary span { display:block; margin-bottom:3px; color:var(--muted); font-size:11px; }

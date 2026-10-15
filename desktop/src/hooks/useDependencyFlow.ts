@@ -103,6 +103,9 @@ function autopilotActionInput(details: WorkspaceDetails, state: AutopilotState, 
 export function useDependencyFlow() {
   const [payload, setPayload] = useState<BootstrapPayload>()
   const [loading, setLoading] = useState(true)
+  const [projectLoading, setProjectLoading] = useState(false)
+  const [projectSelectionError, setProjectSelectionError] = useState(false)
+  const projectSelectionPending = useRef(false)
   const [error, setError] = useState<string>()
   const [baselineDecision, setBaselineDecision] = useState<BaselineDecision>()
   type ActiveRun = { jobId: string; action: ActionInput['action']; workspaceId?: string; projectName?: string; runId?: string; startedAt: number }
@@ -219,6 +222,7 @@ export function useDependencyFlow() {
     const pending = (async () => {
       do {
         refreshQueued.current = false
+        if (projectSelectionPending.current) return
         const epoch = viewEpochRef.current
         try {
           const result = await api.refreshWorkspace()
@@ -564,7 +568,12 @@ export function useDependencyFlow() {
     if (!api) return
     setError(undefined)
     const epoch = ++viewEpochRef.current
-    applyWorkspaceResult(await api.selectWorkspace(workspaceId), epoch)
+    projectSelectionPending.current = true
+    setProjectSelectionError(false)
+    setProjectLoading(true)
+    try { applyWorkspaceResult(await api.selectWorkspace(workspaceId), epoch) }
+    catch (reason) { if (viewEpochRef.current === epoch) { setProjectSelectionError(true); setError(String(reason)) } }
+    finally { if (viewEpochRef.current === epoch) { projectSelectionPending.current = false; setProjectLoading(false) } }
   }, [api, applyWorkspaceResult])
 
   const selectProject = useCallback(async (projectName: string) => {
@@ -587,8 +596,16 @@ export function useDependencyFlow() {
       },
     } : current)
     if (!api) return
-    const result = await api.updateWorkspace({ id: workspaceId, selectedProject: projectName })
-    applyWorkspaceResult(result, epoch)
+    projectSelectionPending.current = true
+    setProjectSelectionError(false)
+    setProjectLoading(true)
+    try {
+      applyWorkspaceResult(await api.updateWorkspace({ id: workspaceId, selectedProject: projectName }), epoch)
+    } catch (reason) {
+      if (viewEpochRef.current === epoch) { setProjectSelectionError(true); setError(String(reason)) }
+    } finally {
+      if (viewEpochRef.current === epoch) { projectSelectionPending.current = false; setProjectLoading(false) }
+    }
   }, [api, applyWorkspaceResult, payload?.details])
 
   // #5: explicit way back to the workspace overview. Deselecting persists
@@ -597,6 +614,9 @@ export function useDependencyFlow() {
   // selected", so WorkspaceOverview can render instead of auto-falling back to
   // the first project.
   const selectOverview = useCallback(async () => {
+    projectSelectionPending.current = false
+    setProjectSelectionError(false)
+    setProjectLoading(false)
     if (!payload?.details) return
     const workspaceId = payload.details.workspace.id
     setError(undefined)
@@ -880,7 +900,7 @@ export function useDependencyFlow() {
   ), [logs, selectedProject?.name, selectedWorkspaceId])
 
   return {
-    payload, loading, error, refreshError, baselineDecision, journal, projectAudit, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch, acknowledgeDraftRun,
+    payload, loading, projectLoading, projectSelectionError, error, refreshError, baselineDecision, journal, projectAudit, activeJobId, activeRunId: selectedActiveRun?.runId, activeRunStartedAt: selectedActiveRun?.startedAt, workspaceBusy: anyActiveJob, autopilotActive, autopilotProjectName: autopilotRef.current?.projectName, activeAction: selectedActiveRun?.action, activeWorkspaceId: selectedActiveRun?.workspaceId, activeProjectName: selectedActiveRun?.projectName, logs: visibleLogs, lastDownload, updateStatus, selectedProject, draftProgressByRunId: draftProgress, activeDraftProgress, draftLaunch: selectedDraftLaunch, markDraftLaunched, resetDraftLaunch, acknowledgeDraftRun,
     load, refresh, pickDirectory, registerExisting, cloneWorkspace, addProject, discoverProject, removeWorkspace, removeProject, selectWorkspace, selectProject, selectOverview, updateWorkspace, updateProjectBranches, updateProjectNode, listNodeVersions,
     runAction, startAutopilot, stopAutopilot, pauseJob, cancelJob, sendAgentNote, recoverWithAgent, choosePrompt, openPath, listAgentModels, checkForUpdates, setNotificationsEnabled, installUpdate, getHardwareSnapshot, getBaselineIntentPlan, getCurrentDraftResult,     getDependencyGraphSnapshot, getIterativeTask, exportIterativeTask, exportLegacyIterativeTask, copyIterativeTask, saveIterativeTask, auditProject, iterativeStatus, iterativeDrive, iterativeBegin, iterativeAgent, iterativeAttemptRead, iterativeCancel, iterativeAttempt, themePreference, setThemePreference, clearBaselineDecision: () => setBaselineDecision(undefined), clearLogs: () => setLogs((current) => current.filter((entry) => !(entry.workspaceId === selectedWorkspaceId && entry.projectName === selectedProject?.name))), setError,
   }
