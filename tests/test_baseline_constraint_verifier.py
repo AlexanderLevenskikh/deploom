@@ -154,6 +154,8 @@ class BaselineConstraintVerifierTests(unittest.TestCase):
             self.assertIn("lifecycle/preparation failed", result.summary)
             self.assertNotIn("deterministically", result.summary)
             self.assertIn("postinstall deterministic toolchain failure", result.output)
+            self.assertIn("lifecycle install exited 7", result.summary)
+            self.assertIn("postinstall deterministic toolchain failure", result.summary)
 
 
 

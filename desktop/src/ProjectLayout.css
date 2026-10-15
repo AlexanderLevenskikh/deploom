@@ -69,6 +69,8 @@ html[data-theme='dark'] .app-shell { --canvas:#111827; }
 .app-settings-menu, .project-actions-menu { position:relative; }
 .app-settings-menu > summary, .project-actions-menu > summary { list-style:none; cursor:pointer; display:flex; align-items:center; justify-content:center; min-height:34px; border-radius:5px; padding:6px 10px; color:var(--muted); font-size:12px; }
 .app-settings-menu > summary:hover, .project-actions-menu > summary:hover { background:var(--surface); color:var(--text); }
+.project-actions-menu > summary { gap:7px; padding:6px 12px; border:1px solid var(--border); background:transparent; color:var(--text); font-weight:600; }
+.project-actions-menu > summary:hover { background:transparent; border-color:var(--blue); }
 .app-settings-popover, .project-actions-menu > div { position:absolute; z-index:30; width:310px; max-width:calc(100vw - 40px); padding:16px; display:flex; flex-direction:column; gap:12px; border:1px solid var(--border); border-radius:7px; box-shadow:0 8px 30px #0002; background:var(--canvas); }
 .app-settings-popover { right:0; top:38px; }
 .project-actions-menu > div { left:0; top:38px; }

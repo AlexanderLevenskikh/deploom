@@ -6,6 +6,8 @@ param(
 
     [string]$TagMessage = "",
 
+    [switch]$NonInteractive,
+
     [switch]$SkipValidation
 )
 
@@ -141,6 +143,7 @@ try {
     if (-not [string]::IsNullOrWhiteSpace($TagMessage)) {
         $ReleaseArgs.TagMessage = $TagMessage
     }
+    if ($NonInteractive) { $ReleaseArgs.NonInteractive = $true }
     if ($SkipValidation) {
         $ReleaseArgs.SkipValidation = $true
     }

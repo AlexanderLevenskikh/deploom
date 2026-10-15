@@ -128,6 +128,35 @@ class MaterializeFailureClassificationUnit(_Base):
 
 
 class MaterializeFailureClassificationEndToEnd(_Base):
+    def test_eresolve_conflict_defers_exact_candidate_without_false_availability_or_infra_block(self):
+        self.assertEqual(("resolver", "CONFLICT"), _materialization_failure("npm error ERESOLVE unable to resolve dependency tree"))
+        run_dir = self.make_run_dir()
+        config = _config_dict(targets={"pkg-a": "2.0.0"})
+        save_config(run_dir, config)
+        _plan_next_locked(run_dir, load_run(run_dir), config)
+        candidate = load_candidate(run_dir)
+        checkpoint_before = (run_dir / 'checkpoints' / 'C0.json').read_bytes()
+        events = []
+        with self.materialize_patches(self.install_failure("npm error ERESOLVE could not resolve\nConflicting peer dependency: companion@3.0.1")):
+            with mock.patch('iterative_migration._emit_status', side_effect=events.append):
+                self.assertEqual(0, _materialize_locked(run_dir, load_run(run_dir), config, SimpleNamespace(timeout_seconds=1200)))
+        rejected = load_candidate(run_dir)
+        self.assertEqual('REJECTED', rejected['stage'])
+        self.assertEqual('resolver-conflict', rejected['conclusion']['kind'])
+        self.assertFalse(rejected['conclusion']['exactTargetDeferred'])
+        ledger = load_ledger(run_dir)
+        self.assertEqual([], ledger.get('targetAvailabilityDeferrals') or [])
+        self.assertEqual([], ledger.get('infraBlocks') or [])
+        self.assertTrue(ledger['deferrals'][0]['assignmentFingerprint'])
+        self.assertEqual('READY', load_run(run_dir)['phase'])
+        self.assertIsNone(load_run(run_dir).get('activeCandidateId'))
+        self.assertEqual(checkpoint_before, (run_dir / 'checkpoints' / 'C0.json').read_bytes())
+        with mock.patch('iterative_migration._emit_status'):
+            _plan_next_locked(run_dir, load_run(run_dir), config)
+        next_candidate = load_candidate(run_dir)
+        if next_candidate and next_candidate['stage'] == 'PLANNED':
+            self.assertNotEqual(candidate['fullAssignment'], next_candidate['fullAssignment'])
+
     def _drive_then_assert_blocked(self, install, expected_code: str) -> None:
         run_dir = self.make_run_dir()
         config = _config_dict(targets={"pkg-a": "2.0.0"})

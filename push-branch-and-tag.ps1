@@ -8,6 +8,8 @@
 
     [string]$TagMessage = "",
 
+    [switch]$NonInteractive,
+
     [switch]$SkipValidation
 )
 
@@ -210,46 +212,10 @@ try {
     # Resolve version
     # --------------------------------------------------------
 
-    if ([string]::IsNullOrWhiteSpace($Tag)) {
-        $CurrentVersion = (Get-Content $VersionPath -Raw).Trim()
-
-        if ($CurrentVersion -notmatch '^(\d+)\.(\d+)\.(\d+)$') {
-            throw (
-                "Cannot automatically increment VERSION " +
-                "'$CurrentVersion'. Expected MAJOR.MINOR.PATCH."
-            )
-        }
-
-        $Major = [int]$Matches[1]
-        $Minor = [int]$Matches[2]
-        $Patch = [int]$Matches[3] + 1
-
-        $Version = "$Major.$Minor.$Patch"
-        $Tag = "v$Version"
-
-        Write-Host ""
-        Write-Host "Automatic patch bump:"
-        Write-Host "  $CurrentVersion -> $Version"
-    }
-    else {
-        $Version = $Tag
-
-        if ($Version.StartsWith("v")) {
-            $Version = $Version.Substring(1)
-        }
-
-        if (
-            $Version -notmatch
-            '^\d+\.\d+\.\d+([-.+][0-9A-Za-z.-]+)?$'
-        ) {
-            throw (
-                "Unsupported version '$Version'. " +
-                "Expected something like 0.1.90."
-            )
-        }
-
-        $Tag = "v$Version"
-    }
+    . (Join-Path $RepoRoot 'scripts/release-version.ps1')
+    $ResolvedVersion = Resolve-ReleaseTag -CurrentVersion (Get-Content $VersionPath -Raw).Trim() -Tag $Tag -NonInteractive:$NonInteractive
+    $Version = $ResolvedVersion.Version
+    $Tag = $ResolvedVersion.Tag
 
     Write-Host ""
     Write-Host "========================================"

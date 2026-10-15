@@ -4117,18 +4117,19 @@ def _handle_materialize_failure(
         # fall through to the terminal path below: the candidate is concluded
         # and the identity is blocked for the current scope, so an identical
         # gate stops with evidence instead of replaying.
-        if not record_unavailable_targets(ledger, run, config, candidate, output):
+        conflict = code == "CONFLICT"
+        if not conflict and not record_unavailable_targets(ledger, run, config, candidate, output):
             classification = "unknown"
             code = "RESOLVER_NO_EVIDENCE"
         else:
-            _append_deferral(ledger, candidate, f"resolver {code}: target version unavailable")
+            _append_deferral(ledger, candidate, f"resolver {code}: " + ("exact assignment rejected by peer resolution" if conflict else "target version unavailable"))
             candidate = dict(candidate)
             candidate["stage"] = "REJECTED"
             candidate["conclusion"] = {
-                "kind": "resolver-target-unavailable",
+                "kind": "resolver-conflict" if conflict else "resolver-target-unavailable",
                 "code": code,
                 "reason": f"resolver {code} during exact materialization",
-                "exactTargetDeferred": True,
+                "exactTargetDeferred": not conflict,
             }
             candidate["attemptResult"] = _build_attempt_result(
                 candidate, base_id, classification=classification, code=code,
@@ -4153,7 +4154,7 @@ def _handle_materialize_failure(
                     "exitCode": exit_code,
                     "outputTail": output[-2000:],
                     "concluded": True,
-                    "exactTargetDeferred": True,
+                    "exactTargetDeferred": not conflict,
                 }
             )
             return 0
@@ -4350,6 +4351,8 @@ def _materialization_failure(output: str) -> Tuple[str, str]:
         if re.search(r"\.tgz\b|\.tar\.gz\b", output or ""):
             return "unknown", "TARBALL_UNAVAILABLE"
         return "unknown", "NOT_FOUND"
+    if "eresolve" in lowered:
+        return "resolver", "CONFLICT"
     for marker, code in (
         ("etarget", "ETARGET"),
         ("enotarget", "NOTARGET"),

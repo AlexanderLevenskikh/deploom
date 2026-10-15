@@ -2045,7 +2045,11 @@ def _publish_prepared_workspace_snapshot(
         item.link_relative: item.target_relative
         for item in canonical_reparse_plan
     }
+    publication_lease = None
     try:
+        publication_lease = acquire_snapshot_copy_lease(
+            stage_workspace, timeout_seconds=max(1, timeout_seconds), progress=progress
+        )
         # On the normal Windows path both directories live under the same temp
         # volume. Renaming the already-prepared tree publishes the immutable
         # snapshot in O(metadata), instead of physically copying node_modules.
@@ -2127,19 +2131,7 @@ def _publish_prepared_workspace_snapshot(
             dependency_roots=tuple(dependency_roots),
             dependency_integrity=dict(dependency_integrity),
         )
-        raced: Optional[PreparedWorkspaceSnapshot] = None
-        if shared_reuse_allowed:
-            with _PREPARED_SNAPSHOT_LOCK:
-                raced = _PREPARED_SNAPSHOTS.get(slot)
-                if raced is None:
-                    _PREPARED_SNAPSHOTS[slot] = snapshot
-                    published = snapshot
-                else:
-                    published = raced
-            if raced is not None:
-                shutil.rmtree(stage, ignore_errors=True)
-        else:
-            published = snapshot
+        published = snapshot
 
         durable_published = False
         source_closure_receipt: dict[str, object] = {}
@@ -2172,6 +2164,10 @@ def _publish_prepared_workspace_snapshot(
             durable_seal_duration_ms = max(
                 0, int((time.monotonic() - durable_seal_started) * 1000)
             )
+        if shared_reuse_allowed and is_durable_prepared_path(published.workspace_root) and not durable_published:
+            raise RuntimeError("PREPARED_ARTIFACT_PUBLICATION_REJECTED: " + str(
+                source_closure_receipt.get("publicationError") or "durable integrity evidence unavailable"
+            ))
         if durable_published:
             confirmed = dataclasses.replace(
                 published,
@@ -2189,14 +2185,6 @@ def _publish_prepared_workspace_snapshot(
             with _PREPARED_SNAPSHOT_LOCK:
                 if _PREPARED_SNAPSHOTS.get(slot) is published:
                     _PREPARED_SNAPSHOTS.pop(slot, None)
-        if shared_reuse_allowed:
-            with _publish_stage(
-                "finalize:budget",
-                operation_id=publish_operation_id,
-                progress=progress,
-                progress_label=progress_label,
-            ):
-                _enforce_prepared_snapshot_budget(slot)
         emit_observability_event(
             "snapshot-publish.finish",
             operationId=publish_operation_id,
@@ -2213,10 +2201,24 @@ def _publish_prepared_workspace_snapshot(
                 progress_interval_seconds=progress_interval_seconds)
             published = dataclasses.replace(published, source_closure_content_key=source_integrity.source_content_key,
                 source_closure_entries=source_integrity.source_entries)
+        if shared_reuse_allowed:
+            with _PREPARED_SNAPSHOT_LOCK:
+                _PREPARED_SNAPSHOTS[slot] = published
+        if shared_reuse_allowed:
+            with _publish_stage(
+                "finalize:budget",
+                operation_id=publish_operation_id,
+                progress=progress,
+                progress_label=progress_label,
+            ):
+                _enforce_prepared_snapshot_budget(slot)
         return published
     except Exception:
         shutil.rmtree(stage, ignore_errors=True)
         raise
+    finally:
+        if publication_lease is not None:
+            publication_lease.close()
 
 
 def _materialize_prepared_workspace_snapshot(
@@ -3958,7 +3960,8 @@ def verify_assignment(
                     verificationPurpose=_verification_purpose(config),
                 )
                 if full_result.returncode != 0:
-                    tail = "\n".join((full_result.stdout or "").splitlines()[-80:])
+                    tail = "\n".join(((full_result.stdout or "") + "\n" + (getattr(full_result, "stderr", "") or "")).splitlines()[-80:])
+                    lifecycle_detail = f"lifecycle install exited {full_result.returncode}: " + "\n".join(tail.splitlines()[-14:])
                     common = dict(
                         command=" ".join(full_argv),
                         output=tail,
@@ -3978,7 +3981,7 @@ def verify_assignment(
                         )
                     return BaselineVerifyResult(
                         False, "unknown",
-                        "assignment resolves, but lifecycle/preparation failed; cause is unclassified",
+                        "assignment resolves, but lifecycle/preparation failed; cause is unclassified; " + lifecycle_detail,
                         **common,
                     )
 

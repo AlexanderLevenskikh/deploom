@@ -364,4 +364,19 @@ for (const repeated of [false,true]) {
   persist({workspaceId:'w',projectName:'demo'}, false);
   assert.equal(readAutopilotState(runDir).enabled, false);
 }
+// Long progress output must not hide the actual structured terminal error.
+{
+  const f = fixture();
+  f.payload.run.phase = 'PLANNING'; delete f.payload.run.terminal;
+  f.payload.candidate = {candidateId:'candidate-error',stage:'PLANNED'};
+  f.bindings.pendingCohortReview = () => undefined;
+  const failure = 'ITERATIVE_MIGRATION_FAILURE_V1 ' + JSON.stringify({code:'CHECKPOINT_BUILD_UPGRADE_UNCONFIRMED',summary:'Prepared artifact file disappeared; original checkpoint preserved',command:'',fixable:true});
+  const output = ('ITERATIVE_MIGRATION_STATUS_V1 {"event":"migration.progress"}\n').repeat(200) + failure + '\n';
+  f.bindings.spawnIterativeStreamed = async () => child('process.stdout.write(' + JSON.stringify(output) + ');process.exit(1)');
+  const result = await f.drive(undefined,{...f.scope,autopilot:false});
+  assert.equal(result.ok,false);
+  assert.match(result.error,/CHECKPOINT_BUILD_UPGRADE_UNCONFIRMED/);
+  assert.match(attempts.readAttempt(f.runDir).lastError,/Prepared artifact file disappeared/);
+  assert.ok(!result.error.startsWith('ITERATIVE_MIGRATION_STATUS_V1'));
+}
 console.log('autopilot lifecycle: production toggle/drive, durable restart, identity, bounded reads, cancel, critical and exhausted verification boundaries OK');

@@ -1,4 +1,4 @@
-import { FileText, LoaderCircle, Play, Rocket, RotateCcw, ShieldCheck, Wrench, X } from 'lucide-react'
+import { FileText, LoaderCircle, MoreHorizontal, Play, Rocket, RotateCcw, ShieldCheck, Wrench, X } from 'lucide-react'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ACTION_ORDER, FLOW_STAGES } from '../data/flow'
@@ -490,7 +490,7 @@ export function FlowWorkspace({ details, project, appVersion, projectAudit, stor
               {scenarioSignal.running ? <X size={16} /> : scenarioSignal.state === 'agent' || scenarioSignal.state === 'repair-current' ? <Wrench size={16} /> : scenarioSignal.state === 'result' || scenarioSignal.state === 'partial' || scenarioSignal.state === 'budget-stop' || scenarioSignal.state === 'blocked' || scenarioSignal.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}
               {scenarioSignal.label}
             </button>
-            <details className="project-actions-menu"><summary>{text('Действия', 'Actions')} ···</summary><div>
+            <details className="project-actions-menu"><summary>{text('Действия', 'Actions')}<MoreHorizontal size={20} aria-hidden="true" /></summary><div>
             <button className="button secondary" disabled={active || scenarioSignal.running || maintenanceBlocked} onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button>
             {draftResult ? <button className="button secondary" onClick={() => void openDraftPrompt()}><FileText size={16} />{text('Последний Draft', 'Last Draft')}</button> : null}
             <button className="button secondary" disabled={!iterativeView?.artifactsDirectory && !run && !activeAction && !scenarioSignal?.attempt} onClick={() => void onOpenPath(iterativeView?.artifactsDirectory || artifactsPath)}><FileText size={16} />{text('Открыть артефакты', 'Open artifacts')}</button>

@@ -7548,7 +7548,7 @@ function setupIpc(): void {
   // failing project commands) BEFORE exiting — even a non-zero exit leaves a
   // real verdict here, so a failed/inconclusive check is NEVER a bare
   // "check failed" without a cause.
-  function readProjectCheckArtifact(runDir: string): { validationScope?: { mode?: string; existingFailures?: number; total?: number; skipped?: number }; ok: boolean; checkedAt?: string; control?: { status?: string; kind?: string; summary?: string; failingCommands?: { command: string; exitCode: number }[] } } | undefined {
+  function readProjectCheckArtifact(runDir: string): { validationScope?: { mode?: string; existingFailures?: number; total?: number; skipped?: number }; ok: boolean; checkedAt?: string; control?: { status?: string; kind?: string; summary?: string; command?: string; failingCommands?: { command: string; exitCode: number }[] } } | undefined {
     const checkPath = join(runDir, 'project-check.json')
     if (!existsSync(checkPath)) return undefined
     try {
@@ -7564,6 +7564,7 @@ function setupIpc(): void {
                 status: typeof control.status === 'string' ? control.status : undefined,
                 kind: typeof control.kind === 'string' ? control.kind : undefined,
                 summary: typeof control.summary === 'string' ? control.summary : undefined,
+                command: typeof control.command === 'string' ? control.command : undefined,
                 failingCommands: Array.isArray(control.failingCommands)
                   ? control.failingCommands
                       .filter((item): item is { command: string; exitCode: number } => Boolean(item) && typeof item === 'object' && typeof (item as { command?: unknown }).command === 'string')
@@ -7589,7 +7590,7 @@ function setupIpc(): void {
       const failing = (verdict.control?.failingCommands ?? []).slice(0, 3).map((f) => `${f.command} (exit ${f.exitCode})`).join('; ')
       return `ITERATIVE_MIGRATION_FAILURE_V1 ${JSON.stringify({ code: 'PROJECT_CONTROL_FAILED', summary: `Контроль текущих зависимостей не пройден${failing ? `: ${failing}` : ''}.`, command: '', fixable: true })}`
     }
-    return `ITERATIVE_MIGRATION_FAILURE_V1 ${JSON.stringify({ code: 'PROJECT_CHECK_INCONCLUSIVE', summary: `Проверка не дала определённого результата (${verdict.control?.kind ?? 'unknown'}): ${verdict.control?.summary || 'результат неизвестен'}. Повторите проверку.`, command: '', fixable: true })}`
+    return `ITERATIVE_MIGRATION_FAILURE_V1 ${JSON.stringify({ code: 'PROJECT_CHECK_INCONCLUSIVE', summary: `Проверка не дала определённого результата (${verdict.control?.kind ?? 'unknown'}): ${verdict.control?.summary || 'результат неизвестен'}. Повторите проверку.`, command: verdict.control?.command || '', fixable: true })}`
   }
 
   // P2 (#1): a repair-only run is auxiliary — it fixes the CURRENT state, it is
@@ -8751,9 +8752,10 @@ function setupIpc(): void {
         }
         const result = await spawnIterativeStreamed(runDir, python, iterativeStepInvocation(runDir, decision.step, generator, python).args, workspace.path, 0, iterativeStreamIo(runDir), iterativeStreamPlatform)
         if (result.code !== 0) {
+          const failure = parseIterativeFailure(result.stdout)
           const raw = result.timedOut
             ? (readAttempt(runDir)?.cancelRequested === true ? 'CANCELED: step terminated by user cancel' : `STEP_TIMEOUT: step ${decision.step} exceeded its 30-minute budget`)
-            : (result.stderr.trim() || result.stdout.trim() || `STEP_EXIT_${result.code}`)
+            : (failure ? `ITERATIVE_MIGRATION_FAILURE_V1 ${JSON.stringify({ ...failure, summary: failure.summary.slice(0, 2800), command: failure.command.slice(0, 500) })}` : result.stderr.trim() || result.stdout.trim().slice(-4000) || `STEP_EXIT_${result.code}`)
           const canceledByUser = readAttempt(runDir)?.cancelRequested === true
           if (canceledByUser) clearCancelRequest(runDir)
           updateAttempt(runDir, {
@@ -8764,7 +8766,6 @@ function setupIpc(): void {
             lastStep: decision.step,
           })
           publish()
-          const failure = parseIterativeFailure(result.stdout)
           return { ok: canceledByUser, retryable: !canceledByUser && failure?.code === 'TRIAL_LOCKED' && failure.summary.startsWith('RUN_LOCK_BUSY:'), retryInfraPending: retryInfra, discardCandidatePending: discardCandidate, steps, stopped: canceledByUser ? 'canceled' : 'error', step: decision.step, error: canceledByUser ? undefined : raw.slice(0, 4000), attempt: readAttempt(runDir) }
         }
         steps.push(decision.step)

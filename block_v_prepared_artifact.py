@@ -590,6 +590,8 @@ def publish_prepared_artifact_record(
             artifactKey=str(key),
             errorType=type(exc).__name__, error=str(exc),
         )
+        if source_closure_receipt is not None:
+            source_closure_receipt["publicationError"] = str(exc)
         if progress:
             progress(f"snapshot-publish: durable record rejected: {exc}")
         return False
