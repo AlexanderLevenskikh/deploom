@@ -41,6 +41,9 @@ try {
   incomplete.start({ ...request, context: context() }); await incomplete.jobs.get(runDir).promise;
   assert.equal(incomplete.status({ ...request, context: context() }).phase, 'error', 'old evidence cannot complete a fresh operation');
   assert.match(incomplete.status({ ...request, context: context() }).error, /AUDIT_EVIDENCE_MISSING/);
+  const canceled = createProjectAuditController({ run: async () => { throw Error('AUDIT_INTERRUPTED: user stopped') } });
+  canceled.start({ ...request, context: context() }); await canceled.jobs.get(runDir).promise;
+  assert.equal(canceled.status({ ...request, context: context() }).phase, 'interrupted');
   console.log('Project audit: read-only status, duplicate joins, shared scope exclusion, context applicability, restart ownership and fresh evidence identity PASS');
 } finally {
   assert.equal(dirname(fixture), resolve(tmpdir()));

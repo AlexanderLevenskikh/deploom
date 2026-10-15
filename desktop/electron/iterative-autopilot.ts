@@ -167,6 +167,7 @@ export function createIterativeAutopilot(key: (scope: Scope) => string, persiste
   return {
     // A session owns the migration across handlers, status reads and retry waits.
     hasActiveSessions(): boolean { return sessions.size > 0 },
+    cancelAll(): void { for (const session of sessions.values()) session.canceled = true },
     hasSession(scope: Scope) { return sessions.has(key(scope)) },
     isEnabled(scope: Scope): boolean | undefined { return sessions.get(key(scope))?.enabled },
     setEnabled(scope: Scope, enabled: boolean) {

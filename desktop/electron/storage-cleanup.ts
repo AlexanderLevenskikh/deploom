@@ -7,13 +7,20 @@ export class StorageCleanupController {
   private queued?: ReturnType<typeof setTimeout>
   status(): StorageStatus { return this.state }
   private publish(state: StorageStatus): void { this.state = state; try { this.changed(state) } catch { /* renderer closure cannot interrupt maintenance */ } }
+  private automaticSuspended = false
+  suspendAutomatic(): void {
+    this.automaticSuspended = true
+    if (this.queued) { clearTimeout(this.queued); this.queued = undefined }
+  }
   scheduleAutomatic(): void {
-    if (this.queued) return
+    if (this.queued || this.automaticSuspended) return
     const start = async () => {
       this.queued = undefined
+      if (this.automaticSuspended) return
       if (this.busy || this.active()) { this.queued = setTimeout(() => void start(), 2000); this.queued.unref(); return }
       try {
         const preview = await this.maintenance('inspect', `auto-${Date.now()}`, () => {}, true)
+        if (this.automaticSuspended) return
         if (!preview.canceled && preview.eligible > 0 && !this.active()) await this.maintenance('clean', `auto-${Date.now()}`, () => {}, true)
         else if (this.active()) this.scheduleAutomatic()
       } catch { /* the UI exposes failure; no silent deletion retry */ }

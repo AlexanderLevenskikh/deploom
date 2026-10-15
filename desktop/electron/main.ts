@@ -1,4 +1,5 @@
 import { readIterativeGraphView } from './iterative-graph-view.js'
+import { defenderExclusionTarget, defenderExclusionCommand } from './defender-exclusion.js'
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
 import updaterPackage from 'electron-updater'
 import { nextUpdaterStatus, type UpdateStatus } from './updater-state.js'
@@ -78,7 +79,7 @@ import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
 import { type IterativeAttemptRecord, beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, readRunLogTail, recordAttemptLog, recordAttemptProgress, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
 import { spawnIterativeStreamed, type CaptureResult, type StreamAttemptIo, type StreamPlatform } from './iterative-stream.js'
-import { extendRepairBudget, repairProgressFingerprint, agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, changedFilesFromBaseline, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, agentProviderFailure, openCodeRuntimeManifestPaths, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, recordAgentDispatchTiming, trialBaselineFile, trialProjectPath, withAgentDispatchLock, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
+import { extendRepairBudget, repairProgressFingerprint, agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, inspectTrialChanges, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, agentProviderFailure, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, recordAgentDispatchTiming, trialBaselineFile, trialProjectPath, withAgentDispatchLock, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
@@ -2771,12 +2772,14 @@ function checkForLatestUpdate(): ReturnType<typeof autoUpdater.checkForUpdates> 
   return request
 }
 
-let updateRestartBlocked = () => jobs.size > 0
+let operationsStopping = false
+let updateRestartBlockers = (): string[] => [...jobs.values()].map(job => `${job.projectName ?? job.workspace.name}: ${job.action}`)
+let updateRestartBlocked = () => updateRestartBlockers().length > 0
 async function installLatestUpdate(): Promise<void> {
   if (!app.isPackaged || updateInstallInProgress) return
   updateInstallInProgress = true
   try {
-    if (updateRestartBlocked()) throw new Error('UPDATE_BUSY: finish or stop active operations before restarting DepLoom')
+    if (updateRestartBlocked()) throw new Error(`UPDATE_BUSY: ${updateRestartBlockers().join('; ')}`)
     // A package may have been downloaded before a newer release appeared.
     // Refresh the feed and wait for that newest package instead of installing
     // the stale cached one and making the user upgrade again on next launch.
@@ -2789,7 +2792,7 @@ async function installLatestUpdate(): Promise<void> {
     if (downloadedUpdateVersion !== latestVersion) {
       throw new Error(`Update ${latestVersion} did not finish downloading.`)
     }
-    if (updateRestartBlocked()) throw new Error('UPDATE_BUSY: an operation started while downloading; restart is deferred')
+    if (updateRestartBlocked()) throw new Error(`UPDATE_BUSY: ${updateRestartBlockers().join('; ')}`)
     autoUpdater.quitAndInstall(false, true)
   } catch (error) {
     publishUpdaterError(error)
@@ -7875,6 +7878,7 @@ function setupIpc(): void {
   const iterativeStepInFlight = new Set<string>()
   const auditChildren = new Set<ChildProcess>()
   let auditShuttingDown = false
+  const canceledAudits = new Set<string>()
   app.on('before-quit', () => { auditShuttingDown = true; for (const child of auditChildren) iterativeStreamPlatform.killProcessTree(child); flushJournal() })
   const projectAudits = createProjectAuditController({
     run: async (request, operationId) => {
@@ -7884,14 +7888,14 @@ function setupIpc(): void {
       let ownedChild: ChildProcess | undefined
       try {
         const result = await spawnIterativeStreamed(request.runDir, resolveExecutable('python'), [join(bundledToolDir(), 'iterative_delivery.py'), '--run-dir', request.runDir, '--input-file', inputFile, 'current-audit'], request.workspacePath, 20 * 60_000, {
-          cancelRequested: () => auditShuttingDown,
+          cancelRequested: () => auditShuttingDown || canceledAudits.has(operationId),
           recordLine: (_dir, text, stream) => queueJournalRecord(logDir, { workspaceId: request.workspaceId, projectName: request.projectName, runId: operationId, source: 'audit', stream: stream ?? 'system', text, at: Date.now() }),
           trimLog: () => {},
         }, iterativeStreamPlatform, undefined, { onSpawn: (_pid, child) => { if (child) { ownedChild = child; auditChildren.add(child) } } })
         if (result.timedOut) throw new Error('AUDIT_TIMEOUT: audit did not complete within its collection budget')
-        if (result.canceled) throw new Error('AUDIT_INTERRUPTED: application closed during the audit')
+        if (result.canceled) throw new Error('AUDIT_INTERRUPTED: audit stopped; previous evidence preserved')
         if (result.code !== 0) throw new Error(result.stderr.trim() || 'INITIAL_AUDIT_FAILED')
-      } finally { if (ownedChild) auditChildren.delete(ownedChild); flushJournal(logDir) }
+      } finally { canceledAudits.delete(operationId); if (ownedChild) auditChildren.delete(ownedChild); flushJournal(logDir) }
     },
     event: (request, text) => {
       const state = auditJson(join(request.runDir, 'current-audit-state.json'))
@@ -7926,6 +7930,7 @@ function setupIpc(): void {
     return projectAuditView(workspace, findProject(workspace, input.projectName))
   })
   ipcMain.handle('flow:audit:start', (_event, input: { workspaceId?: string; projectName: string }) => {
+    if (operationsStopping) throw new Error('OPERATIONS_STOPPING: wait until operations have stopped')
     storageCleanup.assertMigrationAllowed()
     if (jobs.size > 0 || iterativeStepInFlight.size > 0 || iterativeAutopilot.hasActiveSessions()) throw new Error('AUDIT_SCOPE_BUSY: stop the active migration before auditing current source')
     const workspace = findWorkspace(loadState(), input.workspaceId)
@@ -7989,7 +7994,8 @@ function setupIpc(): void {
     }
   })
 
-  ipcMain.handle('flow:iterative:cancel', iterativeAutopilot.register('cancel', async (_event, input: { workspaceId?: string; projectName: string }) => {
+  const cancelIterativeOperation = iterativeAutopilot.register('cancel', async (_event: unknown, input: { workspaceId?: string; projectName: string }) => {
+    storageCleanup.suspendAutomatic()
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
@@ -8007,7 +8013,8 @@ function setupIpc(): void {
     }
     publishIterativeAttempt(runDir)
     return { ok: true, waitingCleared }
-  }))
+  })
+  ipcMain.handle('flow:iterative:cancel', cancelIterativeOperation)
 
   ipcMain.handle('flow:iterative:status', iterativeAutopilot.register('status', async (_event, input: { workspaceId?: string; projectName: string }) => {
     const state = loadState()
@@ -8133,6 +8140,7 @@ function setupIpc(): void {
   }))
 
   ipcMain.handle('flow:iterative:begin', iterativeAutopilot.register('begin', async (_event, input: { workspaceId?: string; projectName: string; language?: 'en' | 'ru'; discovery?: { mode: 'auto' | 'none'; timeoutSeconds?: number; parallelism?: number; maxPackages?: number }; validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string }; checkOnly?: boolean; repair?: boolean; restart?: boolean }) => {
+    if (operationsStopping) throw new Error('OPERATIONS_STOPPING: wait until operations have stopped')
     storageCleanup.assertMigrationAllowed()
     if (projectAudits.active()) throw new Error('AUDIT_SCOPE_BUSY: wait for the current-source audit to finish')
     const state = loadState()
@@ -8599,6 +8607,7 @@ function setupIpc(): void {
   // every iteration recomputes the decision from the DURABLE Python state, so
   // a killed app simply resumes from where the files say the run stands.
   const runIterativeDriveWithAutopilot = iterativeAutopilot.register('drive', async (_event, input: { workspaceId?: string; projectName: string; autopilot?: boolean; retryInfra?: boolean; discardCandidate?: boolean; resumeTerminal?: boolean }) => {
+    if (operationsStopping) throw new Error('OPERATIONS_STOPPING: wait until operations have stopped')
     storageCleanup.assertMigrationAllowed()
     if (projectAudits.active()) throw new Error('AUDIT_SCOPE_BUSY: wait for the current-source audit to finish')
     const state = loadState()
@@ -8947,6 +8956,7 @@ function setupIpc(): void {
     reason?: string
     error?: string
   }> => {
+    if (operationsStopping) throw new Error('OPERATIONS_STOPPING: wait until operations have stopped')
     storageCleanup.assertMigrationAllowed()
     if (projectAudits.active()) throw new Error('AUDIT_SCOPE_BUSY: wait for the current-source audit to finish')
     const state = loadState()
@@ -9426,19 +9436,20 @@ function setupIpc(): void {
         }
 
         const runtimeScope = { provider, projectRelative }
-        const runtimePaths = openCodeRuntimeManifestPaths(workspaceRoot, runtimeScope)
+        const inspection = inspectTrialChanges(workspaceRoot, baselineFile, runtimeScope)
+        const runtimePaths = inspection.runtimePaths
         if (runtimePaths.size > 0) {
           recordAttemptLog(runDir, 'OpenCode plugin runtime manifests recognized; excluded from repair evidence. Project manifests remain protected.\n')
         }
         const changed = [...new Set([
-          ...changedFilesFromBaseline(workspaceRoot, baselineFile),
+          ...inspection.changedFiles,
           ...parseChangedFilesFromAgentOutput(output),
         ])].filter(path => !runtimePaths.has(path)).sort()
         // #4: the baseline hash diff is the source of truth for agent edits.
         // A planner-owned file (manifest/lock/.npmrc/...) that was modified,
         // added or removed is a violation and REJECTS the repair BEFORE any
         // feedback reaches Python and before any verification is attempted.
-        const forbidden = forbiddenTrialViolations(workspaceRoot, baselineFile, runtimeScope)
+        const forbidden = inspection.forbidden
         if (forbidden.length > 0) {
           updateAttempt(runDir, { status: 'failed', stage: 'agent', lastStep: 'agent', finishedAt: Date.now(), lastError: `FORBIDDEN_MUTATION: ${forbidden.join(', ')}` })
           return {
@@ -9549,6 +9560,7 @@ function setupIpc(): void {
   })
 
   ipcMain.handle('flow:run-action', async (_event, input: ActionInput) => {
+    if (operationsStopping) throw new Error('OPERATIONS_STOPPING: wait until operations have stopped')
     storageCleanup.assertMigrationAllowed()
     if (projectAudits.active()) throw new Error('AUDIT_SCOPE_BUSY: wait for the current-source audit to finish')
     const state = loadState()
@@ -9650,11 +9662,74 @@ function setupIpc(): void {
   }), () => loadState().workspaces.map(workspace => workspace.path), () => jobs.size > 0 || iterativeStepInFlight.size > 0 || iterativeAutopilot.hasActiveSessions() || [...initialAuditJobs.values()].some(job => !job.finishedAt), status => {
     for (const window of BrowserWindow.getAllWindows()) if (!window.webContents.isDestroyed()) window.webContents.send('flow:storage-status', status)
   })
-  updateRestartBlocked = () => jobs.size > 0 || iterativeStepInFlight.size > 0 || iterativeAutopilot.hasActiveSessions() || projectAudits.active() || ['inspect', 'clean'].includes(storageCleanup.status().phase)
+  updateRestartBlockers = () => {
+    const blockers = [...jobs.values()].map(job => `${job.projectName ?? job.workspace.name}: ${job.action}`)
+    for (const workspace of loadState().workspaces) {
+      for (const project of readProjects(workspace)) {
+        if (iterativeStepInFlight.has(stepLockKey(workspace.id, project.name)) || iterativeAutopilot.hasSession({ workspaceId: workspace.id, projectName: project.name })) blockers.push(`${project.name}: migration / agent`)
+      }
+    }
+    if (iterativeStepInFlight.size && !blockers.some(item => item.endsWith(': migration / agent'))) blockers.push('Migration: finishing active step')
+    if (iterativeAutopilot.hasActiveSessions() && !blockers.some(item => item.endsWith(': migration / agent'))) blockers.push('Autopilot: finishing active session')
+    for (const [runDir, job] of initialAuditJobs) if (!job.finishedAt) blockers.push(`${basename(runDir)}: audit`)
+    const storage = storageCleanup.status()
+    if (['inspect', 'clean'].includes(storage.phase)) blockers.push(`Storage: ${storage.phase}${storage.control ? ' / ' + storage.control : ''}`)
+    return blockers
+  }
+  let stopAllPending: Promise<{ remaining: string[] }> | undefined
+  ipcMain.handle('flow:update-operations', () => updateRestartBlockers())
+  ipcMain.handle('flow:stop-all-operations', () => {
+    if (stopAllPending) return stopAllPending
+    operationsStopping = true
+    stopAllPending = (async () => {
+      // Suppress cleanup queued by the canceled migration's finally block.
+      storageCleanup.suspendAutomatic()
+      iterativeAutopilot.cancelAll()
+      for (const workspace of loadState().workspaces) for (const project of readProjects(workspace)) {
+        const scope = { workspaceId: workspace.id, projectName: project.name }
+        const attempt = readAttempt(iterativeTaskRunDir(workspace, project))
+        if (iterativeAutopilot.hasSession(scope) || iterativeStepInFlight.has(stepLockKey(workspace.id, project.name)) || attempt && ['starting', 'running', 'waiting'].includes(attempt.status)) await cancelIterativeOperation(undefined, scope)
+      }
+      for (const job of jobs.values()) {
+        job.cancelled = true
+        if (job.agentSessionId) job.agentSessionResumable = true
+        if (job.child) killProcessTree(job.child)
+        for (const child of job.parallelChildren ?? []) killProcessTree(child)
+      }
+      for (const [runDir, job] of initialAuditJobs) {
+        if (job.finishedAt) continue
+        const audit = auditJson(join(runDir, 'current-audit-state.json'))
+        if (audit?.operationId) canceledAudits.add(audit.operationId)
+      }
+      for (const child of auditChildren) iterativeStreamPlatform.killProcessTree(child)
+      const storage = storageCleanup.status()
+      if (['inspect', 'clean'].includes(storage.phase)) storageCleanup.control('cancel', storage.operationId)
+      const deadline = Date.now() + 45_000
+      while (updateRestartBlocked() && Date.now() < deadline) await new Promise(done => setTimeout(done, 250))
+      return { remaining: updateRestartBlockers() }
+    })().finally(() => { stopAllPending = undefined; operationsStopping = false })
+    return stopAllPending
+  })
   ipcMain.handle('flow:storage-status', () => storageCleanup.status())
   ipcMain.handle('flow:storage-control', (_event, input: { operationId: unknown; command: unknown }) => storageCleanup.control(input.command, input.operationId))
   ipcMain.handle('flow:storage-maintenance', async (event, action: unknown, operationId: unknown) =>
     storageCleanup.maintenance(action, operationId, progress => event.sender.send('flow:storage-progress', progress)))
+  ipcMain.handle('flow:defender-exclusion', async (_event, workspaceId: string) => {
+    if (process.platform !== 'win32') throw new Error('Windows Defender is only available on Windows')
+    const workspace = loadState().workspaces.find(item => item.id === workspaceId)
+    if (!workspace) throw new Error('Workspace not found')
+    const path = defenderExclusionTarget(workspace.path)
+    const answer = await dialog.showMessageBox({ type: 'warning', buttons: ['Отмена / Cancel', 'Добавить / Add'], defaultId: 0, cancelId: 0,
+      message: 'Добавить каталог DepLoom в исключения Windows Defender? / Exclude DepLoom data from Windows Defender?',
+      detail: `${path}\n\nDefender перестанет проверять файлы в этом каталоге, включая устанавливаемые зависимости. Только для доверенных проектов. Потребуется подтверждение администратора. / Defender will not scan files in this directory, including installed dependencies. Only for trusted projects. Administrator confirmation is required.` })
+    if (answer.response !== 1) return { canceled: true, path }
+    // Recheck after the user dialog; never accept a renderer-supplied path.
+    if (defenderExclusionTarget(workspace.path) !== path) throw new Error('DEFENDER_PATH_CHANGED')
+    const command = Buffer.from(defenderExclusionCommand(path), 'utf16le').toString('base64')
+    const result = await spawnCapture('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', command], workspace.path, 120_000)
+    if (result.code !== 0) throw new Error('DEFENDER_EXCLUSION_FAILED: администратор отменил запрос, Defender недоступен или политика организации запрещает исключения. / Request canceled, Defender unavailable or exclusion blocked by organization policy.')
+    return { canceled: false, path }
+  })
   ipcMain.handle('flow:get-hardware-snapshot', () => hardwareSnapshot())
   ipcMain.handle('flow:get-theme-preference', () => currentThemePreference())
   ipcMain.handle('flow:set-theme-preference', (_event, value: unknown) => { const state = loadState(); const preference = applyThemePreference(value); saveState({ ...state, themePreference: preference }); return { preference } })

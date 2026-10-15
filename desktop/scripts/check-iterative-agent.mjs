@@ -16,6 +16,7 @@ import {
   buildIterativeRepairPrompt,
   cancelWaitingAgentLease,
   changedFilesFromBaseline,
+  inspectTrialChanges,
   clearAgentLease,
   decideAgentLeaseDispatch,
   forbiddenTrialViolations,
@@ -207,6 +208,8 @@ writeTrialBaseline(workspace, runtimeBaseline);
 pluginRuntime('1.17.14');
 assert.equal(forbiddenTrialViolations(workspace, runtimeBaseline).length, 2);
 assert.deepEqual(forbiddenTrialViolations(workspace, runtimeBaseline, runtimeScope), []);
+assert.deepEqual(inspectTrialChanges(workspace, runtimeBaseline, { ...runtimeScope, projectRelative: 'Web/App' }).forbidden, []);
+assert.deepEqual(inspectTrialChanges(workspace, runtimeBaseline, runtimeScope).changedFiles, changedFilesFromBaseline(workspace, runtimeBaseline));
 assert.equal(openCodeRuntimeManifestPaths(workspace, runtimeScope).size, 2);
 assert.equal(openCodeRuntimeManifestPaths(workspace, { ...runtimeScope, provider: 'codex' }).size, 0);
 assert.equal(changedFilesFromBaseline(workspace, runtimeBaseline).length, 0, 'Tool bootstrap alone is not a repair');
@@ -222,7 +225,12 @@ const matchingLock = JSON.parse(readFileSync(runtimeLockPath, 'utf8'));
 writeJson(runtimeLockPath, { ...matchingLock, packages: { ...matchingLock.packages, '': { dependencies: { 'other-package': '1.0.0' } } } });
 assert.equal(openCodeRuntimeManifestPaths(workspace, runtimeScope).size, 0, 'Manifest and lock must describe the same tool');
 pluginRuntime('1.17.14');
-assert.equal(openCodeRuntimeManifestPaths(workspace, { ...runtimeScope, projectRelative: 'src' }).size, 0, 'Only the selected project runtime is exempt');
+assert.equal(openCodeRuntimeManifestPaths(workspace, { ...runtimeScope, projectRelative: 'src' }).size, 2, 'Nested projects recognize the manager-root plugin runtime');
+assert.deepEqual(forbiddenTrialViolations(workspace, runtimeBaseline, { ...runtimeScope, projectRelative: 'Web/App' }), []);
+writeJson(manifestPath, { dependencies: { 'is-number': '8.0.0' } });
+assert.deepEqual(forbiddenTrialViolations(workspace, runtimeBaseline, { ...runtimeScope, projectRelative: 'Web/App' }), ['modified:package.json']);
+writeJson(manifestPath, { dependencies: { 'is-number': '7.0.0' } });
+assert.equal(openCodeRuntimeManifestPaths(workspace, { ...runtimeScope, projectRelative: '../outside' }).size, 0);
 
 // 4. Feedback payload carries ONLY the durable candidate identity.
 const feedback = buildFeedbackPayload(ctx, changed, "READY_FOR_VERIFY", "source adapted to is-number 7.0.0");

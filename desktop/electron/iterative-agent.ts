@@ -284,6 +284,10 @@ export function openCodeRuntimeManifestPaths(workspaceRoot: string, scope?: Agen
   const project = resolve(workspaceRoot, scope.projectRelative)
   const root = resolve(workspaceRoot)
   if (project !== root && !project.startsWith(root + sep)) return result
+  // OpenCode also bootstraps at the manager root for nested monorepo projects.
+  if (project !== root) {
+    for (const path of openCodeRuntimeManifestPaths(workspaceRoot, { ...scope, projectRelative: '.' })) result.add(path)
+  }
   const directory = join(project, '.opencode')
   try {
     if (realpathSync(directory).toLowerCase() !== directory.toLowerCase()) return result
@@ -378,6 +382,18 @@ export function classifyTrialMutations(workspaceRoot: string, baselineFile: stri
 
 /** Planner-owned files the agent changed or deleted. A non-empty result MUST
  * reject the repair before feedback/verification. */
+/** Hash a completed repair once for both source evidence and guard violations.
+ * The returned observation is consumed immediately, never cached across work. */
+export function inspectTrialChanges(workspaceRoot: string, baselineFile: string, scope?: AgentRuntimeScope) {
+  const runtimePaths = openCodeRuntimeManifestPaths(workspaceRoot, scope)
+  const mutations = classifyTrialMutations(workspaceRoot, baselineFile)
+  return {
+    runtimePaths,
+    changedFiles: mutations.filter(item => !item.forbidden).map(item => item.path).sort(),
+    forbidden: mutations.filter(item => item.forbidden && !runtimePaths.has(item.path)).map(item => `${item.kind}:${item.path}`).sort(),
+  }
+}
+
 export function forbiddenTrialViolations(workspaceRoot: string, baselineFile: string, scope?: AgentRuntimeScope): string[] {
   const runtimePaths = openCodeRuntimeManifestPaths(workspaceRoot, scope)
   return classifyTrialMutations(workspaceRoot, baselineFile)

@@ -9,6 +9,7 @@
     "check:project-journal": "node scripts/check-project-journal.mjs",
     "check:project-audit": "node scripts/check-project-audit.mjs",
     "check:storage-controls": "node scripts/check-storage-controls.mjs",
+    "check:operations-control": "node scripts/check-operations-control.mjs",
     "check:updater-runtime": "node scripts/check-updater-runtime.mjs",
     "check:updater-schedule": "node scripts/check-updater-schedule.mjs",
     "check:updater-error": "node scripts/check-updater-error.mjs",

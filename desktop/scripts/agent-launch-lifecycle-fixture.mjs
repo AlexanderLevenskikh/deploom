@@ -52,6 +52,7 @@ function fixture() {
   let serverError;
   const bindings = {
     projectAudits: { active: () => false },
+    operationsStopping: false,
     storageCleanup: new StorageCleanupController(async () => { throw Error('Unexpected cleanup in migration fixture'); }, () => [], () => false),
     ...agents, ...attempts, ...commands, ...errors, ...delivery, readDeliveryJson: delivery.readJson, iterativeAutopilot,
     existsSync, join, readFileSync, writeFileSync, extractAgentSessionId,

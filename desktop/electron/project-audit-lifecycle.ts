@@ -73,7 +73,7 @@ export function createProjectAuditController(dependencies: { run: (request: Audi
           emit(request, 'Audit completed: ' + operationId)
         } catch (error) {
           job.error = error instanceof Error ? error.message : String(error)
-          state = { ...state, phase: 'error', error: job.error, finishedAt: now() }
+          state = { ...state, phase: job.error.startsWith('AUDIT_INTERRUPTED:') ? 'interrupted' : 'error', error: job.error, finishedAt: now() }
           write(statePath(request.runDir), state)
           write(pending, { operationId, identity: request.context.hash, ownerPid: process.pid, error: job.error })
           emit(request, 'Audit failed: ' + job.error)

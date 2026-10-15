@@ -951,6 +951,10 @@ export function IterativeTaskPanel(props: Props) {
               </button>
             ) : null}
           </div>
+          {runner?.progressSummary ? <div className="attempt-strip-row" data-testid="verified-update-progress">
+            <strong>{text('Принято и проверено', 'Accepted and verified')}: {runner.progressSummary.accepted}/{runner.progressSummary.denominator} · {runner.progressSummary.denominator > 0 ? Math.floor(100 * runner.progressSummary.accepted / runner.progressSummary.denominator) : 0}% · {runner.progressSummary.checkpointId}</strong>
+            <span className="attempt-meta">{text('Отложено', 'Deferred')}: {runner.progressSummary.deferred}. {text('Процент относится к целям обновления; время до завершения пока неизвестно.', 'Percentage covers update goals; time to completion is unknown.')}</span>
+          </div> : null}
           {hasFailure ? failureDetails : null}
           {showLogTail ? (
             <div className="iterative-log-messages">{iterativeLogMessages(currentAttemptLog ?? '').slice(-8).map((message, index) => <pre className="iterative-log-message" key={index}>{message}</pre>)}</div>

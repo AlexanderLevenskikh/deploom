@@ -7,6 +7,7 @@ import { WorkspaceDialog } from './components/WorkspaceDialog'
 import { FlowWorkspace } from './components/FlowWorkspace'
 import { ProjectSurfaceProvider, useProjectSurfaceHosts } from './components/ProjectSurfaces'
 import { AppUpdateControl } from './components/AppUpdateControl'
+import { DefenderExclusionControl } from './components/DefenderExclusionControl'
 import { ProjectJournal } from './components/ProjectJournal'
 import { ProjectRail } from './components/ProjectRail'
 import { QuickSelect } from './components/QuickSelect'
@@ -91,6 +92,7 @@ function App() {
             <button className={language === 'ru' ? 'active' : ''} aria-pressed={language === 'ru'} onClick={() => setLanguage('ru')}>RU</button>
             <button className={language === 'en' ? 'active' : ''} aria-pressed={language === 'en'} onClick={() => setLanguage('en')}>EN</button>
           </div>
+          <DefenderExclusionControl key={details.workspace.id} workspaceId={details.workspace.id} />
           <label className="notification-toggle" title={t('app.notificationsTitle')}><input type="checkbox" checked={payload.notificationsEnabled} onChange={(event) => void flow.setNotificationsEnabled(event.target.checked)} /><Bell size={15} /><span>{t('app.notifications')}</span></label>
 
           {flow.activeJobId ? <button className="button secondary" onClick={() => void flow.cancelJob()}><Pause size={16} /> {t('app.stop')}</button> : <button className="button secondary" disabled={!project || maintenanceBlocked} title={maintenanceBlocked ? t('app.cleanupBlocked') : undefined} onClick={() => project && void flow.runAction({ action: 'preflight', workspaceId: details.workspace.id, projectName: project.name })}><Play size={16} /> {t('app.check')}</button>}

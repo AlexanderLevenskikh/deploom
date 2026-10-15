@@ -38,11 +38,11 @@ if (!appSource.includes('<AppUpdateControl')) throw new Error('updater status mu
 for (const state of ['idle', 'checking', 'available', 'downloading', 'ready', 'error']) {
   if (!control.includes("status.state === '" + state + "'")) throw new Error('missing updater state: ' + state);
 }
-if (!control.includes('disabled={blocked}') || !control.includes('onInstall') || !control.includes('onCheck')) throw new Error('explicit restart and retry controls are required');
+if (!control.includes('disabled={restartBlocked || stopping}') || !control.includes('onInstall') || !control.includes('onCheck')) throw new Error('explicit restart and retry controls are required');
 if (!control.includes("typeof status.percent === 'number'")) throw new Error('unknown download progress must stay indeterminate');
 const guards = compiledMain.slice(compiledMain.indexOf('async function installLatestUpdate()'), compiledMain.indexOf('function findWorkspace('));
 if ((guards.match(/if \(updateRestartBlocked\(\)\)/g) || []).length !== 2) throw new Error('restart must check activity both before and after the async download');
-for (const owner of ['iterativeStepInFlight.size', 'iterativeAutopilot.hasActiveSessions()', 'projectAudits.active()', 'storageCleanup.status().phase']) {
+for (const owner of ['iterativeStepInFlight.has(', 'iterativeAutopilot.hasSession(', 'initialAuditJobs', 'storageCleanup.status()']) {
   if (!compiledMain.includes(owner)) throw new Error('restart activity owner missing: ' + owner);
 }
 
