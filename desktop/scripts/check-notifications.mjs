@@ -160,5 +160,11 @@ try {
   assert.equal(events.pop().kind, "stage-failed");
   stopped(scope, { stopped: "error", error: "STATUS_UNAVAILABLE" });
   assert.deepEqual(events, [], "Autopilot callback must not duplicate a journal failure");
+  updateAttempt(stoppedDir, { status: "canceled", cancelRequested: true, lastError: undefined });
+  seen(readAttempt(stoppedDir));
+  stopped(scope, { stopped: "error", error: "DELIVERY_CANCELED" });
+  assert.equal(readAttempt(stoppedDir).status, "canceled");
+  assert.equal(readAttempt(stoppedDir).lastError, undefined);
+  assert.deepEqual(events, [], "Manual stop must not become a failure notification");
 } finally { rmSync(stoppedDir, { recursive: true, force: true }); }
 console.log("Actual iterative Autopilot stop boundary OK");

@@ -5,11 +5,14 @@ import { iterativeLogMessages } from '../data/iterativeLogMessages'
 import { useLanguage } from '../i18n'
 import { MigrationChecksPanel } from './MigrationChecksPanel'
 import { useProjectSurface } from './ProjectSurfaces'
+import { HelpHint } from './HelpHint'
+import { iterativeRuntimeLine } from '../data/iterativeRuntimeLine'
 import { AuditGoalSummary } from './AuditGoalSummary'
 import { CohortReviewDialog } from './CohortReviewDialog'
 import { validateMigrationProfile, validationProfilesEqual, type MigrationValidationProfile } from '../../electron/migration-validation-profile'
 import { attemptActiveElapsed, canApplyAttemptRead, iterativeActivity } from '../../electron/iterative-activity'
 import { startAttemptJournalPolling } from '../../electron/iterative-journal-poll'
+import { createStatusRequestGate } from '../../electron/iterative-status-sync'
 import { deriveMainAction, parseIterativeFailure, scenarioPipeline, PIPELINE_STAGES, type ScenarioMainActionState, type ScenarioSignal } from '../../electron/iterative-scenario'
 import type { IterativeAgentOutcome, IterativeAttemptView, IterativeBeginOutcome, IterativeDriveOutcome, IterativeStatusOutcome, IterativeTaskActionOutcome, IterativeTaskSnapshot } from '../types'
 
@@ -65,7 +68,7 @@ const MAIN_LABEL: Record<ScenarioMainActionState, [string, string]> = {
   ready: ['Начать обновление', 'Start the update'],
   'start-run': ['Начать обновление', 'Start the update'],
   'continue-run': ['Продолжить обновление', 'Continue the update'],
-  running: ['Остановить', 'Stop'],
+  running: ['Пауза', 'Pause'],
   'recovered-running': ['Продолжить обновление', 'Continue the update'],
   'resume-delivery': ['Продолжить обновление', 'Continue the update'],
   agent: ['Исправить агентом', 'Repair with an agent'],
@@ -92,7 +95,7 @@ const MAIN_DESCRIPTION: Record<ScenarioMainActionState, [string, string]> = {
   ready: ['Проверка пройдена — обновление ещё не запускалось. Начните, когда будете готовы.', 'The check passed — the migration has not started yet. Start when ready.'],
   'start-run': ['Проект проверен. Начните обновление — применим и проверим изменения по группам.', 'The project is verified. Start the update — changes will be applied and verified in groups.'],
   'continue-run': ['Работа приостановлена. Продолжите — применим и проверим следующую группу.', 'The update is paused. Continue — the next group will be applied and verified.'],
-  running: ['Идёт работа. Остановить можно в любой момент; проверенный результат сохраняется.', 'Work is running. You can stop at any time; the verified result is kept.'],
+  running: ['Идёт работа. Можно поставить на паузу; последний проверенный checkpoint сохранится.', 'Work is running. You can pause; the last verified checkpoint is preserved.'],
   'recovered-running': ['Работа была прервана перезапуском; процесс не запущен. Продолжите, чтобы возобновить её.', 'Work was interrupted by a restart; no process is running. Continue to resume it.'],
   'resume-delivery': ['Агент продолжит прерванные исправления в сохранённой рабочей копии. Затем проверим результат.', 'The agent resumes interrupted repairs in the saved workspace. The result will then be verified.'],
   agent: ['Нужны исправления в изолированном окружении. Запустите агента.', 'Repairs are needed in an isolated environment. Run the agent.'],
@@ -116,7 +119,7 @@ const activityText = (attempt?: IterativeAttemptView, text?: (ru: string, en: st
   const t = text ?? ((ru: string) => ru)
   if (!attempt) return t('Подготовка…', 'Preparing…')
   if (attempt.status === 'failed') return t('Попытка не завершилась', 'The attempt failed')
-  if (attempt.status === 'canceled') return t('Работа остановлена', 'Work was stopped')
+  if (attempt.status === 'canceled') return t('На паузе — можно продолжить', 'Paused — ready to resume')
   if (attempt.status === 'waiting') return t('Ожидание повторного запуска агента', 'Waiting for the agent to relaunch')
   if (attempt.status === 'done' && attempt.lastStep === 'agent') return t('Нужны исправления — обновление приостановлено', 'Repairs needed — update paused')
   if (attempt.status === 'done') return t(attempt.lastStep === 'no-targets' ? 'План обновления ещё не выбран' : 'Этап завершён', attempt.lastStep === 'no-targets' ? 'No update plan selected yet' : 'Stage completed')
@@ -162,25 +165,14 @@ export function useIterativeController({ workspaceId, projectName, refreshKey, a
 
   // D2.4: display-only view of the durable runtime contract — requested vs
   // effective + the CI evidence source (installed runtime that committed).
-  const runtimeLine = (runner?: IterativeStatusOutcome) => {
-    const rt = runner?.runtime
-    if (!runner?.present || !rt?.effectiveVersion) return null
-    const manager = [rt.packageManager, rt.packageManagerVersion].filter(Boolean).join(' ')
-    const platform = [rt.platform, rt.arch].filter(Boolean).join('/')
-    const evidence = [rt.source, manager, platform].filter(Boolean).join(' · ')
-    return (
-      <span>
-        {text('Node/CI', 'Node/CI')}: {rt.requested || text('не задан', 'unset')} → {rt.effectiveVersion}
-        {evidence ? ` · ${evidence}` : ''}
-      </span>
-    )
-  }
+  const runtimeLine = (runner?: IterativeStatusOutcome) => iterativeRuntimeLine(runner, text('не задан', 'unset'))
 
   // L4: never swallow a status error. Keep the last good runner AND remember the
   // failure reason so the UI shows it next to the action buttons.
   const runnerScope = useRef(`${workspaceId ?? ''}:${projectName}`)
   runnerScope.current = `${workspaceId ?? ''}:${projectName}`
   const runnerSeq = useRef(0)
+  const statusRequests = useRef(createStatusRequestGate<IterativeStatusOutcome>())
   useEffect(() => {
     runnerScope.current = `${workspaceId ?? ''}:${projectName}`
     return () => { runnerScope.current = '' }
@@ -189,7 +181,7 @@ export function useIterativeController({ workspaceId, projectName, refreshKey, a
     const scopeKey = `${workspaceId ?? ''}:${projectName}`
     const seq = ++runnerSeq.current
     try {
-      const status = await onStatus(projectName)
+      const status = await statusRequests.current(scopeKey, () => onStatus(projectName))
       if (runnerScope.current !== scopeKey || runnerSeq.current !== seq) return undefined
       setRunner(current => status.ok ? status : current ?? status)
       setRunnerError(status.ok || !status.error ? undefined : status.error)
@@ -201,11 +193,6 @@ export function useIterativeController({ workspaceId, projectName, refreshKey, a
     }
   }, [onStatus, projectName, workspaceId])
 
-  useEffect(() => {
-    if (!runner?.audit?.running) return
-    const timer = window.setInterval(() => void refreshRunner(), 2_000)
-    return () => window.clearInterval(timer)
-  }, [runner?.audit?.running, refreshRunner])
 
   const load = useCallback(async () => {
     const seq = ++loadSeq.current
@@ -308,6 +295,15 @@ export function useIterativeController({ workspaceId, projectName, refreshKey, a
   // the async status re-read lands, so «Остановить» can never stick forever.
   const attemptTerminal = Boolean(attempt && (attempt.status === 'done' || attempt.status === 'failed' || attempt.status === 'canceled'))
   const childAlive = stepBusy || runner?.autopilotActive === true || (runner?.inFlight === true && !attemptTerminal)
+
+  // Heartbeats alone do not refresh checkpoints, decisions, or accepted counts.
+  useEffect(() => {
+    if (!(attemptAlive || childAlive || runner?.audit?.running)) return
+    return startAttemptJournalPolling(refreshRunner, () => {})
+  }, [attemptAlive, childAlive, runner?.audit?.running, refreshRunner])
+  useEffect(() => {
+    if (attemptTerminal) void refreshRunner()
+  }, [attemptTerminal, attempt?.attemptId, refreshRunner])
 
   // Both output surfaces share this attempt-scoped journal tail. Poll even
   // when the inline output is collapsed; ignore late reads from a prior run.
@@ -539,7 +535,9 @@ export function useIterativeController({ workspaceId, projectName, refreshKey, a
     try {
       await onBeforeStart?.()
       const outcome = await onAgent(projectName, cleanupNotes ? false : runner?.autopilotEnabled || runner?.autopilotActive || autopilot, cleanupNotes)
-      if (outcome.autopilot) {
+      if (outcome.canceled) {
+        setNote(text('На паузе. Сохранённую сессию можно продолжить.', 'Paused. The saved session can be resumed.'))
+      } else if (outcome.autopilot) {
         setNote(autopilotNote(outcome.autopilot))
       } else if (outcome.ok) {
         if (outcome.phase === 'TERMINAL') { setNote(cleanupNotes ? text('Пояснения удалены отдельным коммитом; проверки и аудит обновлены. Документы сохранены в артефактах.', 'Notes removed in a separate commit; checks and audit refreshed. Documents remain in the artifacts.') : text('Ветка с коммитами подготовлена; проверки и аудит обновлены.', 'The branch with commits is prepared; checks and audit are refreshed.')); return }
@@ -747,6 +745,8 @@ export function useIterativeController({ workspaceId, projectName, refreshKey, a
   // control for a panel that no longer exists.
   const runMainActionRef = useRef<() => void>(runMainAction)
   runMainActionRef.current = runMainAction
+  const restartRef = useRef<() => void>(() => {})
+  restartRef.current = () => { void beginNow({ mode: 'none', checkOnly: true, restart: true }) }
   useEffect(() => {
     if (!onScenario) return
     onScenario({
@@ -756,6 +756,7 @@ export function useIterativeController({ workspaceId, projectName, refreshKey, a
       label: mainLabel,
       description: mainDescription,
       running: childAlive,
+      loading: runner === undefined && !runnerError,
       activity: { title: activity.title, detail: activity.detail, percent: activity.percent },
       elapsed: fmtElapsed(elapsedMs),
       attempt,
@@ -763,8 +764,10 @@ export function useIterativeController({ workspaceId, projectName, refreshKey, a
       runDir: snapshot?.runDir,
       enabled: mainActionEnabled,
       act: () => runMainActionRef.current(),
+      restart: (attempt || runner?.present) && mainAction.state !== 'running' ? () => restartRef.current() : undefined,
+      restartEnabled: !busyLocked,
     })
-  }, [onScenario, projectName, workspaceId, mainAction.state, mainLabel, mainDescription, busyLocked, mainActionEnabled, repairMutationBlocked, childAlive, activity.title, activity.detail, activity.percent, elapsedMs, attempt, currentAttemptLog, snapshot?.runDir])
+  }, [onScenario, projectName, workspaceId, mainAction.state, mainLabel, mainDescription, busyLocked, mainActionEnabled, repairMutationBlocked, childAlive, runner, runnerError, activity.title, activity.detail, activity.percent, elapsedMs, attempt, currentAttemptLog, snapshot?.runDir])
   useEffect(() => () => onScenario?.(undefined), [onScenario])
 
   // D: the single main action is the hero of the panel — rendered right under
@@ -778,18 +781,33 @@ export function IterativeTaskPanel(props: Props) {
   const surface = useProjectSurface()
   const { workspaceId, projectName, onExport, onCopy, onSave, onConfigureScope, onOpenPath, disabledExternal, onStatusView, text, language, state, validationDraft, setValidationDraft, autopilot, setAutopilot, busy, copied, note, setNote, showDialog, setShowDialog, runner, dismissedCohort, setDismissedCohort, runnerError, stepBusy, attempt, showLog, noTargetsStep, showDiag, setShowDiag, runtimeLine, refreshRunner, load, attemptAlive, childAlive, run, driveNow, beginNow, exportLegacyNow, agentNow, toggleLog, snapshot, task, insufficient, blocker, validationChanged, mainAction, mainLabel, mainDescription, elapsedMs, progress, currentAttemptLog, showLogTail, activity, attemptFailure, decisionText, copyDiagnostics, runMainAction, validationError, busyLocked, mainActionEnabled } = useIterativeController(props)
 
+  const hasFailure = mainAction.state !== 'no-targets' && Boolean(attemptFailure || runnerError || blocker)
+  const failureDetails = <>
+    <span className="attempt-failure-summary">{blocker?.summary || (attemptFailure && !blocker ? attemptFailure : undefined) || runnerError || text('Неизвестная причина.', 'Unknown cause.')}</span>
+          <footer className="baseline-intent-actions">
+            <button type="button" className="linklike" onClick={() => setShowDiag((value) => !value)}>
+              {showDiag ? <ChevronUp size={15} /> : <ChevronDown size={15} />}{text('Подробности', 'Details')}
+            </button>
+            <button type="button" className="linklike" onClick={copyDiagnostics}>
+              {copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? text('Скопировано', 'Copied') : text('Скопировать диагностику', 'Copy diagnostics')}
+            </button>
+          </footer>
+          {showDiag ? (
+            <pre className="attempt-log">{attemptFailure || runnerError || blocker?.summary}{blocker?.command ? `\n${blocker.command}` : ''}{attempt?.attemptId ? `\nattemptId: ${attempt.attemptId}` : ''}{attempt?.stage ? `\nstage: ${attempt.stage}` : ''}{decisionText ? `\ndecision: ${decisionText}` : ''}</pre>
+          ) : null}
+  </>
   const mainActionArea = (
     <div className="resume-notice">
       {!props.onScenario ? <span>{mainDescription}</span> : null}
-      {surface('dependencies', <section className="scenario-run-options"><h3>{text('Управление запуском', 'Run controls')}</h3>
+      {<section className="scenario-run-options"><h3>{text('Управление запуском', 'Run controls')}<HelpHint label={text('Как работает автопилот', 'How autopilot works')}>{runner?.phase === 'TERMINAL'
+        ? runner.canResumeTerminal || runner.residualRepair?.resumable
+          ? text('Продолжите обновление кнопкой «Продолжить». Автопилот сможет выполнять следующие этапы автоматически.', 'Choose Continue to resume the update. Autopilot can run subsequent stages automatically.')
+          : text('Прогон завершён. Для продолжения нужен новый вариант обновления; проверенный результат сохранён.', 'The run has ended. Continuing requires a new update proposal; the verified result is preserved.')
+        : text('Можно включить во время работы. Автопилот продолжит после текущего шага; выключение остановит автоматические переходы.', 'Enable while running to continue after the current step; disabling stops automatic transitions.')}</HelpHint></h3>
       <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.cohortReviewEnabled !== false} disabled={autopilot || runner?.autopilotEnabled || runner?.autopilotActive || childAlive || stepBusy || disabledExternal === true} onChange={event => { void window.dependencyFlow?.reviewIterativeCohort({ workspaceId, projectName, enabled: event.target.checked }).then(result => { if (!result.ok) setNote(result.error); return refreshRunner() }).catch(error => setNote(String(error))) }} />{text('Согласовывать группы в ручном режиме', 'Review dependency cohorts in manual mode')}</label>
       <label className="iterative-autopilot-option"><input type="checkbox" checked={runner?.autopilotEnabled || runner?.autopilotActive || autopilot} disabled={disabledExternal === true} onChange={event => { const enabled = event.target.checked; setAutopilot(enabled); void window.dependencyFlow?.setIterativeAutopilot({ workspaceId, projectName, enabled }).then(() => refreshRunner()).catch(error => { setAutopilot(!enabled); setNote(String(error)) }) }} />{text('Автопилот: продолжать автоматически, включая исправления агентом', 'Autopilot: continue automatically, including agent repairs')}</label>
-      <small>{runner?.phase === 'TERMINAL'
-        ? runner.canResumeTerminal || runner.residualRepair?.resumable
-          ? text('Продолжите обновление кнопкой ниже. Автопилот сможет выполнять следующие этапы автоматически.', 'Continue the update using the button below. Autopilot can run subsequent stages automatically.')
-          : text('Прогон завершён. Для продолжения нужен новый вариант обновления; проверенный результат сохранён.', 'The run has ended. Continuing requires a new update proposal; the verified result is preserved.')
-        : text('Можно включить во время работы. Автопилот продолжит после текущего шага; выключение остановит автоматические переходы.', 'Enable while running to continue after the current step; disabling stops automatic transitions.')}</small>
-      </section>)}
+
+      </section>}
       <footer className="baseline-intent-actions">
         {!props.onScenario ? <>
         <button
@@ -805,7 +823,7 @@ export function IterativeTaskPanel(props: Props) {
           {mainLabel}
         </button>
         </> : null}
-        {(attempt || runner?.present) && mainAction.state !== 'running' ? (
+        {!props.onScenario && (attempt || runner?.present) && mainAction.state !== 'running' ? (
           <button type="button" className="button secondary" data-testid="iterative-restart"
             disabled={busyLocked}
             title={text('Прежний прогон, снимки и результаты сохранятся в истории. Проверим текущие файлы проекта заново.', 'The previous run, snapshots and results stay in history. Re-check the current project files.')}
@@ -813,7 +831,7 @@ export function IterativeTaskPanel(props: Props) {
             <RefreshCw size={16} />{text('Начать заново', 'Start over')}
           </button>
         ) : null}
-        {mainAction.state === 'no-targets' ? (
+        {!props.onScenario && mainAction.state === 'no-targets' ? (
           <button type="button" className="button secondary" disabled={busyLocked} onClick={() => onConfigureScope?.()}>
             <Wrench size={16} />{text('Настроить обновление', 'Configure the update')}
           </button>
@@ -826,7 +844,7 @@ export function IterativeTaskPanel(props: Props) {
           </>
         ) : null}
       </footer>
-      {runtimeLine(runner) ? <span className="attempt-meta">{runtimeLine(runner)}</span> : null}
+      {!onStatusView && runtimeLine(runner) ? <span className="attempt-meta">{runtimeLine(runner)}</span> : null}
     </div>
   )
 
@@ -889,7 +907,7 @@ export function IterativeTaskPanel(props: Props) {
         </div>
       ) : null}
 
-      {surface('dependencies', <MigrationChecksPanel key={`${workspaceId}:${projectName}`} profile={validationDraft ? { ...runner?.validationProfile, ...validationDraft } : runner?.validationProfile} locked={Boolean(runner?.present || childAlive || stepBusy || disabledExternal)} scope={validationChanged ? undefined : runner?.validationScope ?? runner?.checked?.validationScope} onChange={setValidationDraft} />)}
+      {<MigrationChecksPanel key={`${workspaceId}:${projectName}`} profile={validationDraft ? { ...runner?.validationProfile, ...validationDraft } : runner?.validationProfile} locked={Boolean(runner?.present || childAlive || stepBusy || disabledExternal)} scope={validationChanged ? undefined : runner?.validationScope ?? runner?.checked?.validationScope} onChange={setValidationDraft} />}
 
       {/* L1: durable attempt strip — visible from the very first click, after a
           restart, and during a long check/discovery/cohort. User-facing wording;
@@ -924,7 +942,7 @@ export function IterativeTaskPanel(props: Props) {
                   : text('Проверка была прервана до создания прогона. Повторите проверку.', 'The check was interrupted before a run was created. Re-check the project.')}
               </span>
             ) : null}
-            {attempt.reason && attempt.status !== 'done' && attempt.stage !== 'drive' ? (
+            {!hasFailure && attempt.reason && attempt.status !== 'done' && attempt.stage !== 'drive' ? (
               <span className="attempt-meta attempt-reason">{attempt.reason}</span>
             ) : null}
             {attempt ? (
@@ -933,13 +951,14 @@ export function IterativeTaskPanel(props: Props) {
               </button>
             ) : null}
           </div>
+          {hasFailure ? failureDetails : null}
           {showLogTail ? (
             <div className="iterative-log-messages">{iterativeLogMessages(currentAttemptLog ?? '').slice(-8).map((message, index) => <pre className="iterative-log-message" key={index}>{message}</pre>)}</div>
           ) : null}
         </div>
       ) : null}
 
-      {surface('report', <>
+      {surface('dependencies', <>
       {runner?.workingCheckout ? (
         <div className="resume-notice" data-testid="iterative-working-checkout">
           <strong>{runner.workingCheckout.kind === 'trial'
@@ -996,30 +1015,14 @@ export function IterativeTaskPanel(props: Props) {
           includes the app version / stage / attempt id / technical reason.
           The no-targets and running states are DECISIONS, not errors — no red
           card, the main action explains itself. */}
-      {mainAction.state !== 'no-targets' && (attemptFailure || runnerError || blocker) ? (
-        <div className={`resume-notice ${attempt?.status === 'canceled' ? '' : 'danger'}`}>
-          <strong>{attempt?.status === 'canceled' ? text('Работа остановлена', 'Work was stopped') : text('Работа не завершилась', 'Work did not finish')}</strong>
-          <span>
-            {blocker?.summary || (attemptFailure && !blocker ? attemptFailure : undefined) || runnerError || text('Неизвестная причина.', 'Unknown cause.')}
-          </span>
-          {blocker?.command ? (
-            <pre className="attempt-log" style={{ margin: '6px 0 0' }}>{blocker.command}</pre>
-          ) : null}
-          <footer className="baseline-intent-actions">
-            <button type="button" className="linklike" onClick={() => setShowDiag((value) => !value)}>
-              {showDiag ? <ChevronUp size={15} /> : <ChevronDown size={15} />}{text('Подробности', 'Details')}
-            </button>
-            <button type="button" className="linklike" onClick={copyDiagnostics}>
-              {copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? text('Скопировано', 'Copied') : text('Скопировать диагностику', 'Copy diagnostics')}
-            </button>
-          </footer>
-          {showDiag ? (
-            <pre className="attempt-log">{attemptFailure}{attempt?.attemptId ? `\nattemptId: ${attempt.attemptId}` : ''}{attempt?.stage ? `\nstage: ${attempt.stage}` : ''}{decisionText ? `\ndecision: ${decisionText}` : ''}</pre>
-          ) : null}
+      {!attempt && hasFailure ? (
+        <div className="resume-notice danger">
+          <strong>{text('Работа не завершилась', 'Work did not finish')}</strong>
+          {failureDetails}
         </div>
       ) : null}
 
-      {surface('report', <>
+      {surface('dependencies', <>
       {state.phase === 'loading' ? (
         <div className="resume-notice"><span>{text('Загружаю…', 'Loading…')}</span></div>
       ) : state.phase === 'error' ? (
@@ -1051,7 +1054,7 @@ export function IterativeTaskPanel(props: Props) {
           </> : null}
 
           {!task ? (
-            <div className="resume-notice">
+            <div className="resume-notice" hidden={Boolean(runner?.present)}>
               <strong>{text('Задание ещё не сформировано', 'The assignment is not ready yet')}</strong>
               {insufficient ? (
                 <span>

@@ -1,3 +1,4 @@
+import { readIterativeGraphView } from './iterative-graph-view.js'
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
 import updaterPackage from 'electron-updater'
 import { nextUpdaterStatus, type UpdateStatus } from './updater-state.js'
@@ -7688,6 +7689,11 @@ function setupIpc(): void {
         return
       }
       const runDir = autopilotRunDir(input)
+      if (readAttempt(runDir)?.cancelRequested || readAttempt(runDir)?.status === 'canceled') {
+        updateAttempt(runDir, { status: 'canceled', lastError: undefined, waitUntil: undefined })
+        publishIterativeAttempt(runDir)
+        return
+      }
       updateAttempt(runDir, { status: 'failed', lastError: summary.error.slice(0, 4000), waitUntil: undefined })
       if (!readAttempt(runDir)) showFlowNotification({ kind: 'stage-failed', projectName: input.projectName, stage: 'Автоматический прогон' })
       recordAttemptLog(runDir, `Autopilot stopped (${summary.stopped}): ${summary.error.slice(0, 4000)}\n`)
@@ -8999,10 +9005,11 @@ function setupIpc(): void {
           } finally { await transport?.stop() }
         },
       })
-      updateAttempt(runDir, { status: outcome.ok ? 'done' : readAttempt(runDir)?.cancelRequested ? 'canceled' : 'failed', stage: 'agent', lastStep: outcome.ok ? 'delivery' : 'delivery-failed', lastError: outcome.error, finishedAt: Date.now() })
+      const canceled = outcome.canceled || readAttempt(runDir)?.cancelRequested
+      updateAttempt(runDir, { status: outcome.ok ? 'done' : canceled ? 'canceled' : 'failed', stage: 'agent', lastStep: outcome.ok ? 'delivery' : canceled ? 'delivery-canceled' : 'delivery-failed', lastError: canceled ? undefined : outcome.error, finishedAt: Date.now() })
       publishIterativeAttempt(runDir)
       storageCleanup.scheduleAutomatic()
-      return { ...outcome, phase: 'TERMINAL' }
+      return { ...outcome, paused: Boolean(canceled), phase: 'TERMINAL' }
     }
     // Launch-wait resilience: classify the durable lease BEFORE marking the
     // attempt running. A parked WAIT (retry time not reached) must not be
@@ -9538,7 +9545,7 @@ function setupIpc(): void {
     const state = loadState()
     const workspace = findWorkspace(state, input.workspaceId)
     const project = findProject(workspace, input.projectName)
-    return dependencyGraphSnapshot(workspace, project)
+    return { ...dependencyGraphSnapshot(workspace, project), iteration: readIterativeGraphView(iterativeTaskRunDir(workspace, project)) }
   })
 
   ipcMain.handle('flow:run-action', async (_event, input: ActionInput) => {

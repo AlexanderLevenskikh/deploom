@@ -17,7 +17,8 @@ import {
   Search,
   ShieldCheck,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { createStatusRequestGate } from '../../electron/iterative-status-sync'
 import type { BaselineDecision, DependencyGraphSnapshot, ProjectSpec, WorkspaceDetails } from '../types'
 import {
   deriveGraphGroups,
@@ -42,6 +43,8 @@ const GROUP_HEIGHT = 98
 
 function statusLabel(status: GraphPackageView['status'], ru: boolean): string {
   const labels: Record<GraphPackageView['status'], [string, string]> = {
+    accepted: ['Принято в checkpoint', 'Accepted in checkpoint'],
+    rejected: ['Группа отложена после попытки', 'Cohort deferred after attempt'],
     'active-issue': ['Активная проблема', 'Active issue'],
     critical: ['Critical security', 'Critical security'],
     deferred: ['Отложено', 'Deferred'],
@@ -132,6 +135,7 @@ export function DependencyGraphWorkspace({
   const ru = language === 'ru'
   const text = (russian: string, english: string) => ru ? russian : english
   const [snapshot, setSnapshot] = useState<DependencyGraphSnapshot>()
+  const snapshotRequests = useRef(createStatusRequestGate<DependencyGraphSnapshot>())
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string>()
   const [mode, setMode] = useState<GraphMode>('packages')
@@ -153,7 +157,7 @@ export function DependencyGraphWorkspace({
     setLoading(true)
     setError(undefined)
     try {
-      setSnapshot(await onGetSnapshot(project.name))
+      setSnapshot(await snapshotRequests.current(details.workspace.id + ':' + project.name, () => onGetSnapshot(project.name)))
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
     } finally {
@@ -163,17 +167,23 @@ export function DependencyGraphWorkspace({
 
   useEffect(() => {
     let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    setSnapshot(undefined)
     setLoading(true)
     setError(undefined)
-    void onGetSnapshot(project.name).then((next) => {
-      if (!cancelled) setSnapshot(next)
-    }).catch((cause) => {
-      if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause))
-    }).finally(() => {
-      if (!cancelled) setLoading(false)
-    })
-    return () => { cancelled = true }
-  }, [details.teamState?.updatedAt, project.name, onGetSnapshot])
+    const poll = async () => {
+      try {
+        const next = await snapshotRequests.current(details.workspace.id + ':' + project.name, () => onGetSnapshot(project.name))
+        if (!cancelled) { setSnapshot(next); setError(undefined) }
+      } catch (cause) {
+        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause))
+      } finally {
+        if (!cancelled) { setLoading(false); timer = setTimeout(() => void poll(), 5000) }
+      }
+    }
+    void poll()
+    return () => { cancelled = true; if (timer) clearTimeout(timer) }
+  }, [details.teamState?.updatedAt, details.workspace.id, project.name, onGetSnapshot])
 
   const groups = useMemo(() => snapshot ? deriveGraphGroups(snapshot, baselineDecision) : [], [baselineDecision, snapshot])
   const groupEdges = useMemo(() => snapshot ? deriveGroupEdges(groups, snapshot.edges) : [], [groups, snapshot])
@@ -257,8 +267,8 @@ export function DependencyGraphWorkspace({
         <div><span>{text('Пакеты', 'Packages')}</span><strong>{snapshot.packages.length}</strong></div>
         <div><span>{text('Наблюдаемые связи', 'Observed relations')}</span><strong>{snapshot.edges.length}</strong></div>
         <div><span>Manifest coverage</span><strong>{snapshot.manifestCoverage.observed}/{snapshot.manifestCoverage.total}</strong></div>
-        <div><span>Verified scope</span><strong>{baselineCompleted ? `${verifiedCount}/${snapshot.packages.length}` : '—'}</strong></div>
-        <div><span>{text('Отложено', 'Deferred')}</span><strong>{deferredCount}</strong></div>
+        <div><span>{snapshot.iteration ? text('Принято', 'Accepted') + ' · ' + snapshot.iteration.checkpointId : 'Verified scope'}</span><strong>{snapshot.iteration ? Object.keys(snapshot.iteration.accepted).length : baselineCompleted ? `${verifiedCount}/${snapshot.packages.length}` : '—'}</strong></div>
+        <div><span>{snapshot.iteration ? text('Непринятые группы', 'Unaccepted cohorts') : text('Отложено', 'Deferred')}</span><strong>{snapshot.iteration ? snapshot.iteration.rejected.length : deferredCount}</strong></div>
         <div className={`graph-health ${health?.status ?? 'unknown'}`}><span>Health</span><strong>{health?.status?.toUpperCase() ?? 'UNKNOWN'}{typeof health?.lagOkPct === 'number' ? ` · ${health.lagOkPct.toFixed(1)}%` : ''}</strong></div>
       </div>
 
@@ -355,7 +365,8 @@ export function DependencyGraphWorkspace({
             </svg>
           </div>
           <div className="graph-legend">
-            <span><i className="legend-dot verified" /> verified/integrated</span>
+            <span><i className="legend-dot verified" />{text('Принятые обновления', 'Accepted updates')}</span>
+            <span><i className="legend-dot active" />{text('Непринятые группы (можно повторить)', 'Unaccepted cohorts (retryable)')}</span>
             <span><i className="legend-dot deferred" /> deferred</span>
             <span><i className="legend-dot active" /> active issue</span>
             <span><i className="legend-dot required" /> required</span>
@@ -370,7 +381,7 @@ export function DependencyGraphWorkspace({
               <div className="graph-details-heading"><GitBranch size={17} /><div><strong>{selectedPackage.name}</strong><span>{selectedPackage.kind}</span></div></div>
               <dl>
                 <div><dt>{text('Текущая', 'Current')}</dt><dd>{selectedPackage.currentVersion || selectedPackage.installedVersion || '—'}</dd></div>
-                <div><dt>{text('План', 'Planned')}</dt><dd>{selectedPackage.plannedTarget || '—'}</dd></div>
+                <div><dt>{selectedPackage.status === 'accepted' ? text('Принято', 'Accepted') : text('План', 'Planned')}</dt><dd>{selectedPackage.plannedTarget || '—'}</dd></div>
                 <div><dt>package.json</dt><dd>{selectedPackage.requestedSpec}</dd></div>
                 <div><dt>{text('Политика', 'Policy')}</dt><dd>{selectedPackage.policy}</dd></div>
                 <div><dt>{text('Состояние', 'State')}</dt><dd>{statusLabel(selectedPackage.status, ru)}</dd></div>
@@ -398,7 +409,7 @@ export function DependencyGraphWorkspace({
             <>
               <div className="graph-details-heading"><Network size={17} /><div><strong>{text('Как читать граф', 'How to read the graph')}</strong><span>projection only</span></div></div>
               <div className="graph-explain-list">
-                <p><CheckCircle2 size={14} /> <strong>Verified Scope</strong> {text('показывает область последнего завершённого Baseline/Flow state.', 'shows the area represented by the latest completed Baseline/Flow state.')}</p>
+                <p><CheckCircle2 size={14} /> <strong>Verified Scope</strong> {text('Зелёный — версии принятого checkpoint; красный — непринятые группы, которые можно попробовать снова. Прежний FLOW показывается при отсутствии итеративного прогона.', 'Green marks accepted checkpoint versions; red marks unaccepted, retryable cohorts. Legacy FLOW is shown when no iterative run is available.')}</p>
                 <p><CircleDot size={14} /> <strong>Groups</strong> {text('— динамические neighborhoods. Они могут пересекаться через bridge packages.', 'are dynamic neighborhoods and may overlap through bridge packages.')}</p>
                 <p><Network size={14} /> <strong>Relations</strong> {text('берутся из локально наблюдаемых package manifests, если node_modules доступен.', 'come from locally observed package manifests when node_modules is available.')}</p>
                 <p><ShieldCheck size={14} /> {text('Ни один визуальный элемент не является proof authority.', 'No visual element is proof authority.')}</p>

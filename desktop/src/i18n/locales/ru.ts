@@ -449,5 +449,6 @@ export const ru: Record<TranslationKey, string> = {
   "app.projectSection": "Раздел проекта",
   "projectRail.audit.aria": "Провести аудит {name}",
   "projectRail.audit": "Провести аудит",
+  "app.legacyDashboard": "Прежний дашборд roadmap",
   "projectRail.manageWorkspace": "Управление workspace",
 }

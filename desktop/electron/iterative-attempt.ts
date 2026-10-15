@@ -89,6 +89,11 @@ export function readAttempt(runDir: string): IterativeAttemptRecord | undefined 
   try {
     const parsed = JSON.parse(readFileSync(target, 'utf8')) as IterativeAttemptRecord
     if (!parsed || typeof parsed !== 'object' || !parsed.attemptId) return undefined
+    // Older releases reported a manual delivery stop as failed. Keep its durable
+    // evidence intact while presenting the explicit cancellation as resumable.
+    if (parsed.status === 'failed' && parsed.cancelRequested && /^DELIVERY_CANCELED\b/.test(parsed.lastError ?? '')) {
+      return { ...parsed, status: 'canceled', lastError: undefined }
+    }
     return parsed
   } catch {
     return undefined

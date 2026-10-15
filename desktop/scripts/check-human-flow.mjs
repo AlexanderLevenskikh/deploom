@@ -26,9 +26,12 @@ for (const needle of [
   "text('Актуальность библиотек', 'Library freshness')",
   "text('Открыть артефакты', 'Open artifacts')",
   '.dependency-roadmap/artifacts/runs',
-  '<details className="flow-technical-details">',
+  '<details className="flow-technical-details" open>',
 ]) has(flow, needle, 'human FLOW')
 
+has(flow, "surface('report', <>", 'technical details belong to Report')
+lacks(flow, 'flow-logs-details', 'Journal has one event view')
+has(app, 'report-legacy-dashboard', 'legacy dashboard is collapsed')
 lacks(app, '<MonitoringPanel', 'default App surface')
 has(app, 'human-error-toast', 'human error surface')
 has(app, "flow.error.split('\\n')[0]", 'visible first-line failure reason')

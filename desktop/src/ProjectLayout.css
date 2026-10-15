@@ -33,6 +33,7 @@ html[data-theme='dark'] .app-shell { --canvas:#111827; }
 .app-shell .tab-switch > button { display:inline-flex; justify-content:center; align-items:center; gap:6px; min-width:0; padding:0 0 12px; height:38px; border:0; border-bottom:2px solid transparent; background:transparent; color:var(--muted); font-size:13px; }
 .app-shell .tab-switch > button.active { color:var(--blue); border-bottom-color:var(--blue); background:transparent; }
 .app-shell .persistent-project-controller, .app-shell .project-tab-body { min-height:0; flex:1; overflow:auto; }
+.app-shell .flow-content { display:contents; }
 .app-shell .flow-workspace { display:flex; flex-direction:column; overflow:visible; padding:24px 30px; max-width:1140px; margin:0 auto; }
 .app-shell .human-flow-card, .app-shell .roadmap-card, .app-shell .audit-goals { border:0; border-radius:0; box-shadow:none; background:transparent; max-width:none; margin:0; padding:0 0 24px; }
 .app-shell .human-flow-card { padding-bottom:20px; }
@@ -51,11 +52,25 @@ html[data-theme='dark'] .app-shell { --canvas:#111827; }
 .app-shell .audit-goals footer { padding-top:16px; font-size:11px; }
 .app-shell .roadmap-card[data-testid='iterative-task-panel'] { order:2; border-top:0; padding-top:0; padding-bottom:18px; }
 .app-shell .roadmap-card[data-testid='iterative-task-panel'] > .roadmap-card-header { display:none; }
-.app-shell .scenario-run-options { margin:22px 0; display:grid; gap:10px; font-size:13px; }
+.app-shell .scenario-run-options { margin:14px 0; display:flex; align-items:center; flex-wrap:wrap; gap:10px 20px; font-size:13px; }
+.app-shell .scenario-run-options .iterative-autopilot-option { padding:8px 10px; margin:0; border:0; background:transparent; }
+.app-shell .scenario-run-options h3 { flex-basis:100%; }
+.app-shell .scenario-run-options small { flex-basis:100%; }
+.app-shell .report-legacy-dashboard { margin:24px; border-top:1px solid var(--border); padding-top:18px; }
+.app-shell .report-legacy-dashboard > summary { cursor:pointer; color:var(--muted); }
 .app-shell .scenario-run-options h3 { margin:0; font-size:15px; }
 .app-shell .scenario-run-options small { color:var(--muted); line-height:1.5; }
-.app-shell .roadmap-card[data-testid='iterative-task-panel'] > .resume-notice:has(> .baseline-intent-actions:empty) { display:none; }
+.app-shell .migration-launch-settings { order:1; padding:12px 0 16px; }
+.app-shell .migration-launch-settings .project-facts { grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:12px 20px; }
+.app-shell .migration-launch-settings .roadmap-card-header { margin-bottom:12px; }
+.app-shell .audit-goals footer:empty { display:none; }
+.app-shell .audit-partial-note { color:var(--muted); font-size:12px; }
+.app-shell .roadmap-card[data-testid='iterative-task-panel'] > .resume-notice:has(> .baseline-intent-actions:empty):not(:has(.scenario-run-options)) { display:none; }
+.app-shell .roadmap-card > .resume-notice:has(.scenario-run-options) { border:0; background:transparent; padding:0; margin:0 0 14px; }
+.app-shell .roadmap-card > .resume-notice:has(.scenario-run-options) > .baseline-intent-actions:empty { display:none; }
 .app-shell .iterative-pipeline { margin:8px 0 18px; }
+.app-shell .attempt-failure-summary { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; line-clamp:2; overflow:hidden; overflow-wrap:anywhere; white-space:normal; font-size:12px; line-height:1.6; }
+.app-shell .attempt-strip > .baseline-intent-actions { padding:6px 0 0; margin:0; }
 .app-shell .project-tab-body > div:not(.project-journal) { padding:24px 30px; }
 .app-shell .project-tab-body .project-scope-actions { margin-bottom:20px; }
 .app-shell .project-scope-actions h2 { margin:0 0 6px; font-size:17px; font-weight:600; }

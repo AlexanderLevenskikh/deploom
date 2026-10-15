@@ -232,9 +232,9 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
         <div><TerminalSquare size={17} /><strong>{t('log.title')}</strong></div>
         {tokens.total > 0 ? <span className="token-counter" title={tokenDetails}>{formatTokens(tokens.total, language)} {t('log.tokensLatest')}</span> : null}
         <div className="heading-actions">
-          {active ? <button className="icon-button danger-text" title={t('log.stop')} onClick={onCancel}><Ban size={16} /></button> : null}
-          <button className="icon-button" title={copied ? t('common.copied') : t('log.copy')} disabled={filteredLogs.length === 0} onClick={() => void copyLog()}>{copied ? <Check size={16} /> : <Copy size={16} />}</button>
-          <button className="icon-button" title={t('log.clear')} onClick={onClear}><RotateCcw size={16} /></button>
+          {active ? <button className="button secondary danger-text" title={t('log.stop')} onClick={onCancel}><Ban size={16} />{text('Остановить процесс', 'Stop process')}</button> : null}
+          <button className="button secondary" title={copied ? t('common.copied') : t('log.copy')} disabled={filteredLogs.length === 0} onClick={() => void copyLog()}>{copied ? <Check size={16} /> : <Copy size={16} />}{copied ? t('common.copied') : text('Копировать показанное', 'Copy visible events')}</button>
+          <button className="button secondary" title={text('Скрыть показанные события. Полный журнал остаётся в файле.', 'Hide displayed events. The full journal remains on disk.')} onClick={onClear}><RotateCcw size={16} />{text('Очистить представление', 'Clear view')}</button>
         </div>
       </div>
 
@@ -246,15 +246,15 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
       <div className="journal-follow-controls"><button type="button" className="button secondary" aria-pressed={following} onClick={() => { const next = !following; followLogRef.current = next; setFollowing(next); if (next) { const element = view === 'activity' ? activityRef.current : terminalRef.current; if (element) element.scrollTop = element.scrollHeight } }}>{following ? text('Следим за новыми событиями', 'Following new events') : text('Следить за новыми событиями', 'Follow new events')}</button></div>
       <div className="log-controls"><div className="log-tabs" role="tablist" aria-label={t('log.viewAria')}>
         <button role="tab" aria-selected={view === 'activity'} className={view === 'activity' ? 'active' : ''} onClick={() => setView('activity')}>{t('log.activity')}</button>
-        <button role="tab" aria-selected={view === 'raw'} className={view === 'raw' ? 'active' : ''} onClick={() => setView('raw')}>Raw</button>
+        <button role="tab" aria-selected={view === 'raw'} className={view === 'raw' ? 'active' : ''} onClick={() => setView('raw')}>{text('Исходный лог', 'Raw log')}</button>
       </div><div className="log-source-filter"><span>{t('log.session')}</span><QuickSelect value={selectedSource} onChange={(value) => { setSelectedSource(value); setNoteState('idle') }} ariaLabel={t('log.session')} options={[{ value: 'all', label: t('log.allMessages') }, { value: 'system', label: t('log.systemOrchestrator') }, ...sourceOptions.map(([key, source]) => ({ value: key, label: sourceLabel(source) }))]} /></div></div>
 
-      <div className="agent-chat-composer">
+      {active && addressedGroup ? <div className="agent-chat-composer">
         <div><strong>{addressedGroup ? t('log.messageSelected', { source: sourceLabel(addressedGroup) }) : t('log.messageAgent')}</strong><span>{addressedGroup ? t('log.selectedLiveOnly') : t('log.selectGroup')}</span></div>
         <textarea rows={2} value={note} disabled={!active || !addressedGroup} onChange={(event) => { setNote(event.target.value); setNoteState('idle') }} placeholder={addressedGroup ? t('log.groupContextPlaceholder') : t('log.placeholderSelect')} />
         <button className="button secondary" disabled={!active || !addressedGroup || !note.trim() || noteState === 'sending'} onClick={() => void sendNote()}><Send size={14} />{noteState === 'sending' ? t('log.sending') : noteState === 'sent' ? t('log.sent') : t('log.send')}</button>
         {noteState === 'unavailable' ? <small>{t('log.sessionUnavailable')}</small> : null}
-      </div>
+      </div> : null}
 
       {view === 'activity' ? (
         <div ref={activityRef} className="activity-log" aria-live="off" onScroll={event => { rememberLogPosition(event); activityWindow.onScroll(event) }}>

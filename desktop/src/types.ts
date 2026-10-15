@@ -23,7 +23,7 @@ export type BaselineDecision = { schemaVersion: 1 | 2; event?: 'BASELINE_CONTINU
 
 export type DependencyGraphPackage = { name: string; kind: 'runtime' | 'dev' | 'peer'; requestedSpec: string; currentVersion?: string; installedVersion?: string; policy: BaselinePackagePolicy; manifestObserved: boolean }
 export type DependencyGraphObservedEdge = { source: string; target: string; kind: 'dependency' | 'peer' | 'optional'; authority: 'OBSERVED_LOCAL_MANIFEST' }
-export type DependencyGraphSnapshot = { schemaVersion: 1; project: string; capturedAt: string; packages: DependencyGraphPackage[]; edges: DependencyGraphObservedEdge[]; intent: Pick<BaselineIntent, 'policies' | 'deferredCohorts'>; manifestCoverage: { observed: number; total: number; missing: string[] }; authorityBoundary: { packageList: 'PROJECT_MANIFEST'; relations: 'OBSERVED_LOCAL_MANIFEST'; cohorts: 'DIAGNOSTIC_HINT_OR_USER_POLICY'; proofAuthority: false } }
+export type DependencyGraphSnapshot = { iteration?: { runId: string; checkpointId: string; accepted: Record<string, string>; rejected: Array<{ id: string; packages: string[]; reason: string }> }; schemaVersion: 1; project: string; capturedAt: string; packages: DependencyGraphPackage[]; edges: DependencyGraphObservedEdge[]; intent: Pick<BaselineIntent, 'policies' | 'deferredCohorts'>; manifestCoverage: { observed: number; total: number; missing: string[] }; authorityBoundary: { packageList: 'PROJECT_MANIFEST'; relations: 'OBSERVED_LOCAL_MANIFEST'; cohorts: 'DIAGNOSTIC_HINT_OR_USER_POLICY'; proofAuthority: false } }
 
 export type HardwareSnapshot = { capturedAt: string; cpu: { logicalCores: number; loadPct?: number }; memory: { totalBytes: number; freeBytes: number; usedBytes: number; usedPct: number }; process: { memoryBytes?: number; cpuPct?: number }; disks?: Array<{ name: string; filesystem?: string; freeBytes?: number; totalBytes?: number; usedPct?: number }> }
 export type BaselineRecoveryInfo = { available: boolean; mode?: 'yellow' | 'green'; status?: string; phase?: string; updatedAt?: string; generation?: number; iteration?: number; lastAssignment?: string; lastPredicate?: string; learnedConstraints?: number; exactExclusions?: number; reason?: string }
@@ -495,6 +495,7 @@ export type IterativeDriveOutcome = {
   error?: string
 }
 export type IterativeAgentOutcome = {
+  canceled?: boolean
   autopilot?: { stopped: string; error?: string }
   ok: boolean
   changedFiles?: string[]

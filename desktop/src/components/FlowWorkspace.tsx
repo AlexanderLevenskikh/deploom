@@ -1,4 +1,4 @@
-import { FileText, LoaderCircle, MoreHorizontal, Play, Rocket, RefreshCw, RotateCcw, ShieldCheck, Wrench, X } from 'lucide-react'
+import { FileText, LoaderCircle, MoreHorizontal, Pause, Play, Rocket, RefreshCw, RotateCcw, ShieldCheck, Wrench } from 'lucide-react'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ACTION_ORDER, FLOW_STAGES } from '../data/flow'
@@ -11,6 +11,8 @@ import { PromptPreviewDialog } from './PromptPreviewDialog'
 import { IterativeTaskPanel } from './IterativeTaskPanel'
 import { useProjectSurface } from './ProjectSurfaces'
 import { AuditGoalSummary } from './AuditGoalSummary'
+import { HelpHint } from './HelpHint'
+import { iterativeRuntimeLine } from '../data/iterativeRuntimeLine'
 import { IterativeRunDiagnostics } from './IterativeRunDiagnostics'
 import { normalizeBaselineIntentPlan } from '../data/baselineIntent'
 import type { ScenarioSignal } from '../../electron/iterative-scenario'
@@ -464,7 +466,9 @@ export function FlowWorkspace({ details, project, appVersion, projectAudit, stor
   const artifactsPath = currentScenario?.attempt ? (currentScenario.runDir ?? `${details.workspace.path}/.dependency-roadmap/iterative`) : `${details.workspace.path}/.dependency-roadmap/artifacts/runs`
 
   return (
-    <section className="flow-workspace">
+    <section className="flow-workspace" aria-busy={!scenarioSignal || scenarioSignal.loading}>
+      {!scenarioSignal || scenarioSignal.loading ? <div className="main-workspace-suspense" role="status"><LoaderCircle className="spin" size={22} /><span>{text('Загружаем состояние миграции…', 'Loading migration state…')}</span></div> : null}
+      <div className="flow-content" hidden={!scenarioSignal || scenarioSignal.loading}>
       {maintenanceBlocked ? <div className="resume-notice storage-migration-notice" role="status"><strong>{storageStatus?.control === 'paused' ? text('Очистка на паузе', 'Cleanup paused') : text('Выполняется очистка хранилища', 'Storage cleanup is running')}</strong><span>{text('Запуск и повтор обновления временно недоступны. Продолжите или отмените очистку, чтобы начать миграцию.', 'Starting or retrying an update is temporarily unavailable. Resume or cancel cleanup before starting a migration.')}</span>{onOpenStorage ? <button type="button" className="button secondary" onClick={onOpenStorage}>{text('Управлять очисткой', 'Manage cleanup')}</button> : null}</div> : null}
 
       <section className="human-flow-card" aria-label={text('Состояние обновления зависимостей', 'Dependency upgrade status')}>
@@ -486,10 +490,12 @@ export function FlowWorkspace({ details, project, appVersion, projectAudit, stor
                 the primary action is visible without scrolling at 1080×700. */}
             <button type="button" className="button primary" data-testid="hero-main-action"
               disabled={!scenarioSignal.enabled || maintenanceBlocked && !scenarioSignal.running}
+              title={scenarioSignal.running ? iterativeView?.progressSummary?.checkpointId ? text(`Последний проверенный checkpoint: ${iterativeView.progressSummary.checkpointId}. Принятые обновления сохранены. Текущая операция прервётся; её результат потребует проверки при продолжении.`, `Last verified checkpoint: ${iterativeView.progressSummary.checkpointId}. Accepted updates are preserved. The current operation stops; its result must be verified when resuming.`) : text('Checkpoint ещё не создан. После паузы начальную проверку потребуется повторить.', 'No checkpoint exists yet. The initial check must be repeated after pausing.') : undefined}
               onClick={() => scenarioSignal.act()}>
-              {scenarioSignal.running ? <X size={16} /> : scenarioSignal.state === 'agent' || scenarioSignal.state === 'repair-current' ? <Wrench size={16} /> : scenarioSignal.state === 'result' || scenarioSignal.state === 'partial' || scenarioSignal.state === 'budget-stop' || scenarioSignal.state === 'blocked' || scenarioSignal.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}
+              {scenarioSignal.running ? <Pause size={16} /> : scenarioSignal.state === 'agent' || scenarioSignal.state === 'repair-current' ? <Wrench size={16} /> : scenarioSignal.state === 'result' || scenarioSignal.state === 'partial' || scenarioSignal.state === 'budget-stop' || scenarioSignal.state === 'blocked' || scenarioSignal.state === 'no-upgrade' ? <FileText size={16} /> : <Rocket size={16} />}
               {scenarioSignal.label}
             </button>
+            {scenarioSignal.restart ? <button className="button secondary" disabled={!scenarioSignal.restartEnabled || maintenanceBlocked || active} title={text('Сохранить прежний прогон в истории и заново проверить текущие файлы.', 'Keep the previous run in history and recheck the current files.')} onClick={scenarioSignal.restart}><RotateCcw size={16} />{text('Начать заново', 'Start over')}</button> : null}
             <details className="project-actions-menu"><summary>{text('Действия', 'Actions')}<MoreHorizontal size={20} aria-hidden="true" /></summary><div>
             <button className="button secondary" disabled={maintenanceBlocked || active || projectAudit?.view?.lifecycle.phase === 'running' || Boolean(projectAudit?.view?.blockedReason) || projectAudit?.starting || !projectAudit} onClick={() => void projectAudit?.start()}><RefreshCw size={16} />{projectAudit?.view?.lifecycle.phase === 'running' ? text('Аудит выполняется…', 'Audit running…') : text('Обновить аудит', 'Refresh audit')}</button>
             <button className="button secondary" disabled={active || scenarioSignal.running || maintenanceBlocked} onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button>
@@ -652,9 +658,8 @@ export function FlowWorkspace({ details, project, appVersion, projectAudit, stor
 
       <AuditGoalSummary audit={iterativeView?.audit?.checkpointId ? iterativeView.audit : projectAudit?.view?.audit ?? iterativeView?.audit} initial={iterativeView?.initialAudit} lifecycle={projectAudit?.view?.lifecycle} refreshDisabled={maintenanceBlocked || active || Boolean(projectAudit?.view?.blockedReason) || projectAudit?.starting} refreshError={projectAudit?.error} onOpenPath={onOpenPath} />
 
-      {surface('dependencies', <>
-      <section className="project-scope-actions"><h2>{text('Состав и настройки обновления', 'Update scope and settings')}</h2><p>{text('Draft предлагает версии; проверенный запуск применяет и проверяет изменения.', 'Draft proposes versions; a verified run applies and checks the changes.')}</p><button className="button secondary" disabled={active || maintenanceBlocked || scenarioSignal?.running} onClick={() => void openBaselineIntentDialog('prepare', 'auto')}><FileText size={16} />{text('Настроить состав / Draft', 'Configure scope / Draft')}</button></section>
-      <section className="roadmap-card migration-launch-settings"><details className="migration-launch-settings-collapse" open={false}><summary className="roadmap-card-header"><div><strong>{text('Настройки запуска', 'Run settings')}</strong><span>{text('Агент и модель используются для исправлений. Выберите их до запуска; работа агента может расходовать токены.', 'Agent and model are used for repairs. Choose them before starting; agent work may consume tokens.')}</span></div></summary>
+      {<>
+      <section className="roadmap-card migration-launch-settings"><details className="migration-launch-settings-collapse" open><summary className="roadmap-card-header"><div><strong>{text('Настройки запуска', 'Run settings')}</strong><HelpHint label={text('Параметры запуска', 'Run parameters')}>{text('Агент и модель используются для исправлений. Выберите их до запуска; работа агента может расходовать токены.', 'Agent and model are used for repairs. Choose them before starting; agent work may consume tokens.')}</HelpHint></div></summary>
       <fieldset className="project-facts" disabled={active || scenarioSignal?.running}>
         <div><span>{t('flow.projectPath')}</span><strong title={project.path}>{project.path}</strong></div>
         <div><span>{t('common.branch')}</span><div className="git-plan-control"><ModelPicker ariaLabel={t('flow.updateBranch')} value={branchBase} options={branchSuggestions} onChange={setBranchBase} onCommit={value => persistGitSettings(value).catch(error => window.alert(String(error)))} placeholder="libs" /><label className="push-toggle" title={t('flow.pushTitle')}><input type="checkbox" checked={pushEnabled} onChange={(event) => void persistGitSettings(branchBase, event.target.checked).catch(error => window.alert(String(error)))} />Push</label></div></div>
@@ -666,13 +671,14 @@ export function FlowWorkspace({ details, project, appVersion, projectAudit, stor
           {project.nodeHints?.length ? <span className="node-hints" title={text('Закрепления Node в репозитории (engines.node / .nvmrc / .node-version). Подсказка: выбирать отсюда не обязательно — пустое значение означает среду хоста.', 'Node pins in this repository (engines.node / .nvmrc / .node-version). Suggestion only — leaving it empty keeps the host runtime.')}>{text('В репо закреплён Node', 'Repo pins Node')}: {project.nodeHints.join(', ')}</span> : null}
         </div>
       </fieldset>
+      {iterativeRuntimeLine(iterativeView, text('не задан', 'unset')) ? <p className="attempt-meta">{iterativeRuntimeLine(iterativeView, text('не задан', 'unset'))}</p> : null}
       </details>
       </section>
 
-      </>)}
+      </>}
 
-      {surface('journal', <>
-      <details className="flow-technical-details">
+      {surface('report', <>
+      <details className="flow-technical-details" open>
         <summary>{text('Технические детали', 'Technical details')}</summary>
         <div className="flow-technical-details-body">
           {(acceptance || currentLevel) ? <section className="previous-audit-metrics"><strong>{text('Метрики последнего отдельного аудита', 'Metrics from the last separate audit')}</strong><p>{text('Это сохранённые метрики отдельного аудита; они не являются статусом текущего итеративного запуска.', 'These are saved metrics from a separate audit, not the status of the current iterative run.')}</p><div className="project-facts">
@@ -686,15 +692,12 @@ export function FlowWorkspace({ details, project, appVersion, projectAudit, stor
 
         </div>
       </details>
-      <details className="flow-technical-details flow-logs-details">
-        <summary>{text('Логи запуска', 'Run logs')}</summary>
-        {currentScenario ? <IterativeRunDiagnostics signal={currentScenario} logs onReadLog={() => onIterativeAttempt(project.name, true)} onOpenLog={() => onOpenPath(`${currentScenario.runDir}/run.log`)} /> : null}
-      </details>
       </>)}
       {selectedBranchFailure?.runtime?.phase === 'failed' ? <BranchFailureModal branch={selectedBranchFailure} onClose={() => setSelectedBranchFailure(null)} /> : null}
       {baselineIntentDialog ? <BaselineIntentDialog disabledReason={maintenanceBlocked ? text('Выполняется очистка хранилища. Продолжите или отмените её перед запуском.', 'Storage cleanup is running. Resume or cancel it before starting.') : undefined} mode={baselineIntentDialog.mode} resume={baselineIntentDialog.resume} plan={baselineIntentDialog.plan} decision={baselineIntentDialog.decision} onCancel={() => { setBaselineIntentDialog(undefined); if (baselineIntentDialog.mode === 'decision') setBaselineDecisionDismissed(true) }} onSubmit={runBaselineIntent} /> : null}
       {draftPromptPreview ? <PromptPreviewDialog preview={draftPromptPreview} onClose={() => setDraftPromptPreview(undefined)} onOpenPath={onOpenPath} /> : null}
 
+      </div>
     </section>
   )
 }

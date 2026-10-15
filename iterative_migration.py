@@ -3973,10 +3973,13 @@ def _materialize_locked(
         }
     )
 
+    from iterative_trial_workspace import remove_trial_workspace, TrialWorkspaceCleanupError
+    try:
+        remove_trial_workspace(run_dir)
+    except TrialWorkspaceCleanupError as exc:
+        raise IterativeMigrationError("TRIAL_WORKSPACE_CLEANUP_BLOCKED", str(exc)) from exc
     snapshot = _open_checkpoint_source(run_dir, base_checkpoint, config, run_id=str(run["runId"]), candidate_id=str(candidate["candidateId"]))
     workspace_root = trial_workspace_root(run_dir)
-    if workspace_root.exists():
-        shutil.rmtree(workspace_root, ignore_errors=True)
     _materialize_trial_tree(snapshot, workspace_root, args.timeout_seconds)
 
     project_relative = Path(str(base_checkpoint.get("projectRelative") or "."))

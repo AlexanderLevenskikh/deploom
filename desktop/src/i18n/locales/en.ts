@@ -447,6 +447,7 @@ export const en = {
   "app.projectSection": "Project section",
   "projectRail.audit.aria": "Audit {name}",
   "projectRail.audit": "Run audit",
+  "app.legacyDashboard": "Legacy roadmap dashboard",
   "projectRail.manageWorkspace": "Manage workspace",
 } as const
 

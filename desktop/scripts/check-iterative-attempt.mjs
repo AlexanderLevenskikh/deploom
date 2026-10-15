@@ -172,4 +172,10 @@ try {
   if (attemptActiveElapsed({ status: "done", lastHeartbeatAt: 9999999 }, false, clock) !== 0) throw new Error("legacy elapsed was invented");
 } finally { Date.now = originalNow; }
 
+const legacyPausedDir = join(root, 'legacy-paused')
+startAttempt(legacyPausedDir, 'DemoApp', 'none')
+updateAttempt(legacyPausedDir, {status:'failed',cancelRequested:true,lastError:'DELIVERY_CANCELED: user stopped'})
+if (readAttempt(legacyPausedDir).status !== 'canceled' || readAttempt(legacyPausedDir).lastError !== undefined) throw Error('A legacy manual stop must display as a resumable pause')
+updateAttempt(legacyPausedDir, {status:'failed',cancelRequested:true,lastError:'BUILD_FAILED'})
+if (readAttempt(legacyPausedDir).status !== 'failed') throw Error('A real failure must not be hidden as cancellation')
 console.log("check-iterative-attempt: OK");

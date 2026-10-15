@@ -205,7 +205,8 @@ try {
   put('security-state.json',state);
   put('delivery-agent.json',{identity:'security:fixture:C0:1',status:'running'});
   assert.equal(securityResumeAvailable(recovery),false);
-  put('delivery-agent.json',{identity:'security:fixture:C0:1',status:'running',sessionId:'same-session',provider:'codex'});
+  put('delivery-agent.json',{identity:'security:fixture:C0:1',status:'canceled',sessionId:'same-session',provider:'codex'});
+  assert.equal(securityResumeAvailable(recovery),true, 'Manual cancellation preserves resumability');
   put('run-config.json',{budget:{maxRepairAttemptsPerRevision:2}});
   let launches = 0;
   const outcome = await runDeliveryWorkflow(recovery, {
@@ -215,6 +216,15 @@ try {
   });
   assert.equal(launches,1);
   assert.equal(outcome.error,'stop-after-security');
+  put('delivery-agent.json',{identity:'security:fixture:C0:1',status:'canceled',sessionId:'same-session',provider:'codex'});
+  const canceledOutcome = await runDeliveryWorkflow(recovery, {
+    provider:'codex', canceled:()=>false, processAlive:()=>false, progress:()=>{},
+    command:async command => { if (command === 'security-prepare') return state; throw Error('unexpected verification after cancellation'); },
+    launch:async context => { assert.equal(context.sessionId,'same-session'); throw Error('DELIVERY_CANCELED: user stopped'); },
+  });
+  assert.equal(canceledOutcome.canceled,true);
+  assert.equal(JSON.parse(readFileSync(join(recovery,'delivery-agent.json'),'utf8')).status,'canceled');
+  assert.equal(securityResumeAvailable(recovery),true,'The stopped session remains resumable after workflow cancellation');
   assert.equal(JSON.parse(readFileSync(join(recovery,'delivery-agent.json'),'utf8')).sessionId,'same-session');
   console.log('Security recovery: same run/checkpoint/session/private workspace required; workflow resumes same session');
 } finally { rmSync(recovery,{recursive:true,force:true}) }

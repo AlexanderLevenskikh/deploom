@@ -1,0 +1,7 @@
+.help-hint { position:relative; display:inline-flex; vertical-align:middle; margin-left:6px; }
+.help-hint-trigger { display:inline-flex; align-items:center; justify-content:center; padding:3px; color:var(--muted); border:0; background:transparent; border-radius:4px; cursor:help; }
+.help-hint-trigger:focus-visible { outline:2px solid var(--accent, #60a5fa); outline-offset:2px; }
+.help-hint-content { display:none; position:absolute; left:0; top:100%; z-index:40; width:min(360px, 65vw); padding:12px 14px; border:1px solid var(--border); border-radius:8px; background:var(--surface-raised, var(--surface, #fff)); color:var(--text); box-shadow:0 6px 20px #0002; font-size:12px; font-weight:400; line-height:1.6; white-space:normal; overflow-wrap:anywhere; }
+.help-hint:hover > .help-hint-content, .help-hint:focus-within > .help-hint-content { display:block; }
+.help-hint-content p { margin:0 0 8px; }
+.help-hint-content p:last-child { margin-bottom:0; }

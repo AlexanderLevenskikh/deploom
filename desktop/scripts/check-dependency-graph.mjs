@@ -1,3 +1,6 @@
+import assert from 'node:assert/strict'
+import ts from 'typescript'
+import { readIterativeGraphView } from '../dist-electron/iterative-graph-view.js'
 import { buildDependencyGraphSnapshot } from "../dist-electron/dependency-graph.js"
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -53,5 +56,28 @@ for (const required of ["deriveGraphGroups", "deriveGroupEdges", "USER_POLICY", 
 if (!preload.includes("getDependencyGraphSnapshot")) throw new Error("preload graph IPC missing")
 if (!main.includes("flow:dependency-graph-snapshot")) throw new Error("main graph IPC missing")
 
+const runDir = join(root, 'iterative')
+mkdirSync(join(runDir, 'checkpoints'), {recursive:true})
+const put = (name, value) => writeFileSync(join(runDir, name), JSON.stringify(value))
+put('run.json', {runId:'fixture',activeCheckpointId:'C1'})
+const checkpoint = (id, parent, assignment) => ({checkpointId:id,parentCheckpointId:parent,status:'VERIFIED',verification:{status:'passed'},fullAssignment:assignment})
+put('checkpoints/C0.json', checkpoint('C0',null,{react:'18.2.0',vite:'4.3.9'}))
+put('checkpoints/C1.json', checkpoint('C1','C0',{react:'19.0.0',vite:'4.3.9'}))
+put('ledger.json', {deferrals:[{candidateId:'trial-1',baseCheckpointId:'C0',packages:['vite'],reason:'build failed'},{candidateId:'foreign',baseCheckpointId:'C9',packages:['react']}]})
+assert.deepEqual(readIterativeGraphView(runDir), {runId:'fixture',checkpointId:'C1',accepted:{react:'19.0.0'},rejected:[{id:'trial-1',packages:['vite'],reason:'build failed'}]})
+const compiledProjection = ts.transpileModule(projection,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText
+const {deriveGraphGroups,derivePackageViews} = await import('data:text/javascript;base64,' + Buffer.from(compiledProjection).toString('base64'))
+const liveSnapshot = {...snapshot,iteration:readIterativeGraphView(runDir)}
+const liveGroups = deriveGraphGroups(liveSnapshot)
+const livePackages = derivePackageViews(liveSnapshot,liveGroups,undefined,undefined,'fixture',undefined,undefined,undefined)
+assert.equal(livePackages.find(item=>item.name==='react').status,'accepted')
+assert.equal(livePackages.find(item=>item.name==='react').plannedTarget,'19.0.0')
+assert.equal(livePackages.find(item=>item.name==='vite').status,'rejected')
+assert.equal(liveGroups.find(group=>group.id==='attempt-trial-1').state,'rejected')
+assert.equal(livePackages.find(item=>item.name==='@vitejs/plugin-react').status,'pending','An untouched package must not become green')
+put('checkpoints/C1.json', {...checkpoint('C1','C0',{react:'19.0.0'}),status:'PLANNED'})
+assert.equal(readIterativeGraphView(runDir),undefined,'planned updates must never appear accepted')
+put('checkpoints/C1.json', checkpoint('C1','C1',{react:'19.0.0'}))
+assert.equal(readIterativeGraphView(runDir),undefined,'cyclic checkpoint evidence must fail closed')
 rmSync(root, { recursive: true, force: true })
 console.log("Dependency graph projection / authority contracts OK")

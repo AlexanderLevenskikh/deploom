@@ -7,6 +7,7 @@ import { deriveMainAction, parseIterativeFailure, scenarioPipeline } from "../di
 import { createIterativeAutopilot } from '../dist-electron/iterative-autopilot.js';
 import { discoveryProgress } from '../dist-electron/iterative-discovery-progress.js';
 import assert from 'node:assert/strict';
+import { createStatusRequestGate } from '../dist-electron/iterative-status-sync.js';
 import { canApplyAttemptRead, iterativeActivity } from "../dist-electron/iterative-activity.js";
 
 let failures = 0;
@@ -522,4 +523,23 @@ if (failures > 0) {
   console.error(`${failures} scenario contract check(s) FAILED`);
   process.exit(1);
 }
-console.log("iterative-scenario contract OK");
+// Slow IPC must complete even while heartbeat-triggered refreshes keep arriving.
+{
+ const read = createStatusRequestGate();
+ let finish, calls = 0;
+ const fetch = () => { calls++; return new Promise(resolve => {finish=resolve;}); };
+ const first = read('w:project-a', fetch);
+ const repeated = Array.from({length:20}, () => read('w:project-a', fetch));
+ await Promise.resolve();
+ assert.equal(calls, 1);
+ assert.ok(repeated.every(request => request === first));
+ const other = read('w:project-b', async () => ({progressSummary:{checkpointId:'C0',accepted:0}}));
+ finish({progressSummary:{checkpointId:'C1',accepted:6}});
+ assert.equal((await first).progressSummary.accepted, 6);
+ assert.equal((await other).progressSummary.accepted, 0);
+ const next = await read('w:project-a', async () => ({progressSummary:{checkpointId:'C2',accepted:9}}));
+ assert.equal(next.progressSummary.accepted, 9, 'the next poll must read fresh durable progress');
+ await assert.rejects(read('w:project-a', async () => {throw Error('STATUS_TIMEOUT');}), /STATUS_TIMEOUT/);
+ assert.equal((await read('w:project-a', async () => ({accepted:9}))).accepted, 9, 'failed reads must not poison future polling');
+}
+console.log("iterative-scenario and coalesced status synchronization OK");

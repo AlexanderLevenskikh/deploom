@@ -11,7 +11,7 @@ type Props = {
 export function MigrationChecksPanel({ profile, locked, scope, onChange }: Props) {
   const { text } = useLanguage()
   if (!profile) return null
-  return <details className="resume-notice migration-checks" open={!locked} data-testid="migration-checks">
+  return <details className="resume-notice migration-checks" data-testid="migration-checks">
     <summary><strong>{text('Проверки миграции', 'Migration checks')}</strong> · {profile.commands.filter(c => c.trim()).length} {text('команд', 'commands')}{profile.deferredChecks ? ` · ${text('есть неподтверждённые проверки', 'some checks are not verified')}` : ''}{scope?.mode === 'test-nonregression' ? ` · ${text('сравнение с исходным; сбоев:', 'compare with initial; failures:')} ${scope.existingFailures}/${scope.total}; skipped: ${scope.skipped ?? 0} (${text('не полностью зелёный проект', 'not a fully green project')})` : ''}</summary>
     <p>{text('Эти команды обязательны при начальной проверке и после обновлений. Успех относится только к выбранному набору проверок. Изменить его можно до запуска; для текущего прогона набор зафиксирован.', 'These commands are required for the initial control and after updates. Success applies only to the selected checks. Configure them before starting; an existing run keeps its pinned selection.')}</p>
     <label>{text('Обязательные команды — по одной в строке', 'Required commands — one per line')}

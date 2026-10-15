@@ -9,7 +9,7 @@ import type {
   TeamFlowState,
 } from '../types'
 
-export type GraphGroupState = 'active' | 'deferred' | 'inferred' | 'display'
+export type GraphGroupState = 'rejected' | 'active' | 'deferred' | 'inferred' | 'display'
 export type GraphGroup = {
   id: string
   label: string
@@ -25,7 +25,7 @@ export type GraphGroup = {
   warningPackages: string[]
 }
 export type GraphGroupEdge = { source: string; target: string; observed: boolean; bridgePackages: string[] }
-export type GraphPackageStatus = 'active-issue' | 'critical' | 'deferred' | 'required' | 'integrated' | 'verified-scope' | 'pending'
+export type GraphPackageStatus = 'accepted' | 'rejected' | 'active-issue' | 'critical' | 'deferred' | 'required' | 'integrated' | 'verified-scope' | 'pending'
 export type GraphPackageView = DependencyGraphPackage & {
   status: GraphPackageStatus
   plannedTarget?: string
@@ -91,6 +91,11 @@ export function deriveGraphGroups(snapshot: DependencyGraphSnapshot, decision?: 
       state: group.active ? 'active' : previous.active ? 'active' : group.deferred ? 'deferred' : previous.state,
       authority: group.active ? 'DIAGNOSTIC_HINT' : group.deferred ? 'USER_POLICY' : previous.authority,
     })
+  }
+
+  for (const cohort of snapshot.iteration?.rejected ?? []) {
+    const packages = cohort.packages.filter(name => direct.has(name))
+    if (packages.length) ensure({ id: 'attempt-' + cohort.id, label: cohort.id, packages, active: false, deferred: false, state: 'rejected', authority: 'DISPLAY_ONLY', reasons: [cohort.reason], boundaryPackages: [], warningPackages: [] })
   }
 
   for (const cohort of snapshot.intent.deferredCohorts ?? []) {
@@ -203,14 +208,16 @@ export function derivePackageViews(
     const migrationFact = migrationByPackage.get(item.name)
     const integrated = migrationFact?.status === 'merged' || migrationFact?.status === 'integrated'
     let status: GraphPackageStatus = 'pending'
-    if (active.has(item.name)) status = 'active-issue'
+    if (snapshot.iteration?.accepted[item.name]) status = 'accepted'
+    else if (snapshot.iteration?.rejected.some(group => group.packages.includes(item.name))) status = 'rejected'
+    else if (active.has(item.name)) status = 'active-issue'
     else if (critical.has(item.name)) status = 'critical'
     else if (item.policy === 'keep-current') status = 'deferred'
     else if (item.policy === 'required') status = 'required'
     else if (integrated) status = 'integrated'
     else if (baselineCompleted && verifiedHealth) status = 'verified-scope'
     return {
-      ...item, status, plannedTarget: planned.get(item.name), migrationGroup: migrationFact?.label,
+      ...item, status, plannedTarget: snapshot.iteration?.accepted[item.name] ?? planned.get(item.name), migrationGroup: migrationFact?.label,
       boundary: boundaries.has(item.name), warning: warnings.has(item.name), critical: critical.has(item.name),
     }
   })

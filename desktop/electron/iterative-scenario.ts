@@ -124,6 +124,7 @@ export type ScenarioSignal = {
   label: string
   description: string
   running: boolean
+  loading?: boolean
   enabled: boolean
   activity: { title: string; detail: string; percent?: number }
   elapsed: string
@@ -131,6 +132,8 @@ export type ScenarioSignal = {
   attemptLog?: string
   runDir?: string
   act: () => void
+  restart?: () => void
+  restartEnabled?: boolean
 }
 
 const FIXABLE_CODES = new Set(["SOURCE_SUBMODULE_INCOMPLETE", "SOURCE_SUBMODULE_STATUS_FAILED"])
