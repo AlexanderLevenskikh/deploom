@@ -1,7 +1,7 @@
 import { Copy, TerminalSquare } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { copyTextToClipboard } from '../clipboard'
-import { iterativeLogMessages } from '../data/iterativeLogMessages'
+import { iterativeLogEntries } from '../data/iterativeLogMessages'
 import { useLanguage } from '../i18n'
 import type { ScenarioSignal } from '../../electron/iterative-scenario'
 
@@ -53,7 +53,7 @@ export function IterativeRunDiagnostics({ signal, logs = false, onReadLog, onOpe
     {attempt?.status === 'failed' ? <p className="error-text">{attempt.lastError || attempt.reason}</p> : null}
     {logs ? <>
       <div className="iterative-log-toolbar"><button className="button secondary" aria-pressed={!raw} onClick={() => setRaw(false)}>{text('Ход работы', 'Activity')}</button><button className="button secondary" aria-pressed={raw} onClick={() => setRaw(true)}>Raw</button><button className="button secondary" disabled={!visibleLog} onClick={() => void copy()}><Copy size={14} />{copyStatus ?? text('Скопировать лог', 'Copy log')}</button></div>
-      <div ref={logRef} className="attempt-log iterative-log-messages" tabIndex={0} onScroll={() => { const el = logRef.current; if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40 }}>{visibleLog ? (raw ? <pre>{visibleLog}</pre> : iterativeLogMessages(visibleLog).map((message, index) => <pre className="iterative-log-message" key={index}>{message}</pre>)) : signal.running ? text('Ожидаем первые сообщения…', 'Waiting for first messages…') : text('Нет сохранённых сообщений.', 'No saved messages.')}</div>
+      <div ref={logRef} className="attempt-log iterative-log-messages" tabIndex={0} onScroll={() => { const el = logRef.current; if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40 }}>{visibleLog ? (raw ? <pre>{visibleLog}</pre> : iterativeLogEntries(visibleLog).map((entry, index) => <pre className={`iterative-log-message ${entry.tone}`} key={index}>{entry.text}</pre>)) : signal.running ? text('Ожидаем первые сообщения…', 'Waiting for first messages…') : text('Нет сохранённых сообщений.', 'No saved messages.')}</div>
       <p>{text('Накопительный журнал запуска. На экране последние 256 КБ; полный журнал сохраняется в run.log.', 'Cumulative run journal. The screen shows the latest 256 KB; the full journal is saved in run.log.')} {onOpenLog ? <button className="linklike" onClick={() => void onOpenLog()}>{text('Открыть полный журнал', 'Open full log')}</button> : null}</p>
     </> : null}
   </section>

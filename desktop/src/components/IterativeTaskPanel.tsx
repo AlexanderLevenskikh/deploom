@@ -1,7 +1,7 @@
 import { Check, ChevronDown, ChevronUp, Clipboard, ExternalLink, FileText, RefreshCw, Rocket, Save, Wrench, X } from 'lucide-react'
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 
-import { iterativeLogMessages } from '../data/iterativeLogMessages'
+import { iterativeLogEntries } from '../data/iterativeLogMessages'
 import { useLanguage } from '../i18n'
 import { MigrationChecksPanel } from './MigrationChecksPanel'
 import { useProjectSurface } from './ProjectSurfaces'
@@ -957,7 +957,7 @@ export function IterativeTaskPanel(props: Props) {
           </div> : null}
           {hasFailure ? failureDetails : null}
           {showLogTail ? (
-            <div className="iterative-log-messages">{iterativeLogMessages(currentAttemptLog ?? '').slice(-8).map((message, index) => <pre className="iterative-log-message" key={index}>{message}</pre>)}</div>
+            <div className="iterative-log-messages">{iterativeLogEntries(currentAttemptLog ?? '').slice(-8).map((entry, index) => <pre className={`iterative-log-message ${entry.tone}`} key={index}>{entry.text}</pre>)}</div>
           ) : null}
         </div>
       ) : null}

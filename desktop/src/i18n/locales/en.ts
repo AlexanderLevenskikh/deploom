@@ -33,7 +33,7 @@ export const en = {
   "app.theme.system": "System theme",
   "app.theme.dark": "Dark theme",
   "app.notifications": "Notifications",
-  "app.notificationsTitle": "Show Windows notifications after each completed FLOW stage and each migrated group.",
+  "app.notificationsTitle": "Notify on major stage transitions, completion and errors that stop the process.",
   "app.update.restart": "Restart and update to {version}",
   "app.update.newVersion": "new version",
   "app.update.downloading": "Downloading {percent}%",

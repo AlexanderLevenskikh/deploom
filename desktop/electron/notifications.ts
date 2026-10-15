@@ -54,11 +54,6 @@ export function flowNotificationContent(event: FlowNotificationEvent): { title: 
 }
 
 
-const ITERATIVE_STEP_LABELS: Record<string, string> = {
-  'plan-next': 'Подбор группы зависимостей', materialize: 'Подготовка проверочного окружения',
-  verify: 'Проверка варианта', 'apply-feedback': 'Обработка результата проверки',
-  finish: 'Завершение расчёта', delivery: 'Подготовка результата в Git',
-}
 const ITERATIVE_STAGE_LABELS: Record<IterativeAttemptRecord['stage'], string> = {
   preflight: 'Проверка окружения', begin: 'Исходная проверка', drive: 'Расчёт обновлений',
   agent: 'Работа агента', none: 'Проверка проекта',
@@ -66,43 +61,39 @@ const ITERATIVE_STAGE_LABELS: Record<IterativeAttemptRecord['stage'], string> = 
 
 /** Observe journal transitions, never poll results or interpret process output as success. */
 export function createIterativeNotificationObserver() {
-  const seen = new Map<string, { attemptId: string; terminal?: string; steps: string[] }>()
-  return (attempt: IterativeAttemptRecord, options: { autopilot?: boolean } = {}): FlowNotificationEvent[] => {
+  const seen = new Map<string, { attemptId: string; terminal?: string; stage: number }>()
+  return (attempt: IterativeAttemptRecord, options: { autopilot?: boolean; stopped?: boolean } = {}): FlowNotificationEvent[] => {
     const scope = JSON.stringify([attempt.workspaceId, attempt.projectName])
-    const steps = Array.isArray(attempt.stepsDone) ? attempt.stepsDone.filter(step => typeof step === 'string') : []
+    // Cohort steps may repeat dozens of times. Notifications follow only the
+    // same four major stages shown by the UI; never infer project success.
+    const pipeline = !options.autopilot && attempt.status === 'done' && attempt.lastStep === 'delivery' && attempt.phase === 'delivery' ? 4
+      : attempt.stage === 'drive' || attempt.stage === 'agent' && attempt.runCreated !== false ? 3
+      : attempt.lastStep === 'checked' || /^begin\.discovery/.test(attempt.phase ?? '') || attempt.discoveryCompleted ? 2 : 1
     let previous = seen.get(scope)
     if (!previous || previous.attemptId !== attempt.attemptId) {
-      previous = { attemptId: attempt.attemptId, steps: [...steps] }
+      previous = { attemptId: attempt.attemptId, stage: pipeline }
       seen.delete(scope)
       seen.set(scope, previous)
       if (seen.size > 128) seen.delete(seen.keys().next().value!)
     }
     const events: FlowNotificationEvent[] = []
-    const stage = attempt.lastStep === 'checked' || attempt.lastStep === 'check'
-      ? 'Проверка проекта' : ITERATIVE_STAGE_LABELS[attempt.stage]
-    if (attempt.cancelRequested || attempt.status === 'canceled') {
-      previous.steps = [...steps]
-      return events
-    }
+    if (attempt.cancelRequested || attempt.status === 'canceled') return events
     if (attempt.status === 'starting' || attempt.status === 'running') previous.terminal = undefined
-    const prefix = previous.steps.every((step, index) => steps[index] === step)
-    for (const step of steps.slice(prefix ? previous.steps.length : 0)) {
-      if (ITERATIVE_STEP_LABELS[step] && !(options.autopilot && step === 'plan-next')) events.push({ kind: 'iterative-stage-complete',
-        projectName: attempt.projectName, stage: ITERATIVE_STEP_LABELS[step] })
+    if (attempt.status !== 'failed' && pipeline > previous.stage) {
+      const labels: Record<number, string> = { 2: 'Проверка → Подбор версий', 3: 'Подбор версий → Обновление', 4: 'Обновление → Результат' }
+      events.push({ kind: 'iterative-stage-complete', projectName: attempt.projectName, stage: labels[pipeline] })
+      previous.stage = pipeline
     }
-    previous.steps = [...steps]
-    if (attempt.status !== 'failed' && attempt.status !== 'done') return events
+    if (attempt.status !== 'failed') return events
+    // An Autopilot handler can fail while the supervisor is already selecting
+    // another cohort or retrying infrastructure. Only its stop callback owns
+    // the final failure notification.
+    if (options.autopilot && !options.stopped) return events
     const terminal = JSON.stringify([attempt.status, attempt.stage, attempt.lastStep])
     if (previous.terminal === terminal) return events
     previous.terminal = terminal
-    if (attempt.status === 'failed') {
-      events.push({ kind: attempt.lastError ? 'stage-failed' : 'stage-attention', projectName: attempt.projectName, stage })
-    } else if (attempt.lastStep === 'cohort-review') {
-      if (!options.autopilot) events.push({ kind: 'stage-attention', projectName: attempt.projectName, stage: 'Согласование группы зависимостей' })
-    } else if (attempt.stage !== 'drive') {
-      events.push({ kind: 'iterative-stage-complete', projectName: attempt.projectName,
-        stage: ITERATIVE_STEP_LABELS[attempt.lastStep || ''] || stage })
-    }
+    events.push({ kind: 'stage-failed', projectName: attempt.projectName,
+      stage: attempt.lastStep === 'checked' || attempt.lastStep === 'check' ? 'Проверка проекта' : ITERATIVE_STAGE_LABELS[attempt.stage] })
     return events
   }
 }

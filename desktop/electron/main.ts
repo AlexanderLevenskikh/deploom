@@ -1036,9 +1036,9 @@ function showFlowNotification(event: FlowNotificationEvent): void {
 }
 const observeIterativeNotifications = createIterativeNotificationObserver()
 let iterativeNotificationAutopilot = (_scope: { workspaceId?: string; projectName: string }) => false
-function broadcastIterativeAttempt(attempt: IterativeAttemptRecord): void {
+function broadcastIterativeAttempt(attempt: IterativeAttemptRecord, stopped = false): void {
   send('flow:iterative:attempt', attempt)
-  for (const event of observeIterativeNotifications(attempt, { autopilot: iterativeNotificationAutopilot(attempt) })) showFlowNotification(event)
+  for (const event of observeIterativeNotifications(attempt, { autopilot: iterativeNotificationAutopilot(attempt), stopped })) showFlowNotification(event)
 }
 function selectedWorkspace(state = loadState()): WorkspaceRecord | undefined {
   return state.workspaces.find((item) => item.id === state.selectedWorkspaceId) ?? state.workspaces[0]
@@ -7689,6 +7689,7 @@ function setupIpc(): void {
     onStopped: (input, summary) => {
       if (!summary.error) {
         if (summary.stopped === 'finished') showFlowNotification({ kind: 'iterative-run-complete', projectName: input.projectName })
+        else if (summary.stopped === 'check-blocked') showFlowNotification({ kind: 'stage-failed', projectName: input.projectName, stage: 'Проверка проекта' })
         return
       }
       const runDir = autopilotRunDir(input)
@@ -7700,7 +7701,7 @@ function setupIpc(): void {
       updateAttempt(runDir, { status: 'failed', lastError: summary.error.slice(0, 4000), waitUntil: undefined })
       if (!readAttempt(runDir)) showFlowNotification({ kind: 'stage-failed', projectName: input.projectName, stage: 'Автоматический прогон' })
       recordAttemptLog(runDir, `Autopilot stopped (${summary.stopped}): ${summary.error.slice(0, 4000)}\n`)
-      publishIterativeAttempt(runDir)
+      publishIterativeAttempt(runDir, true)
     },
     writeRetry: (input, retry) => {
       const runDir = autopilotRunDir(input)
@@ -7958,9 +7959,9 @@ function setupIpc(): void {
   // L1: after every durable attempt mutation a fresh event reaches the renderer,
   // so the very first click is observable and a restart restores the reason the
   // attempt stopped (the record and log live in the run dir, not in memory).
-  function publishIterativeAttempt(runDir: string): void {
+  function publishIterativeAttempt(runDir: string, stopped = false): void {
     const attempt = readAttempt(runDir)
-    if (attempt) broadcastIterativeAttempt(attempt)
+    if (attempt) broadcastIterativeAttempt(attempt, stopped)
   }
 
   registerProjectJournalHandlers(ipcMain, {

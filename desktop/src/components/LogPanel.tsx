@@ -1,6 +1,6 @@
 import { AlertCircle, AlertTriangle, Ban, Check, Copy, Download, MessageSquare, RotateCcw, Send, TerminalSquare, Wrench } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type UIEvent } from 'react'
-import { latestJobId, mergeLogSources, presentLogs, summarizeTokenUsage, type PresentedLog } from '../data/logPresentation'
+import { latestJobId, mergeLogSources, migrationLogError, presentLogs, summarizeTokenUsage, type PresentedLog } from '../data/logPresentation'
 import { useLanguage, type Language, type TranslationKey } from '../i18n'
 import type { EnvironmentInfo, FlowAction, JobOutput, JobOutputSource, MigrationProgress } from '../types'
 import { copyTextToClipboard } from '../clipboard'
@@ -275,7 +275,7 @@ export function LogPanel({ logs, knownSources = [], environment, active, activeJ
             {rawStart > 0 ? <div style={{ height: rawOffsets[rawStart] }} aria-hidden="true" data-window-spacer /> : null}
             {filteredLogs.slice(rawStart, rawEnd).map((entry, index) => {
               const i = rawStart + index
-              return <div className="raw-log-entry" data-row-index={i} key={`${entry.jobId}-${i}`}><span className="log-source-badge">{sourceLabel(entry.source)}</span><pre className={entry.stream}>{entry.line}</pre></div>
+              return <div className="raw-log-entry" data-row-index={i} key={`${entry.jobId}-${i}`}><span className="log-source-badge">{sourceLabel(entry.source)}</span><pre className={`${entry.stream}${migrationLogError(entry.line) ? ' migration-error' : ''}`}>{entry.line}</pre></div>
             })}
             {rawEnd < filteredLogs.length ? <div style={{ height: rawOffsets[filteredLogs.length] - rawOffsets[rawEnd] }} aria-hidden="true" data-window-spacer /> : null}
             {rawWindowed ? <span className="terminal-muted" data-window-note>{t('log.windowed', { shown: rawEnd - rawStart, total: filteredLogs.length })}</span> : null}

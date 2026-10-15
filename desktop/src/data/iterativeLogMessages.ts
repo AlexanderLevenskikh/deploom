@@ -16,3 +16,14 @@ export function iterativeLogMessages(log: string): string[] {
     return [line]
   })
 }
+
+export function iterativeLogEntries(log: string): Array<{ text: string; tone: 'error' | 'info' }> {
+  return log.split(/\r?\n/).flatMap(line => {
+    let failed = /ITERATIVE_MIGRATION_FAILURE_V1|\bFORBIDDEN_MUTATION\b|\bAGENT_REPAIR_BUDGET_EXHAUSTED\b|^(?:Agent failed:|Autopilot stopped \(error\)|RuntimeError:|Error:|npm ERR!|npm error|error[: ]|fatal[: ]|Traceback \(|\[error\])/i.test(line.trim())
+    try {
+      const event = JSON.parse(line)
+      failed ||= event.type === 'error' || Boolean(event.error) || event.part?.type === 'error'
+    } catch { /* plain output */ }
+    return iterativeLogMessages(line).map(text => ({ text, tone: failed ? 'error' as const : 'info' as const }))
+  })
+}

@@ -923,6 +923,7 @@ textarea::placeholder {
 .iterative-pipeline-connector.on { background: var(--green); }
 .iterative-pipeline-connector.on > span { width: 100%; background: var(--green); animation: none; transform: none; }
 .iterative-log-messages { max-height: 380px; overflow: auto; }
+.iterative-log-message.error, .terminal pre.migration-error { color: var(--red); border-left: 3px solid var(--red); background: var(--red-soft); }
 .iterative-log-message { margin: 6px 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
 .iterative-autopilot-option { display: flex; align-items: center; gap: 10px; margin: 12px 0; padding: 12px; border: 1px solid var(--border); border-radius: 10px; font-size: 13px; font-weight: 600; }
 .migration-launch-settings { margin: 16px auto; max-width: 980px; }

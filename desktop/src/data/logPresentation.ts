@@ -67,9 +67,14 @@ function outputSummary(value: unknown): string {
   return output
 }
 
+export function migrationLogError(line: string): boolean {
+  return /\b(?:FORBIDDEN_MUTATION|AGENT_REPAIR_BUDGET_EXHAUSTED|ITERATIVE_MIGRATION_FAILURE_V1)\b|^(?:Agent failed:|Autopilot stopped \(error\)|RuntimeError:|Error:|npm ERR!|npm error|error[: ]|fatal[: ]|Traceback \(|\[error\])/i.test(line.trim())
+}
+
 function parseAgentLine(line: string): PresentedLog | undefined {
   const trimmed = line.trim()
   if (!trimmed) return undefined
+  if (migrationLogError(trimmed)) return { kind: 'error', title: 'Ошибка', body: clean(trimmed) }
   let event: Record<string, unknown>
   try {
     event = JSON.parse(trimmed) as Record<string, unknown>
@@ -190,6 +195,7 @@ export function presentLogs(logs: JobOutput[]): PresentedLog[] {
       const body = clean(entry.line)
       const userMessage = /^Вы → агент:\s*(.*)$/s.exec(body)
       if (userMessage) result.push({ kind: 'user', title: 'Вы', body: userMessage[1].trim(), ...(entry.source ? { source: entry.source } : {}) })
+      else if (migrationLogError(body)) result.push({ kind: 'error', title: 'Ошибка', body, ...(entry.source ? { source: entry.source } : {}) })
       else if (!isTransientSystemProgress(body)) result.push({ kind: 'system', body, ...(entry.source ? { source: entry.source } : {}) })
       continue
     }

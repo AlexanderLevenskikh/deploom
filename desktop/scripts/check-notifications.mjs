@@ -45,22 +45,22 @@ try {
   startAttempt(dir, "demo", "none", undefined, 0, "workspace-a");
   publish();
   updateAttempt(dir, { status: "done", stage: "begin", lastStep: "checked" });
-  assert.equal(publish()[0].stage, "Проверка проекта");
+  assert.equal(publish()[0].stage, "Проверка → Подбор версий");
   assert.deepEqual(publish(), []);
   resumeAttempt(dir, "demo", "workspace-a");
-  publish();
-  updateAttempt(dir, { stepsDone: ["plan-next"] });
-  assert.equal(publish().length, 1);
+  assert.equal(publish()[0].stage, "Подбор версий → Обновление");
+  updateAttempt(dir, { stage: "drive", stepsDone: ["plan-next"] });
   assert.deepEqual(publish(), []);
-  updateAttempt(dir, { stepsDone: ["plan-next", "materialize"] });
-  assert.equal(publish()[0].stage, "Подготовка проверочного окружения");
+  updateAttempt(dir, { stepsDone: ["plan-next", "materialize", "verify"] });
+  assert.deepEqual(publish(), [], "per-command events must remain silent");
   updateAttempt(dir, { status: "done", lastStep: "cohort-review" });
-  assert.equal(publish()[0].kind, "stage-attention");
+  assert.deepEqual(publish(), [], "cohort approval is an on-screen action");
   resumeAttempt(dir, "demo", "workspace-a");
-  updateAttempt(dir, { stepsDone: [] });
-  publish();
-  updateAttempt(dir, { stepsDone: ["plan-next"] });
-  assert.equal(publish().length, 1, "the next cohort must not be suppressed");
+  updateAttempt(dir, { stepsDone: [] }); publish();
+  updateAttempt(dir, { stage: "drive", stepsDone: ["plan-next", "materialize", "verify"] });
+  assert.deepEqual(publish(), [], "next cohort must not replay the major-stage notification");
+  updateAttempt(dir, { status: "done", stage: "agent", phase: "delivery", lastStep: "delivery" });
+  assert.equal(publish()[0].stage, "Обновление → Результат");
   updateAttempt(dir, { status: "canceled", cancelRequested: true });
   assert.deepEqual(publish(), []);
   startAttempt(dir, "demo", "none", undefined, 0, "workspace-b");
@@ -73,16 +73,23 @@ try {
     "restart must not replay previously completed steps");
 } finally { rmSync(dir, { recursive: true, force: true }); }
 
-// Autopilot is quiet about selection/review, while errors and completed stages remain visible.
+// Autopilot reports major transitions and only supervisor-confirmed stops.
 {
   const observe = createIterativeNotificationObserver();
-  const base = {attemptId:'auto',workspaceId:'w',projectName:'demo',status:'running',stage:'drive',stepsDone:[]};
-  observe(base, {autopilot:true});
-  assert.deepEqual(observe({...base,stepsDone:['plan-next']}, {autopilot:true}), []);
-  const completed = observe({...base,stepsDone:['plan-next','verify']}, {autopilot:true});
-  assert.equal(completed[0].kind, 'iterative-stage-complete');
-  assert.deepEqual(observe({...base,stepsDone:['plan-next','verify'],status:'done',lastStep:'cohort-review'}, {autopilot:true}), []);
-  assert.equal(observe({...base,status:'failed',lastError:'CHECK_FAILED'}, {autopilot:true}).at(-1).kind, 'stage-failed');
+  const base = {attemptId:'auto',workspaceId:'w',projectName:'demo',status:'running',stage:'begin',stepsDone:[]};
+  assert.deepEqual(observe(base, {autopilot:true}), []);
+  assert.equal(observe({...base,phase:'begin.discovery'}, {autopilot:true})[0].stage, 'Проверка → Подбор версий');
+  const drive = {...base,stage:'drive'};
+  assert.equal(observe(drive, {autopilot:true})[0].stage, 'Подбор версий → Обновление');
+  for (let cohort=0;cohort<100;cohort++) {
+    assert.deepEqual(observe({...drive,stepsDone:['plan-next','materialize','verify']}, {autopilot:true}), []);
+    assert.deepEqual(observe({...drive,status:'failed',stage:'agent',lastError:'FORBIDDEN_MUTATION: runtime'}, {autopilot:true}), []);
+    assert.deepEqual(observe(drive, {autopilot:true}), []);
+  }
+  const failed = {...drive,status:'failed',lastError:'CHECK_FAILED'};
+  assert.deepEqual(observe(failed, {autopilot:true}), []);
+  assert.equal(observe(failed, {autopilot:true,stopped:true})[0].kind, 'stage-failed');
+  assert.deepEqual(observe(failed, {autopilot:true,stopped:true}), []);
 }
 let enabled = true, supported = true, failures = 0, clicks = 0;
 const native = [];
@@ -109,7 +116,7 @@ assert.equal(failures, 3);
 const completion = flowNotificationContent({ kind: "iterative-run-complete", projectName: "demo" });
 assert.match(completion.title, /Прогон завершён/);
 assert.ok(!completion.body.includes("опубликованы"), "stopping a run does not prove publication");
-for (const marker of ["broadcastIterativeAttempt(attempt)", "observeIterativeNotifications(attempt, { autopilot: iterativeNotificationAutopilot(attempt) })", "summary.stopped === 'finished'", "FLOW_NOTIFICATION_FAILED", "if (!job.cancelled)"]) {
+for (const marker of ["broadcastIterativeAttempt(attempt)", "observeIterativeNotifications(attempt, { autopilot: iterativeNotificationAutopilot(attempt), stopped })", "summary.stopped === 'finished'", "FLOW_NOTIFICATION_FAILED", "if (!job.cancelled)"]) {
   assert.ok(main.includes(marker), "Missing notification boundary: " + marker);
 }
 console.log("Iterative journal, native delivery failures and notification deduplication OK");
@@ -144,7 +151,7 @@ try {
   const seen = createIterativeNotificationObserver(), events = [];
   const stopped = runInNewContext("(" + stoppedCallback + ")", {
     autopilotRunDir: () => stoppedDir, updateAttempt, readAttempt, recordAttemptLog,
-    publishIterativeAttempt: () => { const record = readAttempt(stoppedDir); if (record) events.push(...seen(record)); },
+    publishIterativeAttempt: (_directory, stopped = false) => { const record = readAttempt(stoppedDir); if (record) events.push(...seen(record, {autopilot:true, stopped})); },
     showFlowNotification: event => events.push(event),
   });
   const scope = { workspaceId: "workspace", projectName: "demo" };

@@ -167,5 +167,13 @@ const iterativeJs = ts.transpileModule(iterativeSource, { compilerOptions: { tar
 const iterativeView = await import(`data:text/javascript;base64,${Buffer.from(iterativeJs).toString('base64')}`);
 const messages = iterativeView.iterativeLogMessages('ITERATIVE_MIGRATION_STATUS_V1 '+JSON.stringify({event:'begin.check-output',message:'line one\nline two'})+'\n'+JSON.stringify({schemaVersion:1,run:{phase:'REPAIRING',activeCheckpointId:'C0'},candidate:{large:'payload'}}));
 if (messages.length !== 2 || messages[0] !== 'line one\nline two' || messages[1].includes('payload')) throw new Error('Iterative log messages leaked machine state or lost multiline output');
+const rejected = 'Agent failed: FORBIDDEN_MUTATION: modified:.opencode/package.json';
+for (const stream of ['system','stdout','stderr']) {
+  const failure = module.presentLogs([{jobId:'fixture',stream,line:rejected+'\n'}]);
+  if (failure[0]?.kind !== 'error') throw Error('Explicit migration failure must be red on '+stream);
+}
+const colored = iterativeView.iterativeLogEntries(rejected+'\nDisputed repair trial discarded; continuing from the last verified checkpoint.\nITERATIVE_MIGRATION_STATUS_V1 '+JSON.stringify({event:'plan-next.candidate'}));
+if (colored[0].tone !== 'error' || colored[1].tone !== 'info' || colored[2].tone !== 'info') throw Error('A failed cohort must be red without marking the next active cohort failed');
+if (iterativeView.iterativeLogEntries(JSON.stringify({type:'error',error:{message:'Provider unavailable'}}))[0].tone !== 'error') throw Error('Typed provider failures must be red');
 console.log("OpenCode/Claude JSONL presentation OK");
 

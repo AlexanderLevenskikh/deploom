@@ -35,7 +35,7 @@ export const ru: Record<TranslationKey, string> = {
   "app.theme.system": "Системная тема",
   "app.theme.dark": "Тёмная тема",
   "app.notifications": "Уведомления",
-  "app.notificationsTitle": "Показывать системные Windows-уведомления после каждого завершённого этапа FLOW и каждой мигрированной группы.",
+  "app.notificationsTitle": "Уведомлять о переходах между основными этапами, завершении и ошибках, остановивших процесс.",
   "app.update.restart": "Перезапустить и обновить до {version}",
   "app.update.newVersion": "новой версии",
   "app.update.downloading": "Скачивание {percent}%",
