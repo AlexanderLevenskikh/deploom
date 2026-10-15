@@ -7893,7 +7893,7 @@ function setupIpc(): void {
           trimLog: () => {},
         }, iterativeStreamPlatform, undefined, { onSpawn: (_pid, child) => { if (child) { ownedChild = child; auditChildren.add(child) } } })
         if (result.timedOut) throw new Error('AUDIT_TIMEOUT: audit did not complete within its collection budget')
-        if (result.canceled) throw new Error('AUDIT_INTERRUPTED: audit stopped; previous evidence preserved')
+        if (result.canceled || auditShuttingDown || canceledAudits.has(operationId)) throw new Error('AUDIT_INTERRUPTED: audit stopped; previous evidence preserved')
         if (result.code !== 0) throw new Error(result.stderr.trim() || 'INITIAL_AUDIT_FAILED')
       } finally { canceledAudits.delete(operationId); if (ownedChild) auditChildren.delete(ownedChild); flushJournal(logDir) }
     },

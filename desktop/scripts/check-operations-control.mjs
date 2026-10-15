@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { runInNewContext } from 'node:vm';
@@ -61,6 +61,24 @@ try {
     operationsStopping: false,
   };
   const source = readFileSync(new URL('../dist-electron/main.js', import.meta.url), 'utf8');
+  // A killed child can close before the stream cancellation timer observes the
+  // request. The explicit audit owner still determines interruption, never error.
+  const auditDirectory = join(fixture, 'audit'); mkdirSync(auditDirectory);
+  const auditStart = source.indexOf('    const projectAudits = createProjectAuditController(');
+  const auditEnd = source.indexOf('    const initialAuditJobs = projectAudits.jobs;', auditStart);
+  assert.ok(auditStart >= 0 && auditEnd > auditStart);
+  let auditDependencies;
+  const auditContext = {
+    createProjectAuditController: dependencies => { auditDependencies = dependencies; return {} },
+    join, writeFileSync, readFileSync, mkdirSync,
+    canceledAudits: new Set(['canceled-operation']), auditShuttingDown: false, auditChildren: new Set(),
+    spawnIterativeStreamed: async () => ({code:1, canceled:false, stderr:'killed before polling'}),
+    resolveExecutable: () => 'fixture-python', bundledToolDir: () => fixture, iterativeStreamPlatform: {},
+    flushJournal: () => {},
+  };
+  runInNewContext(source.slice(auditStart, auditEnd), auditContext);
+  await assert.rejects(auditDependencies.run({runDir:auditDirectory, inputs:{}, context:{hash:'fixture'}, workspacePath:fixture}, 'canceled-operation'), /AUDIT_INTERRUPTED/);
+  assert.equal(auditContext.canceledAudits.size, 0, 'Audit cancellation ownership is released');
   const start = source.indexOf('    updateRestartBlockers = () => {');
   const end = source.indexOf("    ipcMain.handle('flow:storage-status'", start);
   assert.ok(start >= 0 && end > start);
