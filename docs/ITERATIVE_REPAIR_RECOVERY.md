@@ -6,20 +6,45 @@ require authoritative verification before a cumulative checkpoint is accepted.
 
 ## Provider runtime and project dependencies
 
-OpenCode may install/update its plugin under the selected trial project's
-`.opencode/`. The repair guard recognizes only its plugin-only `package.json`
-and matching npm v3 `package-lock.json`: explicit OpenCode provider, exact
-project path, ordinary physical files, matching `@opencode-ai/plugin` version.
-Missing files, links, additional manifest keys/dependencies or inconsistent
-locks retain the ordinary guard. This is not an exemption for `.opencode/`
-as a whole or for arbitrary nested manifests.
+Runtime recognition lives in `desktop/electron/agent-runtime-policy.ts` behind
+a policy version (`AGENT_RUNTIME_POLICY_VERSION`) and an explicit adapter
+registry; `iterative-agent.ts` consumes it through one classifier
+(`classifyTrialChanges`) that also runs the dependency guard, so every trial
+mutation gets a single verdict (source-config / dependency-blocked /
+confirmed-runtime / unreadable). Only OpenCode is currently CONFIRMED and
+therefore allowed an in-trial exemption; claude, codex and any unknown provider
+are STRICT (nothing exempt) until their launcher is verified to place runtime
+files in a trial. A provider is never inferred from folder presence.
 
-Those two runtime files cannot count as source repair evidence or appear in
-agent feedback's changed-file list. They remain part of the source snapshot
+OpenCode may install/update its plugin under the selected trial project's
+`.opencode/`. The policy recognizes only its plugin-only `package.json` and
+matching npm v3 `package-lock.json`: explicit OpenCode provider, exact project
+path inside the workspace, ordinary physical files, matching
+`@opencode-ai/plugin` version. Missing files, symlinked directories, links,
+additional manifest keys/dependencies or inconsistent locks retain the ordinary
+guard. This is not an exemption for `.opencode/` as a whole or for arbitrary
+nested manifests: `dist/package.json`, `.opencode/config.json` and any other
+real manifest keep the ordinary guard (`ITERATIVE_FORBIDDEN_NAMES`).
+
+Those recognized runtime files cannot count as source repair evidence or appear
+in agent feedback's changed-file list. They remain part of the source snapshot
 used for fresh verification. Project manifests and lockfiles stay immutable.
 The original durable baseline works after restart, including a trial whose
 plugin installation was already updated by an earlier provider invocation.
-No manual deletion or baseline rewrite is required for a recognized runtime.
+
+An unreadable baseline or unreadable changed file FAILS CLOSED: the repair is
+not verified, never credited, and `repairProgressFingerprint` earns no budget
+extension. Escaping project paths are rejected, and the classifier never walks
+down a symlinked directory.
+
+A REPEATED forbidden-mutation defect is persisted per run dir in
+`agent-blocker.json` (provider, policy version, base checkpoint, normalized
+violations fingerprint + candidate ids). The FIRST occurrence keeps the
+ordinary FORBIDDEN_MUTATION rejection; the same defect on a later candidate (or
+after a restart) ends with `AGENT_REPEATED_BLOCKER`, which stops the repair
+without discarding the verified checkpoint or spending another attempt. A newer
+base checkpoint or a different violations signature is a fresh defect, not a
+repeat.
 
 Unavailable OpenCode models are rejected before dispatch. JSONL provider
 errors, including errors from a process that exits zero, are reported as
@@ -67,8 +92,9 @@ new progress reporting applies to subsequently launched steps.
 - `tests/regression/test_iterative_atomic_write.py` includes a real Windows
   reader that temporarily denies replacement of the durable state file.
 - `check:iterative-agent` covers runtime updates against an existing baseline,
-  unchanged project-manifest guards, inconsistent locks, provider failures and
-  the actual Python feedback handoff.
+  unchanged project-manifest guards, inconsistent locks, strict providers,
+  classified/fail-closed reports, the repeated blocker and the actual Python
+  feedback handoff.
 - `check:iterative-scenario` covers adoption, cancellation, disabling and an
   identical repeated repair gate. Log checks cover persistence across attempts.
 - check:iterative-stream exercises a real Python progress reporter through

@@ -18,9 +18,13 @@
 //     changed-file scope) is then invoked with the real CLI.
 import { createHash } from 'node:crypto'
 import { agentLaunchProviderError } from './agent-launch-errors.js'
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, lstatSync, statSync, unlinkSync, writeFileSync, renameSync, appendFileSync } from 'node:fs'
-import { dirname, join, resolve, sep } from 'node:path'
+import { existsSync, mkdirSync, readdirSync, readFileSync, lstatSync, statSync, unlinkSync, writeFileSync, renameSync, appendFileSync } from 'node:fs'
+import { dirname, join, sep } from 'node:path'
 import type { AgentLaunchDiagnostics } from './agent-launch-errors.js'
+import { runtimePolicyFor, type AgentRuntimeScope, type ClassifiedTrialChange, type TrialMutationKind } from './agent-runtime-policy.js'
+
+export { AGENT_RUNTIME_POLICY_VERSION, openCodeRuntimeManifestPaths } from './agent-runtime-policy.js'
+export type { AgentRuntimeScope, TrialMutationKind } from './agent-runtime-policy.js'
 
 export type IterativeRepairRequest = {
   requestId: string
@@ -272,81 +276,46 @@ export function isForbiddenTrialRelative(relativePath: string): boolean {
   return false
 }
 
-export type AgentRuntimeScope = { provider: string; projectRelative: string }
-
-/** Recognize only OpenCode's own plugin installation, never project manifests.
- * The explicit provider/project scope, physical paths and plugin-only shape
- * are all required. Runtime files remain in source verification, but cannot
- * count as source repair evidence or be sent to Python as changed manifests. */
-export function openCodeRuntimeManifestPaths(workspaceRoot: string, scope?: AgentRuntimeScope): Set<string> {
-  const result = new Set<string>()
-  if (scope?.provider !== 'opencode') return result
-  const project = resolve(workspaceRoot, scope.projectRelative)
-  const root = resolve(workspaceRoot)
-  if (project !== root && !project.startsWith(root + sep)) return result
-  // OpenCode also bootstraps at the manager root for nested monorepo projects.
-  if (project !== root) {
-    for (const path of openCodeRuntimeManifestPaths(workspaceRoot, { ...scope, projectRelative: '.' })) result.add(path)
-  }
-  const directory = join(project, '.opencode')
-  try {
-    if (realpathSync(directory).toLowerCase() !== directory.toLowerCase()) return result
-    const manifestPath = join(directory, 'package.json')
-    const lockPath = join(directory, 'package-lock.json')
-    if (!lstatSync(manifestPath).isFile() || !lstatSync(lockPath).isFile()) return result
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-    const deps = manifest.dependencies
-    if (Object.keys(manifest).some(key => key !== 'dependencies')) return result
-    if (!deps || Object.keys(deps).length !== 1 || typeof deps['@opencode-ai/plugin'] !== 'string') return result
-    const version = deps['@opencode-ai/plugin']
-    if (!/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(version)) return result
-    const lock = JSON.parse(readFileSync(lockPath, 'utf8'))
-    const lockedRoot = lock.packages?.['']
-    if (lock.name !== '.opencode' || lock.lockfileVersion !== 3 || !lockedRoot) return result
-    if (Object.keys(lockedRoot).some(key => key !== 'dependencies')) return result
-    if (JSON.stringify(lockedRoot.dependencies) !== JSON.stringify(deps)) return result
-    const plugin = lock.packages?.['node_modules/@opencode-ai/plugin']
-    if (plugin?.version !== version) return result
-    const prefix = scope.projectRelative.replace(/\\/g, '/').replace(/^\.\/?$/, '').replace(/\/$/, '')
-    for (const file of ['package.json', 'package-lock.json']) {
-      result.add(`${prefix ? prefix + '/' : ''}.opencode/${file}`)
-    }
-  } catch {
-    // Missing, linked or unrecognized runtime files keep the ordinary guard.
-  }
-  return result
-}
-
-export type TrialMutationKind = 'modified' | 'added' | 'removed'
 export type TrialMutation = { path: string; kind: TrialMutationKind; forbidden: boolean }
 
-/** Classify every significant trial mutation against the durable baseline:
- * modified / added / removed, each flagged as planner-forbidden when the path
- * name matches ITERATIVE_FORBIDDEN_NAMES. The agent text is never the source
- * of truth — this hash diff is. */
-export function classifyTrialMutations(workspaceRoot: string, baselineFile: string): TrialMutation[] {
+type CollectedTrialMutations = {
+  baselineUnreadable: boolean
+  mutations: TrialMutation[]
+  unreadable: TrialMutation[]
+}
+
+/** Single pass over the durable baseline and the current trial. Reports
+ *  modified/added/removed for every significant file, keeps planner-forbidden
+ *  classification, and separates files whose content could not be measured
+ *  (unreadable) instead of silently treating "cannot prove" as "no change". */
+function collectTrialMutations(workspaceRoot: string, baselineFile: string): CollectedTrialMutations {
   let baseline: Record<string, string>
   try {
     baseline = JSON.parse(readFileSync(baselineFile, 'utf8')) as Record<string, string>
   } catch {
-    return []
+    return { baselineUnreadable: true, mutations: [], unreadable: [] }
   }
   const mutations: TrialMutation[] = []
+  const unreadable: TrialMutation[] = []
   const seen = new Set<string>()
   for (const [relativePath, expected] of Object.entries(baseline)) {
     const key = relativePath.replace(/\\/g, '/')
     seen.add(key)
     const absolute = join(workspaceRoot, relativePath.split('/').join(sep))
+    const forbidden = isForbiddenTrialRelative(key)
     let actual: string | undefined
+    let failed = false
     try {
       actual = fileHash(absolute)
     } catch {
-      actual = undefined
+      failed = true
     }
-    if (actual === undefined && !existsSync(absolute)) {
-      mutations.push({ path: key, kind: 'removed', forbidden: isForbiddenTrialRelative(key) })
-    } else if (actual !== undefined && actual !== expected) {
-      mutations.push({ path: key, kind: 'modified', forbidden: isForbiddenTrialRelative(key) })
+    if (failed && existsSync(absolute)) {
+      unreadable.push({ path: key, kind: 'modified', forbidden })
+    } else if (!existsSync(absolute)) {
+      mutations.push({ path: key, kind: 'removed', forbidden })
+    } else if (actual !== expected) {
+      mutations.push({ path: key, kind: 'modified', forbidden })
     }
   }
   const stack: string[] = ['']
@@ -370,36 +339,98 @@ export function classifyTrialMutations(workspaceRoot: string, baselineFile: stri
       }
       const relativePath = relativeDir ? `${relativeDir}${sep}${name}` : name
       const key = relativePath.replace(/\\/g, '/')
+      const forbidden = isForbiddenTrialRelative(key)
       if (stats.isDirectory()) {
+        // A symlinked directory is treated as a leaf: never descend through a
+        // link out of the trial, so a runtime tree or host mount outside the
+        // trial cannot be walked as if it were project content.
+        let isLink = true
+        try {
+          isLink = lstatSync(absolute).isSymbolicLink()
+        } catch {
+          isLink = true
+        }
+        if (isLink) {
+          if (!seen.has(key)) mutations.push({ path: key, kind: 'added', forbidden })
+          continue
+        }
         stack.push(relativePath)
       } else if (stats.isFile() && !seen.has(key)) {
-        mutations.push({ path: key, kind: 'added', forbidden: isForbiddenTrialRelative(key) })
+        let failed = false
+        try {
+          fileHash(absolute)
+        } catch {
+          failed = true
+        }
+        if (failed) unreadable.push({ path: key, kind: 'added', forbidden })
+        else mutations.push({ path: key, kind: 'added', forbidden })
       }
     }
   }
-  return mutations
+  return { baselineUnreadable: false, mutations, unreadable }
+}
+
+/** Backwards-compatible mutation list (see collectTrialMutations). Unreadable
+ *  content and an unreadable baseline yield an empty list so callers that
+ *  grant progress (repairProgressFingerprint) fail closed on that. */
+export function classifyTrialMutations(workspaceRoot: string, baselineFile: string): TrialMutation[] {
+  return collectTrialMutations(workspaceRoot, baselineFile).mutations
+}
+
+/** Per-change verdict from ONE pass over the trial, combining the dependency
+ *  guard with the provider runtime policy. Fail-closed fields let the caller
+ *  refuse to trust an unmeasurable baseline. */
+export type TrialChangeReport = {
+  baselineUnreadable: boolean
+  policyVersion: number
+  runtimePaths: Set<string>
+  changes: ClassifiedTrialChange[]
+  unreadable: ClassifiedTrialChange[]
+  changedFiles: string[]
+  forbidden: Array<`${TrialMutationKind}:${string}`>
+}
+
+function classifyMutation(mutation: TrialMutation, runtimePaths: Set<string>): ClassifiedTrialChange {
+  if (runtimePaths.has(mutation.path)) {
+    return { path: mutation.path, kind: mutation.kind, category: 'confirmed-runtime', reason: 'provider runtime file confirmed by its narrow plugin shape' }
+  }
+  if (mutation.forbidden) {
+    return { path: mutation.path, kind: mutation.kind, category: 'dependency-blocked', reason: 'planner-owned dependency file name (ITERATIVE_FORBIDDEN_NAMES)' }
+  }
+  return { path: mutation.path, kind: mutation.kind, category: 'source-config', reason: 'ordinary source/config change' }
+}
+
+/** Classify every trial mutation ONCE under the provider runtime policy. The
+ *  policy is recomputed against CURRENT bytes so recognition is never stale;
+ *  escaping project paths and unknown/strict providers exempt nothing. */
+export function classifyTrialChanges(workspaceRoot: string, baselineFile: string, scope?: AgentRuntimeScope): TrialChangeReport {
+  const policy = runtimePolicyFor(scope?.provider ?? 'unknown', { workspaceRoot, projectRelative: scope?.projectRelative ?? '.' })
+  const runtimePaths = policy.runtimeRelativePaths()
+  const collected = collectTrialMutations(workspaceRoot, baselineFile)
+  const changes = collected.mutations.map(mutation => classifyMutation(mutation, runtimePaths))
+  const unreadable = collected.unreadable.map(mutation => classifyMutation(mutation, runtimePaths))
+  for (const item of unreadable) item.category = 'unreadable'
+  return {
+    baselineUnreadable: collected.baselineUnreadable,
+    policyVersion: policy.version,
+    runtimePaths,
+    changes,
+    unreadable,
+    changedFiles: changes.filter(item => item.category === 'source-config').map(item => item.path).sort(),
+    forbidden: changes.filter(item => item.category === 'dependency-blocked').map(item => `${item.kind}:${item.path}` as `${TrialMutationKind}:${string}`).sort(),
+  }
 }
 
 /** Planner-owned files the agent changed or deleted. A non-empty result MUST
  * reject the repair before feedback/verification. */
 /** Hash a completed repair once for both source evidence and guard violations.
  * The returned observation is consumed immediately, never cached across work. */
-export function inspectTrialChanges(workspaceRoot: string, baselineFile: string, scope?: AgentRuntimeScope) {
-  const runtimePaths = openCodeRuntimeManifestPaths(workspaceRoot, scope)
-  const mutations = classifyTrialMutations(workspaceRoot, baselineFile)
-  return {
-    runtimePaths,
-    changedFiles: mutations.filter(item => !item.forbidden).map(item => item.path).sort(),
-    forbidden: mutations.filter(item => item.forbidden && !runtimePaths.has(item.path)).map(item => `${item.kind}:${item.path}`).sort(),
-  }
+export function inspectTrialChanges(workspaceRoot: string, baselineFile: string, scope?: AgentRuntimeScope): TrialChangeReport {
+  return classifyTrialChanges(workspaceRoot, baselineFile, scope)
 }
 
 export function forbiddenTrialViolations(workspaceRoot: string, baselineFile: string, scope?: AgentRuntimeScope): string[] {
-  const runtimePaths = openCodeRuntimeManifestPaths(workspaceRoot, scope)
-  return classifyTrialMutations(workspaceRoot, baselineFile)
-    .filter((mutation) => mutation.forbidden && !runtimePaths.has(mutation.path))
-    .map((mutation) => `${mutation.kind}:${mutation.path}`)
-    .sort()
+  return classifyTrialChanges(workspaceRoot, baselineFile, scope).forbidden
 }
 
 /** Durable baseline of the trial project: relative path -> sha256. Written
@@ -454,10 +485,7 @@ export function agentPromptFile(runDir: string): string {
  * forbiddenTrialViolations) and installation noise. Paths are relative to
  * workspaceRoot, matching apply-feedback's scope check. */
 export function changedFilesFromBaseline(workspaceRoot: string, baselineFile: string): string[] {
-  return classifyTrialMutations(workspaceRoot, baselineFile)
-    .filter((mutation) => !mutation.forbidden)
-    .map((mutation) => mutation.path)
-    .sort()
+  return classifyTrialChanges(workspaceRoot, baselineFile).changedFiles
 }
 
 /** Path of the project inside the trial, relative to the durable run dir. */
@@ -681,6 +709,101 @@ export function clearAgentLease(file: string): void {
   } catch {
     // best-effort cleanup; a stale lease simply expires via agentLeaseAlive
   }
+}
+
+// Repeated-blocker durability: a persisted record that makes the SAME
+// forbidden-mutation defect (same provider, same policy version, same base
+// checkpoint, same violation profile) fatal for a NEW candidate instead of
+// spending another attempt. The record lives in the run dir, survives agent
+// restarts, and lists the candidateIds it has already rejected.
+export const AGENT_BLOCKER_FILENAME = 'agent-blocker.json'
+
+export function agentBlockerFile(runDir: string): string {
+  return join(runDir, AGENT_BLOCKER_FILENAME)
+}
+
+/** Canonical violation shape for fingerprints: lowercase, forward slashes, no
+ *  leading "./". Different OS spellings of the same file must collide. */
+export function normalizeViolationPath(value: string): string {
+  return value.trim().toLowerCase().replace(/\\/g, '/').replace(/^\.\/+/, '')
+}
+
+export type RepeatedBlockerRecord = {
+  schemaVersion: 1
+  provider: string
+  policyVersion: number
+  reasonCode: string
+  baseCheckpointId: string
+  fingerprint: string
+  violations: string[]
+  candidateIds: string[]
+}
+
+/** Sign one blocking outcome. The candidate id is intentionally EXCLUDED (it
+ *  is the thing being matched), and baseCheckpointId is INCLUDED so a repair
+ *  against a newer baseline is a fresh defect, not a repeat. */
+export function repeatedBlockerFingerprint(context: {
+  provider: string
+  policyVersion: number
+  reasonCode: string
+  baseCheckpointId: string
+  violations: string[]
+}): string {
+  const normalized = [...new Set(context.violations.map(normalizeViolationPath))].sort()
+  return createHash('sha256').update(JSON.stringify([context.provider, context.policyVersion, context.reasonCode, context.baseCheckpointId, normalized])).digest('hex')
+}
+
+export function readAgentBlocker(file: string): RepeatedBlockerRecord | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as unknown
+    if (!parsed || typeof parsed !== 'object') return undefined
+    const record = parsed as Partial<RepeatedBlockerRecord>
+    if (record.schemaVersion !== 1 || typeof record.provider !== 'string' || typeof record.fingerprint !== 'string') return undefined
+    if (!Array.isArray(record.violations) || !Array.isArray(record.candidateIds)) return undefined
+    return record as RepeatedBlockerRecord
+  } catch {
+    return undefined
+  }
+}
+
+export function writeAgentBlocker(file: string, record: RepeatedBlockerRecord): void {
+  mkdirSync(dirname(file), { recursive: true })
+  const temporary = `${file}.${process.pid}.tmp`
+  writeFileSync(temporary, JSON.stringify(record), 'utf8')
+  renameSync(temporary, file)
+}
+
+/** Durable per-candidate blocking. Persists the blocking signature on its FIRST
+ *  occurrence and rejects later candidates that repeat it. A different provider,
+ *  policy version or baseline is a different defect and must not match. */
+export function resolveRepeatedBlocker(file: string, current: {
+  provider: string
+  policyVersion: number
+  reasonCode: string
+  baseCheckpointId: string
+  candidateId: string
+  violations: string[]
+}): { repeated: boolean; stored: RepeatedBlockerRecord | undefined } {
+  const fingerprint = repeatedBlockerFingerprint(current)
+  const existing = readAgentBlocker(file)
+  if (existing && existing.fingerprint === fingerprint) {
+    if (!existing.candidateIds.includes(current.candidateId)) {
+      writeAgentBlocker(file, { ...existing, candidateIds: [...existing.candidateIds, current.candidateId] })
+    }
+    return { repeated: true, stored: existing }
+  }
+  const stored: RepeatedBlockerRecord = {
+    schemaVersion: 1,
+    provider: current.provider,
+    policyVersion: current.policyVersion,
+    reasonCode: current.reasonCode,
+    baseCheckpointId: current.baseCheckpointId,
+    fingerprint,
+    violations: [...new Set(current.violations.map(normalizeViolationPath))].sort(),
+    candidateIds: [current.candidateId],
+  }
+  writeAgentBlocker(file, stored)
+  return { repeated: false, stored }
 }
 
 /** True when the durable lease currently describes a parked launch-wait

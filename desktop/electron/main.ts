@@ -79,7 +79,8 @@ import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
 import { type IterativeAttemptRecord, beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, readRunLogTail, recordAttemptLog, recordAttemptProgress, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
 import { spawnIterativeStreamed, type CaptureResult, type StreamAttemptIo, type StreamPlatform } from './iterative-stream.js'
-import { extendRepairBudget, repairProgressFingerprint, agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, inspectTrialChanges, clearAgentLease, decideAgentLeaseDispatch, forbiddenTrialViolations, iterativeApplyFeedbackInvocation, agentProviderFailure, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, recordAgentDispatchTiming, trialBaselineFile, trialProjectPath, withAgentDispatchLock, writeAgentLease, writeTrialBaseline } from './iterative-agent.js'
+import { extendRepairBudget, repairProgressFingerprint, agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, inspectTrialChanges, clearAgentLease, decideAgentLeaseDispatch, iterativeApplyFeedbackInvocation, agentProviderFailure, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, recordAgentDispatchTiming, trialBaselineFile, trialProjectPath, withAgentDispatchLock, writeAgentLease, writeTrialBaseline, classifyTrialChanges, agentBlockerFile, resolveRepeatedBlocker } from './iterative-agent.js'
+import type { TrialChangeReport } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
@@ -9245,8 +9246,9 @@ function setupIpc(): void {
         let agentWorkObserved = false
         const sessionOptions = {
           onDeadline: () => {
+            const guard = classifyTrialChanges(workspaceRoot, baselineFile, { provider, projectRelative })
             if (streamedProviderError || readAttempt(runDir)?.cancelRequested
-              || forbiddenTrialViolations(workspaceRoot, baselineFile, { provider, projectRelative }).length) return 0
+              || guard.baselineUnreadable || guard.forbidden.length) return 0
             const fingerprint = repairProgressFingerprint(workspaceRoot, baselineFile)
             const extended = extendRepairBudget(repairBudget, fingerprint)
             if (!extended || (Number.isFinite(runDeadline) && Date.now() >= runDeadline)) return 0
@@ -9376,11 +9378,41 @@ function setupIpc(): void {
           updateAttempt(runDir, { status: 'canceled', stage: 'agent', finishedAt: Date.now(), waitUntil: undefined, reason: 'Agent canceled by the user', lastError: undefined })
           return { ok: false, error: 'AGENT_CANCELED', agentOutputTail }
         }
+        // Persist + enforce the repeated blocker for planner-owned mutations:
+        // the FIRST occurrence returns the ordinary FORBIDDEN_MUTATION result;
+        // the same defect on a later candidate throws AGENT_REPEATED_BLOCKER so
+        // autopilot stops WITHOUT discarding the verified checkpoint.
+        const forbiddenMutationResult = (inspection: TrialChangeReport):
+          { ok: false; error: string; forbiddenMutations: string[]; agentOutputTail: string } | undefined => {
+          const { forbidden } = inspection
+          if (forbidden.length === 0) return undefined
+          const reasonCode = 'FORBIDDEN_MUTATION'
+          const resolved = resolveRepeatedBlocker(agentBlockerFile(runDir), {
+            provider,
+            policyVersion: inspection.policyVersion,
+            reasonCode,
+            baseCheckpointId: ctx.baseCheckpointId,
+            candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId,
+            violations: forbidden,
+          })
+          if (resolved.repeated) throw new Error(`AGENT_REPEATED_BLOCKER: ${reasonCode}: ${forbidden.join(', ')}`)
+          updateAttempt(runDir, { status: 'failed', stage: 'agent', lastStep: 'agent', finishedAt: Date.now(), lastError: `${reasonCode}: ${forbidden.join(', ')}` })
+          return {
+            ok: false,
+            error: `${reasonCode}: агент изменил файлы, принадлежащие планировщику: ${forbidden.join(', ')}. Manifest/lockfile и другие forbidden-файлы не могут быть правкой агента; откатите их в trial вручную и повторите ремонт.`,
+            forbiddenMutations: forbidden,
+            agentOutputTail,
+          }
+        }
         const repairTimedOut = agentTimedOut && agentWorkObserved && !streamedProviderError && !agentLaunchProviderError(output)
         const providerFailure = repairTimedOut ? undefined : agentProviderFailure(output, exitCode)
         if (repairTimedOut) {
-          const forbidden = forbiddenTrialViolations(workspaceRoot, baselineFile, { provider, projectRelative })
-          if (forbidden.length) throw new Error(`FORBIDDEN_MUTATION: ${forbidden.join(', ')}`)
+          const guard = classifyTrialChanges(workspaceRoot, baselineFile, { provider, projectRelative })
+          if (guard.baselineUnreadable) throw new Error('AGENT_BASELINE_UNREADABLE: cannot verify agent repair without readable baseline evidence')
+          if (guard.forbidden.length) {
+            forbiddenMutationResult(guard)
+            throw new Error(`FORBIDDEN_MUTATION: ${guard.forbidden.join(', ')}`)
+          }
           const lease = readAgentLease(leasePath)
           if (!lease) throw new Error('AGENT_REPAIR_SESSION_MISSING')
           preserveLease = true
@@ -9438,6 +9470,7 @@ function setupIpc(): void {
 
         const runtimeScope = { provider, projectRelative }
         const inspection = inspectTrialChanges(workspaceRoot, baselineFile, runtimeScope)
+        if (inspection.baselineUnreadable) throw new Error('AGENT_BASELINE_UNREADABLE: cannot verify agent repair without readable baseline evidence')
         const runtimePaths = inspection.runtimePaths
         if (runtimePaths.size > 0) {
           recordAttemptLog(runDir, 'OpenCode plugin runtime manifests recognized; excluded from repair evidence. Project manifests remain protected.\n')
@@ -9450,16 +9483,8 @@ function setupIpc(): void {
         // A planner-owned file (manifest/lock/.npmrc/...) that was modified,
         // added or removed is a violation and REJECTS the repair BEFORE any
         // feedback reaches Python and before any verification is attempted.
-        const forbidden = inspection.forbidden
-        if (forbidden.length > 0) {
-          updateAttempt(runDir, { status: 'failed', stage: 'agent', lastStep: 'agent', finishedAt: Date.now(), lastError: `FORBIDDEN_MUTATION: ${forbidden.join(', ')}` })
-          return {
-            ok: false,
-            error: `FORBIDDEN_MUTATION: агент изменил файлы, принадлежащие планировщику: ${forbidden.join(', ')}. Manifest/lockfile и другие forbidden-файлы не могут быть правкой агента; откатите их в trial вручную и повторите ремонт.`,
-            forbiddenMutations: forbidden,
-            agentOutputTail,
-          }
-        }
+        const blocked = forbiddenMutationResult(inspection)
+        if (blocked) return blocked
         // R5: the TYPED outcome drives the feedback. A zero exit AND real file
         // changes are required for READY_FOR_VERIFY; scheduling kinds carry
         // proposals and deliberately no changed files.

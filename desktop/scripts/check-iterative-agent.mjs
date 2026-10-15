@@ -8,6 +8,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   AGENT_LEASE_FILENAME,
+  AGENT_RUNTIME_POLICY_VERSION,
+  agentBlockerFile,
   agentProviderFailure,
   agentLeaseAlive,
   agentLeaseFile,
@@ -16,6 +18,7 @@ import {
   buildIterativeRepairPrompt,
   cancelWaitingAgentLease,
   changedFilesFromBaseline,
+  classifyTrialChanges,
   inspectTrialChanges,
   clearAgentLease,
   decideAgentLeaseDispatch,
@@ -24,8 +27,11 @@ import {
   openCodeRuntimeManifestPaths,
   parseAgentOutcome,
   parseChangedFilesFromAgentOutput,
+  readAgentBlocker,
   readAgentLease,
   recordAgentDispatchTiming,
+  repeatedBlockerFingerprint,
+  resolveRepeatedBlocker,
   trialBaselineFile,
   withAgentDispatchLock,
   writeAgentLease,
@@ -211,6 +217,7 @@ assert.deepEqual(forbiddenTrialViolations(workspace, runtimeBaseline, runtimeSco
 assert.deepEqual(inspectTrialChanges(workspace, runtimeBaseline, { ...runtimeScope, projectRelative: 'Web/App' }).forbidden, []);
 assert.deepEqual(inspectTrialChanges(workspace, runtimeBaseline, runtimeScope).changedFiles, changedFilesFromBaseline(workspace, runtimeBaseline));
 assert.equal(openCodeRuntimeManifestPaths(workspace, runtimeScope).size, 2);
+assert.equal(classifyTrialChanges(workspace, runtimeBaseline, runtimeScope).changes.find(c => c.path === '.opencode/package.json')?.category, 'confirmed-runtime', 'recognized runtime files are runtime evidence, never project repair');
 assert.equal(openCodeRuntimeManifestPaths(workspace, { ...runtimeScope, provider: 'codex' }).size, 0);
 assert.equal(changedFilesFromBaseline(workspace, runtimeBaseline).length, 0, 'Tool bootstrap alone is not a repair');
 writeJson(manifestPath, { dependencies: { 'is-number': '8.0.0' } });
@@ -231,6 +238,82 @@ writeJson(manifestPath, { dependencies: { 'is-number': '8.0.0' } });
 assert.deepEqual(forbiddenTrialViolations(workspace, runtimeBaseline, { ...runtimeScope, projectRelative: 'Web/App' }), ['modified:package.json']);
 writeJson(manifestPath, { dependencies: { 'is-number': '7.0.0' } });
 assert.equal(openCodeRuntimeManifestPaths(workspace, { ...runtimeScope, projectRelative: '../outside' }).size, 0);
+
+// 3c. Single-pass classifier + repeated-blocker coverage in isolation (no
+// interference with the handoff workspace used by the Python rounds below).
+{
+  const blockRoot = mkdtempSync(join(tmpdir(), "iter-agent-blocker-"));
+  const wt = join(blockRoot, "trial");
+  mkdirSync(wt);
+  const base = join(blockRoot, "baseline.json");
+  writeFileSync(join(wt, "app.js"), "1", "utf8");
+  writeFileSync(join(wt, "package.json"), "{}", "utf8");
+  writeTrialBaseline(wt, base);
+  writeFileSync(join(wt, "package.json"), '{ "deps": { "is-number": "7.0.0" } }', "utf8");
+  // Strict/unconfirmed providers exempt NOTHING: only a verified provider may
+  // remove its files from the guard, and a changed project manifest is always
+  // dependency-blocked, never silently "source" evidence.
+  for (const strictProvider of ["claude", "codex", "future-provider"]) {
+    const r = classifyTrialChanges(wt, base, { provider: strictProvider, projectRelative: "." });
+    assert.equal(r.policyVersion, AGENT_RUNTIME_POLICY_VERSION, "policy version must travel with the report");
+    assert.equal(r.baselineUnreadable, false);
+    assert.equal(r.runtimePaths.size, 0, `${strictProvider} must not claim an in-trial runtime exemption`);
+    assert.equal(r.changes.find(c => c.path === "package.json")?.category, "dependency-blocked");
+    assert.deepEqual(r.forbidden, ["modified:package.json"]);
+    assert.deepEqual(r.changedFiles, [], "forbidden manifests never ride the changed list");
+  }
+  const opencodeNone = classifyTrialChanges(wt, base, { provider: "opencode", projectRelative: "." });
+  assert.equal(opencodeNone.runtimePaths.size, 0, "absent runtime bytes exempt nothing, even for opencode");
+  assert.deepEqual(opencodeNone.forbidden, ["modified:package.json"]);
+  // Any forbidden NAME in any folder is a real project manifest, never runtime.
+  mkdirSync(join(wt, "dist"));
+  writeFileSync(join(wt, "dist", "package.json"), "{}", "utf8");
+  writeTrialBaseline(wt, base);
+  writeFileSync(join(wt, "dist", "package.json"), '{ "v": 2 }', "utf8");
+  const nested = classifyTrialChanges(wt, base, { provider: "opencode", projectRelative: "." });
+  assert.deepEqual(nested.forbidden, ["modified:dist/package.json"], "a real nested manifest is never runtime");
+  assert.deepEqual(nested.changedFiles, []);
+  // An unreadable baseline FAILS CLOSED: "cannot prove" is never "no change".
+  const badBase = join(blockRoot, "bad-baseline.json");
+  writeFileSync(badBase, "not json", "utf8");
+  const unread = classifyTrialChanges(wt, badBase, { provider: "opencode", projectRelative: "." });
+  assert.equal(unread.baselineUnreadable, true, "unreadable baseline must be reported");
+  assert.deepEqual(unread.changes, []);
+  assert.deepEqual(unread.forbidden, []);
+  assert.deepEqual(unread.changedFiles, []);
+  // Repeated blocker: the SAME defect (provider, policy, baseline, violations)
+  // on a NEW candidate is fatal and survives a restart; a newer baseline or a
+  // differently-spelled (OS-normalized) profile is a fresh defect, not a repeat.
+  const blockerFile = agentBlockerFile(join(blockRoot, "run"));
+  assert.ok(blockerFile.endsWith("agent-blocker.json"), "blocker path contract broken");
+  const firstOccurrence = resolveRepeatedBlocker(blockerFile, {
+    provider: "opencode", policyVersion: AGENT_RUNTIME_POLICY_VERSION, reasonCode: "FORBIDDEN_MUTATION",
+    baseCheckpointId: "C1", candidateId: "C2", violations: ["modified:package.json"],
+  });
+  assert.equal(firstOccurrence.repeated, false, "first occurrence is not a repeat");
+  assert.equal(readAgentBlocker(blockerFile).candidateIds.length, 1);
+  const sameDefectNewCandidate = resolveRepeatedBlocker(blockerFile, {
+    provider: "opencode", policyVersion: AGENT_RUNTIME_POLICY_VERSION, reasonCode: "FORBIDDEN_MUTATION",
+    baseCheckpointId: "C1", candidateId: "C3", violations: ["modified:package.json"],
+  });
+  assert.equal(sameDefectNewCandidate.repeated, true, "same defect on a new candidate must stay blocked");
+  assert.deepEqual(readAgentBlocker(blockerFile).candidateIds, ["C2", "C3"]);
+  const spelledSame = resolveRepeatedBlocker(blockerFile, {
+    provider: "opencode", policyVersion: AGENT_RUNTIME_POLICY_VERSION, reasonCode: "FORBIDDEN_MUTATION",
+    baseCheckpointId: "C1", candidateId: "C4", violations: [".\\Modified:package.json"],
+  });
+  assert.equal(spelledSame.repeated, true, "OS-normalized violations must fingerprint identically");
+  const newerBaseline = resolveRepeatedBlocker(blockerFile, {
+    provider: "opencode", policyVersion: AGENT_RUNTIME_POLICY_VERSION, reasonCode: "FORBIDDEN_MUTATION",
+    baseCheckpointId: "C5", candidateId: "C5", violations: ["modified:package.json"],
+  });
+  assert.equal(newerBaseline.repeated, false, "a newer baseline is a different defect, not a repeat");
+  assert.equal(
+    readAgentBlocker(blockerFile).fingerprint,
+    repeatedBlockerFingerprint({ provider: "opencode", policyVersion: AGENT_RUNTIME_POLICY_VERSION, reasonCode: "FORBIDDEN_MUTATION", baseCheckpointId: "C5", violations: ["modified:package.json"] }),
+  );
+  rmSync(blockRoot, { recursive: true, force: true });
+}
 
 // 4. Feedback payload carries ONLY the durable candidate identity.
 const feedback = buildFeedbackPayload(ctx, changed, "READY_FOR_VERIFY", "source adapted to is-number 7.0.0");
