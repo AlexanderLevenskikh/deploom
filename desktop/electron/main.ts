@@ -1,5 +1,6 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
 import updaterPackage from 'electron-updater'
+import { nextUpdaterStatus, type UpdateStatus } from './updater-state.js'
 import { readProjectManifest } from './project-manifest.js'
 import { isDeterministicToolFailure, isDeterministicSourcePreflightFailure, formatSourceCheckoutDirtyFailure } from './baseline-retry.js'
 import { StorageCleanupController } from './storage-cleanup.js'
@@ -448,8 +449,6 @@ type JobRecord = {
   // lets the desktop resolve the run result without guessing or stat-watching.
   runId?: string
 }
-
-type UpdateStatus = { state: 'idle' | 'checking' | 'available' | 'downloading' | 'current' | 'ready' | 'error'; version?: string; percent?: number; message?: string; authRequired?: boolean }
 
 const jobs = new Map<string, JobRecord>()
 const PROJECT_BACKGROUND_ACTIONS = new Set<FlowAction>(['preflight', 'baseline'])
@@ -2746,8 +2745,10 @@ function migrationRuntime(workspace: WorkspaceRecord, projectName: string): Reco
 }
 
 function publishUpdateStatus(status: UpdateStatus): void {
-  currentUpdateStatus = status
-  send('flow:update-status', status)
+  const next = nextUpdaterStatus(currentUpdateStatus, status, autoUpdater.autoDownload)
+  if (JSON.stringify(next) === JSON.stringify(currentUpdateStatus)) return
+  currentUpdateStatus = next
+  send('flow:update-status', next)
 }
 
 function publishUpdaterError(error: unknown): UpdateStatus {
@@ -9838,7 +9839,6 @@ function setupAutoUpdater(): void {
   autoUpdater.on('checking-for-update', () => publishUpdateStatus({ state: 'checking', version: downloadedUpdateVersion ?? currentUpdateStatus.version }))
   autoUpdater.on('update-available', (info) => publishUpdateStatus({ state: 'available', version: info.version }))
   autoUpdater.on('update-not-available', (info) => {
-    downloadedUpdateVersion = undefined
     publishUpdateStatus({ state: 'current', version: info.version })
   })
   autoUpdater.on('download-progress', (progress) => publishUpdateStatus({ state: 'downloading', version: currentUpdateStatus.version, percent: Math.round(progress.percent) }))
