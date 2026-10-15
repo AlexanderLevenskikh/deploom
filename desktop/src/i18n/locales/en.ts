@@ -1,4 +1,7 @@
 export const en = {
+  "app.projectLoadFailed": "Could not load project state",
+  "app.retryProjectLoad": "Retry",
+  "projectRail.openFolder": "Open folder",
   "common.close": "Close",
   "common.cancel": "Cancel",
   "common.add": "Add",

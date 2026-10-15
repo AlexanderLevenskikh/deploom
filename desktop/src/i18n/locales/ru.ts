@@ -1,6 +1,9 @@
 import type { TranslationKey } from './en'
 
 export const ru: Record<TranslationKey, string> = {
+  "app.projectLoadFailed": "Не удалось загрузить состояние проекта",
+  "app.retryProjectLoad": "Повторить",
+  "projectRail.openFolder": "Открыть папку",
   "common.close": "Закрыть",
   "common.cancel": "Отмена",
   "common.add": "Добавить",

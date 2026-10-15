@@ -19,7 +19,7 @@ type Props = {
 }
 
 export function ProjectRail({ details, selected, active, onSelectProject, onRefreshAll, onAddProject, onAddWorkspace, onRemoveWorkspace, onRemoveProject, onAuditProject, onOpenProject, onOverview }: Props) {
-  const { t, text } = useLanguage()
+  const { t } = useLanguage()
   const [query, setQuery] = useState('')
 
   const requestRemove = (project: ProjectSpec) => {
@@ -49,7 +49,7 @@ export function ProjectRail({ details, selected, active, onSelectProject, onRefr
               <span className={`status-dot ${tone}`} title={t('projectRail.currentLevel', { level: levelLabel })} />
               <span className="project-copy"><strong title={project.name}>{project.name}</strong></span>
             </button>
-            <div className="project-row-utilities">{onAuditProject ? <button className="project-row-audit" disabled={active} aria-label={t('projectRail.audit.aria', { name: project.name })} title={t('projectRail.audit')} onClick={() => onAuditProject(project.name)}><ShieldCheck size={14} /></button> : null}<button className="project-row-open" aria-label={text('Открыть папку', 'Open folder') + ': ' + project.name} title={text('Открыть папку', 'Open folder')} onClick={() => onOpenProject(project.path)}><FolderOpen size={14} /></button><button
+            <div className="project-row-utilities">{onAuditProject ? <button className="project-row-audit" disabled={active} aria-label={t('projectRail.audit.aria', { name: project.name })} title={t('projectRail.audit')} onClick={() => onAuditProject(project.name)}><ShieldCheck size={14} /></button> : null}<button className="project-row-open" aria-label={t('projectRail.openFolder') + ': ' + project.name} title={t('projectRail.openFolder')} onClick={() => onOpenProject(project.path)}><FolderOpen size={14} /></button><button
               className="project-row-remove"
               disabled={active}
               title={t('projectRail.remove.title')}
