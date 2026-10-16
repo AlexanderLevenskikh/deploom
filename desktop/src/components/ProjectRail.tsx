@@ -44,17 +44,17 @@ export function ProjectRail({ details, selected, active, onSelectProject, onRefr
           const level = details.projectLevels[project.name]
           const tone = level?.status === 'red' ? 'danger' : level?.status === 'yellow' ? 'warning' : level?.status === 'green' ? 'success' : 'muted'
           const levelLabel = level?.status === 'red' ? t('levels.red') : level?.status === 'yellow' ? t('levels.yellow') : level?.status === 'green' ? t('levels.green') : t('levels.unknown')
-          return <div key={project.name} className={`project-row-shell ${selected?.name === project.name ? 'selected' : ''}`}>
-            <button className="project-row-main" onClick={() => onSelectProject(project.name)}>
+          return <div key={project.name} className={`project-row-shell ${selected?.name === project.name ? 'selected' : ''}`} role="group" aria-label={project.name} onClick={(event) => { if (event.target instanceof Element && event.target.closest('button')) return; onSelectProject(project.name) }}>
+            <button className="project-row-main" onClick={(event) => { event.stopPropagation(); onSelectProject(project.name) }}>
               <span className={`status-dot ${tone}`} title={t('projectRail.currentLevel', { level: levelLabel })} />
               <span className="project-copy"><strong title={project.name}>{project.name}</strong></span>
             </button>
-            <div className="project-row-utilities">{onAuditProject ? <button className="project-row-audit" disabled={active} aria-label={t('projectRail.audit.aria', { name: project.name })} title={t('projectRail.audit')} onClick={() => onAuditProject(project.name)}><ShieldCheck size={14} /></button> : null}<button className="project-row-open" aria-label={t('projectRail.openFolder') + ': ' + project.name} title={t('projectRail.openFolder')} onClick={() => onOpenProject(project.path)}><FolderOpen size={14} /></button><button
+            <div className="project-row-utilities">{onAuditProject ? <button className="project-row-audit" disabled={active} aria-label={t('projectRail.audit.aria', { name: project.name })} title={t('projectRail.audit')} onClick={(event) => { event.stopPropagation(); onAuditProject(project.name) }}><ShieldCheck size={14} /></button> : null}<button className="project-row-open" aria-label={t('projectRail.openFolder') + ': ' + project.name} title={t('projectRail.openFolder')} onClick={(event) => { event.stopPropagation(); onOpenProject(project.path) }}><FolderOpen size={14} /></button><button
               className="project-row-remove"
               disabled={active}
               title={t('projectRail.remove.title')}
               aria-label={t('projectRail.remove.aria', { name: project.name })}
-              onClick={() => requestRemove(project)}
+              onClick={(event) => { event.stopPropagation(); requestRemove(project) }}
             >
               <Trash2 size={14} />
             </button></div>

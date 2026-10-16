@@ -89,6 +89,57 @@ class PreparedArtifactContinuityPhysical(unittest.TestCase):
             self.assertIsNotNone(self._load())
             integrity.assert_not_called()
 
+    @unittest.skipUnless(os.name == "nt", "Windows publication continuity")
+    def test_first_load_reuses_the_publication_seal_without_a_second_tree_hash(self) -> None:
+        with patch.object(artifact_store, "build_artifact_tree_integrity", wraps=build_artifact_tree_integrity) as seal:
+            self._publish()
+            self.assertIsNotNone(self._load())
+            self.assertIsNotNone(self._load())
+            self.assertEqual(1, seal.call_count, "publication and immediate reuse need one complete seal")
+
+    @unittest.skipUnless(os.name == "nt", "Windows publication continuity")
+    def test_mutation_after_publication_before_first_load_never_returns_a_hit(self) -> None:
+        self._publish()
+        victim = self.workspace / "node_modules/demo/package.json"
+        victim.chmod(0o666)
+        victim.write_text('{"name":"demo","version":"9.9.9"}')
+        self.assertIsNone(self._load())
+
+    @unittest.skipUnless(os.name == "nt", "Windows publication continuity")
+    def test_failed_publication_watcher_keeps_the_cold_integrity_check(self) -> None:
+        with patch.object(artifact_store._DirectoryWatcher, "start", return_value=False):
+            self._publish()
+        with patch.object(artifact_store, "build_artifact_tree_integrity", wraps=build_artifact_tree_integrity) as seal:
+            self.assertIsNotNone(self._load())
+            self.assertEqual(1, seal.call_count)
+
+    @unittest.skipUnless(os.name == "nt", "Windows guarded Git lower continuity")
+    def test_git_lower_drains_preserve_hot_hit_but_recreated_sentinel_is_rejected(self) -> None:
+        import prepared_workspace_fastpath as fast
+        objects = self.workspace / ".git" / "objects"
+        objects.mkdir(parents=True)
+        (objects / "payload").write_text("sealed history")
+        self._publish()
+        self.assertIsNotNone(self._load())
+        target = self.root / "trial"
+        project = fast.try_materialize_guarded_clone(source_project=self.source,
+            prepared_workspace_root=self.workspace, project_relative=Path("project"),
+            target=target, dependency_roots=("node_modules",))
+        self.assertIsNotNone(project)
+        try:
+            self.assertEqual((".git/objects",), fast.guarded_clone_git_objects(target))
+            self.assertFalse(fast.peek_guarded_clone(target).errors)
+            self.assertFalse(fast.stop_guarded_clone(target).errors)
+        finally:
+            fast.cleanup_guarded_clone(target)
+        previous_events = [list(entry[0].events) for entry in artifact_store._VALIDATION_WATCHERS.values()]
+        with patch.object(artifact_store, "build_artifact_tree_integrity", wraps=build_artifact_tree_integrity) as seal:
+            self.assertIsNotNone(self._load())
+            self.assertFalse(seal.called, str(previous_events) + str(fast.guarded_integrity_drain_tokens(self.workspace)))
+        token = next(iter(fast.guarded_integrity_drain_tokens(self.workspace)))
+        (self.workspace / token).write_text("unexpected persistent content")
+        self.assertIsNone(self._load(), "an owned token must never hide a persistent file")
+
     def test_mutated_artifact_never_returns_a_hit(self) -> None:
         self._publish()
         self.assertIsNotNone(self._load())

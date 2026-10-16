@@ -385,6 +385,38 @@ class GitDeliveryTests(unittest.TestCase):
         self.assertEqual((root/'fixture-eol.txt').read_bytes(),b'first\r\nsecond\r\n')
         self.assert_original_preserved()
 
+    def test_untracked_ide_settings_do_not_block_isolated_delivery(self):
+        for folder in (".idea", ".vs", ".vscode", ".fleet"):
+            target = self.repo / folder / "workspace.xml"
+            target.parent.mkdir()
+            target.write_text("local IDE settings", encoding="utf-8")
+        before = d.git(self.repo, "status", "--porcelain")
+        state = self.prepare()
+        self.assertEqual(state["status"], "ready")
+        self.assertEqual(d.git(self.repo, "status", "--porcelain"), before)
+        self.assertEqual(d.git(self.repo, "rev-parse", "HEAD"), self.head)
+        self.assertEqual(d.git(self.repo, "branch", "--show-current"), "fixture-base")
+        for folder in (".idea", ".vs", ".vscode", ".fleet"):
+            self.assertEqual((self.repo / folder / "workspace.xml").read_text(), "local IDE settings")
+            self.assertFalse((Path(state["workspaceRoot"]) / folder).exists())
+
+    def test_untracked_product_file_still_blocks_delivery(self):
+        (self.repo / "untracked-source.txt").write_text("preserve user work", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "DELIVERY_ORIGINAL_DIRTY"):
+            self.prepare()
+        self.assertEqual((self.repo / "untracked-source.txt").read_text(), "preserve user work")
+
+    def test_tracked_ide_edit_still_blocks_delivery(self):
+        path = self.repo / ".idea" / "tracked.xml"
+        path.parent.mkdir()
+        path.write_text("committed", encoding="utf-8")
+        d.git(self.repo, "add", ".idea/tracked.xml")
+        d.git(self.repo, "commit", "-m", "tracked configuration")
+        path.write_text("user edit", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "DELIVERY_ORIGINAL_DIRTY"):
+            self.prepare()
+        self.assertEqual(path.read_text(), "user edit")
+
     def test_registered_branch_preserves_original_and_text_fixtures(self):
         state = self.prepare(); root = Path(state["workspaceRoot"])
         self.assertEqual(state["status"], "ready")

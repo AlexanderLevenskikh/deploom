@@ -19,6 +19,7 @@ from reparse_materialization import (
     ReparseLink,
     ReparseMaterializationError,
     inventory_reparse_plan,
+    is_windows_junction,
 )
 from verification_observability import (
     emit_observability_event,
@@ -285,10 +286,30 @@ class _GuardedClone:
     # instead of treating every junction traversal as a boundary escape.
     authorized_lower_roots: tuple[Path, ...] = ()
     stopped: Optional[GuardResult] = None
+    git_objects: tuple[tuple[str, Path, tuple[int, int]], ...] = ()
 
 
 _ACTIVE: dict[str, _GuardedClone] = {}
 _ACTIVE_LOCK = threading.Lock()
+_GUARDED_DRAIN_PATHS: list[tuple[Path, Optional[tuple[int, int]]]] = []
+_GUARDED_DRAIN_LOCK = threading.Lock()
+
+
+def guarded_integrity_drain_tokens(root: Path) -> frozenset[str]:
+    """Exact process-owned, removed sentinels visible to a parent seal watcher."""
+    root = root.resolve()
+    with _GUARDED_DRAIN_LOCK:
+        paths = tuple(_GUARDED_DRAIN_PATHS)
+    return frozenset(path.relative_to(root).as_posix() for path, _identity in paths if path.is_relative_to(root))
+
+
+def guarded_integrity_drain_directories(root: Path) -> dict[str, tuple[int, int]]:
+    """Directory objects whose timestamps our exact sentinels necessarily touch."""
+    root = root.resolve()
+    with _GUARDED_DRAIN_LOCK:
+        paths = tuple(_GUARDED_DRAIN_PATHS)
+    return {path.parent.relative_to(root).as_posix(): identity for path, identity in paths
+            if identity is not None and path.parent.is_relative_to(root)}
 
 
 def _key(path: Path) -> str:
@@ -1139,8 +1160,35 @@ class _DependencyTreeGuard:
     def __init__(
         self,
         roots: list[Path],
+        *, strict_roots: tuple[Path, ...] = (),
     ) -> None:
         self.watchers = [_DirectoryWatcher(root) for root in roots]
+        self.strict_roots = frozenset(strict_roots)
+        self.strict_identities = {root: tree_object_identity(root) for root in strict_roots}
+        self.drain_tokens: dict[Path, set[str]] = {}
+
+    def ignores(self, watcher, name):
+        if name in self.drain_tokens.get(watcher.root, ()):
+            return True
+        return watcher.root not in self.strict_roots and _is_ephemeral_change(name)
+
+    def drain_strict(self) -> tuple[str, ...]:
+        errors = []
+        for watcher in self.watchers:
+            if watcher.root not in self.strict_roots:
+                continue
+            if watcher._thread is None or not watcher._thread.is_alive():
+                errors.append(f"Git object watcher unavailable: {watcher.root}")
+                continue
+            delivered, token = drain_watcher(watcher, watcher.root)
+            self.drain_tokens.setdefault(watcher.root, set()).add(token)
+            with _GUARDED_DRAIN_LOCK:
+                _GUARDED_DRAIN_PATHS.append((watcher.root / token, self.strict_identities[watcher.root]))
+                del _GUARDED_DRAIN_PATHS[:-512]
+            if not delivered or any(os.path.lexists(watcher.root / old)
+                                    for old in self.drain_tokens[watcher.root]):
+                errors.append(f"Git object watcher drain unconfirmed: {watcher.root}")
+        return tuple(errors)
 
     def start(self) -> bool:
         started: list[_DirectoryWatcher] = []
@@ -1154,12 +1202,12 @@ class _DependencyTreeGuard:
 
     def stop(self) -> GuardResult:
         mutations: list[str] = []
-        errors: list[str] = []
+        errors: list[str] = list(self.drain_strict())
         for watcher in self.watchers:
             watcher.stop()
             errors.extend(watcher.errors)
             for _action, event in watcher.events:
-                if _is_ephemeral_change(event):
+                if self.ignores(watcher, event):
                     continue
                 mutations.append(f"{watcher.root}:{_action}:{event}")
         return GuardResult(
@@ -1247,13 +1295,28 @@ def try_materialize_guarded_clone(
         )
         return None
     lease_transferred = False
+    guard = None
+    junctions: list[Path] = []
+    # Borrow only the sealed object database, never a live checkout. Mutable
+    # index/refs/config remain private. Unusual Git layouts use the full copy.
+    git_objects = ()
+    objects = prepared_workspace_root / ".git" / "objects"
+    if (objects.is_dir() and not objects.is_symlink()
+        and not (objects / "info" / "alternates").exists()
+        and objects.resolve() == objects.absolute()
+        and not any(Path(item.link_relative) == Path(".git/objects") or
+            Path(".git/objects") in Path(item.link_relative).parents for item in canonical_reparse_plan)):
+        identity = tree_object_identity(objects)
+        if identity is not None:
+            git_objects = ((".git/objects", objects, identity),)
 
     try:
-        # Block X Source Truth already captured the exact .git database and
-        # source/config bytes into the prepared tree. Copy that sealed upper
-        # directly. Never create a --shared Git clone whose alternates point at
-        # a live mutable checkout.
-        excluded = list(dependency_root_paths)
+        lower_roots = [*dependency_root_paths, *(item[1] for item in git_objects)]
+        # Arm before copying/mapping so setup cannot hide a lower mutation.
+        guard = _DependencyTreeGuard(lower_roots, strict_roots=tuple(item[1] for item in git_objects))
+        if not guard.start():
+            return None
+        excluded = list(lower_roots)
         if not _run_overlay_robocopy(
             prepared_workspace_root,
             target,
@@ -1263,7 +1326,11 @@ def try_materialize_guarded_clone(
             shutil.rmtree(target, ignore_errors=True)
             return None
 
-        junctions: list[Path] = []
+        for relative, lower, _identity in git_objects:
+            link = target / relative
+            if not _create_junction(link, lower):
+                return None
+            junctions.append(link)
         for dependency_root in dependency_root_paths:
             relative = dependency_root.relative_to(prepared_workspace_root)
             clone_root = target / relative
@@ -1281,13 +1348,6 @@ def try_materialize_guarded_clone(
                 return None
             junctions.extend(created)
 
-        guard = _DependencyTreeGuard(dependency_root_paths)
-        if not guard.start():
-            for existing in reversed(junctions):
-                _remove_junction(existing)
-            shutil.rmtree(target, ignore_errors=True)
-            return None
-
         project = target / project_relative
         if not project.is_dir():
             guard.stop()
@@ -1303,6 +1363,7 @@ def try_materialize_guarded_clone(
             guard=guard,
             lease=lease,
             authorized_lower_roots=tuple(dependency_root_paths),
+            git_objects=git_objects,
         )
         with _ACTIVE_LOCK:
             _ACTIVE[_key(target)] = state
@@ -1312,7 +1373,7 @@ def try_materialize_guarded_clone(
             progress(
                 "Ω guarded lower ready: sealed source/config copied privately; "
                 f"dependencyRoots={len(dependency_root_paths)}, "
-                f"packageJunctions={len(junctions)}, integrityHashPass=skipped"
+                f"packageJunctions={len(junctions)}, sharedGitObjectRoots={len(git_objects)}, integrityHashPass=skipped"
             )
         emit_observability_event(
             "filesystem.guarded-lower.finish",
@@ -1341,6 +1402,12 @@ def try_materialize_guarded_clone(
         return None
     finally:
         if not lease_transferred:
+            if guard is not None:
+                guard.stop()
+            for junction in reversed(junctions):
+                _remove_junction(junction)
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
             lease.close()
 
 
@@ -1366,6 +1433,32 @@ def guarded_clone_authorized_roots(target: Path) -> tuple[Path, ...]:
     return tuple(state.authorized_lower_roots)
 
 
+def guarded_clone_git_objects(target: Path) -> tuple[str, ...]:
+    """Borrowed source subtrees, eligible only under this live exclusive guard."""
+    with _ACTIVE_LOCK:
+        state = _ACTIVE.get(_key(target))
+    if state is None or state.stopped is not None:
+        return ()
+    problems = _git_object_mapping_errors(state)
+    if problems:
+        raise RuntimeError("; ".join(problems))
+    return tuple(relative for relative, _lower, _identity in state.git_objects)
+
+
+def _git_object_mapping_errors(state) -> tuple[str, ...]:
+    problems = []
+    for relative, lower, identity in state.git_objects:
+        link = state.target_root / relative
+        try:
+            matches = (is_windows_junction(link) and link.resolve(strict=True) == lower
+                       and tree_object_identity(lower) == identity)
+        except (OSError, ValueError, RuntimeError):
+            matches = False
+        if not matches:
+            problems.append(f"guarded Git object mapping changed: {relative}")
+    return tuple(problems)
+
+
 def peek_guarded_clone(target: Path) -> GuardResult:
     """Keep the lower watcher and exclusive lease alive BETWEEN commands.
 
@@ -1376,14 +1469,14 @@ def peek_guarded_clone(target: Path) -> GuardResult:
         state = _ACTIVE.get(_key(target))
     if state is None or state.stopped is not None:
         return GuardResult(errors=("guarded lower continuity unavailable",))
-    errors = []
+    errors = [*_git_object_mapping_errors(state), *state.guard.drain_strict()]
     notifications = []
     for watcher in state.guard.watchers:
         if watcher._thread is None or not watcher._thread.is_alive():
             errors.append(f"guarded lower watcher stopped: {watcher.root}")
         errors.extend(watcher.errors)
         notifications.extend(f"{watcher.root}:{action}:{name}" for action, name in list(watcher.events)
-                             if not _is_ephemeral_change(name))
+                             if not state.guard.ignores(watcher, name))
     return GuardResult(errors=tuple(errors), notification_only=tuple(sorted(set(notifications))))
 
 
@@ -1393,7 +1486,8 @@ def stop_guarded_clone(target: Path) -> GuardResult:
     if state is None:
         return GuardResult()
     if state.stopped is None:
-        state.stopped = state.guard.stop()
+        result = state.guard.stop()
+        state.stopped = dataclasses.replace(result, errors=result.errors + _git_object_mapping_errors(state))
     return state.stopped
 
 

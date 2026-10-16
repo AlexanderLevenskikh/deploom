@@ -95,7 +95,8 @@ class CheckpointBuildUpgradeTests(unittest.TestCase):
             self.assertNotEqual(first.key, checkpoint["sourceSnapshotKey"])
             self.assertEqual(first.key, second.key)
             self.assertEqual(len(calls), 1)
-            self.assertTrue(any("durable source snapshot copy: ready; files=" in message for message in messages))
+            self.assertTrue(any("durable source snapshot: same-volume promotion; copiedFiles=0;" in message
+                                or "durable source snapshot copy: ready; files=" in message for message in messages))
             self.assertTrue(any("durable source snapshot validation" in message for message in messages))
             changed = {**config, "verifyConfig": {**config["verifyConfig"], "commands": ["node another-check.cjs"]}}
             upgrade.reopen_checkpoint_source(root / "run", checkpoint, changed, verify=verify, progress=lambda *args: None)

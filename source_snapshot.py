@@ -1923,6 +1923,7 @@ def reap_orphaned_source_snapshots(
     *,
     max_age_seconds: int = _REAP_MAX_AGE_SECONDS,
     max_containers: int = _REAP_MAX_CONTAINERS,
+    additional_parents: tuple[Path, ...] = (),
 ) -> dict[str, int]:
     """Remove source snapshot containers abandoned by a crashed/killed run.
 
@@ -1942,7 +1943,7 @@ def reap_orphaned_source_snapshots(
     with _LOCK:
         owned = {os.path.normcase(str(item)) for item in _ALL_CONTAINERS}
     candidates: list[Path] = []
-    for base in candidate_snapshot_parents():
+    for base in (*candidate_snapshot_parents(), *additional_parents):
         try:
             candidates.extend(base.glob(SOURCE_SNAPSHOT_CONTAINER_PREFIX + "*"))
         except OSError:
@@ -2326,8 +2327,13 @@ def persist_source_snapshot(
     *,
     timeout_seconds: int = 1800,
     progress: Optional[ProgressCallback] = None,
+    _consume: bool = False,
 ) -> SourceSnapshot:
-    """Atomically publish an active snapshot as durable evidence."""
+    """Atomically publish an active snapshot as durable evidence.
+
+    A call-owned capture can be consumed by same-volume rename; shared active
+    snapshots retain their existing independent-copy semantics.
+    """
     deadline = float("inf") if timeout_seconds == 0 else time.monotonic() + max(1, timeout_seconds)
     validate_source_snapshot(snapshot, timeout_seconds=_remaining(deadline), progress=progress)
     destination = destination.expanduser().resolve()
@@ -2336,6 +2342,24 @@ def persist_source_snapshot(
         raise SourceCaptureError(
             f"SOURCE_SNAPSHOT_DESTINATION_EXISTS: {destination}"
         )
+    if _consume:
+        # Only capture_durable_source_snapshot owns this temporary container.
+        # Close directory handles before renaming on Windows. Full destination
+        # validation remains mandatory, including after a successful rename.
+        _retire_snapshot_watcher(snapshot)
+        _retire_live_source_watcher(snapshot)
+        try:
+            os.rename(snapshot.container, destination)
+        except OSError as exc:
+            import errno
+            if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
+                raise
+        else:
+            _ALL_CONTAINERS.discard(snapshot.container)
+            if progress:
+                progress(f"durable source snapshot: same-volume promotion; copiedFiles=0; avoidedCopyBytes={snapshot.byte_count}")
+            return open_source_snapshot(destination, expected_key=snapshot.key,
+                timeout_seconds=_remaining(deadline), progress=progress)
     from storage_capacity import require_capacity
     require_capacity(destination, snapshot.byte_count, "durable snapshot")
     stage = Path(tempfile.mkdtemp(
@@ -2394,14 +2418,21 @@ def capture_durable_source_snapshot(
     progress: Optional[ProgressCallback] = None,
 ) -> SourceSnapshot:
     deadline = float("inf") if timeout_seconds == 0 else time.monotonic() + max(1, timeout_seconds)
-    snapshot = capture_source_snapshot(
-        project_dir,
-        timeout_seconds=_remaining(deadline),
-        progress=progress,
-    )
+    from source_snapshot_storage import prefer_snapshot_parent
+    destination_parent = destination.expanduser().resolve().parent
+    # Destination-local temporary captures must remain discoverable after a
+    # crash, just like verification-root temporaries. Existing dead-owner,
+    # age, link and bounded-work guards remain authoritative.
+    reap_orphaned_source_snapshots(additional_parents=(destination_parent,))
+    with prefer_snapshot_parent(destination_parent):
+        snapshot = capture_source_snapshot(
+            project_dir,
+            timeout_seconds=_remaining(deadline),
+            progress=progress,
+        )
     try:
         return persist_source_snapshot(
-            snapshot, destination, timeout_seconds=_remaining(deadline), progress=progress,
+            snapshot, destination, timeout_seconds=_remaining(deadline), progress=progress, _consume=True,
         )
     finally:
         # This capture is private to this call. The published durable copy has

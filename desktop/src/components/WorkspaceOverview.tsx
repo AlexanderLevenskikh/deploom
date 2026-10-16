@@ -59,13 +59,13 @@ export function WorkspaceOverview({ details, environment, storageStatus, selecte
         <div className="overview-projects-title"><strong>{t('app.overview.projects')}</strong><span className="rail-count">{details.projects.length}</span></div>
         <div className="overview-project-list">
           {details.projects.map((project: ProjectSpec) => (
-            <div key={project.name} className="overview-project-with-actions"><button
+            <div key={project.name} className="overview-project-with-actions" role="group" aria-label={project.name} onClick={(event) => { if (event.target instanceof Element && event.target.closest('button')) return; onSelectProject(project.name) }}><button
               className={`project-row-main overview-project-row${selectedName === project.name ? ' selected' : ''}`}
-              onClick={() => onSelectProject(project.name)}
+              onClick={(event) => { event.stopPropagation(); onSelectProject(project.name) }}
             >
               <span className="status-dot muted" />
               <span className="project-copy"><strong>{project.name}</strong><small>{project.path}</small></span>
-            </button>{onAuditProject ? <button className="button secondary" disabled={auditBlocked} onClick={() => onAuditProject(project.name)}>{text('Провести аудит', 'Run audit')}</button> : null}</div>
+            </button>{onAuditProject ? <button className="button secondary" disabled={auditBlocked} onClick={(event) => { event.stopPropagation(); onAuditProject(project.name) }}>{text('Провести аудит', 'Run audit')}</button> : null}</div>
           ))}
           {details.projects.length === 0 ? <p className="empty-copy">{t('app.overview.projectsEmpty')}</p> : null}
         </div>

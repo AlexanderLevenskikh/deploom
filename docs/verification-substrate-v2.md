@@ -62,8 +62,26 @@ the lease is released.
 
 The old fast path used `git clone --shared` and therefore left Git alternates
 pointing to the live source checkout. Ω removes that path. The private upper is
-copied from the sealed PreparedArtifact, including the exact captured `.git`
-database. Git provenance is no longer borrowed from a mutable live checkout.
+copied from the sealed PreparedArtifact. Git provenance is never borrowed from
+a mutable live checkout. On Windows, the ordinary root `.git/objects` database
+can stay in that sealed artifact under the same exclusive lease and a strict
+subtree watcher. The upper has a junction to those exact objects; index, refs,
+config and the remaining Git metadata are copied privately. Git indirections,
+alternates and reparse layouts outside this supported case retain private copy.
+
+The private source-closure seal combines freshly hashed upper entries with the
+already sealed object entries only after checking the live mapping and lower
+continuity. The final guard checks object-directory identity and confirmed
+watcher delivery. Any object write, watcher failure or mapping change rejects
+the optimization and uses the existing full-copy verification retry; it cannot
+become dependency incompatibility evidence. This supports read operations such
+as `git describe` without copying or hashing the history for each check.
+Commands that write new Git objects may require the private-copy fallback.
+
+This optimization applies to temporary project checks, not to mutable installs
+or to arbitrary agent checkouts. Initial capture and cold artifact validation
+still seal the complete source and Git bytes. It does not claim one Git copy
+for an entire migration or eliminate package-manager work.
 
 ## Durable artifacts
 
@@ -73,6 +91,24 @@ simply fall back to private materialization.
 
 A durable PreparedArtifact may use the guarded lower path because cross-process
 serialization is already provided by the snapshot lease.
+
+On Windows, publication arms a directory watcher before the complete integrity
+seal and transfers that live continuity to artifact reuse. The first load can
+therefore reuse the publication seal instead of hashing the entire dependency
+tree a second time. It still checks directory identity, notification delivery,
+record identity and dependency topology. A mutation, unavailable watcher or
+process restart retains the full cold validation. No durable receipt alone
+grants permission to skip hashing.
+
+## Durable source promotion
+
+A durable capture prefers temporary storage on its destination volume, outside
+the live source root. The call-owned sealed container is then published by
+rename rather than a second whole-tree copy. Content is revalidated at the
+final destination; existing destinations are never overwritten. Shared active
+snapshots keep independent-copy semantics. Cross-volume promotion uses the
+original private-copy path. This removes a full source/Git copy at checkpoint
+publication without changing source identity or weakening verification.
 
 ## Complexity
 

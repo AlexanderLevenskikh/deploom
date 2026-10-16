@@ -14,11 +14,14 @@ html[data-theme='dark'] .app-shell { --canvas:#111827; }
 .app-shell .project-list .project-row-main { grid-template-columns:8px minmax(0,1fr); padding:8px 8px 2px; }
 .app-shell .project-list .project-copy strong { display:block; white-space:nowrap; }
 .app-shell .rail-actions { flex-shrink:0; }
-.app-shell .project-row-shell { border-radius:6px; border-color:transparent; box-shadow:none; }
-.app-shell .project-row-utilities { display:flex; flex-direction:row; gap:4px; align-items:center; padding:0 6px 4px 20px; }
-.app-shell .project-row-open, .app-shell .project-row-remove, .app-shell .project-row-audit { position:static; display:grid; place-items:center; width:26px; height:26px; border:0; background:transparent; color:var(--muted); cursor:pointer; }
+.app-shell .project-row-shell { position:relative; border-radius:6px; border-color:transparent; box-shadow:none; cursor:pointer; }
+.app-shell .project-row-shell:hover { border-color:var(--border-strong); }
+.app-shell .project-row-shell:has(> .project-row-main:focus-visible), .app-shell .overview-project-with-actions:has(> .project-row-main:focus-visible) { outline:2px solid var(--blue); outline-offset:2px; }
+.app-shell .project-row-utilities { position:relative; z-index:2; pointer-events:none; display:flex; flex-direction:row; gap:4px; align-items:center; padding:2px 6px 6px 16px; }
+.app-shell .project-row-open, .app-shell .project-row-remove, .app-shell .project-row-audit { position:static; pointer-events:auto; display:grid; place-items:center; width:32px; height:32px; padding:8px; border:0; border-radius:5px; background:transparent; color:var(--muted); cursor:pointer; }
 .app-shell .project-row-audit:hover { color:var(--blue); }
-.app-shell .overview-project-with-actions { display:flex; align-items:center; gap:12px; }
+.app-shell .overview-project-with-actions { position:relative; display:flex; align-items:center; gap:12px; cursor:pointer; }
+.app-shell .overview-project-with-actions > .button { position:relative; z-index:2; }
 .app-shell .overview-project-with-actions > .project-row-main { flex:1; }
 .app-shell .project-row-shell.selected { border-color:transparent; background:var(--blue-soft); }
 .app-shell .project-copy strong { font-size:13px; }

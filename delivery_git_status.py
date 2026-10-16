@@ -36,3 +36,24 @@ def committed_worktree(root):
             if b"\0" in actual or b"\0" in committed: return False
             if actual.replace(b"\r\n", b"\n") != committed.replace(b"\r\n", b"\n"): return False
     return offset == len(blobs)
+
+
+def original_checkout_clean(root):
+    """Untracked IDE settings are outside source truth; tracked edits still block."""
+    result = subprocess.run(["git", "-C", str(root), "status", "--porcelain=v1", "-z",
+                             "--untracked-files=all"], capture_output=True, timeout=120,
+                            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    if result.returncode:
+        raise RuntimeError("DELIVERY_GIT_STATUS_FAILED")
+    ide_directories = {".idea", ".vs", ".vscode", ".fleet"}
+    for record in result.stdout.split(b"\0"):
+        if not record:
+            continue
+        # A tracked modification/rename/submodule must never be hidden by its name.
+        if record[:3] != b"?? ":
+            return False
+        from pathlib import PurePosixPath
+        name = record[3:].decode("utf-8", errors="surrogateescape")
+        if not any(part in ide_directories for part in PurePosixPath(name).parts[:-1]):
+            return False
+    return True

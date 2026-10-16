@@ -74,23 +74,41 @@ def validate_materialized_source_closure(snapshot, target, *, progress=None, pro
     Reused unchanged private trials skip materialization and this check. Never
     hash dependency payload here; lower continuity has its existing proof.
     """
-    from artifact_integrity import ArtifactIntegrityError, build_artifact_tree_integrity
+    from artifact_integrity import (ArtifactIntegrityError, build_artifact_tree_integrity, source_entry_integrity_key)
+    from prepared_workspace_fastpath import guarded_clone_git_objects, peek_guarded_clone
+    from substrate_identity import tool_build_id
+    borrowed = guarded_clone_git_objects(Path(target))
     expected_key = snapshot.source_closure_content_key
     if not expected_key:
         raise ArtifactIntegrityError("VERIFICATION_SOURCE_CLOSURE_RECEIPT_MISSING")
     observed = build_artifact_tree_integrity(Path(target), source_only=True,
         progress=progress, progress_label="private source closure validation",
-        progress_interval_seconds=progress_interval_seconds)
-    if observed.source_content_key == expected_key:
+        progress_interval_seconds=progress_interval_seconds, excluded_relative_paths=borrowed)
+    observed_entries = observed.source_entries
+    if borrowed:
+        # These exact bytes were sealed in the PreparedArtifact. The exclusive
+        # lower lease/watchers remain live through final command acceptance.
+        # Check the physical mapping again after scanning the private upper.
+        if guarded_clone_git_objects(Path(target)) != borrowed:
+            raise ArtifactIntegrityError("VERIFICATION_BORROWED_SOURCE_MAPPING_CHANGED")
+        continuity = peek_guarded_clone(Path(target))
+        if continuity.errors or continuity.mutations or continuity.notification_only:
+            raise ArtifactIntegrityError("VERIFICATION_BORROWED_SOURCE_CONTINUITY_INVALID")
+        def included(entry):
+            path = Path(str(entry["path"]))
+            return any(path == Path(name) or Path(name) in path.parents for name in borrowed)
+        observed_entries = (*observed_entries, *(entry for entry in snapshot.source_closure_entries if included(entry)))
+    observed_key = source_entry_integrity_key(observed_entries, tool_build_id())
+    if observed_key == expected_key:
         return
     expected = {str(item["path"]): item for item in snapshot.source_closure_entries}
-    actual = {str(item["path"]): item for item in observed.source_entries}
+    actual = {str(item["path"]): item for item in observed_entries}
     changes = [{"path": name, "change": "missing" if name not in actual else
                 "unexpected" if name not in expected else "modified"}
                for name in sorted(set(expected) | set(actual)) if expected.get(name) != actual.get(name)]
     import json
     raise ArtifactIntegrityError("VERIFICATION_SOURCE_CLOSURE_MATERIALIZED_MISMATCH: " +
-        json.dumps({"expected": expected_key, "observed": observed.source_content_key,
+        json.dumps({"expected": expected_key, "observed": observed_key,
                     "changedPaths": changes[:20], "changedPathCount": len(changes)}, sort_keys=True))
 
 

@@ -7,11 +7,24 @@ from __future__ import annotations
 
 import os
 import tempfile
+import contextlib
+import contextvars
 from pathlib import Path
 from typing import Mapping, Optional
 
 
 SNAPSHOT_SUBDIR = "source-snapshots"
+_PREFERRED_PARENT = contextvars.ContextVar("source_snapshot_preferred_parent", default=None)
+
+
+@contextlib.contextmanager
+def prefer_snapshot_parent(parent: Path):
+    """Place call-owned durable captures on their destination volume when safe."""
+    token = _PREFERRED_PARENT.set(Path(parent).resolve())
+    try:
+        yield
+    finally:
+        _PREFERRED_PARENT.reset(token)
 
 
 def _contained(path: Path, parent: Path) -> bool:
@@ -63,7 +76,9 @@ def new_snapshot_container(capture_root: Path, *, prefix: str) -> Path:
     SourceSnapshot integrity validation.
     """
     live_root = Path(capture_root).resolve()
-    for parent in candidate_snapshot_parents():
+    preferred = _PREFERRED_PARENT.get()
+    parents = ((preferred,) if preferred is not None else ()) + candidate_snapshot_parents()
+    for parent in parents:
         if _contained(parent, live_root):
             continue  # Never create even a probe file under a source subject.
         try:

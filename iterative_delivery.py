@@ -420,7 +420,8 @@ def delivery_prepare(run_dir, inputs):
     source = Path(snapshot.root)
     original = Path(config["projectDir"])
     repo = Path(git(original, "rev-parse", "--show-toplevel"))
-    if git(repo, "status", "--porcelain"):
+    from delivery_git_status import original_checkout_clean
+    if not original_checkout_clean(repo):
         raise RuntimeError("DELIVERY_ORIGINAL_DIRTY: commit or save your unrelated work first")
     requested_branch = branch
     branch, reuse_branch, branch_resolution = select_delivery_branch(repo, branch, checkpoint["sourceHead"], run["runId"])

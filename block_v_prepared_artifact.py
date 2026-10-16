@@ -9,6 +9,7 @@ maps that exact key to an immutable on-disk tree across process restarts.
 from __future__ import annotations
 
 import ctypes
+import contextlib
 import datetime as dt
 import json
 import os
@@ -28,6 +29,8 @@ from block_vex_storage import verification_root
 from prepared_workspace_fastpath import (
     _DirectoryWatcher,
     drain_watcher,
+    guarded_integrity_drain_tokens,
+    guarded_integrity_drain_directories,
     tree_object_identity,
     try_acquire_snapshot_cleanup_lease,
 )
@@ -50,6 +53,8 @@ _VALIDATION_WATCHERS: dict[
 ] = {}
 # Only exact sentinels created by this process may be ignored by its watcher.
 _VALIDATION_DRAIN_TOKENS: dict[tuple[str, str, str], set[str]] = {}
+# Only directories with benign timestamps observed during the publication seal.
+_PUBLICATION_TIMESTAMP_DIRECTORIES: dict[tuple[str, str, str], dict[str, tuple[int, int]]] = {}
 
 
 def _retire_validation_watchers(*, key: Optional[str] = None) -> None:
@@ -63,6 +68,7 @@ def _retire_validation_watchers(*, key: Optional[str] = None) -> None:
             _VALIDATED_CONTENT.discard(slot)
             _VALIDATED_SOURCE_KEYS.pop(slot, None)
             _VALIDATION_DRAIN_TOKENS.pop(slot, None)
+            _PUBLICATION_TIMESTAMP_DIRECTORIES.pop(slot, None)
     for watcher in watchers:
         watcher.stop()
 
@@ -73,6 +79,7 @@ def _retire_validation_slot(slot: tuple[str, str, str]) -> None:
         _VALIDATED_CONTENT.discard(slot)
         _VALIDATED_SOURCE_KEYS.pop(slot, None)
         _VALIDATION_DRAIN_TOKENS.pop(slot, None)
+        _PUBLICATION_TIMESTAMP_DIRECTORIES.pop(slot, None)
     if entry is not None:
         entry[0].stop()
 
@@ -545,6 +552,27 @@ def _record_path(key: str) -> Optional[Path]:
     return root / "index" / f"{_valid_key(key)}.json"
 
 
+@contextlib.contextmanager
+def _publication_continuity(workspace: Path):
+    """Carry the publication seal into first reuse under a live directory guard."""
+    watcher = None
+    identity = None
+    if os.name == "nt":
+        candidate = _DirectoryWatcher(workspace)
+        if candidate.start():
+            identity = tree_object_identity(workspace)
+            if identity is not None:
+                watcher = candidate
+        if watcher is None:
+            candidate.stop()
+    state = {"watcher": watcher, "identity": identity, "transferred": False}
+    try:
+        yield state
+    finally:
+        if watcher is not None and not state["transferred"]:
+            watcher.stop()
+
+
 def publish_prepared_artifact_record(
     *,
     key: str,
@@ -575,88 +603,115 @@ def publish_prepared_artifact_record(
     observed_hash = str(observed_resolved_hash or "").lower()
     if len(observed_hash) != 64 or any(ch not in "0123456789abcdef" for ch in observed_hash):
         return False
-    try:
-        integrity = build_artifact_tree_integrity(
-            workspace_root,
-            progress=progress,
-            progress_label="snapshot-publish: durable-record integrity seal",
-            progress_interval_seconds=progress_interval_seconds,
-            reparse_plan=reparse_plan,
-        )
-    except ArtifactIntegrityError as exc:
-        emit_observability_event(
-            "prepared-artifact.integrity",
-            outcome="publish-rejected",
-            artifactKey=str(key),
-            errorType=type(exc).__name__, error=str(exc),
-        )
-        if source_closure_receipt is not None:
-            source_closure_receipt["publicationError"] = str(exc)
-        if progress:
-            progress(f"snapshot-publish: durable record rejected: {exc}")
-        return False
-    payload = {
-        "schemaVersion": ARTIFACT_INDEX_SCHEMA,
-        "authority": ARTIFACT_AUTHORITY,
-        "key": _valid_key(key),
-        "toolBuildId": integrity.tool_build_id,
-        "artifactContentKey": integrity.key,
-        "sourceClosureContentKey": integrity.source_content_key,
-        "sourceClosureEntries": list(integrity.source_entries),
-        "artifactFileCount": integrity.file_count,
-        "artifactDirectoryCount": integrity.directory_count,
-        "artifactByteCount": integrity.byte_count,
-        "artifactReparseCount": integrity.reparse_count,
-        "sourceProjectIdentity": _source_identity(source_project),
-        "workspaceRoot": str(workspace_root),
-        "projectRelative": project_relative.as_posix(),
-        "storageMode": str(storage_mode),
-        "observedResolvedVersions": dict(sorted(
-            (str(name), str(version))
-            for name, version in observed_resolved_versions.items()
-        )),
-        "observedResolvedHash": observed_hash,
-        "dependencyRoots": _normalize_dependency_roots(dependency_roots),
-        "publishedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-    try:
-        with temp.open("w", encoding="utf-8", newline="\n") as handle:
-            handle.write(data)
-            handle.flush()
+    with _publication_continuity(workspace_root) as continuity:
+        directory_identities: dict[str, tuple[int, int]] = {}
+        try:
+            integrity = build_artifact_tree_integrity(
+                workspace_root,
+                progress=progress,
+                progress_label="snapshot-publish: durable-record integrity seal",
+                progress_interval_seconds=progress_interval_seconds,
+                reparse_plan=reparse_plan,
+                directory_identity_receipt=directory_identities,
+            )
+        except ArtifactIntegrityError as exc:
+            emit_observability_event(
+                "prepared-artifact.integrity",
+                outcome="publish-rejected",
+                artifactKey=str(key),
+                errorType=type(exc).__name__, error=str(exc),
+            )
+            if source_closure_receipt is not None:
+                source_closure_receipt["publicationError"] = str(exc)
+            if progress:
+                progress(f"snapshot-publish: durable record rejected: {exc}")
+            return False
+        payload = {
+            "schemaVersion": ARTIFACT_INDEX_SCHEMA,
+            "authority": ARTIFACT_AUTHORITY,
+            "key": _valid_key(key),
+            "toolBuildId": integrity.tool_build_id,
+            "artifactContentKey": integrity.key,
+            "sourceClosureContentKey": integrity.source_content_key,
+            "sourceClosureEntries": list(integrity.source_entries),
+            "artifactFileCount": integrity.file_count,
+            "artifactDirectoryCount": integrity.directory_count,
+            "artifactByteCount": integrity.byte_count,
+            "artifactReparseCount": integrity.reparse_count,
+            "sourceProjectIdentity": _source_identity(source_project),
+            "workspaceRoot": str(workspace_root),
+            "projectRelative": project_relative.as_posix(),
+            "storageMode": str(storage_mode),
+            "observedResolvedVersions": dict(sorted(
+                (str(name), str(version))
+                for name, version in observed_resolved_versions.items()
+            )),
+            "observedResolvedHash": observed_hash,
+            "dependencyRoots": _normalize_dependency_roots(dependency_roots),
+            "publishedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+        data = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        try:
+            with temp.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(data)
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except OSError:
+                    pass
+            os.replace(temp, path)
+            slot = (
+                os.path.normcase(str(workspace_root)),
+                _valid_key(key),
+                integrity.key,
+            )
+            watcher = continuity["watcher"]
+            timestamps = {}
+            unexpected = []
+            if watcher is not None:
+                for action, name in list(watcher.events):
+                    identity = directory_identities.get(name)
+                    if (action == _DirectoryWatcher.FILE_ACTION_MODIFIED and identity is not None
+                        and tree_object_identity(workspace_root / name) == identity):
+                        timestamps[name] = identity
+                    else:
+                        unexpected.append((action, name))
+            reusable = bool(watcher is not None and not watcher.errors and not unexpected
+                            and watcher._thread is not None and watcher._thread.is_alive()
+                            and tree_object_identity(workspace_root) == continuity["identity"])
+            with _INTEGRITY_VALIDATION_LOCK:
+                previous = _VALIDATION_WATCHERS.pop(slot, None)
+                _VALIDATION_DRAIN_TOKENS.pop(slot, None)
+                _PUBLICATION_TIMESTAMP_DIRECTORIES.pop(slot, None)
+                _VALIDATED_CONTENT.add(slot)
+                _VALIDATED_SOURCE_KEYS[slot] = integrity.source_content_key
+                if reusable:
+                    _VALIDATION_WATCHERS[slot] = (watcher, continuity["identity"])
+                    _PUBLICATION_TIMESTAMP_DIRECTORIES[slot] = timestamps
+                    continuity["transferred"] = True
+            if previous is not None:
+                previous[0].stop()
+            emit_observability_event(
+                "prepared-artifact.integrity",
+                outcome="published",
+                publicationContinuity=reusable,
+                artifactKey=_valid_key(key),
+                artifactContentKey=integrity.key,
+                fileCount=integrity.file_count,
+                byteCount=integrity.byte_count,
+                toolBuildId=integrity.tool_build_id,
+            )
+            if source_closure_receipt is not None:
+                source_closure_receipt.update(key=integrity.source_content_key, entries=integrity.source_entries)
+            return True
+        except OSError:
             try:
-                os.fsync(handle.fileno())
+                temp.unlink(missing_ok=True)
             except OSError:
                 pass
-        os.replace(temp, path)
-        slot = (
-            os.path.normcase(str(workspace_root)),
-            _valid_key(key),
-            integrity.key,
-        )
-        with _INTEGRITY_VALIDATION_LOCK:
-            _VALIDATED_CONTENT.add(slot)
-            _VALIDATED_SOURCE_KEYS[slot] = integrity.source_content_key
-        emit_observability_event(
-            "prepared-artifact.integrity",
-            outcome="published",
-            artifactKey=_valid_key(key),
-            artifactContentKey=integrity.key,
-            fileCount=integrity.file_count,
-            byteCount=integrity.byte_count,
-            toolBuildId=integrity.tool_build_id,
-        )
-        if source_closure_receipt is not None:
-            source_closure_receipt.update(key=integrity.source_content_key, entries=integrity.source_entries)
-        return True
-    except OSError:
-        try:
-            temp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return False
+            return False
 
 
 def load_prepared_artifact_record(
@@ -743,9 +798,24 @@ def load_prepared_artifact_record(
         with _INTEGRITY_VALIDATION_LOCK:
             owned_tokens = _VALIDATION_DRAIN_TOKENS.setdefault(validation_slot, set())
             owned_tokens.add(drain_token)
+            # Nested sentinels from this artifact's guarded Git lower are
+            # proof-neutral only while absent, exactly like our own drain.
+            owned_tokens.update(guarded_integrity_drain_tokens(workspace))
             owned_tokens = frozenset(owned_tokens)
+        drain_directories = guarded_integrity_drain_directories(workspace)
+        with _INTEGRITY_VALIDATION_LOCK:
+            drain_directories.update(_PUBLICATION_TIMESTAMP_DIRECTORIES.get(validation_slot, {}))
+        def owned_directory_timestamp(item):
+            # Windows also reports the parent directory mtime of each removed
+            # sentinel. Ignore ONLY MODIFY on the same registered directory
+            # object. Added/removed/renamed entries always remain invalidating.
+            action, name = item
+            identity = drain_directories.get(name)
+            return (action == _DirectoryWatcher.FILE_ACTION_MODIFIED and identity is not None
+                    and tree_object_identity(workspace / name) == identity)
         pending_events = [
-            item for item in list(watcher.events) if item[1] not in owned_tokens
+            item for item in list(watcher.events)
+            if item[1] not in owned_tokens and not owned_directory_timestamp(item)
         ]
         thread = watcher._thread
         fallback_reason = ""
