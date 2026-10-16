@@ -2,7 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import assert from "node:assert/strict";
 import ts from "typescript";
 import { commandEnvironment, resolveSpawnInvocation, decodeProcessOutputChunk, processTreeDetached } from "../dist-electron/process-launcher.js";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +19,8 @@ import {
   cancelWaitingAgentLease,
   changedFilesFromBaseline,
   classifyTrialChanges,
+  assertTrialChangesReadable,
+  repairProgressFingerprint,
   inspectTrialChanges,
   clearAgentLease,
   decideAgentLeaseDispatch,
@@ -31,6 +33,7 @@ import {
   readAgentLease,
   recordAgentDispatchTiming,
   repeatedBlockerFingerprint,
+  normalizeViolationPath,
   resolveRepeatedBlocker,
   trialBaselineFile,
   withAgentDispatchLock,
@@ -303,6 +306,7 @@ assert.equal(openCodeRuntimeManifestPaths(workspace, { ...runtimeScope, projectR
     baseCheckpointId: "C1", candidateId: "C4", violations: [".\\Modified:package.json"],
   });
   assert.equal(spelledSame.repeated, true, "OS-normalized violations must fingerprint identically");
+  assert.equal(normalizeViolationPath('modified:Folder/package.json') === normalizeViolationPath('modified:folder/package.json'), process.platform === 'win32', 'POSIX paths with different case are distinct blockers');
   const newerBaseline = resolveRepeatedBlocker(blockerFile, {
     provider: "opencode", policyVersion: AGENT_RUNTIME_POLICY_VERSION, reasonCode: "FORBIDDEN_MUTATION",
     baseCheckpointId: "C5", candidateId: "C5", violations: ["modified:package.json"],
@@ -313,6 +317,118 @@ assert.equal(openCodeRuntimeManifestPaths(workspace, { ...runtimeScope, projectR
     repeatedBlockerFingerprint({ provider: "opencode", policyVersion: AGENT_RUNTIME_POLICY_VERSION, reasonCode: "FORBIDDEN_MUTATION", baseCheckpointId: "C5", violations: ["modified:package.json"] }),
   );
   rmSync(blockRoot, { recursive: true, force: true });
+}
+
+// Evidence failures must block the same production gate, including mixed
+// readable edits + unreadable entries. A syntactically valid JSON value is
+// not necessarily a valid durable baseline.
+{
+  const dir = mkdtempSync(join(tmpdir(), 'iter-agent-evidence-'));
+  const trial = join(dir, 'trial'); mkdirSync(trial);
+  const baseline = join(dir, 'baseline.json');
+  writeFileSync(join(trial, 'source.js'), 'before');
+  writeFileSync(join(trial, 'blocked.js'), 'before');
+  writeTrialBaseline(trial, baseline);
+  writeFileSync(join(trial, 'source.js'), 'after');
+  rmSync(join(trial, 'blocked.js')); mkdirSync(join(trial, 'blocked.js'));
+  // Replacing a file with a directory is a measurable removal plus contents;
+  // a junction to external content is not measurable source repair.
+  const external = join(dir, 'external'); mkdirSync(external);
+  writeFileSync(join(external, 'secret.js'), 'outside');
+  symlinkSync(external, join(trial, 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+  const report = classifyTrialChanges(trial, baseline);
+  assert.equal(report.unreadable.some(item => item.path === 'linked'), true);
+  assert.equal(report.changedFiles.includes('linked/secret.js'), false);
+  assert.throws(() => assertTrialChangesReadable(report), /AGENT_TRIAL_UNREADABLE/);
+  assert.throws(() => changedFilesFromBaseline(trial, baseline), /AGENT_TRIAL_UNREADABLE/);
+  assert.equal(repairProgressFingerprint(trial, baseline), '', 'partial evidence never earns more paid time');
+  assert.throws(() => writeTrialBaseline(trial, join(dir, 'unsafe-baseline.json')), /AGENT_TRIAL_UNREADABLE/);
+  for (const value of [null, [], 1, {'../outside':'a'.repeat(64)}, {'source.js':'bad hash'}, {'node_modules/x':'a'.repeat(64)}]) {
+    writeJson(join(dir, 'invalid.json'), value);
+    const invalid = classifyTrialChanges(trial, join(dir, 'invalid.json'));
+    assert.equal(invalid.baselineUnreadable, true);
+    assert.throws(() => assertTrialChangesReadable(invalid), /AGENT_BASELINE_UNREADABLE/);
+  }
+  const missing = classifyTrialChanges(join(dir, 'missing-trial'), baseline);
+  assert.throws(() => assertTrialChangesReadable(missing), /AGENT_TRIAL_UNREADABLE/);
+  rmSync(dir, {recursive:true, force:true});
+}
+// Windows sharing violations must not silently omit an existing unreadable
+// file when another source edit can be read. Lock only a temporary fixture.
+if (process.platform === 'win32') {
+  const dir = mkdtempSync(join(tmpdir(), 'iter-agent-file-lock-'));
+  const trial = join(dir, 'trial'); mkdirSync(trial);
+  const locked = join(trial, 'locked.js');
+  writeFileSync(locked, 'before'); writeFileSync(join(trial,'source.js'),'before');
+  const baseline = join(dir,'baseline.json'); writeTrialBaseline(trial,baseline);
+  writeFileSync(join(trial,'source.js'),'after');
+  const script = [
+    'import ctypes, sys',
+    'k=ctypes.WinDLL("kernel32", use_last_error=True)',
+    'k.CreateFileW.argtypes=[ctypes.c_wchar_p,ctypes.c_uint32,ctypes.c_uint32,ctypes.c_void_p,ctypes.c_uint32,ctypes.c_uint32,ctypes.c_void_p]',
+    'k.CreateFileW.restype=ctypes.c_void_p',
+    'k.CloseHandle.argtypes=[ctypes.c_void_p]',
+    'h=k.CreateFileW(sys.argv[1],0x80000000,0,None,3,0,None)',
+    'assert h != ctypes.c_void_p(-1).value, ctypes.get_last_error()',
+    'print("LOCKED",flush=True)',
+    'sys.stdin.readline()',
+    'k.CloseHandle(h)',
+  ].join('\n');
+  const child = spawn(PYTHON,['-c',script,locked],{stdio:['pipe','pipe','pipe'],env:commandEnvironment(process.env)});
+  let diagnostics=''; child.stderr.on('data',chunk=>{diagnostics+=chunk.toString()});
+  try {
+    await new Promise((resolve,reject)=>{
+      const timeout=setTimeout(()=>reject(Error('File lock fixture timed out: '+diagnostics)),10000);
+      child.once('error',error=>{clearTimeout(timeout);reject(error)});
+      child.once('exit',code=>{clearTimeout(timeout);reject(Error('File lock fixture exited '+code+': '+diagnostics))});
+      child.stdout.on('data',chunk=>{if(chunk.toString().includes('LOCKED')){clearTimeout(timeout);resolve()}});
+    });
+    const report=classifyTrialChanges(trial,baseline);
+    assert.ok(report.unreadable.some(item=>item.path==='locked.js'));
+    assert.throws(()=>assertTrialChangesReadable(report),/AGENT_TRIAL_UNREADABLE/);
+    assert.equal(report.progressFingerprint,'');
+    assert.throws(()=>writeTrialBaseline(trial,join(dir,'incomplete.json')),/AGENT_TRIAL_UNREADABLE/);
+    assert.equal(existsSync(join(dir,'incomplete.json')),false);
+  } finally {
+    child.stdin.end('done\n');
+    if(child.exitCode===null) await new Promise(resolve=>child.once('exit',resolve));
+    rmSync(dir,{recursive:true,force:true});
+  }
+}
+// Intermediate roots + normalized project scope; provider configuration stays
+// source input, while a real application manifest remains protected.
+{
+  const dir = mkdtempSync(join(tmpdir(), 'iter-agent-ancestor-'));
+  mkdirSync(join(dir, 'Web', 'App'), {recursive:true});
+  mkdirSync(join(dir, 'Web', '.opencode'));
+  const manifest = {dependencies:{'@opencode-ai/plugin':'1.18.18'}};
+  writeJson(join(dir, 'Web', '.opencode', 'package.json'), manifest);
+  writeJson(join(dir, 'Web', '.opencode', 'package-lock.json'), {name:'.opencode',lockfileVersion:3,packages:{'':manifest,'node_modules/@opencode-ai/plugin':{version:'1.18.18'}}});
+  const baseline = join(tmpdir(), 'iter-agent-ancestor-baseline-' + process.pid + '.json');
+  writeTrialBaseline(dir, baseline);
+  // Whitespace-only provider update still has the same recognized shape.
+  writeFileSync(join(dir, 'Web', '.opencode', 'package.json'), JSON.stringify(manifest,null,2));
+  for (const projectRelative of ['Web/App', './Web/App/', 'Web/App/../App']) {
+    const report = classifyTrialChanges(dir, baseline, {provider:'opencode',projectRelative});
+    assert.deepEqual(report.forbidden, []);
+    assert.deepEqual(report.changedFiles, []);
+    assert.equal(report.changes[0].category, 'confirmed-runtime');
+  }
+  for (const provider of ['claude','codex','unknown']) {
+    assert.deepEqual(classifyTrialChanges(dir, baseline, {provider,projectRelative:'Web/App'}).forbidden, ['modified:Web/.opencode/package.json']);
+  }
+  assert.equal(repairProgressFingerprint(dir, baseline, {provider:'opencode',projectRelative:'Web/App'}), '', 'runtime alone earns no budget');
+  writeFileSync(join(dir,'Web','App','source.js'),'actual repair');
+  assert.ok(repairProgressFingerprint(dir, baseline, {provider:'opencode',projectRelative:'Web/App'}), 'confirmed runtime updates must not suppress real repair progress');
+  rmSync(join(dir,'Web','App','source.js'));
+  for (const folder of ['.claude','.codex','.opencode']) {
+    writeJson(join(dir,folder,'settings.json'), {input:'must remain measured'});
+  }
+  const inputs = classifyTrialChanges(dir, baseline, {provider:'opencode',projectRelative:'Web/App'});
+  assert.deepEqual(inputs.changedFiles, ['.claude/settings.json','.codex/settings.json','.opencode/settings.json']);
+  writeJson(join(dir, 'Web', 'App', 'package.json'), {scripts:{test:'skip'}});
+  assert.deepEqual(classifyTrialChanges(dir, baseline, {provider:'opencode',projectRelative:'Web/App'}).forbidden, ['added:Web/App/package.json']);
+  rmSync(dir, {recursive:true,force:true}); rmSync(baseline);
 }
 
 // 4. Feedback payload carries ONLY the durable candidate identity.

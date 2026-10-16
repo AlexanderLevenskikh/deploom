@@ -373,4 +373,51 @@ for (const failureKind of ['none', 'exit', 'provider']) {
   assert.equal(f.bindings.iterativeStepInFlight.size, 0);
   assert.ok(readFileSync(join(f.runDir, 'delivery-delivery-prompt.md'), 'utf8').includes('codex/semantic-fixture'));
 }
+// Actual production boundary refuses incomplete evidence before Python
+// feedback and stops autopilot without discarding a candidate as incompatible.
+{
+  const f=fixture();
+  const outside=join(f.root,'outside'); mkdirSync(outside);
+  f.setChild(`const fs=require('fs');fs.writeFileSync('input.js','repair');fs.symlinkSync(${JSON.stringify(outside)},'link',${JSON.stringify(process.platform==='win32'?'junction':'dir')});console.log('FEEDBACK_KIND: READY_FOR_VERIFY');`);
+  const result=await f.autonomous(undefined,{projectName:'fixture',autopilot:true});
+  assert.equal(result.autopilot.stopped,'error',JSON.stringify(result));
+  assert.match(result.error,/AGENT_TRIAL_UNREADABLE/);
+  assert.equal(f.drives(),0);
+  assert.equal(existsSync(join(f.runDir,'trial','agent-feedback.json')),false);
+}
+// Agent-provided paths are not evidence. Even a zero-exit READY_FOR_VERIFY
+// response without real changes remains INCONCLUSIVE for every launcher.
+for (const provider of ['opencode','claude','codex']) {
+  const f=fixture(); f.bindings.findWorkspace().agent=provider;
+  f.setChild(`console.log('CHANGED_FILES:\\ninput.js\\nFEEDBACK_KIND: READY_FOR_VERIFY');`);
+  const result=await f.run({projectName:'fixture'});
+  assert.equal(result.ok,true,JSON.stringify(result));
+  const feedback=JSON.parse(readFileSync(join(f.runDir,'trial','agent-feedback.json'),'utf8'));
+  assert.equal(feedback.kind,'INCONCLUSIVE'); assert.deepEqual(feedback.changedFiles,[]);
+}
+// A damaged durable baseline is rejected before dispatch, including a restart
+// with an existing candidate identity. Do not spend a model run on bad evidence.
+{
+  const f=fixture();
+  const baseline=agents.trialBaselineFile(f.runDir,{runId:'run',candidateId:'candidate',baseCheckpointId:'C0'});
+  mkdirSync(dirname(baseline),{recursive:true}); writeFileSync(baseline,'[]');
+  const result=await f.run({projectName:'fixture'});
+  assert.match(result.error,/AGENT_BASELINE_UNREADABLE/);
+  assert.equal(f.launches.length,0);
+}
+// Repeating the same forbidden mutation stops the supervisor, rather than
+// discarding another trial and continuing indefinitely. Checkpoint untouched.
+{
+  const f=fixture();
+  f.setChild(`require('fs').writeFileSync('package.json','{ "changed": true }');console.log('FEEDBACK_KIND: READY_FOR_VERIFY');`);
+  const first=await f.run({projectName:'fixture'});
+  assert.match(first.error,/^FORBIDDEN_MUTATION:/);
+  const second=await f.autonomous(undefined,{projectName:'fixture',autopilot:true});
+  assert.equal(second.autopilot.stopped,'error');
+  assert.match(second.error,/AGENT_REPEATED_BLOCKER/);
+  assert.equal(f.launches.length,1,'known unchanged blocker must stop before a second paid dispatch');
+  assert.equal(f.drives(),0);
+  assert.equal(existsSync(join(f.runDir,'trial','agent-feedback.json')),false);
+  assert.deepEqual(JSON.parse(readFileSync(join(f.runDir,'run.json'),'utf8')),{});
+}
 console.log('agent-launch-lifecycle: production handler + real child wait/resume/cancel/autopilot/recovered error/active timeout/final delivery OK');

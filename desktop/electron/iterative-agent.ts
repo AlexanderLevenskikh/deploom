@@ -19,7 +19,7 @@
 import { createHash } from 'node:crypto'
 import { agentLaunchProviderError } from './agent-launch-errors.js'
 import { existsSync, mkdirSync, readdirSync, readFileSync, lstatSync, statSync, unlinkSync, writeFileSync, renameSync, appendFileSync } from 'node:fs'
-import { dirname, join, sep } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import type { AgentLaunchDiagnostics } from './agent-launch-errors.js'
 import { runtimePolicyFor, type AgentRuntimeScope, type ClassifiedTrialChange, type TrialMutationKind } from './agent-runtime-policy.js'
 
@@ -265,13 +265,14 @@ function walkSkip(name: string): boolean {
   // Everything else — INCLUDING planner-owned manifest/lock files — is hashed
   // so a forbidden mutation is detected, never skipped (the controller is the
   // only writer of dependency state, but the detection must not trust that).
-  return name === 'node_modules' || name === '.git'
+  const key = process.platform === 'win32' ? name.toLowerCase() : name
+  return key === 'node_modules' || key === '.git'
 }
 
 /** True when any path segment is a planner-owned forbidden name. */
 export function isForbiddenTrialRelative(relativePath: string): boolean {
   for (const segment of relativePath.split('/')) {
-    if (ITERATIVE_FORBIDDEN_NAMES.has(segment)) return true
+    if (ITERATIVE_FORBIDDEN_NAMES.has(process.platform === 'win32' ? segment.toLowerCase() : segment)) return true
   }
   return false
 }
@@ -282,99 +283,84 @@ type CollectedTrialMutations = {
   baselineUnreadable: boolean
   mutations: TrialMutation[]
   unreadable: TrialMutation[]
+  hashes: Record<string, string>
 }
 
-/** Single pass over the durable baseline and the current trial. Reports
- *  modified/added/removed for every significant file, keeps planner-forbidden
- *  classification, and separates files whose content could not be measured
- *  (unreadable) instead of silently treating "cannot prove" as "no change". */
-function collectTrialMutations(workspaceRoot: string, baselineFile: string): CollectedTrialMutations {
-  let baseline: Record<string, string>
-  try {
-    baseline = JSON.parse(readFileSync(baselineFile, 'utf8')) as Record<string, string>
-  } catch {
-    return { baselineUnreadable: true, mutations: [], unreadable: [] }
-  }
-  const mutations: TrialMutation[] = []
+/** Do not follow links while measuring repair evidence. Reading a link target
+ * could read outside the trial or turn a replaced directory into false changes. */
+function scanTrialFiles(workspaceRoot: string): { hashes: Record<string, string>; unreadable: TrialMutation[] } {
+  const hashes: Record<string, string> = Object.create(null)
   const unreadable: TrialMutation[] = []
-  const seen = new Set<string>()
-  for (const [relativePath, expected] of Object.entries(baseline)) {
-    const key = relativePath.replace(/\\/g, '/')
-    seen.add(key)
-    const absolute = join(workspaceRoot, relativePath.split('/').join(sep))
-    const forbidden = isForbiddenTrialRelative(key)
-    let actual: string | undefined
-    let failed = false
+  const stack = ['']
+  const fail = (path: string) => unreadable.push({ path: path || '.', kind: 'modified', forbidden: isForbiddenTrialRelative(path) })
+  while (stack.length) {
+    const directory = stack.pop()!
+    const absolute = join(workspaceRoot, directory)
+    let entries: string[]
     try {
-      actual = fileHash(absolute)
-    } catch {
-      failed = true
-    }
-    if (failed && existsSync(absolute)) {
-      unreadable.push({ path: key, kind: 'modified', forbidden })
-    } else if (!existsSync(absolute)) {
-      mutations.push({ path: key, kind: 'removed', forbidden })
-    } else if (actual !== expected) {
-      mutations.push({ path: key, kind: 'modified', forbidden })
-    }
-  }
-  const stack: string[] = ['']
-  while (stack.length > 0) {
-    const relativeDir = stack.pop()!
-    const absoluteDir = join(workspaceRoot, relativeDir)
-    let names: string[]
-    try {
-      names = readdirSync(absoluteDir)
-    } catch {
-      continue
-    }
-    for (const name of names) {
+      const info = lstatSync(absolute)
+      if (info.isSymbolicLink() || !info.isDirectory()) { fail(directory); continue }
+      entries = readdirSync(absolute)
+    } catch { fail(directory); continue }
+    for (const name of entries) {
       if (walkSkip(name)) continue
-      const absolute = join(absoluteDir, name)
-      let stats
+      const path = directory ? directory + '/' + name : name
       try {
-        stats = statSync(absolute)
-      } catch {
-        continue
-      }
-      const relativePath = relativeDir ? `${relativeDir}${sep}${name}` : name
-      const key = relativePath.replace(/\\/g, '/')
-      const forbidden = isForbiddenTrialRelative(key)
-      if (stats.isDirectory()) {
-        // A symlinked directory is treated as a leaf: never descend through a
-        // link out of the trial, so a runtime tree or host mount outside the
-        // trial cannot be walked as if it were project content.
-        let isLink = true
-        try {
-          isLink = lstatSync(absolute).isSymbolicLink()
-        } catch {
-          isLink = true
-        }
-        if (isLink) {
-          if (!seen.has(key)) mutations.push({ path: key, kind: 'added', forbidden })
-          continue
-        }
-        stack.push(relativePath)
-      } else if (stats.isFile() && !seen.has(key)) {
-        let failed = false
-        try {
-          fileHash(absolute)
-        } catch {
-          failed = true
-        }
-        if (failed) unreadable.push({ path: key, kind: 'added', forbidden })
-        else mutations.push({ path: key, kind: 'added', forbidden })
-      }
+        const info = lstatSync(join(workspaceRoot, path))
+        if (info.isSymbolicLink()) fail(path)
+        else if (info.isDirectory()) stack.push(path)
+        else if (info.isFile()) hashes[path] = fileHash(join(workspaceRoot, path))
+        else fail(path)
+      } catch { fail(path) }
     }
   }
-  return { baselineUnreadable: false, mutations, unreadable }
+  return { hashes, unreadable }
+}
+
+function validBaseline(value: unknown): value is Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  return Object.entries(value).every(([path, hash]) => {
+    const parts = path.split('/')
+    return path.length > 0 && !isAbsolute(path) && !path.includes('\\') && !path.includes(':')
+      && parts.every(part => part !== '' && part !== '.' && part !== '..' && !walkSkip(part))
+      && typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash)
+  })
+}
+
+/** Validate durable evidence before paying for another agent invocation. */
+export function assertTrialBaselineReadable(baselineFile: string): void {
+  try {
+    if (validBaseline(JSON.parse(readFileSync(baselineFile, 'utf8')))) return
+  } catch { /* Missing and invalid evidence share the same explicit failure. */ }
+  throw new Error('AGENT_BASELINE_UNREADABLE: original repair baseline is missing or invalid')
+}
+
+function collectTrialMutations(workspaceRoot: string, baselineFile: string): CollectedTrialMutations {
+  let baseline: unknown
+  try { baseline = JSON.parse(readFileSync(baselineFile, 'utf8')) } catch {
+    return { baselineUnreadable: true, mutations: [], unreadable: [], hashes: {} }
+  }
+  if (!validBaseline(baseline)) return { baselineUnreadable: true, mutations: [], unreadable: [], hashes: {} }
+  const { hashes, unreadable } = scanTrialFiles(workspaceRoot)
+  const mutations: TrialMutation[] = []
+  for (const [path, hash] of Object.entries(hashes)) {
+    const previous = Object.hasOwn(baseline, path) ? baseline[path] : undefined
+    if (previous !== hash) mutations.push({ path, kind: previous === undefined ? 'added' : 'modified', forbidden: isForbiddenTrialRelative(path) })
+  }
+  for (const path of Object.keys(baseline)) {
+    if (Object.hasOwn(hashes, path)) continue
+    if (unreadable.some(item => item.path === '.' || path === item.path || path.startsWith(item.path + '/'))) continue
+    mutations.push({ path, kind: 'removed', forbidden: isForbiddenTrialRelative(path) })
+  }
+  return { baselineUnreadable: false, mutations, unreadable, hashes }
 }
 
 /** Backwards-compatible mutation list (see collectTrialMutations). Unreadable
  *  content and an unreadable baseline yield an empty list so callers that
  *  grant progress (repairProgressFingerprint) fail closed on that. */
 export function classifyTrialMutations(workspaceRoot: string, baselineFile: string): TrialMutation[] {
-  return collectTrialMutations(workspaceRoot, baselineFile).mutations
+  const observed = collectTrialMutations(workspaceRoot, baselineFile)
+  return observed.baselineUnreadable || observed.unreadable.length ? [] : observed.mutations
 }
 
 /** Per-change verdict from ONE pass over the trial, combining the dependency
@@ -388,6 +374,14 @@ export type TrialChangeReport = {
   unreadable: ClassifiedTrialChange[]
   changedFiles: string[]
   forbidden: Array<`${TrialMutationKind}:${string}`>
+  progressFingerprint: string
+}
+
+/** Shared production boundary: incomplete filesystem evidence never reaches
+ * feedback, bootstrap verification or a repair-budget extension. */
+export function assertTrialChangesReadable(report: TrialChangeReport): void {
+  if (report.baselineUnreadable) throw new Error('AGENT_BASELINE_UNREADABLE: original repair baseline is missing or invalid')
+  if (report.unreadable.length) throw new Error('AGENT_TRIAL_UNREADABLE: ' + report.unreadable.map(item => item.path).sort().join(', '))
 }
 
 function classifyMutation(mutation: TrialMutation, runtimePaths: Set<string>): ClassifiedTrialChange {
@@ -410,8 +404,14 @@ export function classifyTrialChanges(workspaceRoot: string, baselineFile: string
   const changes = collected.mutations.map(mutation => classifyMutation(mutation, runtimePaths))
   const unreadable = collected.unreadable.map(mutation => classifyMutation(mutation, runtimePaths))
   for (const item of unreadable) item.category = 'unreadable'
+  const source = changes.filter(item => item.category === 'source-config').sort((a, b) => a.path.localeCompare(b.path))
+  const complete = !collected.baselineUnreadable && unreadable.length === 0 && !changes.some(item => item.category === 'dependency-blocked')
+  const progressFingerprint = complete && source.length
+    ? createHash('sha256').update(JSON.stringify(source.map(item => [item.path, item.kind,
+      item.kind === 'removed' ? '' : collected.hashes[item.path]]))).digest('hex') : ''
   return {
     baselineUnreadable: collected.baselineUnreadable,
+    progressFingerprint,
     policyVersion: policy.version,
     runtimePaths,
     changes,
@@ -430,44 +430,22 @@ export function inspectTrialChanges(workspaceRoot: string, baselineFile: string,
 }
 
 export function forbiddenTrialViolations(workspaceRoot: string, baselineFile: string, scope?: AgentRuntimeScope): string[] {
-  return classifyTrialChanges(workspaceRoot, baselineFile, scope).forbidden
+  const report = classifyTrialChanges(workspaceRoot, baselineFile, scope)
+  assertTrialChangesReadable(report)
+  return report.forbidden
 }
 
 /** Durable baseline of the trial project: relative path -> sha256. Written
  * ONCE per agent run; a restart re-uses it, so the coordinator's own files
  * are never counted as agent changes. Covers planner-owned manifests too. */
 export function writeTrialBaseline(workspaceRoot: string, baselineFile: string): number {
-  const entries: Record<string, string> = {}
-  const stack = ['']
-  while (stack.length > 0) {
-    const relativeDir = stack.pop()!
-    const absoluteDir = join(workspaceRoot, relativeDir)
-    let names: string[]
-    try {
-      names = readdirSync(absoluteDir)
-    } catch {
-      continue
-    }
-    for (const name of names) {
-      if (walkSkip(name)) continue
-      const absolute = join(absoluteDir, name)
-      let stats
-      try {
-        stats = statSync(absolute)
-      } catch {
-        continue
-      }
-      const relativePath = relativeDir ? `${relativeDir}${sep}${name}` : name
-      if (stats.isDirectory()) {
-        stack.push(relativePath)
-      } else if (stats.isFile()) {
-        entries[relativePath.replace(/\\/g, '/')] = fileHash(absolute)
-      }
-    }
-  }
+  const observed = scanTrialFiles(workspaceRoot)
+  if (observed.unreadable.length) throw new Error('AGENT_TRIAL_UNREADABLE: ' + observed.unreadable.map(item => item.path).join(', '))
   mkdirSync(dirname(baselineFile), { recursive: true })
-  writeFileSync(baselineFile, JSON.stringify(entries), 'utf8')
-  return Object.keys(entries).length
+  const temporary = baselineFile + '.' + process.pid + '.tmp'
+  writeFileSync(temporary, JSON.stringify(observed.hashes), 'utf8')
+  renameSync(temporary, baselineFile)
+  return Object.keys(observed.hashes).length
 }
 
 export function trialBaselineFile(runDir: string, identity?: Pick<IterativeAgentContext, 'runId' | 'candidateId' | 'baseCheckpointId'>): string {
@@ -485,7 +463,9 @@ export function agentPromptFile(runDir: string): string {
  * forbiddenTrialViolations) and installation noise. Paths are relative to
  * workspaceRoot, matching apply-feedback's scope check. */
 export function changedFilesFromBaseline(workspaceRoot: string, baselineFile: string): string[] {
-  return classifyTrialChanges(workspaceRoot, baselineFile).changedFiles
+  const report = classifyTrialChanges(workspaceRoot, baselineFile)
+  assertTrialChangesReadable(report)
+  return report.changedFiles
 }
 
 /** Path of the project inside the trial, relative to the durable run dir. */
@@ -643,11 +623,8 @@ export function validRepairBudget(value: unknown): value is NonNullable<AgentLea
 
 /** Hash actual allowed source mutations; provider prose and repeated heartbeats
  * cannot extend a repair. Protected mutations retain their ordinary guard. */
-export function repairProgressFingerprint(root: string, baseline: string): string {
-  const changes = classifyTrialMutations(root, baseline).filter(m => !m.forbidden)
-  if (!changes.length) return ''
-  return createHash('sha256').update(JSON.stringify(changes.sort((a, b) => a.path.localeCompare(b.path))
-    .map(m => [m.path, m.kind, m.kind === 'removed' ? '' : fileHash(join(root, m.path))]))).digest('hex')
+export function repairProgressFingerprint(root: string, baseline: string, scope?: AgentRuntimeScope): string {
+  return classifyTrialChanges(root, baseline, scope).progressFingerprint
 }
 
 export function extendRepairBudget(budget: NonNullable<AgentLease['repairBudget']>, fingerprint: string,
@@ -722,10 +699,13 @@ export function agentBlockerFile(runDir: string): string {
   return join(runDir, AGENT_BLOCKER_FILENAME)
 }
 
-/** Canonical violation shape for fingerprints: lowercase, forward slashes, no
- *  leading "./". Different OS spellings of the same file must collide. */
+/** Canonical violation shape: case-insensitive operation, forward slashes,
+ * no leading "./"; path case is folded only on Windows. */
 export function normalizeViolationPath(value: string): string {
-  return value.trim().toLowerCase().replace(/\\/g, '/').replace(/^\.\/+/, '')
+  const normalized = value.trim().replace(/\\/g, '/').replace(/^(?:\.\/)+/, '')
+  const operation = /^(added|modified|removed):(.*)$/i.exec(normalized)
+  const path = (operation?.[2] ?? normalized).replace(/^(?:\.\/)+/, '')
+  return (operation ? operation[1].toLowerCase() + ':' : '') + (process.platform === 'win32' ? path.toLowerCase() : path)
 }
 
 export type RepeatedBlockerRecord = {
@@ -759,8 +739,12 @@ export function readAgentBlocker(file: string): RepeatedBlockerRecord | undefine
     if (!parsed || typeof parsed !== 'object') return undefined
     const record = parsed as Partial<RepeatedBlockerRecord>
     if (record.schemaVersion !== 1 || typeof record.provider !== 'string' || typeof record.fingerprint !== 'string') return undefined
-    if (!Array.isArray(record.violations) || !Array.isArray(record.candidateIds)) return undefined
-    return record as RepeatedBlockerRecord
+    if (!Number.isInteger(record.policyVersion) || typeof record.reasonCode !== 'string' || typeof record.baseCheckpointId !== 'string') return undefined
+    if (!Array.isArray(record.violations) || !record.violations.every(value => typeof value === 'string')
+      || !Array.isArray(record.candidateIds) || !record.candidateIds.every(value => typeof value === 'string')) return undefined
+    const valid = record as RepeatedBlockerRecord
+    if (valid.fingerprint !== repeatedBlockerFingerprint(valid)) return undefined
+    return valid
   } catch {
     return undefined
   }
@@ -804,6 +788,20 @@ export function resolveRepeatedBlocker(file: string, current: {
   }
   writeAgentBlocker(file, stored)
   return { repeated: false, stored }
+}
+
+/** Refuse a known, still-present blocker before launching another paid agent.
+ * A repaired trial, new policy/provider/base or different violation can retry. */
+export function assertNoPersistedAgentBlocker(file: string, workspaceRoot: string, baseline: string,
+  scope: AgentRuntimeScope, baseCheckpointId: string): void {
+  const stored = readAgentBlocker(file)
+  if (!stored || stored.provider !== scope.provider || stored.baseCheckpointId !== baseCheckpointId) return
+  const report = classifyTrialChanges(workspaceRoot, baseline, scope)
+  assertTrialChangesReadable(report)
+  if (!report.forbidden.length) return
+  const fingerprint = repeatedBlockerFingerprint({ provider: scope.provider, policyVersion: report.policyVersion,
+    reasonCode: 'FORBIDDEN_MUTATION', baseCheckpointId, violations: report.forbidden })
+  if (stored.fingerprint === fingerprint) throw new Error('AGENT_REPEATED_BLOCKER: FORBIDDEN_MUTATION: ' + report.forbidden.join(', '))
 }
 
 /** True when the durable lease currently describes a parked launch-wait

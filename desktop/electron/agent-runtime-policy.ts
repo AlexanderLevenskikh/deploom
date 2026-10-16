@@ -29,7 +29,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 /** Bump this only when the runtime-recognition rules change in a way that
  *  invalidates previously persisted definitions (e.g. a new adapter or a new
  *  narrowing of an existing one). */
-export const AGENT_RUNTIME_POLICY_VERSION = 1
+export const AGENT_RUNTIME_POLICY_VERSION = 2
 
 /** Provider + project location inside the trial workspace. */
 export type AgentRuntimeScope = { provider: string; projectRelative: string }
@@ -73,10 +73,6 @@ function projectInsideWorkspace(workspaceRoot: string, projectRelative: string):
 const OPENCODE_RUNTIME_ROOT = '.opencode'
 const OPENCODE_RUNTIME_FILES = ['package.json', 'package-lock.json']
 
-function projectPrefix(projectRelative: string): string {
-  return projectRelative.replace(/\\/g, '/').replace(/^\.\/?$/, '').replace(/\/$/, '')
-}
-
 /** Recognize ONLY OpenCode's own plugin installation, never project manifests.
  *  The explicit provider/project scope, physical paths (no symlink roots), and
  *  the plugin-only manifest+lock pair are all required. Returns the
@@ -87,13 +83,17 @@ function openCodeRuntimePaths(workspaceRoot: string, projectRelative: string): S
   const root = resolve(workspaceRoot)
   const project = resolve(workspaceRoot, projectRelative)
   if (!projectInsideWorkspace(workspaceRoot, projectRelative)) return result
-  // OpenCode also bootstraps at the manager root for nested monorepo projects.
+  // Inspect only ancestors inside the private tree, including intermediate
+  // monorepo roots. Never search the host's parent directories.
   if (project !== root) {
-    for (const path of openCodeRuntimePaths(workspaceRoot, '.')) result.add(path)
+    for (const path of openCodeRuntimePaths(workspaceRoot, relative(root, resolve(project, '..')) || '.')) result.add(path)
   }
   const directory = join(project, OPENCODE_RUNTIME_ROOT)
   try {
-    if (realpathSync(directory).toLowerCase() !== directory.toLowerCase()) return result
+    const physical = realpathSync(directory)
+    const samePath = process.platform === 'win32'
+      ? physical.toLowerCase() === directory.toLowerCase() : physical === directory
+    if (!samePath) return result
     const manifestPath = join(directory, 'package.json')
     const lockPath = join(directory, 'package-lock.json')
     if (!lstatSync(manifestPath).isFile() || !lstatSync(lockPath).isFile()) return result
@@ -110,9 +110,8 @@ function openCodeRuntimePaths(workspaceRoot: string, projectRelative: string): S
     if (JSON.stringify(lockedRoot.dependencies) !== JSON.stringify(deps)) return result
     const plugin = lock.packages?.['node_modules/@opencode-ai/plugin']
     if (plugin?.version !== version) return result
-    const prefix = projectPrefix(projectRelative)
     for (const file of OPENCODE_RUNTIME_FILES) {
-      result.add(`${prefix ? prefix + '/' : ''}${OPENCODE_RUNTIME_ROOT}/${file}`)
+      result.add(relative(root, realpathSync(join(directory, file))).split(sep).join('/'))
     }
   } catch {
     // Missing, linked or unrecognized runtime files keep the ordinary guard.

@@ -79,7 +79,7 @@ import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
 import { type IterativeAttemptRecord, beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, readRunLogTail, recordAttemptLog, recordAttemptProgress, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
 import { spawnIterativeStreamed, type CaptureResult, type StreamAttemptIo, type StreamPlatform } from './iterative-stream.js'
-import { extendRepairBudget, repairProgressFingerprint, agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, inspectTrialChanges, clearAgentLease, decideAgentLeaseDispatch, iterativeApplyFeedbackInvocation, agentProviderFailure, parseAgentOutcome, parseChangedFilesFromAgentOutput, readAgentLease, recordAgentDispatchTiming, trialBaselineFile, trialProjectPath, withAgentDispatchLock, writeAgentLease, writeTrialBaseline, classifyTrialChanges, agentBlockerFile, resolveRepeatedBlocker } from './iterative-agent.js'
+import { extendRepairBudget, agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, inspectTrialChanges, clearAgentLease, decideAgentLeaseDispatch, iterativeApplyFeedbackInvocation, agentProviderFailure, parseAgentOutcome, readAgentLease, recordAgentDispatchTiming, trialBaselineFile, trialProjectPath, withAgentDispatchLock, writeAgentLease, writeTrialBaseline, classifyTrialChanges, assertTrialChangesReadable, assertTrialBaselineReadable, agentBlockerFile, resolveRepeatedBlocker, assertNoPersistedAgentBlocker } from './iterative-agent.js'
 import type { TrialChangeReport } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
@@ -9217,6 +9217,8 @@ function setupIpc(): void {
           baselineFile = legacyBaseline
         }
         if (!existsSync(baselineFile)) writeTrialBaseline(workspaceRoot, baselineFile)
+        assertTrialBaselineReadable(baselineFile)
+        assertNoPersistedAgentBlocker(agentBlockerFile(runDir), workspaceRoot, baselineFile, { provider, projectRelative }, ctx.baseCheckpointId)
         const promptFile = agentPromptFile(runDir)
         const promptText = bootstrap
           ? buildIterativeBootstrapPrompt({ ...ctx, checkpointId: ctx.baseCheckpointId })
@@ -9248,8 +9250,8 @@ function setupIpc(): void {
           onDeadline: () => {
             const guard = classifyTrialChanges(workspaceRoot, baselineFile, { provider, projectRelative })
             if (streamedProviderError || readAttempt(runDir)?.cancelRequested
-              || guard.baselineUnreadable || guard.forbidden.length) return 0
-            const fingerprint = repairProgressFingerprint(workspaceRoot, baselineFile)
+              || guard.baselineUnreadable || guard.unreadable.length || guard.forbidden.length) return 0
+            const fingerprint = guard.progressFingerprint
             const extended = extendRepairBudget(repairBudget, fingerprint)
             if (!extended || (Number.isFinite(runDeadline) && Date.now() >= runDeadline)) return 0
             if (Number.isFinite(runDeadline)) extended.deadlineAt = Math.min(extended.deadlineAt, runDeadline)
@@ -9408,7 +9410,7 @@ function setupIpc(): void {
         const providerFailure = repairTimedOut ? undefined : agentProviderFailure(output, exitCode)
         if (repairTimedOut) {
           const guard = classifyTrialChanges(workspaceRoot, baselineFile, { provider, projectRelative })
-          if (guard.baselineUnreadable) throw new Error('AGENT_BASELINE_UNREADABLE: cannot verify agent repair without readable baseline evidence')
+          assertTrialChangesReadable(guard)
           if (guard.forbidden.length) {
             forbiddenMutationResult(guard)
             throw new Error(`FORBIDDEN_MUTATION: ${guard.forbidden.join(', ')}`)
@@ -9470,15 +9472,13 @@ function setupIpc(): void {
 
         const runtimeScope = { provider, projectRelative }
         const inspection = inspectTrialChanges(workspaceRoot, baselineFile, runtimeScope)
-        if (inspection.baselineUnreadable) throw new Error('AGENT_BASELINE_UNREADABLE: cannot verify agent repair without readable baseline evidence')
+        assertTrialChangesReadable(inspection)
         const runtimePaths = inspection.runtimePaths
         if (runtimePaths.size > 0) {
           recordAttemptLog(runDir, 'OpenCode plugin runtime manifests recognized; excluded from repair evidence. Project manifests remain protected.\n')
         }
-        const changed = [...new Set([
-          ...inspection.changedFiles,
-          ...parseChangedFilesFromAgentOutput(output),
-        ])].filter(path => !runtimePaths.has(path)).sort()
+        // Agent prose cannot invent repair evidence or add unmeasured files.
+        const changed = inspection.changedFiles
         // #4: the baseline hash diff is the source of truth for agent edits.
         // A planner-owned file (manifest/lock/.npmrc/...) that was modified,
         // added or removed is a violation and REJECTS the repair BEFORE any

@@ -16,8 +16,9 @@ therefore allowed an in-trial exemption; claude, codex and any unknown provider
 are STRICT (nothing exempt) until their launcher is verified to place runtime
 files in a trial. A provider is never inferred from folder presence.
 
-OpenCode may install/update its plugin under the selected trial project's
-`.opencode/`. The policy recognizes only its plugin-only `package.json` and
+OpenCode may install/update its plugin under `.opencode/` at the selected
+trial project, the workspace root or an intermediate ancestor inside that
+private workspace. The policy recognizes only its plugin-only `package.json` and
 matching npm v3 `package-lock.json`: explicit OpenCode provider, exact project
 path inside the workspace, ordinary physical files, matching
 `@opencode-ai/plugin` version. Missing files, symlinked directories, links,
@@ -29,22 +30,34 @@ real manifest keep the ordinary guard (`ITERATIVE_FORBIDDEN_NAMES`).
 Those recognized runtime files cannot count as source repair evidence or appear
 in agent feedback's changed-file list. They remain part of the source snapshot
 used for fresh verification. Project manifests and lockfiles stay immutable.
+Feedback paths come exclusively from the measured file diff, never from the
+agent's claimed changed-file list. The repair budget uses the same classified
+observation: runtime changes alone earn no time; a confirmed runtime update
+does not suppress progress from a real source edit.
 The original durable baseline works after restart, including a trial whose
 plugin installation was already updated by an earlier provider invocation.
 
 An unreadable baseline or unreadable changed file FAILS CLOSED: the repair is
 not verified, never credited, and `repairProgressFingerprint` earns no budget
-extension. Escaping project paths are rejected, and the classifier never walks
-down a symlinked directory.
+extension. Baseline creation also refuses incomplete evidence; malformed JSON
+shapes, invalid hashes and escaping baseline paths cannot become a clean diff.
+Filesystem reads use one complete tree scan per observation. Directory read
+errors and symlinks/junctions are explicit unreadable evidence, not ignored
+entries; source trees with links require separate supported handling rather
+than following host paths. Escaping project paths are rejected.
 
 A REPEATED forbidden-mutation defect is persisted per run dir in
 `agent-blocker.json` (provider, policy version, base checkpoint, normalized
 violations fingerprint + candidate ids). The FIRST occurrence keeps the
 ordinary FORBIDDEN_MUTATION rejection; the same defect on a later candidate (or
 after a restart) ends with `AGENT_REPEATED_BLOCKER`, which stops the repair
-without discarding the verified checkpoint or spending another attempt. A newer
-base checkpoint or a different violations signature is a fresh defect, not a
-repeat.
+without discarding the verified checkpoint. When the previous forbidden
+mutation is still present in the same trial, the next dispatch is refused
+BEFORE launching the model. A fresh candidate must first be observed before
+its violation can be compared; that first observation can require a dispatch.
+A newer policy version, provider, base checkpoint or different violation
+signature does not match the saved blocker. Fixing the forbidden mutation
+allows another dispatch.
 
 Unavailable OpenCode models are rejected before dispatch. JSONL provider
 errors, including errors from a process that exits zero, are reported as
@@ -87,8 +100,11 @@ new progress reporting applies to subsequently launched steps.
 
 ## Validation
 
-- `python run_tool_tests.py --suite all`: 1638 tests, 4 platform skips.
-- `python run_tool_tests.py --suite production-fast`: 64 tests.
+Run these commands against the implementation being reviewed; historical
+test counts are not evidence for a later commit:
+
+- `python run_tool_tests.py --suite all`.
+- `python run_tool_tests.py --suite production-fast` (a separate gate).
 - `tests/regression/test_iterative_atomic_write.py` includes a real Windows
   reader that temporarily denies replacement of the durable state file.
 - `check:iterative-agent` covers runtime updates against an existing baseline,
