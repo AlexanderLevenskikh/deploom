@@ -592,17 +592,19 @@ def _run_overlay_robocopy(
             "without dependency payload bytes"
         )
     try:
-        result = subprocess.run(
-            argv,
-            cwd=str(source),
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=300,
-            check=False,
-        )
+        from cross_process_io import shared_io_slot
+        with shared_io_slot("copy", progress=progress, label="guarded source upper copy", timeout_seconds=300):
+            result = subprocess.run(
+                argv,
+                cwd=str(source),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=300,
+                check=False,
+            )
     except (OSError, subprocess.SubprocessError):
         return False
     return result.returncode < 8
@@ -746,7 +748,7 @@ def _populate_node_modules_shell(
     """
     clone_root.mkdir(parents=True, exist_ok=True)
     pairs: list[tuple[Path, Path]] = []
-    local_cache_names = {".vite", ".vitest", ".cache"}
+    local_cache_names = set(EPHEMERAL_CACHE_DIR_NAMES)
     plan_by_link = {item.link_relative: item for item in reparse_plan}
 
     def planned_target(entry: Path) -> Optional[Path]:
@@ -813,7 +815,7 @@ def _populate_node_modules_shell(
         return False, []
 
 
-EPHEMERAL_CACHE_DIR_NAMES = frozenset({".vite", ".vitest", ".cache"})
+EPHEMERAL_CACHE_DIR_NAMES = (".vite", ".vitest", ".cache", ".vite-temp")
 
 
 def apply_tree_write_protection(

@@ -21,6 +21,7 @@ from yarn_berry import lock_mapping
 
 
 class ModernYarnPhysicalAcceptance(unittest.TestCase):
+    versions = ('2.4.3', '3.8.7', '4.0.0')
     def test_real_modern_versions_resolve_then_immutable_install_and_check_nested_package(self):
         configured = os.environ.get('DEPLOOM_TEST_YARN_ROOT')
         if not configured:
@@ -53,7 +54,7 @@ class ModernYarnPhysicalAcceptance(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
         registry = f'http://127.0.0.1:{server.server_port}'
-        for version in ('2.4.3', '3.8.7', '4.0.0'):
+        for version in self.versions:
             with self.subTest(yarn=version), tempfile.TemporaryDirectory(prefix='deploom-modern-yarn-') as tmp:
                 root = Path(tmp)/'repo'; app = root/'Web'/'App'; app.mkdir(parents=True)
                 runtime = runtimes/version/'node_modules'/'@yarnpkg'/'cli-dist'/'bin'/'yarn.js'
@@ -79,7 +80,26 @@ class ModernYarnPhysicalAcceptance(unittest.TestCase):
                     self.assertTrue((snapshot.root/'backend.sql').is_file())
                     self.assertTrue((snapshot.root/'.yarn/releases/yarn.cjs').is_file())
                     config = BaselineVerifyConfig(enabled=True, project_checks='strict', commands=('node check.js',), registry=registry, timeout_seconds=120, attempt_timeout_seconds=300, proof_cache_dir=str(Path(tmp)/'proof'))
+                    # Exercise the production resolver-only -> exact lifecycle
+                    # bridge, including Berry's real on-disk install/build state.
+                    from dataclasses import replace
+                    from block_psi57_yarn1_resolver_seed import reset_same_run_resolver_seed_cache
+                    reset_same_run_resolver_seed_cache()
+                    self.addCleanup(reset_same_run_resolver_seed_cache)
+                    telemetry = Path(tmp) / 'seed-telemetry.jsonl'
+                    config = replace(config, recovery_checkpoints=True,
+                        recovery_journal_dir=str(Path(tmp) / 'receipts'),
+                        telemetry_path=str(telemetry), verification_purpose='intermediate-candidate',
+                        resolver_seed_publication_hint='bridge-lifecycle')
+                    resolved = verify_assignment(app, {'deploom-yarn-fixture': '2.0.0'}, config=config,
+                                                 run_project_checks=False, runtime_env=runtime_env)
+                    self.assertTrue(resolved.ok, resolved.summary + resolved.output)
                     result = verify_assignment(app, {'deploom-yarn-fixture': '2.0.0'}, config=config, run_project_checks=True, runtime_env=runtime_env)
+                    if os.name == 'nt' and not version.startswith('2.'):
+                        events = [json.loads(line) for line in telemetry.read_text(encoding='utf-8').splitlines()]
+                        self.assertTrue(any(e.get('event') == 'resolver-seed.hit' for e in events),
+                                        [(e.get('event'), e.get('reason')) for e in events if 'seed' in e.get('event', '')])
+                        self.assertEqual(1, sum(e.get('event') == 'verify.resolver.start' for e in events))
                     self.assertTrue(result.ok, result.summary+'\n'+result.output)
                     self.assertEqual('2.0.0', result.observed_resolved_versions['deploom-yarn-fixture'])
                     self.assertEqual('1.0.0', exact_yarn_lock_version(root/'yarn.lock', 'deploom-yarn-fixture', '1.0.0'))

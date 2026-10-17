@@ -11,7 +11,7 @@ to accept an unverified assignment. Interrupted work remains RUNNING/UNKNOWN.
 | SourceSnapshot sealed | Sealed bytes and source identity. Reuse checks current source, physical snapshot integrity and ordinary live continuity. Incomplete capture is repeated. |
 | Resolver install PASS | ResolverProof plus physical ResolvedState, exact assignment and lockfile. Missing or invalid state requires fresh resolution. |
 | Lifecycle install PASS | PreparationProof plus intact PreparedArtifact. A proof without the physical tree cannot skip lifecycle scripts. |
-| PreparedSnapshot published | Immutable prepared tree and its content key, published only after authoritative guards pass. Recovery enables durable reuse for baseline controls and intermediate attempts. |
+| PreparedSnapshot published | Immutable prepared tree and its content key, published only after authoritative guards pass. Recovery enables durable reuse for baseline controls, incumbent promotion and legacy callers; explicitly intermediate preparation remains private. |
 | Selected checks PASS | Separate receipts for each selected build, test, lint and lint:* command. Receipts bind source, dependencies, prepared artifact, command order, tool closure and effective environment. |
 | Registry discovery | Independent per-package results in preparation-discovery.json. Settled planning results live for 24 hours under matching inputs; errors and UNKNOWN are retained as diagnostics and retried. |
 
@@ -32,15 +32,22 @@ input; later checks cannot accidentally consume a half-mutated previous check.
 Nonregression baseline/observation sidecars are hash-checked and the initial
 control is never reset after an accepted cohort.
 
+Intermediate candidate/diagnostic preparation remains private even with stage
+recovery enabled. If that process stops, installation and checks may replay;
+no cross-process command receipt is issued without a durable prepared artifact.
+The previous verified checkpoint is retained. Baseline control, incumbent and
+legacy durable boundaries below are unchanged. See
+[MIGRATION_PERFORMANCE.md](MIGRATION_PERFORMANCE.md).
+
 ## Migration
 
 | Boundary | Saved progress |
 | --- | --- |
 | Assignment selected | Candidate assignment, cohort, constraints and active attempt. |
-| Resolver and lifecycle PASS | Exact proofs and physical prepared/resolved artifacts; interrupted installs repeat. |
+| Resolver and lifecycle PASS | Exact proofs and resolved state; durable roles retain physical preparation. Intermediate private preparation repeats after process loss. |
 | Diagnostic materialization PASS | Complete mutable trial integrity, observed assignment and next candidate state. Resume verifies the entire trial and base source before skipping installation. |
 | Diagnostic checks PASS | Complete contiguous command prefix and its exact post-command trial integrity. A partial or changed trial cannot reuse the prefix. |
-| Authoritative checks PASS | Individual command receipts, including build, tests, lint and lint:*; incompatible inputs or missing evidence cause fresh execution. |
+| Authoritative checks PASS | Durable preparation permits individual receipts for build, tests, lint and lint:*. Private intermediate checks replay after process loss; incompatible inputs or missing evidence cause fresh execution. |
 | Verification concluded | Saved result independently of controller publication. Reuse requires unchanged trial/runtime and physical proof/artifact/command receipts for PASS. Infrastructure and budget failures are not compatibility facts. |
 | Verified incumbent | Durable sealed source, assignment and proof references. A write-ahead publication journal protects the active checkpoint switch. |
 | Iteration complete | A write-ahead transaction publishes candidate, ledger, repair handoff and run state together after a negative conclusion. Attempts and spent budgets remain intact. |

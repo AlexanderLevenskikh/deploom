@@ -134,6 +134,7 @@ export type ScenarioSignal = {
   act: () => void
   restart?: () => void
   restartEnabled?: boolean
+  prepareResult?: { label: string; enabled: boolean; act: () => void }
 }
 
 const FIXABLE_CODES = new Set(["SOURCE_SUBMODULE_INCOMPLETE", "SOURCE_SUBMODULE_STATUS_FAILED"])

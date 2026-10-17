@@ -749,7 +749,22 @@ def _manager_runtime_identity(project_dir: Path) -> Tuple[str, str]:
     return manager or "", first[:64]
 
 
-def _run_install(project_dir: Path, *, timeout_seconds: int, progress_label: str, runtime_env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess[str]:
+def _run_install(project_dir: Path, *, timeout_seconds: int, progress_label: str,
+                 runtime_env: Optional[Dict[str, str]] = None, run_deadline_at: str = "") -> subprocess.CompletedProcess[str]:
+    deadline_epoch = None
+    if run_deadline_at:
+        try:
+            deadline_epoch = datetime.strptime(run_deadline_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+        except (ValueError, TypeError):
+            pass  # Preserve run_budget_ok's legacy malformed-date behavior.
+    def remaining_run_seconds():
+        if deadline_epoch is None:
+            return None
+        remaining = deadline_epoch - time.time()
+        if remaining <= 0:
+            raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+        return remaining
+    queue_timeout = remaining_run_seconds()
     manager, executable, install_args = _manager_and_install(project_dir)
     if not executable:
         raise IterativeMigrationError(
@@ -761,20 +776,32 @@ def _run_install(project_dir: Path, *, timeout_seconds: int, progress_label: str
         "YARN_ENABLE_IMMUTABLE_INSTALLS": "false",
         "YARN_ENABLE_SCRIPTS": "false",
         "npm_config_ignore_scripts": "true",
+        "NX_DAEMON": "false",
     }
     base_env = os.environ
     if runtime_env:
         base_env = {**base_env, **runtime_env}
     with MigrationProgress(_emit_status, operation="install", message=f"{progress_label}: installing dependencies") as progress:
-        return _run(
-            [executable, *install_args],
-            project_dir,
-            timeout_seconds=timeout_seconds,
-            env=env,
-            base_env=base_env,
-            progress=progress,
-            progress_label=progress_label,
-        )
+        from cross_process_io import shared_io_slot
+        try:
+            with shared_io_slot("pm", progress=progress, label=progress_label, timeout_seconds=queue_timeout or 0):
+                remaining = remaining_run_seconds()
+                active_timeout = timeout_seconds
+                if remaining is not None:
+                    active_timeout = min(timeout_seconds or remaining, max(1, int(remaining)))
+                return _run(
+                    [executable, *install_args],
+                    project_dir,
+                    timeout_seconds=active_timeout,
+                    env=env,
+                    base_env=base_env,
+                    progress=progress,
+                    progress_label=progress_label,
+                )
+        except TimeoutError as exc:
+            if deadline_epoch is not None:
+                raise BudgetExceededError("RUN_DEADLINE_EXCEEDED") from exc
+            raise
 
 
 def verify_config_from(mapping: Mapping[str, Any], run_dir: Path) -> BaselineVerifyConfig:
@@ -2082,7 +2109,7 @@ def _bootstrap_materialize_locked(
         project_path,
         timeout_seconds=args.timeout_seconds,
         progress_label="iterative migration bootstrap materialization",
-        runtime_env=_runtime_env(config),
+        runtime_env=_runtime_env(config), run_deadline_at=str(run.get("deadlineAt") or ""),
     )
     run = dict(run)
     run["bootstrapRefs"] = {
@@ -3998,7 +4025,7 @@ def _materialize_locked(
         project_path,
         timeout_seconds=args.timeout_seconds,
         progress_label="iterative migration exact materialization",
-        runtime_env=_runtime_env(config),
+        runtime_env=_runtime_env(config), run_deadline_at=str(run.get("deadlineAt") or ""),
     )
     install_seconds = time.monotonic() - install_started
     install_kind, install_code = _materialization_failure((install_result.stdout or "") + "\n" + (install_result.stderr or "")) if install_result.returncode else ("passed", "")
@@ -4691,10 +4718,22 @@ def _verify_exact_locked(
     save_run(run_dir, run)
 
     verify_config = verify_config_from(config["verifyConfig"], run_dir)
+    remaining_run = None
+    if run.get("deadlineAt"):
+        try:
+            remaining_run = datetime.strptime(str(run["deadlineAt"]), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp() - time.time()
+        except (ValueError, TypeError):
+            pass
+    if remaining_run is not None and remaining_run <= 0:
+        raise BudgetExceededError("RUN_DEADLINE_EXCEEDED")
+    run_deadline = time.monotonic() + remaining_run if remaining_run is not None else 0
     verify_config = dataclasses.replace(
         verify_config,
         verification_purpose="intermediate-candidate",
         project_checks=config.get("verifyConfig", {}).get("projectChecks", "adaptive"),
+        budget_phase_deadline=(min(verify_config.budget_phase_deadline, run_deadline)
+            if verify_config.budget_phase_deadline and run_deadline
+            else verify_config.budget_phase_deadline or run_deadline),
     )
     _emit_status(
         {

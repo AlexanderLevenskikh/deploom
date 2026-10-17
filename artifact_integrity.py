@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Strong whole-tree integrity seal for durable PreparedArtifacts."""
 from __future__ import annotations
+from cross_process_io import coordinated_io
 
 import concurrent.futures
 import dataclasses
@@ -148,6 +149,7 @@ def _directory_change(before: tuple[object, ...], after: tuple[object, ...]) -> 
     return f"added={added[:5]!r}, removed={removed[:5]!r}, changed={changed[:5]!r}"
 
 
+@coordinated_io("hash", error_type=ArtifactIntegrityError)
 def build_artifact_tree_integrity(
     root: Path,
     *,

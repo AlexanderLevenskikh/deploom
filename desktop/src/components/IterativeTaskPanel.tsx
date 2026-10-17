@@ -747,6 +747,14 @@ export function useIterativeController({ workspaceId, projectName, refreshKey, a
   runMainActionRef.current = runMainAction
   const restartRef = useRef<() => void>(() => {})
   restartRef.current = () => { void beginNow({ mode: 'none', checkOnly: true, restart: true }) }
+  const prepareResultRef = useRef<() => void>(() => {})
+  prepareResultRef.current = () => { void agentNow() }
+  const prepareResultAvailable = runner?.phase === 'TERMINAL' && runner.workingCheckout?.kind === 'checkpoint'
+    && runner.delivery?.status !== 'done' && mainAction.state !== 'resume-delivery'
+  const prepareResultLabel = runner?.residualRepair?.resumable ? text('Возобновить работу агента', 'Resume the agent')
+    : runner?.delivery ? text('Продолжить подготовку коммитов', 'Resume commit preparation')
+    : attempt?.lastStep === 'delivery-failed' ? text('Повторить подготовку коммитов', 'Retry commit preparation')
+    : text('Подготовить коммиты', 'Prepare commits')
   useEffect(() => {
     if (!onScenario) return
     onScenario({
@@ -766,8 +774,9 @@ export function useIterativeController({ workspaceId, projectName, refreshKey, a
       act: () => runMainActionRef.current(),
       restart: (attempt || runner?.present) && mainAction.state !== 'running' ? () => restartRef.current() : undefined,
       restartEnabled: !busyLocked,
+      prepareResult: prepareResultAvailable ? { label: prepareResultLabel, enabled: !busyLocked && !childAlive, act: () => prepareResultRef.current() } : undefined,
     })
-  }, [onScenario, projectName, workspaceId, mainAction.state, mainLabel, mainDescription, busyLocked, mainActionEnabled, repairMutationBlocked, childAlive, runner, runnerError, activity.title, activity.detail, activity.percent, elapsedMs, attempt, currentAttemptLog, snapshot?.runDir])
+  }, [onScenario, projectName, workspaceId, mainAction.state, mainLabel, mainDescription, busyLocked, mainActionEnabled, repairMutationBlocked, childAlive, runner, runnerError, activity.title, activity.detail, activity.percent, elapsedMs, attempt, currentAttemptLog, snapshot?.runDir, prepareResultAvailable, prepareResultLabel])
   useEffect(() => () => onScenario?.(undefined), [onScenario])
 
   // D: the single main action is the hero of the panel — rendered right under

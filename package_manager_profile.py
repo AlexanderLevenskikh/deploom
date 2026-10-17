@@ -108,6 +108,12 @@ def resolver_seed_continuation_capability(
                 "seed itself remains performance-only"
             ),
         )
+    if (family == "yarn-berry" and profile.node_linker == "node-modules"
+            and _major(profile.declared_version) in (3, 4)):
+        return ResolverSeedContinuationCapability(
+            manager_family=family, supported=True, strategy="berry-private-resolver-seed-build-reset-v1",
+            reason="YARN_BERRY_EXACT_SEED: ordinary immutable lifecycle and installed-state verification remain mandatory",
+        )
     if family == "npm":
         return ResolverSeedContinuationCapability(
             manager_family=family,

@@ -97,7 +97,7 @@ def _hash_file(path: Path) -> str:
 def project_verification_environment(runtime_env: Mapping[str, str] | None = None) -> dict[str, str]:
     # CI mode is an execution policy, shared by the planner, verifier and proof
     # readers. Ambient development mode must not create a different proof key.
-    return {**semantic_verification_environment(os.environ), **(runtime_env or {}), "CI": "1"}
+    return {**semantic_verification_environment(os.environ), **(runtime_env or {}), "CI": "1", "NX_DAEMON": "false"}
 
 
 def environment_snapshot_fingerprint(environment: Mapping[str, str]) -> str:

@@ -1,6 +1,12 @@
 import { win32 } from 'node:path'
-import { decodeProcessOutputChunk, packageManagerResolutionHint, resolveExecutable, resolveSpawnInvocation } from '../dist-electron/process-launcher.js'
+import { commandEnvironment, decodeProcessOutputChunk, packageManagerResolutionHint, resolveExecutable, resolveSpawnInvocation } from '../dist-electron/process-launcher.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from '../dist-electron/opencode-runtime.js'
+
+for (const platform of ['win32', 'darwin', 'linux']) {
+  const inherited = { PATH: '/fixture/bin', NX_DAEMON: 'true' }
+  if (commandEnvironment(inherited, platform).NX_DAEMON !== 'false') throw new Error('Private migration children must disable the Nx daemon')
+  if (inherited.NX_DAEMON !== 'true') throw new Error('Child policy must not mutate the parent environment')
+}
 
 const appData = win32.join(String.raw`C:\virtual`, 'AppData', 'Roaming')
 const yarnShim = win32.join(appData, 'npm', 'yarn.cmd')

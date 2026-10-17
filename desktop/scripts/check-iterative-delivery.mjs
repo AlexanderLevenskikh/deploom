@@ -135,7 +135,12 @@ try {
   let resumed
   await runDeliveryWorkflow(root, { ...deps, launch: async context => { resumed = context.sessionId } })
   assert.equal(resumed, 'saved-session')
-  assert.ok(workflowPrompt('security', { ...deliveryState, baseCheckpointId: 'C4' }, { packagePolicies: { frozen: 'keep-current' } }, root).includes('shell-quote'))
+  const securityPrompt = workflowPrompt('security', { ...deliveryState, baseCheckpointId: 'C4' }, { packagePolicies: { frozen: 'keep-current' } }, root)
+  assert.ok(securityPrompt.includes('shell-quote'))
+  assert.match(securityPrompt, /at most three install\/lock regeneration cycles/)
+  assert.match(securityPrompt, /capture \$LASTEXITCODE immediately/)
+  assert.match(securityPrompt, /cannot replace the configured independent audit helper/)
+  assert.match(securityPrompt, /Prefer incremental package-manager regeneration/)
 
   write('delivery-agent.json', { identity:'delivery:fixture:C4:0', status:'running', sessionId:'saved-session', provider:'codex' })
   const interrupted = await runDeliveryWorkflow(root, { ...deps, launch: async context => { context.onSession('same-paid-session'); context.onSpawn(9); throw new Error('DELIVERY_AGENT_IDLE_TIMEOUT') } })

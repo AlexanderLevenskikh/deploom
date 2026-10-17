@@ -27,6 +27,9 @@ export function commandEnvironment(
   source: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): NodeJS.ProcessEnv {
+  // Private migration workspaces are short-lived. A detached Nx watcher can
+  // recreate .nx entries while the next candidate retires its old trial.
+  source = { ...source, NX_DAEMON: 'false' }
   if (platform === 'win32') return { ...source }
   const path = pathApi(platform)
   const home = source.HOME?.trim()

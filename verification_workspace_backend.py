@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from io_governor import io_slot
+from cross_process_io import coordinated_io
 from reparse_materialization import (
     ReparseLink,
+    ReparseMaterializationError,
     inventory_reparse_plan,
     recreate_reparse_plan,
 )
@@ -290,6 +292,7 @@ def _materialize_private_tree_impl(
 
 # BLOCK_VG_ZERO_CONFIG_TRANSACTIONAL_UI_V1
 
+@coordinated_io("copy", error_type=ReparseMaterializationError)
 def materialize_private_tree(
     source: Path,
     target: Path,

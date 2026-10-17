@@ -258,6 +258,8 @@ class _ResolverSeedRecord:
     producer: str
     guard: WorkspaceChangeGuard
     last_used: float
+    manager_family: str = "yarn-classic"
+    directory_identities: dict[str, tuple[int, int]] = dataclasses.field(default_factory=dict)
 
 
 class SameRunResolverSeedStore:
@@ -293,8 +295,22 @@ class SameRunResolverSeedStore:
             return False, f"watcher-stop:{type(exc).__name__}"
         if continuity.errors:
             return False, "watcher-error"
-        if continuity.changes:
-            return False, "workspace-mutated"
+        for relative, expected in record.directory_identities.items():
+            info = (record.workspace_root / relative).lstat()
+            if (info.st_dev, info.st_ino) != expected or getattr(info, "st_file_attributes", 0) & 0x400:
+                return False, "workspace-directory-replaced"
+        for change in continuity.changes:
+            action, relative = change.split(":", 1)
+            expected = record.directory_identities.get(relative)
+            if action != "3" or expected is None:
+                return False, "workspace-mutated"
+            path = record.workspace_root / relative
+            info = path.lstat()
+            import stat
+            if (not stat.S_ISDIR(info.st_mode) or info.st_ino == 0
+                    or getattr(info, "st_file_attributes", 0) & 0x400
+                    or (info.st_dev, info.st_ino) != expected):
+                return False, "workspace-directory-replaced"
         if not record.workspace_root.is_dir():
             return False, "path-missing"
         return True, "clean"
@@ -384,6 +400,7 @@ class SameRunResolverSeedStore:
         progress: Optional[Callable[[str], None]] = None,
         progress_label: str = "resolver seed publish",
         producer: str = "",
+        manager_family: str = "yarn-classic",
     ) -> bool:
         """Copy a post-resolver/pre-lifecycle tree and arm continuity evidence."""
         seed_key = str(key or "").strip()
@@ -396,7 +413,13 @@ class SameRunResolverSeedStore:
         if project_relative.is_absolute() or package_manager_relative.is_absolute():
             raise ResolverSeedError("RESOLVER_SEED_RELATIVE_PATH_INVALID")
         source_pm = source_workspace_root / package_manager_relative
-        validate_yarn1_resolver_seed(source_pm)
+        if manager_family == "yarn-berry":
+            from yarn_berry import validate_resolver_seed as validate_seed
+        elif manager_family == "yarn-classic":
+            validate_seed = validate_yarn1_resolver_seed
+        else:
+            raise ResolverSeedError("RESOLVER_SEED_MANAGER_UNSUPPORTED")
+        validate_seed(source_pm)
 
         # Serialize store publication/materialization/clear. A Baseline may run
         # several diagnostic verifications concurrently; allowing a reset or a
@@ -421,11 +444,11 @@ class SameRunResolverSeedStore:
                 copied_pm = target / package_manager_relative
                 if not copied_project.is_dir() or not copied_pm.is_dir():
                     raise ResolverSeedError("RESOLVER_SEED_COPY_TOPOLOGY_INVALID")
-                validate_yarn1_resolver_seed(copied_pm)
+                validate_seed(copied_pm)
                 guard = self._arm_guard(target)
                 # Revalidate after watcher arming so the published cache point has a
                 # clean continuity interval from a known exact marker state.
-                validate_yarn1_resolver_seed(copied_pm)
+                validate_seed(copied_pm)
                 record = _ResolverSeedRecord(
                     key=seed_key,
                     workspace_root=target,
@@ -437,6 +460,12 @@ class SameRunResolverSeedStore:
                     producer=str(producer or ""),
                     guard=guard,
                     last_used=time.monotonic(),
+                    manager_family=manager_family,
+                    directory_identities={
+                        path.relative_to(target).as_posix(): (path.stat().st_dev, path.stat().st_ino)
+                        for path in {target, target / project_relative / "node_modules", target / package_manager_relative / "node_modules"}
+                        if path.is_dir() and not path.is_symlink() and not getattr(path, "is_junction", lambda: False)()
+                    },
                 )
                 self._evict_locked(seed_key, reason="replaced")
                 self._records[seed_key] = record
@@ -517,9 +546,11 @@ class SameRunResolverSeedStore:
                     )
                     return None
                 # The clone itself must still carry the resolver-stage marker.
-                validate_yarn1_resolver_seed(
-                    target_workspace_root / record.package_manager_relative
-                )
+                if record.manager_family == "yarn-berry":
+                    from yarn_berry import validate_resolver_seed as validate_seed
+                else:
+                    validate_seed = validate_yarn1_resolver_seed
+                validate_seed(target_workspace_root / record.package_manager_relative)
                 record.last_used = time.monotonic()
                 try:
                     record.guard = self._arm_guard(record.workspace_root)

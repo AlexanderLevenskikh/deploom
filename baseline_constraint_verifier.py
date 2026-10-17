@@ -292,10 +292,10 @@ def _durable_prepared_publication_policy(
 ) -> Tuple[bool, str]:
     """Choose durable publication by artifact role, never search depth."""
     purpose = _verification_purpose(config)
-    if config.recovery_checkpoints:
-        return bool(config.publish_durable_prepared_artifact), "durable-stage-recovery"
     if purpose in _PSI4_INTERMEDIATE_PURPOSES:
         return False, "intermediate-role-private"
+    if config.recovery_checkpoints:
+        return bool(config.publish_durable_prepared_artifact), "durable-stage-recovery"
     if purpose == "baseline-control":
         return bool(config.publish_durable_prepared_artifact), "stable-baseline-control"
     if purpose == "incumbent-promotion":
@@ -873,23 +873,46 @@ def _run(
         rolling = candidate[-4096:]
 
     try:
-        completed = run_supervised(
-            argv,
-            cwd,
-            timeout_seconds=timeout_seconds,
-            env=env,
-            base_env=base_env,
-            progress=report_progress if progress is not None else None,
-            progress_label=progress_label,
-            progress_interval_seconds=progress_interval_seconds,
-            output_observer=observe_output,
-        )
+        from cross_process_io import shared_io_slot
+        admission = (shared_io_slot("pm", progress=progress, label=progress_label, timeout_seconds=timeout_seconds)
+                     if progress_label in {"package-manager resolver install", "package-manager lifecycle install"}
+                     else contextlib.nullcontext(0))
+        with admission as waited_ms:
+            remaining = max(1, timeout_seconds - int(waited_ms / 1000)) if timeout_seconds else 0
+            completed = run_supervised(
+                argv,
+                cwd,
+                timeout_seconds=remaining,
+                env=env,
+                base_env=base_env,
+                progress=report_progress if progress is not None else None,
+                progress_label=progress_label,
+                progress_interval_seconds=progress_interval_seconds,
+                output_observer=observe_output,
+            )
     except BaseException:
         package_telemetry.finish(None)
         raise
     setattr(completed, "deploom_infra_detected", bool(infra_seen))
     setattr(completed, "deploom_package_manager_telemetry", package_telemetry.finish(completed.returncode))
     return completed
+
+
+def _run_preparation_install(argv, cwd, *, config, timeout_factory, **kwargs):
+    """Queue without spending active-install time; keep the run/attempt deadline."""
+    from cross_process_io import shared_io_slot
+    initial_timeout = timeout_factory()  # Refuse already-exhausted work before admission.
+    queue_timeout = (max(0.001, config.budget_phase_deadline - time.monotonic())
+                     if config.unbounded_preparation and config.budget_phase_deadline
+                     else 0 if config.unbounded_preparation else initial_timeout)
+    try:
+        with shared_io_slot("pm", progress=kwargs.get("progress"),
+                            label=kwargs.get("progress_label", "package-manager install"),
+                            timeout_seconds=queue_timeout):
+            return _run(argv, cwd, timeout_seconds=timeout_factory(), **kwargs)
+    except TimeoutError:
+        timeout_factory()  # Preserve typed overall/attempt budget exhaustion.
+        raise
 
 
 def _process_failure_output(error: BaseException) -> str:
@@ -931,7 +954,8 @@ def clean_ephemeral_verification_caches(
         relative_root = Path(*dependency_root.split("/"))
         if relative_root.is_absolute() or ".." in relative_root.parts:
             continue
-        for cache_name in (".vite", ".vitest", ".cache"):
+        from prepared_workspace_fastpath import EPHEMERAL_CACHE_DIR_NAMES
+        for cache_name in EPHEMERAL_CACHE_DIR_NAMES:
             relative = (relative_root / cache_name).as_posix()
             target = root / relative_root / cache_name
             if not target.exists():
@@ -3128,7 +3152,10 @@ def verify_assignment(
         resolver_seed_capability = resolver_seed_continuation_capability(
             workspace_topology.profile
         )
-        if resolver_seed_capability.supported:
+        if workspace_topology.profile.family == "yarn-berry":
+            resolver_seed_runtime_version = workspace_topology.profile.declared_version
+            resolver_seed_runtime_ok = os.name == "nt"  # Same-run watcher continuity is Windows-only.
+        elif resolver_seed_capability.supported:
             (
                 resolver_seed_runtime_ok,
                 resolver_seed_runtime_version,
@@ -3353,10 +3380,10 @@ def verify_assignment(
                 verificationPurpose=_verification_purpose(config),
             )
             try:
-                result = _run(
+                result = _run_preparation_install(
                     argv,
                     package_manager_project,
-                    timeout_seconds=phase_timeout(),
+                    config=config, timeout_factory=phase_timeout,
                     env=install_env,
                     base_env=base_env,
                     progress=phase_progress("resolver-install"),
@@ -3570,6 +3597,7 @@ def verify_assignment(
                         progress=phase_progress("resolver-seed-publish"),
                         progress_label=f"{progress_label}: resolver seed publish",
                         producer=progress_label,
+                        manager_family=workspace_topology.profile.family,
                     )
                 except Exception as exc:
                     failed_publish_ms = int(
@@ -3841,9 +3869,11 @@ def verify_assignment(
                                         f"expected={observed_hash} "
                                         f"observed={seed_observed_hash}"
                                     )
-                                prepare_yarn1_resolver_seed_for_lifecycle(
-                                    seed_package_manager
-                                )
+                                if workspace_topology.profile.family == "yarn-berry":
+                                    from yarn_berry import prepare_resolver_seed_for_lifecycle
+                                    prepare_resolver_seed_for_lifecycle(seed_package_manager)
+                                else:
+                                    prepare_yarn1_resolver_seed_for_lifecycle(seed_package_manager)
                                 workspace_root = (
                                     seed_materialization.workspace_root
                                 )
@@ -3922,9 +3952,9 @@ def verify_assignment(
                     consumer=progress_label,
                 )
                 try:
-                    full_result = _run(
+                    full_result = _run_preparation_install(
                         full_argv, package_manager_project,
-                        timeout_seconds=phase_timeout(), env=lifecycle_env,
+                        config=config, timeout_factory=phase_timeout, env=lifecycle_env,
                         base_env=base_env, progress=phase_progress("lifecycle-install"),
                         progress_label="package-manager lifecycle install",
                         progress_interval_seconds=config.progress_interval_seconds,
@@ -3986,11 +4016,12 @@ def verify_assignment(
                     )
 
                 if resolver_seed_used:
+                    from yarn_berry import validate_resolver_seed as validate_berry_resolver_seed
                     try:
                         lifecycle_integrity_flags = (
-                            validate_yarn1_lifecycle_completion(
-                                package_manager_project
-                            )
+                            validate_yarn1_lifecycle_completion(package_manager_project)
+                            if workspace_topology.profile.family == "yarn-classic"
+                            else validate_berry_resolver_seed(package_manager_project)
                         )
                     except ResolverSeedError as exc:
                         event(
@@ -4255,6 +4286,8 @@ def verify_assignment(
             command_checkpoints = None
             command_checkpoint_refs = []
             if config.recovery_checkpoints and proof_store.root is not None:
+                # Reopened snapshots have no same-call publication flag. The
+                # durable loader (or None) owns cross-process receipt authority.
                 from verification_stage_checkpoint import CommandCheckpoint
                 checkpoint_artifact = load_prepared_artifact_record(
                     proof_identity.preparation_proof_key, project_dir, progress=progress)
@@ -4780,7 +4813,10 @@ def verify_assignment(
                             and getattr(getattr(check_result, "supervision", None), "quality", "") == "guaranteed-tree"):
                         from verification_source_closure import reset_observed_trial_outputs
                         source_reset_for_reuse = reset_observed_trial_outputs(
-                            command_root, source_entries_by_path, workspace_changes.changes, progress=progress)
+                            command_root, source_entries_by_path, workspace_changes.changes, progress=progress,
+                            prepared_root=snapshot.workspace_root,
+                            dependency_roots=(snapshot.dependency_roots
+                                if lower_check_clean and guarded_clone_is_active(command_root) else ()))
 
                     if command_checkpoints and check_result is not None:
                         # Command guards above retain their authority. A receipt
@@ -5538,6 +5574,10 @@ def _verify_assignment_with_pinned_source(
     try:
         if not config.proof_cache_dir:
             return _verify_assignment_cache_aware_impl(project_dir, assignment, config=config, **kwargs)
+        pin_started = time.monotonic()
+        pin_finished = False
+        pin_operation = new_observability_id("source-pin")
+        emit_observability_event("verify.source-pin.start", operationId=pin_operation)
         with verification_source_snapshot_scope(
             project_dir,
             timeout_seconds=0 if config.unbounded_preparation else config.snapshot_copy_timeout_seconds,
@@ -5547,8 +5587,14 @@ def _verify_assignment_with_pinned_source(
             recovery_directory=(Path(config.recovery_journal_dir or config.proof_cache_dir) / "sc"
                                 if config.recovery_checkpoints else None),
         ):
+            pin_finished = True
+            emit_observability_event("verify.source-pin.finish", operationId=pin_operation,
+                durationMs=int((time.monotonic() - pin_started) * 1000), outcome="passed")
             return _verify_assignment_cache_aware_impl(project_dir, assignment, config=config, **kwargs)
     except SourceCaptureError as exc:
+        if "pin_operation" in locals() and not pin_finished:
+            emit_observability_event("verify.source-pin.finish", operationId=pin_operation,
+                durationMs=int((time.monotonic() - pin_started) * 1000), outcome="failed")
         return BaselineVerifyResult(False, "infrastructure", f"source snapshot preparation failed: {exc}")
 
 

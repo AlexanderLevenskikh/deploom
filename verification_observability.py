@@ -395,6 +395,7 @@ def performance_category(event: str) -> str:
         "filesystem.materialize.finish": "filesystem-materialize",
         "filesystem.integrity.finish": "dependency-integrity",
         "source.manifest.finish": "source-manifest",
+        "verify.source-pin.finish": "source-pin",
         "verify.resolver.finish": "resolver-install",
         "verify.resolved-state.capture.finish": "resolved-state-capture",
         "verify.preparation.finish": "lifecycle-preparation",
@@ -811,8 +812,10 @@ def run_summary_payload(*, final: bool = False) -> dict[str, object]:
             }
         )
 
+    from substrate_identity import tool_build_id
     return {
         "observabilitySchema": OBSERVABILITY_SCHEMA,
+        "toolBuildId": tool_build_id(),
         "final": bool(final),
         "provisional": not bool(final),
         "sessionId": _SESSION_ID,

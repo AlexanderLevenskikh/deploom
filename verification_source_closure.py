@@ -15,7 +15,10 @@ def require_complete_source_policy(policy):
     validate_build_output_paths(list(policy.frontend_build_output_paths))
     roots = tuple(policy.scope_roots)
     allowed_dirs = set(DEFAULT_EXCLUDED_DIR_NAMES) | (set(AGENT_STATE_DIRS) if policy.frontend_profile else set())
-    allowed_paths = set(KNOWN_FRONTEND_CACHE_PATHS) if policy.frontend_profile else set()
+    from scoped_source_policy import REGENERABLE_CACHE_PATHS
+    allowed_paths = set(REGENERABLE_CACHE_PATHS)
+    if policy.frontend_profile:
+        allowed_paths.update(KNOWN_FRONTEND_CACHE_PATHS)
     complete = (roots in ((), (".",)) and set(policy.excluded_relative_paths).issubset(allowed_paths)
         and set(policy.excluded_dir_names).issubset(allowed_dirs)
         and set(policy.excluded_file_names).issubset(DEFAULT_EXCLUDED_FILE_NAMES))
@@ -112,7 +115,7 @@ def validate_materialized_source_closure(snapshot, target, *, progress=None, pro
                     "changedPaths": changes[:20], "changedPathCount": len(changes)}, sort_keys=True))
 
 
-def reset_observed_trial_outputs(root, expected, changes, *, progress=None):
+def reset_observed_trial_outputs(root, expected, changes, *, progress=None, prepared_root=None, dependency_roots=()):
     """Reset only new private outputs after a complete, quiescent event stream.
 
     Existing source files must still match the original source seal. Dependency
@@ -131,6 +134,12 @@ def reset_observed_trial_outputs(root, expected, changes, *, progress=None):
     touched = {}
     new_paths = set()
     deletion_plan = {}
+    restorations = {}
+    from prepared_workspace_fastpath import EPHEMERAL_CACHE_DIR_NAMES
+    dependency_bases = {Path(name) for name in dependency_roots}
+    def private_cache(path):
+        return any(base in path.parents and path.relative_to(base).parts[0] in EPHEMERAL_CACHE_DIR_NAMES
+                   for base in dependency_bases)
 
     def plain(relative):
         if time.monotonic() >= deadline:
@@ -158,9 +167,18 @@ def reset_observed_trial_outputs(root, expected, changes, *, progress=None):
             relative = Path(name.replace("\\", "/"))
             if (int(action) not in (1, 2, 3, 4, 5) or not relative.parts
                     or relative.is_absolute() or relative.drive
-                    or any(part.casefold() in ("..", "node_modules") or ":" in part
+                    or any(part.casefold() == ".." or ":" in part
                            or part.endswith((".", " ")) for part in relative.parts)):
                 return False
+            if any(part.casefold() == "node_modules" for part in relative.parts) and not private_cache(relative):
+                # Complete watcher events may include parent directory metadata
+                # notifications for writes to a private cache. A real package
+                # event (or add/remove/rename of a shell) still rejects reuse.
+                is_shell = relative in dependency_bases or (relative.parent in dependency_bases and relative.name.startswith("@"))
+                info = plain(relative) if is_shell else None
+                if int(action) != 3 or info is None or not stat.S_ISDIR(info.st_mode):
+                    return False
+                continue
             key = relative.as_posix()
             touched.setdefault(key, set()).add(int(action))
         for name, actions in touched.items():
@@ -183,7 +201,12 @@ def reset_observed_trial_outputs(root, expected, changes, *, progress=None):
                 digest, size, executable = _hash_file(root / relative)
                 checked += 1
                 if (digest, size, executable) != (entry["sha256"], entry["size"], entry["executable"]):
-                    return False
+                    if prepared_root is None:
+                        return False
+                    original = Path(prepared_root) / relative
+                    if _hash_file(original) != (entry["sha256"], entry["size"], entry["executable"]):
+                        return False
+                    restorations[relative] = original
             else:
                 return False
         # Validate the complete deletion plan BEFORE removing anything. A new
@@ -194,7 +217,7 @@ def reset_observed_trial_outputs(root, expected, changes, *, progress=None):
             if relative in deletion_plan:
                 continue
             if (os.path.normcase(relative.as_posix()).replace("\\", "/") in expected
-                    or any(part.casefold() == "node_modules" for part in relative.parts)):
+                    or (any(part.casefold() == "node_modules" for part in relative.parts) and not private_cache(relative))):
                 return False
             info = plain(relative)
             if info is None:
@@ -223,6 +246,16 @@ def reset_observed_trial_outputs(root, expected, changes, *, progress=None):
             else:
                 path.unlink()
             removed += 1
+        for relative, original in restorations.items():
+            if plain(relative) is None:
+                return False
+            import shutil
+            previous_mode = (root / relative).stat().st_mode
+            shutil.copy2(original, root / relative)
+            os.chmod(root / relative, previous_mode)
+            entry = expected[os.path.normcase(relative.as_posix()).replace("\\", "/")]
+            if _hash_file(root / relative) != (entry["sha256"], entry["size"], entry["executable"]):
+                return False
         if progress:
             progress(f"private trial delta validation: sourceFilesRehashed={checked}, newOutputPathsRemoved={removed}; full source hashing skipped")
         return True

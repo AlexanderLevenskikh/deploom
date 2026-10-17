@@ -35,6 +35,36 @@ class IterativeTrialCleanupTests(unittest.TestCase):
         remove_trial_workspace(self.run)
         remove_trial_workspace(self.run)
 
+    def test_recreated_cache_entry_is_reenumerated_with_bounded_retry(self):
+        from unittest.mock import patch
+        import iterative_trial_workspace as cleanup
+        nx = self.trial / '.nx'; nx.mkdir()
+        real_rmdir = os.rmdir
+        recreated = False
+        def rmdir(path, *args, **kwargs):
+            nonlocal recreated
+            if Path(path).name == nx.name and not recreated:
+                recreated = True
+                (nx / 'cache').mkdir()
+                (nx / 'cache/file-map.json').write_text('{}')
+            return real_rmdir(path, *args, **kwargs)
+        with patch.object(cleanup.os, 'rmdir', side_effect=rmdir):
+            remove_trial_workspace(self.run)
+        self.assertTrue(recreated)
+        self.assertFalse(self.trial.exists())
+        self.assertEqual(b'verified checkpoint preserved', self.checkpoint.read_bytes())
+
+    def test_persistent_cache_writer_stops_after_six_attempts(self):
+        from unittest.mock import patch
+        import errno
+        import iterative_trial_workspace as cleanup
+        with patch.object(cleanup.shutil, 'rmtree', side_effect=OSError(errno.ENOTEMPTY, 'cache writer remains')) as remove, patch.object(cleanup.time, 'sleep'):
+            with self.assertRaisesRegex(TrialWorkspaceCleanupError, 'cache writer remains'):
+                remove_trial_workspace(self.run)
+        self.assertEqual(6, remove.call_count)
+        self.assertTrue(self.trial.exists())
+        self.assertEqual(b'verified checkpoint preserved', self.checkpoint.read_bytes())
+
     def test_root_link_is_rejected_without_touching_external_data(self):
         external = self.root / 'external'; external.mkdir(); (external / 'keep').write_bytes(b'keep')
         self.trial.rmdir()

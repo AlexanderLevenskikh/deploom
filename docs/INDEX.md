@@ -19,6 +19,7 @@
 | [MIGRATION_DOCUMENTS.md](MIGRATION_DOCUMENTS.md) | Явный язык документов, аудит до/после, недостающие доказательства и реконструкция. |
 | [REAL_WORLD_WORKSPACE_DEMOS.md](REAL_WORLD_WORKSPACE_DEMOS.md) | Изолированные сценарии форматов манифеста, монорепозиториев и реальных установок. |
 | [CHECKPOINT_RECOVERY.md](CHECKPOINT_RECOVERY.md) | Durable preparation, selected check receipts (including lint), migration and incumbent recovery. |
+| [MIGRATION_PERFORMANCE.md](MIGRATION_PERFORMANCE.md) | Shared I/O admission, source caches, private trials and exact Yarn continuation. |
 | `docs/MIGRATION_VALIDATION.md` | Контракт валидации миграции: явные профили, fail-closed, не-пересъёмка baseline, сохранение старых падений. |
 | `docs/ITERATIVE_REPAIR_RECOVERY.md` | Ремонт исходников/конфига в изолированном checkout, typed feedback, ре-верификация на свежих bytes. |
 | `docs/STORAGE_COHORT_REVIEW.md` | Хранение trial/checkpoint bytes, владельцы, GC и бюджеты когорт. |

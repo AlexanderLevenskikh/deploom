@@ -114,6 +114,32 @@ def update_berry_lockfile(project, package_json, lockfile, registry, config, *, 
     return update, dedupe, validation
 
 
+def validate_resolver_seed(root: Path):
+    """Readiness of a post skip-build seed; never verification authority."""
+    from block_psi57_yarn1_resolver_seed import ResolverSeedError
+    import gzip
+    root = Path(root)
+    marker = root / ".yarn" / "install-state.gz"
+    state = root / "node_modules" / ".yarn-state.yml"
+    try:
+        if marker.is_symlink() or state.is_symlink() or not state.is_file():
+            raise ValueError("missing canonical node-modules state")
+        with gzip.open(marker, "rb") as stream:
+            if not stream.read(1):
+                raise ValueError("empty install state")
+    except (OSError, ValueError) as exc:
+        raise ResolverSeedError(f"YARN_BERRY_SEED_UNAVAILABLE: {exc}") from exc
+    return ()
+
+
+def prepare_resolver_seed_for_lifecycle(root: Path):
+    """Reset private build state so ordinary immutable install executes builds."""
+    validate_resolver_seed(root)
+    marker = Path(root) / ".yarn" / "install-state.gz"
+    marker.unlink()
+    return marker
+
+
 def owning_yarn_lock(project: Path) -> Path:
     if (project / "yarn.lock").is_file():
         return project / "yarn.lock"

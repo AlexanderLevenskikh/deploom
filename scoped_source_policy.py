@@ -2,6 +2,8 @@
 from pathlib import Path
 
 MODE_ENV = "DEPLOOM_SOURCE_SCOPE_MODE"
+# Runtime products only; .nx configuration and arbitrary .nx inputs stay in scope.
+REGENERABLE_CACHE_PATHS = (".nx/cache", ".nx/workspace-data")
 
 
 def in_scope(name, roots):
@@ -20,6 +22,10 @@ def in_scope(name, roots):
 
 
 def policy_payload(policy):
+    if (not policy.frontend_profile and not policy.frontend_build_output_paths
+            and not policy.scope_roots and policy.excluded_relative_paths
+            and set(policy.excluded_relative_paths).issubset(REGENERABLE_CACHE_PATHS)):
+        return {"mode": "regenerable-caches-v1", "excludedCachePaths": list(policy.excluded_relative_paths)}
     if policy.frontend_profile:
         return {"mode": "frontend-source-v1", "excludedBuildOutputPaths": list(policy.frontend_build_output_paths),
                 "excludedCachePaths": list(policy.excluded_relative_paths)}
@@ -35,6 +41,11 @@ def policy_from_payload(raw):
     from source_snapshot import SourceInputPolicy, SourceCaptureError
     if not raw:
         return SourceInputPolicy()
+    if isinstance(raw, dict) and raw.get("mode") == "regenerable-caches-v1":
+        caches = raw.get("excludedCachePaths")
+        if not isinstance(caches, list) or any(name not in REGENERABLE_CACHE_PATHS for name in caches):
+            raise SourceCaptureError("SOURCE_RUNTIME_CACHE_POLICY_INVALID")
+        return SourceInputPolicy(excluded_relative_paths=tuple(caches))
     if isinstance(raw, dict) and raw.get("mode") == "frontend-source-v1":
         paths = raw.get("excludedBuildOutputPaths")
         caches = raw.get("excludedCachePaths")
@@ -82,4 +93,4 @@ def policy_for_project(project, root):
         caches = KNOWN_FRONTEND_CACHE_PATHS if (root / "nx.json").is_file() else ()
         return SourceInputPolicy(excluded_dir_names=tuple(dict.fromkeys((*DEFAULT_EXCLUDED_DIR_NAMES, *AGENT_STATE_DIRS))),
             excluded_relative_paths=caches, frontend_build_output_paths=discover_backend_build_outputs(root), frontend_profile=True)
-    return SourceInputPolicy()
+    return SourceInputPolicy(excluded_relative_paths=REGENERABLE_CACHE_PATHS if (root / "nx.json").is_file() else ())

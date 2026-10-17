@@ -34,6 +34,7 @@ from prepared_workspace_fastpath import (
     apply_tree_write_protection,
 )
 from io_governor import io_slot
+from cross_process_io import coordinated_io
 from reparse_materialization import ReparseMaterializationError
 from verification_observability import (
     configured_observability_path,
@@ -879,6 +880,7 @@ def _directory_stamp_change(before: tuple[object, ...], after: tuple[object, ...
     return f"added={added[:5]!r}, removed={removed[:5]!r}, changed={changed[:5]!r}"
 
 
+@coordinated_io("hash", error_type=SourceCaptureError)
 def _build_source_tree_manifest_impl(
     root: Path,
     *,

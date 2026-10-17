@@ -57,6 +57,15 @@ def io_slot(kind: str, *, label: str = "") -> Iterator[dict[str, int]]:
     operation_id = "" if kind == "hash" else new_observability_id("io-governor")
     started = time.monotonic()
     pool.semaphore.acquire()
+    shared = None
+    if kind == "copy":
+        from cross_process_io import shared_io_slot
+        shared = shared_io_slot(kind, label=label)
+        try:
+            shared.__enter__()
+        except BaseException:
+            pool.semaphore.release()
+            raise
     wait_ms = max(0, int((time.monotonic() - started) * 1000))
     with pool.lock:
         pool.active += 1
@@ -78,6 +87,8 @@ def io_slot(kind: str, *, label: str = "") -> Iterator[dict[str, int]]:
             pool.active -= 1
             remaining = pool.active
         pool.semaphore.release()
+        if shared is not None:
+            shared.__exit__(None, None, None)
         if kind == "hash":
             # A 150k-file seal used to synchronously append 300k JSON records.
             # Aggregate resource telemetry without changing semaphore authority.
