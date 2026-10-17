@@ -600,7 +600,7 @@ export type AgentLease = {
   retryAfterSeconds?: number
   launchAttempts?: number
   launchDiagnostics?: AgentLaunchDiagnostics
-  repairBudget?: { windows: number; deadlineAt: number; fingerprint: string; paused?: boolean }
+  repairBudget?: { windows: number; deadlineAt: number; fingerprint: string; paused?: boolean; waitRemainingMs?: number }
 }
 
 /** Every exit, including a parked wait and exhausted budget, releases the
@@ -618,7 +618,8 @@ export function agentLeaseFile(runDir: string): string {
 export function validRepairBudget(value: unknown): value is NonNullable<AgentLease['repairBudget']> {
   const b = value as NonNullable<AgentLease['repairBudget']> | undefined
   return Boolean(b && Number.isInteger(b.windows) && b.windows >= 1 && b.windows <= 3
-    && Number.isFinite(b.deadlineAt) && typeof b.fingerprint === 'string')
+    && Number.isFinite(b.deadlineAt) && typeof b.fingerprint === 'string'
+    && (b.waitRemainingMs === undefined || (Number.isFinite(b.waitRemainingMs) && b.waitRemainingMs >= 0 && b.waitRemainingMs <= 15 * 60_000)))
 }
 
 /** Hash actual allowed source mutations; provider prose and repeated heartbeats
@@ -631,6 +632,27 @@ export function extendRepairBudget(budget: NonNullable<AgentLease['repairBudget'
   now = Date.now(), windowMs = 15 * 60_000): NonNullable<AgentLease['repairBudget']> | undefined {
   if (budget.windows >= 3 || !fingerprint || fingerprint === budget.fingerprint) return undefined
   return { windows: budget.windows + 1, deadlineAt: now + windowMs, fingerprint }
+}
+
+export const REPAIR_DEADLINE_EXPIRED = 'AGENT_REPAIR_DEADLINE_EXPIRED: время работы агента исчерпано. Правки trial и проверенный checkpoint сохранены. Повторный запуск начнёт новую сессию ремонта.'
+
+/** Provider waits suspend the unused active window, never award a new one. */
+export function parkRepairBudget(budget: NonNullable<AgentLease['repairBudget']>, now = Date.now()): NonNullable<AgentLease['repairBudget']> {
+  const waitRemainingMs = Math.max(0, budget.deadlineAt - now)
+  if (waitRemainingMs === 0) throw new Error(REPAIR_DEADLINE_EXPIRED)
+  return { ...budget, waitRemainingMs }
+}
+
+export function resumeRepairBudget(saved: AgentLease['repairBudget'], now = Date.now()): NonNullable<AgentLease['repairBudget']> {
+  if (!saved) return { windows: 1, deadlineAt: now + 15 * 60_000, fingerprint: '' }
+  if (saved.paused) {
+    if (saved.windows >= 3) throw new Error('AGENT_REPAIR_BUDGET_EXHAUSTED: три окна ремонта использованы')
+    return { windows: saved.windows + 1, deadlineAt: now + 15 * 60_000, fingerprint: saved.fingerprint }
+  }
+  const { waitRemainingMs, ...budget } = saved
+  if (waitRemainingMs !== undefined) budget.deadlineAt = now + waitRemainingMs
+  if (budget.deadlineAt <= now) throw new Error(REPAIR_DEADLINE_EXPIRED)
+  return budget
 }
 
 export function writeAgentLease(file: string, lease: AgentLease): void {
@@ -866,6 +888,11 @@ export function decideAgentLeaseDispatch(
     return lease.sessionId ? { action: 'resume', sessionId: lease.sessionId } : { action: 'retry', launchAttempts: lease.launchAttempts ?? 0, detail: 'Continue preserved trial repair' }
   }
   if (lease.waiting) {
+    // Legacy waits have no suspended remainder: never relaunch an expired window.
+    const budget = lease.repairBudget
+    if (budget && (budget.waitRemainingMs !== undefined ? budget.waitRemainingMs <= 0 : budget.deadlineAt <= now)) {
+      return { action: 'give-up', detail: REPAIR_DEADLINE_EXPIRED }
+    }
     const attempts = lease.launchAttempts ?? 0
     if (lease.waitKind !== 'rate-limited' && !(lease.autopilot && lease.waitKind === 'temporary')) {
       const budget = lease.waitKind === 'unknown' ? 3 : lease.waitKind === 'temporary' ? 5 : 0

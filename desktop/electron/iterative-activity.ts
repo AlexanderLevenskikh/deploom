@@ -4,6 +4,7 @@ export type ActivityAttempt = {
   status: string
   stage: string
   phase?: string
+  reason?: string
   packageProgress?: { processed: number; total: number }
   discoveryCompleted?: boolean
 }
@@ -32,9 +33,12 @@ export type IterativeActivity = { title: string; detail: string; percent?: numbe
 export function iterativeActivity(attempt: ActivityAttempt | undefined, live: boolean, language: 'ru' | 'en'): IterativeActivity {
   const text = (ru: string, en: string) => language === 'ru' ? ru : en
   if (!attempt) return { title: text('Подготовка запуска', 'Preparing the run'), detail: '' }
+  if (attempt.status === 'waiting') return {
+    title: text('Ждём повторного запуска агента', 'Waiting to retry the agent'),
+    detail: attempt.reason ?? '',
+  }
   if (!live) return {
-    title: attempt.status === 'waiting' ? text('Ждём восстановления доступа к агенту', 'Waiting for agent access to recover')
-      : attempt.status === 'failed' ? text('Попытка завершилась ошибкой', 'The attempt failed')
+    title: attempt.status === 'failed' ? text('Попытка завершилась ошибкой', 'The attempt failed')
       : attempt.status === 'canceled' ? text('Работа остановлена', 'Work stopped')
       : attempt.status === 'done' ? text('Этап завершён', 'Stage completed')
       : text('Работа прервана — можно продолжить', 'Work interrupted — ready to resume'),

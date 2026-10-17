@@ -352,8 +352,12 @@ expect("activity: failed and canceled attempts drop stale progress", () => {
   }
 });
 expect("activity: a waiting agent-launch shows the wait, not an interruption", () => {
-  const result = iterativeActivity(attempt({ status: "waiting", stage: "agent" }), false, "en");
-  if (result.title !== "Waiting for agent access to recover" || result.detail) throw new Error(JSON.stringify(result));
+  for (const live of [false, true]) {
+    const result = iterativeActivity(attempt({ status: "waiting", stage: "agent", phase: "BOOTSTRAP_REPAIR", reason: "Retry at 09:30" }), live, "en");
+    if (result.title !== "Waiting to retry the agent" || result.detail !== "Retry at 09:30" || result.percent !== undefined) throw new Error(JSON.stringify(result));
+    const ru = iterativeActivity(attempt({ status: "waiting", stage: "agent" }), live, "ru");
+    if (ru.title !== "Ждём повторного запуска агента") throw new Error(JSON.stringify(ru));
+  }
 });
 expect("activity: malformed counters cannot manufacture progress", () => {
   for (const counter of [{ processed: 10, total: 0 }, { processed: -1, total: 10 }, { processed: 11, total: 10 }, { processed: NaN, total: 10 }]) {

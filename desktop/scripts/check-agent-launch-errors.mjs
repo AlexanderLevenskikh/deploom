@@ -58,6 +58,18 @@ for (const stderr of [
 ]) {
   assert.equal(launch(stderr).kind, "permanent", `Expected permanent for: ${stderr}`);
 }
+// Context exhaustion is not an outage or a request limit, even with the
+// provider's generic limit wording and a watchdog timeout alongside it.
+for (const message of [
+  'ContextOverflowError: maximum context length exceeded',
+  'litellm.ContextWindowExceededError: requested tokens exceed the limit',
+  'context_length_exceeded: prompt is too long',
+]) {
+  const diagnostic = launch('', 1, JSON.stringify({type:'error',error:{message}}), true);
+  assert.equal(diagnostic.kind, 'permanent');
+  assert.match(diagnostic.detail, /AGENT_CONTEXT_EXHAUSTED/);
+  assert.equal(canRetryAgentLaunch(diagnostic.kind, 1, true), false);
+}
 // A success is never a launch failure (left to the outcome/feedback parsers).
 assert.equal(launch("", 0).kind, "permanent");
 

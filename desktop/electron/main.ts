@@ -79,7 +79,7 @@ import { parseIterativeFailure } from './iterative-scenario.js'
 import { iterativeArchiveInvocation, isRepairHandoffPending, parseIterativeArchiveResult } from './iterative-archive.js'
 import { type IterativeAttemptRecord, beginPlan, clearCancelRequest, readAttempt, readAttemptLogTail, readRunLogTail, recordAttemptLog, recordAttemptProgress, requestCancel, resumeAttempt, startAttempt, trimAttemptLog, updateAttempt } from './iterative-attempt.js'
 import { spawnIterativeStreamed, type CaptureResult, type StreamAttemptIo, type StreamPlatform } from './iterative-stream.js'
-import { extendRepairBudget, agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, inspectTrialChanges, clearAgentLease, decideAgentLeaseDispatch, iterativeApplyFeedbackInvocation, agentProviderFailure, parseAgentOutcome, readAgentLease, recordAgentDispatchTiming, trialBaselineFile, trialProjectPath, withAgentDispatchLock, writeAgentLease, writeTrialBaseline, classifyTrialChanges, assertTrialChangesReadable, assertTrialBaselineReadable, agentBlockerFile, resolveRepeatedBlocker, assertNoPersistedAgentBlocker } from './iterative-agent.js'
+import { extendRepairBudget, parkRepairBudget, resumeRepairBudget, agentLeaseFile, agentPromptFile, buildFeedbackPayload, buildIterativeBootstrapPrompt, buildIterativeRepairPrompt, cancelWaitingAgentLease, inspectTrialChanges, clearAgentLease, decideAgentLeaseDispatch, iterativeApplyFeedbackInvocation, agentProviderFailure, parseAgentOutcome, readAgentLease, recordAgentDispatchTiming, trialBaselineFile, trialProjectPath, withAgentDispatchLock, writeAgentLease, writeTrialBaseline, classifyTrialChanges, assertTrialChangesReadable, assertTrialBaselineReadable, agentBlockerFile, resolveRepeatedBlocker, assertNoPersistedAgentBlocker } from './iterative-agent.js'
 import type { TrialChangeReport } from './iterative-agent.js'
 import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
@@ -8095,7 +8095,8 @@ function setupIpc(): void {
     const statusAttempt = readAttempt(runDir)
     const waitLease = readAgentLease(agentLeaseFile(runDir))
     if (statusAttempt?.status === 'waiting' && waitLease?.waiting) {
-      scheduleAgentWaitRetry({ workspaceId: workspace.id, projectName: project.name }, waitLease.retryAt ?? Date.now())
+      const waitDecision = decideAgentLeaseDispatch(waitLease, isPidAlive)
+      scheduleAgentWaitRetry({ workspaceId: workspace.id, projectName: project.name }, waitDecision.action === 'give-up' ? Date.now() : waitLease.retryAt ?? Date.now())
     }
     return {
       ok: error === undefined,
@@ -8909,8 +8910,9 @@ function setupIpc(): void {
     const fullScope = { workspaceId: workspace.id, projectName: project.name }
     const lease = readAgentLease(agentLeaseFile(runDir))
     if (!lease?.waiting) return
-    if ((lease.retryAt ?? 0) > Date.now()) {
-      scheduleAgentWaitRetry(fullScope, lease.retryAt as number)
+    const decision = decideAgentLeaseDispatch(lease, isPidAlive)
+    if (decision.action === 'wait') {
+      scheduleAgentWaitRetry(fullScope, decision.retryAt)
       return
     }
     // An active coordinator owns its wait and continuation; the timer is for
@@ -9233,13 +9235,10 @@ function setupIpc(): void {
           : ''
 
         agentTimingStartedAt = Date.now()
-        const savedBudget = existingLease?.repairBudget
-        let repairBudget = savedBudget?.paused
-          ? { ...savedBudget, windows: savedBudget.windows + 1, deadlineAt: Date.now() + 15 * 60_000, paused: false }
-          : savedBudget ?? { windows: 1, deadlineAt: Date.now() + 15 * 60_000, fingerprint: '' }
+        let repairBudget = resumeRepairBudget(existingLease?.repairBudget, agentTimingStartedAt)
         const runDeadline = Date.parse(String(payload.run?.deadlineAt ?? ''))
-        if (Number.isFinite(runDeadline)) repairBudget.deadlineAt = Math.min(repairBudget.deadlineAt, runDeadline)
-        const repairTimeoutMs = Math.max(1, repairBudget.deadlineAt - Date.now())
+        if (Number.isFinite(runDeadline)) repairBudget = resumeRepairBudget({ ...repairBudget, deadlineAt: Math.min(repairBudget.deadlineAt, runDeadline) }, agentTimingStartedAt)
+        const repairTimeoutMs = repairBudget.deadlineAt - agentTimingStartedAt
         let output = ''
         let exitCode = 0
         let agentTimedOut = false
@@ -9441,7 +9440,7 @@ function setupIpc(): void {
             const waitDetail = agentLaunchWaitDetail(launchDiag, parkedLaunchAttempts, retryAt, retryAutopilot)
             const waitKind: 'rate-limited' | 'temporary' | 'unknown' =
               launchDiag.kind === 'rate-limited' || launchDiag.kind === 'temporary' || launchDiag.kind === 'unknown' ? launchDiag.kind : 'unknown'
-            const parked = { ...(readAgentLease(leasePath) ?? existingLease!), childPid: undefined, autopilot: retryAutopilot, launchDiagnostics: launchDiag, waiting: true, waitKind, waitDetail: launchDiag.detail, retryAt, retryAfterSeconds: launchDiag.retryAfterSeconds, launchAttempts: parkedLaunchAttempts, sessionId, provider, databasePath: readAgentLease(leasePath)?.databasePath ?? existingLease?.databasePath ?? '', runId: ctx.runId, candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId, attemptId: ctx.attemptId, pid: process.pid, startedAt: new Date().toISOString() }
+            const parked = { ...(readAgentLease(leasePath) ?? existingLease!), repairBudget: parkRepairBudget(repairBudget, agentWorkObserved || agentTimedOut ? Date.now() : agentTimingStartedAt), childPid: undefined, autopilot: retryAutopilot, launchDiagnostics: launchDiag, waiting: true, waitKind, waitDetail: launchDiag.detail, retryAt, retryAfterSeconds: launchDiag.retryAfterSeconds, launchAttempts: parkedLaunchAttempts, sessionId, provider, databasePath: readAgentLease(leasePath)?.databasePath ?? existingLease?.databasePath ?? '', runId: ctx.runId, candidateId: bootstrap ? `bootstrap:${ctx.baseCheckpointId}` : ctx.candidateId, attemptId: ctx.attemptId, pid: process.pid, startedAt: new Date().toISOString() }
             writeAgentLease(leasePath, parked)
             recordAttemptLog(runDir, `Agent launch wait (${launchDiag.kind}): exit=${launchDiag.code}, timedOut=${launchDiag.timedOut}${launchDiag.retryAfterSeconds !== undefined ? `, retryAfter=${launchDiag.retryAfterSeconds}s` : ''}; ${launchDiag.detail}\n`)
             updateAttempt(runDir, { status: 'waiting', stage: 'agent', lastError: undefined, cancelRequested: false, reason: waitDetail, waitUntil: retryAt })

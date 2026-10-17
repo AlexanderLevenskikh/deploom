@@ -63,6 +63,32 @@ Unavailable OpenCode models are rejected before dispatch. JSONL provider
 errors, including errors from a process that exits zero, are reported as
 provider failures; they cannot become successful repair feedback.
 
+## Provider waits and exhausted repair sessions
+
+A retryable provider outage parks the same durable session and candidate attempt.
+The lease stores the unused active-window milliseconds as `waitRemainingMs`;
+on resume only that remainder is restored. Waiting time does not consume active
+repair time, reset the window count or earn another extension. The overall run
+deadline still caps resumed work. Restart keeps the remainder, source baseline,
+provider database and session identity. A failed launch with no observed repair
+activity preserves its pre-launch remainder, including a slow transport outage;
+provider downtime alone cannot consume the active repair window. A raw process
+watchdog timeout still consumes the active window: it cannot refund a tiny
+window and enter another immediate timeout cycle.
+
+An expired active window cannot launch a child with a nominal 1 ms timeout.
+Legacy parked leases with an already expired deadline stop with
+`AGENT_REPAIR_DEADLINE_EXPIRED`, retaining the trial and verified checkpoint.
+Context-window exhaustion is `AGENT_CONTEXT_EXHAUSTED`, not a temporary provider
+outage or request-rate limit. Neither condition enters an automatic retry loop
+or produces successful repair feedback. An explicit retry starts a fresh
+conversation against the original durable source baseline; it does not accept
+previous trial edits without verification or clear a protected-file violation.
+
+The activity panel shows the waiting state and its reason even while Desktop
+or the coordinator is alive. The displayed active-time counter pauses during
+waiting; it is not a claim that an agent is currently working.
+
 ## Control and diagnostics
 
 Autopilot can adopt a running manual step without dispatching that step again.

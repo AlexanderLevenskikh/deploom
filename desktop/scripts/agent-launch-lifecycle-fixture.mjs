@@ -159,6 +159,34 @@ function fixture() {
   assert.equal(f.bindings.iterativeStepInFlight.size, 0);
 }
 
+// A provider outage before any work must not consume the repair window,
+// even when starting its transport takes longer than that window.
+{
+  const f=fixture();
+  const resume=f.bindings.resumeRepairBudget;
+  f.bindings.resumeRepairBudget=(saved,now)=>({...resume(saved,now),deadlineAt:now+25});
+  const start=f.bindings.startStandaloneOpenCodeServer;
+  f.bindings.startStandaloneOpenCodeServer=async(...args)=>{
+    await new Promise(resolve=>setTimeout(resolve,60)); return start(...args);
+  };
+  f.setServerError('503 temporarily unavailable');
+  assert.equal((await f.run({projectName:'fixture'})).waiting,true);
+  assert.equal(f.lease().repairBudget.waitRemainingMs,25);
+  assert.equal(f.lease().repairBudget.windows,1);
+  assert.equal(f.launches.length,0);
+}
+// A raw watchdog timeout spends its active window. Without provider error
+// evidence it must not refund a tiny window and relaunch a child forever.
+{
+  const f=fixture();
+  const resume=f.bindings.resumeRepairBudget;
+  f.bindings.resumeRepairBudget=(saved,now)=>({...resume(saved,now),deadlineAt:now+25});
+  f.setChild(`setTimeout(()=>{},60000);`);
+  assert.match((await f.run({projectName:'fixture'})).error,/AGENT_REPAIR_DEADLINE_EXPIRED/);
+  assert.equal(f.launches.length,1); assert.equal(f.waits.length,0);
+  assert.equal(f.lease(),undefined);
+  assert.equal(readFileSync(join(f.projectPath,'input.js'),'utf8'),'original');
+}
 // Exhausted finite budget returns early, releases its lock, and spends no
 // candidate repair attempt (the durable candidate is still attempt 2).
 {
@@ -420,4 +448,78 @@ for (const provider of ['opencode','claude','codex']) {
   assert.equal(existsSync(join(f.runDir,'trial','agent-feedback.json')),false);
   assert.deepEqual(JSON.parse(readFileSync(join(f.runDir,'run.json'),'utf8')),{});
 }
-console.log('agent-launch-lifecycle: production handler + real child wait/resume/cancel/autopilot/recovered error/active timeout/final delivery OK');
+// A legacy expired wait must stop before a child/server launch, including
+// the old endless autonomous episode. Neither trial nor verification changes.
+for (const viaTimer of [false, true]) {
+  const f = fixture();
+  agents.writeAgentLease(agents.agentLeaseFile(f.runDir), {schemaVersion:1,sessionId:'ses-old',provider:'opencode',databasePath:'saved.db',runId:'run',candidateId:'candidate',attemptId:2,pid:0,startedAt:new Date().toISOString(),waiting:true,waitKind:'temporary',retryAt:Date.now()+1800000,launchAttempts:32,autopilot:true,repairBudget:{windows:1,deadlineAt:Date.now()-86400000,fingerprint:''}});
+  if (viaTimer) await f.retry({projectName:'fixture'});
+  else {
+    const result = await f.autonomous(undefined,{projectName:'fixture',autopilot:true});
+    assert.match(result.error,/AGENT_REPAIR_DEADLINE_EXPIRED/);
+    assert.equal(result.autopilot.stopped,'error');
+  }
+  assert.match(attempts.readAttempt(f.runDir).lastError,/AGENT_REPAIR_DEADLINE_EXPIRED/);
+  assert.equal(f.launches.length,0); assert.equal(f.databases.length,0);
+  assert.equal(f.waits.length,0); assert.equal(f.lease(),undefined);
+  assert.equal(readFileSync(join(f.projectPath,'input.js'),'utf8'),'original');
+  assert.equal(existsSync(join(f.runDir,'trial','agent-feedback.json')),false);
+  assert.equal(attempts.readAttempt(f.runDir).status,'failed');
+}
+// A real provider wait preserves only unused ACTIVE time across restart,
+// without resetting the paid session, source baseline or candidate attempt.
+{
+  const f = fixture();
+  f.setChild(`console.log(JSON.stringify({type:'error',sessionID:'ses-wait',error:{message:'HTTP 503 temporarily unavailable'}}));`);
+  assert.equal((await f.run({projectName:'fixture'})).waiting,true);
+  const saved = f.lease();
+  assert.ok(saved.repairBudget.waitRemainingMs > 800000);
+  agents.writeAgentLease(agents.agentLeaseFile(f.runDir), {...saved,retryAt:0,repairBudget:{...saved.repairBudget,deadlineAt:Date.now()-86400000}});
+  f.setChild(`require('fs').writeFileSync('input.js','repaired');console.log('FEEDBACK_KIND: READY_FOR_VERIFY');`);
+  assert.equal((await f.run({projectName:'fixture'})).ok,true);
+  assert.ok(f.launches[1].timeout > 800000 && f.launches[1].timeout <= saved.repairBudget.waitRemainingMs);
+  assert.ok(f.launches[1].args.includes('ses-wait'));
+  const feedback=JSON.parse(readFileSync(join(f.runDir,'trial','agent-feedback.json'),'utf8'));
+  assert.equal(feedback.attemptId,2); assert.deepEqual(feedback.changedFiles,['input.js']);
+}
+// Overfull sessions terminate clearly without waiting or false verification.
+// A user retry starts a new conversation against the SAME original baseline.
+{
+  const f=fixture();
+  f.setChild(`require('fs').writeFileSync('input.js','partial');console.log(JSON.stringify({type:'error',sessionID:'ses-full',error:{name:'ContextOverflowError',message:'maximum context length exceeded'}}));`);
+  const result=await f.autonomous(undefined,{projectName:'fixture',autopilot:true});
+  assert.match(result.error,/AGENT_CONTEXT_EXHAUSTED/);
+  assert.equal(result.autopilot.stopped,'error'); assert.equal(f.waits.length,0);
+  assert.equal(f.lease(),undefined); assert.equal(f.launches.length,1);
+  assert.equal(readFileSync(join(f.projectPath,'input.js'),'utf8'),'partial');
+  assert.equal(existsSync(join(f.runDir,'trial','agent-feedback.json')),false);
+  f.setChild(`console.log('FEEDBACK_KIND: READY_FOR_VERIFY');`);
+  assert.equal((await f.run({projectName:'fixture'})).ok,true);
+  assert.equal(f.launches[1].args.includes('--session'),false);
+  const feedback=JSON.parse(readFileSync(join(f.runDir,'trial','agent-feedback.json'),'utf8'));
+  assert.equal(feedback.attemptId,2); assert.deepEqual(feedback.changedFiles,['input.js']);
+}
+// An expired in-flight budget after a crash also cannot launch a 1 ms child.
+{
+  const f=fixture();
+  agents.writeTrialBaseline(f.projectPath,agents.trialBaselineFile(f.runDir));
+  agents.writeAgentLease(agents.agentLeaseFile(f.runDir), {schemaVersion:1,sessionId:'ses-dead',provider:'opencode',databasePath:'saved.db',runId:'run',candidateId:'candidate',attemptId:2,pid:0,startedAt:new Date().toISOString(),repairBudget:{windows:2,deadlineAt:Date.now()-1,fingerprint:'source-progress'}});
+  const result=await f.run({projectName:'fixture'});
+  assert.match(result.error,/AGENT_REPAIR_DEADLINE_EXPIRED/);
+  assert.equal(f.launches.length,0); assert.equal(f.databases.length,0);
+}
+// Suspension never awards an additional active window or exceeds the run deadline.
+{
+  const now=1000000;
+  const saved=agents.parkRepairBudget({windows:2,deadlineAt:now+12345,fingerprint:'progress'},now);
+  const resumed=agents.resumeRepairBudget(saved,now+86400000);
+  assert.equal(resumed.windows,2); assert.equal(resumed.fingerprint,'progress');
+  assert.equal(resumed.deadlineAt,now+86400000+12345);
+  assert.equal(resumed.waitRemainingMs,undefined);
+  assert.throws(()=>agents.parkRepairBudget({windows:1,deadlineAt:now,fingerprint:''},now),/DEADLINE_EXPIRED/);
+  assert.throws(()=>agents.resumeRepairBudget({...saved,waitRemainingMs:0},now),/DEADLINE_EXPIRED/);
+  const f=fixture(); f.bindings.parseIterativeStatusPayload().run.deadlineAt=new Date(Date.now()-1).toISOString();
+  assert.match((await f.run({projectName:'fixture'})).error,/DEADLINE_EXPIRED/);
+  assert.equal(f.launches.length,0);
+}
+console.log('agent-launch-lifecycle: production handler + real child wait/resume/cancel/autopilot/context exhaustion/expired deadline/final delivery OK');

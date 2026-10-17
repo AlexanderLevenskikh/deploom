@@ -225,6 +225,10 @@ export function classifyAgentLaunchFailure(input: {
     return { code, timedOut, stdout, stderr, kind: 'permanent', detail: 'agent process exited 0 — not a launch failure' }
   }
   const retryAfterSeconds = extractRetryAfterSeconds(source)
+  // Replaying the same overfull conversation cannot heal during a provider wait.
+  if (/ContextOverflowError|ContextWindowExceededError|context_length_exceeded|maximum context length|prompt is too long/i.test(source)) {
+    return { code, timedOut, stdout, stderr, kind: 'permanent', detail: 'AGENT_CONTEXT_EXHAUSTED: контекст сессии агента переполнен. Правки trial сохранены; повторный запуск начнёт новую сессию ремонта.' }
+  }
   // Order matters: rate-limit evidence is checked first so a 429 is never
   // downgraded to a generic temporary/unknown because other text is present.
   if (!HAS_PERMANENT.some((re) => re.test(source)) && HAS_RATE_LIMIT.some((re) => re.test(source))) {
