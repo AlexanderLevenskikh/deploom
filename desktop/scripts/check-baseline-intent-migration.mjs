@@ -63,7 +63,7 @@ const atomicWriteJsonSync = (file, value) => {
 // The migration machinery (legacy slug -> baseline intent file), plus the
 // loader/budget check that must migrate before reading.
 const migStart = source.indexOf('function legacyArtifactSlug(')
-const migEnd = source.indexOf('function projectInstalledVersion(', migStart)
+const migEnd = source.indexOf('function baselineIntentPlan(', migStart)
 if (migStart < 0 || migEnd < 0) throw new Error('R2: intent-migration slice not found in main.ts')
 // N1: ownership of a legacy file is decided against the workspace's project
 // list, so the check injects readProjects over a mutable project set.
