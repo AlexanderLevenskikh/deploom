@@ -3,7 +3,7 @@ import { defenderExclusionTarget, defenderExclusionCommand } from './defender-ex
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
 import updaterPackage from 'electron-updater'
 import { nextUpdaterStatus, type UpdateStatus } from './updater-state.js'
-import { readProjectManifest } from './project-manifest.js'
+import { installedManifestReader, readProjectManifest } from './project-manifest.js'
 import { isDeterministicToolFailure, isDeterministicSourcePreflightFailure, formatSourceCheckoutDirtyFailure } from './baseline-retry.js'
 import { StorageCleanupController } from './storage-cleanup.js'
 import { withStorageControlFile } from './storage-control-file.js'
@@ -895,17 +895,10 @@ function saveBaselineIntent(workspace: WorkspaceRecord, projectName: string, int
   atomicWriteJsonSync(baselineIntentPath(workspace, projectName), { ...durable, decisionGrantIterations: 0 })
 }
 
-function projectInstalledVersion(projectPath: string, packageName: string): string | undefined {
-  try {
-    const manifest = JSON.parse(readFileSync(join(projectPath, 'node_modules', ...packageName.split('/'), 'package.json'), 'utf8')) as { version?: unknown }
-    const version = String(manifest.version ?? '').trim()
-    return version || undefined
-  } catch { return undefined }
-}
-
 function baselineIntentPlan(workspace: WorkspaceRecord, project: ProjectSpec): BaselineIntentPlan {
   const manifestPath = join(project.path, 'package.json')
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>
+  const installedManifest = installedManifestReader(project.path)
   const result = new Map<string, BaselineIntentCandidate>()
   const add = (section: string, kind: BaselineIntentCandidate['kind']) => {
     const values = manifest[section]
@@ -916,7 +909,7 @@ function baselineIntentPlan(workspace: WorkspaceRecord, project: ProjectSpec): B
         name,
         kind,
         requestedSpec: String(rawSpec ?? ''),
-        currentVersion: projectInstalledVersion(project.path, name),
+        currentVersion: String(installedManifest(name)?.version ?? '').trim() || undefined,
       })
     }
   }
@@ -9166,6 +9159,7 @@ function setupIpc(): void {
       ctx.verificationCommands = Array.isArray(verificationCommands)
         ? verificationCommands.filter((command): command is string => typeof command === 'string' && command.trim().length > 0)
         : []
+      ctx.researchTool = join(bundledToolDir(), 'migration_research.py')
       const projectPath = trialProjectPath(workspaceRoot, projectRelative)
       const repairRequests = (Array.isArray(payload.openRepairRequests) ? payload.openRepairRequests : []) as Array<{
         requestId?: string; reason?: string; failingCommands?: Array<{ command: string; exitCode: number }>; diagnosticsTail?: string;

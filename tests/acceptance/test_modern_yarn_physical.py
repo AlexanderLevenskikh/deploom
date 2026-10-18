@@ -64,7 +64,7 @@ class ModernYarnPhysicalAcceptance(unittest.TestCase):
                 (root/'package.json').write_text(json.dumps({'name': 'modern-root', 'private': True, 'packageManager': 'yarn@'+version, 'workspaces': ['./Web/App/']}))
                 (app/'package.json').write_text(json.dumps({'name': 'modern-app', 'version': '1.0.0', 'dependencies': {'deploom-yarn-fixture': '1.0.0'}}))
                 (root/'.gitignore').write_text('node_modules/\n.yarn/cache/\n.yarn/install-state.gz\n.yarn/releases/\n')
-                (root/'.yarnrc.yml').write_text(f'yarnPath: .yarn/releases/yarn.cjs\nnodeLinker: node-modules\nenableGlobalCache: false\nnpmRegistryServer: "{registry}"\nunsafeHttpWhitelist:\n  - 127.0.0.1\n')
+                (root/'.yarnrc.yml').write_text(f'yarnPath: .yarn/releases/yarn.cjs\nnodeLinker: node-modules\nenableGlobalCache: true\nnpmRegistryServer: "{registry}"\nunsafeHttpWhitelist:\n  - 127.0.0.1\n')
                 (root/'backend.sql').write_text('unrelated backend')
                 (app/'check.js').write_text('const fs=require("fs"); const p=require.resolve("deploom-yarn-fixture/package.json"); if(require("deploom-yarn-fixture")!=="2.0.0" || !fs.existsSync(require("path").join(require("path").dirname(p),"built.txt"))) process.exit(41); console.log("MODERN_YARN_CHECK_PASS");')
                 env = {**os.environ, 'YARN_ENABLE_IMMUTABLE_INSTALLS': 'false'}
@@ -74,11 +74,39 @@ class ModernYarnPhysicalAcceptance(unittest.TestCase):
                     subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True)
                 # Use a project-local launcher: its delegation must select the pinned version.
                 bin_dir = runtimes/'4.0.0'/'node_modules'/'.bin'
-                runtime_env = {**os.environ, 'PATH': str(bin_dir)+os.pathsep+os.environ['PATH']}
+                runtime_env = {**os.environ, 'PATH': str(bin_dir)+os.pathsep+os.environ['PATH'], 'YARN_GLOBAL_FOLDER': str(Path(tmp)/'shared-yarn-cache')}
                 with patch.dict(os.environ, {**runtime_env, 'DEPLOOM_SOURCE_SCOPE_MODE': 'project-gitignore'}):
                     snapshot = capture_source_snapshot(app)
                     self.assertTrue((snapshot.root/'backend.sql').is_file())
                     self.assertTrue((snapshot.root/'.yarn/releases/yarn.cjs').is_file())
+                    if not version.startswith('2.'):
+                        from lockfile_preflight import probe_candidate
+                        from iterative_migration import _run_install
+                        from baseline_constraint_verifier import _apply_assignment
+                        planning = Path(tmp) / 'planning'; planning.mkdir()
+                        subjects = []
+                        def run_plan(selected):
+                            subjects.append(selected)
+                            result = _run_install(selected, timeout_seconds=120, progress_label='physical lock-only fixture',
+                                                  runtime_env=runtime_env, lockfile_only=True)
+                            self.assertFalse((selected/'node_modules').exists())
+                            self.assertFalse((selected.parent.parent/'node_modules').exists())
+                            return result
+                        original_manifest = (snapshot.project_path/'package.json').read_bytes()
+                        probe = probe_candidate(snapshot.project_path, planning, {'deploom-yarn-fixture': '2.0.0'}, {}, source_root=snapshot.root,
+                            apply=lambda selected, assignment, additions: _apply_assignment(selected, assignment), run=run_plan)
+                        self.assertIsNotNone(probe, 'ordinary pinned Berry fixture must use small input probe')
+                        self.assertEqual(0, probe.returncode, probe.stdout + (probe.stderr or ''))
+                        missing = probe_candidate(snapshot.project_path, planning, {'deploom-yarn-fixture': '3.0.0'}, {}, source_root=snapshot.root,
+                            apply=lambda selected, assignment, additions: _apply_assignment(selected, assignment), run=run_plan)
+                        self.assertIsNotNone(missing)
+                        self.assertNotEqual(0, missing.returncode)
+                        from iterative_target_deferrals import record_unavailable_targets
+                        self.assertTrue(record_unavailable_targets({}, {}, {'targets': {'deploom-yarn-fixture': '3.0.0'}},
+                            {'candidateId': 'fixture', 'delta': {'changed': {'deploom-yarn-fixture': '3.0.0'}}},
+                            missing.stdout + (missing.stderr or '')), missing.stdout)
+                        self.assertEqual(original_manifest, (snapshot.project_path/'package.json').read_bytes())
+                        self.assertFalse(subjects[0].exists(), 'private planning subject must be retired')
                     config = BaselineVerifyConfig(enabled=True, project_checks='strict', commands=('node check.js',), registry=registry, timeout_seconds=120, attempt_timeout_seconds=300, proof_cache_dir=str(Path(tmp)/'proof'))
                     # Exercise the production resolver-only -> exact lifecycle
                     # bridge, including Berry's real on-disk install/build state.

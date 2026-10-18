@@ -104,5 +104,9 @@ def delivery_preflight(run_dir, inputs):
     from delivery_worktree import assert_delivery_branch
     assert_delivery_branch(root, state)
     delivery.git(root, "merge-base", "--is-ancestor", state["sourceHead"], "HEAD")
+    from delivery_audit_recovery import restore_audit_copies
+    restored = [] if state.get("cleanup") else restore_audit_copies(run_dir, state)
     _, _, report = inspect_delivery(run_dir, state, checkpoint)
+    report.update(restoredAuditReportCount=len(restored), restoredAuditReports=restored)
+    core._write_json_atomic(Path(run_dir) / "delivery" / "preflight.json", report)
     return {key: value for key, value in report.items() if key not in {"lineEndingChanges", "blockedChanges"}}

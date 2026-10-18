@@ -17,3 +17,33 @@ Final dispatch uses a 45-minute inactivity watchdog and a 3-hour overall ceiling
 Browser QA: serve `desktop/monitor-harness.html` with Vite, then run `node scripts/qa-iterative-audit.cjs` from Desktop with Playwright available (or `DEPLOOM_PLAYWRIGHT_MODULE` pointing to its installed package). `DEPLOOM_QA_URL`, `DEPLOOM_QA_BROWSER_CHANNEL` and `DEPLOOM_QA_OUTPUT` optionally override the fixture URL, browser and screenshot directory. The fixture covers initial Critical, unknown evidence, final goals/commits, RU/EN, adjacent directory buttons, dark/light rendering and narrow windows.
 
 Validation: `python -m unittest discover -s tests/regression -p test_iterative_delivery.py -v`, `npm run build`, `npm run check:iterative-delivery`, existing iterative/repair/Desktop contracts and `python run_tool_tests.py --suite all`. The Git boundary fixture uses real worktrees and Node checks; advisory evidence is deterministic test data, not evidence about a user's project.
+
+## Recoverable audit copies and workspace repair scope
+
+The four controller-generated pre/post audit JSON/Markdown copies are pinned
+inputs during commit preparation. The commit agent must not regenerate or
+reformat them. Preflight can recover a changed copy only from the same run's
+saved report whose SHA-256 still equals the prepared hash. It archives the
+displaced bytes under `delivery/displaced-audit-reports/` before replacing the
+copy, reports every restored path, and resumes the saved commit session when
+needed. Missing/corrupt references and unrelated source changes remain blocked.
+This comparison/recovery never grants audit or project verification authority.
+
+For a nested workspace package, residual dependency repair can modify the
+canonical shared lockfile, `overrides`/`resolutions` in its owning manager manifest,
+and dependency versions in transitively referenced local workspace manifests.
+Membership and edges come from the hash-pinned source, not the agent's edited
+manifests. Scripts, workspace declarations, other manifest fields, dependency
+names and unrelated workspace files remain guarded. Scope rejection records all
+blocked paths in `security/scope-rejection.json`. Newly generated, untracked,
+Git-ignored Husky bootstrap files are admitted only for exact recognized upstream
+bootstrap bytes; custom or tracked hook code remains guarded. Accepted repair
+still requires fresh configured checks, independent audit and checkpoint capture.
+
+A repair-only run may have no selected version targets while its initial
+checkpoint still contains the project's direct dependency inventory. A zero
+target/accepted-upgrade count is not an empty dependency inventory. The
+Dependencies tab shows an explicit empty-target explanation rather than three
+zero counters. Installed-manifest coverage is labelled separately; display-only
+lookup includes hoisted node_modules up to the repository boundary, preserves
+local-package precedence, and never invents missing installed evidence.

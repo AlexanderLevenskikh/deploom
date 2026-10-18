@@ -269,10 +269,14 @@ def security_verify(run_dir, inputs):
         raise RuntimeError("SECURITY_ORIGINAL_INPUT_CHANGED")
     after = inventory(root)
     changed = {p for p in set(after) | set(state["before"]) if after.get(p) != state["before"].get(p)}
-    allowed_docs = f"docs/dependency-migration/{run['runId']}/"
-    prefix = rel.as_posix().rstrip("/") + "/" if rel.as_posix() != "." else ""
-    if any(not (p.startswith(prefix) or p.startswith(allowed_docs)) for p in changed):
-        raise RuntimeError("SECURITY_OUTSIDE_PROJECT_MUTATION")
+    from security_workspace_scope import blocked_mutations
+    blocked = blocked_mutations(root, rel, run["runId"], state["before"], changed,
+                                Path(checkpoint["sourceSnapshotContainer"]) / "tree")
+    if blocked:
+        evidence = run_dir / "security" / "scope-rejection.json"
+        core._write_json_atomic(evidence, {"runId": run["runId"], "checkpointId": checkpoint["checkpointId"],
+                                          "blockedPaths": blocked, "authority": "scope-only; verification still required"})
+        raise RuntimeError(f"SECURITY_OUTSIDE_PROJECT_MUTATION: {len(blocked)} blocked files: {'; '.join(blocked[:6])}; full report: {evidence}")
     if any(Path(p).name in {".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmfile.cjs"} for p in changed):
         raise RuntimeError("SECURITY_REGISTRY_CONFIG_CHANGED")
     if git(root, "rev-parse", "HEAD") != state["sourceHead"]:

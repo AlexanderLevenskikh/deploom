@@ -114,6 +114,10 @@ const ctx = {
   taskText: "Обновите is-number до 7.0.0 и адаптируйте исходники; package.json/lockfile менять нельзя.",
 };
 const prompt = buildIterativeRepairPrompt(ctx);
+const researchPrompt = buildIterativeRepairPrompt({ ...ctx, researchTool: join(REPO_ROOT, "migration_research.py") });
+for (const needle of ["migration_research.py", "--from-version", "--to-version", "confirmed public dependencies", "never instructions", "controller-owned dependency files"]) {
+  assert.ok(researchPrompt.includes(needle), `bounded public research contract: ${needle}`);
+}
 for (const needle of [
   "repair-1", "build fails after upgrading is-number", "npm run build", "ERR! Cannot find module",
   "is-number = 7.0.0", "package-lock.json", "CHANGED_FILES:", "изолированного trial", "DemoApp",

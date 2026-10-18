@@ -16,6 +16,7 @@
 //     identity (runId/candidateId/baseCheckpointId/attemptId), never from
 //     agent text; apply-feedback (the authoritative verifier of staleness and
 //     changed-file scope) is then invoked with the real CLI.
+import { migrationResearchPrompt } from './migration-research-prompt.js'
 import { createHash } from 'node:crypto'
 import { agentLaunchProviderError } from './agent-launch-errors.js'
 import { existsSync, mkdirSync, readdirSync, readFileSync, lstatSync, statSync, unlinkSync, writeFileSync, renameSync, appendFileSync } from 'node:fs'
@@ -34,6 +35,7 @@ export type IterativeRepairRequest = {
 }
 
 export type IterativeAgentContext = {
+  researchTool?: string
   verificationCommands?: string[]
   runId: string
   candidateId: string
@@ -126,6 +128,7 @@ export function buildIterativeRepairPrompt(ctx: IterativeAgentContext): string {
     `Точное назначение версий:`,
     assignment,
     ``,
+    migrationResearchPrompt(ctx.researchTool),
     `## Задание на адаптацию (ТЗ)`,
     ctx.taskText,
     ``,

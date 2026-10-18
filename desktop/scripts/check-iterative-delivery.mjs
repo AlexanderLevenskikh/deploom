@@ -121,6 +121,13 @@ try {
   assert.equal((await runDeliveryWorkflow(root, deps)).ok, true)
   assert.equal(paidLaunches, 1, 'an authoritative retry can close EOL-only rejection without replaying the paid agent')
   assert.equal(JSON.parse(readFileSync(join(root, 'delivery-agent.json'), 'utf8')).status, 'finished')
+  let restoredLaunches = 0
+  write('delivery-agent.json', { identity: 'delivery:fixture:C4:0', status: 'finished', sessionId: 'saved-session', provider: 'codex' })
+  const restored = await runDeliveryWorkflow(root, { ...deps,
+    command: async step => step === 'delivery-preflight' ? { status: 'ready', restoredAuditReportCount: 4 } : deps.command(step),
+    launch: async context => { restoredLaunches++; assert.equal(context.sessionId, 'saved-session'); assert.match(context.prompt, /controller-owned pinned evidence/) },
+  })
+  assert.equal(restored.ok, true); assert.equal(restoredLaunches, 1, 'restored evidence must be committed in the saved session')
   let realUncommittedLaunches = 0, retryCommitCalls = 0
   write('delivery-agent.json', { identity: 'delivery:fixture:C4:0', status: 'needs-agent', sessionId: 'saved-session', provider: 'codex', verificationError: 'DELIVERY_UNCOMMITTED_CHANGES' })
   const realUncommitted = await runDeliveryWorkflow(root, { ...deps,
@@ -212,7 +219,17 @@ try {
   assert.equal(securityResumeAvailable(recovery),false);
   put('delivery-agent.json',{identity:'security:fixture:C0:1',status:'canceled',sessionId:'same-session',provider:'codex'});
   assert.equal(securityResumeAvailable(recovery),true, 'Manual cancellation preserves resumability');
+  put('delivery-agent.json',{identity:'security:fixture:C0:1',status:'finished',sessionId:'same-session',provider:'codex'});
+  assert.equal(securityResumeAvailable(recovery),true, 'Finished agent with pending verification remains resumable');
+  let verificationRetries = 0;
   put('run-config.json',{budget:{maxRepairAttemptsPerRevision:2}});
+  const pendingVerification = await runDeliveryWorkflow(recovery, {
+    provider:'codex', canceled:()=>false, processAlive:()=>false, progress:()=>{},
+    command:async command => { if (command === 'security-prepare') return state; if (command === 'security-verify') { verificationRetries++; return {goalSatisfied:true}; } throw Error('after-verified-repair'); },
+    launch:async () => { throw Error('must retry verifier without paid agent'); },
+  });
+  assert.equal(verificationRetries,1); assert.equal(pendingVerification.error,'after-verified-repair');
+  put('delivery-agent.json',{identity:'security:fixture:C0:1',status:'canceled',sessionId:'same-session',provider:'codex'});
   let launches = 0;
   const outcome = await runDeliveryWorkflow(recovery, {
     provider:'codex', canceled:()=>false, processAlive:()=>false, progress:()=>{},

@@ -286,6 +286,17 @@ def resolve_package_manager_profile(
     )
 
 
+def lockfile_preflight_args(profile: PackageManagerProfile) -> list[str]:
+    """Cheap native planning only. A full install and observed tree remain required.
+
+    Keep older/unpinned versions on their established path; no synthetic lock
+    parser is promoted to ResolverProof or materialization evidence.
+    """
+    if profile.family == "yarn-berry" and _major(profile.declared_version) in (3, 4):
+        return ["install", "--mode=update-lockfile"]
+    return []
+
+
 def install_args_for_profile(
     profile: PackageManagerProfile,
     *,

@@ -148,6 +148,7 @@ from registry_request_context import request_context
 from registry_metadata_cache import (
     DEFAULT_METADATA_CACHE_TTL_SECONDS,
     load_packument,
+    load_revalidation_entry,
     store_packument,
 )
 from substrate_identity import tool_build_id
@@ -2916,6 +2917,32 @@ class LiveDataClient:
         return value
 
     def fetch_npm_metadata(self, pkg: str):
+        from planning_cache import planning_lease
+        context, durable = request_context(self.session, self.registry, self.metadata_cache_tool_version)
+        if not durable or self.metadata_cache_dir is None or self.metadata_cache_ttl <= 0:
+            return self._fetch_npm_metadata_live(pkg)
+        def check():
+            if self.deadline is not None:
+                self.deadline.check("metadata-cache-wait")
+        from planning_cache import cached_query
+        def fetch():
+            with planning_lease(["packument", str(self.metadata_cache_dir.resolve()), self.registry, context, pkg],
+                                check=check, timeout=self.timeout):
+                data = self._fetch_npm_metadata_live(pkg)
+                return data, 1, "" if isinstance(data, dict) else "unavailable", "registry-http"
+        if context != self._metadata_request_context:
+            self.npm_cache.clear()
+            self._metadata_request_context = context
+        if pkg in self.npm_cache:
+            return self.npm_cache[pkg]
+        data, executed, *_ = cached_query(["public-packument-v1", self.registry, context, pkg], fetch,
+                                         ttl=self.metadata_cache_ttl, check=check)
+        if not executed and isinstance(data, dict):
+            self._metadata_cache_disk_hits += 1
+        self.npm_cache[pkg] = data
+        return data
+
+    def _fetch_npm_metadata_live(self, pkg: str):
         context, durable = request_context(self.session, self.registry, self.metadata_cache_tool_version)
         if context is None or context != self._metadata_request_context:
             self.npm_cache.clear()
@@ -2937,14 +2964,33 @@ class LiveDataClient:
         self.progress(operation="registry metadata", package=pkg, step="scan")
         encoded = pkg.replace("/", "%2F")
         url = f"{self.registry}/{encoded}"
+        stale = load_revalidation_entry(self.metadata_cache_dir, self.registry, pkg, context=context or "") if durable and self.metadata_cache_ttl > 0 else None
+        conditional = {}
+        if stale:
+            for header, request_header in (("ETag", "If-None-Match"), ("Last-Modified", "If-Modified-Since")):
+                if stale["validators"].get(header):
+                    conditional[request_header] = stale["validators"][header]
         last_error = ""
         for attempt in range(1, REGISTRY_METADATA_MAX_ATTEMPTS + 1):
             try:
                 self.progress(operation="registry metadata", package=pkg, retry=attempt - 1, step="scan")
                 response = self._supervised(
-                    lambda url=url: self.session.get(url, timeout=self._budgeted_timeout(), stream=True)
+                    lambda url=url: self.session.get(url, timeout=self._budgeted_timeout(), stream=True,
+                                                     **({"headers": conditional} if conditional else {}))
                 )
                 status = int(getattr(response, "status_code", 0) or 0)
+                if status == 304 and stale is not None:
+                    response.close()
+                    data = stale["data"]
+                    store_packument(self.metadata_cache_dir, self.registry, pkg, data,
+                                    self.metadata_cache_tool_version, context=context or "", validators=stale["validators"])
+                    self.npm_cache[pkg] = data
+                    from verification_observability import emit_observability_event
+                    emit_observability_event("planning.metadata.revalidated", status=304)
+                    return data
+                if status == 304:
+                    response.close()
+                    raise ValueError("registry returned 304 without a validated cached subject")
                 if status == 404:
                     # A real 404 is a deterministic registry fact. Unlike a
                     # timeout/5xx it is safe to memoize as package absence.
@@ -2961,6 +3007,7 @@ class LiveDataClient:
                     store_packument(
                         self.metadata_cache_dir, self.registry, pkg, data,
                         self.metadata_cache_tool_version, context=context or "",
+                        validators={key: response.headers[key] for key in ("ETag", "Last-Modified") if key in getattr(response, "headers", {})},
                     )
                 self._bounded_sleep(self.sleep_sec)
                 return data

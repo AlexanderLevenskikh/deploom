@@ -22,21 +22,24 @@ def availability_scope(run: Mapping, config: Mapping) -> str:
 
 def record_unavailable_targets(ledger: dict, run: Mapping, config: Mapping,
                                candidate: Mapping, output: str) -> bool:
-    if not re.search(r'\bnpm (?:error|ERR!) code ETARGET\b', output):
+    npm_target = bool(re.search(r'\bnpm (?:error|ERR!) code ETARGET\b', output))
+    yarn_matches = list(re.finditer(r'YN0082:\s+(?:\u2502\s*)?((?:@[^\s/@:]+/)?[^\s/@:]+)@npm:(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?): No candidates found', output))
+    if not npm_target and not yarn_matches:
         return False
     changed = (candidate.get('delta') or {}).get('changed') or {}
     targets = config.get('targets') or {}
     entries = list(ledger.get('targetAvailabilityDeferrals') or [])
     scope = availability_scope(run, config)
     added = False
-    for match in re.finditer(r'No matching version found for ((?:@[^\s/@]+/)?[^\s/@]+)@([^\s.]+(?:\.[^\s.]+)*?)\.(?:\s|$)', output):
+    matches = list(re.finditer(r'No matching version found for ((?:@[^\s/@]+/)?[^\s/@]+)@([^\s.]+(?:\.[^\s.]+)*?)\.(?:\s|$)', output)) if npm_target else []
+    for match in matches + yarn_matches:
         name, version = match.groups()
         if changed.get(name) != version or (targets.get(name) != version and
                 (candidate.get('scopeExpansionVersions') or {}).get(name) != version):
             continue
         entry = {'package': name, 'target': version, 'scope': scope,
                  'code': 'TARGET_VERSION_UNAVAILABLE', 'candidateId': candidate.get('candidateId'),
-                 'reason': f'npm ETARGET: {name}@{version} unavailable for this run/registry context'}
+                 'reason': f'{"npm ETARGET" if npm_target else "Yarn YN0082"}: {name}@{version} unavailable for this run/registry context'}
         if not any(item.get('package') == name and item.get('target') == version and
                    item.get('scope') == scope for item in entries if isinstance(item, dict)):
             entries.append(entry)

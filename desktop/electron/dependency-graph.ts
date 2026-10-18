@@ -1,5 +1,4 @@
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { installedManifestReader } from './project-manifest.js'
 
 export type DependencyGraphCandidate = {
   name: string
@@ -64,16 +63,6 @@ type InstalledManifest = {
   optionalDependencies?: Record<string, unknown>
 }
 
-function installedManifest(projectPath: string, packageName: string): InstalledManifest | undefined {
-  try {
-    return JSON.parse(
-      readFileSync(join(projectPath, 'node_modules', ...packageName.split('/'), 'package.json'), 'utf8'),
-    ) as InstalledManifest
-  } catch {
-    return undefined
-  }
-}
-
 function relationNames(value: unknown): string[] {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return []
   return Object.keys(value as Record<string, unknown>)
@@ -84,6 +73,7 @@ export function buildDependencyGraphSnapshot(
   projectName: string,
   plan: { candidates: DependencyGraphCandidate[]; intent: DependencyGraphIntent },
 ): DependencyGraphSnapshot {
+  const installedManifest = installedManifestReader(projectPath)
   const direct = new Set(plan.candidates.map((item) => item.name))
   const missing: string[] = []
   const packages: DependencyGraphPackage[] = []
@@ -91,7 +81,7 @@ export function buildDependencyGraphSnapshot(
   let observed = 0
 
   for (const candidate of [...plan.candidates].sort((a, b) => a.name.localeCompare(b.name))) {
-    const manifest = installedManifest(projectPath, candidate.name)
+    const manifest = installedManifest(candidate.name) as InstalledManifest | undefined
     if (manifest) observed += 1
     else missing.push(candidate.name)
 

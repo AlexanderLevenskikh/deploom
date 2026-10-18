@@ -750,7 +750,8 @@ def _manager_runtime_identity(project_dir: Path) -> Tuple[str, str]:
 
 
 def _run_install(project_dir: Path, *, timeout_seconds: int, progress_label: str,
-                 runtime_env: Optional[Dict[str, str]] = None, run_deadline_at: str = "") -> subprocess.CompletedProcess[str]:
+                 runtime_env: Optional[Dict[str, str]] = None, run_deadline_at: str = "",
+                 lockfile_only: bool = False) -> subprocess.CompletedProcess[str]:
     deadline_epoch = None
     if run_deadline_at:
         try:
@@ -789,6 +790,21 @@ def _run_install(project_dir: Path, *, timeout_seconds: int, progress_label: str
                 active_timeout = timeout_seconds
                 if remaining is not None:
                     active_timeout = min(timeout_seconds or remaining, max(1, int(remaining)))
+                if lockfile_only:
+                    from package_manager_profile import lockfile_preflight_args
+                    profile = resolve_project_topology(project_dir, allow_discovery=False, require_supported=True).profile
+                    preflight = lockfile_preflight_args(profile)
+                    if not preflight:
+                        raise IterativeMigrationError("LOCKFILE_ONLY_UNSUPPORTED", profile.family)
+                    started = time.monotonic()
+                    progress(f"{progress_label}: resolving lockfile before dependency materialization")
+                    result = _run([executable, *preflight], project_dir, timeout_seconds=active_timeout,
+                                  env=env, base_env=base_env, progress=progress,
+                                  progress_label="lockfile-only planning (not verification)")
+                    from verification_observability import emit_observability_event
+                    emit_observability_event("planning.lockfile.finish", managerFamily=profile.family,
+                                             exitCode=result.returncode, durationMs=int((time.monotonic()-started)*1000))
+                    return result
                 return _run(
                     [executable, *install_args],
                     project_dir,
@@ -2894,6 +2910,18 @@ def _registry_failure_class(output: str, *, timed_out: bool = False) -> str:
 
 
 def _query_discovery_metadata(project_dir: Path, args: List[str], runtime_env: Optional[Dict[str, str]]) -> Any:
+    from planning_cache import cached_query, public_cli_context
+    context = public_cli_context(project_dir, runtime_env)
+    if context is None:
+        return _query_discovery_metadata_live(project_dir, args, runtime_env)
+    def check():
+        if _probe_budget_timeout() is None:
+            raise BudgetExceededError("DISCOVERY_DEADLINE_EXCEEDED")
+    return cached_query(["registry-cli-v1", context, args],
+                        lambda: _query_discovery_metadata_live(project_dir, args, runtime_env), check=check)
+
+
+def _query_discovery_metadata_live(project_dir: Path, args: List[str], runtime_env: Optional[Dict[str, str]]) -> Any:
     """Query a package's *actual* registry in a read-only planning subprocess.
 
     Modern Yarn may use npmScopes/npmRegistries credentials in .yarnrc.yml
@@ -4000,12 +4028,33 @@ def _materialize_locked(
         }
     )
 
+    snapshot = _open_checkpoint_source(run_dir, base_checkpoint, config, run_id=str(run["runId"]), candidate_id=str(candidate["candidateId"]))
+    from lockfile_preflight import probe_candidate
+    from iterative_scope_expansion import apply_expansion_assignment
+    probe_started = time.monotonic()
+    probe = probe_candidate(
+        Path(getattr(snapshot, "project_path", Path(snapshot.root) / project_relative)), run_dir, candidate["fullAssignment"], candidate.get("scopeExpansionAdditions") or {},
+        source_root=Path(snapshot.root),
+        apply=lambda project, assignment, additions: apply_expansion_assignment(
+            project, assignment, additions, _apply_assignment, _validate_assignment_materialization),
+        run=lambda project: _run_install(project, timeout_seconds=args.timeout_seconds,
+            progress_label="candidate lockfile preflight", runtime_env=_runtime_env(config),
+            run_deadline_at=str(run.get("deadlineAt") or ""), lockfile_only=True))
+    probe_seconds = time.monotonic() - probe_started
+    if probe is not None and probe.returncode != 0:
+        # Only exact unavailable-target evidence is actionable without a full
+        # materialization. Other probe errors fall back; they cannot learn a
+        # false incompatibility from an intentionally smaller workspace.
+        output = (probe.stdout or "") + "\n" + (probe.stderr or "")
+        if record_unavailable_targets({}, run, config, candidate, output):
+            return _handle_materialize_failure(run_dir, run, config, candidate, base_checkpoint, install_result=probe)
+    if args.timeout_seconds and probe_seconds >= args.timeout_seconds:
+        raise BudgetExceededError("MATERIALIZATION_PREFLIGHT_TIME_BUDGET")
     from iterative_trial_workspace import remove_trial_workspace, TrialWorkspaceCleanupError
     try:
         remove_trial_workspace(run_dir)
     except TrialWorkspaceCleanupError as exc:
         raise IterativeMigrationError("TRIAL_WORKSPACE_CLEANUP_BLOCKED", str(exc)) from exc
-    snapshot = _open_checkpoint_source(run_dir, base_checkpoint, config, run_id=str(run["runId"]), candidate_id=str(candidate["candidateId"]))
     workspace_root = trial_workspace_root(run_dir)
     _materialize_trial_tree(snapshot, workspace_root, args.timeout_seconds)
 
@@ -4023,7 +4072,7 @@ def _materialize_locked(
     install_started = time.monotonic()
     install_result = _run_install(
         project_path,
-        timeout_seconds=args.timeout_seconds,
+        timeout_seconds=max(1, args.timeout_seconds - probe_seconds) if args.timeout_seconds else 0,
         progress_label="iterative migration exact materialization",
         runtime_env=_runtime_env(config), run_deadline_at=str(run.get("deadlineAt") or ""),
     )
@@ -4385,6 +4434,7 @@ def _materialization_failure(output: str) -> Tuple[str, str]:
         return "resolver", "CONFLICT"
     for marker, code in (
         ("etarget", "ETARGET"),
+        ("yn0082", "ETARGET"),
         ("enotarget", "NOTARGET"),
         ("no matching version", "ETARGET"),
         ("unable to resolve", "RESOLVER"),

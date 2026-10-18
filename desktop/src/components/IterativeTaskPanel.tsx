@@ -1057,7 +1057,12 @@ export function IterativeTaskPanel(props: Props) {
             </div>
           ) : null}
 
-          {runner?.progressSummary ? <>
+          {runner?.progressSummary?.denominator === 0 ? (
+            <div className="resume-notice">
+              <strong>{text('Цели обновления не выбраны', 'No upgrade targets selected')}</strong>
+              <span>{text('В этом прогоне нет выбранных целей обновления. Это не число зависимостей проекта — полный список показан ниже.', 'This run has no selected upgrade targets. This is not the project dependency count — the full list is shown below.')}</span>
+            </div>
+          ) : runner?.progressSummary ? <>
             <div className="roadmap-summary-grid">
               <div><strong>{runner.progressSummary.remaining}</strong><span>{text('до предложенных версий', 'below proposed versions')}</span></div>
               <div><strong>{runner.progressSummary.accepted}</strong><span>{text('принято обновлений', 'accepted updates')}</span></div>

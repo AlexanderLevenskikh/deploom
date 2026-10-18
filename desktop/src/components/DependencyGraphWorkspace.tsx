@@ -266,7 +266,7 @@ export function DependencyGraphWorkspace({
       <div className="dependency-graph-summary">
         <div><span>{text('Пакеты', 'Packages')}</span><strong>{snapshot.packages.length}</strong></div>
         <div><span>{text('Наблюдаемые связи', 'Observed relations')}</span><strong>{snapshot.edges.length}</strong></div>
-        <div><span>Manifest coverage</span><strong>{snapshot.manifestCoverage.observed}/{snapshot.manifestCoverage.total}</strong></div>
+        <div title={text('Манифесты пакетов, найденные в установленном node_modules. Отсутствие установки не уменьшает список объявленных зависимостей.', 'Package manifests found in installed node_modules. A missing installation does not reduce the declared dependency list.')}><span>{text('Установленные манифесты', 'Installed manifests')}</span><strong>{snapshot.manifestCoverage.observed}/{snapshot.manifestCoverage.total}</strong></div>
         <div><span>{snapshot.iteration ? text('Принято', 'Accepted') + ' · ' + snapshot.iteration.checkpointId : 'Verified scope'}</span><strong>{snapshot.iteration ? Object.keys(snapshot.iteration.accepted).length : baselineCompleted ? `${verifiedCount}/${snapshot.packages.length}` : '—'}</strong></div>
         <div><span>{snapshot.iteration ? text('Непринятые группы', 'Unaccepted cohorts') : text('Отложено', 'Deferred')}</span><strong>{snapshot.iteration ? snapshot.iteration.rejected.length : deferredCount}</strong></div>
         <div className={`graph-health ${health?.status ?? 'unknown'}`}><span>Health</span><strong>{health?.status?.toUpperCase() ?? 'UNKNOWN'}{typeof health?.lagOkPct === 'number' ? ` · ${health.lagOkPct.toFixed(1)}%` : ''}</strong></div>

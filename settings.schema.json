@@ -14,7 +14,7 @@
     },
     "registryMetadataCache": {
       "type": "string",
-      "description": "Directory of the durable planning packument cache. Planning-only: install, verification and the vulnerability audit inventory never read it. A TTL bounds freshness; omit or set registryMetadataTtl=0 to disable."
+      "description": "Directory of the durable planning packument cache. Eligible anonymous responses may also use the per-user shared planning cache (DEPLOOM_PLANNING_CACHE_DIR=0 disables that additional layer). Planning-only: install, verification and vulnerability audit never read it. A TTL bounds freshness; omit or set registryMetadataTtl=0 to disable."
     },
     "registryMetadataTtl": {
       "type": "number",

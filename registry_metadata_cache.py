@@ -107,7 +107,7 @@ def load_packument(
     if cache_dir is None or ttl_seconds <= 0:
         return None
     try:
-        raw = _entry_path(cache_dir, registry, name, context).read_text(encoding="utf-8")
+        raw = _entry_path(cache_dir, registry, name, context).read_text(encoding="utf-8-sig")
         entry = json.loads(raw)
     except (OSError, ValueError, TypeError):
         return None
@@ -119,6 +119,27 @@ def load_packument(
     return entry["data"]
 
 
+def load_revalidation_entry(cache_dir, registry, name, *, context=""):
+    """Stale bytes are only a conditional request subject, never a fresh hit."""
+    if cache_dir is None:
+        return None
+    try:
+        path = _entry_path(cache_dir, registry, name, context)
+        if path.stat().st_size > 16 * 1024 * 1024:
+            return None
+        entry = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(entry, dict) or not _entry_is_fresh(entry, registry, name, 30 * 86400, time.time(), context):
+            return None
+        validators = entry.get("validators")
+        if not isinstance(validators, dict):
+            return None
+        if any(not isinstance(v, str) or len(v) > 1024 or "\r" in v or "\n" in v for v in validators.values()):
+            return None
+        return entry if validators.get("ETag") or validators.get("Last-Modified") else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def store_packument(
     cache_dir: Optional[Path],
     registry: str,
@@ -128,6 +149,7 @@ def store_packument(
     *,
     now: Optional[float] = None,
     context: str = "",
+    validators: Optional[Dict[str, str]] = None,
 ) -> None:
     """Best-effort atomic persistence of one packument entry. Never raises.
 
@@ -158,6 +180,8 @@ def store_packument(
         "fetchedAtUnix": current,
         "toolVersion": tool_version or tool_build_id(),
         "data": data,
+        "validators": {key: str(value)[:1024] for key, value in (validators or {}).items()
+                       if key in {"ETag", "Last-Modified"} and "\r" not in str(value) and "\n" not in str(value)},
     }
     payload = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     with _CACHE_WRITE_THREAD_LOCK:
