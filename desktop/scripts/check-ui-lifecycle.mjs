@@ -5,7 +5,6 @@ const app = read('../src/App.tsx')
 const rail = read('../src/components/ProjectRail.tsx')
 const workspace = read('../src/components/WorkspaceDialog.tsx')
 const baseline = read('../src/components/BaselineIntentDialog.tsx')
-const monitoring = read('../src/components/MonitoringPanel.tsx')
 const flow = read('../src/components/FlowWorkspace.tsx')
 const model = read('../src/components/ModelPicker.tsx')
 const main = read('../electron/main.ts')
@@ -18,7 +17,6 @@ for (const [name, source, sentinels] of [
   ['ProjectRail', rail, ['project-row-remove', 'Trash2', 'window.confirm']],
   ['WorkspaceDialog', workspace, ["t('workspaceDialog.connect.title')", "t('workspaceDialog.create')", 'dialog-actions']],
   ['BaselineIntentDialog', baseline, ['useDeferredValue', 'autoFocus', 'deferredQuery']],
-  ['MonitoringPanel', monitoring, ['presentRunError', "setView('errors')"]],
   ['FlowWorkspace', flow, ['ModelPicker', 'persistAgentModel', 'onBeforeStart', 'migration-launch-settings']],
   ['ModelPicker', model, ['role="listbox"', 'onCommit', 'model-picker-menu']],
   ['main', main, ["flow:remove-project", 'Agent execution binding:', "spec.args.indexOf('--model')"]],

@@ -16,6 +16,7 @@
 //    buffered across chunks (and flushed on close), so a status/error split
 //    into two TCP writes is still parsed and journaled.
 import { spawn, type ChildProcess } from 'node:child_process'
+import { createProcessOutputDecoder } from './process-launcher.js'
 
 const MAX_CAPTURE_BYTES = 1024 * 1024
 function captureTail(previous: string, text: string): string {
@@ -81,6 +82,8 @@ export function spawnIterativeStreamed(
     let stdout = ''
     let stderr = ''
     let stdoutCarry = ''
+    const stdoutDecoder = createProcessOutputDecoder(platform.decodeChunk)
+    const stderrDecoder = createProcessOutputDecoder(platform.decodeChunk)
     let settled = false
     let timedOut = false
     let canceled = false
@@ -146,8 +149,8 @@ export function spawnIterativeStreamed(
       observe(() => options?.onLine?.(line))
     }
 
-    child.stdout.on('data', (chunk: Buffer) => {
-      const { carry, lines } = collectStreamedLines(stdoutCarry, platform.decodeChunk(chunk))
+    const consumeStdout = (text: string): void => {
+      const { carry, lines } = collectStreamedLines(stdoutCarry, text)
       stdoutCarry = carry
       // Bound the captured tail once per input chunk, not once per line.
       // Per-line copies repeatedly encoded a 1 MiB tail during chatty output.
@@ -182,13 +185,14 @@ export function spawnIterativeStreamed(
         stdoutCarry = ''
         maybeTrim()
       }
-    })
-    child.stderr.on('data', (chunk: Buffer) => {
-      const text = platform.decodeChunk(chunk)
+    }
+    child.stdout.on('data', (chunk: Buffer) => consumeStdout(stdoutDecoder.write(chunk)))
+    const consumeStderr = (text: string): void => {
       try { io.recordLine(runDir, text, 'stderr') } catch { /* best-effort */ }
       maybeTrim()
       stderr = captureTail(stderr, text)
-    })
+    }
+    child.stderr.on('data', (chunk: Buffer) => consumeStderr(stderrDecoder.write(chunk)))
     child.on('error', (error) => {
       if (settled) return
       settled = true
@@ -203,6 +207,8 @@ export function spawnIterativeStreamed(
       clearInterval(cancelCheck)
       // Flush any unterminated line so a trailing status/error is neither lost
       // from the journal nor missed as an event.
+      consumeStdout(stdoutDecoder.end())
+      consumeStderr(stderrDecoder.end())
       flushCarry()
       try { io.trimLog(runDir) } catch { /* best-effort */ }
       // A kill by the watchdog leaves no exit code from the child's point of

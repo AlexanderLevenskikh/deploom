@@ -15,7 +15,7 @@ class ArtifactReparseCanonicalizationTests(unittest.TestCase):
             (lib/"index.cjs").write_text("module.exports=42;")
             modules=root/"node_modules";modules.mkdir();link=modules/"fixture-lib"
             if os.name=="nt":
-                result=subprocess.run([os.environ.get("COMSPEC","cmd.exe"),"/d","/c","mklink","/J",str(link),str(lib)],capture_output=True,text=True)
+                result=subprocess.run([os.environ.get("COMSPEC","cmd.exe"),"/d","/c","mklink","/J",str(link),str(lib)],capture_output=True)
                 self.assertEqual(0,result.returncode,result.stdout+result.stderr)
                 self.addCleanup(lambda: os.rmdir(link) if link.exists() else None)
             else:link.symlink_to(lib,target_is_directory=True)

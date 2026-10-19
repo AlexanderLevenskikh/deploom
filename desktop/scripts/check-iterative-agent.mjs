@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import assert from "node:assert/strict";
 import ts from "typescript";
-import { commandEnvironment, resolveSpawnInvocation, decodeProcessOutputChunk, processTreeDetached } from "../dist-electron/process-launcher.js";
+import { commandEnvironment, resolveSpawnInvocation, createProcessOutputDecoder, processTreeDetached } from "../dist-electron/process-launcher.js";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -665,8 +665,8 @@ const captureStart = mainSource.indexOf("function spawnCapture(");
 const captureEnd = mainSource.indexOf("// Adoption helpers for the TESTABLE streaming runner", captureStart);
 assert.ok(captureStart >= 0 && captureEnd > captureStart);
 const captureJs = ts.transpileModule(mainSource.slice(captureStart, captureEnd), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-const capture = new Function("spawn", "commandEnvironment", "resolveSpawnInvocation", "processTreeDetached", "decodeProcessOutputChunk", "killProcessTree", captureJs + "; return spawnCapture;")(
-  spawn, commandEnvironment, resolveSpawnInvocation, processTreeDetached, decodeProcessOutputChunk, child => child.kill(),
+const capture = new Function("spawn", "commandEnvironment", "resolveSpawnInvocation", "processTreeDetached", "createProcessOutputDecoder", "killProcessTree", captureJs + "; return spawnCapture;")(
+  spawn, commandEnvironment, resolveSpawnInvocation, processTreeDetached, createProcessOutputDecoder, child => child.kill(),
 );
 const eof = await capture(process.execPath, ["-e", "process.stdin.resume();process.stdin.on('end',()=>{console.log(process.argv[1]);console.error('EOF received')})", "test-provider/explicit-model"], root, 2000);
 assert.equal(eof.timedOut, false);

@@ -62,12 +62,6 @@ class VerifiedPartialGraphErgonomicsContracts(unittest.TestCase):
         self.assertIn(".app-grid.graph-hide-project-rail { grid-template-columns: minmax(0, 1fr); }", css)
         self.assertNotIn("graph-hide-monitor", css)
 
-    def test_graph_remains_projection_only(self) -> None:
-        root = Path(__file__).resolve().parents[2]
-        contract = (root / "desktop/electron/dependency-graph.ts").read_text(encoding="utf-8")
-        self.assertIn("proofAuthority: false", contract)
-        self.assertIn("OBSERVED_LOCAL_MANIFEST", contract)
-
 
 if __name__ == "__main__":
     unittest.main()

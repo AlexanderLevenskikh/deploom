@@ -57,7 +57,7 @@ const updater = new EventEmitter();
 const statuses = [];
 const context = {
   app: { isPackaged: true }, autoUpdater: updater, nextUpdaterStatus,
-  currentUpdateStatus: { state: 'idle' }, downloadedUpdateVersion: undefined,
+  currentUpdateStatus: { state: 'idle' }, downloadedUpdateVersion: undefined, updateCheckInFlight: undefined,
   send: (channel, status) => { assert.equal(channel, 'flow:update-status'); statuses.push(status); },
   updateErrorStatus: (error) => ({ state: 'error', message: error.message }),
   stopUpdateChecks: undefined, scheduleUpdateChecks: () => () => {},
@@ -86,6 +86,15 @@ assert.equal(context.downloadedUpdateVersion, '1.0.0-preview.4', 'feed result ca
 updater.emit('error', new Error('temporary feed error'));
 assert.equal(context.currentUpdateStatus.state, 'ready');
 assert.equal(context.currentUpdateStatus.message, 'temporary feed error');
+updater.emit('checking-for-update');
+assert.equal(context.currentUpdateStatus.message, 'temporary feed error', 'starting a check does not prove recovery');
+updater.emit('update-not-available', { version: '1.0.0-preview.4' });
+assert.equal(context.currentUpdateStatus.state, 'ready');
+assert.equal(context.currentUpdateStatus.message, undefined, 'successful feed check clears stale error');
+context.updateCheckInFlight = Promise.resolve();
+updater.emit('error', new Error('transient request failure'));
+assert.equal(context.currentUpdateStatus.message, undefined, 'in-flight request owns its retry result');
+context.updateCheckInFlight = undefined;
 updater.emit('checking-for-update');
 updater.emit('update-available', { version: '1.0.0-preview.5' });
 assert.equal(context.currentUpdateStatus.state, 'downloading', 'a newer version starts a fresh download');

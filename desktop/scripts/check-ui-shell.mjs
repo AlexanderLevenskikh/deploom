@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 
 const flow = readFileSync(new URL("../src/components/FlowWorkspace.tsx", import.meta.url), "utf8");
-const monitoring = readFileSync(new URL("../src/components/MonitoringPanel.tsx", import.meta.url), "utf8");
 const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
 const hook = readFileSync(new URL("../src/hooks/useDependencyFlow.ts", import.meta.url), "utf8");
 const appCss = readFileSync(new URL("../src/App.css", import.meta.url), "utf8");
@@ -40,6 +39,5 @@ if (app.includes('className="error-banner"')) throw new Error("Fatal errors must
 if (app.includes('<MonitoringPanel')) throw new Error('MonitoringPanel must not be mounted in the default product surface');
 if (!app.includes('className="human-error-toast"')) throw new Error('Human-friendly non-blocking error surface missing');
 if (!app.includes('flow.setError(undefined)')) throw new Error('Human-friendly error surface must be dismissible');
-if (!monitoring.includes("type View = 'overview' | 'run' | 'hardware' | 'logs' | 'errors' | 'environment'")) throw new Error('Monitoring Errors view missing');
 
 console.log("UI shell / strict Baseline Continue / non-blocking error surface contracts OK");

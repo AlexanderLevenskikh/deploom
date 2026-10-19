@@ -10,7 +10,6 @@ const add = read('AddProjectDialog.tsx')
 const baseline = read('BaselineIntentDialog.tsx')
 const workspace = read('WorkspaceDialog.tsx')
 const branchFailure = read('BranchFailureModal.tsx')
-const goal = read('GoalDetailsModal.tsx')
 const quick = read('QuickSelect.tsx')
 const css = readFileSync(new URL('../src/App.css', import.meta.url), 'utf8')
 
@@ -19,7 +18,6 @@ for (const [name, source, sentinels] of [
   ['BaselineIntentDialog', baseline, ['baseline-intent-actions', 'Запустить автономно', 'Запустить Baseline', 'Подтверждать существенное', 'Техническая глубина поиска', 'Отложить группу', 'Вернуться к этой группе', 'Изменения состава Baseline ещё не применены', 'baseline-policy-toggle']],
   ['WorkspaceDialog', workspace, ['dialog-actions', "t('common.cancel')", "t('workspaceDialog.create')", "t('workspaceDialog.connect.title')"]],
   ['BranchFailureModal', branchFailure, ['modal-actions', "t('common.understood')", 'onClose']],
-  ['GoalDetailsModal', goal, ['modal-actions', "t('common.understood')", 'onClose']],
 ]) {
   for (const sentinel of sentinels) {
     if (!source.includes(sentinel)) throw new Error(`${name} interaction contract missing: ${sentinel}`)

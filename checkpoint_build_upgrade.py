@@ -11,9 +11,9 @@ import os
 import uuid
 from pathlib import Path
 
-from source_snapshot import SourceCaptureError, capture_durable_source_snapshot, open_source_snapshot
+from source_snapshot import SourceCaptureError, bind_source_snapshot, capture_durable_source_snapshot, open_source_snapshot
 from substrate_identity import tool_build_id
-from baseline_constraint_verifier import detect_package_manager, resolve_executable
+from baseline_constraint_verifier import assignment_fingerprint, detect_package_manager, resolve_executable
 from verification_proof import build_resolver_context_key, project_verification_environment
 
 
@@ -22,6 +22,31 @@ class CheckpointBuildUpgradeError(RuntimeError):
         super().__init__(message)
         self.command = command
         self.diagnostic_path = diagnostic_path
+
+
+def content_mismatch(directory, key, old, current):
+    """Describe saved index differences without a second filesystem inventory."""
+    def saved(snapshot):
+        raw = json.loads((Path(snapshot.container) / 'manifest.json').read_text(encoding='utf-8-sig'))
+        return raw, {entry['path']: entry for entry in raw['entries']}
+    previous, left = saved(old)
+    latest, right = saved(current)
+    added, removed = sorted(right.keys() - left.keys()), sorted(left.keys() - right.keys())
+    changed = sorted(name for name in left.keys() & right.keys() if left[name] != right[name])
+    facts = lambda raw: {name: raw.get(name) for name in ('schemaVersion', 'toolBuildId', 'inputPolicy', 'manifestKey', 'sourceSnapshotKey')}
+    payload = {'schemaVersion': 1, 'type': 'checkpoint-build-upgrade-content-mismatch',
+        'previous': facts(previous), 'current': facts(latest),
+        'differences': {name: {'count': len(paths), 'samples': paths[:30]} for name, paths in
+                        (('added', added), ('removed', removed), ('changed', changed))},
+        'recovery': 'Preserve the historical checkpoint and proofs. Materialize a separate subject with the recorded capture policy, then run fresh verification of that exact subject; never infer compatibility from excluded path names.'}
+    diagnostics = Path(directory) / 'diagnostics'
+    diagnostics.mkdir(parents=True, exist_ok=True)
+    path = diagnostics / (key + '-content-mismatch-' + uuid.uuid4().hex + '.json')
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    os.replace(temporary, path)
+    return CheckpointBuildUpgradeError(
+        f'CHECKPOINT_BUILD_UPGRADE_CONTENT_MISMATCH: added={len(added)}, removed={len(removed)}, changed={len(changed)}. Historical checkpoint preserved. Diagnostic: {path}', diagnostic_path=str(path))
 
 
 def reopen_checkpoint_source(run_dir, checkpoint, config, *, verify, progress, runtime_env=None):
@@ -64,23 +89,27 @@ def reopen_checkpoint_source(run_dir, checkpoint, config, *, verify, progress, r
     # The context binds actual Node/manager versions, user config and environment.
     if record_path.exists():
         record = json.loads(record_path.read_text(encoding="utf-8-sig"))
-        if record.get("identity") != identity or record.get("verification", {}).get("status") != "passed":
+        receipt = record.get('verification') or {}
+        if (record.get("identity") != identity or receipt.get("status") != "passed"
+                or receipt.get('verifiedSourceSnapshotKey') != record.get('key')
+                or receipt.get('verifiedAssignmentFingerprint') != assignment_fingerprint(checkpoint['fullAssignment'])):
             raise CheckpointBuildUpgradeError("CHECKPOINT_BUILD_UPGRADE_RECORD_INVALID")
         # Explicit maintenance may evict this reproducible copy. Missing bytes
         # require materialization and fresh verification, never reuse of proof.
         if Path(record["container"]).is_dir():
             snapshot = open_source_snapshot(Path(record["container"]), expected_key=record["key"], timeout_seconds=0, progress=progress)
             if snapshot.manifest_key != old.manifest_key:
-                raise CheckpointBuildUpgradeError("CHECKPOINT_BUILD_UPGRADE_CONTENT_MISMATCH")
+                raise content_mismatch(directory, key, old, snapshot)
             return snapshot
     progress("Preparing checkpoint copy for fresh verification with the updated DepLoom")
     destination = directory / (key + "-source")
     snapshot = (open_source_snapshot(destination, timeout_seconds=0, progress=progress) if destination.exists()
                 else capture_durable_source_snapshot(old.project_path, destination, policy=old.input_policy, timeout_seconds=0, progress=progress))
     if snapshot.manifest_key != old.manifest_key:
-        raise CheckpointBuildUpgradeError("CHECKPOINT_BUILD_UPGRADE_CONTENT_MISMATCH")
+        raise content_mismatch(directory, key, old, snapshot)
     progress("Re-running the selected checks on the preserved checkpoint; old proof is not reused")
-    result = verify(snapshot.project_path, checkpoint["fullAssignment"])
+    with bind_source_snapshot(snapshot):
+        result = verify(snapshot.project_path, checkpoint["fullAssignment"])
     if not result.ok:
         # Failure evidence has no authority. Preserve captured output after
         # isolated workspace cleanup; never publish a pass record for failure.
@@ -106,6 +135,9 @@ def reopen_checkpoint_source(run_dir, checkpoint, config, *, verify, progress, r
             "CHECKPOINT_BUILD_UPGRADE_UNCONFIRMED: " + str(result.kind) + ": " + str(result.summary) + detail,
             command=result.command, diagnostic_path=str(diagnostic_path),
         )
+    if (getattr(result, 'verified_source_snapshot_key', '') != snapshot.key
+            or getattr(result, 'verified_assignment_fingerprint', '') != assignment_fingerprint(checkpoint['fullAssignment'])):
+        raise CheckpointBuildUpgradeError('CHECKPOINT_BUILD_UPGRADE_SUBJECT_MISMATCH: preserve the historical checkpoint and require verification of the exact new subject')
     # The verifier may never mutate the sealed input it claims to verify.
     open_source_snapshot(snapshot.container, expected_key=snapshot.key, timeout_seconds=0, progress=progress)
     # No old checkpoint is rewritten; publishing this record is the only commit.
@@ -113,6 +145,8 @@ def reopen_checkpoint_source(run_dir, checkpoint, config, *, verify, progress, r
         "schemaVersion": 1, "identity": identity, "key": snapshot.key,
         "container": str(snapshot.container), "verification": {
             "status": "passed", "kind": result.kind,
+            "verifiedSourceSnapshotKey": result.verified_source_snapshot_key,
+            "verifiedAssignmentFingerprint": result.verified_assignment_fingerprint,
             "resolvedStateKey": result.resolved_state_key or "",
             "preparationProofKey": result.preparation_proof_key or "",
         },

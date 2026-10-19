@@ -961,7 +961,7 @@ export function IterativeTaskPanel(props: Props) {
             ) : null}
           </div>
           {runner?.progressSummary ? <div className="attempt-strip-row" data-testid="verified-update-progress">
-            <strong>{text('Принято и проверено', 'Accepted and verified')}: {runner.progressSummary.accepted}/{runner.progressSummary.denominator} · {runner.progressSummary.denominator > 0 ? Math.floor(100 * runner.progressSummary.accepted / runner.progressSummary.denominator) : 0}% · {runner.progressSummary.checkpointId}</strong>
+            <strong>{text('Выполнено целей', 'Goals satisfied')}: {runner.progressSummary.denominator - runner.progressSummary.remaining}/{runner.progressSummary.denominator} · {runner.progressSummary.denominator > 0 ? Math.floor(100 * (runner.progressSummary.denominator - runner.progressSummary.remaining) / runner.progressSummary.denominator) : 0}% · {runner.progressSummary.checkpointId}</strong>
             <span className="attempt-meta">{text('Отложено', 'Deferred')}: {runner.progressSummary.deferred}. {text('Процент относится к целям обновления; время до завершения пока неизвестно.', 'Percentage covers update goals; time to completion is unknown.')}</span>
           </div> : null}
           {hasFailure ? failureDetails : null}
@@ -1065,7 +1065,7 @@ export function IterativeTaskPanel(props: Props) {
           ) : runner?.progressSummary ? <>
             <div className="roadmap-summary-grid">
               <div><strong>{runner.progressSummary.remaining}</strong><span>{text('до предложенных версий', 'below proposed versions')}</span></div>
-              <div><strong>{runner.progressSummary.accepted}</strong><span>{text('принято обновлений', 'accepted updates')}</span></div>
+              <div><strong>{runner.progressSummary.accepted}</strong><span>{text('обновлено пакетов', 'packages updated')}</span></div>
               <div><strong>{runner.progressSummary.deferred}</strong><span>{text('отложено', 'deferred')}</span></div>
             </div>
             <p className="attempt-meta">{runner.progressSummary.checkpointId} · {text('всего целей', 'total goals')}: {runner.progressSummary.denominator} · {text('цели с версиями', 'versioned targets')}: {runner.progressSummary.targetCount} · {text('без подобранной версии', 'without a selected version')}: {runner.progressSummary.unresolvedGoals}</p>

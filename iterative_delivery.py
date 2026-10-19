@@ -587,7 +587,9 @@ def delivery_verify(run_dir, inputs, *, cleanup=False):
     if not actual.issubset(set(state["files"])):
         raise RuntimeError("DELIVERY_UNEXPECTED_TRACKED_FILES")
     core._assert_runtime_unchanged(config)
+    from delivery_source_identity import assert_committed_files
     delivered_head = git(root, "rev-parse", "HEAD")
+    assert_committed_files(root, expected, state.get("gitlinks", {}), commit=delivered_head)
     # The source guard intentionally rejects absolute .git indirection in a
     # linked worktree. Verify a private clone of the exact delivered commit,
     # without relaxing that guard or mutating the result worktree.

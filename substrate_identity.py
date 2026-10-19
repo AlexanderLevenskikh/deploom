@@ -56,6 +56,7 @@ _COMPONENT_FILES: Mapping[str, tuple[str, ...]] = {
         "verification_stage_checkpoint.py",
         "iterative_stage_checkpoint.py",
         "iterative_state_transaction.py",
+        "run_writer_lock.py",
         "migration_validation.py",
         "baseline_constraint_verifier.py",
         "verification_process_supervisor.py",

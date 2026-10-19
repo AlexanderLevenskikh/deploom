@@ -385,41 +385,13 @@ class _RunLock:
         self.stale_seconds = stale_seconds
 
     def acquire(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.time() + 15
-        while True:
-            try:
-                handle = os.open(
-                    str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY
-                )
-            except FileExistsError:
-                stale = self._stale()
-                if stale:
-                    try:
-                        os.unlink(str(self.path))
-                    except OSError:
-                        pass
-                    continue
-                if time.time() > deadline:
-                    raise TrialLockedError(
-                        f"RUN_LOCK_BUSY: another writer {self.owner} holds {self.path}"
-                    )
-                time.sleep(0.2)
-                continue
-            except OSError as exc:
-                raise IterativeMigrationError(
-                    "RUN_LOCK_FILE_IO", f"cannot create lock {self.path}: {exc}"
-                ) from exc
-            try:
-                os.write(
-                    handle,
-                    json.dumps(
-                        {"owner": self.owner, "pid": os.getpid(), "startedAt": _now_iso()}
-                    ).encode("utf-8"),
-                )
-            finally:
-                os.close(handle)
-            return
+        from run_writer_lock import acquire
+        try:
+            self._lease = acquire(self.path, self.owner, self._stale)
+        except TimeoutError as exc:
+            raise TrialLockedError(str(exc)) from exc
+        except OSError as exc:
+            raise IterativeMigrationError('RUN_LOCK_FILE_IO', str(exc)) from exc
 
     def _stale(self) -> bool:
         try:
@@ -442,10 +414,10 @@ class _RunLock:
                 return False
 
     def release(self) -> None:
-        try:
-            os.unlink(str(self.path))
-        except OSError:
-            pass
+        from run_writer_lock import release
+        lease = getattr(self, '_lease', None)
+        self._lease = None
+        release(self.path, lease)
 
 
 # ---------------------------------------------------------------------------
@@ -1363,6 +1335,8 @@ def _begin_locked(
     args: argparse.Namespace,
     adopt: Optional[Mapping[str, Any]] = None,
 ) -> int:
+    if (run_dir / RUN_FILENAME).exists():
+        raise InvalidInputError(f'RUN_ALREADY_EXISTS: {run_dir}')
     run_dir.mkdir(parents=True, exist_ok=True)
     _write_json_atomic(run_dir / CONFIG_FILENAME, dict(config))
     run_id = (args.run_id or "").strip() or _new_id("iter")
@@ -2058,6 +2032,7 @@ def cmd_archive_repair_run(args: argparse.Namespace) -> int:
     lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}")
     lock.acquire()
     try:
+        run = load_run(run_dir)
         result = _archive_repair_run_locked(run_dir, run)
         _emit_archive_result(result)
         return 0
@@ -2079,11 +2054,11 @@ def cmd_bootstrap_materialize(args: argparse.Namespace) -> int:
     checkout; verify-bootstrap then re-runs the control on the repaired bytes
     and captures a NEW C0 source snapshot."""
     run_dir = Path(args.run_dir).resolve()
-    run = load_run(run_dir)
-    config = load_config(run_dir)
     lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=300)
     lock.acquire()
     try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
         return _bootstrap_materialize_locked(run_dir, run, config, args)
     finally:
         lock.release()
@@ -2165,7 +2140,7 @@ def _force_remove_tree(path: Path) -> None:
 
 
 def _replace_c0_source_snapshot(
-    run_dir: Path, project_path: Path, timeout_seconds: int = 0
+    run_dir: Path, project_path: Path, timeout_seconds: int = 0, *, expected_key: str = ''
 ) -> SourceSnapshot:
     """P1 (v0.2.163 #1): atomically replace the C0 source snapshot container
     with a fresh capture of `project_path` (the repaired bootstrap trial).
@@ -2184,6 +2159,8 @@ def _replace_c0_source_snapshot(
         staged = capture_durable_source_snapshot(
             project_path, stage, timeout_seconds=timeout_seconds
         )
+        if expected_key and staged.key != expected_key:
+            raise InvalidInputError('VERIFIED_SOURCE_IDENTITY_MISMATCH: preserve C0 and reverify the changed bootstrap trial')
         if c0_container.is_dir():
             os.rename(str(c0_container), str(old))
         os.replace(str(stage), str(c0_container))
@@ -2211,11 +2188,11 @@ def cmd_verify_bootstrap(args: argparse.Namespace) -> int:
     source snapshot: the source/config identity of checkpoint C0 is replaced by
     a fresh sealed snapshot so every later materialization uses repaired bytes."""
     run_dir = Path(args.run_dir).resolve()
-    run = load_run(run_dir)
-    config = load_config(run_dir)
     lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}")
     lock.acquire()
     try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
         if run.get("phase") != "BOOTSTRAP_REPAIR":
             raise InvalidInputError(f"PHASE_NOT_BOOTSTRAP: {run.get('phase')}")
         if not run_budget_ok(config, run):
@@ -2252,8 +2229,10 @@ def cmd_verify_bootstrap(args: argparse.Namespace) -> int:
             # capture must never leave checkpoint C0 pointing at a removed
             # container (the verify-bootstrap success path was previously
             # unreachable: persist_source_snapshot refused the existing target).
+            if (not result.verified_source_snapshot_key or result.verified_assignment_fingerprint != assignment_fingerprint(checkpoint['fullAssignment'])):
+                raise InvalidInputError('VERIFIED_SOURCE_IDENTITY_MISMATCH: bootstrap verification receipt missing')
             new_snapshot = _replace_c0_source_snapshot(
-                run_dir, project_path, timeout_seconds=0
+                run_dir, project_path, timeout_seconds=0, expected_key=result.verified_source_snapshot_key
             )
             project_relative = resolve_project_relative(project_path, new_snapshot)
             manifest_hash, lock_hash, _lock = manifest_and_lock_hashes(project_path)
@@ -2367,11 +2346,11 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 def cmd_plan_next(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
-    run = load_run(run_dir)
-    config = load_config(run_dir)
     lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=60)
     lock.acquire()
     try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
         return _plan_next_locked(run_dir, run, config, args)
     finally:
         lock.release()
@@ -3939,11 +3918,11 @@ def _record_engine_deferrals(
 
 def cmd_materialize(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
-    run = load_run(run_dir)
-    config = load_config(run_dir)
     lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=300)
     lock.acquire()
     try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
         return _materialize_locked(run_dir, run, config, args)
     finally:
         lock.release()
@@ -4528,11 +4507,11 @@ def _build_attempt_result(
 
 def cmd_precheck(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
-    run = load_run(run_dir)
-    config = load_config(run_dir)
     lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=300)
     lock.acquire()
     try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
         return _precheck_locked(run_dir, run, config, args)
     finally:
         lock.release()
@@ -4584,18 +4563,29 @@ def _precheck_locked(
         }
         command_started = time.monotonic()
         with MigrationProgress(_emit_status, operation="precheck", message=f"Running project command: {command}", run_id=run["runId"], candidate_id=candidate["candidateId"]) as progress:
-            result = _run(
-                _command_argv(command, base_env),
-                project_path,
-                timeout_seconds=_clamp_int(args.timeout_seconds, 1200, 120, 4 * 3600),
-                env=env,
-                base_env=base_env,
-                progress=progress,
-                progress_label=f"iterative migration precheck {command}",
-            )
+            argv = _command_argv(command, base_env)
+            try:
+                result = _run(
+                    argv, project_path,
+                    timeout_seconds=_clamp_int(args.timeout_seconds, 1200, 120, 4 * 3600),
+                    env=env, base_env=base_env, progress=progress,
+                    progress_label=f"iterative migration precheck {command}",
+                )
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                output = getattr(exc, 'output', '') or ''
+                if isinstance(output, bytes):
+                    output = output.decode('utf-8', errors='replace')
+                # The supervisor did not return a project exit status. Keep
+                # this UNKNOWN instead of inventing a failed project check.
+                result = subprocess.CompletedProcess(argv, -1, stdout=str(output),
+                    stderr=f'{type(exc).__name__}: {exc}')
+                result.deploom_infra_detected = True
+                result.deploom_infrastructure_reason = 'timeout' if isinstance(exc, subprocess.TimeoutExpired) else 'spawn'
         sequence.complete(command_index, command, before_key, result)
         failed = result.returncode != 0
-        measurement_outcome = "UNKNOWN" if result.returncode < 0 or result.returncode in {124, 137} else "FAIL" if failed else "PASS"
+        inconclusive = (result.returncode < 0 or result.returncode in {124, 137}
+                        or bool(getattr(result, 'deploom_infra_detected', False)))
+        measurement_outcome = "UNKNOWN" if inconclusive else "FAIL" if failed else "PASS"
         measurements.append(stage_measurement(command_stage(command), time.monotonic()-command_started, measurement_outcome, command))
         entry = {
             "command": command,
@@ -4616,6 +4606,14 @@ def _precheck_locked(
     record_attempt(run_dir, run, config, candidate, stage="precheck", outcome=precheck_outcome,
                    seconds=time.monotonic()-scheduler_started, stages=measurements,
                    size_feedback="FAIL" if precheck_outcome=="FAIL" else "NONE")
+    if failing and precheck_outcome == "UNKNOWN":
+        candidate["stage"] = "PRECHECKED"
+        candidate["diagnostics"] = failing
+        save_candidate(run_dir, candidate)
+        save_run(run_dir, {**run, "phase": "VERIFYING", "updatedAt": _now_iso()})
+        _emit_status({"event": "precheck.inconclusive", "runId": run["runId"],
+                      "candidateId": candidate["candidateId"], "reason": "fresh authoritative verification required"})
+        return 0
     if failing:
         candidate["stage"] = "REPAIRING"
         candidate["diagnostics"] = failing
@@ -4711,11 +4709,11 @@ def _write_candidate_repair_requests(
 
 def cmd_verify_exact(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
-    run = load_run(run_dir)
-    config = load_config(run_dir)
     lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=600)
     lock.acquire()
     try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
         return _verify_exact_locked(run_dir, run, config, args)
     finally:
         lock.release()
@@ -5054,6 +5052,10 @@ def _accept_checkpoint(
         snapshot, _reused = capture_recovery_source(
             project_path, run_dir / "v" / "sc",
             preferred_destination=run_dir / SOURCE_DIR / checkpoint_id, timeout_seconds=0, progress=progress)
+    if (not result.ok or not result.verified_source_snapshot_key
+            or result.verified_source_snapshot_key != snapshot.key
+            or result.verified_assignment_fingerprint != assignment_fingerprint(candidate["fullAssignment"])):
+        raise InvalidInputError("VERIFIED_SOURCE_IDENTITY_MISMATCH: preserve the incumbent and reverify the changed trial")
     project_relative = resolve_project_relative(project_path, snapshot)
 
     observed = dict(result.observed_resolved_versions or {})
@@ -5216,12 +5218,12 @@ def _accepted_delta(
 
 def cmd_apply_feedback(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
-    run = load_run(run_dir)
-    config = load_config(run_dir)
-    feedback = _read_feedback(args.feedback_file)
     lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=120)
     lock.acquire()
     try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
+        feedback = _read_feedback(args.feedback_file)
         return _apply_feedback_locked(run_dir, run, config, feedback)
     finally:
         lock.release()
@@ -5568,11 +5570,11 @@ def _accepted_upgrade_count(checkpoints: Sequence[Mapping[str, Any]]) -> int:
 
 def cmd_finish(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
-    run = load_run(run_dir)
-    config = load_config(run_dir)
     lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=600)
     lock.acquire()
     try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
         if getattr(args, "lang", None):
             delivery = json.loads((run_dir / "delivery-state.json").read_text(encoding="utf-8-sig")) if (run_dir / "delivery-state.json").exists() else None
             if delivery and (delivery.get("documentLanguage") or "en") != args.lang:
@@ -5756,11 +5758,11 @@ def _build_developer_upgrade_guide(
 def cmd_audit(args: argparse.Namespace) -> int:
     """Independent audit of the ACTIVE checkpoint's exact dependency state."""
     run_dir = Path(args.run_dir).resolve()
-    run = load_run(run_dir)
-    config = load_config(run_dir)
     lock = _RunLock(run_dir, args.owner or f"pid-{os.getpid()}", stale_seconds=600)
     lock.acquire()
     try:
+        run = load_run(run_dir)
+        config = load_config(run_dir)
         return _audit_locked(run_dir, run, config, args)
     finally:
         lock.release()

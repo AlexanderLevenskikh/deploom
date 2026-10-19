@@ -53,7 +53,7 @@ def dependency_input_identity(project: Path) -> Tuple[str, List[str]]:
     project = project.resolve()
     digest = hashlib.sha256()
     files: List[str] = []
-    names = list(DEPENDENCY_INPUT_FILES)
+    names = [*DEPENDENCY_INPUT_FILES, '.npmrc', '.yarnrc', '.yarnrc.yml', '.pnpmfile.cjs']
     # Bind root installation inputs when the selected workspace has no own lock.
     # Node uses the same ordering and names, so a changed root invalidates audit.
     if not any((project / name).is_file() for name in DEPENDENCY_INPUT_FILES[1:]):
@@ -62,7 +62,7 @@ def dependency_input_identity(project: Path) -> Tuple[str, List[str]]:
         if boundary is not None:
             for folder in ancestors:
                 names.extend(os.path.relpath(folder / name, project).replace("\\", "/")
-                             for name in (*DEPENDENCY_INPUT_FILES, ".yarnrc.yml"))
+                             for name in (*DEPENDENCY_INPUT_FILES, '.npmrc', '.yarnrc', '.yarnrc.yml', '.pnpmfile.cjs'))
                 if folder == boundary:
                     break
     for name in names:

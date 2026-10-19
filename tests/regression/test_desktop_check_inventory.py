@@ -13,14 +13,17 @@ class DesktopCheckInventoryRegression(unittest.TestCase):
         scripts = sorted(path.stem.removeprefix("check-") for path in (ROOT / "desktop" / "scripts").glob("check-*.mjs"))
         package = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))
         npm_scripts = package.get("scripts", {})
-        ci_sources = [
-            (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"),
-        ]
-        ci = "\n".join(ci_sources)
         missing_npm = [name for name in scripts if f"check:{name}" not in npm_scripts]
-        missing_ci = [name for name in scripts if f"npm run check:{name}" not in ci]
         self.assertEqual([], missing_npm, f"Desktop check scripts missing npm command: {missing_npm}")
-        self.assertEqual([], missing_ci, f"Desktop checks missing CI invocation: {missing_ci}")
+        import yaml
+        ci = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8'))
+        step = next(step for step in ci['jobs']['desktop']['steps'] if step.get('name') == 'Desktop contract checks')
+        self.assertEqual('desktop', step['working-directory'])
+        self.assertEqual('node scripts/run-all-contract-checks.mjs', step['run'].strip())
+        # The runner's process-level fixtures exercise discovery, custom hooks,
+        # compiler failure and a failing check. Here verify actual file wiring.
+        for name in scripts:
+            self.assertEqual(f'node scripts/check-{name}.mjs', npm_scripts[f'check:{name}'])
 
     def test_release_workflow_runs_every_desktop_check(self) -> None:
         """Release validation must not lag behind main CI.

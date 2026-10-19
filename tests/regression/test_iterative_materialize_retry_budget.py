@@ -20,6 +20,7 @@ audit method for the control loop.
 from __future__ import annotations
 
 import json
+import dataclasses
 import tempfile
 import unittest
 from contextlib import ExitStack, contextmanager
@@ -355,6 +356,8 @@ class ExactTargetDeferralTests(MaterializeRetryBudgetBase):
             True, "passed", "project verified",
             observed_resolved_versions={"pkg-a": "1.0.0", "pkg-b": "1.1.0"},
             observed_resolved_hash="resolved-new", resolved_state_key="state-new",
+            verified_source_snapshot_key="snap-c1",
+            verified_assignment_fingerprint=assignment_fingerprint(candidate2["fullAssignment"]),
         )
         events4: list[dict] = []
         with mock.patch("iterative_migration.run_budget_ok", return_value=True), \
@@ -362,7 +365,7 @@ class ExactTargetDeferralTests(MaterializeRetryBudgetBase):
              mock.patch("iterative_migration.verify_config_from", return_value=BaselineVerifyConfig(commands=("node check.js",))), \
              mock.patch("iterative_migration.verify_assignment", return_value=ok_result), \
              mock.patch("iterative_migration._runtime_env", return_value={}), \
-             mock.patch("iterative_migration.capture_durable_source_snapshot", return_value=SimpleNamespace(key="snap-c1", container=run_dir / "sources", git_head=None)), \
+             mock.patch("verification_stage_checkpoint.capture_recovery_source", return_value=(SimpleNamespace(key="snap-c1", container=run_dir / "sources", git_head=None), False)), \
              mock.patch("iterative_migration.resolve_project_relative", return_value=Path(".")), \
              mock.patch("iterative_migration.manifest_and_lock_hashes", return_value=("manifest-c1", "lock-c1", None)), \
              mock.patch("iterative_migration._emit_status", side_effect=events4.append):
@@ -382,9 +385,11 @@ class PerRevisionRepairBudgetTests(MaterializeRetryBudgetBase):
             mock.patch("iterative_migration.run_budget_ok", return_value=True),
             mock.patch("iterative_migration._assert_runtime_unchanged"),
             mock.patch("iterative_migration.verify_config_from", return_value=BaselineVerifyConfig(commands=("node check.js",))),
-            mock.patch("iterative_migration.verify_assignment", return_value=result),
+            mock.patch("iterative_migration.verify_assignment", side_effect=lambda project, assignment, **kwargs:
+                dataclasses.replace(result, verified_source_snapshot_key="snap",
+                    verified_assignment_fingerprint=assignment_fingerprint(assignment)) if result.ok else result),
             mock.patch("iterative_migration._runtime_env", return_value={}),
-            mock.patch("iterative_migration.capture_durable_source_snapshot", return_value=SimpleNamespace(key="snap", container=Path("sources"), git_head=None)),
+            mock.patch("verification_stage_checkpoint.capture_recovery_source", return_value=(SimpleNamespace(key="snap", container=Path("sources"), git_head=None), False)),
             mock.patch("iterative_migration.resolve_project_relative", return_value=Path(".")),
             mock.patch("iterative_migration.manifest_and_lock_hashes", return_value=("m", "l", None)),
             mock.patch("iterative_migration._emit_status"),

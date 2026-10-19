@@ -9,7 +9,6 @@ const policy = fs.readFileSync(path.join(root, 'src', 'autopilot-policy.ts'), 'u
 const workspace = fs.readFileSync(path.join(root, 'src', 'components', 'FlowWorkspace.tsx'), 'utf8')
 const main = fs.readFileSync(path.join(root, 'electron', 'main.ts'), 'utf8')
 const promptHarness = fs.readFileSync(path.join(root, 'electron', 'prompt-harness.ts'), 'utf8')
-const githubCi = fs.readFileSync(path.resolve(root, '..', '.github', 'workflows', 'ci.yml'), 'utf8')
 
 const mustContain = (text, needle, label) => { if (!text.includes(needle)) throw new Error(`${label}: missing ${JSON.stringify(needle)}`) }
 const mustNotContain = (text, needle, label) => { if (text.includes(needle)) throw new Error(`${label}: forbidden ${JSON.stringify(needle)}`) }
@@ -50,8 +49,7 @@ mustContain(iterativePanel, 'Автопилот: продолжать автом
 mustContain(main, "iterativeAutopilot.register('begin'", 'autopilot is owned by Electron')
 mustNotContain(workspace, 'Прежний FLOW / история (отдельный запуск)', 'obsolete flow surface removed')
 mustContain(promptHarness, 'PROMPT_HARNESS_TIMEOUT', 'prompt export timeout remains')
-mustContain(githubCi, 'npm run check:autopilot-scenarios', 'scenario matrix remains mandatory in CI')
-mustContain(githubCi, 'npm run check:acceptance-policy', 'acceptance policy remains mandatory in CI')
-mustContain(githubCi, 'npm run check:progressive-contract', 'progressive source contract remains mandatory in CI')
+// CI inclusion is checked by test_desktop_check_inventory against the parsed
+// workflow and package inventory; real runner fixtures check execution/failure.
 
 console.log('Progressive Autopilot contract OK')

@@ -164,6 +164,25 @@ export function normalizePathForComparison(value: string, platform: NodeJS.Platf
   return platform === 'win32' ? normalized.toLowerCase() : normalized
 }
 
+// A UTF-8 codepoint can span arbitrary pipe chunks. Decode only complete
+// prefixes; the fallback decoder sees invalid bytes only after reassembly.
+export function createProcessOutputDecoder(decode: (chunk: Buffer) => string = decodeProcessOutputChunk): { write: (chunk: Buffer) => string; end: () => string } {
+  let pending = Buffer.alloc(0)
+  return {
+    write(chunk) {
+      const bytes = pending.length ? Buffer.concat([pending, chunk]) : chunk
+      let lead = bytes.length - 1
+      while (lead >= 0 && bytes.length - lead <= 4 && (bytes[lead] & 0xc0) === 0x80) lead -= 1
+      const first = bytes[lead]
+      const width = first >= 0xc2 && first <= 0xdf ? 2 : first >= 0xe0 && first <= 0xef ? 3 : first >= 0xf0 && first <= 0xf4 ? 4 : 1
+      const end = lead >= 0 && bytes.length - lead < width ? lead : bytes.length
+      pending = Buffer.from(bytes.subarray(end))
+      return end ? decode(bytes.subarray(0, end)) : ''
+    },
+    end() { const tail = pending; pending = Buffer.alloc(0); return tail.length ? decode(tail) : '' },
+  }
+}
+
 export function decodeProcessOutputChunk(chunk: Buffer, platform: NodeJS.Platform = process.platform): string {
   const utf8 = chunk.toString('utf8')
   if (platform !== 'win32' || !utf8.includes('\uFFFD')) return utf8

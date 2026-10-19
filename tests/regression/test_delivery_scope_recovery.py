@@ -51,6 +51,31 @@ class WorkspaceScopeTests(unittest.TestCase):
         self.write(self.root, "packages/local-lib/package.json", manifest)
         self.assertEqual(self.check(), [])
 
+    def test_unrelated_root_selector_stays_blocked(self):
+        manifest = delivery.read(self.root / "package.json")
+        manifest["overrides"] = {"other": "2.0.0"}
+        self.write(self.root, "package.json", manifest)
+        self.assertEqual(self.check(), ["package.json"])
+
+    def test_wildcard_and_parent_qualified_selectors_stay_blocked(self):
+        for field, selector in [("resolutions", "**/external"), ("resolutions", "local-lib/external"), ("overrides", "local-lib@1")]:
+            with self.subTest(field=field, selector=selector):
+                manifest = delivery.read(self.reference / "package.json")
+                manifest[field] = {selector: "2.0.0"}
+                self.write(self.root, "package.json", manifest)
+                self.assertEqual(self.check(), ["package.json"])
+
+    def test_shared_consumer_does_not_gain_repair_authority(self):
+        for root in (self.reference, self.root):
+            manifest = delivery.read(root / "packages/unrelated/package.json")
+            manifest["dependencies"]["external"] = "1.0.0"
+            self.write(root, "packages/unrelated/package.json", manifest)
+        self.before = delivery.inventory(self.root)
+        manifest = delivery.read(self.root / "package.json")
+        manifest["overrides"] = {"external": "2.0.0"}
+        self.write(self.root, "package.json", manifest)
+        self.assertEqual(self.check(), ["package.json"])
+
     def test_unrelated_manifests_and_root_scripts_stay_blocked(self):
         manifest = delivery.read(self.root / "package.json")
         manifest["scripts"] = {"test": "skip"}

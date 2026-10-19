@@ -375,6 +375,7 @@ class DraftFinalAssignmentPlanningOnlyTests(unittest.TestCase):
             sleep_sec=0.0, use_system_proxy=False,
         )
         client.set_draft_run("run-r11-final")
+        self.addCleanup(client.mark_draft_terminal)
         return client
 
     def _meta(self):

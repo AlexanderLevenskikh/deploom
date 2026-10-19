@@ -37,7 +37,7 @@ class SelectedGoalTests(unittest.TestCase):
         self.assertFalse(core._policy_satisfied(config, checkpoint))
 
     def test_keep_current_guard_runs_before_checkpoint_capture(self):
-        with patch.object(core, "capture_durable_source_snapshot") as capture:
+        with patch("verification_stage_checkpoint.capture_recovery_source") as capture:
             with self.assertRaisesRegex(core.InvalidInputError, "KEEP_CURRENT_CHANGED"):
                 core._accept_checkpoint(Path("unused"), {}, {"packagePolicies": {"frozen": "keep-current"}},
                                         {"fullAssignment": {"frozen": "2.0.0"}},

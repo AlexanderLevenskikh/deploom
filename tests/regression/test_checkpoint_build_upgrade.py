@@ -11,7 +11,14 @@ from unittest import mock
 import checkpoint_build_upgrade as upgrade
 import iterative_migration as migration
 import source_snapshot as source
-from baseline_constraint_verifier import BaselineVerifyResult
+from baseline_constraint_verifier import BaselineVerifyResult, assignment_fingerprint
+
+
+def verified_result(project, assignment):
+    snapshot = source.active_source_snapshot(project)
+    assert snapshot is not None, 'upgrade must bind the preserved source policy'
+    return BaselineVerifyResult(True, 'passed', 'fixture verification receipt',
+        verified_source_snapshot_key=snapshot.key, verified_assignment_fingerprint=assignment_fingerprint(assignment))
 
 
 class CheckpointBuildUpgradeTests(unittest.TestCase):
@@ -51,7 +58,7 @@ class CheckpointBuildUpgradeTests(unittest.TestCase):
                 def verify(selected, assignment):
                     self.assertEqual((selected / '.nx/cache/pinned-input').read_text(), 'legacy captured bytes')
                     self.assertEqual((selected / '.nx/config.json').read_text(), '{"source":true}')
-                    return BaselineVerifyResult(True, 'passed', 'fresh checks')
+                    return verified_result(selected, assignment)
                 checked = mock.Mock(side_effect=verify)
                 with mock.patch.dict(os.environ, {'DEPLOOM_SOURCE_SCOPE_MODE': 'frontend'}):
                     result = upgrade.reopen_checkpoint_source(root / 'run', checkpoint, config, verify=checked, progress=lambda *a: None)
@@ -60,6 +67,61 @@ class CheckpointBuildUpgradeTests(unittest.TestCase):
                 self.assertEqual((old.container / 'manifest.json').read_bytes(), original_manifest)
                 self.assertNotEqual(result.key, old.key)
                 self.assertEqual(checkpoint['sourceSnapshotKey'], old.key)
+
+    def test_real_upgrade_verifier_consumes_the_recorded_legacy_policy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint, config = self.fixture(root)
+            project = root / 'project'
+            (project / 'nx.json').write_text('{}', encoding='utf-8')
+            (project / '.nx/cache').mkdir(parents=True)
+            (project / '.nx/cache/pinned-input').write_text('required', encoding='utf-8')
+            (project / 'check.cjs').write_text("if(require('fs').readFileSync('.nx/cache/pinned-input','utf8')!=='required')process.exit(1)", encoding='utf-8')
+            with mock.patch.object(source, 'tool_build_id', return_value='a' * 64):
+                original = source.capture_durable_source_snapshot(project, root / 'legacy-policy', policy=source.SourceInputPolicy())
+            checkpoint.update(sourceSnapshotKey=original.key, sourceSnapshotContainer=str(original.container))
+            manifest = (original.container / 'manifest.json').read_bytes()
+            with mock.patch.dict(os.environ, {'npm_config_offline': 'true', 'npm_config_cache': str(root / 'npm-cache')}):
+                recovered = migration._open_checkpoint_source(root / 'run', checkpoint, config)
+            self.assertTrue((recovered.project_path / '.nx/cache/pinned-input').is_file())
+            self.assertEqual(manifest, (original.container / 'manifest.json').read_bytes())
+            record = json.loads(next((root / 'run/checkpoint-build-upgrades').glob('*.json')).read_text(encoding='utf-8'))
+            self.assertEqual(recovered.key, record['verification']['verifiedSourceSnapshotKey'])
+            self.assertEqual(checkpoint['sourceSnapshotKey'], original.key)
+
+    def test_bare_success_and_wrong_subject_receipts_publish_no_upgrade_proof(self):
+        import dataclasses
+        for mode in ('missing', 'source', 'assignment'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                checkpoint, config = self.fixture(root)
+                def verify(project, assignment):
+                    if mode == 'missing':
+                        return BaselineVerifyResult(True, 'passed', 'unbound success')
+                    result = verified_result(project, assignment)
+                    return dataclasses.replace(result, **({'verified_source_snapshot_key': 'foreign'} if mode == 'source' else {'verified_assignment_fingerprint': 'foreign'}))
+                with self.assertRaisesRegex(upgrade.CheckpointBuildUpgradeError, 'SUBJECT_MISMATCH'):
+                    upgrade.reopen_checkpoint_source(root / 'run', checkpoint, config, verify=verify, progress=lambda *args: None)
+                self.assertEqual([], list((root / 'run/checkpoint-build-upgrades').glob('*.json')))
+                self.assertTrue(Path(checkpoint['sourceSnapshotContainer']).is_dir())
+
+    def test_mismatch_diagnostics_describe_saved_index_differences(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = root / 'project'; project.mkdir()
+            (project / '.nx/cache').mkdir(parents=True)
+            (project / '.nx/cache/pinned').write_text('captured', encoding='utf-8')
+            old = source.capture_durable_source_snapshot(project, root / 'before', policy=source.SourceInputPolicy())
+            new = source.capture_durable_source_snapshot(project, root / 'after', policy=source.SourceInputPolicy(excluded_relative_paths=('.nx/cache',)))
+            original = (old.container / 'manifest.json').read_bytes()
+            error = upgrade.content_mismatch(root / 'run', 'fixture', old, new)
+            diagnostic = json.loads(Path(error.diagnostic_path).read_text(encoding='utf-8'))
+            self.assertGreater(diagnostic['differences']['removed']['count'], 0)
+            self.assertIn('.nx/cache/pinned', diagnostic['differences']['removed']['samples'])
+            self.assertEqual(0, diagnostic['differences']['added']['count'])
+            self.assertEqual(0, diagnostic['differences']['changed']['count'])
+            self.assertNotEqual(diagnostic['previous']['inputPolicy'], diagnostic['current']['inputPolicy'])
+            self.assertEqual(original, (old.container / 'manifest.json').read_bytes())
 
     def test_default_capture_still_excludes_runtime_nx_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -76,7 +138,7 @@ class CheckpointBuildUpgradeTests(unittest.TestCase):
     def test_evicted_upgrade_copy_requires_fresh_verification(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); checkpoint,config=self.fixture(root)
-            verify=mock.Mock(return_value=BaselineVerifyResult(True,'passed','fresh'))
+            verify=mock.Mock(side_effect=verified_result)
             first=upgrade.reopen_checkpoint_source(root/'run',checkpoint,config,verify=verify,progress=lambda *args:None)
             source._force_rmtree(first.container)
             second=upgrade.reopen_checkpoint_source(root/'run',checkpoint,config,verify=verify,progress=lambda *args:None)
@@ -135,7 +197,7 @@ class CheckpointBuildUpgradeTests(unittest.TestCase):
             messages = []
             def verify(project, assignment):
                 calls.append((project, assignment))
-                return BaselineVerifyResult(True, "passed", "checked")
+                return verified_result(project, assignment)
             first = upgrade.reopen_checkpoint_source(root / "run", checkpoint, config, verify=verify, progress=messages.append)
             second = upgrade.reopen_checkpoint_source(root / "run", checkpoint, config, verify=verify, progress=lambda *args: None)
             self.assertNotEqual(first.key, checkpoint["sourceSnapshotKey"])
@@ -214,7 +276,7 @@ class CheckpointBuildUpgradeTests(unittest.TestCase):
             checkpoint, config, original = self.index_fixture(root, producer_build=source.tool_build_id())
             with self.assertRaisesRegex(source.SourceCaptureError, "CONTENT_MISMATCH"):
                 source.open_source_snapshot(original.container)
-            verify = mock.Mock(return_value=BaselineVerifyResult(True, "passed", "new checks"))
+            verify = mock.Mock(side_effect=verified_result)
             recovered = upgrade.reopen_checkpoint_source(root / "run", checkpoint, config, verify=verify, progress=lambda *args: None)
             self.assertNotEqual(recovered.key, checkpoint["sourceSnapshotKey"])
             verify.assert_called_once()

@@ -150,7 +150,7 @@ for(const item of %s)if(!fs.existsSync(path.join(root,item)))throw new Error('MI
         external=self.base/"outside";external.mkdir();(external/"input.txt").write_text("outside",encoding="utf-8")
         link=self.repo/"tools/external"
         if os.name=="nt":
-            result=subprocess.run([os.environ.get("COMSPEC","cmd.exe"),"/d","/c","mklink","/J",str(link),str(external)],capture_output=True,text=True)
+            result=subprocess.run([os.environ.get("COMSPEC","cmd.exe"),"/d","/c","mklink","/J",str(link),str(external)],capture_output=True)
             self.assertEqual(0,result.returncode,result.stdout+result.stderr)
             self.addCleanup(lambda: os.rmdir(link) if link.exists() else None)
         else:

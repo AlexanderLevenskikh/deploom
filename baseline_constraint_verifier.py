@@ -365,6 +365,8 @@ class BaselineVerifyResult:
     resolved_state_artifact: str = ""
     preparation_proof_key: str = ""
     command_checkpoint_refs: Tuple[str, ...] = ()
+    verified_source_snapshot_key: str = ""
+    verified_assignment_fingerprint: str = ""
 
     @property
     def hard_failure(self) -> bool:
@@ -4928,6 +4930,8 @@ def verify_assignment(
             resolved_state_artifact=resolved_state.artifact_relative_path if resolved_state is not None else "",
             preparation_proof_key=proof_identity.preparation_proof_key if run_project_checks and config.commands else "",
             command_checkpoint_refs=tuple(command_checkpoint_refs) if run_project_checks and config.commands else (),
+            verified_source_snapshot_key=source_snapshot.key,
+            verified_assignment_fingerprint=assignment_hash,
         )
     finally:
         # Early return may retain a trial provisionally. Release every owned
@@ -5573,6 +5577,8 @@ def _verify_assignment_with_pinned_source(
     # and performs an unnecessary full-tree content pass.
     try:
         if not config.proof_cache_dir:
+            # The uncached verifier issues its receipt from the materialized
+            # source. Avoid an additional top-level capture for ad-hoc checks.
             return _verify_assignment_cache_aware_impl(project_dir, assignment, config=config, **kwargs)
         pin_started = time.monotonic()
         pin_finished = False
@@ -5585,12 +5591,16 @@ def _verify_assignment_with_pinned_source(
             progress_interval_seconds=config.progress_interval_seconds,
             reuse_completed=True,
             recovery_directory=(Path(config.recovery_journal_dir or config.proof_cache_dir) / "sc"
-                                if config.recovery_checkpoints else None),
-        ):
+                                if config.recovery_checkpoints and (config.recovery_journal_dir or config.proof_cache_dir) else None),
+        ) as subject:
             pin_finished = True
             emit_observability_event("verify.source-pin.finish", operationId=pin_operation,
                 durationMs=int((time.monotonic() - pin_started) * 1000), outcome="passed")
-            return _verify_assignment_cache_aware_impl(project_dir, assignment, config=config, **kwargs)
+            result = _verify_assignment_cache_aware_impl(project_dir, assignment, config=config, **kwargs)
+            if result.ok:
+                result = dataclasses.replace(result, verified_source_snapshot_key=subject.key,
+                    verified_assignment_fingerprint=assignment_fingerprint(assignment))
+            return result
     except SourceCaptureError as exc:
         if "pin_operation" in locals() and not pin_finished:
             emit_observability_event("verify.source-pin.finish", operationId=pin_operation,

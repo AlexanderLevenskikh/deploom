@@ -8,7 +8,7 @@
 // any check fails; fails when package.json declares no checks at all.
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -24,13 +24,27 @@ if (names.length === 0) {
 
 const win = process.platform === 'win32';
 let failed = 0;
-
+const compileHook = 'tsc -p tsconfig.electron.json';
+const sharedCompile = names.some(name => pkg.scripts[`pre${name}`] === compileHook);
+if (sharedCompile) {
+  const compiled = spawnSync(process.execPath, ['node_modules/typescript/bin/tsc', '-p', 'tsconfig.electron.json'], {cwd: ROOT, stdio: 'inherit'});
+  if (compiled.error || compiled.status !== 0) {
+    console.error('run-all-contract-checks: shared Electron compilation failed');
+    process.exit(1);
+  }
+}
+const commandEnv = {...process.env, PATH: join(ROOT, 'node_modules', '.bin') + delimiter + (process.env.PATH ?? '')};
 for (const name of names) {
-  const result = spawnSync('npm', ['run', name], {
-    cwd: ROOT,
-    stdio: 'inherit',
-    shell: win,
-  });
+  const command = /^node (scripts\/[a-zA-Z0-9_-]+\.mjs)$/.exec(pkg.scripts[name]);
+  const pre = pkg.scripts[`pre${name}`];
+  const post = pkg.scripts[`post${name}`];
+  // Only coalesce the identical compiler hook. Custom lifecycle hooks retain
+  // normal npm semantics, and each check still runs in its own process.
+  const direct = command && (!pre || pre === compileHook) && !post;
+  console.log(`run-all-contract-checks: ${name}`);
+  const result = direct
+    ? spawnSync(process.execPath, [command[1]], {cwd: ROOT, stdio: 'inherit', env: commandEnv})
+    : spawnSync('npm', ['run', name], {cwd: ROOT, stdio: 'inherit', shell: win});
   if (result.error) {
     console.error(`run-all-contract-checks: cannot run ${name}: ${result.error.message}`);
     failed += 1;

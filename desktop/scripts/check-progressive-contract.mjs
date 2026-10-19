@@ -9,7 +9,6 @@ const acceptance = fs.readFileSync(new URL('../electron/acceptance-policy.ts', i
 const policy = fs.readFileSync(new URL('../src/autopilot-policy.ts', import.meta.url), 'utf8')
 const recovery = fs.readFileSync(new URL('../electron/flow-recovery.ts', import.meta.url), 'utf8')
 const generator = fs.readFileSync(new URL('../../dependency_live_roadmap_generator.py', import.meta.url), 'utf8')
-const ci = fs.readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8')
 
 const has = (source, needle, label) => { if (!source.includes(needle)) throw new Error(`${label}: missing ${JSON.stringify(needle)}`) }
 const lacks = (source, needle, label) => { if (source.includes(needle)) throw new Error(`${label}: forbidden ${JSON.stringify(needle)}`) }
@@ -97,8 +96,7 @@ has(policy, "if (verdict.accepted)", 'accepted completion')
 has(policy, "return 'agent'", 'security remediation re-entry')
 has(recovery, "'ACCEPTANCE_NOT_SATISFIED'", 'pre-release acceptance hard stop')
 has(recovery, "'ACCEPTANCE_AUTHORITY_INVALIDATED_DURING_RELEASE'", 'post-release acceptance hard stop')
-has(ci, 'npm run check:acceptance-policy', 'acceptance contract must run in CI')
-has(ci, 'npm run check:progressive-contract', 'progressive contract must run in CI')
-has(ci, 'npm run check:human-flow', 'human-flow contract must run in CI')
+// CI inclusion is covered by the parsed workflow/package inventory and
+// process-level runner tests, not by spelling individual npm commands here.
 
 console.log('Progressive acceptance source contract OK')

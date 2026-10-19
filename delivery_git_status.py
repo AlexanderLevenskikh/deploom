@@ -10,6 +10,9 @@ def committed_worktree(root):
                                 timeout=120, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
         if result.returncode: raise RuntimeError("DELIVERY_GIT_STATUS_FAILED")
         return result.stdout
+    flags = run("ls-files", "-v", "-z")
+    if any(row and (row[:1].islower() or row[:1] == b"S") for row in flags.split(b"\0")):
+        return False
     status = run("status", "--porcelain=v1", "-z")
     if not status: return True
     names = []

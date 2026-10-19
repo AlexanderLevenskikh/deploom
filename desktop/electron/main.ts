@@ -12,7 +12,7 @@ import { registerProjectJournalHandlers } from './project-journal-ipc.js'
 import { projectAuditContext } from './project-audit-context.js'
 import { auditJson, createProjectAuditController } from './project-audit-lifecycle.js'
 import { baselineFailureMessage } from './baseline-failure.js'
-import { draftArtifactsRoot, draftManifestPath, draftReadFailureText, draftResultStaleness, readDraftResultArtifact, type DraftResultArtifact as ParsedDraftResultArtifact, type DraftReadResult } from './draft-artifact-reader.js'
+import { draftReadFailureText, draftResultStaleness, readDraftResultArtifact, type DraftResultArtifact as ParsedDraftResultArtifact, type DraftReadResult } from './draft-artifact-reader.js'
 import { BASELINE_DECISION_MARKER, extractBaselineDecisionEnvelope } from './migration-baseline-decision.js'
 import { buildDependencyGraphSnapshot } from './dependency-graph.js'
 import { BaselineWorkerPool, WORKER_CANCEL } from './baseline-worker.js'
@@ -41,7 +41,7 @@ import { classifyFlowRecovery, type FlowRecoveryIssue } from './flow-recovery.js
 import { deterministicPlannerDecision } from './deterministic-planner.js'
 import { plannerResultCacheKey, plannerResultCachePath, writePlannerResultCache } from './planner-result-cache.js'
 import { buildReleaseRecoveryPrompt, readReleaseRecoveryResult } from './release-recovery.js'
-import { assessMigrationCheckpoint, baselineFailureDecision, baselineFailuresNeedingProbe, baselineObservationMatchesFailure, createVerificationDiagnosticCollector, verificationCommandKey, type BaselineVerificationObservation, type MigrationVerificationAssessment, type VerificationDiagnosticEvidence, type VerificationEvidence, type VerificationFailure } from './migration-verification.js'
+import { assessMigrationCheckpoint, baselineFailureDecision, baselineFailuresNeedingProbe, baselineObservationMatchesFailure, createVerificationDiagnosticCollector, verificationCommandKey, type BaselineVerificationObservation, type MigrationVerificationAssessment, type VerificationDiagnosticEvidence, type VerificationFailure } from './migration-verification.js'
 import { openRepairRequests, repairHandoffStateRelativeDir, requestSummary, extractRepairRequiredEnvelope, type RepairRequest, type RepairRequiredEnvelope } from './repair-handoff.js'
 import { DEFAULT_MAX_BASELINE_REPAIR_CYCLES, clearRepairDispatchState, readRepairDispatchState, repairCheckoutDirName, repairSettingsFileName, runBaselineRepairCycles } from './repair-dispatch.js'
 import { applyRepairReVerification, buildRepairSettingsFile, createIsolatedRepairCheckout, resolveGitHead } from './repair-checkout.js'
@@ -53,7 +53,7 @@ import { assessPromptRevision, buildPlannerPrompt, partitionPlannerDeferrals, re
 import { autonomyPolicy, normalizedPlannerFailure } from './autonomy-policy.js'
 import { runParallelQueue, selectParallelGroupQueue } from './parallel-groups.js'
 import { isToolManagedWorktreePath, portablePathKey, restartWorktreeCleanupTargets, toolManagedWorktreeFromLegacyDeferral, toolManagedWorktreePaths } from './worktree-ownership.js'
-import { scheduleUpdateChecks } from './updater-schedule.js'
+import { checkUpdateFeed, scheduleUpdateChecks } from './updater-schedule.js'
 import { teamStatePaths, teamStatePathspecs } from './state-commit.js'
 import { changedOverrideProjects } from './dashboard-state.js'
 import { forgetScopedPromptPath, rememberScopedPromptPath, roadmapContainsProject, scopedPromptPath } from './project-context.js'
@@ -64,7 +64,7 @@ import { normalizeBudgetField } from './baseline-intent.js'
 import { summarizeUpdaterError } from './updater-error.js'
 import { createFlowNotificationSender, createIterativeNotificationObserver, type FlowNotificationEvent } from './notifications.js'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { commandEnvironment, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
+import { commandEnvironment, createProcessOutputDecoder, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { discoveryProgress } from './iterative-discovery-progress.js'
 import { pendingCohortReview, cohortReviewEnabled, saveCohortReviewEnabled } from './iterative-cohort-review.js'
@@ -85,7 +85,7 @@ import { copyTaskWithVerification, type ClipboardWriter } from './task-clipboard
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from './opencode-runtime.js'
 import { initializeWorkspaceRepository } from './workspace-bootstrap.js'
 import { createHash, randomUUID } from 'node:crypto'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, type Dirent } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { basename, delimiter, dirname, join, normalize, resolve, isAbsolute, relative, sep } from 'node:path'
 import { createServer as createNetServer } from 'node:net'
 import os from 'node:os'
@@ -1679,8 +1679,10 @@ function spawnCapture(command: string, args: string[], cwd: string, timeoutMs = 
     const invocation = resolveSpawnInvocation(command, args, { env: commandEnv })
     const child = spawn(invocation.command, invocation.args, { cwd, shell: false, detached: processTreeDetached(), windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments, env: commandEnv })
     const timer = setTimeout(() => { timedOut = true; killProcessTree(child) }, timeoutMs)
-    child.stdout.on('data', (chunk: Buffer) => { stdout += decodeProcessOutputChunk(chunk) })
-    child.stderr.on('data', (chunk: Buffer) => { stderr += decodeProcessOutputChunk(chunk) })
+    const stdoutDecoder = createProcessOutputDecoder()
+    const stderrDecoder = createProcessOutputDecoder()
+    child.stdout.on('data', (chunk: Buffer) => { stdout += stdoutDecoder.write(chunk) })
+    child.stderr.on('data', (chunk: Buffer) => { stderr += stderrDecoder.write(chunk) })
     child.on('error', (error) => {
       if (settled) return
       settled = true
@@ -1691,6 +1693,8 @@ function spawnCapture(command: string, args: string[], cwd: string, timeoutMs = 
       if (settled) return
       settled = true
       clearTimeout(timer)
+      stdout += stdoutDecoder.end()
+      stderr += stderrDecoder.end()
       resolvePromise({ code: code ?? 1, stdout, stderr, timedOut })
     })
     // Non-interactive capture has no input. OpenCode waits for EOF before
@@ -2198,16 +2202,24 @@ async function ensureOpenCodeServer(job: JobRecord, cwd: string): Promise<string
       owner.openCodeServer = server
       owner.openCodeServerUrl = url
       owner.openCodeServerError = ''
+      const stdoutDecoder = createProcessOutputDecoder()
+      const stderrDecoder = createProcessOutputDecoder()
+      server.on('close', () => {
+        const tail = stdoutDecoder.end() + stderrDecoder.end()
+        if (owner.openCodeServer === server) owner.openCodeServerError = `${owner.openCodeServerError ?? ''}${tail}`.slice(-3000)
+      })
       server.stdout.on('data', (chunk: Buffer) => {
         // Keep server plumbing out of the user-facing activity feed; only retain
         // a short tail for a useful startup error.
-        owner.openCodeServerError = `${owner.openCodeServerError ?? ''}${decodeProcessOutputChunk(chunk)}`.slice(-3000)
+        const text = stdoutDecoder.write(chunk)
+        if (owner.openCodeServer === server) owner.openCodeServerError = `${owner.openCodeServerError ?? ''}${text}`.slice(-3000)
       })
       server.stderr.on('data', (chunk: Buffer) => {
-        owner.openCodeServerError = `${owner.openCodeServerError ?? ''}${decodeProcessOutputChunk(chunk)}`.slice(-3000)
+        const text = stderrDecoder.write(chunk)
+        if (owner.openCodeServer === server) owner.openCodeServerError = `${owner.openCodeServerError ?? ''}${text}`.slice(-3000)
       })
       server.on('error', (error) => {
-        owner.openCodeServerError = `${owner.openCodeServerError ?? ''}\n${error.message}`.slice(-3000)
+        if (owner.openCodeServer === server) owner.openCodeServerError = `${owner.openCodeServerError ?? ''}\n${error.message}`.slice(-3000)
       })
 
       for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -2759,7 +2771,7 @@ function publishUpdaterError(error: unknown): UpdateStatus {
 
 function checkForLatestUpdate(): ReturnType<typeof autoUpdater.checkForUpdates> {
   if (updateCheckInFlight) return updateCheckInFlight
-  const request = autoUpdater.checkForUpdates().finally(() => {
+  const request = checkUpdateFeed(() => autoUpdater.checkForUpdates()).finally(() => {
     if (updateCheckInFlight === request) updateCheckInFlight = undefined
   })
   updateCheckInFlight = request
@@ -6709,22 +6721,26 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
         line: `[warn] ⚠ ${spec.label}: нет новых сообщений ${Math.max(1, Math.floor(silentMs / 60_000))} мин. Процесс ещё запущен; это метка возможного зависания. Внутренний verifier обязан либо прислать heartbeat/progress, либо завершить зависший subprocess по hard timeout.`,
       })
     }, Math.min(spec.stallWarningMs, 60_000)) : undefined
-    child.stdout.on('data', (chunk: Buffer) => {
+    const stdoutDecoder = createProcessOutputDecoder()
+    const stderrDecoder = createProcessOutputDecoder()
+    const consumeStdout = (text: string) => {
+      if (!text) return
       markOutput()
-      const text = decodeProcessOutputChunk(chunk)
       diagnosticCollector?.push(text, 'stdout')
       stdout = `${stdout}${text}`.slice(-6000)
       if (spec.captureAgentSession !== false) captureAgentSession(job, text, spec.onAgentSessionId)
       send('flow:job-output', { jobId: job.id, stream: 'stdout', line: text })
-    })
-    child.stderr.on('data', (chunk: Buffer) => {
+    }
+    child.stdout.on('data', (chunk: Buffer) => consumeStdout(stdoutDecoder.write(chunk)))
+    const consumeStderr = (text: string) => {
+      if (!text) return
       markOutput()
-      const text = decodeProcessOutputChunk(chunk)
       diagnosticCollector?.push(text, 'stderr')
       if (spec.captureAgentSession !== false) captureAgentSession(job, text, spec.onAgentSessionId)
       stderr = `${stderr}${text}`.slice(-6000)
       send('flow:job-output', { jobId: job.id, stream: 'stderr', line: text })
-    })
+    }
+    child.stderr.on('data', (chunk: Buffer) => consumeStderr(stderrDecoder.write(chunk)))
     const cleanupCommandRuntime = () => {
       if (!ephemeralOpenCodeDirectory) return
       try { rmSync(ephemeralOpenCodeDirectory, { recursive: true, force: true }) } catch { /* isolated client DB will be abandoned and the parent runtime cleanup removes it later */ }
@@ -6736,6 +6752,8 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
       if (timer) clearTimeout(timer)
       if (forceTimer) clearTimeout(forceTimer)
       if (stallTimer) clearInterval(stallTimer)
+      consumeStdout(stdoutDecoder.end())
+      consumeStderr(stderrDecoder.end())
       rootJob.parallelChildren?.delete(child)
       cleanupCommandRuntime()
       resolvePromise(result)
@@ -8832,8 +8850,11 @@ function setupIpc(): void {
       env: commandEnv,
     })
     let tail = ''
-    server.stdout.on('data', (chunk: Buffer) => { tail = `${tail}${decodeProcessOutputChunk(chunk)}`.slice(-2000) })
-    server.stderr.on('data', (chunk: Buffer) => { tail = `${tail}${decodeProcessOutputChunk(chunk)}`.slice(-2000) })
+    const stdoutDecoder = createProcessOutputDecoder()
+    const stderrDecoder = createProcessOutputDecoder()
+    server.stdout.on('data', (chunk: Buffer) => { tail = `${tail}${stdoutDecoder.write(chunk)}`.slice(-2000) })
+    server.stderr.on('data', (chunk: Buffer) => { tail = `${tail}${stderrDecoder.write(chunk)}`.slice(-2000) })
+    server.on('close', () => { tail = `${tail}${stdoutDecoder.end()}${stderrDecoder.end()}`.slice(-2000) })
     server.on('error', (error) => { tail = `${tail}\n${error.message}`.slice(-2000) })
     for (let attempt = 0; attempt < 40; attempt += 1) {
       if (server.exitCode !== null) break
@@ -9951,7 +9972,9 @@ function setupAutoUpdater(): void {
     publishUpdateStatus({ state: 'ready', version: info.version })
   })
   autoUpdater.on('error', (error) => {
-    publishUpdaterError(error)
+    // Feed request rejections are handled after their bounded retry. Errors
+    // from the independently running package download remain visible.
+    if (!updateCheckInFlight || currentUpdateStatus.state === 'downloading') publishUpdaterError(error)
   })
   const check = () => {
     void checkForLatestUpdate().catch((error: unknown) => {

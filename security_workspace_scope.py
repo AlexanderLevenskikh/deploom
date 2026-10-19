@@ -81,6 +81,15 @@ def blocked_mutations(root, project_relative, run_id, before, changed, reference
                 for dependency in (rows.get(name, {}).get(section) or {}):
                     if dependency in by_name:
                         queue.append(by_name[dependency][0])
+        # A root selector has repository-wide effect. Only exact dependency
+        # names with no consumer outside the pinned reachable closure qualify.
+        consumers = {}
+        for manifest_name, manifest in rows.items():
+            for section in SECTIONS:
+                for dependency in (manifest.get(section) or {}):
+                    consumers.setdefault(dependency, set()).add(manifest_name)
+        allowed_selectors = {dependency for dependency, owners in consumers.items()
+                             if owners and owners.issubset(reachable)}
         manager_manifest = (manager / "package.json").relative_to(reference_root).as_posix()
         lock_name = lockfile.relative_to(reference_root).as_posix()
         blocked = []
@@ -101,6 +110,25 @@ def blocked_mutations(root, project_relative, run_id, before, changed, reference
             if not differences.issubset(permitted):
                 blocked.append(name)
                 continue
+            if name == manager_manifest:
+                invalid_selector = False
+                for field in differences:
+                    previous, current = old.get(field, {}), new.get(field, {})
+                    if not isinstance(previous, dict) or not isinstance(current, dict):
+                        invalid_selector = True
+                        break
+                    for selector in set(previous) | set(current):
+                        if previous.get(selector) == current.get(selector):
+                            continue
+                        # Wildcards, parent-qualified selectors and nested npm
+                        # override objects need a larger proven blast radius.
+                        if (selector not in allowed_selectors or
+                                any(value is not None and not isinstance(value, str)
+                                    for value in (previous.get(selector), current.get(selector)))):
+                            invalid_selector = True
+                if invalid_selector:
+                    blocked.append(name)
+                    continue
             if name != manager_manifest and any(set(old.get(s) or {}) != set(new.get(s) or {}) for s in SECTIONS):
                 blocked.append(name)
         return blocked

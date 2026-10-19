@@ -91,16 +91,41 @@ def test_desktop_draft_is_invocation_local_and_does_not_advance_flow() -> None:
 
 
 def test_desktop_draft_writer_and_reader_resolve_the_same_artifact_root() -> None:
-    # R6: writer passes --artifacts-dir <ws>/.dependency-roadmap/artifacts and
-    # the reader (production module used by main.ts) must resolve the SAME
-    # path, regardless of where settings.project.json lives (root-level vs
-    # .dependency-roadmap). Both sides are the `.dependency-roadmap/artifacts`
-    # convention spelled identically in the two languages.
-    assert "'--artifacts-dir', join(workspace.path, '.dependency-roadmap', 'artifacts')" in DESKTOP_MAIN
-    assert "join(workspacePath, '.dependency-roadmap', 'artifacts')" in DRAFT_READER
-    assert "draftArtifactsRoot" in DESKTOP_MAIN
-    assert "draftManifestPath" in DRAFT_READER
-    assert "draftReadStrict(workspace" in DESKTOP_MAIN
+    # Evaluate the actual main-process CLI argument expression and compare it
+    # with both real path resolvers. An unused import cannot satisfy this test.
+    import subprocess
+    script = r"""
+import ts from './desktop/node_modules/typescript/lib/typescript.js';
+import {readFileSync} from 'node:fs';
+import {join} from 'node:path';
+import {draftArtifactsRoot,draftManifestPath} from './desktop/dist-electron/draft-artifact-reader.js';
+const source=ts.createSourceFile('main.ts',readFileSync('./desktop/electron/main.ts','utf8'),ts.ScriptTarget.Latest,true);
+let declaration;
+function visit(node){if(ts.isVariableDeclaration(node)&&node.name.getText(source)==='draftScopeArgs')declaration=node;ts.forEachChild(node,visit)}
+visit(source);
+if(!declaration)throw Error('Draft CLI producer is missing');
+const produce=new Function('proofMode','effectiveDraftRunId','workspace','project','join','return ('+declaration.initializer.getText(source)+')');
+const workspace={path:process.argv[1],id:'fixture-workspace'};
+const args=produce('DRAFT','fixture-run',workspace,{name:'fixture-project'},join);
+const index=args.indexOf('--artifacts-dir');
+if(index<0)throw Error('Draft producer omitted artifact directory');
+if(produce('VERIFIED','fixture-run',workspace,{name:'fixture-project'},join).length)throw Error('Draft arguments leaked into verified execution');
+console.log(JSON.stringify({producer:args[index+1],reader:draftArtifactsRoot(workspace.path),manifest:draftManifestPath(workspace.path,'fixture-run')}));
+"""
+    previous = list(roadmap._ARTIFACTS_BASE_FOR_DRAFT)
+    try:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = subprocess.run(['node', '--input-type=module', '-e', script, temporary],
+                                    cwd=ROOT, capture_output=True, text=True, encoding='utf-8', timeout=20)
+            assert result.returncode == 0, result.stderr
+            paths = json.loads(result.stdout)
+            expected = Path(temporary) / '.dependency-roadmap' / 'artifacts'
+            assert Path(paths['producer']) == expected
+            assert Path(paths['reader']) == expected
+            roadmap.set_draft_artifacts_base(Path(paths['producer']))
+            assert roadmap._draft_artifacts_dir('fixture-run') / 'result.json' == Path(paths['manifest'])
+    finally:
+        roadmap._ARTIFACTS_BASE_FOR_DRAFT = previous
 
 
 def test_generator_draft_skips_legacy_roadmap_writes() -> None:

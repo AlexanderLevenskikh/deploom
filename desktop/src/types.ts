@@ -438,7 +438,7 @@ export type IterativeStatusOutcome = {
   runDirectory?: string
   artifactsDirectory?: string
   iterationDirectory?: string
-  progressSummary?: { checkpointId: string; remaining: number; denominator: number; accepted: number; deferred: number; targetCount: number; unresolvedGoals: number }
+  progressSummary?: { checkpointId: string; remaining: number; denominator: number; accepted: number; acceptedActions?: number; goalsSatisfied?: number; deferred: number; targetCount: number; unresolvedGoals: number }
   autopilotActive?: boolean
   autopilotEnabled?: boolean
   validationProfile?: { commands: string[]; unitCommand?: string; compareExistingFailures?: boolean; deferredChecks?: string; suggestedUnitCommand?: string }

@@ -249,6 +249,18 @@ const mkIo = (overrides = {}) => {
   const statusRecords = lines.filter(line=>line.startsWith('ITERATIVE_MIGRATION_STATUS_V1 '));
   if(statusRecords.length!==2 || statusRecords.some(line=>line.trim().includes('\n'))) throw Error('status records must remain individually parseable');
 }
+{
+  const message = 'Сохранено 🧶'
+  const payload = 'ITERATIVE_MIGRATION_STATUS_V1 ' + JSON.stringify({event:'fixture',message}) + '\n'
+  const diagnostic = 'Ошибка 🛑'
+  const script = `const out=Buffer.from(${JSON.stringify(payload)});const err=Buffer.from(${JSON.stringify(diagnostic)});let i=0;const timer=setInterval(()=>{if(i<out.length)process.stdout.write(out.subarray(i,i+1));if(i<err.length)process.stderr.write(err.subarray(i,i+1));if(++i>=Math.max(out.length,err.length))clearInterval(timer)},2)`
+  const events = []
+  const records = {stdout:'',stderr:''}
+  const io = {cancelRequested:()=>false,trimLog:()=>{},recordLine:(_dir,text,stream='stdout')=>{records[stream]+=text}}
+  const result = await spawnIterativeStreamed(root,process.execPath,['-e',script],root,10000,io,mkPlatform(),event=>events.push(event))
+  if(result.code!==0 || result.stdout!==payload || result.stderr!==diagnostic) throw Error('split UTF-8 corrupted child output')
+  if(records.stdout!==payload || records.stderr!==diagnostic || events.length!==1 || events[0].message!==message) throw Error('split UTF-8 corrupted durable diagnostics/status envelope')
+}
 console.log("check-iterative-stream: OK");
 
 // Actual child survives an earned extension; another child is still stopped.

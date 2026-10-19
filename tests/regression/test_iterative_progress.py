@@ -28,7 +28,7 @@ class MigrationProgressTests(unittest.TestCase):
         base = {"checkpointId": "C0", "fullAssignment": {"a": "1", "b": "1"}, "acceptedDelta": {}}
         active = {"checkpointId": "C1", "fullAssignment": {"a": "2", "b": "1"}, "acceptedDelta": {"changed": {"a": "2"}}}
         summary = build_progress_summary(config, [base, active], active, {"deferrals": [{"package": "b", "reason": "blocked"}]})
-        self.assertEqual(summary, {"checkpointId": "C1", "remaining": 2, "denominator": 3, "accepted": 1, "deferred": 1, "targetCount": 2, "unresolvedGoals": 1})
+        self.assertEqual(summary, {"checkpointId": "C1", "remaining": 2, "denominator": 3, "accepted": 1, "acceptedActions": 1, "goalsSatisfied": 1, "deferred": 1, "targetCount": 2, "unresolvedGoals": 1})
         # Candidate work never enters counts until it becomes a checkpoint.
         before = build_progress_summary(config, [base], base, {})
         self.assertEqual(before["accepted"], 0)

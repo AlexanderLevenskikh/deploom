@@ -150,10 +150,13 @@ def build_progress_summary(config, checkpoints, active, ledger):
         seen.add(str(cursor.get("checkpointId")))
         chain.append(cursor)
         cursor = by_id.get(str(cursor.get("parentCheckpointId") or ""))
+    actions = _accepted_actions(list(reversed(chain)))
     return {
         "checkpointId": str(active.get("checkpointId") or ""),
         "remaining": remaining, "denominator": denominator,
-        "accepted": len(_accepted_actions(list(reversed(chain)))),
+        "accepted": len({action['package'] for action in actions}),
+        "acceptedActions": len(actions),
+        "goalsSatisfied": denominator - remaining,
         "deferred": len(_deferred_rows(ledger, config, active)),
         "targetCount": len(config.get("targets") or {}),
         "unresolvedGoals": denominator - len(config.get("targets") or {}),

@@ -158,7 +158,7 @@ export function mergeTargetPolicy(
 
 export function dependencyInputIdentity(projectPath: string): { hash: string; files: string[] } {
   projectPath = realpathSync.native(projectPath)
-  const names: string[] = [...DEPENDENCY_INPUT_FILES]
+  const names: string[] = [...DEPENDENCY_INPUT_FILES, '.npmrc', '.yarnrc', '.yarnrc.yml', '.pnpmfile.cjs']
   if (!DEPENDENCY_INPUT_FILES.slice(1).some((name) => existsSync(join(projectPath, name)))) {
     const ancestors: string[] = []
     let folder = dirname(resolve(projectPath))
@@ -169,7 +169,7 @@ export function dependencyInputIdentity(projectPath: string): { hash: string; fi
     }
     if (ancestors.some((ancestor) => existsSync(join(ancestor, '.git')))) {
       for (const ancestor of ancestors) {
-        for (const name of [...DEPENDENCY_INPUT_FILES, '.yarnrc.yml']) {
+        for (const name of [...DEPENDENCY_INPUT_FILES, '.npmrc', '.yarnrc', '.yarnrc.yml', '.pnpmfile.cjs']) {
           names.push(relative(projectPath, join(ancestor, name)).replaceAll('\\', '/'))
         }
       }

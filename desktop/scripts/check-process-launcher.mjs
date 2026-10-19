@@ -1,5 +1,6 @@
 import { win32 } from 'node:path'
-import { commandEnvironment, decodeProcessOutputChunk, packageManagerResolutionHint, resolveExecutable, resolveSpawnInvocation } from '../dist-electron/process-launcher.js'
+import assert from 'node:assert/strict'
+import { commandEnvironment, createProcessOutputDecoder, decodeProcessOutputChunk, packageManagerResolutionHint, resolveExecutable, resolveSpawnInvocation } from '../dist-electron/process-launcher.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from '../dist-electron/opencode-runtime.js'
 
 for (const platform of ['win32', 'darwin', 'linux']) {
@@ -73,4 +74,23 @@ const hint = packageManagerResolutionHint('yarn', missing)
 if (!hint?.includes('не найден')) throw new Error('Missing package manager must produce an infrastructure hint')
 if (packageManagerResolutionHint('git', 'git')) throw new Error('Non-package-manager commands must not get a package-manager hint')
 
-console.log('Process launcher Windows shim resolution OK')
+// Every possible cut, including inside Cyrillic and four-byte emoji. Test
+// both independent streams and EOF; a stateless decode must fail these cases.
+const payload = 'ITERATIVE_MIGRATION_STATUS_V1 {"message":"Сохранено 🧶"}\n'
+const bytes = Buffer.from(payload)
+for (const platform of ['win32', 'linux', 'darwin']) {
+  for (let cut = 0; cut <= bytes.length; cut += 1) {
+    const decoder = createProcessOutputDecoder(chunk => decodeProcessOutputChunk(chunk, platform))
+    assert.equal(decoder.write(bytes.subarray(0, cut)) + decoder.write(bytes.subarray(cut)) + decoder.end(), payload)
+  }
+  const decoder = createProcessOutputDecoder(chunk => decodeProcessOutputChunk(chunk, platform))
+  assert.equal([...bytes].map(byte => decoder.write(Buffer.from([byte]))).join('') + decoder.end(), payload)
+}
+const out = createProcessOutputDecoder()
+const err = createProcessOutputDecoder()
+assert.equal(out.write(Buffer.from([0xd0])), '')
+assert.equal(err.write(Buffer.from('error')), 'error')
+assert.equal(out.write(Buffer.from([0xa1])), 'С')
+assert.equal(out.end(), '')
+assert.equal(err.end(), '')
+console.log('Process launcher shim resolution and incremental decoding OK')
