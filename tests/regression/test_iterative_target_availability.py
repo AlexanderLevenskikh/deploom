@@ -25,6 +25,31 @@ class TargetAvailabilityDeferralsTests(unittest.TestCase):
         self.assertTrue(record_unavailable_targets(self.ledger, self.run, self.config, self.candidate, output))
         self.assertEqual({'@demo/scoped'}, unavailable_targets(self.ledger, self.run, self.config))
 
+    def test_yarn_coloured_and_plain_exact_targets_have_identical_evidence(self):
+        for name, version in [('pkg', '99.99.99'), ('@demo/scoped', '2.0.0')]:
+            candidate = {'candidateId': 'colour-fixture', 'delta': {'changed': {name: version}}}
+            for separator in (' ', ' │ '):
+                for coloured in (False, True):
+                    with self.subTest(name=name, separator=separator, coloured=coloured):
+                        subject = f'{name}@npm:{version}'
+                        if coloured:
+                            subject = f'\x1b[36m{name}\x1b[39m@\x1b[33mnpm:{version}\x1b[39m'
+                        message = f'➤ YN0082:{separator}{subject}: No candidates found'
+                        ledger = {}
+                        self.assertTrue(record_unavailable_targets(ledger, self.run, self.config, candidate, message))
+                        self.assertEqual({name}, unavailable_targets(ledger, self.run, self.config))
+                        self.assertFalse(record_unavailable_targets({}, self.run, self.config, candidate, message.replace(version, '1.0.0')))
+
+    def test_yarn_hyperlinked_error_code_preserves_exact_target_binding(self):
+        for end in ('\x07', '\x1b\\'):
+            with self.subTest(terminator=repr(end)):
+                code = f'\x1b]8;;https://yarnpkg.com/advanced/error-codes#yn0082{end}YN0082\x1b]8;;{end}'
+                output = f'➤ {code}: │ \x1b[36mpkg\x1b[39m@npm:99.99.99: No candidates found'
+                ledger = {}
+                self.assertTrue(record_unavailable_targets(ledger, self.run, self.config, self.candidate, output))
+                self.assertEqual({'pkg'}, unavailable_targets(ledger, self.run, self.config))
+                self.assertFalse(record_unavailable_targets({}, self.run, self.config, self.candidate, output.replace('99.99.99', '1.0.0')))
+
     def test_network_cache_timeout_and_peer_failures_do_not_defer_targets(self):
         for code in ('ETIMEDOUT', 'ENOTCACHED', 'EAI_AGAIN', 'ERESOLVE', 'E401'):
             self.assertFalse(record_unavailable_targets(self.ledger, self.run, self.config, self.candidate,

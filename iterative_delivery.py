@@ -178,15 +178,24 @@ def security_prepare(run_dir, inputs):
     attempts = int(state.get("attempt", 0))
     if attempts >= int((config.get("budget") or {}).get("maxRepairAttemptsPerRevision", 2)):
         return {**state, "status": "exhausted"}
-    audit = checkpoint.get("audit") or {}
+    def saved_audit(checkpoint):
+        audit = checkpoint.get("audit") or {}
+        evidence_path = Path(audit.get("evidenceRef") or "") / "audit-report.json"
+        if evidence_path.is_file() and contained(run_dir, evidence_path):
+            try:
+                return {**audit, **summary(read(evidence_path), evidence_path.parent, checkpoint["checkpointId"])}
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+        return {**audit, "status": "UNKNOWN"}
+
+    # Saved PASS/FAIL labels can outlive the authoritative report's freshness.
+    audit = saved_audit(checkpoint)
     if audit.get("status") not in {"PASS", "FAIL"}:
         core._audit_locked(run_dir, run, config, argparse.Namespace(registry="", lag_months=None,
-                           min_lag_ok_pct=None, max_known_high=None, yarn_audit_engine="yarn-inventory"))
+                           min_lag_ok_pct=None, max_known_high=None, yarn_audit_engine="yarn-inventory",
+                           refresh_evidence=audit.get("generatedAt") or "missing"))
         checkpoint = core.load_checkpoint(run_dir, run["activeCheckpointId"])
-        audit = checkpoint.get("audit") or {}
-    evidence_path = Path(audit.get("evidenceRef") or "") / "audit-report.json"
-    if evidence_path.is_file() and contained(run_dir, evidence_path):
-        audit = {**audit, **summary(read(evidence_path), evidence_path.parent, checkpoint["checkpointId"])}
+        audit = saved_audit(checkpoint)
     if audit.get("status") not in {"PASS", "FAIL"}:
         raise RuntimeError("SECURITY_AUDIT_UNKNOWN: no authoritative evidence to repair")
     if core._policy_satisfied(config, checkpoint):

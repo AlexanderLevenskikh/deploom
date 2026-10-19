@@ -96,6 +96,7 @@ def write_entry(root, key, data, **metadata):
 
 def cached_query(key, fetch, *, root=None, ttl=600, check=lambda: None):
     """Only complete successful query tuples persist; failures always remain live."""
+    check()  # Expiration also applies to a warm hit and disabled-cache fallback.
     if ttl <= 0:
         return fetch()
     if root is None:

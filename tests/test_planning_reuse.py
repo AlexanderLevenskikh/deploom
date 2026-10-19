@@ -195,6 +195,15 @@ class PlanningReuseTests(unittest.TestCase):
             self.assertEqual(len(calls), 2)
             self.assertEqual(list(Path(temp).glob("*.json")), [])
 
+    def test_expired_budget_rejects_a_warm_cache_hit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cache.write_entry(root, 'warm', {'version': '2.0.0'})
+            def expired():
+                raise TimeoutError('expired fixture')
+            with self.assertRaisesRegex(TimeoutError, 'expired fixture'):
+                cache.cached_query('warm', lambda: self.fail('must not fetch'), root=root, check=expired)
+
     def test_corrupt_cache_is_a_miss_and_contexts_are_isolated(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

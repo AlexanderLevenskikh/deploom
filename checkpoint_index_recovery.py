@@ -19,6 +19,7 @@ class IndexRecoveryInput:
     project_path: Path
     manifest_key: str
     recovery: dict
+    input_policy: SourceInputPolicy = SourceInputPolicy()
 
 
 def inspect_checkpoint_index_drift(container, expected_key, *, progress):
@@ -59,4 +60,4 @@ def inspect_checkpoint_index_drift(container, expected_key, *, progress):
     return IndexRecoveryInput(project, observed.key, {
         "kind": "git-index-only", "originalManifestKey": recorded,
         "observedManifestKey": observed.key, "changedPaths": changed,
-    })
+    }, input_policy=policy)

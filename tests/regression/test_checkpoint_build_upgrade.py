@@ -27,6 +27,52 @@ class CheckpointBuildUpgradeTests(unittest.TestCase):
         config = {"verifyConfig": {"commands": ["node check.cjs"], "projectChecks": "strict", "timeoutSeconds": 60}}
         return checkpoint, config
 
+    def test_upgrade_preserves_explicit_legacy_policy_despite_new_nx_defaults(self):
+        for index_drift in (False, True):
+            with self.subTest(index_drift=index_drift), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                checkpoint, config = self.fixture(root)
+                project = root / 'project'
+                (project / 'nx.json').write_text('{}', encoding='utf-8')
+                (project / '.nx/cache').mkdir(parents=True)
+                (project / '.nx/cache/pinned-input').write_text('legacy captured bytes', encoding='utf-8')
+                (project / '.nx/config.json').write_text('{"source":true}', encoding='utf-8')
+                if index_drift:
+                    for args in (['init'], ['add', '.'], ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'fixture']):
+                        subprocess.run(['git', '-C', str(project), *args], check=True, capture_output=True)
+                with mock.patch.object(source, 'tool_build_id', return_value='a' * 64):
+                    old = source.capture_durable_source_snapshot(project, root / 'legacy-nx', policy=source.SourceInputPolicy())
+                checkpoint.update(sourceSnapshotKey=old.key, sourceSnapshotContainer=str(old.container))
+                self.assertTrue((old.project_path / '.nx/cache/pinned-input').is_file())
+                original_manifest = (old.container / 'manifest.json').read_bytes()
+                if index_drift:
+                    os.utime(old.project_path / 'check.cjs', (1_700_000_000, 1_700_000_000))
+                    subprocess.run(['git', '--no-optional-locks', '-C', str(old.root), 'update-index', '--refresh'], check=True, capture_output=True)
+                def verify(selected, assignment):
+                    self.assertEqual((selected / '.nx/cache/pinned-input').read_text(), 'legacy captured bytes')
+                    self.assertEqual((selected / '.nx/config.json').read_text(), '{"source":true}')
+                    return BaselineVerifyResult(True, 'passed', 'fresh checks')
+                checked = mock.Mock(side_effect=verify)
+                with mock.patch.dict(os.environ, {'DEPLOOM_SOURCE_SCOPE_MODE': 'frontend'}):
+                    result = upgrade.reopen_checkpoint_source(root / 'run', checkpoint, config, verify=checked, progress=lambda *a: None)
+                checked.assert_called_once()
+                self.assertEqual(result.input_policy, source.SourceInputPolicy())
+                self.assertEqual((old.container / 'manifest.json').read_bytes(), original_manifest)
+                self.assertNotEqual(result.key, old.key)
+                self.assertEqual(checkpoint['sourceSnapshotKey'], old.key)
+
+    def test_default_capture_still_excludes_runtime_nx_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / 'project'; project.mkdir()
+            (project / 'nx.json').write_text('{}', encoding='utf-8')
+            (project / '.nx/cache').mkdir(parents=True)
+            (project / '.nx/cache/runtime').write_text('cache', encoding='utf-8')
+            (project / '.nx/source-config.json').write_text('{}', encoding='utf-8')
+            captured = source.capture_durable_source_snapshot(project, root / 'automatic')
+            self.assertFalse((captured.root / '.nx/cache/runtime').exists())
+            self.assertTrue((captured.root / '.nx/source-config.json').exists())
+
     def test_evicted_upgrade_copy_requires_fresh_verification(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); checkpoint,config=self.fixture(root)

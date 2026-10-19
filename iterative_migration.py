@@ -2911,14 +2911,19 @@ def _registry_failure_class(output: str, *, timed_out: bool = False) -> str:
 
 def _query_discovery_metadata(project_dir: Path, args: List[str], runtime_env: Optional[Dict[str, str]]) -> Any:
     from planning_cache import cached_query, public_cli_context
+    if _probe_budget_timeout() is None:
+        return None, False, "budget-exhausted", ""
     context = public_cli_context(project_dir, runtime_env)
     if context is None:
         return _query_discovery_metadata_live(project_dir, args, runtime_env)
     def check():
         if _probe_budget_timeout() is None:
             raise BudgetExceededError("DISCOVERY_DEADLINE_EXCEEDED")
-    return cached_query(["registry-cli-v1", context, args],
-                        lambda: _query_discovery_metadata_live(project_dir, args, runtime_env), check=check)
+    try:
+        return cached_query(["registry-cli-v1", context, args],
+                            lambda: _query_discovery_metadata_live(project_dir, args, runtime_env), check=check)
+    except BudgetExceededError:
+        return None, False, "budget-exhausted", ""
 
 
 def _query_discovery_metadata_live(project_dir: Path, args: List[str], runtime_env: Optional[Dict[str, str]]) -> Any:
@@ -5769,6 +5774,10 @@ def _audit_locked(
     overrides = {key: getattr(args, key, None) for key in (
         "registry", "lag_months", "min_lag_ok_pct", "max_known_high", "yarn_audit_engine")
         if getattr(args, key, None) not in (None, "", "auto")}
+    if getattr(args, "refresh_evidence", None):
+        # A stale report needs its own bounded refresh, not the completed
+        # collection's retry slot. Repeated retries share this same identity.
+        overrides["refresh_evidence"] = args.refresh_evidence
     audit_identity = _sha256_text(_stable_json(overrides)) if overrides else ""
     checkpoint_id = str(run["activeCheckpointId"])
     return recover_checkpoint_audit(checkpoint_id=checkpoint_id, config=config,

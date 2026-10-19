@@ -99,6 +99,44 @@ class GitDeliveryTests(unittest.TestCase):
         expected,_,_=inspect_delivery(self.run_dir,state,self.checkpoint)
         self.assertIn('docs/dependency-migration/'+self.run['runId']+'/ru/MIGRATION_REPORT.md',expected)
 
+    def test_security_prepare_refreshes_expired_saved_failure_before_repair(self):
+        from datetime import timedelta
+        evidence = self.run_dir / "audit" / "C1"
+        evidence.mkdir(parents=True)
+        expired = report(critical=1)
+        expired["generatedAt"] = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        core._write_json_atomic(evidence / "audit-report.json", expired)
+        self.checkpoint["audit"] = {"status": "FAIL", "evidenceRef": str(evidence)}
+        core.save_checkpoint(self.run_dir, self.checkpoint)
+        # A completed collection under the old scope must not suppress refresh.
+        old_scope = "C1:fixture-key::" + core._sha256_text(core._stable_json({"yarn_audit_engine": "yarn-inventory"}))
+        self.run["auditRecovery"] = {old_scope: {"attempts": 1, "inFlight": False}}
+        core.save_run(self.run_dir, self.run)
+        def refresh(*args):
+            core._write_json_atomic(evidence / "audit-report.json", report(critical=1))
+        with patch.object(core, "_audit_once_locked", side_effect=refresh) as audit, patch.object(core, "_materialize_trial_tree", side_effect=lambda snapshot, root, timeout: shutil.copytree(snapshot.root, root)):
+            result = d.security_prepare(self.run_dir, {})
+        audit.assert_called_once()
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["beforeAudit"]["status"], "FAIL")
+        self.assertEqual(core.load_run(self.run_dir)["activeCheckpointId"], "C1")
+        self.assert_original_preserved()
+
+    def test_security_prepare_missing_or_unknown_report_still_blocks_after_refresh(self):
+        evidence = self.run_dir / "audit" / "C1"
+        evidence.mkdir(parents=True)
+        self.checkpoint["audit"] = {"status": "FAIL", "evidenceRef": str(evidence)}
+        core.save_checkpoint(self.run_dir, self.checkpoint)
+        for value in (None, {**report(), "auditComplete": False}):
+            if value is not None:
+                core._write_json_atomic(evidence / "audit-report.json", value)
+            with self.subTest(evidence=value is not None), patch.object(core, "_audit_locked") as audit, patch.object(core, "_materialize_trial_tree") as materialize:
+                with self.assertRaisesRegex(RuntimeError, "SECURITY_AUDIT_UNKNOWN"):
+                    d.security_prepare(self.run_dir, {})
+                audit.assert_called_once()
+                materialize.assert_not_called()
+        self.assertFalse((self.run_dir / "security-state.json").exists())
+
     def security_fixture(self):
         root = self.run_dir / "security" / "attempt-1" / "workspace"
         root.parent.mkdir(parents=True)

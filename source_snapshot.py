@@ -1145,7 +1145,7 @@ def source_copy_budget():
 def _capture_once(
     project_dir: Path,
     *,
-    policy: SourceInputPolicy,
+    policy: Optional[SourceInputPolicy],
     timeout_seconds: int,
     progress: Optional[ProgressCallback],
     progress_interval_seconds: int,
@@ -1154,7 +1154,7 @@ def _capture_once(
     deadline = (float("inf") if timeout_seconds == 0
                 else started + max(1, int(timeout_seconds)))
     capture_root, project_relative, git_head = _subject_layout(project_dir)
-    if policy == SourceInputPolicy():
+    if policy is None:
         from scoped_source_policy import policy_for_project
         policy = policy_for_project(project_dir, capture_root)
     if _excluded(project_relative / "package.json", policy):
@@ -1298,7 +1298,7 @@ def _capture_once(
 def _capture_source_snapshot_impl(
     project_dir: Path,
     *,
-    policy: SourceInputPolicy = SourceInputPolicy(),
+    policy: Optional[SourceInputPolicy] = None,
     timeout_seconds: int = 1800,
     progress: Optional[ProgressCallback] = None,
     progress_interval_seconds: int = 15,
@@ -2133,12 +2133,15 @@ def build_source_tree_manifest(
 def capture_source_snapshot(
     project_dir: Path,
     *,
-    policy: SourceInputPolicy = SourceInputPolicy(),
+    policy: Optional[SourceInputPolicy] = None,
     timeout_seconds: int = 1800,
     progress: Optional[ProgressCallback] = None,
     progress_interval_seconds: int = 15,
 ) -> SourceSnapshot:
     capture_root, _project_relative, _git_head = _subject_layout(project_dir)
+    if policy is None:
+        from scoped_source_policy import policy_for_project
+        policy = policy_for_project(project_dir, capture_root)
     if not _observability_sink_is_source_safe(capture_root, policy):
         with suppress_observability():
             return _capture_source_snapshot_impl(
@@ -2416,6 +2419,7 @@ def capture_durable_source_snapshot(
     project_dir: Path,
     destination: Path,
     *,
+    policy: Optional[SourceInputPolicy] = None,
     timeout_seconds: int = 1800,
     progress: Optional[ProgressCallback] = None,
 ) -> SourceSnapshot:
@@ -2429,6 +2433,7 @@ def capture_durable_source_snapshot(
     with prefer_snapshot_parent(destination_parent):
         snapshot = capture_source_snapshot(
             project_dir,
+            policy=policy,
             timeout_seconds=_remaining(deadline),
             progress=progress,
         )

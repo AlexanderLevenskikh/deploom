@@ -76,7 +76,7 @@ def reopen_checkpoint_source(run_dir, checkpoint, config, *, verify, progress, r
     progress("Preparing checkpoint copy for fresh verification with the updated DepLoom")
     destination = directory / (key + "-source")
     snapshot = (open_source_snapshot(destination, timeout_seconds=0, progress=progress) if destination.exists()
-                else capture_durable_source_snapshot(old.project_path, destination, timeout_seconds=0, progress=progress))
+                else capture_durable_source_snapshot(old.project_path, destination, policy=old.input_policy, timeout_seconds=0, progress=progress))
     if snapshot.manifest_key != old.manifest_key:
         raise CheckpointBuildUpgradeError("CHECKPOINT_BUILD_UPGRADE_CONTENT_MISMATCH")
     progress("Re-running the selected checks on the preserved checkpoint; old proof is not reused")

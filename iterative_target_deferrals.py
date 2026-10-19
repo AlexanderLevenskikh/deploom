@@ -22,6 +22,9 @@ def availability_scope(run: Mapping, config: Mapping) -> str:
 
 def record_unavailable_targets(ledger: dict, run: Mapping, config: Mapping,
                                candidate: Mapping, output: str) -> bool:
+    # Yarn emits colours and OSC hyperlinks around codes in captured CI output.
+    output = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", output)
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
     npm_target = bool(re.search(r'\bnpm (?:error|ERR!) code ETARGET\b', output))
     yarn_matches = list(re.finditer(r'YN0082:\s+(?:\u2502\s*)?((?:@[^\s/@:]+/)?[^\s/@:]+)@npm:(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?): No candidates found', output))
     if not npm_target and not yarn_matches:

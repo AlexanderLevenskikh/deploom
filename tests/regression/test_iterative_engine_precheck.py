@@ -273,7 +273,9 @@ class IterativeEnginePrecheckTests(unittest.TestCase):
         for body, expected in [("", ""), ('{"version":"2.0.0","engines.node":">=20"}', ">=20"),
                                ('{"version":"2.0.0","engines.node":">=25"}', ">=25"),
                                ('{"version":"3.0.0","engines.node":">=25"}', ""), ('not JSON', "")]:
-            with self.subTest(body=body), mock.patch.object(migration, 'modern_yarn_root', return_value=None), \
+            # Each subtest supplies a different synthetic registry response at
+            # the same address. Exercise parsing rather than a prior cached row.
+            with self.subTest(body=body), mock.patch.dict('os.environ', {'DEPLOOM_PLANNING_CACHE_DIR': '0'}), mock.patch.object(migration, 'modern_yarn_root', return_value=None), \
                  mock.patch.object(migration, 'resolve_executable', return_value='npm'), \
                  mock.patch.object(migration, '_run', return_value=subprocess.CompletedProcess([], 0, warning + body, '')):
                 self.assertEqual(migration._npm_engines_node(Path('.'), 'fixture', '2.0.0', {}), expected)

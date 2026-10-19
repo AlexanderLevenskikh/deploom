@@ -73,6 +73,27 @@ class IterativeRegistryBatchTests(unittest.TestCase):
         self.assertIsNone(target)
         self.assertTrue(all(item['status'] in ('engines-unknown', 'not-newer-than-current') for item in row['rejected']))
 
+    def test_cache_lease_deadline_returns_budget_result_without_spawning(self):
+        import planning_cache
+        with tempfile.TemporaryDirectory() as tmp, patch.object(planning_cache, 'public_cli_context', return_value={'fixture': 'public'}), \
+             patch.object(planning_cache, 'cache_root', return_value=Path(tmp)), \
+             patch.object(im, '_probe_budget_timeout', side_effect=[10, 10, None]), patch.object(im, '_run') as runner:
+            result = im._query_discovery_metadata(Path(tmp), ['view', 'fixture', 'version', '--json'], {})
+            self.assertEqual(result, (None, False, 'budget-exhausted', ''))
+            runner.assert_not_called()
+
+    def test_expired_deadline_does_not_return_warm_registry_metadata(self):
+        import planning_cache
+        context = {'fixture': 'public'}
+        args = ['view', 'fixture', 'version', '--json']
+        with tempfile.TemporaryDirectory() as tmp:
+            planning_cache.write_entry(Path(tmp), ['registry-cli-v1', context, args], {'version': '3.0.0'})
+            with patch.object(planning_cache, 'public_cli_context', return_value=context), \
+                 patch.object(planning_cache, 'cache_root', return_value=Path(tmp)), \
+                 patch.object(im, '_probe_budget_timeout', return_value=None), patch.object(im, '_run') as runner:
+                self.assertEqual(im._query_discovery_metadata(Path(tmp), args, {}), (None, False, 'budget-exhausted', ''))
+                runner.assert_not_called()
+
     def test_expired_deadline_spawns_nothing(self):
         previous = im._ACTIVE_DISCOVERY_DEADLINE
         try:
