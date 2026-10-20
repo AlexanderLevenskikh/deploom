@@ -35,6 +35,10 @@ class AuthorityBoundaryTests(unittest.TestCase):
         (self.project / 'input.txt').write_text('good', encoding='utf-8')
         (self.project / 'check.cjs').write_text("if(require('fs').readFileSync('input.txt','utf8')!=='good')process.exit(1)", encoding='utf-8')
         self.git('init', '-q')
+        # Detached Git housekeeping can recreate .git entries during temp cleanup.
+        # This fixture tests committed bytes, so keep its repository quiescent.
+        self.git('config', 'maintenance.auto', 'false')
+        self.git('config', 'gc.auto', '0')
         self.git('config', 'core.autocrlf', 'false')
         self.git('add', '.')
         self.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture')
