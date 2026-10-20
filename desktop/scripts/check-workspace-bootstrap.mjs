@@ -8,6 +8,7 @@ const root = process.cwd()
 const compiled = join(root, 'dist-electron', 'workspace-bootstrap.js')
 const { initializeWorkspaceRepository, WORKSPACE_SETTINGS_PATH } = await import(pathToFileURL(compiled).href)
 const { readProjectManifest } = await import(pathToFileURL(join(root, 'dist-electron/project-manifest.js')).href)
+const { registerWslRepository } = await import(pathToFileURL(join(root, 'dist-electron/wsl-paths.js')).href)
 
 const calls = []
 const fakeGit = async (command, args, cwd) => {
@@ -76,7 +77,7 @@ try {
   const state = { workspaces: [workspace, other], selectedWorkspaceId: 'ws' }
   const settingsPath = join(workspaceRoot, 'settings.json'), jobs = new Map()
   const bindings = {
-    ...fs, ...paths, jobs, readProjectManifest,
+    ...fs, ...paths, jobs, readProjectManifest, registerWslRepository,
     loadState: () => state, saveState: () => {},
     findWorkspace: (current, id) => { const value = current.workspaces.find(w => w.id === id); if (!value) throw Error('missing workspace'); return value },
     selectedWorkspace: current => current.workspaces.find(w => w.id === current.selectedWorkspaceId),
