@@ -45,8 +45,8 @@ try {
     "-r", path.join(repoDir, "requirements.txt"), "--target", vendorDir,
   ], "portable tool dependency installation");
   // -S prevents installed host packages from hiding a broken vendor directory.
-  runPython(["-S", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import yaml; assert not yaml.__with_libyaml__; assert yaml.safe_load('version: 4') == {'version': 4}", vendorDir],
-    "portable YAML parser smoke test");
+  runPython(["-S", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import requests, semantic_version, dateutil, yaml; assert semantic_version.NpmSpec('^1.0.0').match(semantic_version.Version('1.2.3')); assert not yaml.__with_libyaml__; assert yaml.safe_load('version: 4') == {'version': 4}", vendorDir],
+    "portable tool dependency smoke test");
 } finally {
   rmSync(wheelDir, { recursive: true, force: true });
 }

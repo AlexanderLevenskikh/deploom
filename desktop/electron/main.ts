@@ -64,7 +64,7 @@ import { normalizeBudgetField } from './baseline-intent.js'
 import { summarizeUpdaterError } from './updater-error.js'
 import { createFlowNotificationSender, createIterativeNotificationObserver, type FlowNotificationEvent } from './notifications.js'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { commandEnvironment, createProcessOutputDecoder, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
+import { bundledPythonEnvironment, commandEnvironment, createProcessOutputDecoder, decodeProcessOutputChunk, normalizePathForComparison, packageManagerResolutionHint, processTreeDetached, resolveExecutable, resolveSpawnInvocation } from './process-launcher.js'
 import { currentTask as readIterativeCurrentTask, type IterativeTaskRefreshResult, iterativeRunDirPath, missingTaskExportInput, repairPromptTaskText, taskDispatchable, taskStaleness } from './iterative-migration.js'
 import { discoveryProgress } from './iterative-discovery-progress.js'
 import { pendingCohortReview, cohortReviewEnabled, saveCohortReviewEnabled } from './iterative-cohort-review.js'
@@ -1675,7 +1675,7 @@ function spawnCapture(command: string, args: string[], cwd: string, timeoutMs = 
     let timedOut = false
     // Reading Git status must not refresh an index inside a sealed checkpoint.
     const captureEnv = { ...process.env, ...envOverrides, ...(command === 'git' ? { GIT_OPTIONAL_LOCKS: '0' } : {}) }
-    const commandEnv = commandEnvironment(captureEnv)
+    const commandEnv = bundledPythonEnvironment(command, bundledToolDir(), commandEnvironment(captureEnv))
     const invocation = resolveSpawnInvocation(command, args, { env: commandEnv })
     const child = spawn(invocation.command, invocation.args, { cwd, shell: false, detached: processTreeDetached(), windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments, env: commandEnv })
     const timer = setTimeout(() => { timedOut = true; killProcessTree(child) }, timeoutMs)
@@ -1711,7 +1711,7 @@ function spawnCapture(command: string, args: string[], cwd: string, timeoutMs = 
 // Desktop contract checks can exercise it with a real child.
 const iterativeStreamPlatform: StreamPlatform = {
   processTreeDetached: () => processTreeDetached(),
-  commandEnvironment: (env: NodeJS.ProcessEnv) => commandEnvironment(env),
+  commandEnvironment: (env: NodeJS.ProcessEnv, command: string) => bundledPythonEnvironment(command, bundledToolDir(), commandEnvironment(env)),
   resolveSpawnInvocation: (command: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => resolveSpawnInvocation(command, args, opts),
   killProcessTree: (child: ChildProcess) => killProcessTree(child as ChildProcessWithoutNullStreams),
   decodeChunk: (chunk: Buffer) => decodeProcessOutputChunk(chunk),

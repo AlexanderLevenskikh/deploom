@@ -54,6 +54,25 @@ export function commandEnvironment(
   return { ...source, PATH: [...new Set([...inherited, ...extras])].join(path.delimiter) }
 }
 
+/** Give bundled Python entry points their release's dependencies even on a
+ * clean host. Commands may already be resolved to python3 or an absolute exe. */
+export function bundledPythonEnvironment(
+  command: string,
+  toolDirectory: string,
+  source: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  const path = pathApi(platform)
+  if (!/^python(?:\d+(?:\.\d+)*)?(?:\.exe)?$/i.test(path.basename(command))) return { ...source }
+  const vendor = path.join(toolDirectory, 'vendor')
+  const inherited = (source.PYTHONPATH ?? '').split(path.delimiter).filter(Boolean)
+  return {
+    ...source,
+    PYTHONUNBUFFERED: '1',
+    PYTHONPATH: [vendor, ...inherited.filter(entry => entry !== vendor)].join(path.delimiter),
+  }
+}
+
 function windowsSearchDirectories(env: NodeJS.ProcessEnv, pathValue: string, platform: NodeJS.Platform): string[] {
   const path = pathApi(platform)
   const entries = pathValue.split(path.delimiter).map((item) => item.trim()).filter(Boolean)

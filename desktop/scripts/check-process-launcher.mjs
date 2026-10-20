@@ -1,12 +1,32 @@
 import { win32 } from 'node:path'
 import assert from 'node:assert/strict'
-import { commandEnvironment, createProcessOutputDecoder, decodeProcessOutputChunk, packageManagerResolutionHint, resolveExecutable, resolveSpawnInvocation } from '../dist-electron/process-launcher.js'
+import { bundledPythonEnvironment, commandEnvironment, createProcessOutputDecoder, decodeProcessOutputChunk, packageManagerResolutionHint, resolveExecutable, resolveSpawnInvocation } from '../dist-electron/process-launcher.js'
 import { openCodeDatabaseEnv, openCodeDatabaseLocked, openCodeRuntimePaths } from '../dist-electron/opencode-runtime.js'
 
 for (const platform of ['win32', 'darwin', 'linux']) {
   const inherited = { PATH: '/fixture/bin', NX_DAEMON: 'true' }
   if (commandEnvironment(inherited, platform).NX_DAEMON !== 'false') throw new Error('Private migration children must disable the Nx daemon')
   if (inherited.NX_DAEMON !== 'true') throw new Error('Child policy must not mutate the parent environment')
+}
+
+// Both logical and resolved Python names must receive release-local dependencies.
+for (const platform of ['win32', 'linux', 'darwin']) {
+  const tool = platform === 'win32' ? 'C:\\Program Files\\DepLoom\\tool' : '/opt/DepLoom/tool';
+  const separator = platform === 'win32' ? ';' : ':';
+  const vendor = platform === 'win32' ? tool + '\\vendor' : tool + '/vendor';
+  const inherited = { PATH: 'keep', PYTHONPATH: 'inherited', MARKER: 'override' };
+  for (const command of ['python', 'python3', 'python3.12', 'python.exe',
+    platform === 'win32' ? 'C:\\Python\\python.exe' : '/usr/bin/python3']) {
+    const env = bundledPythonEnvironment(command, tool, inherited, platform);
+    assert.equal(env.PYTHONPATH, vendor + separator + 'inherited');
+    assert.equal(env.PYTHONUNBUFFERED, '1');
+    assert.equal(env.MARKER, 'override');
+    assert.deepEqual(bundledPythonEnvironment(command, tool, env, platform), env);
+  }
+  assert.equal(inherited.PYTHONPATH, 'inherited', 'parent environment must stay unchanged');
+  for (const command of ['git', 'node', 'opencode', 'python-helper']) {
+    assert.deepEqual(bundledPythonEnvironment(command, tool, inherited, platform), inherited);
+  }
 }
 
 const appData = win32.join(String.raw`C:\virtual`, 'AppData', 'Roaming')

@@ -30,7 +30,7 @@ export type CaptureResult = { code: number; stdout: string; stderr: string; time
 
 export type StreamPlatform = {
   processTreeDetached: () => boolean
-  commandEnvironment: (env: NodeJS.ProcessEnv) => NodeJS.ProcessEnv
+  commandEnvironment: (env: NodeJS.ProcessEnv, command: string) => NodeJS.ProcessEnv
   resolveSpawnInvocation: (
     command: string,
     args: string[],
@@ -107,7 +107,7 @@ export function spawnIterativeStreamed(
         try { io.trimLog(runDir) } catch { /* best-effort */ }
       }
     }
-    const commandEnv = platform.commandEnvironment(process.env)
+    const commandEnv = platform.commandEnvironment(process.env, command)
     const invocation = platform.resolveSpawnInvocation(command, args, { env: commandEnv })
     const child = spawn(invocation.command, invocation.args, {
       cwd,
