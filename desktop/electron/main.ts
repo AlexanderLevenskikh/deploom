@@ -1,4 +1,5 @@
 import { readIterativeGraphView } from './iterative-graph-view.js'
+import { registerWslRepository } from './wsl-paths.js'
 import { defenderExclusionTarget, defenderExclusionCommand } from './defender-exclusion.js'
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, net, Notification, protocol, session, shell } from 'electron'
 import updaterPackage from 'electron-updater'
@@ -1065,6 +1066,7 @@ function resolveProjectPackageDirectory(inputPath: string, strict = false): stri
 
 async function resolveProjectGitLayout(project: ProjectSpec): Promise<{ gitRoot: string; packageRelativePath: string }> {
   const packageRoot = realpathSync.native(resolve(project.path))
+  registerWslRepository(packageRoot)
   const probe = await spawnCapture('git', ['-C', packageRoot, 'rev-parse', '--show-toplevel'], packageRoot, 15_000)
   if (probe.timedOut || probe.code !== 0) {
     throw new Error(probe.stderr.trim() || `Не удалось определить Git root для ${packageRoot}`)
@@ -1122,6 +1124,7 @@ function readProjects(workspace: WorkspaceRecord): ProjectSpec[] {
     return settings.projects.map((project) => {
       const absolute = isAbsolute(project.path) ? resolve(project.path) : resolve(configuredRoot, project.path)
       const path = resolveProjectPackageDirectory(absolute)
+      registerWslRepository(path)
       // D2.4: display-only Node hints from the repo pins (engines.node and
       // .nvmrc/.node-version). The UI may suggest them, never auto-fills.
       return { ...project, git: { ...project.git, sourceBranch: project.sourceBranch || project.git?.sourceBranch || 'master' }, path, nodeHints: projectNodeHints(path) }
@@ -1676,8 +1679,8 @@ function spawnCapture(command: string, args: string[], cwd: string, timeoutMs = 
     // Reading Git status must not refresh an index inside a sealed checkpoint.
     const captureEnv = { ...process.env, ...envOverrides, ...(command === 'git' ? { GIT_OPTIONAL_LOCKS: '0' } : {}) }
     const commandEnv = bundledPythonEnvironment(command, bundledToolDir(), commandEnvironment(captureEnv))
-    const invocation = resolveSpawnInvocation(command, args, { env: commandEnv })
-    const child = spawn(invocation.command, invocation.args, { cwd, shell: false, detached: processTreeDetached(), windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments, env: commandEnv })
+    const invocation = resolveSpawnInvocation(command, args, { env: commandEnv, cwd })
+    const child = spawn(invocation.command, invocation.args, { cwd: invocation.cwd ?? cwd, shell: false, detached: processTreeDetached(), windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments, env: invocation.env ?? commandEnv })
     const timer = setTimeout(() => { timedOut = true; killProcessTree(child) }, timeoutMs)
     const stdoutDecoder = createProcessOutputDecoder()
     const stderrDecoder = createProcessOutputDecoder()
@@ -1712,7 +1715,7 @@ function spawnCapture(command: string, args: string[], cwd: string, timeoutMs = 
 const iterativeStreamPlatform: StreamPlatform = {
   processTreeDetached: () => processTreeDetached(),
   commandEnvironment: (env: NodeJS.ProcessEnv, command: string) => bundledPythonEnvironment(command, bundledToolDir(), commandEnvironment(env)),
-  resolveSpawnInvocation: (command: string, args: string[], opts: { env: NodeJS.ProcessEnv }) => resolveSpawnInvocation(command, args, opts),
+  resolveSpawnInvocation: (command: string, args: string[], opts: { env: NodeJS.ProcessEnv; cwd?: string }) => resolveSpawnInvocation(command, args, opts),
   killProcessTree: (child: ChildProcess) => killProcessTree(child as ChildProcessWithoutNullStreams),
   decodeChunk: (chunk: Buffer) => decodeProcessOutputChunk(chunk),
 }
@@ -2190,14 +2193,14 @@ async function ensureOpenCodeServer(job: JobRecord, cwd: string): Promise<string
       const port = await reserveLocalPort()
       const url = `http://127.0.0.1:${port}`
       const commandEnv = commandEnvironment(openCodeDatabaseEnv(process.env, databasePath))
-      const opencodeInvocation = resolveSpawnInvocation('opencode', ['serve', '--hostname', '127.0.0.1', '--port', String(port)], { env: commandEnv })
+      const opencodeInvocation = resolveSpawnInvocation('opencode', ['serve', '--hostname', '127.0.0.1', '--port', String(port)], { env: commandEnv, cwd })
       const server = spawn(opencodeInvocation.command, opencodeInvocation.args, {
-        cwd,
+        cwd: opencodeInvocation.cwd ?? cwd,
         shell: false,
         detached: processTreeDetached(),
         windowsHide: true,
         windowsVerbatimArguments: opencodeInvocation.windowsVerbatimArguments,
-        env: commandEnv,
+        env: opencodeInvocation.env ?? commandEnv,
       })
       owner.openCodeServer = server
       owner.openCodeServerUrl = url
@@ -2869,10 +2872,11 @@ async function executeBaselineWorkerCommand(
   const request = baselineWorker().run(workerKey, {
     cwd: spec.cwd,
     argv: spec.args.slice(1),
-    env: {
+    env: commandEnvironment({
+      ...process.env,
       ...spec.env,
       DEPLOOM_BASELINE_HOT_CONTINUATION: hotContinuation ? '1' : '0',
-    },
+    }),
     onOutput: (stream, text) => {
       if (!text) return
       if (
@@ -6680,8 +6684,8 @@ async function executeCommand(job: JobRecord, spec: CommandSpec): Promise<{ code
     } else {
       commandEnv = baseEnv
     }
-    const invocation = resolveSpawnInvocation(spec.command, spec.args, { env: commandEnv })
-    const child = spawn(invocation.command, invocation.args, { cwd: spec.cwd, shell: false, detached: processTreeDetached(), windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments, env: commandEnv })
+    const invocation = resolveSpawnInvocation(spec.command, spec.args, { env: commandEnv, cwd: spec.cwd })
+    const child = spawn(invocation.command, invocation.args, { cwd: invocation.cwd ?? spec.cwd, shell: false, detached: processTreeDetached(), windowsHide: true, windowsVerbatimArguments: invocation.windowsVerbatimArguments, env: invocation.env ?? commandEnv })
     job.child = child
     rootJob.parallelChildren ??= new Set<ChildProcessWithoutNullStreams>()
     rootJob.parallelChildren.add(child)
@@ -7237,9 +7241,10 @@ function setupIpc(): void {
     try { manifestIsFile = statSync(join(projectPath, 'package.json')).isFile() } catch { manifestIsFile = false }
     if (!manifestIsFile) throw new Error('Выберите рабочую директорию с package.json. Подпроекты автоматически не выбираются.')
     readProjectManifest(projectPath)
+    registerWslRepository(projectPath)
     const gitProbe = await spawnCapture('git', ['-C', projectPath, 'rev-parse', '--is-inside-work-tree'], projectPath, 15_000)
     if (gitProbe.timedOut || gitProbe.code !== 0 || gitProbe.stdout.trim().toLowerCase() !== 'true') {
-      throw new Error('Папка проекта не находится внутри Git-репозитория.')
+      throw new Error(gitProbe.stderr.trim() || (gitProbe.timedOut ? 'Проверка Git превысила время ожидания.' : 'Папка проекта не находится внутри Git-репозитория.'))
     }
     const layout = await resolveProjectGitLayout({ name: raw.name, path: projectPath })
     if (raw.repositoryPath?.trim() && relative(realpathSync.native(resolve(raw.repositoryPath.trim())), layout.gitRoot) !== '') {
@@ -8840,14 +8845,14 @@ function setupIpc(): void {
     const port = await reserveLocalPort()
     const url = `http://127.0.0.1:${port}`
     const commandEnv = commandEnvironment(openCodeDatabaseEnv(process.env, databasePath))
-    const invocation = resolveSpawnInvocation('opencode', ['serve', '--hostname', '127.0.0.1', '--port', String(port)], { env: commandEnv })
+    const invocation = resolveSpawnInvocation('opencode', ['serve', '--hostname', '127.0.0.1', '--port', String(port)], { env: commandEnv, cwd })
     const server = spawn(invocation.command, invocation.args, {
-      cwd,
+      cwd: invocation.cwd ?? cwd,
       shell: false,
       detached: processTreeDetached(),
       windowsHide: true,
       windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-      env: commandEnv,
+      env: invocation.env ?? commandEnv,
     })
     let tail = ''
     const stdoutDecoder = createProcessOutputDecoder()

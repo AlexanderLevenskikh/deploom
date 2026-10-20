@@ -14,6 +14,7 @@
 | `README.md` | Публичный обзор продукта, платформы, установка, запуск, публикация, поддержка пакетных менеджеров. |
 | `HOW_IT_WORKS.md` | Простыми словами: baseline, solver, greedy, группы, накопительная миграция, верификация. |
 | `settings.schema.json` | Схема настроек проекта и Desktop; источник истины для путей/режимов. |
+| [WINDOWS_WSL.md](WINDOWS_WSL.md) | Windows Desktop с исходниками WSL: Git trust и рабочая директория UNC-команд. |
 | [WSL_APPIMAGE.md](WSL_APPIMAGE.md) | Запуск AppImage в Ubuntu WSLg, системные пакеты и подключение проекта. |
 | `docs/ITERATIVE_MIGRATION_CONTROL_LOOP.md` | Текущий управляющий цикл накопительной миграции, фиксы аудита B1–B7, bounded GC и результаты валидации. |
 | `docs/ITERATIVE_MIGRATION_DEMO.md` | Профильная интеграционная демонстрация через настоящий Node coordinator + Python CLI. |

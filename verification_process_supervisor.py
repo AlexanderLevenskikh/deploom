@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
 from verification_observability import emit_observability_event
+from windows_unc import prepare_unc_shell
 
 ProgressCallback = Callable[[str], None]
 OutputObserver = Callable[[str], None]
@@ -482,13 +483,14 @@ def run_supervised(
     merged_env = dict(base_env) if base_env is not None else os.environ.copy()
     if env:
         merged_env.update({str(k): str(v) for k, v in env.items()})
+    argv, launch_cwd, merged_env = prepare_unc_shell(argv, cwd, merged_env)
     linux_token = uuid.uuid4().hex
     if _LINUX_SUBREAPER:
         merged_env["DEPLOOM_SUPERVISION_TOKEN"] = linux_token
 
     started = time.monotonic()
     popen_kwargs = dict(
-        cwd=str(cwd),
+        cwd=str(launch_cwd),
         env=merged_env,
         text=True,
         encoding="utf-8",

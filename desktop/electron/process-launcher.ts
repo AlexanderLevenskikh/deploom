@@ -1,10 +1,12 @@
 import { existsSync } from 'node:fs'
 import { posix, win32 } from 'node:path'
+import { uncShellInvocation, wslGitEnvironment } from './wsl-paths.js'
 
-export type ResolvedInvocation = { command: string; args: string[]; resolvedExecutable: string; windowsVerbatimArguments?: boolean }
+export type ResolvedInvocation = { command: string; args: string[]; resolvedExecutable: string; windowsVerbatimArguments?: boolean; cwd?: string; env?: NodeJS.ProcessEnv }
 
 type ResolveOptions = {
   platform?: NodeJS.Platform
+  cwd?: string
   env?: NodeJS.ProcessEnv
   pathValue?: string
   fileExists?: (path: string) => boolean
@@ -30,7 +32,7 @@ export function commandEnvironment(
   // Private migration workspaces are short-lived. A detached Nx watcher can
   // recreate .nx entries while the next candidate retires its old trial.
   source = { ...source, NX_DAEMON: 'false' }
-  if (platform === 'win32') return { ...source }
+  if (platform === 'win32') return wslGitEnvironment(source)
   const path = pathApi(platform)
   const home = source.HOME?.trim()
   const bunBin = source.BUN_INSTALL?.trim() ? path.join(source.BUN_INSTALL, 'bin') : undefined
@@ -158,7 +160,13 @@ export function resolveSpawnInvocation(command: string, args: string[], options:
   const resolvedExecutable = resolveExecutable(command, options)
   if (platform === 'win32' && /\.(?:cmd|bat)$/i.test(resolvedExecutable)) {
     const comspec = env.ComSpec || env.COMSPEC || 'cmd.exe'
+    if (options.cwd?.startsWith('\\\\') || options.cwd?.startsWith('//')) {
+      return { ...uncShellInvocation(cmdCommandLine(resolvedExecutable, args), options.cwd, env), resolvedExecutable }
+    }
     return { command: comspec, args: ['/d', '/s', '/c', cmdCommandLine(resolvedExecutable, args)], resolvedExecutable, windowsVerbatimArguments: true }
+  }
+  if (platform === 'win32' && (options.cwd?.startsWith('\\\\') || options.cwd?.startsWith('//')) && /^(?:cmd|cmd\.exe)$/i.test(win32.basename(resolvedExecutable)) && args.at(-2)?.toLowerCase() === '/c') {
+    return { ...uncShellInvocation(`"${args.at(-1)}"`, options.cwd, env), resolvedExecutable }
   }
   return { command: resolvedExecutable, args, resolvedExecutable }
 }

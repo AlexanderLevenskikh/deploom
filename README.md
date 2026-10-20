@@ -11,6 +11,7 @@
 | [USERGUIDE.md](USERGUIDE.md) | Как пользоваться DepLoom: два пути работы, скриншоты и переход к Draft при неудаче автоматического обновления. |
 | [HOW_IT_WORKS.md](HOW_IT_WORKS.md) | Как устроены подбор версий, накопительное обновление и проверка результата. |
 | [Desktop](desktop/README.md) | Запуск из исходников, сборка и особенности Desktop. |
+| [WSL-папки в Windows](docs/WINDOWS_WSL.md) | Подключение исходников WSL с выполнением команд инструментами Windows. |
 | [WSL и AppImage](docs/WSL_APPIMAGE.md) | Запуск Linux-версии в Ubuntu WSLg, установка пакетов и подключение проекта. |
 | [Индекс документации](docs/INDEX.md) | Основные контракты и исторические отчёты. |
 | [Настройки](settings.schema.json) | Схема настроек проектов и workspace. |

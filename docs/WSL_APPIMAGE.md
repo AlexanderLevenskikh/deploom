@@ -1,6 +1,6 @@
 # Запуск DepLoom в WSL через AppImage
 
-Для проектов внутри Ubuntu WSL запускайте Linux-версию DepLoom в той же Ubuntu. WSLg покажет окно на рабочем столе Windows, а Git, Python, Node и агент будут работать внутри Linux.
+Если проект требует Linux-окружения, запускайте Linux-версию DepLoom в той же Ubuntu WSL. WSLg покажет окно на рабочем столе Windows, а Git, Python, Node и агент будут работать внутри Linux. Для выполнения Windows-инструментами используйте [Windows-версию с WSL-папками](WINDOWS_WSL.md).
 
 ## 1. Проверка WSL
 

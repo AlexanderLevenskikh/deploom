@@ -34,8 +34,8 @@ export type StreamPlatform = {
   resolveSpawnInvocation: (
     command: string,
     args: string[],
-    opts: { env: NodeJS.ProcessEnv },
-  ) => { command: string; args: string[]; windowsVerbatimArguments?: boolean }
+    opts: { env: NodeJS.ProcessEnv; cwd?: string },
+  ) => { command: string; args: string[]; windowsVerbatimArguments?: boolean; cwd?: string; env?: NodeJS.ProcessEnv }
   killProcessTree: (child: ChildProcess) => void
   decodeChunk: (chunk: Buffer) => string
 }
@@ -108,14 +108,14 @@ export function spawnIterativeStreamed(
       }
     }
     const commandEnv = platform.commandEnvironment(process.env, command)
-    const invocation = platform.resolveSpawnInvocation(command, args, { env: commandEnv })
+    const invocation = platform.resolveSpawnInvocation(command, args, { env: commandEnv, cwd })
     const child = spawn(invocation.command, invocation.args, {
-      cwd,
+      cwd: invocation.cwd ?? cwd,
       shell: false,
       detached: platform.processTreeDetached(),
       windowsHide: true,
       windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-      env: commandEnv,
+      env: invocation.env ?? commandEnv,
     })
     // Zero disables only the overall watchdog; cancellation remains active.
     child.stdin.on('error', () => { /* EPIPE from an early child exit */ })

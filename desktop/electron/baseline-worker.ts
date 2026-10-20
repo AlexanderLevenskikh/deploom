@@ -61,15 +61,15 @@ export class BaselineWorkerPool {
     const invocation = resolveSpawnInvocation(
       this.pythonCommand,
       [this.workerPath],
-      { env },
+      { env, cwd },
     )
     const child = spawn(invocation.command, invocation.args, {
-      cwd,
+      cwd: invocation.cwd ?? cwd,
       shell: false,
       detached: processTreeDetached(),
       windowsHide: true,
       windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-      env,
+      env: invocation.env ?? env,
     })
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
