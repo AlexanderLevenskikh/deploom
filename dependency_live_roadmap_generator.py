@@ -7110,6 +7110,46 @@ def capture_desired_targets(rows_by_project: Dict[str, List[DependencyRow]]) -> 
                 setattr(row, _resolution_reason_attr(mode), "")
 
 
+def _draft_mirror_solver_resolution(
+    rows_by_project: Dict[str, List[DependencyRow]],
+    *,
+    solved_modes: Tuple[str, ...] = ("default",),
+) -> None:
+    """Draft solves ONE variant (``solved_modes``, the R2 "default" path) and
+    publishes the chosen target level (yellow/green) via _draft_target_for_major.
+    Rows whose version the compatibility solver changed in that variant carry the
+    solver-resolved target ONLY in that variant's attributes. Without mirroring,
+    the chosen-level export resurrects the stale pre-solver target -- evidence:
+    react-dom was published PROPOSED @19.0.4 while the exact solver proved
+    PEER_RESOLUTION_DEFERRED to current 18.3.1 (react stays 18.3.1, react-dom@19
+    requires react@^19). The compatibility solver is the canonical owner of a
+    resolved peer-connected/fallback/deferred target, so every other variant
+    attribute must reflect the same resolved assignment (target + resolution +
+    reason). Rows the solver did not adjust (empty resolution reason) keep all
+    their variants untouched.
+    """
+    if not solved_modes:
+        return
+    solved = solved_modes[0]
+    others = [mode for mode in ("yellow", "green", "default") if mode != solved]
+    if not others:
+        return
+    for rows in rows_by_project.values():
+        for row in rows:
+            if row.scope_excluded:
+                continue
+            reason = str(getattr(row, _resolution_reason_attr(solved), "") or "")
+            if not reason:
+                continue
+            resolved_target = getattr(row, _target_attr(solved))
+            solved_target_reason = str(getattr(row, _target_reason_attr(solved), "") or "")
+            for other in others:
+                setattr(row, _target_attr(other), resolved_target)
+                setattr(row, _resolution_reason_attr(other), reason)
+                if solved_target_reason:
+                    setattr(row, _target_reason_attr(other), solved_target_reason)
+
+
 def _aggregate_vulnerability_summary(rows: List[DependencyRow]) -> str:
     """Combine duplicate declarations without counting the same finding twice."""
     totals = {"C": 0, "H": 0, "M": 0, "L": 0, "U": 0}
@@ -27084,6 +27124,16 @@ def main() -> None:
                     run_context={"runId": run_id},
                 ),
                 rows_by_project,
+            )
+            # P0-DRAFT-EXPORT: the Draft solver resolves ONLY the "default"
+            # variant, while the export reads the chosen level (yellow/green).
+            # Mirror the solver-resolved target on to the other variants so a
+            # deferred/fallback version (e.g. react-dom@19.0.4 proven
+            # PEER_RESOLUTION_DEFERRED to 18.3.1) can never be resurrected as
+            # PROPOSED with needsReview=false.
+            _draft_mirror_solver_resolution(
+                rows_by_project,
+                solved_modes=("default",),
             )
             # A1/A4: reports are read from the ACCEPTED snapshot rows -- the
             # supervisor spliced them in atomically on success, so a worker
