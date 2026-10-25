@@ -180,6 +180,40 @@ class DraftPeerDeferralExportTests(unittest.TestCase):
         self.assertEqual("3.0.0", entry["target"], entry)
         self.assertEqual("proposed", entry["status"], entry)
 
+    def test_mirror_is_noop_when_variant_already_matches_solver(self):
+        client = self.make_client()
+        self.add_package(client, "plugin", {
+            "1.0.0": {},
+            "2.0.0": {"peerDependencies": {"core": "=2.0.0"}},
+            "3.0.0": {"peerDependencies": {"core": "=3.0.0"}},
+        })
+        self.add_package(client, "core", {"2.0.0": {}})
+        plugin = self.row("plugin", "1.0.0", "3.0.0")
+        core = self.row("core", "2.0.0", roadmap.NO_ACTION)
+
+        by_project = {"Demo": [plugin, core]}
+        roadmap.capture_desired_targets(by_project)
+        roadmap.enrich_registry_target_evidence(by_project, client)
+        roadmap.resolve_peer_compatibility(
+            by_project, client, modes=("default",), apply_results=True,
+            partial_on_incomplete=True, run_context={"runId": "test-noop"},
+        )
+        # The yellow AND green variants ALREADY carry the solver-resolved
+        # assignment (a consistent baseline -- e.g. re-run after a prior fix).
+        plugin.target_yellow = plugin.target_default
+        plugin.target_green = plugin.target_default
+        plugin.target_yellow_reason = plugin.target_default_reason
+        plugin.target_green_reason = plugin.target_default_reason
+        before = plugin.target_default, plugin.target_yellow, plugin.target_green
+
+        roadmap._draft_mirror_solver_resolution(by_project, solved_modes=("default",))
+
+        # Idempotence: mirroring an already-consistent row changes nothing and
+        # never invents a target that contradicts the solved assignment.
+        self.assertEqual(before, (plugin.target_default, plugin.target_yellow, plugin.target_green))
+        self.assertEqual(plugin.target_default, roadmap._draft_target_for_major(plugin))
+        self.assertIn("PEER_RESOLUTION_FALLBACK", plugin.compatibility_note)
+
     def test_mirror_is_wired_into_the_draft_branch_after_the_solver(self):
         source = Path(roadmap.__file__).read_text(encoding="utf-8")
         assert "def _draft_mirror_solver_resolution" in source
