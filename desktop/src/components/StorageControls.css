@@ -1,4 +1,0 @@
-.storage-control-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-.storage-migration-notice { margin: 0 0 16px; border-left: 3px solid var(--blue); background: var(--surface); padding: 14px 16px; }
-.storage-migration-notice strong { color: var(--text); }
-.storage-migration-notice .button { align-self: flex-start; }

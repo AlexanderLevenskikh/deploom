@@ -1,2 +1,0 @@
-# Backwards-compatible helper for developer scripts.
--r requirements-solver.txt

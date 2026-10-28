@@ -1,59 +1,8 @@
-# Local configuration and credentials
-.env
-.env.*
-!.env.example
-.npmrc
-.yarnrc
-.netrc
-*.pem
-*.key
-*.p12
-*.pfx
-*.jks
-*.keystore
-id_rsa
-id_ed25519
-
-# IDE / editor
-.idea/
-.vs/
-.vscode/
-.fleet/
-.history/
-*.swp
-*.swo
-*.suo
-*.user
-*.userosscache
-*.sln.docstates
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Generated / caches
+.venv/
 __pycache__/
-*.pyc
-node_modules/
-desktop/node_modules/
-desktop/dist/
-desktop/dist-electron/
-desktop/release/
-desktop/.npm/
-desktop/.cache/
-.dependency-roadmap/
-
-# Local agent-managed worktrees
-.claude/worktrees/
-
-# Local benchmark scratch/fixtures/raw results (never published)
-/benchmarks/work/*
-
-# Local per-date probe/audit artifacts (never published)
-docs/2026-*/
-
-# Internal audit/task evidence from the 2026-10-04 audit session (never published)
-docs/AUDIT_2026-10-04.md
-docs/AGENT_TASK_AUDIT_2026-10-04.md
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+*.log

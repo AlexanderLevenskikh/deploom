@@ -1,7 +1,0 @@
-.app-update-control { position:relative; font-size:12px; }
-.app-update-control > summary { display:flex; align-items:center; gap:6px; min-height:32px; padding:4px 8px; cursor:pointer; color:var(--muted); list-style:none; }
-.app-update-control > summary:hover { color:var(--blue); background:var(--surface); }
-.app-update-popover { position:absolute; z-index:40; right:0; top:38px; width:min(340px, 85vw); padding:18px; border:1px solid var(--border); border-radius:8px; background:var(--canvas, #fff); box-shadow:0 8px 32px #0002; overflow-wrap:anywhere; line-height:1.55; }
-html[data-theme='dark'] .app-update-popover { background:#111827; }
-.app-update-popover progress { width:100%; margin-bottom:12px; }
-@media(max-width:1100px) { .app-update-control > summary > span { max-width:135px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; } }

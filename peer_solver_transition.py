@@ -227,6 +227,16 @@ def refine_transition_safe_groups(
         unresolved = []
         checks = []
         for constraint in model.constraints:
+            # An explicit required update is an obligation on the *final*
+            # assignment. The baseline necessarily precedes that update, so
+            # treating its current-version ban as a transition invariant
+            # incorrectly yields INVALID_CURRENT_ENDPOINT. Keep the guard in
+            # the final solver model; ignore it only for intermediate states.
+            # Peer constraints and keep-current constraints remain active.
+            if (constraint.reason.startswith("USER_BASELINE_REQUIRED_UPDATE")
+                    and len(constraint.literals) == 1
+                    and current_assignment.get(constraint.literals[0][0]) == constraint.literals[0][1]):
+                continue
             checks.append((
                 constraint.reason or "FORBIDDEN_COMBINATION",
                 constraint.provenance,
