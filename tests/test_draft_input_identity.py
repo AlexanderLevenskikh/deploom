@@ -109,7 +109,7 @@ class DraftInputIdentityTests(unittest.TestCase):
             }
             first = capture_draft_semantic_inputs(child, topology=topology)
             self.assertEqual("UNKNOWN", first["inputCoverage"]["status"])
-            record = next(r for r in first["files"] if r.get("path") == str(external))
+            record = next(r for r in first["files"] if Path(r.get("path", "")).resolve() == external.resolve())
             self.assertEqual("PRESENT", record["status"])
             self.write_json(external, {"name": "synthetic-external", "version": "2.0.0"})
             second = capture_draft_semantic_inputs(child, topology=topology)
@@ -129,7 +129,7 @@ class DraftInputIdentityTests(unittest.TestCase):
             original = Path.read_bytes
             lock = root / "package-lock.json"
             def deny(path):
-                if path == lock:
+                if path.resolve() == lock.resolve():
                     raise PermissionError("synthetic unreadable lock")
                 return original(path)
             with patch.object(Path, "read_bytes", deny):

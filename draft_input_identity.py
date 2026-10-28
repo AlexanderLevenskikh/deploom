@@ -39,9 +39,19 @@ def _settings_value(value: Any, roots: Sequence[tuple[Path, str]]) -> Any:
         return [_settings_value(v, roots) for v in value]
     if isinstance(value, str):
         candidate = value.replace("\\", "/")
+        # Windows can represent one folder with an 8.3 short name and a
+        # canonical long path. Resolve settings paths like workspace roots
+        # before hashing. URLs and relative values remain unchanged.
+        try:
+            path = Path(value)
+            if path.is_absolute():
+                candidate = path.resolve().as_posix()
+        except (OSError, ValueError):
+            pass
         for root, label in roots:
             prefix = root.as_posix().rstrip("/")
-            if candidate == prefix or candidate.startswith(prefix + "/"):
+            folded = candidate.casefold()
+            if folded == prefix.casefold() or folded.startswith((prefix + "/").casefold()):
                 return label + candidate[len(prefix):]
     return value
 
