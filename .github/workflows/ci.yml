@@ -29,6 +29,7 @@ jobs:
           python -m unittest discover -s tests -p "test_peer_solver_model.py" -v
           python -m unittest discover -s tests -p "test_peer_solver_transition.py" -v
           python -m unittest discover -s tests -p "test_required_transition.py" -v
+          python -m unittest discover -s tests -p "test_required_planner.py" -v
           python -m unittest discover -s tests -p "test_draft_decision_contract.py" -v
           python -m unittest discover -s tests -p "test_draft_input_identity.py" -v
       - name: CLI and syntax smoke
