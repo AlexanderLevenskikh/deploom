@@ -23,6 +23,7 @@
 | [CHECKPOINT_RECOVERY.md](CHECKPOINT_RECOVERY.md) | Durable preparation, selected check receipts (including lint), migration and incumbent recovery. |
 | [MIGRATION_PERFORMANCE.md](MIGRATION_PERFORMANCE.md) | Shared I/O admission, source caches, private trials and exact Yarn continuation. |
 | [PLANNING_DATA_REUSE.md](PLANNING_DATA_REUSE.md) | Shared metadata queries, small Yarn lockfile probes and bounded public migration research. |
+| [DRAFT_DECISION_CONTRACT.md](DRAFT_DECISION_CONTRACT.md) | Draft authority, health/freshness objectives, mutable scope, semantic input identity and Storybook release cohorts. |
 | `docs/MIGRATION_VALIDATION.md` | Контракт валидации миграции: явные профили, fail-closed, не-пересъёмка baseline, сохранение старых падений. |
 | `docs/ITERATIVE_REPAIR_RECOVERY.md` | Ремонт исходников/конфига в изолированном checkout, typed feedback, ре-верификация на свежих bytes. |
 | `docs/STORAGE_COHORT_REVIEW.md` | Хранение trial/checkpoint bytes, владельцы, GC и бюджеты когорт. |

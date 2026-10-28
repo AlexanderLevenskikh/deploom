@@ -1,0 +1,6 @@
+# Keep hash-bound headless Core resources byte-stable across checkouts.
+*.py text eol=lf
+*.schema.json text eol=lf
+/document_locales/*.json text eol=lf
+/VERSION text eol=lf
+/.gitattributes text eol=lf

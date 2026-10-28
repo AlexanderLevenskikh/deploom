@@ -88,6 +88,12 @@ from baseline_repair_handoff import (
     is_repairable_project_failure,
 )
 from baseline_cohort_inference import infer_baseline_cohort
+from draft_decision_contract import (
+    LATEST_APPROVED, contract_from_snapshot, decision_contract_prompt,
+    normalize_decision_contract, package_is_mutable, version_line_allowed,
+)
+from draft_input_identity import capture_draft_semantic_inputs, aggregate_semantic_inputs
+from storybook_release_policy import is_storybook_release_package
 
 from deploom_failure import build_failure, write_diagnostic_artifact
 from cli_io import configure_utf8_stdio
@@ -306,25 +312,23 @@ def _baseline_intent_payload() -> Dict[str, Any]:
     raw = str(os.environ.get("DEPLOOM_BASELINE_INTENT_JSON") or "").strip()
     if raw == _BASELINE_INTENT_CACHE_RAW:
         return _BASELINE_INTENT_CACHE
-    _BASELINE_INTENT_CACHE_RAW = raw
-    if not raw:
-        _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": {}, "searchMode": "AUTO", "executionMode": "FAST", "deferredCohorts": [], "cohortAction": {}}
-        return _BASELINE_INTENT_CACHE
     try:
-        parsed = json.loads(raw)
-    except (TypeError, ValueError):
-        _BASELINE_INTENT_CACHE = {"schemaVersion": 1, "policies": {}, "searchMode": "AUTO", "executionMode": "FAST", "deferredCohorts": [], "cohortAction": {}}
-        return _BASELINE_INTENT_CACHE
+        parsed = json.loads(raw) if raw else {}
+    except (TypeError, ValueError) as exc:
+        raise ValueError("DECISION_CONTRACT_INVALID: intent must contain valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("DECISION_CONTRACT_INVALID: intent must be an object")
     policies: Dict[str, str] = {}
-    if isinstance(parsed, dict) and isinstance(parsed.get("policies"), dict):
+    if isinstance(parsed.get("policies"), dict):
         for name, policy in parsed["policies"].items():
             normalized = str(policy or "").strip().lower()
             if normalized in {"keep-current", "required"}:
                 policies[str(name)] = normalized
-    execution_mode = str(parsed.get("executionMode") or "FAST").strip().upper() if isinstance(parsed, dict) else "FAST"
+    contract = normalize_decision_contract({**parsed, "policies": policies})
+    execution_mode = str(parsed.get("executionMode") or "FAST").strip().upper()
     if execution_mode not in BASELINE_EXECUTION_MODES:
         execution_mode = "FAST"
-    search_mode = str(parsed.get("searchMode") or "AUTO").strip().upper() if isinstance(parsed, dict) else "AUTO"
+    search_mode = str(parsed.get("searchMode") or "AUTO").strip().upper()
     if search_mode not in {"AUTO", "BOUNDED_IMPROVEMENT", "EXHAUSTIVE"}:
         search_mode = "AUTO"
     _BASELINE_INTENT_CACHE = {
@@ -332,9 +336,13 @@ def _baseline_intent_payload() -> Dict[str, Any]:
         "policies": policies,
         "searchMode": search_mode,
         "executionMode": execution_mode,
-        "deferredCohorts": _normalize_baseline_deferred_cohorts(parsed.get("deferredCohorts") if isinstance(parsed, dict) else None),
-        "cohortAction": _normalize_baseline_cohort_action(parsed.get("cohortAction") if isinstance(parsed, dict) else None),
+        "deferredCohorts": _normalize_baseline_deferred_cohorts(parsed.get("deferredCohorts")),
+        "cohortAction": _normalize_baseline_cohort_action(parsed.get("cohortAction")),
+        "decisionContract": contract,
+        **{key: value for key, value in contract.items() if key != "version"},
     }
+    # Cache only valid input: a rejected contract must fail on every attempt.
+    _BASELINE_INTENT_CACHE_RAW = raw
     return _BASELINE_INTENT_CACHE
 
 
@@ -348,7 +356,10 @@ def _baseline_cohort_action() -> Dict[str, object]:
 
 
 def _baseline_intent_policy(package: str) -> str:
-    policy = str((_baseline_intent_payload().get("policies") or {}).get(package) or "auto")
+    intent = _baseline_intent_payload()
+    if not package_is_mutable(package, intent["decisionContract"]):
+        return "keep-current"
+    policy = str((intent.get("policies") or {}).get(package) or "auto")
     return policy if policy in BASELINE_INTENT_POLICIES else "auto"
 
 # BLOCK_VH3_USER_SCOPE_SEMANTICS
@@ -968,6 +979,7 @@ class ProjectSpec:
     lockfile_state: Dict[str, Any] = dataclasses.field(default_factory=dict)
     current_audit: Dict[str, Any] = dataclasses.field(default_factory=dict)
     constraint_cache_path: Optional[Path] = None
+    draft_semantic_inputs: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def resolved_branch_prefix(self) -> str:
         return self.branch_prefix or self.base_branch
@@ -1097,6 +1109,8 @@ class DependencyRow:
     # supervisor never leaks its reports into a partial result. The dict
     # carries timeoutMs/solverElapsedMs/counts/reason/operationId/runId.
     peer_compat_unresolved_report: Optional[Dict[str, Any]] = None
+    objective_candidate: str = ""
+    objective_note: str = ""
 
 
 @dataclasses.dataclass
@@ -6067,7 +6081,7 @@ def _severity_at_candidate_version(row: DependencyRow, planned: str, severity: s
         return parse_vuln_counts(row.current_vulns).get(severity, 0)
     if planned and row.vuln_evidence_by_version:
         summary = row.vuln_evidence_by_version.get(planned)
-        if summary is not None:
+        if summary is not None and _summary_security_known(summary):
             return parse_vuln_counts(summary).get(severity, 0)
     return None
 
@@ -6632,11 +6646,59 @@ def enrich_project_targets(
     return health_by_project
 
 
+def apply_decision_contract_targets(rows_by_project: Dict[str, List[DependencyRow]], client: LiveDataClient) -> None:
+    """Select freshness candidates within user bounds, without claiming proof.
+
+    The existing exact peer solver still resolves constraints and fallbacks.
+    Candidate selection does not fill missing OSV evidence with a safe value.
+    """
+    contract = _baseline_intent_payload()["decisionContract"]
+    latest = contract["objective"] == LATEST_APPROVED
+    for rows in rows_by_project.values():
+        for row in rows:
+            for mode in ("default", "yellow", "green"):
+                target = getattr(row, f"target_{mode}")
+                if target_is_action(target) and not version_line_allowed(row.name, row.current_version, target, contract):
+                    _set_mode_target(row, mode, NO_ACTION, "USER_APPROVED_VERSION_LINE: policy target is outside approved update bounds")
+            if not latest or row.scope_excluded or row.planner_deferred or _is_fixed_dependency_input(row):
+                continue
+            if _baseline_intent_policy(row.name) == "keep-current":
+                continue
+            meta = client.npm_cache.get(row.name)
+            current = safe_version(row.current_version)
+            if not isinstance(meta, dict) or current is None:
+                row.objective_note = "LATEST_CANDIDATE_UNKNOWN: registry metadata or current version unavailable"
+                continue
+            versions = published_versions(meta, include_prerelease=False)
+            structural, _ = client.registry_structural_candidates(meta, versions)
+            eligible = [version for version in structural
+                        if (parsed := safe_version(version)) is not None and parsed >= current
+                        and version_line_allowed(row.name, row.current_version, version, contract)]
+            selected = ""
+            for version in sorted(eligible, key=version_sort_key, reverse=True):
+                if version != row.current_version:
+                    if not client.registry_version_is_installable(row.name, meta, version):
+                        continue
+                    if client.registry_version_type_declarations_ok(row.name, meta, version):
+                        continue
+                    if client.registry_version_runtime_entrypoint_ok(row.name, meta, version):
+                        continue
+                selected = version
+                break
+            if not selected:
+                row.objective_note = "LATEST_CANDIDATE_UNKNOWN: no installable candidate established inside approved lines"
+                continue
+            row.objective_candidate = selected
+            row.objective_note = "LATEST_REGISTRY_CANDIDATE: static peer planning and fresh physical/security checks remain required"
+            for mode in ("default", "yellow", "green"):
+                _set_mode_target(row, mode, selected if selected != row.current_version else NO_ACTION, row.objective_note)
+
+
 STORYBOOK_ESLINT_PACKAGE = "eslint-plugin-storybook"
 
 
 def is_storybook_core_package(name: str) -> bool:
-    return name == "storybook" or name.startswith("@storybook/")
+    return is_storybook_release_package(name)
 
 
 def _target_attr(mode: str) -> str:
@@ -6674,6 +6736,8 @@ def _storybook_common_installable_version(
             for version in structural
             if (parsed := safe_version(version)) is not None
             and int(parsed.major) == desired_major
+            and version_line_allowed(row.name, row.current_version, version, _baseline_intent_payload()["decisionContract"])
+            and (_baseline_intent_policy(row.name) != "keep-current" or version == row.current_version)
             and (cmp_current := compare_semver(version, row.current_version)) is not None
             and cmp_current >= 0
             and (cmp_floor := compare_semver(version, required_floor)) is not None
@@ -6708,6 +6772,8 @@ def _storybook_plugin_target(
         for version in structural
         if (parsed := safe_version(version)) is not None
         and int(parsed.major) == desired_major
+        and version_line_allowed(row.name, row.current_version, version, _baseline_intent_payload()["decisionContract"])
+        and (_baseline_intent_policy(row.name) != "keep-current" or version == row.current_version)
         and (cmp_current := compare_semver(version, row.current_version)) is not None
         and cmp_current >= 0
     ]
@@ -7566,9 +7632,12 @@ def _candidate_domain(row: DependencyRow, mode: str, client: LiveDataClient) -> 
     structural, _ = client.registry_structural_candidates(meta, versions)
     current_v = safe_version(row.current_version)
     eligible: List[str] = []
+    contract = _baseline_intent_payload()["decisionContract"]
     for version in structural:
         parsed = safe_version(version)
         if current_v is not None and parsed is not None and parsed < current_v:
+            continue
+        if not version_line_allowed(row.name, row.current_version, version, contract):
             continue
         eligible.append(version)
     if row.current_version not in eligible:
@@ -7904,6 +7973,8 @@ def _assignment_constraint_issue(
         intent_row = rows_by_name.get(intent_name)
         if intent_row is None:
             continue
+        if not version_line_allowed(intent_name, intent_row.current_version, intent_version, _baseline_intent_payload()["decisionContract"]):
+            return f"USER_APPROVED_VERSION_LINE: {intent_name}@{intent_version} is outside the approved update bounds"
         intent_policy = _baseline_intent_policy(intent_name)
         if intent_policy == "keep-current" and intent_version != intent_row.current_version:
             return f"USER_BASELINE_KEEP_CURRENT: {intent_name} must remain {intent_row.current_version} in this Baseline"
@@ -7972,6 +8043,8 @@ def _new_assignment_constraint_issue(
 
     source = rows_by_name[name]
     source_version = assignment[name]
+    if not version_line_allowed(name, source.current_version, source_version, _baseline_intent_payload()["decisionContract"]):
+        return f"USER_APPROVED_VERSION_LINE: {name}@{source_version} is outside the approved update bounds"
     intent_policy = _baseline_intent_policy(name)
     if intent_policy == "keep-current" and source_version != source.current_version:
         return f"USER_BASELINE_KEEP_CURRENT: {name} must remain {source.current_version} in this Baseline"
@@ -24206,6 +24279,8 @@ def build_draft_plan(
                 "scanState": state,
                 "draftUnknown": row.draft_unknown,
                 "candidateSearchTruncated": row.candidate_search_truncated,
+                "objectiveCandidate": row.objective_candidate or None,
+                "objectiveNote": row.objective_note or None,
                 "peerCompatUnresolved": bool(getattr(row, "peer_compat_unresolved", False)),
                 "breakingChanges": list(row.breaking_changes or []),
                 "migrationNotes": list(row.migration_notes or []),
@@ -24782,9 +24857,9 @@ def build_draft_prompt(
             "Этот план НЕ проверен физически. DepLoom сознательно пропустил physical resolver/lifecycle/project verification.",
             "compatibility = UNKNOWN; authority = PLANNING_ONLY; verificationStatus = NOT_VERIFIED.",
             "",
-            "Используй предложенный target только как отправную точку. Выполни реальный package-manager install и",
-            "обнаруженные в проекте lint/type/build/test проверки. Сохраняй уже работающий scope, локализуй",
-            "несовместимые когорты и объясни каждое отклонение от предложенного target.",
+            "Следуй контракту решений ниже. Только для разрешённого пользователем EXECUTE выполни package-manager install и",
+            "обнаруженные в проекте lint/type/build/test проверки; в PLAN_ONLY перечисли их как будущие шаги. Сохраняй уже работающий scope, локализуй",
+            "несовместимые когорты и фиксируй evidence каждого выбора target.",
             "НЕ заявляй authority ProofEnvelope от DepLoom для этого Draft.",
             "",
             f"runId: `{run_id}`", f"workspaceId: `{workspace_id}`", f"projectId: `{project_id}`",
@@ -24800,9 +24875,9 @@ def build_draft_prompt(
             "This plan is NOT physically verified. DepLoom deliberately skipped physical resolver/lifecycle/project verification.",
             "compatibility = UNKNOWN; authority = PLANNING_ONLY; verificationStatus = NOT_VERIFIED.",
             "",
-            "Treat the proposed targets only as a starting point. Run the real package-manager install and the project's",
-            "discovered lint/type/build/test checks. Preserve already-working scope, localize incompatible cohorts and",
-            "explain every deviation from the proposed target. Do not claim DepLoom ProofEnvelope authority for this Draft.",
+            "Follow the decision contract below. Only in user-authorized EXECUTE run package-manager install and the project's",
+            "discovered lint/type/build/test checks; in PLAN_ONLY list them as future steps. Preserve already-working scope, localize incompatible cohorts and",
+            "record evidence for each target decision. Do not claim DepLoom ProofEnvelope authority for this Draft.",
             "",
             f"runId: `{run_id}`", f"workspaceId: `{workspace_id}`", f"projectId: `{project_id}`",
             f"mode: `{mode}`", f"policyHash: `{policy_hash}`",
@@ -24811,6 +24886,8 @@ def build_draft_prompt(
             "",
         ]
 
+    contract = contract_from_snapshot(snapshot if snapshot is not None else policy_snapshot_from_env())
+    lines += decision_contract_prompt(contract, language)
     ctx = execution_context or {}
     registry = str(ctx.get("registry") or "").strip()
     registry_note = "—" if not registry else "см. ниже (без credentials)"
@@ -25424,12 +25501,12 @@ def build_draft_prompt(
             "- Перед изменением проверить доступность точного target tarball в настроенном registry/nexus.",
             "- Для каждой зависимости определить затронутое поведение/конфигурацию и выполнить релевантные проверки до и после обновления.",
             "- После изменения выполнить install только штатным package manager проекта, focused tests, lint/build/typecheck и свежую проверку OSV/outdated.",
-            "- Не менять исключённые и deferred-строки без отдельного пересогласования scope.",
+            "- Explicit user exclusions/keep-current соблюдай до разрешённого обновления scope; используй уже выданное разрешение. Рекомендацию planner defer пересматривай по изменённым условиям/evidence, сохраняя известные ограничения совместимости.",
             "- После объединения веток перегенерировать roadmap и убедиться, что target совпадает с фактической версией.",
             "",
             "## Критерии приёмки (Draft НЕ доказывает их)",
             "",
-            "- Все строки из раздела «Что требуется изменить» доведены до указанных target или оформлен доказанный blocker.",
+            "- Все строки из раздела «Что требуется изменить» соответствуют выбранному назначению по контракту решений: pinned target либо явно перепланированное назначение; для advisory допустим обоснованный decision diff. Оставшиеся blocker/UNKNOWN и незавершённые строки явно перечислены.",
             "- package.json и канонический lockfile согласованы.",
             "- Регрессионные проверки, обычные тесты, сборка, линтер и typecheck проходят в применимой части.",
         ]
@@ -25440,12 +25517,12 @@ def build_draft_prompt(
             "- Before changing anything, verify the exact target tarball is available in the configured registry/nexus.",
             "- For each dependency determine affected behavior/configuration and run relevant checks before and after the upgrade.",
             "- After changing, run install with the project's package manager only, focused tests, lint/build/typecheck and a fresh OSV/outdated check.",
-            "- Do not touch excluded and deferred rows without re-negotiating the scope.",
+            "- Honor explicit user exclusions/keep-current until an authorized scope update, using existing authorization. Reconsider planner defer recommendations when conditions/evidence change while preserving known compatibility constraints.",
             "- After merging branches regenerate the roadmap and confirm the target matches the installed version.",
             "",
             "## Acceptance criteria (Draft does NOT prove them)",
             "",
-            "- Every row in 'Proposed changes' is brought to its target or a proven blocker is recorded.",
+            "- Every row in 'Proposed changes' follows the selected decision contract: pinned targets or an explicit replanned assignment; advisory may use an evidence-backed decision diff. List remaining blockers, UNKNOWNs and unfinished rows explicitly.",
             "- package.json and the canonical lockfile are consistent.",
             "- Regression checks, tests, build, linter and typecheck pass for the applicable part.",
         ]
@@ -25680,8 +25757,19 @@ def publish_draft_result(
     """
     snapshot = settings_snapshot if settings_snapshot is not None else policy_snapshot_from_env()
     policy_hash = draft_policy_hash(snapshot)
+    cap_value = snapshot.get("draftMaxCandidates")
+    raw_cap = str(cap_value).strip() if cap_value is not None else ""
+    effective_cap = int(raw_cap) if raw_cap.isdecimal() else None
     generated_at = dt.datetime.now(dt.timezone.utc).isoformat()
     plan = build_draft_plan(rows_by_project, projects_by_name, health_by_project)
+    contract = contract_from_snapshot(snapshot)
+    plan["decisionContract"] = contract
+    semantic_inputs = aggregate_semantic_inputs({
+        name: (spec.draft_semantic_inputs or capture_draft_semantic_inputs(
+            spec.path, topology=spec.lockfile_state.get("projectTopology"),
+        ))
+        for name, spec in projects_by_name.items()
+    })
     draft_dir = _draft_artifacts_dir(run_id)
     exec_ctx = dict(execution_context or {})
     first_spec = next(iter(projects_by_name.values()), None) if projects_by_name else None
@@ -25960,6 +26048,26 @@ def publish_draft_result(
         "elapsedMs": int((time.monotonic() - deadline.started) * 1000),
         "deadline": deadline.as_dict(),
         "policyHash": policy_hash,
+        "decisionContract": contract,
+        "planningOptions": {
+            "draftMaxCandidates": effective_cap,
+            "candidateCapScope": "SECURITY_EVIDENCE_SEARCH",
+            "staticSolverDomainCap": None,
+        },
+        "objectiveEvidence": {
+            "objective": contract["objective"],
+            "status": (
+                "UNKNOWN" if contract["objective"] == LATEST_APPROVED
+                and any(not row.objective_candidate for rows in rows_by_project.values() for row in rows
+                        if not row.scope_excluded and not row.planner_deferred
+                        and package_is_mutable(row.name, contract) and not _is_fixed_dependency_input(row))
+                else "CANDIDATE_PLAN_ONLY"
+            ),
+            "freshnessOptimality": "NOT_PROVEN",
+            "candidateUniverse": "STABLE_REGISTRY_VERSIONS",
+            "physicalCompatibility": "UNKNOWN",
+        },
+        **semantic_inputs,
         "settings": snapshot,
         "verificationStatus": "NOT_VERIFIED",
         "authority": "PLANNING_ONLY",
@@ -26622,8 +26730,9 @@ def main() -> None:
         )
         if draft_candidates >= 0:
             configured_candidates = draft_candidates
-        if args.draft_max_candidates is not None:
-            os.environ["DEPLOOM_DRAFT_MAX_CANDIDATES"] = str(args.draft_max_candidates)
+        # Persist the effective value (including settings/default), never a
+        # requested value that was superseded by configuration precedence.
+        os.environ["DEPLOOM_DRAFT_MAX_CANDIDATES"] = str(configured_candidates)
     max_candidates = configured_candidates
     include_prerelease = args.include_prerelease or as_bool(settings_get(settings, "include-prerelease", "includePrerelease"), False)
     use_system_proxy = args.use_system_proxy or as_bool(settings_get(settings, "use-system-proxy", "useSystemProxy"), False)
@@ -26977,6 +27086,18 @@ def main() -> None:
                     project, settings_sources, dashboard_state_path, groups_config_path
                 )
                 draft_input_hashes[project.name] = draft_input_hash(project, draft_input_files_by_project[project.name])
+                project.draft_semantic_inputs = capture_draft_semantic_inputs(
+                    project.path,
+                    topology=project.lockfile_state.get("projectTopology"),
+                    settings_sources=settings_sources,
+                    dashboard_state_path=dashboard_state_path,
+                    groups_config_path=groups_config_path,
+                    effective_overrides=overrides,
+                    effective_planner_config={
+                        "registry": registry, "includePrerelease": include_prerelease,
+                        "maxCandidates": max_candidates,
+                    },
+                )
                 client.for_project(project.name)
                 _draft_progress(client, operation="local inventory", package=project.name, step="inventory", completed=i, total=len(projects))
         # C2: scale the Draft default deadline to the real dependency count
@@ -27068,6 +27189,7 @@ def main() -> None:
             rows_by_project,
         )
         run_supervised_planning("planning", deadline_clock, lambda working: apply_supervisor_scope_expansions(working), rows_by_project)
+        run_supervised_planning("planning", deadline_clock, lambda working: apply_decision_contract_targets(working, client), rows_by_project)
         enforce_storybook_cohort(rows_by_project, client)
         apply_planner_deferrals(rows_by_project)
         # BLOCK_W_P0_P1_TYPES_NESTED_FIX_V1
