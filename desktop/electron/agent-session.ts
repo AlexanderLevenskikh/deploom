@@ -17,6 +17,7 @@ export function extractAgentSessionId(line: string, provider: SessionProvider): 
   } catch {
     return undefined
   }
+  if (event === null || typeof event !== 'object' || Array.isArray(event)) return undefined
   const part = event.part && typeof event.part === 'object' ? event.part as Record<string, unknown> : undefined
   const candidates = provider === 'opencode'
     ? [event.sessionID, part?.sessionID, event.session_id]

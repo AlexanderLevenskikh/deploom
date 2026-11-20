@@ -22,6 +22,7 @@ const attachedResume = buildOpenCodeResumeArgs(projectPath, openCodeSession, und
 if (attachedResume[attachedResume.indexOf("--attach") + 1] !== liveServer) throw new Error("OpenCode resume did not attach to the live server");
 if (openCodeResume[0] !== "run" || openCodeResume[openCodeResume.indexOf("--session") + 1] !== openCodeSession) throw new Error("OpenCode resume command is malformed");
 if (openCodeResume.some((arg) => arg.startsWith("--file"))) throw new Error("Resume must not attach the original prompt again");
+if (extractAgentSessionId("null", "codex") !== undefined) throw new Error("JSON null is not a session event");
 const codexSession = "019fa7af-21e2-74e3-8dbd-5d7281bd2378";
 const codexResume = buildCodexResumeArgs(codexSession);
 if (codexResume.slice(0, 4).join(" ") !== `exec resume --json ${codexSession}`) throw new Error("Codex resume command is malformed");
